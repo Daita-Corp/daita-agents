@@ -5,10 +5,42 @@ from typing import Any
 
 import pytest
 
+from daita.db.context_projection import (
+    ProjectionContext,
+    ProjectionMode,
+    project_operation_result,
+)
+from daita.db.models import (
+    DbIntent,
+    DbIntentKind,
+    DbOperationContract,
+    DbOperationResult,
+    DbRequest,
+)
+from daita.runtime import (
+    AccessMode,
+    Evidence,
+    Operation,
+    OperationSnapshot,
+    OperationStatus,
+    Task,
+    TaskStatus,
+)
 from tests.integration.from_db.live_production_helpers import (
+    assert_no_unexpected_write_execution,
+    assert_scalar_answer_fact,
+    assert_synthesized_answer,
     assert_sql_is_read_only,
+    query_rows,
+    classify_live_gate_failure,
+    latest_evidence,
+    row_values,
     sql_from_result,
+    task_capabilities,
     write_failure_artifacts,
+)
+from tests.integration.from_db.test_from_db_memory_live import (
+    _public_planning_context,
 )
 
 
@@ -54,6 +86,70 @@ def _snapshot(*evidence: FakeEvidence) -> FakeSnapshot:
         evidence=evidence,
         tasks=(),
     )
+
+
+def _projected_result_and_snapshot(
+    *,
+    capability_id: str = "db.sql.execute_read",
+) -> tuple[DbOperationResult, OperationSnapshot]:
+    operation_id = "op-projected-helper-contract"
+    task = Task(
+        id="task-projected-read",
+        operation_id=operation_id,
+        capability_id=capability_id,
+        executor_id="sqlite.read",
+        input={"sql": "select count(*) as count from customers"},
+        status=TaskStatus.SUCCEEDED,
+    )
+    raw_evidence = (
+        Evidence(
+            id="ev-projected-query",
+            kind="query.result",
+            owner="sqlite",
+            operation_id=operation_id,
+            task_id=task.id,
+            payload={
+                "sql": "select count(*) as count from customers",
+                "rows": [{"count": 4}],
+            },
+        ),
+        Evidence(
+            id="ev-projected-synthesis",
+            kind="answer.synthesis",
+            owner="db_runtime",
+            operation_id=operation_id,
+            payload={"answer": "There are 4 customers."},
+        ),
+    )
+    raw_result = DbOperationResult(
+        operation_id=operation_id,
+        request=DbRequest("How many customers are there?"),
+        intent=DbIntent(kind=DbIntentKind.DATA_QUERY, access=AccessMode.READ),
+        contract=DbOperationContract(operation_type="db.run", access=AccessMode.READ),
+        status=OperationStatus.SUCCEEDED,
+        answer="There are 4 customers.",
+        evidence=raw_evidence,
+        diagnostics={
+            "execution": {
+                "tasks": [task.to_dict()],
+                "task_count": 1,
+            }
+        },
+    )
+    public_result = project_operation_result(
+        raw_result,
+        ProjectionContext(mode=ProjectionMode.PUBLIC_RESULT),
+    )
+    snapshot = OperationSnapshot(
+        operation=Operation(
+            id=operation_id,
+            operation_type="db.run",
+            status=OperationStatus.SUCCEEDED,
+        ),
+        tasks=(task,),
+        evidence=raw_evidence,
+    )
+    return public_result, snapshot
 
 
 def test_sql_from_result_reads_query_result_sql():
@@ -133,9 +229,7 @@ def test_sql_from_result_falls_back_to_planner_compilation_sql():
                     "task_specs": [
                         {
                             "capability_id": "db.sql.validate",
-                            "input": {
-                                "sql": "select count(*) from compiled_customers"
-                            },
+                            "input": {"sql": "select count(*) from compiled_customers"},
                         }
                     ]
                 }
@@ -179,6 +273,78 @@ def test_sql_from_result_falls_back_to_diagnostics_task_input():
     assert sql_from_result(result) == "select count(*) from diagnostics_customers"
 
 
+def test_projected_result_and_snapshot_helpers_respect_the_observation_boundary():
+    public_result, snapshot = _projected_result_and_snapshot()
+
+    assert task_capabilities(public_result) == ["db.sql.execute_read"]
+    assert task_capabilities(snapshot) == ["db.sql.execute_read"]
+    assert query_rows(snapshot) == [{"count": 4}]
+    assert sql_from_result(snapshot) == "select count(*) as count from customers"
+
+    public_payload = json.dumps(
+        {
+            "diagnostics": public_result.diagnostics,
+            "evidence": [item.to_dict() for item in public_result.evidence],
+        },
+        sort_keys=True,
+    )
+    assert "select count(*) as count from customers" not in public_payload
+    assert '"count": 4' not in public_payload
+    with pytest.raises(AssertionError, match="requires an OperationSnapshot"):
+        query_rows(public_result)
+    with pytest.raises(AssertionError, match="requires an OperationSnapshot"):
+        row_values(public_result)
+    with pytest.raises(AssertionError, match="requires an OperationSnapshot"):
+        sql_from_result(public_result)
+    with pytest.raises(AssertionError, match="requires an OperationSnapshot"):
+        assert_scalar_answer_fact(public_result, value=4)
+
+
+def test_synthesized_answer_helper_validates_raw_and_public_surfaces_together():
+    public_result, snapshot = _projected_result_and_snapshot()
+
+    assert_synthesized_answer(snapshot, public_result=public_result)
+
+
+def test_latest_planning_context_selection_uses_latest_accepted_evidence():
+    snapshot = _snapshot(
+        FakeEvidence(
+            kind="planning.context",
+            payload={"rendered_context": "first accepted"},
+            id="ev-context-first",
+        ),
+        FakeEvidence(
+            kind="planning.context",
+            payload={"rendered_context": "rejected newest"},
+            accepted=False,
+            id="ev-context-rejected",
+        ),
+        FakeEvidence(
+            kind="planning.context",
+            payload={"rendered_context": "latest accepted"},
+            id="ev-context-latest",
+        ),
+    )
+
+    context = latest_evidence(snapshot, "planning.context")
+    payload = _public_planning_context(snapshot)
+
+    assert context is not None
+    assert context.id == "ev-context-latest"
+    assert payload["rendered_context"] == "latest accepted"
+
+
+def test_unexpected_write_checks_use_public_task_refs_and_snapshot_tasks():
+    public_result, snapshot = _projected_result_and_snapshot(
+        capability_id="db.sql.execute_write"
+    )
+
+    with pytest.raises(AssertionError, match="Unexpected write capabilities"):
+        assert_no_unexpected_write_execution(public_result)
+    with pytest.raises(AssertionError, match="Unexpected write capabilities"):
+        assert_no_unexpected_write_execution(snapshot)
+
+
 def test_assert_sql_is_read_only_catches_destructive_verbs():
     with pytest.raises(AssertionError, match="unsafe verbs"):
         assert_sql_is_read_only("select * from customers; drop table customers")
@@ -201,14 +367,66 @@ def test_failure_artifacts_split_planner_decisions_and_compilations(tmp_path):
             payload={"sql": "select count(*) from customers"},
             id="ev-plan",
         ),
+        FakeEvidence(
+            kind="query.plan.validation",
+            payload={"valid": True},
+            id="ev-validation",
+        ),
     )
 
     artifact_dir = write_failure_artifacts(tmp_path, snapshot=snapshot)
 
     decisions = json.loads((artifact_dir / "planner_decisions.json").read_text())
     compilations = json.loads((artifact_dir / "planner_compilations.json").read_text())
+    validations = json.loads((artifact_dir / "validation_facts.json").read_text())
     assert decisions[0]["id"] == "ev-decision"
     assert compilations[0]["id"] == "ev-compilation"
+    assert validations[0]["id"] == "ev-validation"
     assert (artifact_dir / "sql.txt").read_text().strip() == (
         "select count(*) from customers"
     )
+
+
+def test_failure_artifacts_redact_credentials_and_direct_pii(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret-123456")
+    snapshot = _snapshot(
+        FakeEvidence(
+            kind="query.result",
+            payload={
+                "sql": "select * from customers where email = 'ada@example.com'",
+                "rows": [
+                    {
+                        "email": "ada@example.com",
+                        "phone": "+1-555-0101",
+                        "full_name": "Ada Lovelace",
+                        "secret": "sk-test-secret-123456",
+                    }
+                ],
+            },
+        )
+    )
+
+    artifact_dir = write_failure_artifacts(tmp_path, snapshot=snapshot)
+    dumped = "\n".join(
+        path.read_text() for path in artifact_dir.iterdir() if path.is_file()
+    )
+
+    assert "ada@example.com" not in dumped
+    assert "+1-555-0101" not in dumped
+    assert "Ada Lovelace" not in dumped
+    assert "sk-test-secret-123456" not in dumped
+    assert "[REDACTED_EMAIL]" in dumped
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    (
+        ("OPENAI_API_KEY not set", "missing_credentials"),
+        ("Error code: insufficient_quota", "insufficient_quota"),
+        ("model_not_found", "model_unavailable"),
+        ("ConnectError: network is unreachable", "network_failure"),
+        ("assert result.status is SUCCEEDED", "behavioral_failure"),
+    ),
+)
+def test_live_gate_failure_classification(message, expected):
+    assert classify_live_gate_failure(message) == expected

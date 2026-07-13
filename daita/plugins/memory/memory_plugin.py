@@ -633,18 +633,19 @@ class MemoryPlugin(DomainServicePlugin):
 
         structured_results = []
         if retrieval_mode in {"structured", "hybrid"}:
-            recall_db_records = _declared_method(backend, "recall_db_records")
-            if recall_db_records is not None:
-                structured_results = await recall_db_records(
-                    query,
-                    limit=limit,
-                    score_threshold=score_threshold,
-                    source_identity=source_identity,
-                    category="db_semantics",
-                    kinds=args.get("kinds"),
-                )
-            elif retrieval_mode == "structured":
-                diagnostics["fallback"] = "structured_backend_unavailable"
+            from daita.db.memory.storage import require_structured_db_backend_method
+
+            recall_db_records = require_structured_db_backend_method(
+                self, "recall_db_records"
+            )
+            structured_results = await recall_db_records(
+                query,
+                limit=limit,
+                score_threshold=score_threshold,
+                source_identity=source_identity,
+                category="db_semantics",
+                kinds=args.get("kinds"),
+            )
             diagnostics["structured_candidate_count"] = len(structured_results)
 
         embedding_results = []
@@ -693,10 +694,8 @@ class MemoryPlugin(DomainServicePlugin):
 
         args = dict(payload or {})
         if "db_memory_payload" in args:
-            from daita.db.memory import (
-                db_memory_record_from_payload,
-                write_db_memory_record,
-            )
+            from daita.db.memory.records import db_memory_record_from_payload
+            from daita.db.memory.storage import write_db_memory_record
 
             try:
                 record = db_memory_record_from_payload(

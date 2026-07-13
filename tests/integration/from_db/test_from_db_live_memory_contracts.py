@@ -56,6 +56,7 @@ async def test_live_memory_metric_definition_changes_future_planning(tmp_path):
             agent,
             "Calculate recognized revenue from orders.total.",
         )
+        before_snapshot = await agent.runtime.inspect_operation(before.operation_id)
         await _write_memory(
             agent,
             kind="metric_definition",
@@ -73,19 +74,22 @@ async def test_live_memory_metric_definition_changes_future_planning(tmp_path):
             agent,
             "Calculate recognized revenue from orders.total.",
         )
+        after_snapshot = await agent.runtime.inspect_operation(after.operation_id)
     finally:
         await agent.stop()
 
-    assert "metric:recognized_revenue" not in _db_memory_keys(before)
+    assert before_snapshot is not None
+    assert after_snapshot is not None
+    assert "metric:recognized_revenue" not in _db_memory_keys(before_snapshot)
     assert after.status is OperationStatus.SUCCEEDED
     assert_loop_evidence(after)
-    assert_synthesized_answer(after)
-    assert "metric:recognized_revenue" in _db_memory_keys(after)
-    sql = _sql(after).lower()
+    assert_synthesized_answer(after_snapshot, public_result=after)
+    assert "metric:recognized_revenue" in _db_memory_keys(after_snapshot)
+    sql = _sql(after_snapshot).lower()
     assert "orders" in sql
     assert "total" in sql
     assert "complete" in sql
-    assert _has_numeric_value(_rows(after), 345.0)
+    assert _has_numeric_value(_rows(after_snapshot), 345.0)
 
 
 async def test_live_memory_source_scope_and_stale_filters(tmp_path):
@@ -190,15 +194,17 @@ async def test_live_memory_source_scope_and_stale_filters(tmp_path):
             agent,
             "Calculate active memory revenue from orders.total.",
         )
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
     finally:
         await other_source.stop()
         await agent.stop()
 
     assert result.status is OperationStatus.SUCCEEDED
+    assert snapshot is not None
     assert_loop_evidence(result)
-    assert_synthesized_answer(result)
-    context = _planning_context(result)
-    keys = _db_memory_keys(result)
+    assert_synthesized_answer(snapshot, public_result=result)
+    context = _planning_context(snapshot)
+    keys = _db_memory_keys(snapshot)
     assert keys == ["metric:active_memory"]
     assert "metric:inactive_memory" not in keys
     assert "metric:stale_memory" not in keys
@@ -207,8 +213,8 @@ async def test_live_memory_source_scope_and_stale_filters(tmp_path):
     assert "metric:cross_source_memory" not in keys
     diagnostics = context.get("db_memory_diagnostics") or {}
     assert diagnostics.get("included_count") == 1
-    assert _has_numeric_value(_rows(result), 345.0)
-    assert "complete" in _sql(result).lower()
+    assert _has_numeric_value(_rows(snapshot), 345.0)
+    assert "complete" in _sql(snapshot).lower()
 
 
 async def test_live_memory_pii_candidate_rejected(tmp_path):
@@ -249,6 +255,7 @@ async def test_live_memory_pii_candidate_rejected(tmp_path):
         result = await _run_live(
             agent, "Calculate recognized revenue from orders.total."
         )
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
     finally:
         await agent.stop()
 
@@ -262,12 +269,13 @@ async def test_live_memory_pii_candidate_rejected(tmp_path):
     assert records == []
 
     assert result.status is OperationStatus.SUCCEEDED
+    assert snapshot is not None
     assert_loop_evidence(result)
-    assert_synthesized_answer(result)
-    context = _planning_context(result)
+    assert_synthesized_answer(snapshot, public_result=result)
+    context = _planning_context(snapshot)
     assert not context.get("db_memory_refs")
     assert blocked_value not in diagnostic_text(result)
-    synthesis = latest_evidence(result, "answer.synthesis")
+    synthesis = latest_evidence(snapshot, "answer.synthesis")
     assert synthesis is not None
     assert blocked_value not in json.dumps(synthesis.payload, default=str)
 

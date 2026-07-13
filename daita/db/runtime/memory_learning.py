@@ -7,7 +7,7 @@ from typing import Any, TYPE_CHECKING
 from daita.runtime import Evidence, Operation, OperationStatus, Task
 
 from ..fingerprints import persisted_fingerprint
-from ..memory import db_memory_options_from_runtime_metadata
+from ..memory.config import db_memory_options_from_runtime_metadata
 from ..models import DbOperationContract, DbOperationResult, DbRuntimeConfig
 from .tasks.models import DbTaskPlan, DbTaskSpec
 

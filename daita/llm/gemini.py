@@ -47,6 +47,7 @@ class GeminiProvider(BaseLLMProvider):
                 "stop_sequences": kwargs.get("stop_sequences", None),
                 "response_mime_type": kwargs.get("response_mime_type", None),
                 "response_schema": kwargs.get("response_schema", None),
+                "response_json_schema": kwargs.get("response_json_schema", None),
                 "thinking_config": kwargs.get("thinking_config", None),
             }
         )
@@ -71,6 +72,15 @@ class GeminiProvider(BaseLLMProvider):
                     "Google Genai package not installed. Install with: pip install 'daita-agents[google]'"
                 ) from None
         return self._client
+
+    def structured_output_options(
+        self, schema: Dict[str, Any], *, name: str
+    ) -> Dict[str, Any]:
+        """Use Gemini's native JSON response schema."""
+        return {
+            "response_mime_type": "application/json",
+            "response_json_schema": dict(schema),
+        }
 
     def _prepare_api_params(
         self,
@@ -117,12 +127,15 @@ class GeminiProvider(BaseLLMProvider):
             "stop_sequences": "stop_sequences",
             "response_mime_type": "response_mime_type",
             "response_schema": "response_schema",
+            "response_json_schema": "response_json_schema",
             "thinking_config": "thinking_config",
         }
         for source_key, config_key in option_map.items():
             value = kwargs.get(source_key)
             if value is not None:
                 config_params[config_key] = value
+        if config_params.get("response_json_schema") is not None:
+            config_params["response_schema"] = None
 
         if system_instruction:
             config_params["system_instruction"] = system_instruction

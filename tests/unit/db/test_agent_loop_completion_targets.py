@@ -362,6 +362,63 @@ def test_finalization_policy_accepts_data_query_with_query_result():
     assert check.query_result_present is True
 
 
+def test_finalization_policy_ignores_result_from_older_query_plan():
+    old_sql = "select count(*) as count from orders"
+    new_sql = "select count(*) as count from customers"
+    tasks = (
+        Task(
+            id="validate-old",
+            operation_id="finalization-policy-target",
+            capability_id="db.sql.validate",
+            executor_id=f"{OWNER}.sql.validate",
+            status=TaskStatus.SUCCEEDED,
+        ),
+        Task(
+            id="read-old",
+            operation_id="finalization-policy-target",
+            capability_id="db.sql.execute_read",
+            executor_id=f"{OWNER}.sql.execute_read",
+            input={"plan_evidence_id": "plan-old"},
+            status=TaskStatus.SUCCEEDED,
+        ),
+    )
+    check = _finalization_check(
+        intent_kind=DbIntentKind.DATA_QUERY,
+        required_evidence=("query.result",),
+        evidence=(
+            Evidence(
+                id="plan-old",
+                kind="query.plan.proposal",
+                accepted=True,
+                payload={"valid": True, "sql": old_sql},
+            ),
+            Evidence(
+                kind="sql.validation",
+                task_id="validate-old",
+                accepted=True,
+                payload={"valid": True, "sql": old_sql, "operation": "query"},
+            ),
+            Evidence(
+                kind="query.result",
+                task_id="read-old",
+                accepted=True,
+                payload={"rows": [{"count": 3}], "sql": old_sql},
+            ),
+            Evidence(
+                id="plan-new",
+                kind="query.plan.proposal",
+                accepted=True,
+                payload={"valid": True, "sql": new_sql},
+            ),
+        ),
+        tasks=tasks,
+    )
+
+    assert check.finalizable is False
+    assert check.query_result_present is False
+    assert "query_result_missing" in check.verification.warnings
+
+
 def test_finalization_policy_accepts_schema_query_without_query_result():
     check = _finalization_check(
         intent_kind=DbIntentKind.SCHEMA_QUERY,
@@ -1004,7 +1061,7 @@ async def test_agent_loop_finishes_without_planner_when_operation_is_finalizable
     assert no_planner.states == []
 
 
-async def test_agent_loop_compiles_finish_decision_when_actions_present():
+async def test_agent_loop_rejects_finish_decision_when_actions_present():
     finish_with_read = DbPlannerDecision(
         status=DbPlannerDecisionStatus.FINISH,
         intent={"operation_type": "data.query"},
@@ -1032,13 +1089,20 @@ async def test_agent_loop_compiles_finish_decision_when_actions_present():
     tasks = await runtime.store.list_tasks(operation.id)
     evidence = await runtime.store.list_evidence(operation.id)
 
-    assert result.status == "finished"
+    assert result.status == "failed"
     assert len(planner.states) == 2
-    assert [call["capability_id"] for call in plugin.read.calls] == [
-        "db.sql.execute_read"
-    ]
-    assert "db.sql.validate" in {task.capability_id for task in tasks}
-    assert "query.result" in {item.kind for item in evidence}
+    assert plugin.read.calls == []
+    assert "db.sql.validate" not in {task.capability_id for task in tasks}
+    assert "query.result" not in {item.kind for item in evidence}
+    planner_decision = next(
+        item for item in reversed(evidence) if item.kind == "planner.decision"
+    )
+    persisted = planner_decision.payload["decision"]
+    assert persisted["status"] == "failed"
+    assert persisted["actions"] == []
+    assert persisted["metadata"]["error"] == (
+        "terminal_status_mixed_with_executable_actions"
+    )
 
 
 async def test_planner_dag_dependencies_become_durable_task_dependencies():

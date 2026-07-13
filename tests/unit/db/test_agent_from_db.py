@@ -80,7 +80,8 @@ class FailingRuntimeDbPlugin(BaseDatabasePlugin):
 
 async def _seed_sqlite(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL
@@ -92,19 +93,22 @@ async def _seed_sqlite(path):
         );
         INSERT INTO customers (name) VALUES ('Ada'), ('Linus');
         INSERT INTO orders (customer_id, total) VALUES (1, 10.0), (2, 20.0);
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
 async def _seed_sqlite_with_cents(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             total_cents INTEGER NOT NULL
         );
         INSERT INTO orders (total_cents) VALUES (1234);
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
@@ -916,8 +920,15 @@ async def test_agent_from_db_calibrate_memory_stores_structured_unit_conventions
     db_path = tmp_path / "phase13_memory_calibration.sqlite"
     await _seed_sqlite_with_cents(db_path)
     backend = MagicMock()
-    backend.list_by_category = AsyncMock(return_value=[])
-    backend.remember = AsyncMock(return_value={"status": "success"})
+    backend.list_db_records = AsyncMock(return_value=[])
+    backend.upsert_db_record = AsyncMock(
+        side_effect=lambda record: {
+            "status": "created",
+            "record_id": record["key"],
+            "db_memory": record,
+            "structured": True,
+        }
+    )
 
     agent = await Agent.from_db(
         str(db_path),
@@ -929,8 +940,9 @@ async def test_agent_from_db_calibrate_memory_stores_structured_unit_conventions
     finally:
         await agent.stop()
 
-    categories = [call.kwargs["category"] for call in backend.remember.await_args_list]
-    contents = [call.args[0] for call in backend.remember.await_args_list]
+    records = [call.args[0] for call in backend.upsert_db_record.await_args_list]
+    categories = [record["category"] for record in records]
+    contents = [record["text"] for record in records]
 
     assert "memory" in inspection.plugin_ids
     assert "db_semantics" in categories
@@ -948,16 +960,22 @@ async def test_agent_from_db_calibrate_memory_skips_when_exact_marker_exists(
     original_schema_inspect = source._execute_schema_inspect
     source._execute_schema_inspect = AsyncMock(side_effect=original_schema_inspect)
     backend = MagicMock()
-    backend.list_by_category = AsyncMock(
-        return_value=[
+    backend.list_db_records = AsyncMock(
+        side_effect=lambda **kwargs: [
             {
-                "content": (
-                    "DB exact cache marker: " f"numeric_unit_calibration:{db_path}"
-                )
+                "record_id": "existing-marker",
+                "metadata": {
+                    "db_memory": {
+                        "kind": "cache_marker",
+                        "key": kwargs["key"],
+                        "category": kwargs["category"],
+                        "metadata": {"source_identity": kwargs["source_identity"]},
+                    }
+                },
             }
         ]
     )
-    backend.remember = AsyncMock()
+    backend.upsert_db_record = AsyncMock()
 
     agent = await Agent.from_db(
         source,
@@ -971,7 +989,7 @@ async def test_agent_from_db_calibrate_memory_skips_when_exact_marker_exists(
 
     assert "memory" in inspection.plugin_ids
     source._execute_schema_inspect.assert_not_awaited()
-    backend.remember.assert_not_awaited()
+    backend.upsert_db_record.assert_not_awaited()
 
 
 async def test_agent_from_db_does_not_register_generic_memory_tools(tmp_path):

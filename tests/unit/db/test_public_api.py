@@ -132,7 +132,6 @@ def test_db_root_has_exact_public_surface():
         "DbSynthesizer",
         "DbVerifier",
         "analyze_sql",
-        "DBMemory",
         "DBPromptReadModel",
     ):
         assert not hasattr(db, internal_name)

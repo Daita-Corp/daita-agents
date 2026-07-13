@@ -19,14 +19,14 @@ from .context_projection import (
     project_session_context,
 )
 from .fingerprints import persisted_fingerprint
-from .memory import (
-    db_memory_options_from_from_db_options,
-    db_memory_refs_from_recall_evidence,
-    db_memory_selection_artifact_payload,
-)
-from .memory_contracts import (
+from .memory.config import db_memory_options_from_from_db_options
+from .memory.contracts import (
     db_memory_contracts_artifact_payload,
     project_db_memory_semantic_contracts,
+)
+from .memory.selection import (
+    db_memory_refs_from_recall_evidence,
+    db_memory_selection_artifact_payload,
 )
 from .models import DbIntent, DbRequest, DbRuntimeConfig
 from .session_context import db_session_context_from_request
@@ -1011,6 +1011,10 @@ def _compact_session_context(request: DbRequest) -> dict[str, Any]:
     durable_ids = context.get("durable_ids")
     diagnostics = context.get("diagnostics")
     compact: dict[str, Any] = {}
+    for key in ("session_id", "user_id"):
+        value = context.get(key)
+        if isinstance(value, str) and value.strip():
+            compact[key] = value.strip()
     if isinstance(referents, dict):
         compact["referents"] = {
             key: list(referents.get(key) or [])[:20]

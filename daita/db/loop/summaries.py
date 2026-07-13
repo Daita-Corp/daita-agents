@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Task
 
+from ..fingerprints import persisted_fingerprint
 from ..planner_protocol import DbLoopState
 from ..planning_context import planner_eligible_column_value_hint
 from .utils import (
@@ -90,11 +91,18 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
             if "valid" in evidence.payload:
                 summary["valid"] = evidence.payload.get("valid") is True
             if evidence.kind == "query.plan.validation":
-                plan_evidence_id = _optional_string(
-                    evidence.payload.get("plan_evidence_id")
-                )
-                if plan_evidence_id is not None:
-                    summary["plan_evidence_id"] = plan_evidence_id
+                for key in (
+                    "plan_evidence_id",
+                    "planning_context_evidence_id",
+                    "planning_context_fingerprint",
+                    "schema_fingerprint",
+                    "session_scope_binding_fingerprint",
+                    "session_context_fingerprint",
+                    "contract_fingerprint",
+                ):
+                    value = _optional_string(evidence.payload.get(key))
+                    if value is not None:
+                        summary[key] = value
             validation_facts = _safe_validation_items(
                 evidence.payload.get("validation_facts")
             )
@@ -109,6 +117,17 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
             if validation_errors:
                 summary["validation_warnings"] = validation_errors
             if evidence.kind == "query.plan.proposal":
+                for key in (
+                    "planning_context_evidence_id",
+                    "planning_context_fingerprint",
+                    "schema_fingerprint",
+                    "session_scope_binding_fingerprint",
+                    "session_context_fingerprint",
+                    "contract_fingerprint",
+                ):
+                    value = _optional_string(evidence.payload.get(key))
+                    if value is not None:
+                        summary[key] = value
                 structured_plan = evidence.payload.get("structured_plan")
                 if isinstance(structured_plan, Mapping):
                     selected_tables = _string_list(
@@ -124,6 +143,24 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
             if hints:
                 summary["hints"] = hints
         if evidence.kind == "planning.context":
+            memory_refs = evidence.payload.get("db_memory_refs")
+            if isinstance(memory_refs, list):
+                summary["db_memory_refs"] = [
+                    dict(item) for item in memory_refs if isinstance(item, Mapping)
+                ]
+            session_context = evidence.payload.get("session_context")
+            if isinstance(session_context, Mapping):
+                summary["session_context_fingerprint"] = persisted_fingerprint(
+                    session_context
+                )
+            for key in (
+                "schema_fingerprint",
+                "session_scope_binding_fingerprint",
+                "contract_fingerprint",
+            ):
+                value = _optional_string(evidence.payload.get(key))
+                if value is not None:
+                    summary[key] = value
             for key in (
                 "schema_evidence_refs",
                 "catalog_evidence_refs",
@@ -163,10 +200,26 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
                     ]
                     if target_refs:
                         summary["validation_grounding_target_refs"] = target_refs
+        if evidence.kind == "query.result":
+            plan_evidence_id = _optional_string(
+                evidence.payload.get("plan_evidence_id")
+                or evidence.metadata.get("plan_evidence_id")
+            )
+            if plan_evidence_id is not None:
+                summary["plan_evidence_id"] = plan_evidence_id
         if evidence.kind == "db.memory.proposal":
             proposal_fingerprint = evidence.payload.get("proposal_fingerprint")
             if isinstance(proposal_fingerprint, str) and proposal_fingerprint.strip():
                 summary["proposal_fingerprint"] = proposal_fingerprint.strip()
+        if evidence.kind == "query.plan.repair":
+            for key in (
+                "failure_evidence_id",
+                "prior_plan_evidence_id",
+                "planning_context_evidence_id",
+            ):
+                value = _optional_string(evidence.payload.get(key))
+                if value is not None:
+                    summary[key] = value
         if evidence.kind == "db.memory.definition":
             proposal_evidence_id = evidence.payload.get(
                 "proposal_evidence_id"

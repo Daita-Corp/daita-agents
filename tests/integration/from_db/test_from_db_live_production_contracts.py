@@ -89,21 +89,25 @@ async def test_live_sqlite_simple_query_full_loop_contract(tmp_path):
         assert_successful_prompt_run(result, snapshot=snapshot)
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
-        assert_synthesized_answer(result)
-        assert_scalar_answer_fact(result, value=4, aggregate_kind="count")
+        assert_synthesized_answer(snapshot, public_result=result)
         assert_scalar_answer_fact(snapshot, value=4, aggregate_kind="count")
         assert "db.answer.synthesize" in task_capabilities(result)
         assert "db.answer.synthesize" in task_capabilities(snapshot)
 
-        query_result = latest_evidence(result, "query.result")
-        assert query_result is not None
-        assert 4 in row_values(result)
+        raw_query_result = latest_evidence(snapshot, "query.result")
+        assert raw_query_result is not None
+        assert 4 in row_values(snapshot)
         assert re.search(r"\b4\b", result.answer or "")
 
-        sql = sql_from_result(result) or sql_from_result(snapshot)
+        sql = sql_from_result(snapshot)
         assert_sql_is_read_only(sql)
         assert re.search(r"(?i)\bcustomers\b", sql), sql
         assert re.search(r"(?i)\bcount\s*\(", sql), sql
+
+        public_query_result = latest_evidence(result, "query.result")
+        assert public_query_result is not None
+        assert "rows" not in public_query_result.payload
+        assert "sql" not in public_query_result.payload
 
         assert {
             "schema.asset_profile",
@@ -145,16 +149,15 @@ async def test_live_postgres_simple_query_full_loop_contract(
         assert_successful_prompt_run(result, snapshot=snapshot)
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
-        assert_synthesized_answer(result)
-        assert_scalar_answer_fact(result, value=4, aggregate_kind="count")
+        assert_synthesized_answer(snapshot, public_result=result)
         assert_scalar_answer_fact(snapshot, value=4, aggregate_kind="count")
         assert "db.answer.synthesize" in task_capabilities(result)
         assert "db.answer.synthesize" in task_capabilities(snapshot)
 
-        assert 4 in row_values(result)
+        assert 4 in row_values(snapshot)
         assert re.search(r"\b4\b", result.answer or "")
 
-        sql = sql_from_result(result) or sql_from_result(snapshot)
+        sql = sql_from_result(snapshot)
         assert_sql_is_read_only(sql)
         assert re.search(r"(?i)\bcustomers\b", sql), sql
         assert re.search(r"(?i)\bcount\s*\(", sql), sql
@@ -198,7 +201,7 @@ async def test_live_catalog_relationship_join_uses_catalog_paths(tmp_path):
         assert_successful_prompt_run(result, snapshot=snapshot)
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
-        assert_synthesized_answer(result)
+        assert_synthesized_answer(snapshot, public_result=result)
 
         assert {
             "catalog.source_registered",
@@ -215,13 +218,13 @@ async def test_live_catalog_relationship_join_uses_catalog_paths(tmp_path):
         assert relationship_path is not None
         assert relationship_path.payload
 
-        rows = query_rows(result)
+        rows = query_rows(snapshot)
         values = {str(value) for row in rows for value in row.values()}
         assert len(rows) >= 5
         assert "Ada Lovelace" in values
         assert "100" in values
 
-        sql = sql_from_result(result) or sql_from_result(snapshot)
+        sql = sql_from_result(snapshot)
         assert_sql_is_read_only(sql)
         assert re.search(r"(?i)\borders\b", sql), sql
         assert re.search(r"(?i)\bcustomers\b", sql), sql
@@ -263,17 +266,17 @@ async def test_live_literal_value_grounding_completed_vs_complete(tmp_path):
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
         assert_no_invalid_accepted_query_plans(snapshot.evidence)
-        assert_synthesized_answer(result)
+        assert_synthesized_answer(snapshot, public_result=result)
         assert "catalog.column_values.search" in task_capabilities(result)
         assert "schema.column_value_search_result" in evidence_kinds(result)
 
-        rows = query_rows(result)
+        rows = query_rows(snapshot)
         statuses = {row.get("status") for row in rows if "status" in row}
-        values = row_values(result)
+        values = row_values(snapshot)
         assert rows
         assert statuses == {"complete"} or 3 in values
 
-        sql = sql_from_result(result) or sql_from_result(snapshot)
+        sql = sql_from_result(snapshot)
         assert_sql_is_read_only(sql)
         lowered_sql = sql.lower()
         assert "orders" in lowered_sql
@@ -322,17 +325,17 @@ async def test_live_stateful_followup_uses_session_context(tmp_path):
         assert_loop_evidence(snapshot)
         assert_no_invalid_accepted_query_plans(first_snapshot.evidence)
         assert_no_invalid_accepted_query_plans(snapshot.evidence)
-        assert_synthesized_answer(second)
+        assert_synthesized_answer(snapshot, public_result=second)
         assert first.request.session_id
         assert second.request.session_id == first.request.session_id
 
-        session = second.diagnostics.get("session_context") or {}
-        assert session.get("session_id") == second.request.session_id
-        assert session.get("recent_operation_count", 0) >= 1
-        assert session.get("query_scope_count", 0) >= 1
-
-        planning = latest_evidence(second, "planning.context")
+        planning = latest_evidence(snapshot, "planning.context")
         assert planning is not None
+        session = planning.payload.get("session_context") or {}
+        assert session.get("session_id") == second.request.session_id
+        assert len(session.get("recent_operations") or []) >= 1
+        assert len(session.get("query_scopes") or []) >= 1
+
         planning_session = planning.payload.get("session_context") or {}
         assert planning_session.get("query_scopes") or []
         rendered = str(planning.payload.get("rendered_context") or "").lower()
@@ -340,7 +343,13 @@ async def test_live_stateful_followup_uses_session_context(tmp_path):
         assert "enterprise" in rendered
         assert "na" in rendered
 
-        sql = sql_from_result(second) or sql_from_result(snapshot)
+        assert "session_context" not in second.diagnostics
+        public_planning = latest_evidence(second, "planning.context")
+        assert public_planning is not None
+        assert "session_context" not in public_planning.payload
+        assert "rendered_context" not in public_planning.payload
+
+        sql = sql_from_result(snapshot)
         assert_sql_is_read_only(sql)
         lowered_sql = sql.lower()
         assert "orders" in lowered_sql
@@ -348,9 +357,9 @@ async def test_live_stateful_followup_uses_session_context(tmp_path):
         assert "enterprise" in lowered_sql
         assert re.search(r"(?i)\bNA\b|north america", sql), sql
 
-        rows = query_rows(second)
+        rows = query_rows(snapshot)
         assert rows
-        values = row_values(second)
+        values = row_values(snapshot)
         assert "Linus Torvalds" not in values
         assert "Katherine Johnson" not in values
         numeric_values = _numeric_values(rows)
@@ -392,27 +401,31 @@ async def test_live_stateless_followup_does_not_leak_context(tmp_path):
         second = await agent.run_detailed(SESSION_FOLLOWUP_PROMPT)
         snapshot = await agent.runtime.inspect_operation(second.operation_id)
 
+        assert snapshot is not None
         assert first.request.session_id is None
         assert second.request.session_id is None
         assert getattr(agent, "_default_history", None) is None
 
-        session = second.diagnostics.get("session_context") or {}
+        planning = latest_evidence(snapshot, "planning.context", accepted_only=False)
+        session = (
+            planning.payload.get("session_context") if planning is not None else {}
+        )
+        session = session or {}
         assert session.get("session_id") is None
-        assert session.get("recent_operation_count", 0) == 0
-        assert session.get("query_scope_count", 0) == 0
+        assert not (session.get("recent_operations") or [])
+        assert not (session.get("query_scopes") or [])
         session_sources = set((session.get("diagnostics") or {}).get("sources") or [])
         assert "runtime.operations" not in session_sources
         assert "conversation_history" not in session_sources
 
-        planning = latest_evidence(second, "planning.context", accepted_only=False)
         if planning is not None:
             planning_session = planning.payload.get("session_context") or {}
             assert not (planning_session.get("query_scopes") or [])
 
-        text = diagnostic_text(second)
+        text = diagnostic_text(snapshot)
         assert SESSION_FIRST_PROMPT not in text
 
-        sql = sql_from_result(second) or (sql_from_result(snapshot) if snapshot else "")
+        sql = sql_from_result(snapshot)
         if sql:
             lowered_sql = sql.lower()
             assert not (

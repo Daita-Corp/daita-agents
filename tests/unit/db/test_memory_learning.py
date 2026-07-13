@@ -27,9 +27,14 @@ SOURCE_IDENTITY = "sqlite:from_db:learning-source"
 
 def _memory_backend(*, existing=()):
     backend = MagicMock()
-    backend.list_by_category = AsyncMock(return_value=list(existing))
-    backend.remember = AsyncMock(
-        return_value={"status": "success", "chunk_id": "mem-learned"}
+    backend.list_db_records = AsyncMock(return_value=list(existing))
+    backend.upsert_db_record = AsyncMock(
+        side_effect=lambda record: {
+            "status": "created",
+            "record_id": "mem-learned",
+            "db_memory": record,
+            "structured": True,
+        }
     )
     return backend
 
@@ -325,7 +330,7 @@ async def test_learner_promotes_safe_unit_candidate_through_memory_write():
     assert run.handoff.task_id not in {
         call.args[0].id for call in runtime.execute_task.await_args_list
     }
-    backend.remember.assert_awaited_once()
+    backend.upsert_db_record.assert_awaited_once()
 
 
 async def test_learner_promotes_catalog_cited_value_alias_without_observed_values():
@@ -353,7 +358,7 @@ async def test_learner_promotes_catalog_cited_value_alias_without_observed_value
     evidence = await runtime.store.list_evidence(run.handoff.operation_id)
     candidate = next(item for item in evidence if item.kind == "db.memory.candidate")
     write = next(item for item in evidence if item.kind == "memory.semantic.write")
-    stored_record = backend.remember.await_args.kwargs["extra_metadata"]["db_memory"]
+    stored_record = backend.upsert_db_record.await_args.args[0]
 
     assert write.payload["kind"] == "value_alias"
     assert "observed_values" not in str(candidate.payload)
@@ -371,6 +376,7 @@ async def test_learner_rejects_duplicate_missing_source_cross_source_and_pii_can
                 "kind": "unit_convention",
                 "key": "unit_convention:orders.total_cents",
                 "text": "orders.total_cents is stored as cents.",
+                "category": "db_semantics",
                 "metadata": {"source_identity": SOURCE_IDENTITY},
             }
         },
@@ -464,7 +470,7 @@ async def test_learner_rejects_duplicate_missing_source_cross_source_and_pii_can
 
     assert rejection.payload["reason"] == "pii_or_sensitive_candidate"
     assert not any(item.kind == "memory.semantic.write" for item in evidence)
-    pii_backend.remember.assert_not_awaited()
+    pii_backend.upsert_db_record.assert_not_awaited()
 
 
 async def test_runtime_inspection_exposes_memory_learning_worker_and_capabilities():

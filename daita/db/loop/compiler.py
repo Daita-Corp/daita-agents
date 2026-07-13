@@ -14,6 +14,7 @@ from ..planner_protocol import (
     DbPlannerAction,
     DbPlannerActionKind,
     DbPlannerDecision,
+    DbPlannerDecisionStatus,
 )
 from ..runtime.tasks.models import DbTaskSpec
 from .actions import (
@@ -65,6 +66,7 @@ from .grounding import (
     _value_grounding_plan_task_input,
 )
 from .memory import (
+    _matching_memory_recall_summary,
     _memory_recall_task_input,
     _memory_update_runtime_continuation_action,
     _resolve_memory_proposal_for_action,
@@ -118,22 +120,69 @@ class DbActionCompiler:
             if error is not None or action is None:
                 rejected.append(error or {"error": "invalid_action"})
                 continue
+            if action.kind in {
+                DbPlannerActionKind.CLARIFY,
+                DbPlannerActionKind.FINISH,
+            }:
+                rejected.append(
+                    _action_error(
+                        action,
+                        "terminal_action_must_use_decision_status",
+                    )
+                )
+                continue
             actions.append(action)
 
-        runtime_continuation = _validation_grounding_runtime_continuation_action(
-            state,
-            current_action_ids={action.action_id for action in actions},
+        if (
+            decision.status
+            in {
+                DbPlannerDecisionStatus.FINISH,
+                DbPlannerDecisionStatus.CLARIFY,
+                DbPlannerDecisionStatus.BLOCKED,
+                DbPlannerDecisionStatus.FAILED,
+            }
+            and actions
+        ):
+            rejected.extend(
+                _action_error(action, "terminal_status_must_not_include_actions")
+                for action in actions
+            )
+            actions = []
+
+        runtime_continuation_selected = any(
+            action.metadata.get("runtime_continuation") is True for action in actions
+        )
+        runtime_continuation = (
+            _validation_grounding_runtime_continuation_action(
+                state,
+                current_action_ids={action.action_id for action in actions},
+            )
+            if not rejected and not runtime_continuation_selected
+            else None
         )
         if runtime_continuation is not None:
             if self.continuation_resolver.blocked_diagnostic(runtime_continuation):
                 actions = [runtime_continuation]
-            elif not any(
-                action.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT
-                for action in actions
+            elif (
+                runtime_continuation.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT
+                and not any(
+                    action.kind is runtime_continuation.kind for action in actions
+                )
             ):
                 actions.insert(0, runtime_continuation)
+            elif (
+                not actions
+                and not rejected
+                and not any(
+                    action.kind is runtime_continuation.kind for action in actions
+                )
+            ):
+                actions.append(runtime_continuation)
 
-        if not any(
+        runtime_continuation_selected = any(
+            action.metadata.get("runtime_continuation") is True for action in actions
+        )
+        if not runtime_continuation_selected and not any(
             action.kind is DbPlannerActionKind.COMMIT_MEMORY_UPDATE
             for action in actions
         ):
@@ -384,8 +433,6 @@ class DbActionCompiler:
         sequence_start: int,
         decision_fingerprint: str,
     ) -> tuple[list[DbTaskSpec], list[dict[str, Any]], list[dict[str, Any]]]:
-        if action.kind in {DbPlannerActionKind.CLARIFY, DbPlannerActionKind.FINISH}:
-            return [], [], []
         if action.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT:
             return self._compile_planning_context_action(
                 action,
@@ -687,6 +734,11 @@ class DbActionCompiler:
                     )
                 )
 
+        matching_recall = _matching_memory_recall_summary(state)
+        recall_required = (
+            isinstance(memory_decision, Mapping)
+            and memory_decision.get("recall") is True
+        )
         if _state_should_recall_memory_for_planning(state):
             recall_resolved = self._resolve_capability(
                 "memory.semantic.recall",
@@ -754,6 +806,65 @@ class DbActionCompiler:
                         "decision": memory_decision,
                     },
                 )
+        elif recall_required and matching_recall is not None:
+            recall_resolved = self._resolve_capability(
+                "memory.semantic.recall",
+                owner=str(matching_recall.get("owner") or "memory"),
+            )
+            recall_error = self._capability_error(action, recall_resolved)
+            if recall_error is not None:
+                return [], [], [recall_error]
+            recall_capability = recall_resolved["capability"]
+            prerequisite_capabilities.append(recall_capability)
+            access_errors = self._access_errors(
+                action,
+                prerequisite_capabilities,
+                state,
+            )
+            if access_errors:
+                return [], [], access_errors
+            recall_evidence_id = str(matching_recall.get("id") or "").strip()
+            recall_task_id = str(matching_recall.get("task_id") or "").strip()
+            if not recall_evidence_id or not recall_task_id:
+                return (
+                    [],
+                    [],
+                    [_action_error(action, "matching_memory_recall_is_not_durable")],
+                )
+            context_dependencies.append(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="memory.semantic.recall",
+                    evidence_id=recall_evidence_id,
+                    evidence_owner=recall_capability.owner,
+                    producer_task_id=recall_task_id,
+                    producer_capability_id=recall_capability.id,
+                    producer_executor_id=recall_capability.executor,
+                    evidence_accepted=True,
+                    payload_fingerprint=matching_recall.get("payload_fingerprint"),
+                    input_hash=matching_recall.get("task_input_hash"),
+                    operation_id=state.operation_id,
+                    metadata={
+                        "runtime_prerequisite": True,
+                        "reused_completed_recall": True,
+                        "producer_action_id": action.action_id,
+                        "consumer_action_id": action.action_id,
+                    },
+                )
+            )
+            context_input.setdefault(
+                "memory_recall_evidence_ids",
+                [recall_evidence_id],
+            )
+            context_input.setdefault(
+                "memory_recall_diagnostics",
+                {
+                    "registered": True,
+                    "queried": True,
+                    "reused": True,
+                    "decision": memory_decision,
+                },
+            )
 
         if not specs:
             access_errors = self._access_errors(action, capabilities, state)
@@ -962,6 +1073,12 @@ class DbActionCompiler:
             **_action_metadata(action, decision_fingerprint),
             "sql_provenance": _sql_provenance_metadata(resolved_sql),
         }
+        if (
+            resolved_sql.source_evidence_kind == "query.plan.proposal"
+            and resolved_sql.source_evidence_id is not None
+        ):
+            metadata["plan_evidence_id"] = resolved_sql.source_evidence_id
+            metadata["evidence_trace_keys"] = ["plan_evidence_id"]
         specs: list[DbTaskSpec] = []
         selected_capabilities: list[Any] = []
         if plan_validation is not None:
@@ -1563,7 +1680,12 @@ class DbActionCompiler:
         if access_errors:
             return [], [], access_errors
         specs: list[DbTaskSpec] = []
-        task_input = _task_input_for_action(action)
+        task_input = (
+            _memory_recall_task_input(state)
+            if action.kind is DbPlannerActionKind.RECALL_MEMORY
+            and state.memory_context.get("enabled") is True
+            else _task_input_for_action(action)
+        )
         task_dependencies: tuple[TaskDependency, ...] = ()
         if action.kind is DbPlannerActionKind.REPAIR_QUERY_PLAN:
             (

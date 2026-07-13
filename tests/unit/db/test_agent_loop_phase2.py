@@ -2,6 +2,9 @@ import json
 
 from daita.db import DbRuntime, DbRuntimeConfig
 from daita.db.loop import DbAgentLoop
+from daita.db.loop.grounding import (
+    _validation_grounding_runtime_continuation_action,
+)
 from daita.db.llm_agent_planner import DbLLMAgentPlanner
 from daita.db.llm_planner import DbLLMPlannerExecutor, DbLLMRepairExecutor
 from daita.db.llm_service import DbLLMResponse, DbLLMService
@@ -10,7 +13,9 @@ from daita.db.planner_protocol import (
     DbPlannerAction,
     DbPlannerActionKind,
     DbPlannerDecision,
+    DbPlannerDecisionShapeError,
     DbPlannerDecisionStatus,
+    validate_planner_decision_shape,
 )
 from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
@@ -242,13 +247,26 @@ class FakeLLMService:
     safe_metadata = {"provider": "fake", "model": "phase-two"}
 
     def __init__(self, content):
-        self.content = content
+        self.contents = (
+            list(content) if isinstance(content, (list, tuple)) else [content]
+        )
         self.messages = None
+        self.calls = []
+        self.response_schemas = []
 
-    async def generate_json(self, messages):
+    async def generate_json(
+        self,
+        messages,
+        *,
+        response_schema=None,
+        schema_name="db_json_response",
+    ):
         self.messages = messages
+        self.calls.append(messages)
+        self.response_schemas.append((response_schema, schema_name))
+        index = min(len(self.calls) - 1, len(self.contents) - 1)
         return DbLLMResponse(
-            content=self.content,
+            content=self.contents[index],
             diagnostics={"provider": "fake", "model": "phase-two"},
         )
 
@@ -529,6 +547,7 @@ async def test_llm_repair_repeated_sql_allowed_when_failure_context_changed():
             operation,
             {},
         )
+        repair_messages = runtime.db_llm_service.messages
     finally:
         await runtime.teardown()
 
@@ -540,6 +559,9 @@ async def test_llm_repair_repeated_sql_allowed_when_failure_context_changed():
     assert proposal.accepted is True
     assert proposal.payload["repair_context_changed"] is True
     assert proposal.payload["repeated_sql_allowed_context_changed"] is True
+    assert "current source of truth" in repair_messages[0]["content"]
+    repair_request = json.loads(repair_messages[1]["content"])
+    assert repair_request["repair_context_changed"] is True
 
 
 async def test_llm_repair_missing_input_ids_produces_rejected_diagnostics():
@@ -1423,6 +1445,30 @@ async def test_agent_loop_runs_schema_and_read_flow_through_task_specs():
     )
     query_result = next(item for item in evidence if item.kind == "query.result")
     assert query_result.payload["sql"] == "select 1 as answer"
+
+
+async def test_premature_finish_cannot_complete_a_data_query_without_result():
+    runtime, operation = await _runtime_and_operation(
+        "phase-zero-premature-finish",
+        required_evidence=frozenset({"query.result"}),
+    )
+    planner = FakePlanner(
+        DbPlannerDecision(
+            status=DbPlannerDecisionStatus.FINISH,
+            intent={"operation_type": "data.query"},
+            actions=(),
+        )
+    )
+    try:
+        result = await DbAgentLoop(runtime, planner).run(operation, max_turns=1)
+    finally:
+        await runtime.teardown()
+
+    assert result.status != "finished"
+    assert not any(
+        item.kind == "query.result"
+        for item in await runtime.store.list_evidence(operation.id)
+    )
 
 
 async def test_direct_sql_compiles_validation_and_read_task_specs():
@@ -2754,6 +2800,101 @@ async def test_validation_grounding_repair_targets_only_validation_column():
     assert ("customers", "status") not in targets
 
 
+def test_validation_grounding_continues_from_refresh_to_repair_then_execution():
+    grounding_fact = {
+        "kind": "filter_literal_requires_grounding",
+        "table": "orders",
+        "column": "status",
+        "literal": "completed",
+        "candidates": ["complete", "pending"],
+    }
+    rejected_validation = {
+        "id": "validation-rejected",
+        "kind": "query.plan.validation",
+        "owner": "db_runtime",
+        "accepted": False,
+        "valid": False,
+        "plan_evidence_id": "plan-original",
+        "validation_facts": [grounding_fact],
+    }
+    grounded_evidence = (
+        {
+            "id": "plan-original",
+            "kind": "query.plan.proposal",
+            "owner": "db_runtime",
+            "accepted": True,
+            "valid": True,
+            "sql": "select count(*) from orders where status = 'completed'",
+        },
+        {
+            "id": "hint-orders-status",
+            "kind": "schema.column_value_hint",
+            "owner": "catalog",
+            "accepted": True,
+            "hints": [
+                {
+                    "table": "orders",
+                    "column": "status",
+                    "observed_values": ["complete", "pending"],
+                }
+            ],
+        },
+        {
+            "id": "planning-context-refreshed",
+            "kind": "planning.context",
+            "owner": "db_runtime",
+            "accepted": True,
+        },
+    )
+    state_after_refresh = DbLoopState(
+        operation_id="phase-zero-grounding-repair",
+        normalized_user_request={"prompt": "Count completed orders."},
+        safety_frame={"max_access": "read"},
+        accepted_evidence_summaries=grounded_evidence,
+        rejected_evidence_summaries=(rejected_validation,),
+        validation_summaries=(rejected_validation,),
+    )
+
+    repair = _validation_grounding_runtime_continuation_action(
+        state_after_refresh,
+        current_action_ids=set(),
+    )
+
+    assert repair is not None
+    assert repair.kind is DbPlannerActionKind.REPAIR_QUERY_PLAN
+    assert repair.input["failure_evidence_id"] == "validation-rejected"
+    assert repair.input["prior_plan_evidence_id"] == "plan-original"
+    assert repair.input["planning_context_evidence_id"] == (
+        "planning-context-refreshed"
+    )
+
+    repaired_plan = {
+        "id": "plan-repaired",
+        "kind": "query.plan.proposal",
+        "owner": "db_runtime",
+        "accepted": True,
+        "valid": True,
+        "sql": "select count(*) from orders where status = 'complete'",
+    }
+    state_after_repair = DbLoopState(
+        operation_id="phase-zero-grounding-execute",
+        normalized_user_request={"prompt": "Count completed orders."},
+        safety_frame={"max_access": "read"},
+        accepted_evidence_summaries=(*grounded_evidence, repaired_plan),
+        rejected_evidence_summaries=(rejected_validation,),
+        validation_summaries=(rejected_validation,),
+    )
+
+    execute = _validation_grounding_runtime_continuation_action(
+        state_after_repair,
+        current_action_ids=set(),
+    )
+
+    assert execute is not None
+    assert execute.kind is DbPlannerActionKind.EXECUTE_VALIDATED_READ
+    assert execute.input["plan_evidence_id"] == "plan-repaired"
+
+
 async def test_agent_loop_rejects_action_outside_contract_before_task_creation():
     runtime, operation = await _runtime_and_operation("phase-two-reject")
     decision = DbPlannerDecision(
@@ -2811,6 +2952,25 @@ async def test_llm_agent_planner_emits_typed_decision_from_mocked_response():
     assert service.messages is not None
     request_payload = json.loads(service.messages[-1]["content"])
     assert request_payload["state"]["operation_id"] == "op-loop"
+    assert "finish" not in request_payload["available_action_kinds"]
+    assert "clarify" not in request_payload["available_action_kinds"]
+    assert "finish" not in request_payload["state"]["available_action_kinds"]
+    assert "clarify" not in request_payload["state"]["available_action_kinds"]
+    schema = request_payload["decision_schema"]
+    assert "Executable actions require status='continue'" in schema["description"]
+    branches = schema["properties"]["decision"]["anyOf"]
+    assert len(branches) == 3
+    action_kind_schema = branches[0]["properties"]["actions"]["items"]["properties"][
+        "kind"
+    ]
+    assert "finish" not in action_kind_schema["enum"]
+    assert "clarify" not in action_kind_schema["enum"]
+    assert (
+        "Executable actions require status='continue'" in service.messages[0]["content"]
+    )
+    native_schema, schema_name = service.response_schemas[0]
+    assert native_schema == schema
+    assert schema_name == "db_planner_decision"
 
 
 async def test_llm_agent_planner_parses_fenced_json_at_boundary():
@@ -2867,6 +3027,711 @@ async def test_llm_agent_planner_normalizes_unknown_keys_and_tuple_fields():
         "actions[0].depends_on",
         "stop_conditions",
     }
+
+
+def test_planner_decision_shape_accepts_continue_with_executable_action():
+    decision = DbPlannerDecision.from_dict(_llm_planner_payload())
+
+    assert validate_planner_decision_shape(decision) is decision
+
+
+@pytest.mark.parametrize("status", ["finish", "clarify", "blocked", "failed"])
+def test_planner_decision_shape_rejects_terminal_status_with_actions(status):
+    decision = DbPlannerDecision.from_dict(
+        _llm_planner_payload(
+            status=status,
+            clarification_question=("Which segment?" if status == "clarify" else None),
+        )
+    )
+
+    with pytest.raises(DbPlannerDecisionShapeError) as raised:
+        validate_planner_decision_shape(decision)
+
+    assert raised.value.code == "terminal_status_mixed_with_executable_actions"
+
+
+@pytest.mark.parametrize("status", ["finish", "clarify", "blocked", "failed"])
+def test_planner_decision_shape_accepts_terminal_status_without_actions(status):
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus(status),
+        actions=(),
+        clarification_question=("Which segment?" if status == "clarify" else None),
+    )
+
+    assert validate_planner_decision_shape(decision) is decision
+
+
+def test_persisted_legacy_terminal_actions_normalize_compatibly():
+    for status, action_kind in (
+        ("finish", "finish"),
+        ("continue", "finish"),
+        ("clarify", "clarify"),
+        ("continue", "clarify"),
+    ):
+        payload = _llm_planner_payload(
+            status=status,
+            actions=[
+                {
+                    "action_id": "terminal",
+                    "kind": action_kind,
+                    "input": {},
+                    "depends_on": [],
+                    "metadata": {},
+                }
+            ],
+            clarification_question=(
+                "Which customer segment?" if action_kind == "clarify" else None
+            ),
+        )
+
+        decision = DbPlannerDecision.from_persisted_dict(payload)
+
+        assert decision.status.value == action_kind
+        assert decision.actions == ()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["terminal_status", "legacy_terminal_action"],
+)
+async def test_llm_agent_planner_rejects_mixed_terminal_and_executable_actions(
+    case,
+):
+    if case == "terminal_status":
+        payload = _llm_planner_payload(status="finish")
+    else:
+        payload = _llm_planner_payload(
+            actions=[
+                {
+                    "action_id": "terminal",
+                    "kind": "finish",
+                    "input": {},
+                    "depends_on": [],
+                    "metadata": {},
+                },
+                {
+                    "action_id": "read",
+                    "kind": "execute_validated_read",
+                    "input": {"owner": "phase_two", "sql": "select 1"},
+                    "depends_on": [],
+                    "metadata": {},
+                },
+            ]
+        )
+    service = FakeLLMService(json.dumps(payload))
+    decision = await DbLLMAgentPlanner(service).plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.FAILED
+    assert decision.actions == ()
+    assert decision.metadata["failure"] == "planner_decision_shape_invalid"
+    assert "terminal" in decision.metadata["error"]
+    assert len(service.calls) == 2
+
+
+async def test_llm_agent_planner_rejects_empty_clarification_question():
+    payload = _llm_planner_payload(
+        status="clarify",
+        actions=[],
+        clarification_question="  ",
+    )
+
+    service = FakeLLMService(json.dumps(payload))
+    decision = await DbLLMAgentPlanner(service).plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.FAILED
+    assert decision.metadata["error"] == "clarification_question_required"
+    assert len(service.calls) == 2
+
+
+async def test_llm_agent_planner_corrects_one_invalid_shape_with_same_state():
+    invalid = _llm_planner_payload(status="finish")
+    valid = _llm_planner_payload(status="continue")
+    service = FakeLLMService([json.dumps(invalid), json.dumps(valid)])
+
+    decision = await DbLLMAgentPlanner(service).plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.CONTINUE
+    assert len(decision.actions) == 1
+    assert len(service.calls) == 2
+    assert (
+        json.loads(service.calls[0][-1]["content"])["state"]
+        == json.loads(service.calls[1][1]["content"])["state"]
+    )
+    correction = json.loads(service.calls[1][-1]["content"])
+    assert correction["validation_error"]["code"] == (
+        "terminal_status_mixed_with_executable_actions"
+    )
+    diagnostics = decision.metadata["planner_private_diagnostics"]
+    assert diagnostics["attempt_count"] == 2
+    assert [item["correction_requested"] for item in diagnostics["attempts"]] == [
+        False,
+        True,
+    ]
+
+
+async def test_llm_agent_planner_corrects_non_object_action_array_item():
+    invalid = _llm_planner_payload()
+    invalid["actions"].extend(["rationale", "metadata"])
+    valid = _llm_planner_payload()
+    service = FakeLLMService([json.dumps(invalid), json.dumps(valid)])
+
+    decision = await DbLLMAgentPlanner(service).plan(_loop_state())
+
+    assert decision.status is DbPlannerDecisionStatus.CONTINUE
+    assert len(service.calls) == 2
+    correction = json.loads(service.calls[1][-1]["content"])
+    assert correction["validation_error"]["code"] == "planner_action_not_object"
+    diagnostics = decision.metadata["planner_private_diagnostics"]
+    assert diagnostics["attempt_count"] == 2
+    assert diagnostics["attempts"][0]["validation_error"]["code"] == (
+        "planner_action_not_object"
+    )
+
+
+async def test_planner_shape_correction_has_no_tasks_or_extra_loop_turn():
+    invalid = _llm_planner_payload(status="failed")
+    valid = _llm_planner_payload(
+        status="clarify",
+        actions=[],
+        clarification_question="Which customer segment?",
+    )
+    service = FakeLLMService([json.dumps(invalid), json.dumps(valid)])
+    planner = DbLLMAgentPlanner(service)
+    runtime, operation = await _runtime_and_operation(
+        "phase-five-shape-correction",
+    )
+    try:
+        result = await DbAgentLoop(runtime, planner).run(operation, max_turns=1)
+        tasks = await runtime.store.list_tasks(operation.id)
+        decisions = [
+            item
+            for item in await runtime.store.list_evidence(operation.id)
+            if item.kind == "planner.decision"
+        ]
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "clarification_required"
+    assert tasks == []
+    assert len(service.calls) == 2
+    assert len(decisions) == 1
+    assert decisions[0].payload["turn"] == 1
+
+
+async def test_planner_private_attempt_diagnostics_are_redacted_and_persisted():
+    secret = "sk-test-secret-123456"
+    invalid = _llm_planner_payload(
+        status="blocked",
+        rationale=f"Contact ada@example.com using {secret}",
+    )
+    service = FakeLLMService(json.dumps(invalid))
+    planner = DbLLMAgentPlanner(service)
+    runtime, operation = await _runtime_and_operation(
+        "phase-five-private-planner-diagnostics"
+    )
+    try:
+        result = await DbAgentLoop(runtime, planner).run(operation, max_turns=1)
+        persisted = next(
+            item
+            for item in await runtime.store.list_evidence(operation.id)
+            if item.kind == "planner.decision"
+        )
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "failed"
+    dumped = json.dumps(persisted.payload, sort_keys=True)
+    assert secret not in dumped
+    assert "ada@example.com" not in dumped
+    assert "[REDACTED_API_KEY]" in dumped
+    assert "[REDACTED_EMAIL]" in dumped
+    private = persisted.payload["decision"]["metadata"]["planner_private_diagnostics"]
+    assert private["attempt_count"] == 2
+    assert private["attempts"][0]["parsed_pre_normalization"] is not None
+
+
+async def test_compiler_rejects_compatibility_terminal_action():
+    runtime, operation = await _runtime_and_operation("phase-two-terminal-compiler")
+    loop = DbAgentLoop(runtime, FakePlanner())
+    state = await loop.build_loop_state(operation, turn=1, remaining_turns=1)
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        actions=(
+            DbPlannerAction(
+                action_id="legacy-finish",
+                kind=DbPlannerActionKind.FINISH,
+            ),
+        ),
+    )
+    try:
+        compilation = loop.compile_actions(decision, state)
+    finally:
+        await runtime.teardown()
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "terminal_action_must_use_decision_status"
+    )
+
+
+async def test_repeated_premature_finish_has_unmet_finalization_reason():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-repeated-premature-finish",
+        required_evidence={"query.result"},
+    )
+    finish = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.FINISH,
+        intent={"operation_type": "data.query"},
+    )
+    try:
+        result = await DbAgentLoop(runtime, FakePlanner(finish, finish)).run(
+            operation,
+            max_turns=2,
+        )
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "failed"
+    assert result.diagnostics["error"] == "db_agent_loop_unmet_finalization"
+    assert "db_agent_loop_unmet_finalization" in result.warnings
+
+
+async def test_premature_finish_progress_resets_repetition_fingerprint():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-premature-finish-progress",
+        required_evidence={"query.result"},
+    )
+    finish = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.FINISH,
+        intent={"operation_type": "data.query"},
+    )
+    inspect = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=(
+            DbPlannerAction(
+                action_id="inspect-after-finish",
+                kind=DbPlannerActionKind.INSPECT_SCHEMA,
+                input={"owner": "phase_two"},
+            ),
+        ),
+    )
+    try:
+        result = await DbAgentLoop(
+            runtime,
+            FakePlanner(finish, inspect, finish),
+        ).run(operation, max_turns=3)
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "budget_exhausted"
+    assert "db_agent_loop_unmet_finalization" not in result.warnings
+
+
+async def test_premature_finish_preserves_substantive_contract_for_resume():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-preserve-contract",
+        required_evidence={"query.result"},
+    )
+    inspect = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=(
+            DbPlannerAction(
+                action_id="inspect",
+                kind=DbPlannerActionKind.INSPECT_SCHEMA,
+                input={"owner": "phase_two"},
+            ),
+        ),
+    )
+    finish = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.FINISH,
+        intent={"operation_type": "data.query"},
+    )
+    loop = DbAgentLoop(runtime, FakePlanner(inspect, finish))
+    try:
+        result = await loop.run(operation, max_turns=2)
+        persisted = await runtime.store.load_operation(operation.id)
+        resumed_state = await loop.build_loop_state(
+            persisted,
+            turn=1,
+            remaining_turns=1,
+        )
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "budget_exhausted"
+    snapshot = persisted.metadata["latest_compiled_contract_snapshot"]
+    assert snapshot["required_capabilities"] == ["db.schema.inspect"]
+    assert snapshot["required_evidence"] == ["database.schema"]
+    assert resumed_state.latest_compiled_contract_snapshot == snapshot
+
+
+def test_validation_continuation_rejects_stale_latest_plan():
+    state = DbLoopState(
+        operation_id="phase-two-stale-plan",
+        normalized_user_request={"prompt": "Count completed orders."},
+        safety_frame={"max_access": "read"},
+        accepted_evidence_summaries=(
+            {
+                "id": "context-new",
+                "kind": "planning.context",
+                "accepted": True,
+                "schema_fingerprint": "schema-new",
+            },
+            {
+                "id": "plan-stale",
+                "kind": "query.plan.proposal",
+                "accepted": True,
+                "valid": True,
+                "sql": "select count(*) from orders",
+                "planning_context_evidence_id": "context-old",
+                "schema_fingerprint": "schema-old",
+            },
+        ),
+    )
+
+    action = _validation_grounding_runtime_continuation_action(
+        state,
+        current_action_ids=set(),
+    )
+
+    assert action is not None
+    resolution = action.metadata["continuation_resolution"]
+    assert resolution["status"] == "blocked"
+    assert resolution["error"] == "stale_query_plan_planning_context"
+
+
+def test_validation_grounding_fingerprint_is_bound_to_failed_plan():
+    def state_for(plan_id, validation_id):
+        validation = {
+            "id": validation_id,
+            "kind": "query.plan.validation",
+            "accepted": False,
+            "valid": False,
+            "plan_evidence_id": plan_id,
+            "validation_facts": [
+                {
+                    "kind": "unobserved_filter_literal",
+                    "table": "orders",
+                    "column": "status",
+                    "literal": "completed",
+                }
+            ],
+        }
+        return DbLoopState(
+            operation_id="phase-two-plan-bound-grounding",
+            normalized_user_request={"prompt": "Count completed orders."},
+            safety_frame={"max_access": "read"},
+            accepted_evidence_summaries=(
+                {
+                    "id": plan_id,
+                    "kind": "query.plan.proposal",
+                    "accepted": True,
+                    "valid": True,
+                    "sql": "select count(*) from orders",
+                },
+            ),
+            rejected_evidence_summaries=(validation,),
+            validation_summaries=(validation,),
+        )
+
+    first = _validation_grounding_runtime_continuation_action(
+        state_for("plan-a", "validation-a"),
+        current_action_ids=set(),
+    )
+    second = _validation_grounding_runtime_continuation_action(
+        state_for("plan-b", "validation-b"),
+        current_action_ids=set(),
+    )
+
+    assert first is not None and second is not None
+    assert first.metadata["validation_grounding_fingerprint"] != (
+        second.metadata["validation_grounding_fingerprint"]
+    )
+
+
+def test_validation_continuation_ignores_result_from_older_plan():
+    state = DbLoopState(
+        operation_id="phase-two-old-result",
+        normalized_user_request={"prompt": "Count customers."},
+        safety_frame={"max_access": "read"},
+        accepted_evidence_summaries=(
+            {
+                "id": "plan-old",
+                "kind": "query.plan.proposal",
+                "accepted": True,
+                "valid": True,
+                "sql": "select count(*) from orders",
+            },
+            {
+                "id": "result-old",
+                "kind": "query.result",
+                "accepted": True,
+                "plan_evidence_id": "plan-old",
+            },
+            {
+                "id": "plan-new",
+                "kind": "query.plan.proposal",
+                "accepted": True,
+                "valid": True,
+                "sql": "select count(*) from customers",
+            },
+        ),
+    )
+
+    action = _validation_grounding_runtime_continuation_action(
+        state,
+        current_action_ids=set(),
+    )
+
+    assert action is not None
+    assert action.kind is DbPlannerActionKind.EXECUTE_VALIDATED_READ
+    assert action.input["plan_evidence_id"] == "plan-new"
+
+
+def test_equivalent_planning_context_fingerprint_allows_new_evidence_id():
+    state = DbLoopState(
+        operation_id="phase-two-equivalent-context",
+        normalized_user_request={"prompt": "Count orders."},
+        safety_frame={"max_access": "read"},
+        accepted_evidence_summaries=(
+            {
+                "id": "plan-current",
+                "kind": "query.plan.proposal",
+                "accepted": True,
+                "valid": True,
+                "sql": "select count(*) from orders",
+                "planning_context_evidence_id": "context-old-id",
+                "planning_context_fingerprint": "context-same",
+            },
+            {
+                "id": "context-new-id",
+                "kind": "planning.context",
+                "accepted": True,
+                "payload_fingerprint": "context-same",
+            },
+        ),
+    )
+
+    action = _validation_grounding_runtime_continuation_action(
+        state,
+        current_action_ids=set(),
+    )
+
+    assert action is not None
+    assert "continuation_resolution" not in action.metadata
+
+
+@pytest.mark.parametrize(
+    ("plan_key", "state_key", "expected_error"),
+    [
+        (
+            "session_context_fingerprint",
+            "session_context_fingerprint",
+            "stale_query_plan_session_binding",
+        ),
+        (
+            "contract_fingerprint",
+            "contract_fingerprint",
+            "stale_query_plan_contract",
+        ),
+    ],
+)
+def test_validation_continuation_rejects_session_or_contract_change(
+    plan_key,
+    state_key,
+    expected_error,
+):
+    plan = {
+        "id": "plan-current",
+        "kind": "query.plan.proposal",
+        "accepted": True,
+        "valid": True,
+        "sql": "select count(*) from orders",
+        "planning_context_fingerprint": "context-same",
+        plan_key: "old-binding",
+    }
+    current_context = {
+        "id": "context-current",
+        "kind": "planning.context",
+        "accepted": True,
+        "payload_fingerprint": "context-same",
+    }
+    if state_key == "session_context_fingerprint":
+        current_context[state_key] = "new-binding"
+    state = DbLoopState(
+        operation_id="phase-two-stale-binding",
+        normalized_user_request={"prompt": "Count orders."},
+        safety_frame={"max_access": "read"},
+        accepted_evidence_summaries=(
+            plan,
+            current_context,
+        ),
+        diagnostics={
+            state_key: (
+                "new-binding"
+                if state_key == "contract_fingerprint"
+                else "raw-request-binding"
+            )
+        },
+    )
+
+    action = _validation_grounding_runtime_continuation_action(
+        state,
+        current_action_ids=set(),
+    )
+
+    assert action is not None
+    assert action.metadata["continuation_resolution"]["error"] == expected_error
+
+
+def test_validation_continuation_uses_bounded_session_context_binding():
+    state = DbLoopState(
+        operation_id="phase-two-bounded-session-binding",
+        normalized_user_request={"prompt": "Count orders."},
+        safety_frame={"max_access": "read"},
+        accepted_evidence_summaries=(
+            {
+                "id": "plan-current",
+                "kind": "query.plan.proposal",
+                "accepted": True,
+                "valid": True,
+                "sql": "select count(*) from orders",
+                "planning_context_fingerprint": "context-same",
+                "session_context_fingerprint": "bounded-session",
+            },
+            {
+                "id": "context-current",
+                "kind": "planning.context",
+                "accepted": True,
+                "payload_fingerprint": "context-same",
+                "session_context_fingerprint": "bounded-session",
+            },
+        ),
+        diagnostics={"session_context_fingerprint": "raw-request-session"},
+    )
+
+    action = _validation_grounding_runtime_continuation_action(
+        state,
+        current_action_ids=set(),
+    )
+
+    assert action is not None
+    assert "continuation_resolution" not in action.metadata
+
+
+async def test_compiler_preserves_selected_runtime_continuation_action_id():
+    runtime, operation = await _runtime_and_operation(
+        "phase-two-runtime-continuation-identity"
+    )
+    state = DbLoopState(
+        operation_id=operation.id,
+        normalized_user_request={"prompt": "Count orders."},
+        safety_frame={"max_access": "read"},
+        accepted_evidence_summaries=(
+            {
+                "id": "plan-current",
+                "kind": "query.plan.proposal",
+                "accepted": True,
+                "valid": True,
+                "sql": "select count(*) from orders",
+                "planning_context_fingerprint": "context-same",
+                "contract_fingerprint": "old-contract",
+            },
+            {
+                "id": "context-current",
+                "kind": "planning.context",
+                "accepted": True,
+                "payload_fingerprint": "context-same",
+            },
+        ),
+        diagnostics={"contract_fingerprint": "new-contract"},
+    )
+    action = _validation_grounding_runtime_continuation_action(
+        state,
+        current_action_ids=set(),
+    )
+    assert action is not None
+    decision = DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": "data.query"},
+        actions=(action,),
+    )
+    try:
+        compilation = DbAgentLoop(runtime, FakePlanner()).compile_actions(
+            decision,
+            state,
+        )
+    finally:
+        await runtime.teardown()
+
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["action_id"] == action.action_id
+
+
+def test_validation_grounding_repair_exhaustion_blocks_specifically():
+    grounding_fact = {
+        "kind": "unobserved_filter_literal",
+        "table": "orders",
+        "column": "status",
+        "literal": "completed",
+    }
+    failed_validation = {
+        "id": "validation-rejected",
+        "kind": "query.plan.validation",
+        "accepted": False,
+        "valid": False,
+        "plan_evidence_id": "plan-original",
+        "validation_facts": [grounding_fact],
+    }
+    state = DbLoopState(
+        operation_id="phase-two-repair-exhausted",
+        normalized_user_request={"prompt": "Count completed orders."},
+        safety_frame={"max_access": "read"},
+        accepted_evidence_summaries=(
+            {
+                "id": "plan-original",
+                "kind": "query.plan.proposal",
+                "accepted": True,
+                "valid": True,
+                "sql": "select count(*) from orders where status = 'completed'",
+            },
+            {
+                "id": "hint-orders-status",
+                "kind": "schema.column_value_hint",
+                "accepted": True,
+                "hints": [{"table": "orders", "column": "status"}],
+            },
+            {
+                "id": "planning-context-refreshed",
+                "kind": "planning.context",
+                "accepted": True,
+            },
+        ),
+        rejected_evidence_summaries=(
+            failed_validation,
+            {
+                "id": "repair-rejected",
+                "kind": "query.plan.repair",
+                "accepted": False,
+                "failure_evidence_id": "validation-rejected",
+                "prior_plan_evidence_id": "plan-original",
+                "planning_context_evidence_id": "planning-context-refreshed",
+            },
+        ),
+        validation_summaries=(failed_validation,),
+    )
+
+    action = _validation_grounding_runtime_continuation_action(
+        state,
+        current_action_ids=set(),
+    )
+
+    assert action is not None
+    resolution = action.metadata["continuation_resolution"]
+    assert resolution["status"] == "blocked"
+    assert resolution["error"] == "validation_grounding_repair_exhausted"
 
 
 async def test_llm_agent_planner_rejects_invalid_action_kind_without_tasks():

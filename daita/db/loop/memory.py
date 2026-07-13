@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation
 
+from ..analysis import structural_schema_fingerprint
+from ..context_projection import policy_summary_from_source
 from ..fingerprints import persisted_fingerprint
-from ..memory import (
-    db_memory_options_from_runtime_metadata,
-    db_memory_planning_recall_decision,
-)
+from ..memory.config import db_memory_options_from_runtime_metadata
+from ..memory.recall import db_memory_planning_recall_decision
 from ..models import DbIntentKind
 from ..planner_protocol import DbLoopState, DbPlannerAction, DbPlannerActionKind
 from .actions import _summary_id
-from .summaries import _state_has_accepted_evidence
 from .utils import _float_option, _string_list
 
 
@@ -22,19 +22,79 @@ def _memory_context_for_state(
     runtime: Any,
     operation: Operation,
     accepted: tuple[Evidence, ...],
+    *,
+    safety_frame: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     memory_config = db_memory_options_from_runtime_metadata(runtime.config.metadata)
     if not memory_config:
         return {"enabled": False}
     prompt = str(operation.request.get("prompt") or "")
     schema = _latest_schema_payload(accepted)
+    schema_fingerprint = structural_schema_fingerprint(schema) if schema else None
     decision = db_memory_planning_recall_decision(
         prompt=prompt,
         intent_kind=_memory_recall_intent_kind(operation),
         schema=schema,
         memory_config=memory_config,
     )
-    return {
+    policy_summary = policy_summary_from_source(_runtime_source(runtime))
+    policy_fingerprint = persisted_fingerprint(
+        {
+            "connector_policy": policy_summary,
+            "runtime_policy_ids": sorted(
+                f"{getattr(policy, 'owner', '')}:{getattr(policy, 'id', '')}"
+                for policy in getattr(runtime.registry, "policies", ())
+            ),
+            "safety_frame": dict(safety_frame or {}),
+        }
+    )
+    configuration_fingerprint = persisted_fingerprint(memory_config)
+    freshness_fingerprint = persisted_fingerprint(
+        {
+            "default_ttl_days": memory_config.get("default_ttl_days"),
+            "guards": ["active", "stale", "expires_at"],
+        }
+    )
+    source_scope = tuple(
+        str(item)
+        for item in (
+            operation.request.get("source_scope")
+            or operation.metadata.get("source_scope")
+            or ()
+        )
+    )
+    recall_identity = {
+        "prompt": prompt,
+        "source_identity": memory_config.get("source_identity"),
+        "source_scope": list(source_scope),
+        "policy_fingerprint": policy_fingerprint,
+        "freshness_fingerprint": freshness_fingerprint,
+        "configuration_fingerprint": configuration_fingerprint,
+    }
+    recall_fingerprint = persisted_fingerprint(recall_identity)
+    recall_binding = {
+        **recall_identity,
+        "schema_fingerprint": schema_fingerprint,
+        "recall_fingerprint": recall_fingerprint,
+    }
+    matching_recall = _matching_recall_evidence(
+        accepted,
+        recall_fingerprint=recall_fingerprint,
+    )
+    matching_context = _matching_memory_planning_context(
+        accepted,
+        recall_evidence=matching_recall,
+        prompt=prompt,
+        schema_fingerprint=schema_fingerprint,
+        source_identity=memory_config.get("source_identity"),
+        policy_fingerprint=policy_fingerprint,
+        freshness_fingerprint=freshness_fingerprint,
+        configuration_fingerprint=configuration_fingerprint,
+        limit=int(memory_config.get("limit") or 3),
+        char_budget=int(memory_config.get("char_budget") or 800),
+        score_threshold=_float_option(memory_config, "score_threshold", 0.45),
+    )
+    context = {
         "enabled": bool(memory_config.get("enabled")),
         "source_identity": memory_config.get("source_identity"),
         "retrieval_mode": memory_config.get("retrieval_mode") or "structured",
@@ -43,9 +103,130 @@ def _memory_context_for_state(
         "score_threshold": _float_option(memory_config, "score_threshold", 0.45),
         "recall": memory_config.get("recall") or "auto",
         "recall_decision": decision,
-        "has_recall_evidence": any(
-            item.kind == "memory.semantic.recall" and item.accepted for item in accepted
+        "recall_binding": recall_binding,
+        "recall_fingerprint": recall_fingerprint,
+        "matching_recall_evidence": (
+            _matching_evidence_facts(matching_recall) if matching_recall else None
         ),
+        "has_matching_planning_context": matching_context is not None,
+    }
+    return context
+
+
+def _runtime_source(runtime: Any) -> Any:
+    source = getattr(runtime, "source", None)
+    if source is not None:
+        return source
+    for plugin in getattr(getattr(runtime, "config", None), "plugins", ()) or ():
+        if getattr(plugin, "sql_dialect", None) and hasattr(plugin, "query"):
+            return plugin
+    return None
+
+
+def _matching_recall_evidence(
+    accepted: tuple[Evidence, ...],
+    *,
+    recall_fingerprint: str,
+) -> Evidence | None:
+    for evidence in reversed(accepted):
+        if evidence.kind != "memory.semantic.recall" or not evidence.accepted:
+            continue
+        payload = evidence.payload if isinstance(evidence.payload, Mapping) else {}
+        binding = payload.get("recall_binding")
+        if not isinstance(binding, Mapping):
+            continue
+        if str(binding.get("recall_fingerprint") or "") == recall_fingerprint:
+            return evidence
+    return None
+
+
+def _matching_memory_planning_context(
+    accepted: tuple[Evidence, ...],
+    *,
+    recall_evidence: Evidence | None,
+    prompt: str,
+    schema_fingerprint: str | None,
+    source_identity: Any,
+    policy_fingerprint: str,
+    freshness_fingerprint: str,
+    configuration_fingerprint: str,
+    limit: int,
+    char_budget: int,
+    score_threshold: float,
+) -> Evidence | None:
+    if recall_evidence is None or not recall_evidence.id:
+        return None
+    selection_by_task: dict[str, Evidence] = {}
+    for evidence in accepted:
+        if evidence.kind != "db.memory.selection" or not evidence.accepted:
+            continue
+        payload = evidence.payload if isinstance(evidence.payload, Mapping) else {}
+        if recall_evidence.id not in (payload.get("recall_evidence_refs") or ()):
+            continue
+        if payload.get("source_identity") != source_identity:
+            continue
+        if payload.get("schema_fingerprint") != schema_fingerprint:
+            continue
+        budget = payload.get("budget_usage")
+        budget = budget if isinstance(budget, Mapping) else {}
+        if int(budget.get("limit") or 0) != max(0, int(limit)):
+            continue
+        if int(budget.get("char_budget") or 0) != max(0, int(char_budget)):
+            continue
+        if float(budget.get("score_threshold") or 0.0) != float(score_threshold):
+            continue
+        freshness = payload.get("freshness")
+        freshness = freshness if isinstance(freshness, Mapping) else {}
+        valid_until = freshness.get("valid_until")
+        if valid_until and _timestamp_is_expired(valid_until):
+            continue
+        if evidence.task_id:
+            selection_by_task[evidence.task_id] = evidence
+    if not selection_by_task:
+        return None
+
+    for evidence in reversed(accepted):
+        if evidence.kind != "planning.context" or not evidence.accepted:
+            continue
+        if not evidence.task_id or evidence.task_id not in selection_by_task:
+            continue
+        payload = evidence.payload if isinstance(evidence.payload, Mapping) else {}
+        if str(payload.get("prompt") or "") != prompt:
+            continue
+        if payload.get("schema_fingerprint") != schema_fingerprint:
+            continue
+        diagnostics = payload.get("diagnostics")
+        diagnostics = diagnostics if isinstance(diagnostics, Mapping) else {}
+        binding = diagnostics.get("memory_recall_binding")
+        if not isinstance(binding, Mapping):
+            continue
+        if binding.get("policy_fingerprint") != policy_fingerprint:
+            continue
+        if binding.get("freshness_fingerprint") != freshness_fingerprint:
+            continue
+        if binding.get("configuration_fingerprint") != configuration_fingerprint:
+            continue
+        return evidence
+    return None
+
+
+def _timestamp_is_expired(value: Any) -> bool:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed <= datetime.now(timezone.utc)
+
+
+def _matching_evidence_facts(evidence: Evidence) -> dict[str, Any]:
+    return {
+        "id": evidence.id,
+        "owner": evidence.owner,
+        "task_id": evidence.task_id,
+        "payload_fingerprint": evidence.metadata.get("payload_fingerprint"),
+        "task_input_hash": evidence.metadata.get("task_input_hash"),
     }
 
 
@@ -70,9 +251,9 @@ def _state_should_recall_memory_for_planning(state: DbLoopState) -> bool:
     decision = memory_context.get("recall_decision")
     if not isinstance(decision, Mapping) or decision.get("recall") is not True:
         return False
-    if memory_context.get("has_recall_evidence") is True:
+    if memory_context.get("has_matching_planning_context") is True:
         return False
-    return not _state_has_accepted_evidence(state, "memory.semantic.recall")
+    return not isinstance(memory_context.get("matching_recall_evidence"), Mapping)
 
 
 def _memory_recall_task_input(state: DbLoopState) -> dict[str, Any]:
@@ -80,7 +261,7 @@ def _memory_recall_task_input(state: DbLoopState) -> dict[str, Any]:
     decision = memory_context.get("recall_decision")
     decision = decision if isinstance(decision, Mapping) else {}
     limit = int(memory_context.get("limit") or 3)
-    return {
+    task_input = {
         "query": str(
             decision.get("query") or state.normalized_user_request.get("prompt") or ""
         ),
@@ -90,6 +271,50 @@ def _memory_recall_task_input(state: DbLoopState) -> dict[str, Any]:
         "retrieval_mode": str(memory_context.get("retrieval_mode") or "structured"),
         "source_identity": memory_context.get("source_identity"),
     }
+    recall_binding = memory_context.get("recall_binding")
+    if isinstance(recall_binding, Mapping) and recall_binding:
+        task_input["recall_binding"] = dict(recall_binding)
+    return task_input
+
+
+def _matching_memory_recall_summary(state: DbLoopState) -> dict[str, Any] | None:
+    match = (state.memory_context or {}).get("matching_recall_evidence")
+    return dict(match) if isinstance(match, Mapping) else None
+
+
+def _required_memory_recall_runtime_continuation_action(
+    state: DbLoopState,
+    *,
+    current_action_ids: set[str],
+) -> DbPlannerAction | None:
+    memory_context = state.memory_context or {}
+    decision = memory_context.get("recall_decision")
+    if not isinstance(decision, Mapping) or decision.get("recall") is not True:
+        return None
+    if memory_context.get("has_matching_planning_context") is True:
+        return None
+    binding = dict(memory_context.get("recall_binding") or {})
+    action_id = f"runtime_memory_recall_{persisted_fingerprint(binding)[:12]}"
+    if action_id in current_action_ids:
+        action_id = (
+            f"{action_id}_"
+            f"{persisted_fingerprint({'existing_ids': sorted(current_action_ids)})[:8]}"
+        )
+    action_input: dict[str, Any] = {"memory_recall_binding": binding}
+    source_owner = _single_source_owner_for_state(state)
+    if source_owner:
+        action_input["source_owner"] = source_owner
+    return DbPlannerAction(
+        action_id=action_id,
+        kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+        input=action_input,
+        rationale="Runtime continuation for required DB memory recall.",
+        metadata={
+            "runtime_continuation": True,
+            "continuation": "memory.recall.bootstrap",
+            "memory_recall_fingerprint": memory_context.get("recall_fingerprint"),
+        },
+    )
 
 
 def _memory_update_runtime_continuation_action(

@@ -63,6 +63,37 @@ PLANNER_ARTIFACTS = {
     "planner.decision": "planner_decisions.json",
     "planner.compilation": "planner_compilations.json",
 }
+VALIDATION_EVIDENCE_KINDS = frozenset(
+    {
+        "query.plan.validation",
+        "sql.validation",
+        "query.validation",
+        "validation.fact",
+    }
+)
+_SENSITIVE_MAPPING_KEYS = frozenset(
+    {"api_key", "authorization", "credential", "password", "secret"}
+)
+_PII_MAPPING_KEYS = frozenset(
+    {
+        "address",
+        "customer",
+        "customer_name",
+        "date_of_birth",
+        "email",
+        "first_name",
+        "full_name",
+        "last_name",
+        "phone",
+        "social_security_number",
+        "ssn",
+        "user_name",
+        "username",
+    }
+)
+_EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+_PHONE_PATTERN = re.compile(r"\+\d[\d\s().-]{7,}\d")
+_API_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 RICH_POSTGRES_SEED_SQL = """
 DROP TABLE IF EXISTS monitor_actions;
 DROP TABLE IF EXISTS audit_logs;
@@ -219,6 +250,58 @@ INSERT INTO audit_logs (audit_id, actor_id, event_type, created_at) VALUES
 INSERT INTO monitor_actions (id, status, note) VALUES
     (1, 'pending', 'fixture row for approval and resume tests');
 """
+
+
+def classify_live_gate_failure(error: BaseException | str) -> str:
+    """Classify live-gate infrastructure separately from model behavior."""
+    text = str(error).lower()
+    if any(
+        marker in text
+        for marker in (
+            "openai_api_key not set",
+            "api key is required",
+            "invalid api key",
+            "incorrect api key",
+            "authenticationerror",
+            "status code: 401",
+        )
+    ):
+        return "missing_credentials"
+    if any(
+        marker in text
+        for marker in (
+            "insufficient_quota",
+            "insufficient quota",
+            "quota exceeded",
+            "billing hard limit",
+        )
+    ):
+        return "insufficient_quota"
+    if any(
+        marker in text
+        for marker in (
+            "model_not_found",
+            "model not found",
+            "model is unavailable",
+            "does not exist or you do not have access",
+        )
+    ):
+        return "model_unavailable"
+    if any(
+        marker in text
+        for marker in (
+            "connection error",
+            "connectionerror",
+            "connecterror",
+            "network is unreachable",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "timed out",
+            "timeout",
+        )
+    ):
+        return "network_failure"
+    return "behavioral_failure"
 
 
 def require_live_openai_kwargs() -> dict[str, object]:
@@ -495,6 +578,7 @@ async def _create_writable_sqlite_runtime_agent(
         ),
         store=SQLiteRuntimeStore(runtime_path),
         db_llm_service=db_llm_service_from_config(llm, agent_id=name),
+        owns_db_llm_service=True,
     )
     await runtime.setup(agent_id=name)
     return DbAgent(runtime=runtime, name=name)
@@ -539,7 +623,9 @@ def task_capabilities(result_or_snapshot: Any) -> list[str]:
 
     diagnostics = getattr(result_or_snapshot, "diagnostics", {}) or {}
     execution = diagnostics.get("execution") if isinstance(diagnostics, dict) else {}
-    task_payloads = execution.get("tasks", []) if isinstance(execution, dict) else []
+    task_payloads = (
+        execution.get("task_refs", []) if isinstance(execution, dict) else []
+    )
     return [
         str(task.get("capability_id") or "")
         for task in task_payloads
@@ -564,7 +650,8 @@ def latest_evidence(
 
 
 def query_rows(result_or_snapshot: Any) -> list[dict[str, Any]]:
-    """Return rows from latest accepted ``query.result`` evidence."""
+    """Return rows from raw latest accepted ``query.result`` evidence."""
+    _require_raw_evidence_surface(result_or_snapshot, helper="query_rows")
     query_result = latest_evidence(result_or_snapshot, "query.result")
     assert query_result is not None, "Expected query.result evidence"
     rows = query_result.payload.get("rows") or []
@@ -573,7 +660,8 @@ def query_rows(result_or_snapshot: Any) -> list[dict[str, Any]]:
 
 
 def row_values(result_or_snapshot: Any) -> set[Any]:
-    """Return scalar values from latest accepted ``query.result`` rows."""
+    """Return scalar values from raw latest accepted ``query.result`` rows."""
+    _require_raw_evidence_surface(result_or_snapshot, helper="row_values")
     values: set[Any] = set()
     for row in query_rows(result_or_snapshot):
         values.update(row.values())
@@ -581,7 +669,8 @@ def row_values(result_or_snapshot: Any) -> set[Any]:
 
 
 def sql_from_result(result_or_snapshot: Any) -> str:
-    """Extract the planned or executed SQL from a result or snapshot."""
+    """Extract SQL from an ``OperationSnapshot`` or other raw evidence surface."""
+    _require_raw_evidence_surface(result_or_snapshot, helper="sql_from_result")
     diagnostics = getattr(result_or_snapshot, "diagnostics", {}) or {}
     if isinstance(diagnostics, dict):
         execution = diagnostics.get("execution")
@@ -618,7 +707,8 @@ def sql_from_result(result_or_snapshot: Any) -> str:
 
 
 def all_sql_strings(result_or_snapshot: Any) -> list[str]:
-    """Extract all planned, validated, and executed SQL strings."""
+    """Extract all SQL strings from a snapshot or other raw evidence surface."""
+    _require_raw_evidence_surface(result_or_snapshot, helper="all_sql_strings")
     values: list[str] = []
 
     diagnostics = getattr(result_or_snapshot, "diagnostics", {}) or {}
@@ -711,14 +801,26 @@ def assert_loop_evidence(result_or_snapshot: Any) -> None:
     assert not missing, f"Missing loop evidence: {sorted(missing)}"
 
 
-def assert_synthesized_answer(result_or_snapshot: Any) -> None:
-    """Assert that ``db.answer.synthesize`` produced accepted answer evidence."""
-    synthesis = latest_evidence(result_or_snapshot, "answer.synthesis")
+def assert_synthesized_answer(
+    snapshot_or_raw: Any,
+    *,
+    public_result: Any | None = None,
+) -> None:
+    """Validate raw synthesis and, when supplied, its redacted public projection."""
+    _require_raw_evidence_surface(snapshot_or_raw, helper="assert_synthesized_answer")
+    synthesis = latest_evidence(snapshot_or_raw, "answer.synthesis")
     assert synthesis is not None
     answer = synthesis.payload.get("answer")
     assert isinstance(answer, str) and answer.strip()
-    if hasattr(result_or_snapshot, "answer"):
-        assert result_or_snapshot.answer == answer
+    if public_result is None:
+        return
+
+    assert public_result.answer == answer
+    public_synthesis = latest_evidence(public_result, "answer.synthesis")
+    assert public_synthesis is not None
+    assert public_synthesis.payload.get("redacted") is True
+    assert "answer" not in public_synthesis.payload
+    assert "answer_facts" not in public_synthesis.payload
 
 
 def assert_scalar_answer_fact(
@@ -728,7 +830,11 @@ def assert_scalar_answer_fact(
     label: str | None = None,
     aggregate_kind: str | None = None,
 ) -> None:
-    """Assert synthesized answer evidence preserves a primary scalar fact."""
+    """Assert raw synthesis evidence preserves a primary scalar fact."""
+    _require_raw_evidence_surface(
+        result_or_snapshot,
+        helper="assert_scalar_answer_fact",
+    )
     synthesis = latest_evidence(result_or_snapshot, "answer.synthesis")
     assert synthesis is not None
     facts = synthesis.payload.get("answer_facts") or {}
@@ -822,8 +928,16 @@ def write_failure_artifacts(
                 source,
                 kind,
             )
+        validation_facts = [
+            item.to_dict()
+            for item in _evidence_items(source)
+            if item.kind in VALIDATION_EVIDENCE_KINDS
+            or item.kind.endswith(".validation")
+        ]
+        if validation_facts:
+            _write_json(artifact_dir / "validation_facts.json", validation_facts)
         (artifact_dir / "sql.txt").write_text(
-            sql_from_result(source) + "\n",
+            str(_redact_artifact_payload(sql_from_result(source))) + "\n",
             encoding="utf-8",
         )
     return artifact_dir
@@ -832,6 +946,31 @@ def write_failure_artifacts(
 def _evidence_items(result_or_snapshot: Any) -> tuple[Any, ...]:
     evidence = getattr(result_or_snapshot, "evidence", ())
     return tuple(evidence or ())
+
+
+def _require_raw_evidence_surface(source: Any, *, helper: str) -> None:
+    """Reject caller-facing projections for helpers that inspect raw facts."""
+    operation = getattr(source, "operation", None)
+    tasks = getattr(source, "tasks", None)
+    evidence = _evidence_items(source)
+    if operation is not None and tasks is not None:
+        return
+
+    diagnostics = getattr(source, "diagnostics", {}) or {}
+    execution = diagnostics.get("execution") if isinstance(diagnostics, dict) else {}
+    if isinstance(execution, dict) and isinstance(execution.get("tasks"), list):
+        return
+
+    if any(
+        isinstance(getattr(item, "payload", None), dict)
+        and getattr(item, "payload").get("redacted") is not True
+        for item in evidence
+    ):
+        return
+
+    raise AssertionError(
+        f"{helper} requires an OperationSnapshot or another raw evidence surface"
+    )
 
 
 def _first_sql_value(payload: Any) -> str:
@@ -966,7 +1105,7 @@ def _task_statuses(result_or_snapshot: Any) -> list[dict[str, Any]]:
         ]
     diagnostics = getattr(result_or_snapshot, "diagnostics", {}) or {}
     execution = diagnostics.get("execution") if isinstance(diagnostics, dict) else {}
-    tasks = execution.get("tasks", []) if isinstance(execution, dict) else []
+    tasks = execution.get("task_refs", []) if isinstance(execution, dict) else []
     return [dict(task) for task in tasks if isinstance(task, dict)]
 
 
@@ -982,8 +1121,58 @@ def _write_evidence_artifact(path: Path, result_or_snapshot: Any, kind: str) -> 
 
 def _write_json(path: Path, payload: Any) -> None:
     path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, default=_json_default) + "\n",
+        json.dumps(
+            _redact_artifact_payload(payload),
+            indent=2,
+            sort_keys=True,
+            default=_json_default,
+        )
+        + "\n",
         encoding="utf-8",
+    )
+
+
+def _redact_artifact_payload(value: Any) -> Any:
+    """Redact credentials and common direct PII while retaining diagnostics."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                "[REDACTED]"
+                if _is_sensitive_artifact_key(key)
+                else _redact_artifact_payload(nested)
+            )
+            for key, nested in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_artifact_payload(item) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    redacted = value
+    for secret in _artifact_secret_values():
+        redacted = redacted.replace(secret, "[REDACTED]")
+    redacted = _API_KEY_PATTERN.sub("[REDACTED_API_KEY]", redacted)
+    redacted = _EMAIL_PATTERN.sub("[REDACTED_EMAIL]", redacted)
+    return _PHONE_PATTERN.sub("[REDACTED_PHONE]", redacted)
+
+
+def _is_sensitive_artifact_key(key: Any) -> bool:
+    normalized = str(key).lower()
+    if normalized in _SENSITIVE_MAPPING_KEYS or normalized in _PII_MAPPING_KEYS:
+        return True
+    return normalized.endswith(
+        ("_api_key", "_authorization", "_credential", "_password", "_secret")
+    )
+
+
+def _artifact_secret_values() -> tuple[str, ...]:
+    secret_markers = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+    return tuple(
+        value
+        for key, value in os.environ.items()
+        if value
+        and len(value) >= 8
+        and any(marker in key.upper() for marker in secret_markers)
     )
 
 

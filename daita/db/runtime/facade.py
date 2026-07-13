@@ -114,6 +114,7 @@ class DbRuntime(
         approval_channel: InMemoryApprovalChannel | None = None,
         runtime_id: str | None = None,
         db_llm_service: DbLLMService | None = None,
+        owns_db_llm_service: bool = False,
         host_services: dict[str, Any] | None = None,
     ) -> None:
         self.source = source
@@ -125,7 +126,12 @@ class DbRuntime(
         self.runtime_id = runtime_id or f"db-runtime-{uuid4()}"
         self.verifier = DbVerifier()
         self.synthesizer = DbSynthesizer()
-        self.db_llm_service = db_llm_service or DbLLMService(None)
+        if db_llm_service is None:
+            self.db_llm_service = DbLLMService(None)
+            self._owns_db_llm_service = True
+        else:
+            self.db_llm_service = db_llm_service
+            self._owns_db_llm_service = owns_db_llm_service
         self.host_services = dict(host_services or {})
         if "audit_fingerprint_key" in self.host_services:
             audit_fingerprint_key = self.host_services.pop("audit_fingerprint_key")
@@ -282,12 +288,27 @@ class DbRuntime(
         return await self.tasks.executable_input_for_task(task, operation)
 
     async def teardown(self) -> None:
-        """Tear down registered plugins in reverse registration order."""
-        if not self._is_setup:
-            return
-        await self.registry.teardown_all()
-        self._setup_context = None
-        self._is_setup = False
+        """Tear down plugins and the runtime-owned DB LLM service."""
+        failures: list[Exception] = []
+        try:
+            if self._is_setup:
+                try:
+                    await self.registry.teardown_all()
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(exc)
+            if self._owns_db_llm_service:
+                try:
+                    await self.db_llm_service.aclose()
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(exc)
+        finally:
+            self._setup_context = None
+            self._is_setup = False
+
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise ExceptionGroup("DbRuntime teardown failed", failures)
 
     async def inspect(self) -> DbRuntimeInspection:
         """Return a diagnostics snapshot of registry-backed runtime state."""
@@ -678,7 +699,10 @@ class DbRuntime(
         synthesis_evidence, synthesis_task = await self.tasks.execute_answer_synthesis(
             operation=operation,
             intent=intent,
-            outcome_evidence=(*evidence, verification_evidence),
+            outcome_evidence=(
+                *finalization.supporting_evidence,
+                verification_evidence,
+            ),
         )
         refreshed_tasks = tuple(await self.store.list_tasks(operation_id))
         final_tasks = refreshed_tasks

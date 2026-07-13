@@ -141,6 +141,51 @@ class TestOpenAICompatibleHelpers:
             "max_tokens": 100
         }
 
+    def test_openai_structured_output_uses_json_schema_response_format(self):
+        schema = {"type": "object"}
+
+        options = OpenAIProvider(api_key="test").structured_output_options(
+            schema, name="db_planner_decision"
+        )
+
+        assert options == {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "db_planner_decision",
+                    "strict": False,
+                    "schema": schema,
+                },
+            }
+        }
+
+    def test_gemini_structured_output_uses_response_json_schema(self):
+        schema = {"type": "object"}
+
+        options = GeminiProvider(api_key="test").structured_output_options(
+            schema, name="db_planner_decision"
+        )
+
+        assert options == {
+            "response_mime_type": "application/json",
+            "response_json_schema": schema,
+        }
+
+    def test_gemini_json_schema_reaches_sdk_config_without_openapi_coercion(self):
+        types = pytest.importorskip("google.genai.types")
+        schema = {
+            "type": "object",
+            "properties": {"rationale": {"type": ["string", "null"]}},
+        }
+        provider = GeminiProvider(api_key="test", response_schema={"type": "string"})
+        options = provider.structured_output_options(schema, name="db_planner_decision")
+
+        params = provider._merge_params(options)
+        config = provider._build_generation_config(types, tools=None, **params)
+
+        assert config.response_json_schema == schema
+        assert config.response_schema is None
+
     def test_converts_flat_tool_calls_to_openai_message_shape(self):
         p = OpenAIProvider(api_key="test")
         converted = p._convert_messages_to_openai(

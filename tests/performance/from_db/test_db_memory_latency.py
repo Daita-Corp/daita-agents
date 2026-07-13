@@ -27,11 +27,8 @@ from typing import Any, Awaitable, Callable
 import pytest
 
 from daita.db import DbRuntime, DbRuntimeConfig
-from daita.db.memory import (
-    DBMemoryRecord,
-    recall_db_memory_records,
-    write_db_memory_record,
-)
+from daita.db.memory.records import DBMemoryRecord
+from daita.db.memory.storage import write_db_memory_record
 from daita.plugins.memory.local_backend import LocalMemoryBackend
 from daita.plugins.memory.memory_plugin import MemoryPlugin
 
@@ -46,9 +43,9 @@ async def test_structured_db_memory_write_and_recall_latency(tmp_path):
 
     for index in range(warmup):
         await _write_record(memory, source_identity, index=index, prefix="warmup")
-        await recall_db_memory_records(
-            memory,
+        await memory.backend.recall_db_records(
             "latency warmup revenue orders.total",
+            source_identity=source_identity,
             kinds=["metric_definition"],
             limit=3,
             score_threshold=0.0,
@@ -71,9 +68,9 @@ async def test_structured_db_memory_write_and_recall_latency(tmp_path):
             )
         )
         recall_elapsed, recall_result = await _timed(
-            recall_db_memory_records(
-                memory,
+            memory.backend.recall_db_records(
                 f"{marker} revenue orders.total",
+                source_identity=source_identity,
                 kinds=["metric_definition"],
                 limit=3,
                 score_threshold=0.0,

@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import inspect
+import json
+import os
+import re
 import time
 from typing import Any
 
@@ -24,6 +28,62 @@ _PRICING_DIAGNOSTIC_KEYS = frozenset(
         "pricing_warning",
     }
 )
+_PRIVATE_DIAGNOSTIC_SENSITIVE_KEYS = frozenset(
+    {
+        "address",
+        "api_key",
+        "authorization",
+        "credential",
+        "credentials",
+        "customer",
+        "customer_name",
+        "date_of_birth",
+        "email",
+        "first_name",
+        "full_name",
+        "last_name",
+        "password",
+        "phone",
+        "secret",
+        "social_security_number",
+        "ssn",
+        "token",
+        "user_name",
+        "username",
+    }
+)
+_PRIVATE_DIAGNOSTIC_CONTENT_KEYS = frozenset(
+    {
+        "accepted_evidence_summaries",
+        "catalog_context",
+        "content",
+        "db_memory_refs",
+        "execution_error_summaries",
+        "input",
+        "memory_context",
+        "normalized_user_request",
+        "planning_context",
+        "query_result",
+        "rejected_evidence_summaries",
+        "rendered_context",
+        "result_rows",
+        "row",
+        "rows",
+        "state",
+        "task_summaries",
+        "validation_summaries",
+    }
+)
+_EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+_INTERNATIONAL_PHONE_PATTERN = re.compile(r"\+\d[\d\s().-]{7,}\d")
+_US_PHONE_PATTERN = re.compile(
+    r"(?<!\w)(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}(?!\w)"
+)
+_US_SSN_PATTERN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_CREDIT_CARD_PATTERN = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+_API_KEY_PATTERN = re.compile(r"\b(?:sk|key|token)-[A-Za-z0-9_-]{8,}\b", re.I)
+_BEARER_PATTERN = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{8,}", re.I)
+_PRIVATE_DIAGNOSTIC_MAX_ITEMS = 50
 
 
 @dataclass(frozen=True)
@@ -104,20 +164,60 @@ class DbLLMService:
             )
         return self._provider
 
-    async def generate_json(self, messages: list[dict[str, str]]) -> DbLLMResponse:
+    async def aclose(self) -> None:
+        """Close the already-created provider while preserving lazy setup."""
+        provider = self._provider
+        if provider is None:
+            return
+        try:
+            close = getattr(provider, "aclose", None)
+            if close is None:
+                close = getattr(provider, "close", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        finally:
+            if self._provider is provider:
+                self._provider = None
+
+    async def generate_json(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        response_schema: dict[str, Any] | None = None,
+        schema_name: str = "db_json_response",
+    ) -> DbLLMResponse:
         if not self.available:
             raise RuntimeError("DB LLM service is not configured")
         started = time.perf_counter()
-        result = await self.provider.generate(messages, stream=False)
+        provider = self.provider
+        structured_options: dict[str, Any] = {}
+        if response_schema is not None:
+            options = getattr(provider, "structured_output_options", None)
+            if options is not None:
+                structured_options = dict(
+                    options(response_schema, name=schema_name) or {}
+                )
+        result = await provider.generate(
+            messages,
+            stream=False,
+            **structured_options,
+        )
         latency_ms = (time.perf_counter() - started) * 1000
         content = _content_from_result(result)
         diagnostics = {
             **self.safe_metadata,
             "latency_ms": latency_ms,
         }
+        if response_schema is not None:
+            diagnostics["structured_output"] = {
+                "schema_name": schema_name,
+                "provider_native": bool(structured_options),
+            }
         credential_values = _credential_values(self.config)
         raw_usage: dict[str, Any] = getattr(
-            self.provider, "_get_last_token_usage", lambda: {}
+            provider, "_get_last_token_usage", lambda: {}
         )()
         usage = _safe_diagnostics_mapping(
             raw_usage,
@@ -126,11 +226,11 @@ class DbLLMService:
         )
         if usage:
             diagnostics["tokens"] = usage
-        estimate = getattr(self.provider, "_estimate_cost", lambda usage: None)(usage)
+        estimate = getattr(provider, "_estimate_cost", lambda usage: None)(usage)
         if isinstance(estimate, (int, float)) and not isinstance(estimate, bool):
             diagnostics["estimated_cost_usd"] = estimate
         raw_pricing: dict[str, Any] = getattr(
-            self.provider, "get_pricing_metadata", lambda: {}
+            provider, "get_pricing_metadata", lambda: {}
         )()
         pricing = _safe_diagnostics_mapping(
             raw_pricing,
@@ -189,10 +289,19 @@ def _safe_diagnostics_mapping(
 
 
 def _credential_values(config: DbLLMConfig | None) -> frozenset[str]:
-    if config is None:
-        return frozenset()
-    values = {config.api_key} if config.api_key else set()
-    values.update(_nested_string_values(config.options))
+    values = set()
+    if config is not None:
+        if config.api_key:
+            values.add(config.api_key)
+        values.update(_nested_string_values(config.options))
+    secret_markers = ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+    values.update(
+        value
+        for key, value in os.environ.items()
+        if value
+        and len(value) >= 8
+        and any(marker in key.upper() for marker in secret_markers)
+    )
     return frozenset(value for value in values if value)
 
 
@@ -210,3 +319,116 @@ def _nested_string_values(value: Any) -> set[str]:
             values.update(_nested_string_values(nested))
         return values
     return set()
+
+
+def redact_db_llm_private_diagnostic(
+    value: Any,
+    *,
+    config: DbLLMConfig | None = None,
+    max_chars: int = 4096,
+) -> Any:
+    """Return bounded private LLM diagnostics with secrets and content removed."""
+    credentials = _credential_values(config)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                pass
+            else:
+                redacted = _redact_private_diagnostic_value(parsed, credentials)
+                serialized = json.dumps(redacted, sort_keys=True, default=str)
+                return _bounded_private_diagnostic(serialized, max_chars=max_chars)
+    redacted = _redact_private_diagnostic_value(value, credentials)
+    return _bounded_private_diagnostic(redacted, max_chars=max_chars)
+
+
+def _redact_private_diagnostic_value(
+    value: Any,
+    credentials: frozenset[str],
+) -> Any:
+    if isinstance(value, dict):
+        redacted_mapping: dict[str, Any] = {}
+        for index, (key, nested) in enumerate(value.items()):
+            if index >= _PRIVATE_DIAGNOSTIC_MAX_ITEMS:
+                redacted_mapping["__truncated_items__"] = len(value) - index
+                break
+            normalized = str(key).lower()
+            if (
+                normalized in _PRIVATE_DIAGNOSTIC_SENSITIVE_KEYS
+                or normalized in _PRIVATE_DIAGNOSTIC_CONTENT_KEYS
+                or normalized.endswith(
+                    (
+                        "_api_key",
+                        "_authorization",
+                        "_credential",
+                        "_password",
+                        "_secret",
+                    )
+                )
+            ):
+                redacted_mapping[str(key)] = "[REDACTED_PRIVATE]"
+            else:
+                redacted_mapping[str(key)] = _redact_private_diagnostic_value(
+                    nested, credentials
+                )
+        return redacted_mapping
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = list(value)
+        redacted_items = [
+            _redact_private_diagnostic_value(item, credentials)
+            for item in items[:_PRIVATE_DIAGNOSTIC_MAX_ITEMS]
+        ]
+        if len(items) > _PRIVATE_DIAGNOSTIC_MAX_ITEMS:
+            redacted_items.append(
+                {"__truncated_items__": len(items) - _PRIVATE_DIAGNOSTIC_MAX_ITEMS}
+            )
+        return redacted_items
+    if not isinstance(value, str):
+        return value
+    redacted_text = value
+    for credential in credentials:
+        redacted_text = redacted_text.replace(credential, "[REDACTED_SECRET]")
+    redacted_text = _API_KEY_PATTERN.sub("[REDACTED_API_KEY]", redacted_text)
+    redacted_text = _BEARER_PATTERN.sub("[REDACTED_AUTHORIZATION]", redacted_text)
+    redacted_text = _EMAIL_PATTERN.sub("[REDACTED_EMAIL]", redacted_text)
+    redacted_text = _US_SSN_PATTERN.sub("[REDACTED_SSN]", redacted_text)
+    redacted_text = _CREDIT_CARD_PATTERN.sub(_redact_credit_card_match, redacted_text)
+    redacted_text = _INTERNATIONAL_PHONE_PATTERN.sub("[REDACTED_PHONE]", redacted_text)
+    return _US_PHONE_PATTERN.sub("[REDACTED_PHONE]", redacted_text)
+
+
+def _redact_credit_card_match(match: re.Match[str]) -> str:
+    candidate = match.group(0)
+    if not _looks_like_credit_card(candidate):
+        return candidate
+    return "[REDACTED_CREDIT_CARD]"
+
+
+def _looks_like_credit_card(candidate: str) -> bool:
+    digits = [int(character) for character in candidate if character.isdigit()]
+    if not 13 <= len(digits) <= 19:
+        return False
+    checksum = 0
+    parity = len(digits) % 2
+    for index, digit in enumerate(digits):
+        if index % 2 == parity:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        checksum += digit
+    return checksum % 10 == 0
+
+
+def _bounded_private_diagnostic(value: Any, *, max_chars: int) -> Any:
+    limit = max(256, min(int(max_chars), 8192))
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit] + "...[truncated]"
+    serialized = json.dumps(value, sort_keys=True, default=str)
+    if len(serialized) <= limit:
+        return value
+    return {
+        "truncated": True,
+        "preview": serialized[:limit] + "...[truncated]",
+    }

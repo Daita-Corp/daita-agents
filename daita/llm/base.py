@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, Dict, List, Optional
 from contextlib import asynccontextmanager
 import logging
+import inspect
 
 from ..core.exceptions import LLMError
 from ..core.tracing import get_trace_manager, TraceType
@@ -82,6 +83,38 @@ class BaseLLMProvider(LLMProvider, ABC):
         logger.debug(
             f"Initialized {self.__class__.__name__} with model {model} (automatic tracing enabled)"
         )
+
+    async def aclose(self) -> None:
+        """Close an already-created provider client without forcing initialization.
+
+        Providers in this package keep their optional SDK client in ``_client``.
+        Async SDKs expose ``aclose()`` while synchronous clients such as Gemini
+        expose ``close()``.  Clearing the owned reference in ``finally`` makes
+        repeated closure safe and permits a later use to create a fresh client.
+        """
+        client = getattr(self, "_client", None)
+        if client is None:
+            return
+        try:
+            close = getattr(client, "aclose", None)
+            if close is None:
+                close = getattr(client, "close", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        finally:
+            if getattr(self, "_client", None) is client:
+                self._client = None
+
+    def structured_output_options(
+        self,
+        schema: Dict[str, Any],
+        *,
+        name: str,
+    ) -> Dict[str, Any]:
+        """Return provider-native JSON-schema options when supported."""
+        return {}
 
     async def generate(
         self,

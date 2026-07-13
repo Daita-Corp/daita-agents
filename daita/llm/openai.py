@@ -79,6 +79,21 @@ class OpenAIProvider(OpenAICompatibleMixin, BaseLLMProvider):
                 )
         return self._client
 
+    def structured_output_options(
+        self, schema: Dict[str, Any], *, name: str
+    ) -> Dict[str, Any]:
+        """Use OpenAI's native JSON-schema response format."""
+        return {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": name,
+                    "strict": False,
+                    "schema": dict(schema),
+                },
+            }
+        }
+
     async def _generate_impl(
         self,
         messages: list[Dict[str, Any]],
@@ -110,6 +125,7 @@ class OpenAIProvider(OpenAICompatibleMixin, BaseLLMProvider):
                     "reasoning_effort": kwargs.get("reasoning_effort"),
                     "service_tier": kwargs.get("service_tier"),
                     "parallel_tool_calls": kwargs.get("parallel_tool_calls"),
+                    "response_format": kwargs.get("response_format"),
                     "timeout": kwargs.get("timeout"),
                     **_build_token_param(
                         max_tokens=kwargs.get("max_tokens"),

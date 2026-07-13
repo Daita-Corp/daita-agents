@@ -24,6 +24,11 @@ from daita.plugins.memory.local_backend import LocalMemoryBackend
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import OperationStatus, WorkerRuntime, WorkerRuntimeOptions
 from tests.db_evidence_helpers import assert_no_invalid_accepted_query_plans
+from tests.integration.from_db.live_production_helpers import (
+    latest_evidence,
+    query_rows,
+    sql_from_result,
+)
 
 load_dotenv(Path.cwd() / ".env")
 
@@ -149,6 +154,37 @@ def _board_revenue_metric_metadata() -> dict[str, Any]:
     }
 
 
+def _persistent_revenue_metric_metadata() -> dict[str, Any]:
+    return {
+        "aliases": ["persistent revenue"],
+        "schema_refs": ["orders.total", "orders.status"],
+        "subject": {
+            "type": "metric",
+            "key": "metric:persistent_revenue",
+            "aliases": ["persistent revenue"],
+        },
+        "requirements": {
+            "refs": [
+                {"kind": "column", "ref": "orders.total", "role": "measure"},
+                {"kind": "column", "ref": "orders.status", "role": "filter"},
+            ],
+            "filters": [
+                {
+                    "ref": "orders.status",
+                    "operator": "semantic_equals",
+                    "value": "complete",
+                    "value_source": "literal_or_catalog_value",
+                }
+            ],
+            "aggregations": [
+                {"function": "sum", "ref": "orders.total", "role": "measure"}
+            ],
+            "result_shape": {"grain": "single_aggregate"},
+        },
+        "enforcement": {"mode": "required_when_recalled", "min_confidence": 0.8},
+    }
+
+
 def _memory_backend(tmp_path: Path, workspace: str) -> LocalMemoryBackend:
     return LocalMemoryBackend(
         workspace=workspace,
@@ -237,37 +273,31 @@ def _maybe_evidence(result, kind: str):
     return next((item for item in result.evidence if item.kind == kind), None)
 
 
-def _sql(result) -> str:
-    return str(_evidence(result, "sql.validation").payload.get("sql") or "")
+def _sql(snapshot) -> str:
+    """Return raw SQL from an operation snapshot."""
+    return sql_from_result(snapshot)
 
 
 def _public_planning_context(result) -> dict[str, Any]:
-    evidence = _maybe_evidence(result, "planning.context")
+    """Return the latest accepted planning context on the supplied surface."""
+    evidence = latest_evidence(result, "planning.context")
     if evidence is None:
         return {}
     return dict(evidence.payload)
 
 
-async def _raw_planning_context(agent, result) -> dict[str, Any]:
-    evidence = await agent.runtime.store.list_evidence(result.operation_id)
-    contexts = [
-        item for item in evidence if item.kind == "planning.context" and item.accepted
-    ]
-    return dict(contexts[-1].payload) if contexts else {}
+def _raw_planning_context(snapshot) -> dict[str, Any]:
+    """Return the latest accepted raw planning context from a snapshot."""
+    return _public_planning_context(snapshot)
 
 
-def _db_memory_keys(result) -> list[str]:
-    context = _public_planning_context(result)
+def _db_memory_keys(result_or_snapshot) -> list[str]:
+    context = _public_planning_context(result_or_snapshot)
     return [str(item.get("key")) for item in context.get("db_memory_refs", [])]
 
 
 async def _run_live(agent, prompt: str):
-    result = None
-    for _ in range(2):
-        result = await agent.run_detailed(prompt)
-        if "Connection error" not in str(result.answer):
-            return result
-    return result
+    return await agent.run_detailed(prompt)
 
 
 async def _recall_memory(
@@ -334,13 +364,18 @@ async def _remember_board_revenue_contract(agent) -> Any:
         )
     )
     assert result.status is OperationStatus.SUCCEEDED
-    proposal = _evidence(result, "db.memory.proposal")
+    snapshot = await agent.runtime.inspect_operation(result.operation_id)
+    assert snapshot is not None
+    proposal = _evidence(snapshot, "db.memory.proposal")
     assert proposal.payload["validation"]["diagnostics"]["semantic_contract"]["created"]
+    public_proposal = _evidence(result, "db.memory.proposal")
+    assert "validation" not in public_proposal.payload
     return result
 
 
-def _rows(result) -> list[dict[str, Any]]:
-    return list(_evidence(result, "query.result").payload.get("rows") or [])
+def _rows(snapshot) -> list[dict[str, Any]]:
+    """Return raw query rows from an operation snapshot."""
+    return query_rows(snapshot)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +399,7 @@ async def test_live_explicit_db_memory_changes_future_planning(tmp_path):
         before = await _run_live(
             agent, "Calculate greenlight revenue from orders.total."
         )
+        before_snapshot = await agent.runtime.inspect_operation(before.operation_id)
         await _write_memory(
             agent,
             kind="metric_definition",
@@ -381,14 +417,17 @@ async def test_live_explicit_db_memory_changes_future_planning(tmp_path):
         after = await _run_live(
             agent, "Calculate greenlight revenue from orders.total."
         )
+        after_snapshot = await agent.runtime.inspect_operation(after.operation_id)
     finally:
         await agent.stop()
 
-    assert "metric:greenlight_revenue" not in _db_memory_keys(before)
+    assert before_snapshot is not None
+    assert after_snapshot is not None
+    assert "metric:greenlight_revenue" not in _db_memory_keys(before_snapshot)
     assert after.status is OperationStatus.SUCCEEDED
-    assert "metric:greenlight_revenue" in _db_memory_keys(after)
-    assert "complete" in _sql(after).lower()
-    assert _rows(after)[0]
+    assert "metric:greenlight_revenue" in _db_memory_keys(after_snapshot)
+    assert "complete" in _sql(after_snapshot).lower()
+    assert _rows(after_snapshot)[0]
 
 
 async def test_live_default_structured_memory_uses_no_embedder_or_vector_recall(
@@ -417,12 +456,14 @@ async def test_live_default_structured_memory_uses_no_embedder_or_vector_recall(
             },
         )
         result = await _run_live(agent, "How should recognized revenue be calculated?")
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
         inspection = await agent.describe()
     finally:
         await agent.stop()
 
     memory_options = inspection.metadata["from_db_options"]["memory"]
-    recall = _evidence(result, "memory.semantic.recall")
+    assert snapshot is not None
+    recall = _evidence(snapshot, "memory.semantic.recall")
     assert memory._embedder is None
     assert getattr(memory.backend, "embedding_available") is False
     assert memory_options["retrieval_mode"] == "structured"
@@ -573,13 +614,15 @@ async def test_live_alias_and_schema_ref_memory_ranks_above_broad_match(tmp_path
         result = await _run_live(
             agent, "Calculate recognized revenue from orders.total"
         )
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
     finally:
         await agent.stop()
 
-    assert _db_memory_keys(result)[0] == "metric:recognized_revenue"
-    top = _public_planning_context(result)["db_memory_refs"][0]
+    assert snapshot is not None
+    assert _db_memory_keys(snapshot)[0] == "metric:recognized_revenue"
+    top = _public_planning_context(snapshot)["db_memory_refs"][0]
     assert top["kind"] == "metric_definition"
-    assert "complete" in _sql(result).lower()
+    assert "complete" in _sql(snapshot).lower()
 
 
 async def test_live_unit_convention_memory_affects_answer(tmp_path):
@@ -614,12 +657,14 @@ async def test_live_unit_convention_memory_affects_answer(tmp_path):
             agent,
             "Calculate one aggregate booked revenue dollars from orders.total_cents.",
         )
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
     finally:
         await agent.stop()
 
-    assert "unit_convention:orders.total_cents" in _db_memory_keys(result)
+    assert snapshot is not None
+    assert "unit_convention:orders.total_cents" in _db_memory_keys(snapshot)
     assert result.status is OperationStatus.SUCCEEDED
-    assert _rows(result)
+    assert _rows(snapshot)
 
 
 async def test_live_direct_contract_payload_remains_advisory(tmp_path):
@@ -654,6 +699,7 @@ async def test_live_direct_contract_payload_remains_advisory(tmp_path):
             agent,
             "Calculate one aggregate board revenue from orders.total and refunds.amount.",
         )
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
     finally:
         await agent.stop()
 
@@ -664,7 +710,8 @@ async def test_live_direct_contract_payload_remains_advisory(tmp_path):
         stored_metadata["semantic_contract_diagnostics"]["reason"]
         == "direct_write_unvalidated"
     )
-    context = _public_planning_context(result)
+    assert snapshot is not None
+    context = _public_planning_context(snapshot)
     semantics = context.get("db_memory_semantics") or []
     assert not any(item.get("enforceable") for item in semantics)
 
@@ -686,12 +733,14 @@ async def test_live_explicit_metric_memory_projects_enforceable_contract(tmp_pat
             agent,
             "Calculate one aggregate board revenue from orders.total and refunds.amount.",
         )
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
     finally:
         await agent.stop()
 
-    context = _public_planning_context(result)
+    assert snapshot is not None
+    context = _public_planning_context(snapshot)
     semantics = context.get("db_memory_semantics") or []
-    assert "metric:board_revenue" in _db_memory_keys(result)
+    assert "metric:board_revenue" in _db_memory_keys(snapshot)
     assert any(
         item.get("memory_key") == "metric:board_revenue" and item.get("enforceable")
         for item in semantics
@@ -730,9 +779,10 @@ async def test_live_policy_blocked_contract_is_not_enforceable(tmp_path):
             agent,
             "Calculate one aggregate board revenue from orders.total and refunds.amount.",
         )
-        evidence = await agent.runtime.store.list_evidence(result.operation_id)
-        assert_no_invalid_accepted_query_plans(evidence)
-        raw_context = await _raw_planning_context(agent, result)
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
+        assert snapshot is not None
+        assert_no_invalid_accepted_query_plans(snapshot.evidence)
+        raw_context = _raw_planning_context(snapshot)
     finally:
         await agent.stop()
 
@@ -789,19 +839,21 @@ async def test_live_explicit_unit_convention_projects_and_enforces_conversion(tm
             agent,
             "Calculate one aggregate SUM booked revenue dollars from orders.total_cents.",
         )
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
     finally:
         await agent.stop()
 
     assert memory_result.status is OperationStatus.SUCCEEDED
     assert result.status is OperationStatus.SUCCEEDED
-    context = _public_planning_context(result)
+    assert snapshot is not None
+    context = _public_planning_context(snapshot)
     semantics = context.get("db_memory_semantics") or []
     assert any(
         item.get("memory_key") == "unit_convention:orders.total_cents"
         and item.get("enforceable")
         for item in semantics
     )
-    assert "/ 100" in _sql(result).lower() or "/100" in _sql(result).lower()
+    assert "/ 100" in _sql(snapshot).lower() or "/100" in _sql(snapshot).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -972,22 +1024,26 @@ async def test_live_golden_memory_improves_metric_answer(tmp_path):
             agent,
             "Calculate board revenue from orders.total and refunds.amount.",
         )
+        before_snapshot = await agent.runtime.inspect_operation(before.operation_id)
         await _remember_board_revenue_contract(agent)
         after = await _run_live(
             agent,
             "Calculate one aggregate board revenue from orders.total and refunds.amount.",
         )
+        after_snapshot = await agent.runtime.inspect_operation(after.operation_id)
     finally:
         await agent.stop()
 
-    assert "metric:board_revenue" not in _db_memory_keys(before)
+    assert before_snapshot is not None
+    assert after_snapshot is not None
+    assert "metric:board_revenue" not in _db_memory_keys(before_snapshot)
     assert after.status is OperationStatus.SUCCEEDED
-    assert "metric:board_revenue" in _db_memory_keys(after)
-    sql = _sql(after).lower()
+    assert "metric:board_revenue" in _db_memory_keys(after_snapshot)
+    sql = _sql(after_snapshot).lower()
     assert "refund" in sql
     assert "sum" in sql
     assert "complete" in sql
-    assert _rows(after)
+    assert _rows(after_snapshot)
 
 
 async def test_live_golden_context_budget_under_memory_load(tmp_path):
@@ -1025,10 +1081,12 @@ async def test_live_golden_context_budget_under_memory_load(tmp_path):
                 importance=0.5 + min(idx, 10) / 20,
             )
         result = await _run_live(agent, "How should revenue load be calculated?")
+        snapshot = await agent.runtime.inspect_operation(result.operation_id)
     finally:
         await agent.stop()
 
-    context = _public_planning_context(result)
+    assert snapshot is not None
+    context = _raw_planning_context(snapshot)
     rendered = str(context.get("rendered_context") or "")
     diagnostics = context.get("db_memory_diagnostics") or {}
     assert len(context.get("db_memory_refs") or []) <= 3
@@ -1036,6 +1094,12 @@ async def test_live_golden_context_budget_under_memory_load(tmp_path):
     assert diagnostics["included_count"] <= 3
     assert diagnostics["candidate_count"] >= 3
     assert "Database memory:" in rendered
+
+    public_context = _public_planning_context(result)
+    public_diagnostics = public_context.get("db_memory_diagnostics") or {}
+    assert "rendered_context" not in public_context
+    assert "used_chars" not in public_diagnostics
+    assert "included_count" not in public_diagnostics
 
 
 async def test_live_golden_structured_memory_persists_after_restart(tmp_path):
@@ -1063,13 +1127,10 @@ async def test_live_golden_structured_memory_persists_after_restart(tmp_path):
     try:
         await _write_memory(
             first,
-            kind="business_rule",
-            key="business_rule:persistent_revenue",
+            kind="metric_definition",
+            key="metric:persistent_revenue",
             text="Persistent revenue uses complete orders only.",
-            metadata={
-                "aliases": ["persistent revenue"],
-                "schema_refs": ["orders.total", "orders.status"],
-            },
+            metadata=_persistent_revenue_metric_metadata(),
         )
     finally:
         await first.stop()
@@ -1092,10 +1153,18 @@ async def test_live_golden_structured_memory_persists_after_restart(tmp_path):
     )
 
     try:
-        result = await _run_live(second, "How should persistent revenue be calculated?")
+        result = await _run_live(
+            second,
+            "Calculate persistent revenue as one total from the database.",
+        )
+        snapshot = await second.runtime.inspect_operation(result.operation_id)
     finally:
         await second.stop()
 
     assert result.status is OperationStatus.SUCCEEDED
-    assert "business_rule:persistent_revenue" in _db_memory_keys(result)
-    assert "complete" in _sql(result).lower()
+    assert snapshot is not None
+    assert "metric:persistent_revenue" in _db_memory_keys(snapshot)
+    sql = _sql(snapshot).lower()
+    assert "complete" in sql
+    assert "sum" in sql
+    assert _rows(snapshot)

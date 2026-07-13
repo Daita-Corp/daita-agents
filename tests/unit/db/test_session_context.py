@@ -778,6 +778,7 @@ def test_planner_visible_session_context_redacts_blocked_columns():
         },
         sort_keys=True,
     )
+    assert context.session_context["session_id"] == "s-blocked"
     assert "customers.loyalty_band" not in planner_visible
     assert "platinum" not in planner_visible
     assert "blocked_columns" in context.policy_summary
