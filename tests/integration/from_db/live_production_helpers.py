@@ -7,7 +7,6 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -253,18 +252,6 @@ INSERT INTO monitor_actions (id, status, note) VALUES
 """
 
 
-@dataclass(frozen=True)
-class LiveGatePreflight:
-    """Classified availability result for the live Bucket 3 gate."""
-
-    status: str
-    detail: str
-
-    @property
-    def ready(self) -> bool:
-        return self.status == "ready"
-
-
 def classify_live_gate_failure(error: BaseException | str) -> str:
     """Classify live-gate infrastructure separately from model behavior."""
     text = str(error).lower()
@@ -315,36 +302,6 @@ def classify_live_gate_failure(error: BaseException | str) -> str:
     ):
         return "network_failure"
     return "behavioral_failure"
-
-
-async def run_live_gate_preflight() -> LiveGatePreflight:
-    """Perform one minimal model call and close its owned provider explicitly."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return LiveGatePreflight(
-            status="missing_credentials",
-            detail="OPENAI_API_KEY not set",
-        )
-    config = DbLLMConfig(
-        provider="openai",
-        model=os.environ.get("OPENAI_TEST_MODEL", DEFAULT_LIVE_OPENAI_MODEL),
-        api_key=api_key,
-        temperature=0,
-        options={"max_tokens": 8},
-    )
-    service = db_llm_service_from_config(config, agent_id="bucket3-preflight")
-    try:
-        await service.generate_json(
-            [{"role": "user", "content": "Reply with the single word ready."}]
-        )
-    except Exception as exc:  # noqa: BLE001
-        return LiveGatePreflight(
-            status=classify_live_gate_failure(exc),
-            detail=str(exc),
-        )
-    finally:
-        await service.aclose()
-    return LiveGatePreflight(status="ready", detail="model call succeeded")
 
 
 def require_live_openai_kwargs() -> dict[str, object]:

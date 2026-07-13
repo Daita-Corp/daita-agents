@@ -82,7 +82,7 @@ jobs:
           node-version: "22"
 
       - name: Install dependencies
-        run: pip install -e ".[all,dev,aws,data-quality,google-drive,sentence-transformers,voyage]"
+        run: pip install -e ".[all,dev,aws,azure,data-quality,google-drive,sentence-transformers,voyage]"
 
       - name: Type-check with Pyright
         run: npx --yes pyright@1.1.411 daita

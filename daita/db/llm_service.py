@@ -349,10 +349,10 @@ def _redact_private_diagnostic_value(
     credentials: frozenset[str],
 ) -> Any:
     if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
+        redacted_mapping: dict[str, Any] = {}
         for index, (key, nested) in enumerate(value.items()):
             if index >= _PRIVATE_DIAGNOSTIC_MAX_ITEMS:
-                redacted["__truncated_items__"] = len(value) - index
+                redacted_mapping["__truncated_items__"] = len(value) - index
                 break
             normalized = str(key).lower()
             if (
@@ -368,12 +368,12 @@ def _redact_private_diagnostic_value(
                     )
                 )
             ):
-                redacted[str(key)] = "[REDACTED_PRIVATE]"
+                redacted_mapping[str(key)] = "[REDACTED_PRIVATE]"
             else:
-                redacted[str(key)] = _redact_private_diagnostic_value(
+                redacted_mapping[str(key)] = _redact_private_diagnostic_value(
                     nested, credentials
                 )
-        return redacted
+        return redacted_mapping
     if isinstance(value, (list, tuple, set, frozenset)):
         items = list(value)
         redacted_items = [
@@ -387,16 +387,16 @@ def _redact_private_diagnostic_value(
         return redacted_items
     if not isinstance(value, str):
         return value
-    redacted = value
+    redacted_text = value
     for credential in credentials:
-        redacted = redacted.replace(credential, "[REDACTED_SECRET]")
-    redacted = _API_KEY_PATTERN.sub("[REDACTED_API_KEY]", redacted)
-    redacted = _BEARER_PATTERN.sub("[REDACTED_AUTHORIZATION]", redacted)
-    redacted = _EMAIL_PATTERN.sub("[REDACTED_EMAIL]", redacted)
-    redacted = _US_SSN_PATTERN.sub("[REDACTED_SSN]", redacted)
-    redacted = _CREDIT_CARD_PATTERN.sub(_redact_credit_card_match, redacted)
-    redacted = _INTERNATIONAL_PHONE_PATTERN.sub("[REDACTED_PHONE]", redacted)
-    return _US_PHONE_PATTERN.sub("[REDACTED_PHONE]", redacted)
+        redacted_text = redacted_text.replace(credential, "[REDACTED_SECRET]")
+    redacted_text = _API_KEY_PATTERN.sub("[REDACTED_API_KEY]", redacted_text)
+    redacted_text = _BEARER_PATTERN.sub("[REDACTED_AUTHORIZATION]", redacted_text)
+    redacted_text = _EMAIL_PATTERN.sub("[REDACTED_EMAIL]", redacted_text)
+    redacted_text = _US_SSN_PATTERN.sub("[REDACTED_SSN]", redacted_text)
+    redacted_text = _CREDIT_CARD_PATTERN.sub(_redact_credit_card_match, redacted_text)
+    redacted_text = _INTERNATIONAL_PHONE_PATTERN.sub("[REDACTED_PHONE]", redacted_text)
+    return _US_PHONE_PATTERN.sub("[REDACTED_PHONE]", redacted_text)
 
 
 def _redact_credit_card_match(match: re.Match[str]) -> str:
