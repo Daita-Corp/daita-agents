@@ -69,12 +69,22 @@ class DbPlanningContextExecutor:
             task.input.get("relationship_evidence_ids", ()),
             kinds=("schema.relationship_path",),
         )
+        memory_recall_evidence_ids = task.input.get("memory_recall_evidence_ids", ())
         memory_recall_evidence = await load_evidence_refs_or_latest(
             runtime,
             operation.id,
-            task.input.get("memory_recall_evidence_ids", ()),
+            memory_recall_evidence_ids,
             kinds=("memory.semantic.recall",),
         )
+        if not memory_recall_evidence_ids:
+            dependency_recall = await _load_dependency_evidence(
+                runtime,
+                operation.id,
+                task,
+                "memory.semantic.recall",
+            )
+            if dependency_recall is not None:
+                memory_recall_evidence = (dependency_recall,)
         memory_recall_diagnostics = task.input.get("memory_recall_diagnostics")
         planning_context = builder.build(
             request=base_request,
@@ -100,6 +110,15 @@ class DbPlanningContextExecutor:
                     **planning_context.diagnostics,
                     "validation_grounding_repair_attempted": True,
                     "validation_grounding_repair": dict(validation_repair),
+                },
+            )
+        memory_recall_binding = task.input.get("memory_recall_binding")
+        if isinstance(memory_recall_binding, Mapping):
+            planning_context = replace(
+                planning_context,
+                diagnostics={
+                    **planning_context.diagnostics,
+                    "memory_recall_binding": dict(memory_recall_binding),
                 },
             )
         memory_selection = builder.memory_selection_evidence_for(

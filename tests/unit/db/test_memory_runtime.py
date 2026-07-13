@@ -90,6 +90,11 @@ def _runtime_with_memory_source(*plugins) -> DbRuntime:
                 "from_db_options": {
                     "memory": {
                         "enabled": True,
+                        "recall": "auto",
+                        "limit": 3,
+                        "char_budget": 800,
+                        "score_threshold": 0.45,
+                        "retrieval_mode": "structured",
                         "workspace_scope": "source",
                         "source_identity": "test:memory-runtime-source",
                     }
@@ -827,6 +832,125 @@ async def test_required_memory_recall_runs_before_planner_can_clarify(tmp_path):
     assert capabilities.index("memory.semantic.recall") < capabilities.index(
         "db.planning.context.build"
     )
+
+
+async def test_required_memory_recall_is_in_first_planner_state_and_reused(tmp_path):
+    source_identity = "test:memory-runtime-source"
+    memory = MemoryPlugin()
+    backend = _mock_db_memory_backend(
+        [
+            _db_memory_recall_result(
+                key="metric:recognized_revenue",
+                text="Recognized revenue uses orders.total_cents.",
+                source_identity=source_identity,
+                table="orders",
+            )
+        ]
+    )
+    memory.backend = backend
+    runtime = _runtime_with_memory_source(SchemaInspectPlugin(), memory)
+    await runtime.setup()
+    operation = await runtime.kernel.create_operation(
+        operation_type="data.query",
+        request={
+            "prompt": "What does recognized revenue mean for orders?",
+            "source_scope": ["schema_probe"],
+        },
+        required_evidence=frozenset({"query.result"}),
+        metadata={"intent_kind": "metric.query"},
+        evaluate_governance=False,
+    )
+    planner = _ScriptedPlanner(
+        DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CLARIFY,
+            intent={"operation_type": "metric.query"},
+            clarification_question="What does recognized revenue mean?",
+        )
+    )
+    resumed_planner = _ScriptedPlanner(
+        DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CLARIFY,
+            intent={"operation_type": "metric.query"},
+            clarification_question="What does recognized revenue mean?",
+        )
+    )
+    try:
+        result = await DbAgentLoop(runtime, planner).run(operation, max_turns=2)
+        resumed = await DbAgentLoop(runtime, resumed_planner).run(
+            operation,
+            max_turns=1,
+        )
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert result.status == "clarification_required"
+    assert resumed.status == "clarification_required"
+    assert len(planner.states) == 1
+    planning_context = next(
+        summary
+        for summary in planner.states[0].accepted_evidence_summaries
+        if summary["kind"] == "planning.context"
+    )
+    assert planning_context["db_memory_refs"][0]["key"] == ("metric:recognized_revenue")
+    assert len(resumed_planner.states) == 1
+    assert backend.recall_db_records.await_count == 1
+    assert sum(task.capability_id == "memory.semantic.recall" for task in tasks) == 1
+    assert sum(task.capability_id == "db.planning.context.build" for task in tasks) == 1
+
+
+async def test_mismatched_recall_evidence_does_not_satisfy_required_continuation(
+    tmp_path,
+):
+    memory = MemoryPlugin()
+    backend = _mock_db_memory_backend([])
+    memory.backend = backend
+    runtime = _runtime_with_memory_source(memory)
+    await runtime.setup()
+    operation = await runtime.kernel.create_operation(
+        operation_type="db.run",
+        request={
+            "prompt": "Calculate recognized revenue.",
+            "source_scope": ["memory"],
+        },
+        required_evidence=frozenset({"query.result"}),
+        metadata={"intent_kind": "metric.query"},
+        evaluate_governance=False,
+    )
+    await runtime.store.save_evidence(
+        Evidence(
+            id="mismatched-recall",
+            kind="memory.semantic.recall",
+            owner="memory",
+            operation_id=operation.id,
+            task_id="mismatched-recall-task",
+            payload={
+                "query": "a different prompt",
+                "results": [],
+                "recall_binding": {"recall_fingerprint": "wrong"},
+            },
+            metadata={"task_input_hash": "wrong"},
+        )
+    )
+    planner = _ScriptedPlanner(
+        DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CLARIFY,
+            intent={"operation_type": "metric.query"},
+            clarification_question="What does recognized revenue mean?",
+        )
+    )
+    try:
+        result = await DbAgentLoop(runtime, planner).run(operation, max_turns=1)
+        evidence = await runtime.store.list_evidence(operation.id)
+    finally:
+        await runtime.teardown()
+
+    recalls = [item for item in evidence if item.kind == "memory.semantic.recall"]
+    assert result.status != "clarification_required"
+    assert planner.states == []
+    assert len(recalls) == 2
+    assert recalls[-1].payload["recall_binding"]["recall_fingerprint"] != "wrong"
+    assert backend.recall_db_records.await_count == 1
 
 
 async def test_prior_turn_memory_proposal_dependency_recovers_to_latest_proposal(
@@ -2137,6 +2261,123 @@ def test_db_memory_planning_refs_omit_cross_source_irrelevant_and_stale_records(
     assert diagnostics["omitted_reasons"]["stale"] == 1
     assert diagnostics["omitted_reasons"]["inactive"] == 1
     assert diagnostics["omitted_reasons"]["low_confidence"] == 1
+
+
+def test_db_memory_selection_deduplicates_before_limits_and_budgets():
+    source_identity = "sqlite:from_db:source-a"
+
+    def result(
+        *,
+        key,
+        text,
+        score,
+        evidence_ref,
+        chunk_id=None,
+    ):
+        item = {
+            "metadata": {
+                "db_memory": {
+                    "kind": "metric_definition",
+                    "key": key,
+                    "text": text,
+                    "metadata": {
+                        "source_identity": source_identity,
+                        "workspace_scope": "source",
+                        "active": True,
+                        "confidence": 0.9,
+                        "evidence_refs": [evidence_ref],
+                    },
+                    "importance": 0.8,
+                    "category": "db_semantics",
+                }
+            },
+            "score": score,
+        }
+        if chunk_id is not None:
+            item["chunk_id"] = chunk_id
+        return item
+
+    recall_a = Evidence(
+        id="recall-a",
+        kind="memory.semantic.recall",
+        owner="memory",
+        payload={
+            "results": [
+                result(
+                    chunk_id="record-revenue",
+                    key="metric:old_revenue_key",
+                    text="Revenue uses the lower-ranked definition.",
+                    score=0.6,
+                    evidence_ref="source-z",
+                ),
+                result(
+                    key="metric:fallback_revenue",
+                    text="Revenue uses the lower-ranked fallback.",
+                    score=0.7,
+                    evidence_ref="fallback-z",
+                ),
+            ]
+        },
+    )
+    recall_b = Evidence(
+        id="recall-b",
+        kind="memory.semantic.recall",
+        owner="memory",
+        payload={
+            "results": [
+                result(
+                    chunk_id="record-revenue",
+                    key="metric:recognized_revenue",
+                    text="Revenue uses the highest-ranked definition.",
+                    score=0.95,
+                    evidence_ref="source-a",
+                ),
+                result(
+                    key="metric:fallback_revenue",
+                    text="Revenue uses the highest-ranked fallback.",
+                    score=0.9,
+                    evidence_ref="fallback-a",
+                ),
+            ]
+        },
+    )
+
+    refs, evidence_refs, diagnostics = db_memory_refs_from_recall_evidence(
+        (recall_a, recall_b),
+        prompt="How should revenue be calculated?",
+        schema={"tables": []},
+        source_identity=source_identity,
+        schema_fingerprint=None,
+        limit=2,
+        char_budget=200,
+        score_threshold=0.0,
+    )
+
+    assert [ref["key"] for ref in refs] == [
+        "metric:recognized_revenue",
+        "metric:fallback_revenue",
+    ]
+    assert [ref["text"] for ref in refs] == [
+        "Revenue uses the highest-ranked definition.",
+        "Revenue uses the highest-ranked fallback.",
+    ]
+    assert refs[0]["evidence_refs"] == ["source-a", "source-z"]
+    assert refs[1]["evidence_refs"] == ["fallback-a", "fallback-z"]
+    assert evidence_refs == (
+        "recall-a",
+        "recall-b",
+        "source-a",
+        "source-z",
+        "fallback-a",
+        "fallback-z",
+    )
+    assert diagnostics["candidate_count"] == 4
+    assert diagnostics["deduplicated_candidate_count"] == 2
+    assert diagnostics["included_count"] == 2
+    assert diagnostics["omitted_reasons"] == {"duplicate": 2}
+    assert diagnostics["used_chars"] == sum(
+        len(f"- {ref['kind']} {ref['key']}: {ref['text']}") for ref in refs
+    )
 
 
 def test_db_memory_selection_artifact_reports_required_omission_reasons():

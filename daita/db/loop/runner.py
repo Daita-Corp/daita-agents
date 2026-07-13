@@ -45,6 +45,7 @@ from .execution import DbLoopTaskBatchExecutor
 from .memory import (
     _memory_context_for_state,
     _memory_update_runtime_continuation_action,
+    _required_memory_recall_runtime_continuation_action,
     _state_is_memory_update_operation,
 )
 from .progress import (
@@ -118,10 +119,15 @@ class DbAgentLoop:
                 turn=turn,
                 remaining_turns=turn_budget - turn + 1,
             )
-            runtime_continuation = _memory_update_runtime_continuation_action(
+            runtime_continuation = _required_memory_recall_runtime_continuation_action(
                 state,
                 current_action_ids=set(),
             )
+            if runtime_continuation is None:
+                runtime_continuation = _memory_update_runtime_continuation_action(
+                    state,
+                    current_action_ids=set(),
+                )
             if runtime_continuation is None:
                 runtime_continuation = (
                     _validation_grounding_runtime_continuation_action(
@@ -133,14 +139,12 @@ class DbAgentLoop:
                 decision = await self.planner.plan(state)
             elif str(
                 runtime_continuation.metadata.get("continuation") or ""
-            ).startswith("validation_grounding."):
+            ).startswith(("validation_grounding.", "memory.recall.")):
                 decision = DbPlannerDecision(
                     status=DbPlannerDecisionStatus.CONTINUE,
                     intent={"operation_type": DbIntentKind.DATA_QUERY.value},
                     actions=(runtime_continuation,),
-                    rationale=(
-                        "Runtime continuation for validation-grounded query execution."
-                    ),
+                    rationale="Runtime continuation for deterministic DB work.",
                     metadata={
                         "runtime_continuation": True,
                         "continuation": runtime_continuation.metadata.get(
@@ -605,6 +609,7 @@ class DbAgentLoop:
                 self.runtime,
                 operation,
                 accepted,
+                safety_frame=frame,
             ),
             task_summaries=await self._task_summaries(operation.id),
             accepted_evidence_summaries=tuple(

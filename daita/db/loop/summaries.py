@@ -143,6 +143,11 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
             if hints:
                 summary["hints"] = hints
         if evidence.kind == "planning.context":
+            memory_refs = evidence.payload.get("db_memory_refs")
+            if isinstance(memory_refs, list):
+                summary["db_memory_refs"] = [
+                    dict(item) for item in memory_refs if isinstance(item, Mapping)
+                ]
             session_context = evidence.payload.get("session_context")
             if isinstance(session_context, Mapping):
                 summary["session_context_fingerprint"] = persisted_fingerprint(

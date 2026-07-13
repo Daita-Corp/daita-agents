@@ -471,13 +471,8 @@ def db_memory_refs_from_recall_evidence(
                 candidates.append((result, evidence))
     diagnostics["candidate_count"] = len(candidates)
 
-    refs: list[dict[str, Any]] = []
-    evidence_refs: list[str] = []
-    used_chars = 0
+    eligible: list[dict[str, Any]] = []
     for result, evidence in candidates:
-        if len(refs) >= max(0, int(limit)):
-            _bump_omitted(diagnostics, "limit")
-            continue
         record = _db_memory_record_from_recall_result(result)
         reason = _planner_memory_omit_reason(
             record,
@@ -491,6 +486,35 @@ def db_memory_refs_from_recall_evidence(
         if reason:
             _bump_omitted(diagnostics, reason)
             continue
+        raw_metadata = record.get("metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        eligible.append(
+            {
+                "result": result,
+                "record": record,
+                "evidence_ids": (
+                    [str(evidence.id)] if getattr(evidence, "id", None) else []
+                ),
+                "record_evidence_refs": _memory_evidence_ref_ids(metadata),
+            }
+        )
+
+    selected_candidates, duplicate_count = _dedupe_planning_memory_candidates(eligible)
+    diagnostics["deduplicated_candidate_count"] = len(selected_candidates)
+    if duplicate_count:
+        diagnostics["omitted_reasons"]["duplicate"] = duplicate_count
+
+    refs: list[dict[str, Any]] = []
+    evidence_refs: list[str] = []
+    used_chars = 0
+    valid_until: list[datetime] = []
+    valid_until_raw: dict[datetime, str] = {}
+    for candidate in selected_candidates:
+        if len(refs) >= max(0, int(limit)):
+            _bump_omitted(diagnostics, "limit")
+            continue
+        result = candidate["result"]
+        record = candidate["record"]
         text = str(record.get("text") or "").strip()
         key = str(record.get("key") or "").strip()
         kind = str(record.get("kind") or "").strip()
@@ -500,9 +524,8 @@ def db_memory_refs_from_recall_evidence(
             continue
         raw_metadata = record.get("metadata")
         metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
-        ref_evidence = _memory_evidence_ref_ids(metadata)
-        if getattr(evidence, "id", None):
-            evidence_refs.append(evidence.id)
+        ref_evidence = list(candidate["record_evidence_refs"])
+        evidence_refs.extend(candidate["evidence_ids"])
         evidence_refs.extend(ref_evidence)
         ref = {
             "chunk_id": result.get("chunk_id"),
@@ -534,9 +557,16 @@ def db_memory_refs_from_recall_evidence(
             ref[DB_MEMORY_SEMANTIC_CONTRACT_KEY] = contract
         refs.append(ref)
         used_chars += len(line)
+        expires_at = _memory_expiry(metadata)
+        if expires_at is not None:
+            valid_until.append(expires_at)
+            valid_until_raw[expires_at] = str(metadata.get("expires_at"))
     diagnostics["included_count"] = len(refs)
     diagnostics["char_budget"] = int(char_budget)
     diagnostics["used_chars"] = used_chars
+    if valid_until:
+        earliest = min(valid_until)
+        diagnostics["valid_until"] = valid_until_raw[earliest]
     return tuple(refs), tuple(dict.fromkeys(evidence_refs)), diagnostics
 
 
@@ -575,6 +605,10 @@ def db_memory_selection_artifact_payload(
         "included_count": included_count,
         "omitted_counts_by_reason": omitted_counts,
         "safe_diagnostic_omission_summaries": safe_omission_summaries(omitted_counts),
+        "freshness": {
+            "checked_guards": ["active", "stale", "expires_at"],
+            "valid_until": diagnostics.get("valid_until"),
+        },
         "budget_usage": {
             "limit": max(0, int(limit)),
             "char_budget": max(0, int(char_budget)),
@@ -1550,16 +1584,21 @@ def _score_is_high_enough(result: dict[str, Any], threshold: float) -> bool:
 
 
 def _is_memory_expired(metadata: dict[str, Any]) -> bool:
+    parsed = _memory_expiry(metadata)
+    return parsed is not None and parsed <= datetime.now(timezone.utc)
+
+
+def _memory_expiry(metadata: dict[str, Any]) -> datetime | None:
     expires_at = metadata.get("expires_at")
     if not expires_at:
-        return False
+        return None
     try:
         parsed = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
     except ValueError:
-        return True
+        return datetime.min.replace(tzinfo=timezone.utc)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed <= datetime.now(timezone.utc)
+    return parsed
 
 
 def _value_alias_has_catalog_citation(metadata: dict[str, Any]) -> bool:
@@ -1670,6 +1709,80 @@ def _memory_evidence_ref_ids(metadata: dict[str, Any]) -> list[str]:
 def _bump_omitted(diagnostics: dict[str, Any], reason: str) -> None:
     omitted = diagnostics.setdefault("omitted_reasons", {})
     omitted[reason] = int(omitted.get(reason) or 0) + 1
+
+
+def _dedupe_planning_memory_candidates(
+    candidates: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    deduped: list[dict[str, Any]] = []
+    index_by_identity: dict[tuple[Any, ...], int] = {}
+    duplicate_count = 0
+    for candidate in candidates:
+        identity = _planning_memory_candidate_identity(candidate)
+        if identity is None:
+            deduped.append(candidate)
+            continue
+        existing_index = index_by_identity.get(identity)
+        if existing_index is None:
+            index_by_identity[identity] = len(deduped)
+            deduped.append(candidate)
+            continue
+        duplicate_count += 1
+        existing = deduped[existing_index]
+        merged_evidence_ids = sorted(
+            {
+                *existing.get("evidence_ids", ()),
+                *candidate.get("evidence_ids", ()),
+            }
+        )
+        merged_record_refs = sorted(
+            {
+                *existing.get("record_evidence_refs", ()),
+                *candidate.get("record_evidence_refs", ()),
+            }
+        )
+        selected = (
+            candidate
+            if _planning_memory_candidate_rank(candidate)
+            > _planning_memory_candidate_rank(existing)
+            else existing
+        )
+        deduped[existing_index] = {
+            **selected,
+            "evidence_ids": merged_evidence_ids,
+            "record_evidence_refs": merged_record_refs,
+        }
+    return deduped, duplicate_count
+
+
+def _planning_memory_candidate_identity(
+    candidate: dict[str, Any],
+) -> tuple[Any, ...] | None:
+    result = candidate.get("result")
+    result = result if isinstance(result, dict) else {}
+    record_id = result.get("chunk_id") or result.get("record_id")
+    if record_id:
+        return ("record", str(record_id))
+    record = candidate.get("record")
+    record = record if isinstance(record, dict) else {}
+    metadata = record.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    source_identity = str(metadata.get("source_identity") or "").strip()
+    kind = str(record.get("kind") or "").strip()
+    key = str(record.get("key") or "").strip()
+    if source_identity and kind and key:
+        return ("semantic", source_identity, kind, key)
+    return None
+
+
+def _planning_memory_candidate_rank(candidate: dict[str, Any]) -> float:
+    result = candidate.get("result")
+    result = result if isinstance(result, dict) else {}
+    value = result.get("relevance_score", result.get("score"))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("-inf")
 
 
 def _dedupe_recall_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -66,6 +66,7 @@ from .grounding import (
     _value_grounding_plan_task_input,
 )
 from .memory import (
+    _matching_memory_recall_summary,
     _memory_recall_task_input,
     _memory_update_runtime_continuation_action,
     _resolve_memory_proposal_for_action,
@@ -731,6 +732,11 @@ class DbActionCompiler:
                     )
                 )
 
+        matching_recall = _matching_memory_recall_summary(state)
+        recall_required = (
+            isinstance(memory_decision, Mapping)
+            and memory_decision.get("recall") is True
+        )
         if _state_should_recall_memory_for_planning(state):
             recall_resolved = self._resolve_capability(
                 "memory.semantic.recall",
@@ -798,6 +804,65 @@ class DbActionCompiler:
                         "decision": memory_decision,
                     },
                 )
+        elif recall_required and matching_recall is not None:
+            recall_resolved = self._resolve_capability(
+                "memory.semantic.recall",
+                owner=str(matching_recall.get("owner") or "memory"),
+            )
+            recall_error = self._capability_error(action, recall_resolved)
+            if recall_error is not None:
+                return [], [], [recall_error]
+            recall_capability = recall_resolved["capability"]
+            prerequisite_capabilities.append(recall_capability)
+            access_errors = self._access_errors(
+                action,
+                prerequisite_capabilities,
+                state,
+            )
+            if access_errors:
+                return [], [], access_errors
+            recall_evidence_id = str(matching_recall.get("id") or "").strip()
+            recall_task_id = str(matching_recall.get("task_id") or "").strip()
+            if not recall_evidence_id or not recall_task_id:
+                return (
+                    [],
+                    [],
+                    [_action_error(action, "matching_memory_recall_is_not_durable")],
+                )
+            context_dependencies.append(
+                TaskDependency(
+                    kind="evidence",
+                    evidence_kind="memory.semantic.recall",
+                    evidence_id=recall_evidence_id,
+                    evidence_owner=recall_capability.owner,
+                    producer_task_id=recall_task_id,
+                    producer_capability_id=recall_capability.id,
+                    producer_executor_id=recall_capability.executor,
+                    evidence_accepted=True,
+                    payload_fingerprint=matching_recall.get("payload_fingerprint"),
+                    input_hash=matching_recall.get("task_input_hash"),
+                    operation_id=state.operation_id,
+                    metadata={
+                        "runtime_prerequisite": True,
+                        "reused_completed_recall": True,
+                        "producer_action_id": action.action_id,
+                        "consumer_action_id": action.action_id,
+                    },
+                )
+            )
+            context_input.setdefault(
+                "memory_recall_evidence_ids",
+                [recall_evidence_id],
+            )
+            context_input.setdefault(
+                "memory_recall_diagnostics",
+                {
+                    "registered": True,
+                    "queried": True,
+                    "reused": True,
+                    "decision": memory_decision,
+                },
+            )
 
         if not specs:
             access_errors = self._access_errors(action, capabilities, state)

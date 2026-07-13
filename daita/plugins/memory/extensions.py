@@ -148,6 +148,10 @@ class MemoryExecutor:
         handler_input = dict(task.input)
         handler_input["_runtime_task_metadata"] = dict(task.metadata)
         payload = await self.handler(handler_input)
+        if self.evidence_kind == "memory.semantic.recall":
+            binding = task.input.get("recall_binding")
+            if isinstance(binding, Mapping):
+                payload = {**payload, "recall_binding": dict(binding)}
         return [
             Evidence(
                 kind=self.evidence_kind,
