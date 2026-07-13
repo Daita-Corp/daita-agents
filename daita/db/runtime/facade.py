@@ -678,7 +678,10 @@ class DbRuntime(
         synthesis_evidence, synthesis_task = await self.tasks.execute_answer_synthesis(
             operation=operation,
             intent=intent,
-            outcome_evidence=(*evidence, verification_evidence),
+            outcome_evidence=(
+                *finalization.supporting_evidence,
+                verification_evidence,
+            ),
         )
         refreshed_tasks = tuple(await self.store.list_tasks(operation_id))
         final_tasks = refreshed_tasks

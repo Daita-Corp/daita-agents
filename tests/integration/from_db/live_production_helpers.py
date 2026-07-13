@@ -539,7 +539,9 @@ def task_capabilities(result_or_snapshot: Any) -> list[str]:
 
     diagnostics = getattr(result_or_snapshot, "diagnostics", {}) or {}
     execution = diagnostics.get("execution") if isinstance(diagnostics, dict) else {}
-    task_payloads = execution.get("tasks", []) if isinstance(execution, dict) else []
+    task_payloads = (
+        execution.get("task_refs", []) if isinstance(execution, dict) else []
+    )
     return [
         str(task.get("capability_id") or "")
         for task in task_payloads
@@ -564,7 +566,8 @@ def latest_evidence(
 
 
 def query_rows(result_or_snapshot: Any) -> list[dict[str, Any]]:
-    """Return rows from latest accepted ``query.result`` evidence."""
+    """Return rows from raw latest accepted ``query.result`` evidence."""
+    _require_raw_evidence_surface(result_or_snapshot, helper="query_rows")
     query_result = latest_evidence(result_or_snapshot, "query.result")
     assert query_result is not None, "Expected query.result evidence"
     rows = query_result.payload.get("rows") or []
@@ -573,7 +576,8 @@ def query_rows(result_or_snapshot: Any) -> list[dict[str, Any]]:
 
 
 def row_values(result_or_snapshot: Any) -> set[Any]:
-    """Return scalar values from latest accepted ``query.result`` rows."""
+    """Return scalar values from raw latest accepted ``query.result`` rows."""
+    _require_raw_evidence_surface(result_or_snapshot, helper="row_values")
     values: set[Any] = set()
     for row in query_rows(result_or_snapshot):
         values.update(row.values())
@@ -581,7 +585,8 @@ def row_values(result_or_snapshot: Any) -> set[Any]:
 
 
 def sql_from_result(result_or_snapshot: Any) -> str:
-    """Extract the planned or executed SQL from a result or snapshot."""
+    """Extract SQL from an ``OperationSnapshot`` or other raw evidence surface."""
+    _require_raw_evidence_surface(result_or_snapshot, helper="sql_from_result")
     diagnostics = getattr(result_or_snapshot, "diagnostics", {}) or {}
     if isinstance(diagnostics, dict):
         execution = diagnostics.get("execution")
@@ -618,7 +623,8 @@ def sql_from_result(result_or_snapshot: Any) -> str:
 
 
 def all_sql_strings(result_or_snapshot: Any) -> list[str]:
-    """Extract all planned, validated, and executed SQL strings."""
+    """Extract all SQL strings from a snapshot or other raw evidence surface."""
+    _require_raw_evidence_surface(result_or_snapshot, helper="all_sql_strings")
     values: list[str] = []
 
     diagnostics = getattr(result_or_snapshot, "diagnostics", {}) or {}
@@ -711,14 +717,26 @@ def assert_loop_evidence(result_or_snapshot: Any) -> None:
     assert not missing, f"Missing loop evidence: {sorted(missing)}"
 
 
-def assert_synthesized_answer(result_or_snapshot: Any) -> None:
-    """Assert that ``db.answer.synthesize`` produced accepted answer evidence."""
-    synthesis = latest_evidence(result_or_snapshot, "answer.synthesis")
+def assert_synthesized_answer(
+    snapshot_or_raw: Any,
+    *,
+    public_result: Any | None = None,
+) -> None:
+    """Validate raw synthesis and, when supplied, its redacted public projection."""
+    _require_raw_evidence_surface(snapshot_or_raw, helper="assert_synthesized_answer")
+    synthesis = latest_evidence(snapshot_or_raw, "answer.synthesis")
     assert synthesis is not None
     answer = synthesis.payload.get("answer")
     assert isinstance(answer, str) and answer.strip()
-    if hasattr(result_or_snapshot, "answer"):
-        assert result_or_snapshot.answer == answer
+    if public_result is None:
+        return
+
+    assert public_result.answer == answer
+    public_synthesis = latest_evidence(public_result, "answer.synthesis")
+    assert public_synthesis is not None
+    assert public_synthesis.payload.get("redacted") is True
+    assert "answer" not in public_synthesis.payload
+    assert "answer_facts" not in public_synthesis.payload
 
 
 def assert_scalar_answer_fact(
@@ -728,7 +746,11 @@ def assert_scalar_answer_fact(
     label: str | None = None,
     aggregate_kind: str | None = None,
 ) -> None:
-    """Assert synthesized answer evidence preserves a primary scalar fact."""
+    """Assert raw synthesis evidence preserves a primary scalar fact."""
+    _require_raw_evidence_surface(
+        result_or_snapshot,
+        helper="assert_scalar_answer_fact",
+    )
     synthesis = latest_evidence(result_or_snapshot, "answer.synthesis")
     assert synthesis is not None
     facts = synthesis.payload.get("answer_facts") or {}
@@ -832,6 +854,31 @@ def write_failure_artifacts(
 def _evidence_items(result_or_snapshot: Any) -> tuple[Any, ...]:
     evidence = getattr(result_or_snapshot, "evidence", ())
     return tuple(evidence or ())
+
+
+def _require_raw_evidence_surface(source: Any, *, helper: str) -> None:
+    """Reject caller-facing projections for helpers that inspect raw facts."""
+    operation = getattr(source, "operation", None)
+    tasks = getattr(source, "tasks", None)
+    evidence = _evidence_items(source)
+    if operation is not None and tasks is not None:
+        return
+
+    diagnostics = getattr(source, "diagnostics", {}) or {}
+    execution = diagnostics.get("execution") if isinstance(diagnostics, dict) else {}
+    if isinstance(execution, dict) and isinstance(execution.get("tasks"), list):
+        return
+
+    if any(
+        isinstance(getattr(item, "payload", None), dict)
+        and getattr(item, "payload").get("redacted") is not True
+        for item in evidence
+    ):
+        return
+
+    raise AssertionError(
+        f"{helper} requires an OperationSnapshot or another raw evidence surface"
+    )
 
 
 def _first_sql_value(payload: Any) -> str:
@@ -966,7 +1013,7 @@ def _task_statuses(result_or_snapshot: Any) -> list[dict[str, Any]]:
         ]
     diagnostics = getattr(result_or_snapshot, "diagnostics", {}) or {}
     execution = diagnostics.get("execution") if isinstance(diagnostics, dict) else {}
-    tasks = execution.get("tasks", []) if isinstance(execution, dict) else []
+    tasks = execution.get("task_refs", []) if isinstance(execution, dict) else []
     return [dict(task) for task in tasks if isinstance(task, dict)]
 
 

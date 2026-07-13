@@ -277,20 +277,40 @@ def _safe_target_list(value: Any) -> list[dict[str, Any]]:
 def _state_value_grounding_validation_inputs(
     state: DbLoopState,
 ) -> tuple[list[Any], list[Any]]:
-    facts: list[Any] = []
-    warnings: list[Any] = []
-    for summary in state.validation_summaries:
-        facts.extend(_safe_iterable(summary.get("validation_facts")))
-        warnings.extend(_safe_iterable(summary.get("warnings")))
+    for summary in reversed(state.validation_summaries):
+        facts = list(_safe_iterable(summary.get("validation_facts")))
+        warnings = list(_safe_iterable(summary.get("warnings")))
         warnings.extend(_safe_iterable(summary.get("validation_warnings")))
-    return _dedupe_json_values(facts), _dedupe_json_values(warnings)
+        if _validation_value_grounding_targets((*facts, *warnings)):
+            return _dedupe_json_values(facts), _dedupe_json_values(warnings)
+    return [], []
 
 
 def _validation_grounding_repair_context(
     state: DbLoopState,
 ) -> dict[str, Any]:
-    validation_facts, validation_warnings = _state_value_grounding_validation_inputs(
-        state
+    failed_validation = next(
+        (
+            summary
+            for summary in reversed(state.validation_summaries)
+            if summary.get("kind") in {"query.plan.validation", "sql.validation"}
+            and summary.get("valid") is False
+            and _validation_value_grounding_targets(
+                (
+                    *list(_safe_iterable(summary.get("validation_facts"))),
+                    *list(_safe_iterable(summary.get("warnings"))),
+                    *list(_safe_iterable(summary.get("validation_warnings"))),
+                )
+            )
+        ),
+        None,
+    )
+    if failed_validation is None:
+        return {}
+    validation_facts = list(_safe_iterable(failed_validation.get("validation_facts")))
+    validation_warnings = list(_safe_iterable(failed_validation.get("warnings")))
+    validation_warnings.extend(
+        _safe_iterable(failed_validation.get("validation_warnings"))
     )
     targets = _validation_value_grounding_targets(
         (*validation_facts, *validation_warnings)
@@ -303,14 +323,48 @@ def _validation_grounding_repair_context(
     fingerprint = persisted_fingerprint(
         {
             "operation_id": state.operation_id,
+            "validation_kind": failed_validation.get("kind"),
+            "validation_evidence_id": failed_validation.get("id"),
+            "plan_evidence_id": failed_validation.get("plan_evidence_id"),
+            "planning_context_evidence_id": failed_validation.get(
+                "planning_context_evidence_id"
+            ),
+            "planning_context_fingerprint": failed_validation.get(
+                "planning_context_fingerprint"
+            ),
+            "schema_fingerprint": failed_validation.get("schema_fingerprint"),
+            "session_scope_binding_fingerprint": failed_validation.get(
+                "session_scope_binding_fingerprint"
+            ),
+            "session_context_fingerprint": failed_validation.get(
+                "session_context_fingerprint"
+            ),
+            "contract_fingerprint": failed_validation.get("contract_fingerprint"),
             "targets": targets,
         }
     )
     return {
         "attempted": True,
+        "validation_kind": failed_validation.get("kind"),
         "fingerprint": fingerprint,
         "target_refs": target_refs,
         "targets": targets,
+        "validation_evidence_id": failed_validation.get("id"),
+        "plan_evidence_id": failed_validation.get("plan_evidence_id"),
+        "planning_context_evidence_id": failed_validation.get(
+            "planning_context_evidence_id"
+        ),
+        "planning_context_fingerprint": failed_validation.get(
+            "planning_context_fingerprint"
+        ),
+        "schema_fingerprint": failed_validation.get("schema_fingerprint"),
+        "session_scope_binding_fingerprint": failed_validation.get(
+            "session_scope_binding_fingerprint"
+        ),
+        "session_context_fingerprint": failed_validation.get(
+            "session_context_fingerprint"
+        ),
+        "contract_fingerprint": failed_validation.get("contract_fingerprint"),
         "missing_target_refs": missing_refs,
         "satisfied_target_refs": [
             ref for ref in target_refs if ref.lower() in satisfied_refs
@@ -462,44 +516,262 @@ def _validation_grounding_runtime_continuation_action(
         for item in repair_context.get("missing_target_refs", ())
         if str(item).strip()
     )
-    if not missing_refs:
-        return None
     if not _state_allows_read_profile(state):
         return None
-
     fingerprint = str(repair_context.get("fingerprint") or "").strip()
     targets = _safe_target_list(repair_context.get("targets"))
-    action_input: dict[str, Any] = {}
-    source_owner = _single_source_owner_for_state(state)
-    if source_owner:
-        action_input["source_owner"] = source_owner
-
-    metadata: dict[str, Any] = {
-        "runtime_continuation": True,
-        "continuation": "validation_grounding.context_refresh",
-        "validation_grounding_fingerprint": fingerprint,
-        "validation_grounding_targets": targets,
+    read_owners = {
+        str(summary.get("owner") or "").strip()
+        for summary in state.capability_summaries
+        if summary.get("id") == "db.sql.execute_read"
+        and str(summary.get("owner") or "").strip()
     }
-    if _validation_grounding_context_refresh_exhausted(state, repair_context):
-        metadata["continuation_resolution"] = {
-            "status": "blocked",
-            "source": "runtime_continuation",
-            "error": "validation_grounding_context_refresh_exhausted",
+    source_owner = (
+        next(iter(read_owners))
+        if len(read_owners) == 1
+        else _single_source_owner_for_state(state)
+    )
+    action_input: dict[str, Any] = {}
+    if source_owner:
+        action_input["owner"] = source_owner
+
+    accepted_plans = tuple(
+        summary
+        for summary in state.accepted_evidence_summaries
+        if summary.get("kind") == "query.plan.proposal"
+        and summary.get("accepted", True) is True
+        and summary.get("valid") is True
+        and isinstance(summary.get("sql"), str)
+        and bool(str(summary.get("sql") or "").strip())
+    )
+    latest_plan = accepted_plans[-1] if accepted_plans else None
+    latest_plan_id = str((latest_plan or {}).get("id") or "").strip()
+    grounding_plan_id = str(repair_context.get("plan_evidence_id") or "").strip()
+    grounding_applies = repair_context.get(
+        "validation_kind"
+    ) == "query.plan.validation" and (
+        not grounding_plan_id or grounding_plan_id == latest_plan_id
+    )
+
+    if missing_refs and grounding_applies:
+        metadata: dict[str, Any] = {
+            "runtime_continuation": True,
             "continuation": "validation_grounding.context_refresh",
             "validation_grounding_fingerprint": fingerprint,
             "validation_grounding_targets": targets,
-            "missing_target_refs": list(missing_refs),
         }
+        if _validation_grounding_context_refresh_exhausted(state, repair_context):
+            metadata["continuation_resolution"] = {
+                "status": "blocked",
+                "source": "runtime_continuation",
+                "error": "validation_grounding_context_refresh_exhausted",
+                "continuation": "validation_grounding.context_refresh",
+                "validation_grounding_fingerprint": fingerprint,
+                "validation_grounding_targets": targets,
+                "missing_target_refs": list(missing_refs),
+            }
+        context_input = {"source_owner": source_owner} if source_owner else {}
+        return DbPlannerAction(
+            action_id=_runtime_validation_grounding_action_id(
+                {**repair_context, "stage": "context_refresh"},
+                current_action_ids,
+            ),
+            kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
+            input=context_input,
+            rationale="Runtime continuation for validation-driven value grounding.",
+            metadata=metadata,
+        )
+
+    if latest_plan is None:
+        return None
+    if any(
+        summary.get("kind") == "query.result"
+        and summary.get("accepted", True) is True
+        and summary.get("plan_evidence_id") == latest_plan_id
+        for summary in state.accepted_evidence_summaries
+    ):
+        return None
+
+    latest_plan_validation = next(
+        (
+            summary
+            for summary in reversed(state.validation_summaries)
+            if summary.get("kind") == "query.plan.validation"
+            and summary.get("plan_evidence_id") == latest_plan_id
+        ),
+        None,
+    )
+    latest_failed_validation = (
+        latest_plan_validation
+        if latest_plan_validation is not None
+        and latest_plan_validation.get("valid") is False
+        else None
+    )
+    failed_plan_id = str(
+        (latest_failed_validation or {}).get("plan_evidence_id") or ""
+    ).strip()
+    repair_validation_id = str(
+        repair_context.get("validation_evidence_id") or ""
+    ).strip()
+
+    if (
+        latest_failed_validation is not None
+        and failed_plan_id == latest_plan_id
+        and str(latest_failed_validation.get("id") or "") == repair_validation_id
+    ):
+        planning_context = next(
+            (
+                summary
+                for summary in reversed(state.accepted_evidence_summaries)
+                if summary.get("kind") == "planning.context"
+                and summary.get("accepted", True) is True
+                and str(summary.get("id") or "").strip()
+            ),
+            None,
+        )
+        if planning_context is None:
+            return None
+        failure_id = str(latest_failed_validation.get("id") or "").strip()
+        context_id = str(planning_context.get("id") or "").strip()
+        repeated_repair = next(
+            (
+                summary
+                for summary in reversed(state.rejected_evidence_summaries)
+                if summary.get("kind") == "query.plan.repair"
+                and summary.get("failure_evidence_id") == failure_id
+                and summary.get("prior_plan_evidence_id") == latest_plan_id
+                and summary.get("planning_context_evidence_id") == context_id
+            ),
+            None,
+        )
+        repair_metadata: dict[str, Any] = {
+            "runtime_continuation": True,
+            "continuation": "validation_grounding.query_plan_repair",
+            "validation_grounding_fingerprint": fingerprint,
+            "validation_grounding_targets": targets,
+        }
+        if repeated_repair is not None:
+            repair_metadata["continuation_resolution"] = {
+                "status": "blocked",
+                "source": "runtime_continuation",
+                "error": "validation_grounding_repair_exhausted",
+                "failure_evidence_id": failure_id,
+                "prior_plan_evidence_id": latest_plan_id,
+                "planning_context_evidence_id": context_id,
+            }
+        return DbPlannerAction(
+            action_id=_runtime_validation_grounding_action_id(
+                {
+                    **repair_context,
+                    "stage": "repair",
+                    "failure_evidence_id": failure_id,
+                    "prior_plan_evidence_id": latest_plan_id,
+                    "planning_context_evidence_id": context_id,
+                },
+                current_action_ids,
+            ),
+            kind=DbPlannerActionKind.REPAIR_QUERY_PLAN,
+            input={
+                "owner": "db_runtime",
+                "failure_evidence_id": failure_id,
+                "prior_plan_evidence_id": latest_plan_id,
+                "planning_context_evidence_id": context_id,
+            },
+            rationale="Runtime continuation for a grounded query-plan repair.",
+            metadata=repair_metadata,
+        )
+
+    if (
+        latest_plan_validation is not None
+        and latest_plan_validation.get("valid") is False
+    ):
+        return None
+
+    planning_context = next(
+        (
+            summary
+            for summary in reversed(state.accepted_evidence_summaries)
+            if summary.get("kind") == "planning.context"
+            and summary.get("accepted", True) is True
+        ),
+        None,
+    )
+    if planning_context is not None:
+        plan_context_id = str(
+            latest_plan.get("planning_context_evidence_id") or ""
+        ).strip()
+        current_context_id = str(planning_context.get("id") or "").strip()
+        plan_context_fingerprint = str(
+            latest_plan.get("planning_context_fingerprint") or ""
+        ).strip()
+        current_context_fingerprint = str(
+            planning_context.get("payload_fingerprint") or ""
+        ).strip()
+        plan_schema = str(latest_plan.get("schema_fingerprint") or "").strip()
+        current_schema = str(planning_context.get("schema_fingerprint") or "").strip()
+        plan_session = str(latest_plan.get("session_context_fingerprint") or "").strip()
+        current_session = str(
+            planning_context.get("session_context_fingerprint") or ""
+        ).strip()
+        plan_contract = str(latest_plan.get("contract_fingerprint") or "").strip()
+        current_contract = str(
+            state.diagnostics.get("contract_fingerprint") or ""
+        ).strip()
+        stale_reason = None
+        if (
+            plan_context_fingerprint
+            and current_context_fingerprint
+            and plan_context_fingerprint != current_context_fingerprint
+        ):
+            stale_reason = "stale_query_plan_planning_context"
+        elif (
+            not plan_context_fingerprint
+            and not current_context_fingerprint
+            and plan_context_id
+            and current_context_id
+            and plan_context_id != current_context_id
+        ):
+            stale_reason = "stale_query_plan_planning_context"
+        elif plan_schema and current_schema and plan_schema != current_schema:
+            stale_reason = "stale_query_plan_schema"
+        elif plan_session and current_session and plan_session != current_session:
+            stale_reason = "stale_query_plan_session_binding"
+        elif plan_contract and current_contract and plan_contract != current_contract:
+            stale_reason = "stale_query_plan_contract"
+        if stale_reason is not None:
+            return DbPlannerAction(
+                action_id=_runtime_validation_grounding_action_id(
+                    {**repair_context, "stage": "stale", "plan": latest_plan_id},
+                    current_action_ids,
+                ),
+                kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+                input={"plan_evidence_id": latest_plan_id, **action_input},
+                rationale="Runtime continuation rejected a stale query plan.",
+                metadata={
+                    "runtime_continuation": True,
+                    "continuation": "validation_grounding.validated_execution",
+                    "continuation_resolution": {
+                        "status": "blocked",
+                        "source": "runtime_continuation",
+                        "error": stale_reason,
+                        "plan_evidence_id": latest_plan_id,
+                    },
+                },
+            )
 
     return DbPlannerAction(
         action_id=_runtime_validation_grounding_action_id(
-            repair_context,
+            {**repair_context, "stage": "execute", "plan": latest_plan_id},
             current_action_ids,
         ),
-        kind=DbPlannerActionKind.BUILD_PLANNING_CONTEXT,
-        input=action_input,
-        rationale="Runtime continuation for validation-driven value grounding.",
-        metadata=metadata,
+        kind=DbPlannerActionKind.EXECUTE_VALIDATED_READ,
+        input={"plan_evidence_id": latest_plan_id, **action_input},
+        rationale="Runtime continuation for governed validated read execution.",
+        metadata={
+            "runtime_continuation": True,
+            "continuation": "validation_grounding.validated_execution",
+            "validation_grounding_fingerprint": fingerprint,
+        },
     )
 
 
@@ -511,6 +783,13 @@ def _runtime_validation_grounding_action_id(
     seed = {
         "fingerprint": fingerprint,
         "target_refs": list(repair_context.get("target_refs") or ()),
+        "stage": repair_context.get("stage"),
+        "failure_evidence_id": repair_context.get("failure_evidence_id"),
+        "prior_plan_evidence_id": repair_context.get("prior_plan_evidence_id"),
+        "planning_context_evidence_id": repair_context.get(
+            "planning_context_evidence_id"
+        ),
+        "plan": repair_context.get("plan"),
     }
     action_id = f"runtime_validation_grounding_{persisted_fingerprint(seed)[:12]}"
     if action_id not in current_action_ids:

@@ -183,6 +183,13 @@ class DbQueryPlanValidationExecutor:
             "plan_evidence_id": plan_evidence.id,
             "planning_context_evidence_id": context_evidence.id,
             "schema_fingerprint": context_evidence.payload.get("schema_fingerprint"),
+            "planning_context_fingerprint": (
+                context_evidence.metadata.get("payload_fingerprint")
+            ),
+            "session_context_fingerprint": plan_evidence.payload.get(
+                "session_context_fingerprint"
+            ),
+            "contract_fingerprint": plan_evidence.payload.get("contract_fingerprint"),
         }
         if binding is not None:
             payload["session_scope_binding_evidence_id"] = binding.id

@@ -55,11 +55,11 @@ async def test_live_schema_query_disambiguates_near_collision_tables(tmp_path):
 
         assert snapshot is not None
         assert_successful_prompt_run(result, snapshot=snapshot)
-        assert_synthesized_answer(result)
+        assert_synthesized_answer(snapshot, public_result=result)
         assert "schema.asset_profile" in evidence_kinds(result)
         assert "query.result" not in evidence_kinds(result)
 
-        synthesis = latest_evidence(result, "answer.synthesis")
+        synthesis = latest_evidence(snapshot, "answer.synthesis")
         assert synthesis is not None
         diagnostics = synthesis.payload.get("diagnostics") or {}
         context = diagnostics.get("context") or {}
@@ -111,12 +111,12 @@ async def test_live_zero_row_result_is_truthful(tmp_path):
         assert_successful_prompt_run(result, snapshot=snapshot)
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
-        assert_synthesized_answer(result)
+        assert_synthesized_answer(snapshot, public_result=result)
 
-        rows = query_rows(result)
+        rows = query_rows(snapshot)
         assert rows == []
 
-        sql = sql_from_result(result) or sql_from_result(snapshot)
+        sql = sql_from_result(snapshot)
         assert_sql_is_read_only(sql)
         assert re.search(r"(?i)\borders\b", sql), sql
         assert re.search(r"(?i)\bstatus\b", sql), sql
@@ -211,9 +211,9 @@ async def test_live_sql_repair_loop_recovers_from_bad_literal_or_column(tmp_path
         if result.status is OperationStatus.SUCCEEDED:
             assert_successful_prompt_run(result, snapshot=snapshot)
             assert_loop_evidence(result)
-            assert_synthesized_answer(result)
+            assert_synthesized_answer(snapshot, public_result=result)
 
-            sql = sql_from_result(result) or sql_from_result(snapshot)
+            sql = sql_from_result(snapshot)
             assert re.search(r"(?i)\bsupport_tickets\b", sql), sql
             assert not re.search(r"(?i)['\"]unresolved['\"]", sql), sql
             assert not re.search(r"(?i)['\"]urgent['\"]", sql), sql

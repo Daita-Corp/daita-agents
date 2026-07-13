@@ -5,7 +5,7 @@ Evidence verification for DB runtime operations.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from daita.runtime import Evidence, Task
 
@@ -155,12 +155,54 @@ def db_run_finalization_check(
     tasks: tuple[Task, ...],
 ) -> DbFinalizationCheck:
     """Check whether accepted evidence is sufficient to finalize a DB run."""
-    verification = verifier.verify(contract, intent, evidence, tasks)
-    supporting_evidence = db_accepted_synthesis_support_evidence(evidence)
-    query_result_required = db_operation_requires_query_result(operation, intent)
-    query_result_present = any(
-        item.accepted and item.kind == "query.result" for item in evidence
+    latest_plan = next(
+        (
+            item
+            for item in reversed(evidence)
+            if item.accepted
+            and item.kind == "query.plan.proposal"
+            and item.payload.get("valid") is True
+            and isinstance(item.payload.get("sql"), str)
+            and bool(str(item.payload.get("sql") or "").strip())
+        ),
+        None,
     )
+    accepted_results = tuple(
+        item for item in evidence if item.accepted and item.kind == "query.result"
+    )
+    applicable_results = accepted_results
+    if latest_plan is not None:
+        tasks_by_id = {task.id: task for task in tasks}
+        matched_results: list[Evidence] = []
+        for result in accepted_results:
+            task = tasks_by_id.get(str(result.task_id or ""))
+            task_plan_id = None
+            if task is not None:
+                task_plan_id = task.input.get("plan_evidence_id")
+                if not task_plan_id:
+                    provenance = task.metadata.get("sql_provenance")
+                    if isinstance(provenance, Mapping):
+                        task_plan_id = provenance.get("source_evidence_id")
+            result_plan_id = (
+                result.payload.get("plan_evidence_id")
+                or result.metadata.get("plan_evidence_id")
+                or task_plan_id
+            )
+            if str(result_plan_id or "") == latest_plan.id:
+                matched_results.append(result)
+        applicable_results = tuple(matched_results[-1:])
+    elif accepted_results:
+        applicable_results = accepted_results[-1:]
+
+    verification_evidence = tuple(
+        item
+        for item in evidence
+        if item.kind != "query.result" or item in applicable_results
+    )
+    verification = verifier.verify(contract, intent, verification_evidence, tasks)
+    supporting_evidence = db_accepted_synthesis_support_evidence(verification_evidence)
+    query_result_required = db_operation_requires_query_result(operation, intent)
+    query_result_present = bool(applicable_results)
     finalizable = (
         verification.passed
         and bool(supporting_evidence)
@@ -182,10 +224,20 @@ def _verify_data_query(
 ) -> tuple[str, ...]:
     warnings: list[str] = []
     validation = next(
-        (item for item in evidence if item.kind == "sql.validation"), None
+        (
+            item
+            for item in reversed(evidence)
+            if item.accepted and item.kind == "sql.validation"
+        ),
+        None,
     )
     query_result = next(
-        (item for item in evidence if item.kind == "query.result"), None
+        (
+            item
+            for item in reversed(evidence)
+            if item.accepted and item.kind == "query.result"
+        ),
+        None,
     )
 
     if validation is None:

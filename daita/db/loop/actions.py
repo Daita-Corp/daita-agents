@@ -313,6 +313,8 @@ def _has_terminal_compilation_error(compilation: DbActionCompilation) -> bool:
         "dependency_not_durable:",
         "ambiguous_continuation:",
         "ambiguous_continuation_evidence:",
+        "terminal_action_must_use_decision_status",
+        "terminal_status_must_not_include_actions",
     )
     return any(
         str(item.get("error") or "").startswith(terminal_prefixes)

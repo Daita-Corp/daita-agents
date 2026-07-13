@@ -773,6 +773,62 @@ async def test_agent_loop_build_planning_context_adds_memory_recall_prerequisite
     assert context.input["memory_recall_diagnostics"]["queried"] is True
 
 
+async def test_required_memory_recall_runs_before_planner_can_clarify(tmp_path):
+    source_identity = "sqlite:from_db:phase-zero-recall"
+    memory = _memory(tmp_path)
+    runtime = DbRuntime(
+        plugins=(memory,),
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "memory": {
+                        "enabled": True,
+                        "recall": "auto",
+                        "learning": "safe",
+                        "limit": 3,
+                        "char_budget": 800,
+                        "score_threshold": 0.0,
+                        "retrieval_mode": "structured",
+                        "source_identity": source_identity,
+                    }
+                }
+            }
+        ),
+    )
+    await runtime.setup()
+    operation = await runtime.kernel.create_operation(
+        operation_type="db.run",
+        request={
+            "prompt": "Calculate recognized revenue from orders.total.",
+            "source_scope": ["sqlite"],
+        },
+        required_evidence=frozenset({"query.result"}),
+        metadata={"intent_kind": "metric.query"},
+        evaluate_governance=False,
+    )
+    planner = _ScriptedPlanner(
+        DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CLARIFY,
+            intent={"operation_type": "metric.query"},
+            clarification_question="What does recognized revenue mean?",
+        )
+    )
+    try:
+        result = await DbAgentLoop(runtime, planner).run(operation, max_turns=1)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert result.status != "clarification_required"
+    assert planner.states == []
+    capabilities = [task.capability_id for task in tasks]
+    assert "memory.semantic.recall" in capabilities
+    assert "db.planning.context.build" in capabilities
+    assert capabilities.index("memory.semantic.recall") < capabilities.index(
+        "db.planning.context.build"
+    )
+
+
 async def test_prior_turn_memory_proposal_dependency_recovers_to_latest_proposal(
     tmp_path,
 ):

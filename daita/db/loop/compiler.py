@@ -14,6 +14,7 @@ from ..planner_protocol import (
     DbPlannerAction,
     DbPlannerActionKind,
     DbPlannerDecision,
+    DbPlannerDecisionStatus,
 )
 from ..runtime.tasks.models import DbTaskSpec
 from .actions import (
@@ -118,22 +119,67 @@ class DbActionCompiler:
             if error is not None or action is None:
                 rejected.append(error or {"error": "invalid_action"})
                 continue
+            if action.kind in {
+                DbPlannerActionKind.CLARIFY,
+                DbPlannerActionKind.FINISH,
+            }:
+                rejected.append(
+                    _action_error(
+                        action,
+                        "terminal_action_must_use_decision_status",
+                    )
+                )
+                continue
             actions.append(action)
 
-        runtime_continuation = _validation_grounding_runtime_continuation_action(
-            state,
-            current_action_ids={action.action_id for action in actions},
+        if (
+            decision.status
+            in {
+                DbPlannerDecisionStatus.FINISH,
+                DbPlannerDecisionStatus.CLARIFY,
+            }
+            and actions
+        ):
+            rejected.extend(
+                _action_error(action, "terminal_status_must_not_include_actions")
+                for action in actions
+            )
+            actions = []
+
+        runtime_continuation_selected = any(
+            action.metadata.get("runtime_continuation") is True for action in actions
+        )
+        runtime_continuation = (
+            _validation_grounding_runtime_continuation_action(
+                state,
+                current_action_ids={action.action_id for action in actions},
+            )
+            if not rejected and not runtime_continuation_selected
+            else None
         )
         if runtime_continuation is not None:
             if self.continuation_resolver.blocked_diagnostic(runtime_continuation):
                 actions = [runtime_continuation]
-            elif not any(
-                action.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT
-                for action in actions
+            elif (
+                runtime_continuation.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT
+                and not any(
+                    action.kind is runtime_continuation.kind for action in actions
+                )
             ):
                 actions.insert(0, runtime_continuation)
+            elif (
+                not actions
+                and not rejected
+                and not any(
+                    action.kind is runtime_continuation.kind for action in actions
+                )
+            ):
+                actions.append(runtime_continuation)
 
-        if not any(
+        runtime_continuation_selected = any(
+            action.metadata.get("runtime_continuation") is True for action in actions
+        )
+        if not runtime_continuation_selected and not any(
             action.kind is DbPlannerActionKind.COMMIT_MEMORY_UPDATE
             for action in actions
         ):
@@ -384,8 +430,6 @@ class DbActionCompiler:
         sequence_start: int,
         decision_fingerprint: str,
     ) -> tuple[list[DbTaskSpec], list[dict[str, Any]], list[dict[str, Any]]]:
-        if action.kind in {DbPlannerActionKind.CLARIFY, DbPlannerActionKind.FINISH}:
-            return [], [], []
         if action.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT:
             return self._compile_planning_context_action(
                 action,
@@ -962,6 +1006,12 @@ class DbActionCompiler:
             **_action_metadata(action, decision_fingerprint),
             "sql_provenance": _sql_provenance_metadata(resolved_sql),
         }
+        if (
+            resolved_sql.source_evidence_kind == "query.plan.proposal"
+            and resolved_sql.source_evidence_id is not None
+        ):
+            metadata["plan_evidence_id"] = resolved_sql.source_evidence_id
+            metadata["evidence_trace_keys"] = ["plan_evidence_id"]
         specs: list[DbTaskSpec] = []
         selected_capabilities: list[Any] = []
         if plan_validation is not None:

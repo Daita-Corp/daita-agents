@@ -1011,6 +1011,10 @@ def _compact_session_context(request: DbRequest) -> dict[str, Any]:
     durable_ids = context.get("durable_ids")
     diagnostics = context.get("diagnostics")
     compact: dict[str, Any] = {}
+    for key in ("session_id", "user_id"):
+        value = context.get(key)
+        if isinstance(value, str) and value.strip():
+            compact[key] = value.strip()
     if isinstance(referents, dict):
         compact["referents"] = {
             key: list(referents.get(key) or [])[:20]

@@ -14,7 +14,10 @@ from daita.runtime import (
 
 from ..continuation import DbContinuationResolver
 from ..evidence import evidence_in_task_plan_order
-from ..fingerprints import persisted_fingerprint
+from ..fingerprints import (
+    db_operation_contract_binding_fingerprint,
+    persisted_fingerprint,
+)
 from ..models import DbIntentKind
 from ..planner_protocol import (
     DbAgentPlanner,
@@ -128,19 +131,21 @@ class DbAgentLoop:
                 )
             if runtime_continuation is None:
                 decision = await self.planner.plan(state)
-            elif (
-                runtime_continuation.kind is DbPlannerActionKind.BUILD_PLANNING_CONTEXT
-            ):
+            elif str(
+                runtime_continuation.metadata.get("continuation") or ""
+            ).startswith("validation_grounding."):
                 decision = DbPlannerDecision(
                     status=DbPlannerDecisionStatus.CONTINUE,
                     intent={"operation_type": DbIntentKind.DATA_QUERY.value},
                     actions=(runtime_continuation,),
                     rationale=(
-                        "Runtime continuation for validation-driven value grounding."
+                        "Runtime continuation for validation-grounded query execution."
                     ),
                     metadata={
                         "runtime_continuation": True,
-                        "continuation": "validation_grounding.context_refresh",
+                        "continuation": runtime_continuation.metadata.get(
+                            "continuation"
+                        ),
                     },
                 )
             else:
@@ -158,7 +163,14 @@ class DbAgentLoop:
                 )
             await self._persist_planner_decision(operation, decision, turn=turn)
 
-            if decision.status is DbPlannerDecisionStatus.CLARIFY:
+            finish_finalization: tuple[bool, dict[str, Any]] | None = None
+            if decision.status is DbPlannerDecisionStatus.FINISH:
+                finish_finalization = await self._operation_finalizable(operation.id)
+
+            if (
+                decision.status is DbPlannerDecisionStatus.CLARIFY
+                and not decision.actions
+            ):
                 observation = await self._persist_observation(
                     operation,
                     DbPlannerObservation(
@@ -208,8 +220,22 @@ class DbAgentLoop:
                 decision.status is DbPlannerDecisionStatus.FINISH
                 and not decision.actions
             ):
-                finalizable, finalization = await self._operation_finalizable(
-                    operation.id
+                assert finish_finalization is not None
+                finalizable, finalization = finish_finalization
+                verification = finalization.get("verification")
+                verification = verification if isinstance(verification, Mapping) else {}
+                finalization_fingerprint = persisted_fingerprint(
+                    {
+                        "query_result_required": finalization.get(
+                            "query_result_required"
+                        ),
+                        "query_result_present": finalization.get(
+                            "query_result_present"
+                        ),
+                        "missing_evidence": verification.get("missing_evidence") or (),
+                        "warnings": verification.get("warnings") or (),
+                        "contract": finalization.get("contract") or {},
+                    }
                 )
                 observation = await self._persist_observation(
                     operation,
@@ -222,16 +248,14 @@ class DbAgentLoop:
                             ),
                             "turn": turn,
                             "finalization": finalization,
+                            "finalization_fingerprint": finalization_fingerprint,
                         }
                     ),
                     turn=turn,
                 )
                 if not finalizable and _state_is_memory_update_operation(state):
-                    verification = finalization.get("verification")
                     verification_warnings = (
-                        verification.get("warnings")
-                        if isinstance(verification, Mapping)
-                        else ()
+                        verification.get("warnings") if verification else ()
                     )
                     return await self._result(
                         operation,
@@ -244,12 +268,45 @@ class DbAgentLoop:
                             "finalization": finalization,
                         },
                     )
-                return await self._result(
-                    operation,
-                    "finished",
-                    warnings=warnings,
-                    diagnostics={"observation": observation.to_dict()},
+                if finalizable:
+                    return await self._result(
+                        operation,
+                        "finished",
+                        warnings=warnings,
+                        diagnostics={"observation": observation.to_dict()},
+                    )
+                premature_finish_count = 1 + sum(
+                    1
+                    for prior in state.planner_observations
+                    if prior.diagnostics.get("status")
+                    == "finish_requested_not_finalizable"
+                    and prior.diagnostics.get("finalization_fingerprint")
+                    == finalization_fingerprint
                 )
+                if premature_finish_count > 1:
+                    warning = "db_agent_loop_unmet_finalization"
+                    warnings.append(warning)
+                    return await self._result(
+                        operation,
+                        "failed",
+                        warnings=warnings,
+                        diagnostics={
+                            "error": warning,
+                            "observation": observation.to_dict(),
+                            "finalization": finalization,
+                        },
+                    )
+                missing_requirements = (
+                    verification.get("warnings") if verification else ()
+                )
+                warnings.extend(
+                    str(item)
+                    for item in (missing_requirements or ())
+                    if str(item).strip()
+                )
+                if not warnings:
+                    warnings.append("finish_requested_not_finalizable")
+                continue
 
             compilation = self.compile_actions(decision, state)
             last_compilation = compilation
@@ -570,7 +627,17 @@ class DbAgentLoop:
             planner_observations=planner_observations,
             runtime_limits=self.runtime.config.limits.to_dict(),
             remaining_budget={"planner_turns": remaining_turns},
-            diagnostics={"turn": turn},
+            diagnostics={
+                "turn": turn,
+                "contract_fingerprint": (
+                    db_operation_contract_binding_fingerprint(operation)
+                ),
+                "session_context_fingerprint": (
+                    persisted_fingerprint(operation.request["session_context"])
+                    if isinstance(operation.request.get("session_context"), Mapping)
+                    else None
+                ),
+            },
         )
 
     def compile_actions(
@@ -586,6 +653,8 @@ class DbAgentLoop:
         operation: Operation,
         compilation: DbActionCompilation,
     ) -> Operation:
+        if not compilation.accepted_action_summaries and not compilation.task_specs:
+            return operation
         metadata = {
             **operation.metadata,
             "latest_compiled_contract_snapshot": compilation.compiled_contract_snapshot,

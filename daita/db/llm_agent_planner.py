@@ -23,6 +23,12 @@ _PLANNER_DECISION_ENVELOPES = (
     "planner_decision",
     "DbPlannerDecision",
 )
+_TERMINAL_ACTION_KINDS = frozenset(
+    {DbPlannerActionKind.FINISH, DbPlannerActionKind.CLARIFY}
+)
+_LLM_ACTION_KINDS = tuple(
+    kind for kind in DbPlannerActionKind if kind not in _TERMINAL_ACTION_KINDS
+)
 
 
 class DbLLMAgentPlanner(DbAgentPlanner):
@@ -78,6 +84,20 @@ class DbLLMAgentPlanner(DbAgentPlanner):
                     "llm": response.diagnostics,
                 },
             )
+        decision, terminal_error = _normalize_terminal_decision(decision)
+        if terminal_error is not None:
+            return DbPlannerDecision(
+                status=DbPlannerDecisionStatus.FAILED,
+                intent=decision.intent,
+                stop_conditions=(terminal_error,),
+                rationale="DB LLM planner returned an invalid terminal decision.",
+                metadata={
+                    "failure": "planner_decision_invalid",
+                    "error": terminal_error,
+                    "planner_json_normalization": diagnostics,
+                    "llm": response.diagnostics,
+                },
+            )
         metadata = {
             **decision.metadata,
             "llm": response.diagnostics,
@@ -95,6 +115,12 @@ class DbLLMAgentPlanner(DbAgentPlanner):
 
 
 def _planner_messages(state: DbLoopState) -> list[dict[str, str]]:
+    state_payload = state.to_dict()
+    state_payload["available_action_kinds"] = [
+        kind
+        for kind in state_payload.get("available_action_kinds", ())
+        if kind not in {item.value for item in _TERMINAL_ACTION_KINDS}
+    ]
     return [
         {
             "role": "system",
@@ -138,9 +164,9 @@ def _planner_messages(state: DbLoopState) -> list[dict[str, str]]:
                 {
                     "decision_schema": _decision_schema_hint(),
                     "available_action_kinds": [
-                        kind.value for kind in DbPlannerActionKind
+                        kind.value for kind in _LLM_ACTION_KINDS
                     ],
-                    "state": state.to_dict(),
+                    "state": state_payload,
                 },
                 sort_keys=True,
                 default=str,
@@ -343,6 +369,60 @@ def _normalize_planner_action_payload(
             path=f"actions[{index}].depends_on",
         )
     return normalized
+
+
+def _normalize_terminal_decision(
+    decision: DbPlannerDecision,
+) -> tuple[DbPlannerDecision, str | None]:
+    terminal_actions = tuple(
+        action for action in decision.actions if action.kind in _TERMINAL_ACTION_KINDS
+    )
+    executable_actions = tuple(
+        action
+        for action in decision.actions
+        if action.kind not in _TERMINAL_ACTION_KINDS
+    )
+    if terminal_actions and (len(terminal_actions) != 1 or executable_actions):
+        return decision, "terminal_action_mixed_with_executable_actions"
+
+    status = decision.status
+    actions = decision.actions
+    if terminal_actions:
+        terminal_status = DbPlannerDecisionStatus(terminal_actions[0].kind.value)
+        if status not in {DbPlannerDecisionStatus.CONTINUE, terminal_status}:
+            return decision, "terminal_action_conflicts_with_decision_status"
+        status = terminal_status
+        actions = ()
+    elif (
+        status
+        in {
+            DbPlannerDecisionStatus.FINISH,
+            DbPlannerDecisionStatus.CLARIFY,
+        }
+        and executable_actions
+    ):
+        return decision, "terminal_status_mixed_with_executable_actions"
+
+    if (
+        status is DbPlannerDecisionStatus.CLARIFY
+        and not str(decision.clarification_question or "").strip()
+    ):
+        return decision, "clarification_question_required"
+
+    if status is decision.status and actions == decision.actions:
+        return decision, None
+    return (
+        DbPlannerDecision(
+            status=status,
+            intent=decision.intent,
+            actions=actions,
+            stop_conditions=decision.stop_conditions,
+            clarification_question=decision.clarification_question,
+            rationale=decision.rationale,
+            metadata=decision.metadata,
+        ),
+        None,
+    )
 
 
 def _coerce_boundary_string_list(

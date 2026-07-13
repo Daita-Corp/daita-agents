@@ -1896,7 +1896,7 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
     )
 
 
-async def test_same_turn_validation_repair_execute_defers_until_plan_is_durable():
+async def test_runtime_validation_repair_executes_after_plan_is_durable():
     stale_sql = (
         "SELECT COUNT(*) AS order_count FROM orders "
         "WHERE orders.status = 'completed'"
@@ -1979,23 +1979,22 @@ async def test_same_turn_validation_repair_execute_defers_until_plan_is_durable(
 
     assert_no_invalid_accepted_query_plans(evidence)
     assert result.status == "finished"
-    deferred_compilation = next(
+    repair_compilation = next(
         item
         for item in evidence
         if item.kind == "planner.compilation"
         and any(
-            rejected["error"] == "deferred_until_query_plan_proposal_available"
-            for rejected in item.payload["compilation"]["rejected_action_summaries"]
+            spec["capability_id"] == "db.query.repair"
+            for spec in item.payload["compilation"]["task_specs"]
         )
     )
-    deferred_payload = deferred_compilation.payload["compilation"]
-    assert [spec["capability_id"] for spec in deferred_payload["task_specs"]] == [
+    repair_payload = repair_compilation.payload["compilation"]
+    assert repair_compilation.accepted is True
+    assert [spec["capability_id"] for spec in repair_payload["task_specs"]] == [
         "db.query.repair"
     ]
-    assert deferred_payload["rejected_action_summaries"][0]["deferred"][
-        "producer_action_ids"
-    ] == ["repair_plan"]
-    assert stale_sql not in json.dumps(deferred_payload["task_specs"], sort_keys=True)
+    assert repair_payload["rejected_action_summaries"] == []
+    assert stale_sql not in json.dumps(repair_payload["task_specs"], sort_keys=True)
     plans = [item for item in evidence if item.kind == "query.plan.proposal"]
     repaired_plan = plans[-1]
     assert repaired_plan.accepted is True

@@ -9,7 +9,10 @@ from typing import Any, Mapping
 from daita.runtime import Evidence, Operation, Task
 
 from .evidence import load_evidence
-from .fingerprints import persisted_fingerprint
+from .fingerprints import (
+    db_operation_contract_binding_fingerprint,
+    persisted_fingerprint,
+)
 from .query_plan import DbQueryPlan
 from .query_sql_validation import sql_fingerprint
 
@@ -71,6 +74,7 @@ class DbLLMPlannerExecutor:
         plan = DbQueryPlan.from_mapping(parsed)
         payload = _plan_payload(
             plan,
+            operation=operation,
             raw_model_response=response.content,
             planning_context=planning_context,
             planner_diagnostics=response.diagnostics,
@@ -203,6 +207,7 @@ class DbLLMRepairExecutor:
         payload = {
             **_plan_payload(
                 plan,
+                operation=operation,
                 raw_model_response=response.content,
                 planning_context=planning_context,
                 planner_diagnostics=response.diagnostics,
@@ -448,6 +453,7 @@ def _failure_facts_are_context_sensitive(
 def _plan_payload(
     plan: DbQueryPlan,
     *,
+    operation: Operation,
     raw_model_response: str,
     planning_context: Evidence,
     planner_diagnostics: dict[str, Any],
@@ -457,6 +463,7 @@ def _plan_payload(
     executable_sql = isinstance(plan.selected_sql, str) and bool(
         plan.selected_sql.strip()
     )
+    session_context = planning_context.payload.get("session_context")
     return {
         "valid": executable_sql,
         "sql": plan.selected_sql,
@@ -465,8 +472,18 @@ def _plan_payload(
         "parse_diagnostics": parse_diagnostics,
         "planner_diagnostics": planner_diagnostics,
         "planning_context_evidence_id": planning_context.id,
+        "planning_context_fingerprint": (
+            planning_context.metadata.get("payload_fingerprint")
+            or persisted_fingerprint(planning_context.payload)
+        ),
         "planning_context_refs": [planning_context.id] if planning_context.id else [],
         "schema_fingerprint": planning_context.payload.get("schema_fingerprint"),
+        "session_context_fingerprint": (
+            persisted_fingerprint(session_context)
+            if isinstance(session_context, Mapping)
+            else None
+        ),
+        "contract_fingerprint": db_operation_contract_binding_fingerprint(operation),
         "plan_fingerprint": persisted_fingerprint(plan_dict),
         "sql_fingerprint": (
             sql_fingerprint(plan.selected_sql) if plan.selected_sql else None
