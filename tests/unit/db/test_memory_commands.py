@@ -21,9 +21,14 @@ TEST_SOURCE_IDENTITY = "test:memory-command-source"
 def _memory_runtime(*, backend=None, plugins=()) -> tuple[DbRuntime, MagicMock]:
     if backend is None:
         backend = MagicMock()
-        backend.list_by_category = AsyncMock(return_value=[])
-        backend.remember = AsyncMock(
-            return_value={"status": "success", "chunk_id": "mem-1"}
+        backend.list_db_records = AsyncMock(return_value=[])
+        backend.upsert_db_record = AsyncMock(
+            side_effect=lambda record: {
+                "status": "created",
+                "record_id": "mem-1",
+                "db_memory": record,
+                "structured": True,
+            }
         )
     memory = MemoryPlugin()
     memory.backend = backend

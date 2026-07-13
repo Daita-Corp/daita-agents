@@ -1,4 +1,5 @@
 from dataclasses import replace
+import inspect
 import json
 from pathlib import Path
 import sqlite3
@@ -14,20 +15,12 @@ from daita.db import (
 from daita.db.analysis import structural_schema_fingerprint
 from daita.db.loop import DbAgentLoop
 from daita.db.llm_planner import _planner_messages
-from daita.db.memory import (
-    DBMemoryRecord,
+import daita.db.memory as db_memory_package
+from daita.db.memory.calibration import (
     calibrate_db_memory,
-    db_memory_planning_recall_decision,
-    db_memory_planning_recall_query,
-    db_memory_refs_from_recall_evidence,
-    db_memory_selection_artifact_payload,
-    has_db_memory_marker,
-    normalize_db_memory_record,
-    recall_db_memory_records,
-    write_db_memory_record,
-    write_db_memory_records,
+    unit_records_from_schema,
 )
-from daita.db.memory_contracts import (
+from daita.db.memory.contracts import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
     confidence_value,
     db_memory_contract_refs,
@@ -37,6 +30,20 @@ from daita.db.memory_contracts import (
     project_db_memory_semantic_contracts,
     safe_omission_summaries,
     schema_refs_known_schema,
+)
+from daita.db.memory.recall import (
+    db_memory_planning_recall_decision,
+    db_memory_planning_recall_query,
+)
+from daita.db.memory.records import DBMemoryRecord, normalize_db_memory_record
+from daita.db.memory.selection import (
+    db_memory_refs_from_recall_evidence,
+    db_memory_selection_artifact_payload,
+)
+from daita.db.memory.storage import (
+    db_memory_record_ids_by_key,
+    has_db_memory_marker,
+    write_db_memory_record,
 )
 from daita.db.planning_context import DbPlanningContextBuilder
 from daita.db.planner_protocol import (
@@ -154,7 +161,6 @@ def _mock_db_memory_backend(results: list[dict]) -> MagicMock:
     backend.structured_index = True
     backend.recall_db_records = AsyncMock(return_value=results)
     backend.recall = AsyncMock(return_value=[])
-    backend.list_by_category = AsyncMock(return_value=[])
     return backend
 
 
@@ -432,13 +438,15 @@ async def test_memory_executors_return_typed_evidence(tmp_path):
 async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
     db_path = tmp_path / "planning_memory.sqlite"
     sqlite = SQLitePlugin(path=str(db_path))
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             total REAL NOT NULL
         );
         INSERT INTO orders (total) VALUES (10.0), (20.0);
-        """)
+        """
+    )
     source_identity = "sqlite:from_db:memory-test-source"
     memory = MemoryPlugin()
     backend = MagicMock()
@@ -474,7 +482,6 @@ async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
         ]
     )
     backend.recall = AsyncMock(return_value=[])
-    backend.list_by_category = AsyncMock(return_value=[])
     memory.backend = backend
     runtime = DbRuntime(
         source=sqlite,
@@ -1595,46 +1602,86 @@ async def test_db_runtime_renders_memory_context_through_context_provider(tmp_pa
     assert "Orders revenue excludes tax" in blocks[0].content
 
 
-async def test_db_memory_helpers_write_metric_definitions_and_business_rules():
-    backend = MagicMock()
-    backend.list_by_category = AsyncMock(return_value=[])
-    backend.remember = AsyncMock(side_effect=lambda *args, **kwargs: kwargs)
+async def test_db_memory_write_rejects_generic_only_custom_backend():
+    backend = MagicMock(spec=["list_by_category", "recall", "remember"])
+    backend.remember = AsyncMock()
     memory = MemoryPlugin()
     memory.backend = backend
 
-    await write_db_memory_records(
-        memory,
-        [
+    with pytest.raises(
+        TypeError,
+        match="structured backend implementing 'upsert_db_record'",
+    ):
+        await write_db_memory_record(
+            memory,
             DBMemoryRecord(
                 kind="metric_definition",
                 key="metric:revenue",
                 text="Revenue excludes refunded orders.",
-                metadata={"metric": "revenue"},
             ),
+        )
+
+    backend.remember.assert_not_awaited()
+
+
+async def test_structured_db_memory_recall_rejects_generic_only_custom_backend():
+    backend = MagicMock(spec=["recall", "remember"])
+    backend.recall = AsyncMock(return_value=[])
+    memory = MemoryPlugin(
+        db_memory_mode=True,
+        db_memory_retrieval_mode="structured",
+    )
+    memory.backend = backend
+
+    with pytest.raises(
+        TypeError,
+        match="structured backend implementing 'recall_db_records'",
+    ):
+        await memory._execute_semantic_recall(
             {
-                "kind": "business_rule",
-                "key": "rule:refunds",
-                "text": "Refunded orders must be excluded from revenue.",
-                "metadata": {"table": "orders"},
-            },
-        ],
+                "query": "How should revenue be calculated?",
+                "category": "db_semantics",
+            }
+        )
+
+    backend.recall.assert_not_awaited()
+
+
+async def test_db_memory_duplicate_lookup_is_exact_and_source_scoped():
+    source_identity = "sqlite:from_db:source-a"
+    backend = MagicMock()
+    backend.list_db_records = AsyncMock(return_value=[{"record_id": "record-existing"}])
+    memory = MemoryPlugin()
+    memory.backend = backend
+
+    record_ids = await db_memory_record_ids_by_key(
+        memory,
+        DBMemoryRecord(
+            kind="business_rule",
+            key="business_rule:revenue",
+            text="Revenue excludes refunds.",
+            metadata={"source_identity": source_identity},
+        ),
     )
 
-    assert backend.remember.await_count == 2
-    first_call = backend.remember.await_args_list[0]
-    second_call = backend.remember.await_args_list[1]
-    assert first_call.kwargs["category"] == "db_semantics"
-    assert first_call.kwargs["index_content"] == "Revenue excludes refunded orders."
-    assert (
-        first_call.kwargs["extra_metadata"]["db_memory"]["kind"] == "metric_definition"
+    assert record_ids == ["record-existing"]
+    backend.list_db_records.assert_awaited_once_with(
+        category="db_semantics",
+        key="business_rule:revenue",
+        source_identity=source_identity,
+        limit=1000,
     )
-    assert second_call.kwargs["extra_metadata"]["db_memory"]["kind"] == "business_rule"
 
 
 async def test_direct_db_memory_write_keeps_unvalidated_metric_memory_advisory():
     backend = MagicMock()
-    backend.list_by_category = AsyncMock(return_value=[])
-    backend.remember = AsyncMock(side_effect=lambda *args, **kwargs: kwargs)
+    backend.upsert_db_record = AsyncMock(
+        side_effect=lambda record: {
+            "status": "created",
+            "db_memory": record,
+            "structured": True,
+        }
+    )
     memory = MemoryPlugin()
     memory.backend = backend
 
@@ -1674,7 +1721,7 @@ async def test_direct_db_memory_write_keeps_unvalidated_metric_memory_advisory()
     )
 
     assert result["success"] is True
-    stored = backend.remember.await_args.kwargs["extra_metadata"]["db_memory"]
+    stored = backend.upsert_db_record.await_args.args[0]
     assert DB_MEMORY_SEMANTIC_CONTRACT_KEY not in stored["metadata"]
     assert (
         stored["metadata"]["semantic_contract_diagnostics"]["reason"]
@@ -1684,9 +1731,13 @@ async def test_direct_db_memory_write_keeps_unvalidated_metric_memory_advisory()
 
 async def test_db_memory_allows_catalog_cited_value_alias_without_observed_values():
     backend = MagicMock()
-    backend.list_by_category = AsyncMock(return_value=[])
-    backend.remember = AsyncMock(
-        return_value={"status": "success", "chunk_id": "mem-1"}
+    backend.upsert_db_record = AsyncMock(
+        side_effect=lambda record: {
+            "status": "created",
+            "record_id": "mem-1",
+            "db_memory": record,
+            "structured": True,
+        }
     )
     memory = MemoryPlugin()
     memory.backend = backend
@@ -1713,8 +1764,8 @@ async def test_db_memory_allows_catalog_cited_value_alias_without_observed_value
     assert result["success"] is True
     assert result["kind"] == "value_alias"
     assert result["category"] == "db_semantics"
-    backend.remember.assert_awaited_once()
-    stored = backend.remember.await_args.kwargs["extra_metadata"]["db_memory"]
+    backend.upsert_db_record.assert_awaited_once()
+    stored = backend.upsert_db_record.await_args.args[0]
     assert stored["metadata"]["catalog_profile_ref"] == "shipments.status"
     assert "observed_value" not in stored["metadata"]
     assert "top_values" not in stored["metadata"]
@@ -1722,10 +1773,7 @@ async def test_db_memory_allows_catalog_cited_value_alias_without_observed_value
 
 async def test_db_memory_rejects_value_alias_without_catalog_citation():
     backend = MagicMock()
-    backend.list_by_category = AsyncMock(return_value=[])
-    backend.remember = AsyncMock(
-        return_value={"status": "success", "chunk_id": "mem-1"}
-    )
+    backend.upsert_db_record = AsyncMock()
     memory = MemoryPlugin()
     memory.backend = backend
 
@@ -1741,15 +1789,12 @@ async def test_db_memory_rejects_value_alias_without_catalog_citation():
 
     assert result["success"] is False
     assert "catalog_profile_ref or catalog_evidence_id" in result["error"]
-    backend.remember.assert_not_awaited()
+    backend.upsert_db_record.assert_not_awaited()
 
 
 async def test_db_memory_rejects_value_alias_observed_values_in_metadata():
     backend = MagicMock()
-    backend.list_by_category = AsyncMock(return_value=[])
-    backend.remember = AsyncMock(
-        return_value={"status": "success", "chunk_id": "mem-1"}
-    )
+    backend.upsert_db_record = AsyncMock()
     memory = MemoryPlugin()
     memory.backend = backend
 
@@ -1771,77 +1816,7 @@ async def test_db_memory_rejects_value_alias_observed_values_in_metadata():
 
     assert result["success"] is False
     assert "cannot store observed value field 'observed_value'" in result["error"]
-    backend.remember.assert_not_awaited()
-
-
-async def test_db_memory_helpers_recall_single_category_and_filter_kind():
-    backend = MagicMock()
-    backend.recall = AsyncMock(
-        return_value=[
-            {
-                "chunk_id": "1",
-                "content": (
-                    'DB memory record:\n{"kind": "unit_convention", '
-                    '"text": "orders.total_cents is stored as cents"}'
-                ),
-            },
-            {
-                "chunk_id": "2",
-                "content": (
-                    'DB memory record:\n{"kind": "business_rule", '
-                    '"text": "exclude refunds"}'
-                ),
-            },
-        ]
-    )
-    memory = MemoryPlugin()
-    memory.backend = backend
-
-    results = await recall_db_memory_records(
-        memory,
-        "How much revenue?",
-        kinds=["unit_convention"],
-        limit=5,
-    )
-
-    backend.recall.assert_awaited_once()
-    assert backend.recall.call_args.kwargs["category"] == "db_semantics"
-    assert [item["chunk_id"] for item in results] == ["1"]
-
-
-async def test_db_memory_helpers_recall_relevant_business_rules():
-    backend = MagicMock()
-    backend.recall = AsyncMock(
-        return_value=[
-            {
-                "chunk_id": "rule-1",
-                "content": (
-                    'DB memory record:\n{"kind": "business_rule", '
-                    '"text": "Revenue excludes refunded orders."}'
-                ),
-            },
-            {
-                "chunk_id": "metric-1",
-                "content": (
-                    'DB memory record:\n{"kind": "metric_definition", '
-                    '"text": "Revenue is SUM(total_amount)."}'
-                ),
-            },
-        ]
-    )
-    memory = MemoryPlugin()
-    memory.backend = backend
-
-    results = await recall_db_memory_records(
-        memory,
-        "How should revenue be calculated?",
-        kinds=["business_rule"],
-        limit=5,
-    )
-
-    assert [item["chunk_id"] for item in results] == ["rule-1"]
-    backend.recall.assert_awaited_once()
-    assert backend.recall.call_args.kwargs["category"] == "db_semantics"
+    backend.upsert_db_record.assert_not_awaited()
 
 
 async def test_structured_db_memory_ranks_key_alias_and_schema_matches(tmp_path):
@@ -1893,9 +1868,9 @@ async def test_structured_db_memory_ranks_key_alias_and_schema_matches(tmp_path)
         ),
     )
 
-    results = await recall_db_memory_records(
-        memory,
+    results = await memory.backend.recall_db_records(
         "calculate revenue from orders.total",
+        source_identity=source_identity,
         limit=2,
         score_threshold=0.0,
     )
@@ -2120,7 +2095,8 @@ async def test_structured_db_memory_backfills_phase31_rows(tmp_path):
     db_path = tmp_path / "db_semantics.db"
     conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE db_memory_records (
             record_id TEXT PRIMARY KEY,
             source_identity_key TEXT NOT NULL,
@@ -2142,7 +2118,8 @@ async def test_structured_db_memory_backfills_phase31_rows(tmp_path):
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
-        """)
+        """
+    )
     cursor.execute(
         """
         INSERT INTO db_memory_records VALUES (
@@ -2214,7 +2191,8 @@ async def test_local_backend_migrates_legacy_db_memory_chunks(tmp_path):
     vector_db = workspace_dir / "vectors.db"
     conn = sqlite3.connect(str(vector_db))
     cursor = conn.cursor()
-    cursor.execute("""
+    cursor.execute(
+        """
         CREATE TABLE chunks (
             chunk_id TEXT PRIMARY KEY,
             file_path TEXT NOT NULL,
@@ -2224,7 +2202,8 @@ async def test_local_backend_migrates_legacy_db_memory_chunks(tmp_path):
             metadata TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        """)
+        """
+    )
     cursor.execute(
         "CREATE TABLE embeddings (chunk_id TEXT PRIMARY KEY, embedding TEXT NOT NULL)"
     )
@@ -3656,35 +3635,136 @@ def test_db_memory_planning_context_remains_bounded():
     assert diagnostics["omitted_reasons"]["budget"] >= 1
 
 
-async def test_db_memory_helpers_marker_lookup_uses_exact_category_listing():
+def test_runtime_memory_calibration_has_explicit_runtime_only_api():
+    signature = inspect.signature(calibrate_db_memory)
+
+    assert list(signature.parameters) == ["runtime", "source_owner", "marker_key"]
+    assert (
+        signature.parameters["runtime"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    )
+    assert signature.parameters["source_owner"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["marker_key"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert inspect.iscoroutinefunction(calibrate_db_memory)
+    assert {
+        name
+        for name, value in vars(db_memory_package).items()
+        if not name.startswith("_") and callable(value)
+    } == set()
+
+
+def test_unit_records_from_schema_are_deterministic_and_preserve_contracts():
+    schema = {
+        "tables": [
+            {
+                "name": "orders",
+                "columns": [
+                    {"name": "total_cents", "type": "INTEGER"},
+                    {"name": "discount_pct", "data_type": "DECIMAL(5, 2)"},
+                    {"name": "interest_bps", "type": "DOUBLE"},
+                    {"name": "quantity", "type": "INTEGER"},
+                    {"name": "display_cents", "type": "VARCHAR"},
+                ],
+            }
+        ]
+    }
+
+    records = unit_records_from_schema(schema)
+
+    assert [record.key for record in records] == [
+        "unit_convention:orders.total_cents",
+        "unit_convention:orders.discount_pct",
+        "unit_convention:orders.interest_bps",
+    ]
+    assert [record.kind for record in records] == ["unit_convention"] * 3
+    assert [record.metadata["unit"] for record in records] == [
+        "cents",
+        "percent",
+        "basis_points",
+    ]
+    assert [record.metadata["confidence"] for record in records] == ["high"] * 3
+    assert [record.importance for record in records] == [0.75] * 3
+    assert records[0].text == (
+        "orders.total_cents is stored as cents (confidence: high). "
+        "Reason: column name contains cents"
+    )
+    for record in records:
+        assert record.metadata["semantic_contract_status"] == "validated"
+        contract = record.metadata[DB_MEMORY_SEMANTIC_CONTRACT_KEY]
+        assert contract["contract_kind"] == "unit_convention"
+        assert contract["requirements"]["refs"] == [
+            {
+                "kind": "column",
+                "ref": f"orders.{record.metadata['column']}",
+                "role": "unit",
+            }
+        ]
+
+
+async def test_db_memory_marker_lookup_is_exact_and_source_scoped():
+    source_identity = "test:memory-runtime-source"
     backend = MagicMock()
-    backend.list_by_category = AsyncMock(
+    backend.list_db_records = AsyncMock(
         return_value=[
-            {"content": "DB exact cache marker: numeric_unit_calibration:abc"}
+            {
+                "record_id": "exact-marker",
+                "metadata": {
+                    "db_memory": {
+                        "kind": "cache_marker",
+                        "key": "numeric_unit_calibration:abc",
+                        "category": "db_cache_marker",
+                        "metadata": {"source_identity": source_identity},
+                    }
+                },
+            },
         ]
     )
-    backend.recall = AsyncMock(return_value=[])
     memory = MemoryPlugin()
     memory.backend = backend
 
-    assert await has_db_memory_marker(memory, "numeric_unit_calibration:abc") is True
-
-    backend.list_by_category.assert_awaited_once_with(
-        category="db_cache_marker",
-        limit=1000,
+    assert (
+        await has_db_memory_marker(
+            memory,
+            "numeric_unit_calibration:abc",
+            source_identity=source_identity,
+        )
+        is True
     )
-    backend.recall.assert_not_awaited()
+
+    backend.list_db_records.assert_awaited_once_with(
+        category="db_cache_marker",
+        key="numeric_unit_calibration:abc",
+        source_identity=source_identity,
+        limit=1,
+    )
+
+
+async def test_runtime_memory_calibration_reports_missing_memory_plugin():
+    runtime = _runtime_with_memory_source(SchemaInspectPlugin())
+
+    result = await calibrate_db_memory(
+        runtime,
+        source_owner="schema_probe",
+        marker_key="numeric_unit_calibration:probe",
+    )
+
+    assert result == {"calibrated": False, "reason": "memory_not_registered"}
+    assert await runtime.store.list_tasks() == []
 
 
 async def test_runtime_memory_calibration_writes_through_capability_boundary():
     backend = MagicMock()
-    backend.list_by_category = AsyncMock(return_value=[])
-    backend.remember = AsyncMock(
-        return_value={"status": "success", "chunk_id": "mem-1"}
+    backend.list_db_records = AsyncMock(return_value=[])
+    backend.upsert_db_record = AsyncMock(
+        side_effect=lambda record: {
+            "status": "created",
+            "record_id": record["key"],
+            "db_memory": record,
+            "structured": True,
+        }
     )
     memory = MemoryPlugin()
     memory.backend = backend
-    runtime = DbRuntime(plugins=(SchemaInspectPlugin(), memory))
+    runtime = _runtime_with_memory_source(SchemaInspectPlugin(), memory)
 
     result = await calibrate_db_memory(
         runtime,
@@ -3695,9 +3775,49 @@ async def test_runtime_memory_calibration_writes_through_capability_boundary():
 
     assert result["calibrated"] is True
     assert result["record_count"] == 1
-    assert backend.remember.await_count == 2
+    assert backend.upsert_db_record.await_count == 2
     assert sum(task.capability_id == "memory.semantic.write" for task in tasks) == 2
     assert any(task.capability_id == "db.schema.inspect" for task in tasks)
+
+
+async def test_runtime_memory_calibration_skips_exact_existing_marker():
+    source_identity = "test:memory-runtime-source"
+    backend = MagicMock()
+    backend.list_db_records = AsyncMock(
+        return_value=[
+            {
+                "record_id": "marker-existing",
+                "metadata": {
+                    "db_memory": {
+                        "kind": "cache_marker",
+                        "key": "numeric_unit_calibration:probe",
+                        "category": "db_cache_marker",
+                        "metadata": {"source_identity": source_identity},
+                    }
+                },
+            }
+        ]
+    )
+    backend.upsert_db_record = AsyncMock()
+    memory = MemoryPlugin()
+    memory.backend = backend
+    runtime = _runtime_with_memory_source(SchemaInspectPlugin(), memory)
+
+    result = await calibrate_db_memory(
+        runtime,
+        source_owner="schema_probe",
+        marker_key="numeric_unit_calibration:probe",
+    )
+
+    assert result == {"calibrated": False, "reason": "marker_exists"}
+    backend.list_db_records.assert_awaited_once_with(
+        category="db_cache_marker",
+        key="numeric_unit_calibration:probe",
+        source_identity=source_identity,
+        limit=1,
+    )
+    backend.upsert_db_record.assert_not_awaited()
+    assert await runtime.store.list_tasks() == []
 
 
 def test_db_memory_record_validation():

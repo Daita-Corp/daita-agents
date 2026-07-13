@@ -5,13 +5,15 @@ from __future__ import annotations
 from typing import Any
 
 from daita.db.fingerprints import persisted_fingerprint
-from daita.db.memory import (
+from ..contracts import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
+    extract_db_memory_semantic_contract,
+)
+from ..records import (
     DB_SEMANTIC_MEMORY_KINDS,
-    db_memory_pii_error,
     normalize_db_memory_record,
 )
-from daita.db.memory_contracts import extract_db_memory_semantic_contract
+from ..safety import db_memory_pii_error
 
 from .types import DB_MEMORY_MUTATION_ACTIONS, DbMemoryIntent, DbMemoryValidation
 

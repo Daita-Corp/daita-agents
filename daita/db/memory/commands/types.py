@@ -5,13 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from daita.db.memory import DB_SEMANTIC_MEMORY_KINDS
-
 DB_MEMORY_COMMAND_ACTIONS = frozenset(
     {"remember", "update", "forget", "inspect", "list"}
 )
 DB_MEMORY_MUTATION_ACTIONS = frozenset({"remember", "update"})
-DB_MEMORY_COMMAND_KINDS = frozenset(DB_SEMANTIC_MEMORY_KINDS)
 
 
 @dataclass(frozen=True)

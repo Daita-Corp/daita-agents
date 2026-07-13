@@ -12,16 +12,15 @@ from daita.runtime import Evidence, Operation, Task
 
 from ...analysis import structural_schema_fingerprint
 from ...fingerprints import persisted_fingerprint
-from ...memory import (
+from ...memory.calibration import unit_records_from_schema
+from ...memory.contracts import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
-    DBMemoryRecord,
-    db_memory_pii_error,
-    db_memory_record_chunk_ids_by_key,
-    db_memory_record_refs_known_schema,
-    normalize_db_memory_record,
-    unit_records_from_schema,
+    extract_db_memory_semantic_contract,
 )
-from ...memory_contracts import extract_db_memory_semantic_contract
+from ...memory.records import DBMemoryRecord, normalize_db_memory_record
+from ...memory.safety import db_memory_pii_error
+from ...memory.selection import db_memory_record_refs_known_schema
+from ...memory.storage import db_memory_record_ids_by_key
 from ..memory_learning import _learner_task_id_from_operation
 from ..tasks.models import DbTaskSpec
 
@@ -563,7 +562,7 @@ async def _promotion_rejection(
         return "schema_scope_mismatch"
     try:
         memory_plugin = runtime.registry.get_plugin("memory")
-        existing = await db_memory_record_chunk_ids_by_key(memory_plugin, record)
+        existing = await db_memory_record_ids_by_key(memory_plugin, record)
     except KeyError:
         return "memory_plugin_missing"
     except Exception as exc:

@@ -21,7 +21,7 @@ from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import RuntimeStore, SQLiteRuntimeStore, current_host_runtime_context
 
 from .agent import DbAgent
-from .memory import calibrate_db_memory
+from .memory.calibration import calibrate_db_memory
 from .llm_service import DbLLMConfig, db_llm_service_from_config
 from .models import (
     DbLimits,

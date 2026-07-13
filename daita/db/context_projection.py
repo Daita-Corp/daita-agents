@@ -15,11 +15,11 @@ from daita.runtime import (
     RuntimeStreamEvent,
 )
 
-from .memory import PII_COLUMN_PATTERNS, _detect_pii_value as _memory_detect_pii_value
-from .memory_contracts import (
+from .memory.contracts import (
     DB_MEMORY_SEMANTIC_CONTRACT_KEY,
     db_memory_contract_refs,
 )
+from .memory.safety import PII_COLUMN_PATTERNS, detect_pii_value
 from .models import DbOperationResult
 
 _PUBLIC_WARNING_CODE = re.compile(r"[a-z0-9_.:-]+")
@@ -1439,7 +1439,7 @@ def _value_blocked(value: Any, projection: ProjectionContext) -> bool:
         return False
     if text in projection.blocked_values:
         return True
-    return bool(_memory_detect_pii_value(text))
+    return bool(detect_pii_value(text))
 
 
 def _text_contains_blocked_or_sensitive(
@@ -1449,7 +1449,7 @@ def _text_contains_blocked_or_sensitive(
     lowered = str(text or "").lower()
     if not lowered:
         return False
-    if _memory_detect_pii_value(lowered):
+    if detect_pii_value(lowered):
         return True
     for table in projection.blocked_tables:
         if table and _ref_token_in_text(table, lowered):

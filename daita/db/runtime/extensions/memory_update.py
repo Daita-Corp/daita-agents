@@ -10,11 +10,9 @@ from daita.runtime import Evidence, Operation, Task, TaskDependency, TaskStatus
 from ...analysis import structural_schema_fingerprint
 from ...evidence import load_evidence
 from ...fingerprints import persisted_fingerprint
-from ...memory import (
-    db_memory_options_from_runtime_metadata,
-    db_memory_record_chunk_ids_by_key,
-)
-from ...memory_commands import DbMemoryCommandService
+from ...memory.commands import DbMemoryCommandService
+from ...memory.config import db_memory_options_from_runtime_metadata
+from ...memory.storage import db_memory_record_ids_by_key
 from ...models import DbRequest
 from ..tasks.models import DbTaskSpec
 
@@ -288,7 +286,7 @@ def _first_capability(runtime: Any, capability_id: str, *, owner: str | None = N
 async def _annotate_duplicate_behavior(runtime: Any, proposal: dict[str, Any]) -> bool:
     try:
         memory_plugin = runtime.registry.get_plugin("memory")
-        existing_chunk_ids = await db_memory_record_chunk_ids_by_key(
+        existing_record_ids = await db_memory_record_ids_by_key(
             memory_plugin,
             dict(proposal.get("record") or {}),
         )
@@ -308,12 +306,12 @@ async def _annotate_duplicate_behavior(runtime: Any, proposal: dict[str, Any]) -
     else:
         validation_payload = dict(proposal.get("validation") or {})
         diagnostics = dict(validation_payload.get("diagnostics") or {})
-        diagnostics["existing_chunk_ids"] = list(existing_chunk_ids)
-        diagnostics["commit_behavior"] = "update" if existing_chunk_ids else "create"
+        diagnostics["existing_chunk_ids"] = list(existing_record_ids)
+        diagnostics["commit_behavior"] = "update" if existing_record_ids else "create"
         validation_payload["diagnostics"] = diagnostics
         proposal["validation"] = validation_payload
-        proposal["existing_chunk_ids"] = list(existing_chunk_ids)
-        proposal["commit_behavior"] = "update" if existing_chunk_ids else "create"
+        proposal["existing_chunk_ids"] = list(existing_record_ids)
+        proposal["commit_behavior"] = "update" if existing_record_ids else "create"
         accepted = True
     proposal["proposal_fingerprint"] = persisted_fingerprint(
         {key: value for key, value in proposal.items() if key != "proposal_fingerprint"}

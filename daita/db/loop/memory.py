@@ -10,10 +10,8 @@ from daita.runtime import Evidence, Operation
 from ..analysis import structural_schema_fingerprint
 from ..context_projection import policy_summary_from_source
 from ..fingerprints import persisted_fingerprint
-from ..memory import (
-    db_memory_options_from_runtime_metadata,
-    db_memory_planning_recall_decision,
-)
+from ..memory.config import db_memory_options_from_runtime_metadata
+from ..memory.recall import db_memory_planning_recall_decision
 from ..models import DbIntentKind
 from ..planner_protocol import DbLoopState, DbPlannerAction, DbPlannerActionKind
 from .actions import _summary_id
