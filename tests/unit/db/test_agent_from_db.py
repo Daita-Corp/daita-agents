@@ -27,6 +27,7 @@ from daita.db.models import (
     DbOperationResult,
 )
 from daita.db.runtime.extensions import HostedInAppMonitorDeliveryPlugin
+from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.embeddings.mock import MockEmbeddingProvider
 from daita.plugins.catalog.persistence import catalog_profile_key
 from daita.plugins import PluginKind, PluginManifest
@@ -45,6 +46,7 @@ from daita.runtime import (
     RuntimeEventType,
     SQLiteRuntimeStore,
     Task,
+    TaskDependency,
     TaskStatus,
     host_runtime_context,
 )
@@ -516,11 +518,78 @@ async def test_agent_from_db_consumes_host_runtime_extensions_before_setup(tmp_p
             "monitor.delivery.in_app",
             owner="hosted_monitor_delivery",
         )
-        proposal_evidence = await agent.runtime.execute_capability(
-            "db.monitor.plan_create",
-            owner="db_runtime",
+        catalog_store_id = agent.runtime.config.metadata["from_db_options"][
+            "catalog_store_id"
+        ]
+        schema_evidence = await agent.runtime.execute_capability(
+            "db.schema.inspect",
+            owner="sqlite",
+            operation_type="schema.query",
+            input={},
+        )
+        catalog = agent.runtime.registry.get_plugin("catalog")
+        await catalog.register_schema(
+            schema_evidence[0].payload,
+            store_type="sqlite",
+            store_id=catalog_store_id,
+            persist=False,
+        )
+        operation = await agent.runtime.kernel.create_operation(
             operation_type="monitor.create",
-            input={"proposal": _hosted_monitor_proposal()},
+            request={"prompt": "create hosted monitor"},
+            required_evidence=frozenset({"monitor.proposal"}),
+            evaluate_governance=False,
+        )
+        inspect_plan = await agent.runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="catalog.asset.inspect",
+                    owner="catalog",
+                    input={
+                        "store_id": catalog_store_id,
+                        "asset_ref": "orders",
+                        "limit": 100,
+                        "include_relationships": True,
+                    },
+                    reason="hosted_monitor_catalog_prerequisite",
+                ),
+            ),
+        )
+        inspect_task = inspect_plan.tasks[0]
+        await agent.runtime.execute_task(inspect_task, operation)
+        proposal_plan = await agent.runtime.plan_task_specs(
+            operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.monitor.plan_create",
+                    owner="db_runtime",
+                    input={
+                        "proposal": _hosted_monitor_proposal(),
+                        "catalog_asset_name": "orders",
+                        "catalog_asset_ref": "orders",
+                        "catalog_store_id": catalog_store_id,
+                        "source_scope": ["orders"],
+                    },
+                    reason="hosted_monitor_plan",
+                    dependencies=(
+                        TaskDependency(
+                            kind="evidence",
+                            evidence_kind="schema.asset_profile",
+                            evidence_owner="catalog",
+                            producer_task_id=inspect_task.id,
+                            producer_capability_id="catalog.asset.inspect",
+                            producer_executor_id="catalog.inspect_asset",
+                            evidence_accepted=True,
+                            input_hash=inspect_task.metadata["input_hash"],
+                            operation_id=operation.id,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        proposal_evidence = await agent.runtime.execute_task(
+            proposal_plan.tasks[0], operation
         )
         assert calls == []
         evidence = await agent.runtime.execute_capability(

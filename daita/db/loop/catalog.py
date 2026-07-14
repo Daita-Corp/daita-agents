@@ -29,6 +29,7 @@ def _state_can_use_catalog_structure(state: DbLoopState) -> bool:
         DbIntentKind.DATA_QUERY.value,
         DbIntentKind.CATALOG_ASSISTED_DATA_QUERY.value,
         "query.plan",
+        "monitor.create",
     }
 
 

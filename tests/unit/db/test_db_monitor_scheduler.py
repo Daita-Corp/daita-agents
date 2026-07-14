@@ -21,6 +21,7 @@ from daita.db.monitor_commands import DbMonitorValidation
 from daita.db.monitor_scheduler.observation import (
     _cursor_updates_from_plan as _observation_cursor_updates_from_plan,
 )
+from daita.db.monitor_scheduler.params import resolve_observation_params
 from daita.db.monitor_scheduler.state import (
     _cursor_updates_from_plan as _state_cursor_updates_from_plan,
 )
@@ -44,6 +45,36 @@ from daita.runtime import (
 )
 
 NOW = datetime(2026, 6, 12, 12, 0, tzinfo=timezone.utc)
+
+
+def test_observation_parameters_preserve_grounding_evidence_and_typed_literals():
+    params, specs = resolve_observation_params(
+        {
+            "parameters": [
+                {
+                    "value": "pending",
+                    "source": "catalog_value_hint",
+                    "table": "orders",
+                    "column": "status",
+                    "db_type": "TEXT",
+                    "native_type": "string",
+                    "dialect": "sqlite",
+                    "evidence_ids": ["hint-orders-status"],
+                },
+                {
+                    "ref": "monitor.state.cursor.last_id",
+                    "source": "monitor_state",
+                    "path": ["cursor", "last_id"],
+                },
+            ]
+        },
+        DbMonitorState(monitor_id="orders-watch", cursor={"last_id": 42}),
+    )
+
+    assert params == ["pending", 42]
+    assert specs[0]["evidence_ids"] == ["hint-orders-status"]
+    assert specs[0]["value"] == "pending"
+    assert specs[1]["ref"] == "monitor.state.cursor.last_id"
 
 
 async def test_sqlite_monitor_store_does_not_block_the_event_loop(

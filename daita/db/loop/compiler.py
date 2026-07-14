@@ -90,6 +90,157 @@ from .summaries import (
 )
 from .types import DbActionCompilation
 
+_MONITOR_CATALOG_CANDIDATE_LIMIT = 8
+_MONITOR_CATALOG_TEXT_LIMIT = 256
+
+
+def _bounded_monitor_catalog_text(value: Any) -> str:
+    return str(value or "")[:_MONITOR_CATALOG_TEXT_LIMIT]
+
+
+def _monitor_catalog_asset_selection(
+    action: DbPlannerAction,
+    state: DbLoopState,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    intent = action.input.get("intent")
+    target = intent.get("target") if isinstance(intent, Mapping) else None
+    target = target if isinstance(target, Mapping) else {}
+    target_name = str(target.get("name") or "")
+    if not target_name:
+        return None, _monitor_catalog_selection_error(
+            action,
+            state,
+            "monitor_target_name_required",
+        )
+    assets = [
+        item
+        for item in state.catalog_context.get("assets") or ()
+        if isinstance(item, Mapping)
+    ]
+    matches = [
+        item
+        for item in assets
+        if target_name
+        in {
+            str(item.get("name") or ""),
+            str(item.get("asset_ref") or ""),
+        }
+    ]
+    if not matches:
+        return None, _monitor_catalog_selection_error(
+            action,
+            state,
+            "monitor_target_not_canonical",
+        )
+    if len(matches) != 1:
+        return None, _monitor_catalog_selection_error(
+            action,
+            state,
+            "monitor_target_catalog_store_ambiguous",
+        )
+    selected = matches[0]
+    supporting_ids = tuple(
+        str(item) for item in selected.get("evidence_ids") or () if str(item)
+    )
+    cited_ids = tuple(str(item) for item in target.get("evidence") or () if str(item))
+    if not cited_ids:
+        return None, _monitor_catalog_selection_error(
+            action,
+            state,
+            "monitor_target_catalog_evidence_required",
+        )
+    if not supporting_ids or any(item not in supporting_ids for item in cited_ids):
+        return None, _monitor_catalog_selection_error(
+            action,
+            state,
+            "monitor_target_catalog_evidence_unrelated",
+        )
+    store_ids = tuple(
+        str(item)
+        for item in (
+            selected.get("catalog_store_ids")
+            or (
+                (selected.get("catalog_store_id"),)
+                if selected.get("catalog_store_id")
+                else ()
+            )
+        )
+        if str(item)
+    )
+    projected_store_count = selected.get("catalog_store_count")
+    if (
+        len(set(store_ids)) != 1
+        or (isinstance(projected_store_count, int) and projected_store_count != 1)
+        or bool(selected.get("catalog_stores_truncated"))
+    ):
+        return None, _monitor_catalog_selection_error(
+            action,
+            state,
+            "monitor_target_catalog_store_ambiguous",
+        )
+    asset_name = str(selected.get("name") or "")
+    asset_ref = str(selected.get("asset_ref") or asset_name)
+    if not asset_name or not asset_ref:
+        return None, _monitor_catalog_selection_error(
+            action,
+            state,
+            "monitor_target_not_canonical",
+        )
+    return (
+        {
+            "asset_name": asset_name,
+            "asset_ref": asset_ref,
+            "store_id": store_ids[0],
+            "evidence_ids": cited_ids,
+        },
+        None,
+    )
+
+
+def _monitor_catalog_selection_error(
+    action: DbPlannerAction,
+    state: DbLoopState,
+    error: str,
+) -> dict[str, Any]:
+    assets = [
+        item
+        for item in state.catalog_context.get("assets") or ()
+        if isinstance(item, Mapping)
+    ]
+    candidates = []
+    for item in assets[:_MONITOR_CATALOG_CANDIDATE_LIMIT]:
+        candidate = {
+            "asset_ref": _bounded_monitor_catalog_text(item.get("asset_ref")),
+            "name": _bounded_monitor_catalog_text(item.get("name")),
+            "evidence_ids": [
+                _bounded_monitor_catalog_text(value)
+                for value in item.get("evidence_ids") or ()
+                if str(value)
+            ][:_MONITOR_CATALOG_CANDIDATE_LIMIT],
+            "catalog_store_ids": [
+                _bounded_monitor_catalog_text(value)
+                for value in item.get("catalog_store_ids") or ()
+                if str(value)
+            ][:_MONITOR_CATALOG_CANDIDATE_LIMIT],
+        }
+        if item.get("catalog_store_id") and not candidate["catalog_store_ids"]:
+            candidate["catalog_store_ids"] = [
+                _bounded_monitor_catalog_text(item["catalog_store_id"])
+            ]
+        candidates.append(candidate)
+    candidate_count = state.catalog_context.get("candidate_count")
+    if not isinstance(candidate_count, int) or isinstance(candidate_count, bool):
+        candidate_count = len(assets)
+    return {
+        **_action_error(action, error),
+        "catalog_candidates": candidates,
+        "candidate_count": candidate_count,
+        "included_candidate_count": len(candidates),
+        "candidates_truncated": bool(
+            state.catalog_context.get("truncated") or candidate_count > len(candidates)
+        ),
+    }
+
 
 class DbActionCompiler:
     def __init__(
@@ -1395,6 +1546,8 @@ class DbActionCompiler:
         decision_fingerprint: str,
         upstream_dependencies: tuple[TaskDependency, ...] = (),
         force_relationship_scope: tuple[list[str], list[str]] | None = None,
+        consumer_capability_id: str = "db.planning.context.build",
+        selected_catalog_asset: Mapping[str, Any] | None = None,
     ) -> tuple[
         list[DbTaskSpec],
         list[dict[str, Any]],
@@ -1403,7 +1556,12 @@ class DbActionCompiler:
     ]:
         if not _state_can_use_catalog_structure(state):
             return [], [], [], []
-        if not _catalog_capability_present(state, "catalog.schema.search"):
+        required_catalog_capability = (
+            "catalog.asset.inspect"
+            if selected_catalog_asset is not None
+            else "catalog.schema.search"
+        )
+        if not _catalog_capability_present(state, required_catalog_capability):
             return [], [], [], []
 
         specs: list[DbTaskSpec] = []
@@ -1443,7 +1601,7 @@ class DbActionCompiler:
                         **_action_metadata(action, decision_fingerprint),
                         "runtime_prerequisite": True,
                         "catalog_structure": "planning",
-                        "prerequisite_for": "db.planning.context.build",
+                        "prerequisite_for": consumer_capability_id,
                     },
                     deterministic_key=deterministic_key,
                 ),
@@ -1455,10 +1613,29 @@ class DbActionCompiler:
                 capability=capability,
                 operation_id=state.operation_id,
                 action_id=action.action_id,
-                consumer_capability_id="db.planning.context.build",
+                consumer_capability_id=consumer_capability_id,
             )
             dependencies.append(dependency)
             return dependency
+
+        if selected_catalog_asset is not None:
+            asset_ref = str(selected_catalog_asset["asset_ref"])
+            store_id = str(selected_catalog_asset["store_id"])
+            add_spec(
+                "catalog.asset.inspect",
+                task_input={
+                    "store_id": store_id,
+                    "asset_ref": asset_ref,
+                    "limit": 100,
+                    "include_relationships": True,
+                },
+                reason="runtime_prerequisite:catalog_asset_inspect",
+                deterministic_key=(
+                    f"{action.action_id}:catalog.asset.inspect:{store_id}:{asset_ref}"
+                ),
+                extra_dependencies=upstream_dependencies,
+            )
+            return specs, selected, dependencies, errors
 
         if not _state_has_catalog_structural_evidence(state, "schema.search_result"):
             search_query = _catalog_search_query(action, state)
@@ -1551,24 +1728,81 @@ class DbActionCompiler:
         if evidence_error is not None:
             return [], [], [_action_error(action, evidence_error)]
         task_input = _task_input_for_action(action)
+        prerequisite_specs: list[DbTaskSpec] = []
+        prerequisite_selected: list[dict[str, Any]] = []
+        prerequisite_dependencies: list[TaskDependency] = []
+        if action.kind is DbPlannerActionKind.PLAN_MONITOR_CREATE:
+            catalog_asset, catalog_error = _monitor_catalog_asset_selection(
+                action,
+                state,
+            )
+            if catalog_error is not None or catalog_asset is None:
+                return (
+                    [],
+                    [],
+                    [catalog_error or _action_error(action, "missing_catalog_asset")],
+                )
+            (
+                prerequisite_specs,
+                prerequisite_selected,
+                prerequisite_dependencies,
+                prerequisite_errors,
+            ) = self._catalog_structure_prerequisite_specs(
+                action,
+                state=state,
+                sequence_start=sequence_start,
+                decision_fingerprint=decision_fingerprint,
+                consumer_capability_id=capability.id,
+                selected_catalog_asset=catalog_asset,
+            )
+            if prerequisite_errors:
+                return [], [], prerequisite_errors
+            if len(prerequisite_specs) != 1 or len(prerequisite_dependencies) != 1:
+                return (
+                    [],
+                    [],
+                    [
+                        _monitor_catalog_selection_error(
+                            action,
+                            state,
+                            "monitor_target_catalog_inspection_unavailable",
+                        )
+                    ],
+                )
+            asset_name = str(catalog_asset["asset_name"])
+            intent_input = dict(task_input.get("intent") or {})
+            target_input = dict(intent_input.get("target") or {})
+            target_input["name"] = asset_name
+            target_input["source_scope"] = [asset_name]
+            intent_input["target"] = target_input
+            task_input["intent"] = intent_input
+            task_input["catalog_asset_name"] = asset_name
+            task_input["catalog_asset_ref"] = catalog_asset["asset_ref"]
+            task_input["catalog_store_id"] = catalog_asset["store_id"]
+            task_input["catalog_selection_evidence_ids"] = list(
+                catalog_asset["evidence_ids"]
+            )
+            task_input["source_scope"] = [asset_name]
         spec = DbTaskSpec(
             capability_id=capability.id,
             owner=capability.owner,
             input=task_input,
             reason=f"planner:{action.kind.value}",
-            sequence=sequence_start,
+            sequence=sequence_start + len(prerequisite_specs),
+            dependencies=tuple(prerequisite_dependencies),
             metadata=_action_metadata(action, decision_fingerprint),
             deterministic_key=f"{action.action_id}:{capability.id}",
         )
         spec = _with_deterministic_task_id(state.operation_id, spec)
         return (
-            [spec],
+            [*prerequisite_specs, spec],
             [
+                *prerequisite_selected,
                 _capability_selection(
                     capability,
                     action,
                     output_evidence=(expected_evidence,),
-                )
+                ),
             ],
             [],
         )

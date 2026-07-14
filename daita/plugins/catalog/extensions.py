@@ -90,7 +90,12 @@ def catalog_capabilities() -> tuple[Capability, ...]:
             description="Inspect one bounded catalog asset.",
             domains=frozenset({"db"}),
             operation_types=frozenset(
-                {"schema.query", "schema.relationship_query", "data.query"}
+                {
+                    "schema.query",
+                    "schema.relationship_query",
+                    "data.query",
+                    "monitor.create",
+                }
             ),
             access=AccessMode.METADATA_READ,
             risk=RiskLevel.LOW,
@@ -525,6 +530,7 @@ class CatalogExecutor:
                 owner="catalog",
                 operation_id=operation.id,
                 task_id=task.id,
+                accepted=payload.get("success") is not False,
                 payload=payload,
             )
         ]

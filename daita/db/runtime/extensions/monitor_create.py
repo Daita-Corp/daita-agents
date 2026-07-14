@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Mapping, TYPE_CHECKING
-from uuid import uuid4
 
 from daita.runtime import Evidence, Operation, Task
 
 from ...fingerprints import persisted_fingerprint
+from ...planning_context import catalog_schema_from_evidence
 from ...monitor_commands.planner import (
     DbMonitorPlanner,
     _monitor_from_proposal,
@@ -16,7 +16,6 @@ from ...monitor_commands.planner import (
 )
 from ...monitor_commands.types import DbMonitorCommand, DbMonitorValidation
 from ...monitors import DbMonitorMutation, DbMonitorState
-from ..tasks.models import DbTaskSpec
 from .monitor_evidence import load_monitor_proposal_evidence
 
 if TYPE_CHECKING:
@@ -63,12 +62,21 @@ class DbMonitorPlanCreateExecutor:
             else (intent.target.name if intent is not None else None)
         )
         target = str(raw_target or "")
-        schema_evidence = await _inspect_monitor_target_schema(
-            runtime,
-            operation,
-            target=target,
+        schema_evidence, catalog_schema, catalog_errors = (
+            await _catalog_asset_dependency_evidence(
+                runtime,
+                operation,
+                task,
+                target=target,
+            )
         )
-        if proposal_input is not None:
+        if catalog_errors:
+            proposal, validation = _blocked_catalog_dependency(
+                task_input,
+                target=target,
+                errors=catalog_errors,
+            )
+        elif proposal_input is not None:
             proposal, validation = planner.create_structured_proposal(
                 proposal_input,
                 source_scope=source_scope,
@@ -78,6 +86,12 @@ class DbMonitorPlanCreateExecutor:
                 ),
             )
         elif intent is not None:
+            grounding_evidence_by_id = await _grounding_evidence_by_id(
+                runtime,
+                operation,
+                intent.to_dict().get("observation"),
+                schema_evidence=schema_evidence,
+            )
             command = DbMonitorCommand(
                 kind="create",
                 monitor_id=_optional_string(task_input.get("monitor_id")),
@@ -91,20 +105,28 @@ class DbMonitorPlanCreateExecutor:
                 command,
                 source_scope=source_scope,
                 owner=dict(task.input.get("owner") or {}),
-                schema=(
-                    schema_evidence.payload if schema_evidence is not None else None
-                ),
+                schema=catalog_schema,
                 schema_evidence_id=(
                     schema_evidence.id if schema_evidence is not None else None
                 ),
                 intent=intent,
+                grounding_evidence_by_id=grounding_evidence_by_id,
             )
         else:
             proposal, validation = _blocked_structured_input_required(task_input)
+        if schema_evidence is not None:
+            metadata = proposal.setdefault("metadata", {})
+            metadata["schema_evidence_id"] = schema_evidence.id
+            metadata["catalog_selection_evidence_ids"] = list(
+                task_input.get("catalog_selection_evidence_ids") or ()
+            )
+            proposal.pop("proposal_fingerprint", None)
+            metadata.pop("proposal_fingerprint", None)
         fingerprint = str(
             proposal.get("proposal_fingerprint") or persisted_fingerprint(proposal)
         )
         proposal.setdefault("proposal_fingerprint", fingerprint)
+        proposal.setdefault("metadata", {})["proposal_fingerprint"] = fingerprint
         proposal.setdefault("kind", "monitor.proposal")
         proposal["validation"] = validation.to_dict()
         return [
@@ -304,71 +326,191 @@ class DbMonitorCommitCreateExecutor:
         ]
 
 
-async def _inspect_monitor_target_schema(
+async def _catalog_asset_dependency_evidence(
     runtime: Any,
     operation: Operation,
+    task: Task,
     *,
     target: str,
-) -> Evidence | None:
-    cached = runtime.cached_schema_evidence(operation_id=operation.id)
-    if cached is not None:
-        return await _persist_monitor_schema_evidence(runtime, operation, cached)
-    persisted = runtime.persisted_schema_evidence(operation_id=operation.id)
-    if persisted is not None:
-        return await _persist_monitor_schema_evidence(runtime, operation, persisted)
-    capability = _first_capability(runtime, "db.schema.inspect")
-    if capability is None:
-        return None
-    plan = await runtime.plan_task_specs(
-        operation,
+) -> tuple[Evidence | None, dict[str, Any] | None, tuple[str, ...]]:
+    dependencies = [
+        item
+        for item in task.dependencies
+        if item.kind_value == "evidence"
+        and item.evidence_kind == "schema.asset_profile"
+    ]
+    if len(dependencies) != 1:
+        return None, None, ("monitor.catalog_dependency_required",)
+    dependency = dependencies[0]
+    if (
+        dependency.evidence_owner != "catalog"
+        or dependency.producer_task_id is None
+        or dependency.producer_capability_id != "catalog.asset.inspect"
+        or dependency.producer_executor_id != "catalog.inspect_asset"
+        or dependency.input_hash is None
+        or dependency.evidence_accepted is not True
+        or dependency.operation_id != operation.id
+    ):
+        return None, None, ("monitor.catalog_dependency_identity_mismatch",)
+    producer = await runtime.store.load_task(dependency.producer_task_id)
+    if producer is None:
+        return None, None, ("monitor.catalog_dependency_task_missing",)
+    if (
+        producer.operation_id != operation.id
+        or producer.capability_id != dependency.producer_capability_id
+        or producer.executor_id != dependency.producer_executor_id
+        or producer.metadata.get("owner") != dependency.evidence_owner
+        or producer.metadata.get("input_hash") != dependency.input_hash
+    ):
+        return None, None, ("monitor.catalog_dependency_identity_mismatch",)
+    selected = await runtime.tasks.accepted_evidence_for_dependency(
+        operation.id,
+        dependency,
+    )
+    if selected is None:
+        return None, None, ("monitor.catalog_dependency_evidence_missing",)
+    if selected.payload.get("success") is False:
+        return None, None, ("monitor.catalog_dependency_evidence_rejected",)
+
+    expected_asset_ref = str(task.input.get("catalog_asset_ref") or "")
+    expected_asset_name = str(task.input.get("catalog_asset_name") or "")
+    expected_store = str(task.input.get("catalog_store_id") or "")
+    producer_asset_ref = str(producer.input.get("asset_ref") or "")
+    producer_store = str(producer.input.get("store_id") or "")
+    payload = selected.payload
+    asset = payload.get("asset")
+    asset = asset if isinstance(asset, Mapping) else {}
+    evidence_asset_name = str(asset.get("name") or payload.get("name") or "")
+    evidence_asset_ref = str(
+        asset.get("asset_ref") or payload.get("asset_ref") or evidence_asset_name
+    )
+    evidence_store = str(payload.get("store_id") or asset.get("store_id") or "")
+    if (
+        not target
+        or not expected_asset_ref
+        or not expected_asset_name
+        or not expected_store
+        or target != expected_asset_name
+        or producer_asset_ref != expected_asset_ref
+        or producer_store != expected_store
+        or evidence_asset_ref != expected_asset_ref
+        or evidence_asset_name != expected_asset_name
+        or evidence_store != expected_store
+    ):
+        return None, None, ("monitor.catalog_dependency_selection_mismatch",)
+    source_scopes: list[tuple[str, ...]] = []
+    raw_intent = task.input.get("intent")
+    intent_target = (
+        raw_intent.get("target") if isinstance(raw_intent, Mapping) else None
+    )
+    if isinstance(intent_target, Mapping) and intent_target.get("source_scope"):
+        source_scopes.append(
+            tuple(str(item) for item in intent_target.get("source_scope") or ())
+        )
+    structured_proposal = _structured_proposal_input(dict(task.input))
+    if structured_proposal is not None and structured_proposal.get("source_scope"):
+        source_scopes.append(
+            tuple(str(item) for item in structured_proposal.get("source_scope") or ())
+        )
+    if task.input.get("source_scope"):
+        source_scopes.append(
+            tuple(str(item) for item in task.input.get("source_scope") or ())
+        )
+    if not source_scopes or any(set(scope) != {target} for scope in source_scopes):
+        return None, None, ("monitor.catalog_dependency_source_scope_mismatch",)
+    schema = catalog_schema_from_evidence((selected,), ())
+    normalized_assets = {
         (
-            DbTaskSpec(
-                capability_id=capability.id,
-                owner=capability.owner,
-                input={"tables": [target] if target else []},
-                reason="monitor_create_schema_context",
-                sequence=0,
-                metadata={"target_table": target},
+            str(item.get("name") or ""),
+            str(
+                (item.get("metadata") or {}).get("catalog_asset_ref")
+                if isinstance(item.get("metadata"), Mapping)
+                else ""
             ),
-        ),
-    )
-    evidence = await runtime.execute_task(plan.tasks[0], operation)
-    schema_evidence = next(
-        (item for item in evidence if item.kind == "schema.asset_profile"),
-        None,
-    )
-    if schema_evidence is not None:
-        runtime.remember_schema_evidence(schema_evidence)
-    return schema_evidence
+        )
+        for item in schema.get("tables") or ()
+        if isinstance(item, Mapping)
+    }
+    if (expected_asset_name, expected_asset_ref) not in normalized_assets:
+        return None, None, ("monitor.catalog_dependency_target_mismatch",)
+    return selected, schema, ()
 
 
-async def _persist_monitor_schema_evidence(
+async def _grounding_evidence_by_id(
     runtime: Any,
     operation: Operation,
-    evidence: Evidence,
-) -> Evidence:
-    persisted = Evidence(
-        id=evidence.id or f"monitor-schema-{uuid4()}",
-        kind=evidence.kind,
-        owner=evidence.owner,
-        operation_id=operation.id,
-        accepted=evidence.accepted,
-        payload=dict(evidence.payload),
-        metadata={
-            **dict(evidence.metadata),
-            "monitor_planning_schema_context": True,
-        },
+    observation: Any,
+    *,
+    schema_evidence: Evidence | None,
+) -> dict[str, dict[str, Any]]:
+    raw_filters = observation.get("filters") if isinstance(observation, Mapping) else ()
+    evidence_ids = {
+        str(evidence_id)
+        for item in (raw_filters or ())
+        if isinstance(item, Mapping)
+        for evidence_id in item.get("evidence_ids") or ()
+        if str(evidence_id)
+    }
+    if schema_evidence is not None and schema_evidence.id:
+        evidence_ids.add(schema_evidence.id)
+    return {
+        item.id: {
+            "id": item.id,
+            "kind": item.kind,
+            "owner": item.owner,
+            "accepted": item.accepted,
+            "payload": dict(item.payload),
+        }
+        for item in await runtime.store.list_evidence(operation.id)
+        if item.id in evidence_ids
+    }
+
+
+def _blocked_catalog_dependency(
+    data: dict[str, Any],
+    *,
+    target: str,
+    errors: tuple[str, ...],
+) -> tuple[dict[str, Any], DbMonitorValidation]:
+    validation = DbMonitorValidation(
+        accepted=False,
+        errors=errors,
+        diagnostics={"catalog_dependency": "rejected"},
     )
-    await runtime.store.save_evidence(persisted)
-    return persisted
+    proposal: dict[str, Any] = {
+        "kind": "monitor.proposal",
+        "monitor_id": _optional_string(data.get("monitor_id")) or "db_monitor",
+        "name": _optional_string(data.get("name")) or "DB Monitor",
+        "description": "",
+        "status": "blocked",
+        "target_type": "table",
+        "target_name": target,
+        "source_scope": list(_monitor_create_source_scope_from_input(data)),
+        "schedule": None,
+        "stream": None,
+        "trigger": {},
+        "observation_plan": {},
+        "action_plan": {"kind": "none", "steps": []},
+        "initial_state": {},
+        "policy": {},
+        "budgets": {},
+        "owner": dict(data.get("owner") or {}),
+        "runtime_limits": {},
+        "governance": {"approval_required": False, "risk": "low"},
+        "metadata": {
+            "created_from_structured_planner_action": True,
+            "validation": validation.to_dict(),
+        },
+        "validation": validation.to_dict(),
+    }
+    proposal["proposal_fingerprint"] = persisted_fingerprint(proposal)
+    proposal["metadata"]["proposal_fingerprint"] = proposal["proposal_fingerprint"]
+    return proposal, validation
 
 
-def _first_capability(runtime: Any, capability_id: str) -> Any | None:
-    matches = [
-        capability
-        for capability in runtime.registry.capabilities
-        if capability.id == capability_id
-    ]
-    if not matches:
-        return None
-    return sorted(matches, key=lambda item: item.owner)[0]
+def _monitor_create_source_scope_from_input(data: Mapping[str, Any]) -> tuple[str, ...]:
+    intent = data.get("intent")
+    target = intent.get("target") if isinstance(intent, Mapping) else None
+    if isinstance(target, Mapping) and target.get("source_scope"):
+        return tuple(str(item) for item in target.get("source_scope") or ())
+    return tuple(str(item) for item in data.get("source_scope") or ())

@@ -23,6 +23,7 @@ class MonitorObservationParamSpec:
     native_type: str | None = None
     dialect: str | None = None
     nullable: bool | None = None
+    evidence_ids: tuple[str, ...] = ()
     value: Any = _MISSING
 
     @property
@@ -62,6 +63,8 @@ class MonitorObservationParamSpec:
             payload["dialect"] = self.dialect
         if self.nullable is not None:
             payload["nullable"] = self.nullable
+        if self.evidence_ids:
+            payload["evidence_ids"] = list(self.evidence_ids)
         if self.has_value:
             payload["value"] = self.value
         return payload
@@ -95,6 +98,9 @@ def normalize_observation_param_spec(value: Any) -> MonitorObservationParamSpec:
                 payload.get("dialect") or payload.get("sql_dialect")
             ),
             nullable=nullable,
+            evidence_ids=tuple(
+                str(item) for item in payload.get("evidence_ids") or () if str(item)
+            ),
             value=literal,
         )
     raise TypeError(

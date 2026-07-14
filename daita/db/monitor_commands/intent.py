@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
+
+_OBSERVATION_MAPPING_LIMIT = 8
+_OBSERVATION_FILTER_LIMIT = 8
+_OBSERVATION_EVIDENCE_LIMIT = 8
+_OBSERVATION_STRING_LIMIT = 256
 
 
 @dataclass(frozen=True)
@@ -187,6 +192,7 @@ class MonitorCreateIntent:
     condition: MonitorConditionIntent
     schedule: MonitorScheduleIntent | None
     delivery: MonitorDeliveryRequest | None
+    observation: dict[str, Any] = field(default_factory=dict)
     action: MonitorActionIntent = field(default_factory=MonitorActionIntent)
     display: MonitorDisplayIntent = field(default_factory=MonitorDisplayIntent)
     policy: MonitorPolicyIntent = field(default_factory=MonitorPolicyIntent)
@@ -196,6 +202,11 @@ class MonitorCreateIntent:
 
     def __post_init__(self) -> None:
         _validate_confidence(self.confidence)
+        object.__setattr__(
+            self,
+            "observation",
+            _bounded_observation_mapping(self.observation),
+        )
         object.__setattr__(self, "diagnostics", dict(self.diagnostics))
 
     def to_dict(self) -> dict[str, Any]:
@@ -204,6 +215,7 @@ class MonitorCreateIntent:
             "condition": self.condition.to_dict(),
             "schedule": None if self.schedule is None else self.schedule.to_dict(),
             "delivery": None if self.delivery is None else self.delivery.to_dict(),
+            "observation": _bounded_observation_mapping(self.observation),
             "action": self.action.to_dict(),
             "display": self.display.to_dict(),
             "policy": self.policy.to_dict(),
@@ -216,3 +228,52 @@ class MonitorCreateIntent:
 def _validate_confidence(value: float) -> None:
     if not 0 <= value <= 1:
         raise ValueError("confidence must be between 0 and 1")
+
+
+def _bounded_observation_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy the planner-owned observation shape without retaining unbounded input."""
+    raw = dict(value)
+    result: dict[str, Any] = {}
+    for raw_key, raw_value in list(raw.items())[:_OBSERVATION_MAPPING_LIMIT]:
+        key = str(raw_key)[:_OBSERVATION_STRING_LIMIT]
+        if key != "filters":
+            result[key] = _bounded_observation_value(raw_value)
+            continue
+        filters = raw_value
+        if not isinstance(filters, (list, tuple)):
+            result[key] = _bounded_observation_value(filters)
+            continue
+        result[key] = [
+            _bounded_observation_value(item)
+            for item in filters[:_OBSERVATION_FILTER_LIMIT]
+        ]
+        if len(filters) > _OBSERVATION_FILTER_LIMIT:
+            result["_filters_truncated"] = True
+    if len(raw) > _OBSERVATION_MAPPING_LIMIT:
+        result["_mapping_truncated"] = True
+    return result
+
+
+def _bounded_observation_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 3:
+        return str(value)[:_OBSERVATION_STRING_LIMIT]
+    if isinstance(value, str):
+        return value[:_OBSERVATION_STRING_LIMIT]
+    if isinstance(value, Mapping):
+        return {
+            str(key)[:_OBSERVATION_STRING_LIMIT]: _bounded_observation_value(
+                item,
+                depth=depth + 1,
+            )
+            for key, item in list(value.items())[:_OBSERVATION_MAPPING_LIMIT]
+        }
+    if isinstance(value, (list, tuple)):
+        limit = (
+            _OBSERVATION_EVIDENCE_LIMIT
+            if all(isinstance(item, str) for item in value)
+            else _OBSERVATION_MAPPING_LIMIT
+        )
+        return [
+            _bounded_observation_value(item, depth=depth + 1) for item in value[:limit]
+        ]
+    return value

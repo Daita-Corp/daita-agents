@@ -17,7 +17,8 @@ from ..monitor_plugin_planning import (
     MonitorPluginPlanningBlocked,
 )
 from ..monitors import DbMonitor
-from ..query_metadata import column_name, is_numeric_type, matching_tables
+from ..planning_context import planner_eligible_column_value_hint
+from ..query_metadata import column_name, is_numeric_type, matching_tables, table_name
 from ...core.db_type_metadata import column_type_metadata
 from .intent import (
     MonitorActionIntent,
@@ -78,6 +79,7 @@ class DbMonitorPlanner:
         schema: dict[str, Any] | None = None,
         schema_evidence_id: str | None = None,
         intent: MonitorCreateIntent | None = None,
+        grounding_evidence_by_id: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> tuple[dict[str, Any], DbMonitorValidation]:
         """Plan a prompt-created monitor as an executable proposal."""
         if command.kind != "create":
@@ -94,7 +96,6 @@ class DbMonitorPlanner:
             if intent.schedule is not None
             else {"interval_seconds": 300}
         )
-        trigger = _trigger_from_condition(intent.condition)
         budgets = intent.budget.to_dict()
         policy = intent.policy.to_dict()
         action_steps = intent.action.steps
@@ -103,11 +104,22 @@ class DbMonitorPlanner:
         effective_scope = tuple(intent.target.source_scope or source_scope or ())
         if not effective_scope and target:
             effective_scope = (target,)
-        observation_plan, initial_cursor = _planned_read_observation_plan(
-            target,
-            budgets=budgets,
-            schema=schema,
-            registry=self.registry,
+        observation_value_path = str(intent.observation.get("value_path") or "rows")
+        trigger, trigger_errors = _trigger_from_condition(
+            intent.condition,
+            observation_value_path=observation_value_path,
+        )
+        observation_plan, initial_cursor, observation_errors = (
+            _planned_read_observation_plan(
+                target,
+                budgets=budgets,
+                schema=schema,
+                registry=self.registry,
+                observation=intent.observation,
+                grounding_evidence_by_id=grounding_evidence_by_id or {},
+                runtime_limits=self.limits,
+                required_row_count=_required_row_count(trigger),
+            )
         )
         action_plan = _notification_action_plan(intent)
         action_plan, validation = self._normalize_and_validate(
@@ -120,6 +132,7 @@ class DbMonitorPlanner:
             stream=None,
             trigger=trigger,
             action_plan=action_plan,
+            additional_errors=(*observation_errors, *trigger_errors),
         )
         proposal: dict[str, Any] = {
             "kind": "monitor.proposal",
@@ -304,6 +317,7 @@ class DbMonitorPlanner:
         stream: dict[str, Any] | None = None,
         trigger: dict[str, Any] | None = None,
         action_plan: dict[str, Any] | None = None,
+        additional_errors: tuple[str, ...] = (),
     ) -> tuple[dict[str, Any], DbMonitorValidation]:
         normalized_action_plan = _action_plan_with_delivery_kind_default(
             deepcopy(action_plan or {}),
@@ -343,6 +357,7 @@ class DbMonitorPlanner:
             trigger=trigger or {},
             action_plan=normalized_action_plan,
         )
+        plan_errors = tuple(dict.fromkeys((*plan_errors, *additional_errors)))
         delivery_errors: list[str] = []
         delivery_diagnostics: dict[str, Any] = {}
         delivery_intent = normalized_action_plan.get("delivery_intent")
@@ -444,6 +459,16 @@ def monitor_create_intent_from_dict(data: dict[str, Any]) -> MonitorCreateIntent
     )
     action = dict(data.get("action") or {})
     display = dict(data.get("display") or {})
+    raw_observation = data.get("observation")
+    observation = (
+        dict(raw_observation)
+        if isinstance(raw_observation, Mapping)
+        else (
+            {"_invalid_shape": type(raw_observation).__name__}
+            if raw_observation
+            else {}
+        )
+    )
     return MonitorCreateIntent(
         target=MonitorTargetIntent(
             target_type=str(target.get("target_type") or "table"),
@@ -498,6 +523,7 @@ def monitor_create_intent_from_dict(data: dict[str, Any]) -> MonitorCreateIntent
                 ),
             )
         ),
+        observation=observation,
         action=MonitorActionIntent(
             actions=tuple(str(item) for item in action.get("actions") or ()),
             steps=tuple(
@@ -556,7 +582,17 @@ def _planned_read_observation_plan(
     budgets: dict[str, Any],
     schema: dict[str, Any] | None,
     registry: ExtensionRegistry | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+    observation: Mapping[str, Any] | None = None,
+    grounding_evidence_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+    runtime_limits: Mapping[str, Any] | None = None,
+    required_row_count: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], tuple[str, ...]]:
+    observation = dict(observation or {})
+    grounding_evidence_by_id = grounding_evidence_by_id or {}
+    errors: list[str] = []
+    unsupported_keys = sorted(set(observation) - {"filters", "value_path"})
+    if unsupported_keys:
+        errors.append("monitor.observation_invalid:unsupported_fields")
     if not _valid_sql_identifier(target):
         return (
             {
@@ -566,6 +602,7 @@ def _planned_read_observation_plan(
                 "block_reason": "invalid_target_identifier",
             },
             {},
+            (*errors, "monitor.observation_invalid:unsafe_target_identifier"),
         )
     cursor = _cursor_strategy_from_schema(target, schema)
     if cursor is None:
@@ -579,19 +616,42 @@ def _planned_read_observation_plan(
                 "schema_available": bool(schema),
             },
             {},
+            (*errors, "monitor.observation_invalid:missing_reliable_cursor"),
         )
-    max_rows = int(budgets.get("max_rows_per_tick") or 100)
-    max_rows = max(1, min(max_rows, 1000))
+    max_rows, row_limit_error = _observation_row_limit(
+        budgets,
+        runtime_limits=runtime_limits or {},
+        required_row_count=required_row_count,
+    )
+    if row_limit_error is not None:
+        errors.append(row_limit_error)
     field = cursor["field"]
     cursor_key = cursor["cursor_key"]
     sql_contract = _planned_read_sql_contract(schema, registry)
-    placeholder = _sql_placeholder(sql_contract["sql_dialect"], 1)
+    filters, filter_parameters, filter_errors = _planned_observation_filters(
+        target,
+        schema=schema or {},
+        observation=observation,
+        sql_dialect=sql_contract["sql_dialect"],
+        grounding_evidence_by_id=grounding_evidence_by_id,
+    )
+    errors.extend(filter_errors)
+    cursor_position = len(filter_parameters) + 1
+    placeholder = _sql_placeholder(sql_contract["sql_dialect"], cursor_position)
     parameter = _cursor_observation_parameter(
         cursor,
         target=target,
         cursor_key=cursor_key,
         dialect=sql_contract["sql_dialect"],
     )
+    filter_predicates = [
+        f"{item['column']} = " f"{_sql_placeholder(sql_contract['sql_dialect'], index)}"
+        for index, item in enumerate(filters, start=1)
+    ]
+    where_predicates = [*filter_predicates, f"{field} > {placeholder}"]
+    value_path = str(observation.get("value_path") or "rows")
+    if not _valid_observation_value_path(value_path):
+        errors.append("monitor.observation_invalid:value_path")
     return (
         {
             "kind": "planned_read",
@@ -599,10 +659,12 @@ def _planned_read_observation_plan(
             "target_name": target,
             "sql": (
                 f"select * from {target} "
-                f"where {field} > {placeholder} order by {field} asc limit "
+                f"where {' and '.join(where_predicates)} "
+                f"order by {field} asc limit "
                 f"{max_rows}"
             ),
-            "parameters": [parameter],
+            "parameters": [*filter_parameters, parameter],
+            "filters": filters,
             "cursor": {
                 "field": field,
                 "initialization": cursor["initialization"],
@@ -618,7 +680,7 @@ def _planned_read_observation_plan(
                 cursor_key: f"max(rows.{field})",
             },
             "max_rows": max_rows,
-            "value_path": "rows",
+            "value_path": value_path,
             "capability_id": "db.sql.execute_read",
             **sql_contract,
         },
@@ -626,6 +688,234 @@ def _planned_read_observation_plan(
             cursor_key: cursor["initial_value"],
             "initialized_from": "monitor_create",
         },
+        tuple(dict.fromkeys(errors)),
+    )
+
+
+def _observation_row_limit(
+    budgets: Mapping[str, Any],
+    *,
+    runtime_limits: Mapping[str, Any],
+    required_row_count: int | None,
+) -> tuple[int, str | None]:
+    explicit_limit = budgets.get("max_rows_per_tick")
+    try:
+        requested = int(explicit_limit) if explicit_limit is not None else 100
+    except (TypeError, ValueError):
+        return 1, "monitor.observation_invalid:max_rows_per_tick"
+    try:
+        runtime_limit = int(runtime_limits.get("max_rows") or 1000)
+    except (TypeError, ValueError):
+        runtime_limit = 1000
+    ceiling = max(1, min(runtime_limit, 1000))
+    required = max(1, int(required_row_count or 1))
+    if explicit_limit is None:
+        requested = max(requested, required)
+    max_rows = max(1, min(requested, ceiling))
+    if required > max_rows:
+        return max_rows, "monitor.observation_invalid:threshold_exceeds_row_limit"
+    return max_rows, None
+
+
+def _planned_observation_filters(
+    target: str,
+    *,
+    schema: dict[str, Any],
+    observation: Mapping[str, Any],
+    sql_dialect: str,
+    grounding_evidence_by_id: Mapping[str, Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], tuple[str, ...]]:
+    raw_filters = observation.get("filters") or ()
+    if not isinstance(raw_filters, (list, tuple)):
+        return [], [], ("monitor.observation_invalid:filters",)
+    tables = matching_tables(schema, target)
+    if len(tables) != 1:
+        return [], [], ("monitor.observation_invalid:target_profile",)
+    table = tables[0]
+    columns = {
+        column_name(item): item
+        for item in table.get("columns") or ()
+        if isinstance(item, dict) and column_name(item)
+    }
+    filters: list[dict[str, Any]] = []
+    parameters: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for raw_filter in raw_filters:
+        if not isinstance(raw_filter, Mapping):
+            errors.append("monitor.observation_invalid:filter_shape")
+            continue
+        item = dict(raw_filter)
+        if set(item) - {"column", "operator", "value", "evidence_ids"}:
+            errors.append("monitor.observation_invalid:filter_fields")
+            continue
+        column = str(item.get("column") or "")
+        if not _valid_sql_identifier(column):
+            errors.append("monitor.observation_invalid:unsafe_filter_identifier")
+            continue
+        column_schema = columns.get(column)
+        if column_schema is None:
+            errors.append("monitor.observation_invalid:unknown_filter_column")
+            continue
+        operator = str(item.get("operator") or "").lower()
+        if operator != "eq":
+            errors.append("monitor.observation_invalid:unsupported_filter_operator")
+            continue
+        value = item.get("value")
+        if (
+            "value" not in item
+            or value is None
+            or isinstance(value, (Mapping, list, tuple, set))
+        ):
+            errors.append("monitor.observation_invalid:filter_value")
+            continue
+        raw_evidence_ids = item.get("evidence_ids") or ()
+        if not isinstance(raw_evidence_ids, (list, tuple)):
+            errors.append("monitor.observation_invalid:filter_evidence_ids")
+            continue
+        evidence_ids = tuple(
+            str(evidence_id) for evidence_id in raw_evidence_ids if str(evidence_id)
+        )
+        grounded_value, grounding_error = _grounded_filter_value(
+            value,
+            target=target,
+            column=column,
+            evidence_ids=evidence_ids,
+            grounding_evidence_by_id=grounding_evidence_by_id,
+        )
+        if grounding_error is not None:
+            errors.append(grounding_error)
+            continue
+        normalized_filter = {
+            "column": column,
+            "operator": "eq",
+            "parameter_index": len(parameters) + 1,
+            "evidence_ids": list(evidence_ids),
+        }
+        parameter = {
+            "value": grounded_value,
+            "source": "catalog_value_hint" if evidence_ids else "typed_literal",
+            "table": table_name(table) or target,
+            "column": column,
+            "evidence_ids": list(evidence_ids),
+        }
+        type_metadata = column_type_metadata(table, column_schema, schema)
+        if type_metadata is not None:
+            parameter.update(type_metadata)
+        else:
+            parameter["dialect"] = sql_dialect
+        filters.append(normalized_filter)
+        parameters.append(parameter)
+    return filters, parameters, tuple(dict.fromkeys(errors))
+
+
+def _grounded_filter_value(
+    value: Any,
+    *,
+    target: str,
+    column: str,
+    evidence_ids: tuple[str, ...],
+    grounding_evidence_by_id: Mapping[str, Mapping[str, Any]],
+) -> tuple[Any, str | None]:
+    if not evidence_ids:
+        if isinstance(value, str):
+            return value, "monitor.observation_invalid:ambiguous_ungrounded_value"
+        return value, None
+    candidates: list[Any] = []
+    for evidence_id in evidence_ids:
+        evidence = grounding_evidence_by_id.get(evidence_id)
+        if not isinstance(evidence, Mapping):
+            return value, "monitor.observation_invalid:unrelated_grounding_evidence"
+        if (
+            evidence.get("accepted", True) is not True
+            or evidence.get("owner") != "catalog"
+        ):
+            return value, "monitor.observation_invalid:unrelated_grounding_evidence"
+        supported, relevant = _grounding_candidates_from_evidence(
+            evidence,
+            target=target,
+            column=column,
+            requested=value,
+        )
+        if not relevant:
+            return value, "monitor.observation_invalid:unrelated_grounding_evidence"
+        candidates.extend(supported)
+    unique = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    if len(unique) != 1:
+        return value, "monitor.observation_invalid:ambiguous_ungrounded_value"
+    return unique[0], None
+
+
+def _grounding_candidates_from_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    target: str,
+    column: str,
+    requested: Any,
+) -> tuple[list[Any], bool]:
+    payload = evidence.get("payload")
+    payload = payload if isinstance(payload, Mapping) else evidence
+    kind = str(evidence.get("kind") or "")
+    hints: list[Mapping[str, Any]] = []
+    if kind == "schema.column_value_hint":
+        for hint in payload.get("hints") or ():
+            if not isinstance(hint, Mapping):
+                continue
+            if hint.get("table") != target or hint.get("column") != column:
+                continue
+            if planner_eligible_column_value_hint(dict(hint)):
+                hints.append(hint)
+    elif kind == "schema.asset_profile":
+        asset = payload.get("asset")
+        asset = asset if isinstance(asset, Mapping) else {}
+        if target not in {asset.get("name"), asset.get("asset_ref")}:
+            return [], False
+        for field in payload.get("fields") or ():
+            if not isinstance(field, Mapping) or field.get("name") != column:
+                continue
+            inline_hint = field.get("column_value_hint")
+            if isinstance(inline_hint, Mapping):
+                hints.append(inline_hint)
+    else:
+        return [], False
+    if not hints:
+        return [], False
+    candidates: list[Any] = []
+    for hint in hints:
+        observed = hint.get("observed_values") or hint.get("top_values") or ()
+        observed_values = [
+            item.get("value") if isinstance(item, Mapping) else item
+            for item in observed
+        ]
+        for observed_value in observed_values:
+            if observed_value == requested or (
+                isinstance(observed_value, str)
+                and isinstance(requested, str)
+                and observed_value.casefold() == requested.casefold()
+            ):
+                candidates.append(observed_value)
+        mapping = hint.get("candidate_mapping")
+        if isinstance(mapping, Mapping):
+            prompt_term = mapping.get("prompt_term")
+            closest = mapping.get("closest_value")
+            if (
+                isinstance(prompt_term, str)
+                and isinstance(requested, str)
+                and prompt_term.casefold() == requested.casefold()
+                and closest in observed_values
+            ):
+                candidates.append(closest)
+    return candidates, True
+
+
+def _valid_observation_value_path(value: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"rows(?:\.\d+\.[A-Za-z_][A-Za-z0-9_]*)?",
+            value or "",
+        )
     )
 
 
@@ -906,19 +1196,109 @@ def _looks_auto_incrementing(column: dict[str, Any]) -> bool:
     )
 
 
-def _trigger_from_condition(condition: MonitorConditionIntent) -> dict[str, Any]:
-    trigger: dict[str, Any] = {
-        "type": condition.kind,
-    }
-    if condition.path is not None:
-        trigger["path"] = condition.path
-    if condition.operator is not None:
-        trigger["operator"] = condition.operator
-    if condition.value is not None:
-        trigger["value"] = condition.value
-    if condition.expression is not None:
-        trigger["expression"] = condition.expression
-    return trigger
+def _trigger_from_condition(
+    condition: MonitorConditionIntent,
+    *,
+    observation_value_path: str,
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    if condition.path is not None and condition.path != observation_value_path:
+        return (
+            {
+                "type": condition.kind,
+                "path": condition.path,
+            },
+            ("monitor.trigger_invalid:path_mismatch",),
+        )
+    path = condition.path or observation_value_path
+    raw_operator = str(condition.operator or "").strip().lower()
+    if not raw_operator and condition.kind in {"new_rows", "rows_present"}:
+        raw_operator = ">"
+        value = 0
+    else:
+        value = condition.value
+    normalized_operator = {
+        ">": "gt",
+        "gt": "gt",
+        ">=": "gte",
+        "gte": "gte",
+        "<": "lt",
+        "lt": "lt",
+        "<=": "lte",
+        "lte": "lte",
+        "=": "equals",
+        "==": "equals",
+        "eq": "equals",
+        "equals": "equals",
+        "!=": "not_equals",
+        "ne": "not_equals",
+        "not_equals": "not_equals",
+        "count_gt": "count_gt",
+        "count_gte": "count_gte",
+    }.get(raw_operator)
+    if normalized_operator is None or value is None:
+        return (
+            {"type": condition.kind, "path": path},
+            ("monitor.trigger_invalid:unsupported_comparison",),
+        )
+    if path == "rows":
+        count_operator = {
+            "gt": "count_gt",
+            "gte": "count_gte",
+            "count_gt": "count_gt",
+            "count_gte": "count_gte",
+        }.get(normalized_operator)
+        if count_operator is None:
+            return (
+                {"type": condition.kind, "path": path},
+                ("monitor.trigger_invalid:unsupported_row_comparison",),
+            )
+        try:
+            threshold = int(value)
+        except (TypeError, ValueError):
+            return (
+                {"type": condition.kind, "path": path},
+                ("monitor.trigger_invalid:row_threshold",),
+            )
+        if threshold < 0:
+            return (
+                {"type": condition.kind, "path": path},
+                ("monitor.trigger_invalid:row_threshold",),
+            )
+        return (
+            {
+                "type": "threshold",
+                "operator": count_operator,
+                "path": "rows",
+                "value": threshold,
+            },
+            (),
+        )
+    if normalized_operator in {"count_gt", "count_gte"}:
+        return (
+            {"type": condition.kind, "path": path},
+            ("monitor.trigger_invalid:count_operator_requires_rows",),
+        )
+    return (
+        {
+            "type": condition.kind,
+            normalized_operator: value,
+        },
+        (),
+    )
+
+
+def _required_row_count(trigger: Mapping[str, Any]) -> int | None:
+    operator = trigger.get("operator")
+    if operator not in {"count_gt", "count_gte"}:
+        return None
+    value = trigger.get("value")
+    if value is None:
+        return None
+    try:
+        threshold = int(value)
+    except (TypeError, ValueError):
+        return None
+    return threshold + 1 if operator == "count_gt" else threshold
 
 
 def _notification_action_plan(intent: MonitorCreateIntent) -> dict[str, Any]:
@@ -958,6 +1338,11 @@ def _proposal_validation_errors(
 ) -> tuple[str, ...]:
     errors: list[str] = []
     kind = observation_plan.get("kind")
+    if observation_plan.get("planning_status") == "blocked":
+        block_reason = str(
+            observation_plan.get("block_reason") or "observation_planning_blocked"
+        )
+        errors.append(f"monitor.proposal_invalid:{block_reason}")
     if kind not in {"planned_read", "metric_sql", "freshness_sql", "plugin_source"}:
         errors.append("monitor.proposal_incomplete:observation_plan")
     if kind in {"planned_read", "metric_sql", "freshness_sql"}:

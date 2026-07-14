@@ -43,6 +43,11 @@ class DbTaskCatalog:
         store_id = _catalog_store_id(task_input, self.context.config.metadata)
         if not store_id:
             return task_input
+        if task.capability_id == "catalog.asset.inspect":
+            # Catalog inspection is already the structural source of truth.  It
+            # must not bootstrap itself through connector schema inspection or
+            # re-register an asset-profile payload as a whole catalog schema.
+            return {**task_input, "store_id": store_id}
         schema_evidence = await latest_evidence(
             self.context,
             operation.id,
@@ -291,6 +296,8 @@ class DbTaskCatalog:
         prerequisite_for: str | None = None,
         prerequisite_reason: str = _CATALOG_COLUMN_VALUE_GROUNDING_REASON,
     ) -> None:
+        if schema_evidence.owner == "catalog":
+            return
         registered = await latest_evidence(
             self.context,
             operation.id,

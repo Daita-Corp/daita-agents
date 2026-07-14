@@ -181,6 +181,12 @@ def test_catalog_capabilities_are_visible_in_extension_registry():
     assert plan_capability.operation_types == frozenset(
         {"data.query", "query.plan", "schema.query"}
     )
+    inspect_capability = next(
+        capability
+        for capability in registry.capabilities
+        if capability.id == "catalog.asset.inspect"
+    )
+    assert "monitor.create" in inspect_capability.operation_types
 
 
 def test_catalog_tool_views_expose_strict_required_schemas():
@@ -236,9 +242,11 @@ async def test_catalog_register_and_search_executors_return_typed_evidence():
     )
 
     assert isinstance(register_evidence[0], Evidence)
+    assert register_evidence[0].accepted is True
     assert register_evidence[0].kind == "catalog.source_registered"
     assert register_evidence[0].payload["store_id"] == "store:shop"
     assert search_evidence[0].kind == "schema.search_result"
+    assert search_evidence[0].accepted is True
     assert search_evidence[0].payload["tables"][0]["name"] == "customers"
 
 
@@ -320,6 +328,36 @@ async def test_catalog_inspect_relationship_and_profile_executors_return_evidenc
     assert relationship_evidence[0].payload["reachable"] is True
     assert profile_evidence[0].kind == "catalog.profile"
     assert profile_evidence[0].payload["table_count"] == 2
+
+
+async def test_catalog_executor_rejects_explicit_unsuccessful_asset_inspection():
+    catalog = CatalogPlugin(auto_persist=False)
+    await catalog.register_schema(
+        _reference_schema(),
+        store_type="sqlite",
+        store_id="store:shop",
+        persist=False,
+    )
+    registry = ExtensionRegistry()
+    registry.register(catalog)
+    operation = Operation(id="op-inspect-rejected", operation_type="monitor.create")
+
+    evidence = await _executor(registry, "catalog.inspect_asset").execute(
+        Task(
+            id="task-inspect-rejected",
+            operation_id=operation.id,
+            capability_id="catalog.asset.inspect",
+            executor_id="catalog.inspect_asset",
+            input={"store_id": "store:shop", "asset_ref": "pending orders"},
+        ),
+        operation,
+        {},
+    )
+
+    assert evidence[0].kind == "schema.asset_profile"
+    assert evidence[0].accepted is False
+    assert evidence[0].payload["success"] is False
+    assert evidence[0].payload["asset_ref"] == "pending orders"
 
 
 async def test_catalog_registers_searches_and_resolves_column_value_profiles():

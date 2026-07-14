@@ -386,6 +386,19 @@ def _action_input_hints() -> dict[str, Any]:
                         "value": "optional threshold",
                         "path": "optional value path",
                     },
+                    "observation": {
+                        "filters": [
+                            {
+                                "column": "canonical column name",
+                                "operator": "eq",
+                                "value": "grounded filter value",
+                                "evidence_ids": [
+                                    "supporting catalog value-hint evidence id"
+                                ],
+                            }
+                        ],
+                        "value_path": "rows",
+                    },
                     "schedule": {
                         "kind": "interval",
                         "interval_seconds": 300,
