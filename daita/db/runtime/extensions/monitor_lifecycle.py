@@ -9,7 +9,12 @@ from daita.runtime import Evidence, Operation, Task
 
 from ...evidence import load_evidence
 from ...fingerprints import persisted_fingerprint
-from ...monitor_commands.types import DbMonitorValidation
+from ...monitor_commands.naming import (
+    MAX_MONITOR_DISPLAY_NAME_LENGTH,
+    MAX_MONITOR_ID_LENGTH,
+)
+from ...monitor_commands.resolver import DbMonitorResolver
+from ...monitor_commands.types import DbMonitorCommand, DbMonitorValidation
 from ...monitors import (
     DbMonitor,
     DbMonitorMutation,
@@ -23,6 +28,9 @@ if TYPE_CHECKING:
     from .plugin import DbRuntimePlanningPlugin
 
 DbMonitorLifecycleAction = Literal["update", "pause", "resume", "delete", "disable"]
+
+_MONITOR_RESOLUTION_CANDIDATE_LIMIT = 10
+_MONITOR_REFERENCE_LENGTH_LIMIT = 256
 
 
 @dataclass(frozen=True)
@@ -44,21 +52,45 @@ class DbMonitorPlanLifecycleExecutor:
         action = _monitor_lifecycle_action(
             str(task.input.get("action") or operation.operation_type)
         )
-        monitor_id = str(
-            task.input.get("monitor_id") or operation.metadata.get("monitor_id") or ""
+        raw_monitor_ref = (
+            task.input["monitor_id"]
+            if "monitor_id" in task.input
+            else operation.metadata.get("monitor_id")
         )
-        if not monitor_id:
-            raise RuntimeError("monitor lifecycle proposal requires monitor_id")
+        monitor_ref = _monitor_reference(raw_monitor_ref)
+        monitor = (
+            await runtime.monitor_store.load_monitor(monitor_ref)
+            if monitor_ref is not None
+            else None
+        )
+        resolution_source = "canonical_id"
+        resolution_warnings: tuple[str, ...] = ()
+        resolution_errors: tuple[str, ...] = ()
+        resolution_matches: tuple[DbMonitor, ...] = ()
+        if monitor is None:
+            resolution_source = "resolver"
+            resolution = DbMonitorResolver().resolve(
+                DbMonitorCommand(kind="inspect", monitor_id=monitor_ref),
+                await runtime.list_monitors(),
+            )
+            monitor = resolution.monitor
+            resolution_warnings = resolution.warnings
+            resolution_errors = resolution.errors
+            if monitor is None:
+                resolution_matches = resolution.matches
 
-        monitor = await runtime.monitor_store.load_monitor(monitor_id)
-        errors: list[str] = []
+        candidate_facts = _bounded_monitor_candidate_facts(resolution_matches)
+        safe_monitor_ref, monitor_ref_truncated = _bounded_text(
+            monitor_ref,
+            max_length=_MONITOR_REFERENCE_LENGTH_LIMIT,
+        )
+        monitor_id = monitor.id if monitor is not None else None
+        errors = list(resolution_errors)
         before = monitor.to_dict() if monitor is not None else None
         after = None
         patch = dict(task.input.get("patch") or {})
         paused_until = task.input.get("paused_until")
-        if monitor is None:
-            errors.append("monitor.lifecycle:monitor_not_found")
-        else:
+        if monitor is not None:
             try:
                 updated = _monitor_after_lifecycle_action(
                     monitor,
@@ -81,6 +113,7 @@ class DbMonitorPlanLifecycleExecutor:
 
         validation = DbMonitorValidation(
             accepted=not errors,
+            warnings=resolution_warnings,
             errors=tuple(errors),
             diagnostics={
                 "action": action,
@@ -92,6 +125,10 @@ class DbMonitorPlanLifecycleExecutor:
             "operation_type": operation.operation_type,
             "action": action,
             "monitor_id": monitor_id,
+            "monitor_ref": safe_monitor_ref,
+            "monitor_ref_truncated": monitor_ref_truncated,
+            "resolution_source": resolution_source,
+            **candidate_facts,
             "before": before,
             "after": after,
             "patch": patch,
@@ -111,7 +148,9 @@ class DbMonitorPlanLifecycleExecutor:
                 metadata={
                     "payload_fingerprint": fingerprint,
                     "monitor_id": monitor_id,
+                    "monitor_ref": safe_monitor_ref,
                     "action": action,
+                    "resolution_source": resolution_source,
                     "validation_accepted": validation.accepted,
                 },
             )
@@ -328,6 +367,56 @@ def _monitor_lifecycle_action(value: str) -> DbMonitorLifecycleAction:
     if normalized == "disabled":
         return "disable"
     raise ValueError(f"unsupported monitor lifecycle action: {value!r}")
+
+
+def _monitor_reference(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value if value.strip() else None
+
+
+def _bounded_monitor_candidate_facts(
+    matches: tuple[DbMonitor, ...],
+) -> dict[str, Any]:
+    ordered = sorted(
+        matches,
+        key=lambda monitor: (monitor.id.casefold(), monitor.name.casefold()),
+    )
+    included = ordered[:_MONITOR_RESOLUTION_CANDIDATE_LIMIT]
+    candidates: list[dict[str, Any]] = []
+    for monitor in included:
+        monitor_id, monitor_id_truncated = _bounded_text(
+            monitor.id,
+            max_length=MAX_MONITOR_ID_LENGTH,
+        )
+        monitor_name, monitor_name_truncated = _bounded_text(
+            monitor.name,
+            max_length=MAX_MONITOR_DISPLAY_NAME_LENGTH,
+        )
+        candidate: dict[str, Any] = {
+            "id": monitor_id,
+            "name": monitor_name,
+        }
+        truncated_fields = []
+        if monitor_id_truncated:
+            truncated_fields.append("id")
+        if monitor_name_truncated:
+            truncated_fields.append("name")
+        if truncated_fields:
+            candidate["truncated_fields"] = truncated_fields
+        candidates.append(candidate)
+    return {
+        "candidates": candidates,
+        "candidate_count": len(ordered),
+        "included_candidate_count": len(candidates),
+        "candidates_truncated": len(ordered) > len(candidates),
+    }
+
+
+def _bounded_text(value: str | None, *, max_length: int) -> tuple[str | None, bool]:
+    if value is None:
+        return None, False
+    return value[:max_length], len(value) > max_length
 
 
 def _monitor_after_lifecycle_action(

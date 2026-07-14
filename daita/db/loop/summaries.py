@@ -697,6 +697,14 @@ def _monitor_proposal_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
             limit=_MONITOR_SUMMARY_CANDIDATE_LIMIT,
         )
     )
+    candidate_count = len(raw_candidates)
+    reported_candidate_count = payload.get("candidate_count")
+    if (
+        isinstance(reported_candidate_count, int)
+        and not isinstance(reported_candidate_count, bool)
+        and reported_candidate_count >= candidate_count
+    ):
+        candidate_count = reported_candidate_count
     result: dict[str, Any] = {
         "action": action,
         "validation_errors": included_errors,
@@ -706,14 +714,26 @@ def _monitor_proposal_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
         "validation_errors_truncated": len(raw_errors) > len(included_errors)
         or error_text_truncated_count > 0,
         "candidates": included_candidates,
-        "candidate_count": len(raw_candidates),
+        "candidate_count": candidate_count,
         "included_candidate_count": len(included_candidates),
-        "candidates_truncated": candidates_truncated,
+        "candidates_truncated": candidates_truncated
+        or payload.get("candidates_truncated") is True
+        or candidate_count > len(included_candidates),
     }
     if monitor_id is not None:
         result["monitor_id"] = monitor_id
     if monitor_id_truncated:
         result["truncated_fields"] = ["monitor_id"]
+    _set_bounded_string(result, "monitor_ref", payload.get("monitor_ref"))
+    _set_bounded_string(
+        result,
+        "resolution_source",
+        payload.get("resolution_source"),
+    )
+    if payload.get("monitor_ref_truncated") is True:
+        truncated_fields = result.setdefault("truncated_fields", [])
+        if "monitor_ref" not in truncated_fields:
+            truncated_fields.append("monitor_ref")
     return result
 
 
@@ -868,6 +888,11 @@ def _safe_monitor_candidates(value: Any) -> list[dict[str, Any]]:
                 item.get("name"),
                 max_length=MAX_MONITOR_DISPLAY_NAME_LENGTH,
             )
+            source_truncated_fields = {
+                field
+                for field in _safe_iterable(item.get("truncated_fields"))
+                if isinstance(field, str) and field in {"id", "name"}
+            }
         elif isinstance(item, str):
             candidate_id, candidate_id_truncated = _bounded_optional_string(
                 item,
@@ -875,6 +900,7 @@ def _safe_monitor_candidates(value: Any) -> list[dict[str, Any]]:
             )
             name = None
             name_truncated = False
+            source_truncated_fields = set()
         else:
             continue
         candidate: dict[str, Any] = {}
@@ -887,6 +913,11 @@ def _safe_monitor_candidates(value: Any) -> list[dict[str, Any]]:
             truncated_fields.append("id")
         if name_truncated:
             truncated_fields.append("name")
+        truncated_fields.extend(
+            field
+            for field in ("id", "name")
+            if field in source_truncated_fields and field not in truncated_fields
+        )
         if truncated_fields:
             candidate["truncated_fields"] = truncated_fields
         if candidate:

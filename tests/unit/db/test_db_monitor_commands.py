@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+
+import pytest
 
 from daita.db import DbAgent, DbMonitor, DbRuntime
 from daita.db.llm_agent_planner import _action_input_hints
@@ -9,6 +12,7 @@ from daita.db.planner_protocol import (
     DbPlannerDecision,
     DbPlannerDecisionStatus,
 )
+from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.runtime import OperationStatus, TaskStatus
 
 
@@ -20,6 +24,16 @@ class FakeMonitorPlanner:
     async def plan(self, state):
         self.states.append(state)
         return self.decisions.pop(0)
+
+
+class MonitorInventorySpyRuntime(DbRuntime):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.monitor_inventory_loads = 0
+
+    async def list_monitors(self, *, status=None):
+        self.monitor_inventory_loads += 1
+        return await super().list_monitors(status=status)
 
 
 async def test_prompt_list_monitors_enters_runtime_run_and_agent_loop():
@@ -167,9 +181,7 @@ async def test_prompt_monitor_create_commits_each_proposal_dependency():
         "orders_watch",
         "users_watch",
     ]
-    assert sorted(
-        item.payload["monitor"]["id"] for item in definitions
-    ) == [
+    assert sorted(item.payload["monitor"]["id"] for item in definitions) == [
         "orders_watch",
         "users_watch",
     ]
@@ -181,36 +193,20 @@ async def test_prompt_monitor_create_commits_each_proposal_dependency():
         }
     for task in snapshot.tasks:
         if task.metadata.get("planner_action_id") == "commit_orders":
-            assert task.dependencies[0].producer_task_id == task_ids_by_action[
-                "plan_orders"
-            ]
+            assert (
+                task.dependencies[0].producer_task_id
+                == task_ids_by_action["plan_orders"]
+            )
         if task.metadata.get("planner_action_id") == "commit_users":
-            assert task.dependencies[0].producer_task_id == task_ids_by_action[
-                "plan_users"
-            ]
+            assert (
+                task.dependencies[0].producer_task_id
+                == task_ids_by_action["plan_users"]
+            )
 
 
 async def test_prompt_monitor_lifecycle_compiles_to_task_specs_and_execute_task():
-    planner = FakeMonitorPlanner(
-        DbPlannerDecision(
-            status=DbPlannerDecisionStatus.CONTINUE,
-            intent={"operation_type": "monitor.pause"},
-            actions=(
-                DbPlannerAction(
-                    action_id="plan_pause",
-                    kind=DbPlannerActionKind.PLAN_MONITOR_LIFECYCLE,
-                    input={"action": "pause", "monitor_id": "orders_watch"},
-                ),
-                DbPlannerAction(
-                    action_id="commit_pause",
-                    kind=DbPlannerActionKind.COMMIT_MONITOR_LIFECYCLE,
-                    input={"action": "pause"},
-                    depends_on=("plan_pause",),
-                ),
-            ),
-        )
-    )
-    runtime = DbRuntime(host_services={"db_agent_planner": planner})
+    planner = FakeMonitorPlanner(_lifecycle_decision("orders_watch", action="pause"))
+    runtime = MonitorInventorySpyRuntime(host_services={"db_agent_planner": planner})
     await runtime.create_monitor(_monitor("orders_watch", "Orders Watch"))
     original_execute_task = runtime.execute_task
     executed_capabilities = []
@@ -228,6 +224,7 @@ async def test_prompt_monitor_lifecycle_compiles_to_task_specs_and_execute_task(
     snapshot = await runtime.inspect_operation(result.operation_id)
     inspection = await runtime.inspect_monitor("orders_watch")
 
+    assert snapshot is not None
     assert result.status is OperationStatus.SUCCEEDED
     assert "Paused monitor Orders Watch (orders_watch)" in result.answer
     assert inspection is not None
@@ -243,6 +240,247 @@ async def test_prompt_monitor_lifecycle_compiles_to_task_specs_and_execute_task(
     ]
     assert all(task.status is TaskStatus.SUCCEEDED for task in snapshot.tasks)
     assert any(item.kind == "monitor.paused" for item in snapshot.evidence)
+    proposal = next(
+        item for item in snapshot.evidence if item.kind == "monitor.proposal"
+    )
+    assert proposal.accepted is True
+    assert proposal.payload["monitor_id"] == "orders_watch"
+    assert proposal.payload["monitor_ref"] == "orders_watch"
+    assert proposal.payload["resolution_source"] == "canonical_id"
+    assert runtime.monitor_inventory_loads == 0
+
+    plan_task, commit_task = snapshot.tasks[:2]
+    dependency = commit_task.dependencies[0]
+    assert dependency.evidence_kind == "monitor.proposal"
+    assert dependency.producer_task_id == plan_task.id
+    assert dependency.producer_capability_id == "db.monitor.plan_lifecycle"
+    assert dependency.producer_executor_id == "db_runtime.monitor.plan_lifecycle"
+    assert dependency.evidence_accepted is True
+
+
+async def test_prompt_monitor_lifecycle_resolves_unique_human_reference():
+    planner = FakeMonitorPlanner(_lifecycle_decision("Orders Watch", action="pause"))
+    runtime = MonitorInventorySpyRuntime(host_services={"db_agent_planner": planner})
+    await runtime.create_monitor(_monitor("orders_watch", "Orders Watch"))
+
+    result = await runtime.run(DbRequest(prompt="pause Orders Watch"))
+    snapshot = await runtime.inspect_operation(result.operation_id)
+    inspection = await runtime.inspect_monitor("orders_watch")
+    assert snapshot is not None
+    proposal = next(
+        item for item in snapshot.evidence if item.kind == "monitor.proposal"
+    )
+
+    assert result.status is OperationStatus.SUCCEEDED
+    assert inspection is not None
+    assert inspection.monitor.status == "paused"
+    assert proposal.accepted is True
+    assert proposal.payload["monitor_id"] == "orders_watch"
+    assert proposal.payload["monitor_ref"] == "Orders Watch"
+    assert proposal.payload["resolution_source"] == "resolver"
+    assert proposal.payload["validation"]["warnings"] == []
+    assert runtime.monitor_inventory_loads == 1
+
+
+async def test_ambiguous_lifecycle_reference_persists_bounded_candidates_without_mutation():
+    secret = "AMBIGUOUS_MONITOR_SECRET"
+    planner = FakeMonitorPlanner(
+        _lifecycle_decision("orders backlog", action="pause"),
+        DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CLARIFY,
+            clarification_question="Which orders backlog monitor should I pause?",
+        ),
+    )
+    runtime = MonitorInventorySpyRuntime(host_services={"db_agent_planner": planner})
+    for index in reversed(range(12)):
+        await runtime.create_monitor(
+            DbMonitor(
+                id=f"orders_backlog_{index:02d}",
+                name=f"Orders Backlog {index:02d}",
+                description=secret,
+                status="active",
+                observation_plan={
+                    "kind": "plugin_source",
+                    "source_kind": "test_source",
+                    "value_path": "rows",
+                    "sql": secret,
+                },
+                action_plan={"delivery_target": secret},
+                metadata={"raw_prompt": secret},
+            )
+        )
+    mutations = []
+    original_commit_monitor_mutation = runtime.commit_monitor_mutation
+
+    async def commit_monitor_mutation_spy(mutation):
+        mutations.append(mutation)
+        return await original_commit_monitor_mutation(mutation)
+
+    runtime.commit_monitor_mutation = commit_monitor_mutation_spy
+
+    result = await runtime.run(DbRequest(prompt="pause the orders backlog monitor"))
+    snapshot = await runtime.inspect_operation(result.operation_id)
+    assert snapshot is not None
+    proposal = next(
+        item for item in snapshot.evidence if item.kind == "monitor.proposal"
+    )
+    plan_task = next(
+        task
+        for task in snapshot.tasks
+        if task.capability_id == "db.monitor.plan_lifecycle"
+    )
+    commit_task = next(
+        task
+        for task in snapshot.tasks
+        if task.capability_id == "db.monitor.commit_lifecycle"
+    )
+
+    assert result.status is OperationStatus.BLOCKED
+    assert proposal.accepted is False
+    assert proposal.payload["monitor_id"] is None
+    assert proposal.payload["monitor_ref"] == "orders backlog"
+    assert proposal.payload["resolution_source"] == "resolver"
+    assert proposal.payload["validation"]["errors"] == ["monitor_reference_ambiguous"]
+    assert proposal.payload["candidate_count"] == 12
+    assert proposal.payload["included_candidate_count"] == 10
+    assert proposal.payload["candidates_truncated"] is True
+    assert proposal.payload["candidates"] == [
+        {
+            "id": f"orders_backlog_{index:02d}",
+            "name": f"Orders Backlog {index:02d}",
+        }
+        for index in range(10)
+    ]
+    assert all(
+        set(candidate) <= {"id", "name", "truncated_fields"}
+        for candidate in proposal.payload["candidates"]
+    )
+    assert secret not in json.dumps(proposal.payload, sort_keys=True)
+    assert mutations == []
+    assert commit_task.status is TaskStatus.BLOCKED
+    dependency = commit_task.dependencies[0]
+    assert dependency.evidence_kind == "monitor.proposal"
+    assert dependency.producer_task_id == plan_task.id
+    assert dependency.producer_capability_id == "db.monitor.plan_lifecycle"
+    assert dependency.producer_executor_id == "db_runtime.monitor.plan_lifecycle"
+    assert dependency.evidence_accepted is True
+    for index in range(12):
+        inspection = await runtime.inspect_monitor(f"orders_backlog_{index:02d}")
+        assert inspection is not None
+        assert inspection.monitor.status == "active"
+
+    summary = next(
+        item
+        for item in planner.states[1].rejected_evidence_summaries
+        if item["kind"] == "monitor.proposal"
+    )
+    assert summary["monitor_ref"] == "orders backlog"
+    assert summary["resolution_source"] == "resolver"
+    assert summary["validation_errors"] == ["monitor_reference_ambiguous"]
+    assert summary["candidate_count"] == 12
+    assert summary["included_candidate_count"] == 10
+    assert summary["candidates_truncated"] is True
+    assert summary["candidates"] == proposal.payload["candidates"]
+
+
+async def test_missing_lifecycle_reference_rejects_before_commit_mutation():
+    runtime = MonitorInventorySpyRuntime(runtime_id="missing-monitor-reference")
+    mutations = []
+    original_commit_monitor_mutation = runtime.commit_monitor_mutation
+
+    async def commit_monitor_mutation_spy(mutation):
+        mutations.append(mutation)
+        return await original_commit_monitor_mutation(mutation)
+
+    runtime.commit_monitor_mutation = commit_monitor_mutation_spy
+
+    result = await runtime.execute_monitor_lifecycle_operation(
+        {
+            "operation_type": "monitor.pause",
+            "monitor_id": "missing monitor",
+        }
+    )
+    snapshot = await runtime.inspect_operation(result.operation_id)
+    assert snapshot is not None
+    proposal = next(
+        item for item in snapshot.evidence if item.kind == "monitor.proposal"
+    )
+
+    assert result.status is OperationStatus.BLOCKED
+    assert proposal.accepted is False
+    assert proposal.payload["monitor_id"] is None
+    assert proposal.payload["monitor_ref"] == "missing monitor"
+    assert proposal.payload["validation"]["errors"] == ["monitor_not_found"]
+    assert proposal.payload["candidate_count"] == 0
+    assert proposal.payload["candidates"] == []
+    assert [task.capability_id for task in snapshot.tasks] == [
+        "db.monitor.plan_lifecycle"
+    ]
+    assert mutations == []
+    assert runtime.monitor_inventory_loads == 1
+
+
+@pytest.mark.parametrize(
+    "monitor_ref",
+    (None, "", "   ", {"name": "orders"}, ["orders"]),
+)
+async def test_empty_or_malformed_lifecycle_reference_rejects_safely(monitor_ref):
+    runtime = MonitorInventorySpyRuntime(runtime_id="malformed-monitor-reference")
+
+    task, proposal = await _execute_lifecycle_plan(runtime, monitor_ref)
+
+    assert task.status is TaskStatus.SUCCEEDED
+    assert proposal.accepted is False
+    assert proposal.payload["monitor_id"] is None
+    assert proposal.payload["monitor_ref"] is None
+    assert proposal.payload["validation"]["errors"] == ["monitor_reference_required"]
+    assert proposal.payload["candidates"] == []
+    assert runtime.monitor_inventory_loads == 1
+
+
+async def test_explicit_null_lifecycle_reference_does_not_fall_back_to_metadata():
+    runtime = MonitorInventorySpyRuntime(runtime_id="null-monitor-reference")
+    await runtime.create_monitor(_monitor("orders_watch", "Orders Watch"))
+
+    _, proposal = await _execute_lifecycle_plan(
+        runtime,
+        None,
+        operation_monitor_id="orders_watch",
+    )
+
+    inspection = await runtime.inspect_monitor("orders_watch")
+    assert proposal.accepted is False
+    assert proposal.payload["monitor_id"] is None
+    assert proposal.payload["monitor_ref"] is None
+    assert proposal.payload["validation"]["errors"] == ["monitor_reference_required"]
+    assert inspection is not None
+    assert inspection.monitor.status == "active"
+    assert [task.capability_id for task in await runtime.store.list_tasks()] == [
+        "db.monitor.plan_lifecycle"
+    ]
+
+
+async def test_ambiguous_lifecycle_candidate_text_is_bounded():
+    runtime = MonitorInventorySpyRuntime(runtime_id="bounded-monitor-candidates")
+    for suffix in ("a", "b"):
+        await runtime.create_monitor(
+            _monitor(
+                f"orders_{suffix}_{'x' * 80}",
+                f"Orders {suffix.upper()} {'N' * 80}",
+            )
+        )
+
+    _, proposal = await _execute_lifecycle_plan(runtime, "orders")
+
+    assert proposal.accepted is False
+    assert proposal.payload["validation"]["errors"] == ["monitor_reference_ambiguous"]
+    assert proposal.payload["candidate_count"] == 2
+    assert proposal.payload["included_candidate_count"] == 2
+    assert proposal.payload["candidates_truncated"] is False
+    for candidate in proposal.payload["candidates"]:
+        assert len(candidate["id"]) == 48
+        assert len(candidate["name"]) == 64
+        assert candidate["truncated_fields"] == ["id", "name"]
 
 
 async def test_prompt_monitor_request_without_llm_does_not_fall_back_to_regex_router():
@@ -286,6 +524,66 @@ def test_no_production_prompt_monitor_router_or_service_sources_remain():
                 matches.append(f"{path.relative_to(Path(__file__).parents[3])}:{token}")
 
     assert matches == []
+
+
+def _lifecycle_decision(monitor_ref, *, action):
+    return DbPlannerDecision(
+        status=DbPlannerDecisionStatus.CONTINUE,
+        intent={"operation_type": f"monitor.{action}"},
+        actions=(
+            DbPlannerAction(
+                action_id=f"plan_{action}",
+                kind=DbPlannerActionKind.PLAN_MONITOR_LIFECYCLE,
+                input={"action": action, "monitor_id": monitor_ref},
+            ),
+            DbPlannerAction(
+                action_id=f"commit_{action}",
+                kind=DbPlannerActionKind.COMMIT_MONITOR_LIFECYCLE,
+                input={"action": action},
+                depends_on=(f"plan_{action}",),
+            ),
+        ),
+    )
+
+
+async def _execute_lifecycle_plan(
+    runtime,
+    monitor_ref,
+    *,
+    operation_monitor_id=None,
+):
+    await runtime.setup()
+    operation = await runtime.kernel.create_operation(
+        operation_type="monitor.pause",
+        request={"kind": "monitor.pause"},
+        required_evidence=frozenset({"monitor.proposal"}),
+        metadata={
+            "runtime_id": runtime.runtime_id,
+            "runtime_kind": runtime.runtime_kind,
+            "control_plane": "db.monitor",
+            "monitor_id": operation_monitor_id,
+        },
+        evaluate_governance=False,
+    )
+    plan = await runtime.plan_task_specs(
+        operation,
+        (
+            DbTaskSpec(
+                capability_id="db.monitor.plan_lifecycle",
+                owner="db_runtime",
+                input={
+                    "action": "pause",
+                    "monitor_id": monitor_ref,
+                },
+                reason="test_monitor_reference_resolution",
+            ),
+        ),
+    )
+    task = plan.tasks[0]
+    evidence = await runtime.execute_task(task, operation)
+    persisted_task = await runtime.store.load_task(task.id)
+    assert persisted_task is not None
+    return persisted_task, evidence[0]
 
 
 def _monitor(monitor_id: str, name: str) -> DbMonitor:
