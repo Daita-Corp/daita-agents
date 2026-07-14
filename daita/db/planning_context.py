@@ -151,7 +151,7 @@ class DbPlanningContextBuilder:
             catalog_evidence,
         )
         relationship_details = _relationship_evidence_details(relationship_evidence)
-        schema = _schema_from_catalog_evidence(
+        schema = catalog_schema_from_evidence(
             catalog_structural_evidence,
             relationship_evidence,
         )
@@ -542,10 +542,11 @@ def _catalog_structural_evidence(
     return _dedupe_evidence(evidence)
 
 
-def _schema_from_catalog_evidence(
+def catalog_schema_from_evidence(
     catalog_evidence: tuple[Evidence, ...],
     relationship_evidence: tuple[Evidence, ...],
 ) -> dict[str, Any]:
+    """Normalize accepted catalog evidence into the planner's schema contract."""
     if not catalog_evidence:
         return {}
     tables: dict[str, dict[str, Any]] = {}

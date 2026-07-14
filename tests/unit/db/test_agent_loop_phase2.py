@@ -5,6 +5,7 @@ from daita.db.loop import DbAgentLoop
 from daita.db.loop.grounding import (
     _validation_grounding_runtime_continuation_action,
 )
+from daita.db.loop.summaries import _evidence_summary
 from daita.db.llm_agent_planner import DbLLMAgentPlanner
 from daita.db.llm_planner import DbLLMPlannerExecutor, DbLLMRepairExecutor
 from daita.db.llm_service import DbLLMResponse, DbLLMService
@@ -269,6 +270,698 @@ class FakeLLMService:
             content=self.contents[index],
             diagnostics={"provider": "fake", "model": "phase-two"},
         )
+
+
+async def test_loop_state_projects_bounded_evidence_backed_catalog_context():
+    runtime, operation = await _runtime_and_operation(
+        "phase-one-bounded-catalog-context"
+    )
+    secret = "TOP_SECRET_CATALOG_VALUE"
+    assets = [
+        {
+            "store_id": "store:catalog",
+            "name": f"asset_{asset_index:02d}",
+            "asset_ref": f"asset_{asset_index:02d}",
+            "matched_fields": [
+                {
+                    "name": f"column_{column_index:02d}",
+                    "type": "TEXT",
+                    "sample_values": [secret],
+                }
+                for column_index in reversed(range(25))
+            ],
+            "sample_rows": [{"unsafe": secret}],
+        }
+        for asset_index in reversed(range(12))
+    ]
+    try:
+        await runtime.store.save_evidence(
+            Evidence(
+                id="catalog-search-related",
+                kind="schema.search_result",
+                owner="catalog",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "store_id": "store:catalog",
+                    "query": "prompt scoped assets",
+                    "total_matches": 12,
+                    "truncated": True,
+                    "assets": assets,
+                    "sql": "select unrestricted_catalog_payload",
+                },
+            )
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="catalog-search-rejected",
+                kind="schema.search_result",
+                owner="catalog",
+                operation_id=operation.id,
+                accepted=False,
+                payload={
+                    "store_id": "store:rejected",
+                    "assets": [{"name": "rejected_asset"}],
+                },
+            )
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="catalog-search-malformed",
+                kind="schema.search_result",
+                owner="catalog",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "store_id": "store:malformed",
+                    "assets": [
+                        {
+                            "name": "malformed_asset",
+                            "metadata": "not-a-mapping",
+                        }
+                    ],
+                },
+            )
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="catalog-search-unrelated",
+                kind="schema.search_result",
+                owner="catalog",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "store_id": "store:unrelated",
+                    "assets": [{"name": "unrelated_asset"}],
+                },
+            )
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="planning-context-stale",
+                kind="planning.context",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "schema_fingerprint": "stale-fingerprint",
+                    "catalog_evidence_refs": ["catalog-search-unrelated"],
+                    "diagnostics": {
+                        "structural_schema_source": "catalog",
+                        "catalog_structural_evidence_refs": [
+                            "catalog-search-unrelated"
+                        ],
+                    },
+                },
+            )
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="planning-context-authoritative",
+                kind="planning.context",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "prompt": secret,
+                    "schema_fingerprint": "schema-fingerprint-catalog",
+                    "catalog_evidence_refs": [
+                        "catalog-search-malformed",
+                        "catalog-search-related",
+                        "catalog-search-rejected",
+                    ],
+                    "diagnostics": {
+                        "structural_schema_source": "catalog",
+                        "catalog_structural_evidence_refs": [
+                            "catalog-search-malformed",
+                            "catalog-search-rejected",
+                            "catalog-search-related",
+                        ],
+                    },
+                    "schema": {
+                        "tables": [
+                            {
+                                "name": "raw_planning_context_asset",
+                                "columns": [
+                                    {"name": "unsafe", "sample_values": [secret]}
+                                ],
+                            }
+                        ],
+                        "sample_rows": [{"unsafe": secret}],
+                    },
+                    "rendered_context": secret,
+                },
+            )
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="planning-context-rejected-later",
+                kind="planning.context",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=False,
+                payload={
+                    "schema_fingerprint": "rejected-fingerprint",
+                    "catalog_evidence_refs": ["catalog-search-unrelated"],
+                    "diagnostics": {
+                        "structural_schema_source": "catalog",
+                        "catalog_structural_evidence_refs": [
+                            "catalog-search-unrelated"
+                        ],
+                    },
+                },
+            )
+        )
+
+        loop = DbAgentLoop(runtime, FakePlanner())
+        state = await loop.build_loop_state(operation, turn=1, remaining_turns=2)
+        rebuilt = await loop.build_loop_state(operation, turn=1, remaining_turns=2)
+    finally:
+        await runtime.teardown()
+
+    context = state.catalog_context
+    assert context == rebuilt.catalog_context
+    assert context["planning_context_evidence_id"] == ("planning-context-authoritative")
+    assert context["structural_source"] == "catalog"
+    assert context["schema_fingerprint"] == "schema-fingerprint-catalog"
+    assert context["catalog_store_id"] == "store:catalog"
+    assert context["catalog_store_ids"] == ["store:catalog"]
+    assert context["catalog_store_count"] == 1
+    assert context["catalog_stores_truncated"] is False
+    assert context["supporting_catalog_evidence_ids"] == ["catalog-search-related"]
+    assert context["supporting_evidence_count"] == 1
+    assert context["supporting_evidence_truncated"] is False
+    assert context["referenced_evidence_count"] == 3
+    assert context["omitted_evidence_count"] == 2
+    assert context["omitted_evidence_reasons"] == [
+        {"reason": "catalog_normalization_failed", "count": 1},
+        {
+            "reason": "not_accepted_catalog_structural_evidence",
+            "count": 1,
+        },
+    ]
+    assert context["candidate_count"] == 12
+    assert context["included_candidate_count"] == 8
+    assert context["truncated"] is True
+    assert context["candidate_sources"] == [
+        {
+            "evidence_id": "catalog-search-related",
+            "candidate_count": 12,
+            "included_candidate_count": 12,
+            "truncated": True,
+            "catalog_store_id": "store:catalog",
+            "catalog_store_ids": ["store:catalog"],
+            "catalog_store_count": 1,
+            "catalog_stores_truncated": False,
+        }
+    ]
+    assert [item["name"] for item in context["assets"]] == [
+        f"asset_{index:02d}" for index in range(8)
+    ]
+    first_asset = context["assets"][0]
+    assert first_asset["asset_ref"] == "asset_00"
+    assert first_asset["evidence_ids"] == ["catalog-search-related"]
+    assert first_asset["catalog_store_id"] == "store:catalog"
+    assert first_asset["catalog_store_ids"] == ["store:catalog"]
+    assert first_asset["column_count"] == 25
+    assert first_asset["included_column_count"] == 20
+    assert first_asset["columns_truncated"] is True
+    assert first_asset["columns"] == [
+        {"name": f"column_{index:02d}", "type": "TEXT"} for index in range(20)
+    ]
+    serialized = json.dumps(context, sort_keys=True)
+    assert secret not in serialized
+    assert "sample_rows" not in serialized
+    assert "sample_values" not in serialized
+    assert "unrestricted_catalog_payload" not in serialized
+    assert "raw_planning_context_asset" not in serialized
+    assert "malformed_asset" not in serialized
+    assert "rejected_asset" not in serialized
+    assert "unrelated_asset" not in serialized
+    assert DbLoopState.from_dict(state.to_dict()).catalog_context == context
+
+
+async def test_catalog_context_preserves_multi_store_asset_provenance_and_counts():
+    runtime, operation = await _runtime_and_operation(
+        "phase-one-multi-store-catalog-context"
+    )
+    try:
+        for evidence in (
+            Evidence(
+                id="catalog-search-a",
+                kind="schema.search_result",
+                owner="catalog",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "store_id": "store:a",
+                    "total_matches": 2,
+                    "assets": [{"name": "zeta"}],
+                },
+            ),
+            Evidence(
+                id="catalog-search-b",
+                kind="schema.search_result",
+                owner="catalog",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "store_id": "store:b",
+                    "total_matches": 50,
+                    "truncated": True,
+                    "assets": [{"name": "alpha"}],
+                },
+            ),
+            Evidence(
+                id="catalog-profile-b",
+                kind="catalog.profile",
+                owner="catalog",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "store_id": "store:b",
+                    "table_count": 999,
+                    "assets": [{"name": "profile_only"}],
+                },
+            ),
+            Evidence(
+                id="planning-context-multi-store",
+                kind="planning.context",
+                owner="db_runtime",
+                operation_id=operation.id,
+                accepted=True,
+                payload={
+                    "catalog_evidence_refs": [
+                        "catalog-search-a",
+                        "catalog-search-b",
+                        "catalog-profile-b",
+                    ],
+                    "diagnostics": {
+                        "structural_schema_source": "catalog",
+                        "catalog_structural_evidence_refs": [
+                            "catalog-search-a",
+                            "catalog-search-b",
+                            "catalog-profile-b",
+                        ],
+                    },
+                },
+            ),
+        ):
+            await runtime.store.save_evidence(evidence)
+
+        state = await DbAgentLoop(runtime, FakePlanner()).build_loop_state(
+            operation,
+            turn=1,
+            remaining_turns=1,
+        )
+    finally:
+        await runtime.teardown()
+
+    context = state.catalog_context
+    assert "catalog_store_id" not in context
+    assert context["catalog_store_ids"] == ["store:a", "store:b"]
+    assert context["catalog_store_count"] == 2
+    assert context["catalog_stores_truncated"] is False
+    assert context["candidate_count"] == 3
+    assert [
+        (item["evidence_id"], item["candidate_count"])
+        for item in context["candidate_sources"]
+    ] == [("catalog-search-a", 2), ("catalog-search-b", 50)]
+    assert context["referenced_evidence_count"] == 3
+    assert context["supporting_evidence_count"] == 3
+    assert context["omitted_evidence_count"] == 0
+    assert context["omitted_evidence_reasons"] == []
+    assets = {item["name"]: item for item in context["assets"]}
+    assert assets["alpha"]["catalog_store_id"] == "store:b"
+    assert assets["profile_only"]["catalog_store_id"] == "store:b"
+    assert assets["zeta"]["catalog_store_id"] == "store:a"
+
+
+def test_monitor_and_failed_catalog_evidence_summaries_are_safe_and_bounded():
+    secret = "TOP_SECRET_MONITOR_PAYLOAD"
+    listing = _evidence_summary(
+        Evidence(
+            id="listing",
+            kind="monitor.listing",
+            owner="db_runtime",
+            accepted=True,
+            payload={
+                "monitors": [
+                    {
+                        "id": f"monitor_{index:02d}",
+                        "name": f"Monitor {index:02d}",
+                        "status": "active",
+                        "observation_plan": {"sql": secret},
+                        "delivery": {"target": secret},
+                    }
+                    for index in reversed(range(25))
+                ],
+                "raw_prompt": secret,
+            },
+        )
+    )
+    inspection = _evidence_summary(
+        Evidence(
+            id="inspection",
+            kind="monitor.inspection",
+            owner="db_runtime",
+            accepted=True,
+            payload={
+                "resolution": {
+                    "monitor_id": "monitor_00",
+                    "monitor_ref": "Monitor 00",
+                    "resolution_source": "canonical_id",
+                    "matches": [f"monitor_{index:02d}" for index in range(12)],
+                    "warnings": [f"warning_{index:02d}" for index in range(12)],
+                    "errors": [f"error_{index:02d}" for index in range(12)],
+                    "metadata": {"secret": secret},
+                },
+                "inspection": {
+                    "monitor": {
+                        "id": "monitor_00",
+                        "name": "Monitor 00",
+                        "status": "active",
+                        "observation_plan": {"sql": secret},
+                    },
+                    "runs": [{"rows": [secret]}],
+                },
+                "sql": secret,
+            },
+        )
+    )
+    proposal = _evidence_summary(
+        Evidence(
+            id="proposal",
+            kind="monitor.proposal",
+            owner="db_runtime",
+            accepted=False,
+            payload={
+                "action": "pause",
+                "monitor_id": "canonical-monitor",
+                "validation": {
+                    "accepted": False,
+                    "errors": [f"validation_{index:02d}" for index in range(12)],
+                    "governance": {"secret": secret},
+                },
+                "candidates": [
+                    {
+                        "monitor_id": f"candidate_{index:02d}",
+                        "name": f"Candidate {index:02d}",
+                        "definition": {"sql": secret},
+                    }
+                    for index in reversed(range(12))
+                ],
+                "before": {"observation_plan": {"sql": secret}},
+                "after": {"delivery": {"target": secret}},
+                "raw_prompt": secret,
+                "sql": secret,
+            },
+        )
+    )
+    create_proposal = _evidence_summary(
+        Evidence(
+            id="create-proposal",
+            kind="monitor.proposal",
+            owner="db_runtime",
+            accepted=True,
+            payload={"monitor_id": "new-monitor", "validation": {"errors": []}},
+        )
+    )
+    approval_state = _evidence_summary(
+        Evidence(
+            id="approval-state",
+            kind="monitor.approval_state",
+            owner="db_runtime",
+            accepted=True,
+            payload={
+                "approvals": [
+                    {
+                        "approval_id": f"approval_{index:02d}",
+                        "operation_id": f"operation_{index:02d}",
+                        "status": "pending",
+                        "requested_by_policy_id": "monitor-policy",
+                        "context": {
+                            "monitor_id": f"monitor_{index:02d}",
+                            "governance": {"secret": secret},
+                        },
+                        "reason": secret,
+                    }
+                    for index in reversed(range(25))
+                ]
+            },
+        )
+    )
+    approval_resolution = _evidence_summary(
+        Evidence(
+            id="approval-resolution",
+            kind="monitor.approval_resolution",
+            owner="db_runtime",
+            accepted=True,
+            payload={
+                "status": "resolved",
+                "approval_id": "approval_00",
+                "approval_status": "approved",
+                "operation_id": "operation_00",
+                "matched_approvals": [
+                    {
+                        "approval_id": f"approval_{index:02d}",
+                        "operation_id": f"operation_{index:02d}",
+                        "status": "pending",
+                        "requested_by_policy_id": "monitor-policy",
+                        "context": {"monitor_id": f"monitor_{index:02d}"},
+                        "governance": {"secret": secret},
+                    }
+                    for index in reversed(range(25))
+                ],
+                "governance": {"secret": secret},
+            },
+        )
+    )
+    failed_asset = _evidence_summary(
+        Evidence(
+            id="failed-asset",
+            kind="schema.asset_profile",
+            owner="catalog",
+            accepted=False,
+            payload={
+                "success": False,
+                "asset_ref": "pending orders",
+                "candidates": [
+                    {
+                        "asset_ref": f"asset_{index:02d}",
+                        "name": f"Asset {index:02d}",
+                        "sample_rows": [{"secret": secret}],
+                    }
+                    for index in reversed(range(12))
+                ],
+                "sql": secret,
+                "error": secret,
+            },
+        )
+    )
+
+    assert listing["monitor_count"] == 25
+    assert listing["included_monitor_count"] == 20
+    assert listing["monitors_truncated"] is True
+    assert listing["monitors"][0] == {
+        "id": "monitor_00",
+        "name": "Monitor 00",
+        "status": "active",
+    }
+    assert inspection["monitor_id"] == "monitor_00"
+    assert inspection["monitor_name"] == "Monitor 00"
+    assert inspection["monitor_status"] == "active"
+    assert inspection["resolution"]["match_count"] == 12
+    assert inspection["resolution"]["included_match_count"] == 10
+    assert inspection["resolution"]["matches_truncated"] is True
+    assert inspection["resolution"]["warning_count"] == 12
+    assert inspection["resolution"]["included_warning_count"] == 10
+    assert inspection["resolution"]["warnings_truncated"] is True
+    assert proposal["action"] == "pause"
+    assert proposal["monitor_id"] == "canonical-monitor"
+    assert proposal["validation_error_count"] == 12
+    assert proposal["included_validation_error_count"] == 10
+    assert proposal["validation_errors_truncated"] is True
+    assert proposal["candidate_count"] == 12
+    assert proposal["included_candidate_count"] == 10
+    assert proposal["candidates_truncated"] is True
+    assert create_proposal["action"] == "create"
+    assert approval_state["approval_count"] == 25
+    assert approval_state["included_approval_count"] == 20
+    assert approval_state["approvals_truncated"] is True
+    assert approval_state["approvals"][0] == {
+        "approval_id": "approval_00",
+        "target_operation_id": "operation_00",
+        "monitor_id": "monitor_00",
+        "policy_id": "monitor-policy",
+        "status": "pending",
+    }
+    assert approval_resolution["resolution_status"] == "resolved"
+    assert approval_resolution["approval_id"] == "approval_00"
+    assert approval_resolution["approval_status"] == "approved"
+    assert approval_resolution["target_operation_id"] == "operation_00"
+    assert approval_resolution["matched_approval_count"] == 25
+    assert approval_resolution["included_matched_approval_count"] == 20
+    assert approval_resolution["matched_approvals_truncated"] is True
+    assert failed_asset["requested_asset"] == "pending orders"
+    assert failed_asset["candidate_count"] == 12
+    assert failed_asset["included_candidate_count"] == 10
+    assert failed_asset["candidates_truncated"] is True
+    assert failed_asset["candidates"][0] == {
+        "asset_ref": "asset_00",
+        "name": "Asset 00",
+    }
+
+    serialized = json.dumps(
+        {
+            "listing": listing,
+            "inspection": inspection,
+            "proposal": proposal,
+            "approval_state": approval_state,
+            "approval_resolution": approval_resolution,
+            "failed_asset": failed_asset,
+        },
+        sort_keys=True,
+    )
+    assert secret not in serialized
+    for forbidden in (
+        "observation_plan",
+        "delivery",
+        "raw_prompt",
+        "governance",
+        "sample_rows",
+        "sql",
+    ):
+        assert forbidden not in serialized
+
+
+def test_monitor_evidence_summaries_bound_scalar_text_and_report_truncation():
+    oversized = "x" * 100_000
+    listing = _evidence_summary(
+        Evidence(
+            id="long-listing",
+            kind="monitor.listing",
+            owner="db_runtime",
+            accepted=True,
+            payload={
+                "monitors": [{"id": oversized, "name": oversized, "status": oversized}]
+            },
+        )
+    )
+    inspection = _evidence_summary(
+        Evidence(
+            id="long-inspection",
+            kind="monitor.inspection",
+            owner="db_runtime",
+            accepted=True,
+            payload={
+                "resolution": {
+                    "monitor_id": "monitor_00",
+                    "monitor_ref": oversized,
+                    "warnings": [oversized],
+                    "errors": [oversized],
+                }
+            },
+        )
+    )
+    proposal = _evidence_summary(
+        Evidence(
+            id="long-proposal",
+            kind="monitor.proposal",
+            owner="db_runtime",
+            accepted=False,
+            payload={
+                "monitor_id": oversized,
+                "validation": {
+                    "errors": [oversized, {"code": oversized}],
+                },
+            },
+        )
+    )
+
+    monitor = listing["monitors"][0]
+    assert len(monitor["id"]) == 48
+    assert len(monitor["name"]) == 64
+    assert len(monitor["status"]) == 256
+    assert monitor["truncated_fields"] == ["id", "name", "status"]
+
+    resolution = inspection["resolution"]
+    assert len(resolution["monitor_ref"]) == 256
+    assert resolution["truncated_fields"] == ["monitor_ref"]
+    assert len(resolution["warnings"][0]) == 256
+    assert resolution["warning_text_truncated_count"] == 1
+    assert resolution["warnings_truncated"] is True
+    assert len(resolution["errors"][0]) == 256
+    assert resolution["error_text_truncated_count"] == 1
+    assert resolution["errors_truncated"] is True
+
+    assert len(proposal["monitor_id"]) == 48
+    assert proposal["truncated_fields"] == ["monitor_id"]
+    assert len(proposal["validation_errors"][0]) == 256
+    assert proposal["validation_error_text_truncated_count"] == 2
+    assert proposal["validation_errors_truncated"] is True
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload", "accepted"),
+    (
+        (
+            "monitor.listing",
+            {"monitors": {"id": {"nested": "secret"}, "name": []}},
+            True,
+        ),
+        (
+            "monitor.inspection",
+            {"resolution": "malformed", "inspection": {"monitor": []}},
+            False,
+        ),
+        (
+            "monitor.proposal",
+            {
+                "action": {"nested": "secret"},
+                "validation": {"errors": {"nested": "secret"}},
+                "candidates": {"id": {"nested": "secret"}},
+            },
+            False,
+        ),
+        (
+            "monitor.approval_state",
+            {"approvals": {"approval_id": {"nested": "secret"}}},
+            True,
+        ),
+        (
+            "monitor.approval_resolution",
+            {"status": [], "matched_approvals": "malformed"},
+            True,
+        ),
+        (
+            "schema.asset_profile",
+            {
+                "success": False,
+                "asset_ref": {"nested": "secret"},
+                "candidates": {"name": {"nested": "secret"}},
+            },
+            False,
+        ),
+    ),
+)
+def test_bounded_evidence_summaries_tolerate_malformed_optional_fields(
+    kind,
+    payload,
+    accepted,
+):
+    summary = _evidence_summary(
+        Evidence(
+            id=f"malformed-{kind}",
+            kind=kind,
+            owner="db_runtime",
+            accepted=accepted,
+            payload=payload,
+        )
+    )
+
+    assert summary["kind"] == kind
+    assert "secret" not in json.dumps(summary, sort_keys=True)
 
 
 async def test_llm_query_plan_normalizes_sql_alias_and_accepts_executable_plan():

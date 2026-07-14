@@ -2,19 +2,43 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from daita.runtime import Evidence, Task
 
 from ..fingerprints import persisted_fingerprint
+from ..monitor_commands.naming import (
+    MAX_MONITOR_DISPLAY_NAME_LENGTH,
+    MAX_MONITOR_ID_LENGTH,
+)
 from ..planner_protocol import DbLoopState
-from ..planning_context import planner_eligible_column_value_hint
+from ..planning_context import (
+    catalog_schema_from_evidence,
+    planner_eligible_column_value_hint,
+)
 from .utils import (
     _dedupe_dicts,
     _dedupe_json_values,
     _optional_string,
     _safe_iterable,
     _string_list,
+)
+
+
+_CATALOG_CONTEXT_ASSET_LIMIT = 8
+_CATALOG_CONTEXT_COLUMN_LIMIT = 20
+_CATALOG_CONTEXT_EVIDENCE_LIMIT = 8
+_MONITOR_SUMMARY_ITEM_LIMIT = 20
+_MONITOR_SUMMARY_CANDIDATE_LIMIT = 10
+_MONITOR_SUMMARY_ERROR_LIMIT = 10
+_SUMMARY_STRING_LIMIT = 256
+_CATALOG_STRUCTURAL_EVIDENCE_KINDS = frozenset(
+    {
+        "schema.asset_profile",
+        "schema.search_result",
+        "catalog.source_registered",
+        "catalog.profile",
+    }
 )
 
 
@@ -71,6 +95,281 @@ def _approval_task_id(approval: Any) -> str | None:
     return None
 
 
+def _catalog_context_for_state(evidence: tuple[Evidence, ...]) -> dict[str, Any]:
+    """Project bounded catalog facts from the latest accepted planning context."""
+    planning_context = next(
+        (
+            item
+            for item in reversed(evidence)
+            if item.accepted
+            and item.kind == "planning.context"
+            and isinstance(item.payload, Mapping)
+        ),
+        None,
+    )
+    if planning_context is None:
+        return {}
+
+    payload = planning_context.payload
+    diagnostics = payload.get("diagnostics")
+    diagnostics = diagnostics if isinstance(diagnostics, Mapping) else {}
+    referenced_ids = _safe_string_values(
+        diagnostics.get("catalog_structural_evidence_refs")
+    )
+    if not referenced_ids:
+        referenced_ids = _safe_string_values(payload.get("catalog_evidence_refs"))
+    referenced_ids = sorted(set(referenced_ids))
+    if not referenced_ids:
+        return {}
+
+    accepted_by_id = {
+        str(item.id): item
+        for item in evidence
+        if item.id
+        and item.accepted
+        and item.owner == "catalog"
+        and item.kind in _CATALOG_STRUCTURAL_EVIDENCE_KINDS
+    }
+    normalized_by_evidence_id: dict[str, dict[str, Any]] = {}
+    referenced: list[Evidence] = []
+    omitted_reasons: dict[str, int] = {}
+    for evidence_id in referenced_ids:
+        item = accepted_by_id.get(evidence_id)
+        if item is None:
+            omitted_reasons["not_accepted_catalog_structural_evidence"] = (
+                omitted_reasons.get("not_accepted_catalog_structural_evidence", 0) + 1
+            )
+            continue
+        try:
+            item_schema = catalog_schema_from_evidence((item,), ())
+        except (AttributeError, TypeError, ValueError):
+            omitted_reasons["catalog_normalization_failed"] = (
+                omitted_reasons.get("catalog_normalization_failed", 0) + 1
+            )
+            continue
+        referenced.append(item)
+        normalized_by_evidence_id[evidence_id] = item_schema
+
+    normalized_schema = catalog_schema_from_evidence(tuple(referenced), ())
+    raw_tables = normalized_schema.get("tables")
+    tables = [item for item in _safe_iterable(raw_tables) if isinstance(item, Mapping)]
+    supporting_ids = sorted(str(item.id) for item in referenced if item.id)
+    included_supporting_ids = supporting_ids[:_CATALOG_CONTEXT_EVIDENCE_LIMIT]
+
+    evidence_ids_by_asset: dict[str, set[str]] = {}
+    store_ids_by_asset: dict[str, set[str]] = {}
+    for item in referenced:
+        if not item.id:
+            continue
+        item_schema = normalized_by_evidence_id[str(item.id)]
+        item_store_ids = _catalog_store_ids_for_evidence(item)
+        for table in _safe_iterable(item_schema.get("tables")):
+            if not isinstance(table, Mapping):
+                continue
+            name = _safe_optional_string(table.get("name"))
+            metadata = table.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            asset_ref = _safe_optional_string(metadata.get("catalog_asset_ref")) or name
+            for value in (name, asset_ref):
+                if value:
+                    evidence_ids_by_asset.setdefault(value.casefold(), set()).add(
+                        str(item.id)
+                    )
+                    store_ids_by_asset.setdefault(value.casefold(), set()).update(
+                        item_store_ids
+                    )
+
+    assets: list[dict[str, Any]] = []
+    for table in tables:
+        name, name_truncated = _bounded_optional_string(table.get("name"))
+        if name is None:
+            continue
+        metadata = table.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        asset_ref, asset_ref_truncated = _bounded_optional_string(
+            metadata.get("catalog_asset_ref")
+        )
+        asset_ref = asset_ref or name
+        columns = []
+        for column in _safe_iterable(table.get("columns")):
+            if not isinstance(column, Mapping):
+                continue
+            column_name, column_name_truncated = _bounded_optional_string(
+                column.get("name")
+            )
+            if column_name is None:
+                continue
+            column_summary: dict[str, Any] = {"name": column_name}
+            column_type, column_type_truncated = _bounded_optional_string(
+                column.get("data_type") or column.get("type")
+            )
+            if column_type is not None:
+                column_summary["type"] = column_type
+            truncated_fields = []
+            if column_name_truncated:
+                truncated_fields.append("name")
+            if column_type_truncated:
+                truncated_fields.append("type")
+            if truncated_fields:
+                column_summary["truncated_fields"] = truncated_fields
+            columns.append(column_summary)
+        columns.sort(
+            key=lambda item: (
+                str(item.get("name") or "").casefold(),
+                str(item.get("type") or "").casefold(),
+            )
+        )
+        evidence_ids = sorted(
+            evidence_ids_by_asset.get(name.casefold(), set())
+            | evidence_ids_by_asset.get(asset_ref.casefold(), set())
+        )
+        if not evidence_ids:
+            evidence_ids = supporting_ids
+        included_evidence_ids = evidence_ids[:_CATALOG_CONTEXT_EVIDENCE_LIMIT]
+        asset_store_ids = sorted(
+            store_ids_by_asset.get(name.casefold(), set())
+            | store_ids_by_asset.get(asset_ref.casefold(), set())
+        )
+        included_asset_store_ids = asset_store_ids[:_CATALOG_CONTEXT_EVIDENCE_LIMIT]
+        included_columns = columns[:_CATALOG_CONTEXT_COLUMN_LIMIT]
+        asset = {
+            "asset_ref": asset_ref,
+            "name": name,
+            "columns": included_columns,
+            "column_count": len(columns),
+            "included_column_count": len(included_columns),
+            "columns_truncated": len(columns) > len(included_columns),
+            "evidence_ids": included_evidence_ids,
+            "evidence_count": len(evidence_ids),
+            "evidence_truncated": len(evidence_ids) > len(included_evidence_ids),
+        }
+        truncated_fields = []
+        if name_truncated:
+            truncated_fields.append("name")
+        if asset_ref_truncated:
+            truncated_fields.append("asset_ref")
+        if truncated_fields:
+            asset["truncated_fields"] = truncated_fields
+        if asset_store_ids:
+            asset.update(
+                {
+                    "catalog_store_ids": included_asset_store_ids,
+                    "catalog_store_count": len(asset_store_ids),
+                    "catalog_stores_truncated": len(asset_store_ids)
+                    > len(included_asset_store_ids),
+                }
+            )
+            if len(asset_store_ids) == 1:
+                asset["catalog_store_id"] = asset_store_ids[0]
+        assets.append(asset)
+    assets.sort(
+        key=lambda item: (
+            str(item.get("name") or "").casefold(),
+            str(item.get("asset_ref") or "").casefold(),
+        )
+    )
+    included_assets = assets[:_CATALOG_CONTEXT_ASSET_LIMIT]
+    candidate_sources, source_truncated = _catalog_candidate_metadata(tuple(referenced))
+    included_candidate_sources = candidate_sources[:_CATALOG_CONTEXT_EVIDENCE_LIMIT]
+    store_ids = _catalog_store_ids(tuple(referenced))
+    included_store_ids = store_ids[:_CATALOG_CONTEXT_EVIDENCE_LIMIT]
+    structural_source = (
+        _safe_optional_string(diagnostics.get("structural_schema_source")) or "catalog"
+    )
+    schema_fingerprint = _safe_optional_string(
+        payload.get("schema_fingerprint") or diagnostics.get("schema_fingerprint")
+    )
+
+    result: dict[str, Any] = {
+        "planning_context_evidence_id": planning_context.id,
+        "structural_source": structural_source,
+        "assets": included_assets,
+        "candidate_count": len(assets),
+        "included_candidate_count": len(included_assets),
+        "truncated": source_truncated or len(assets) > len(included_assets),
+        "candidate_sources": included_candidate_sources,
+        "candidate_source_count": len(candidate_sources),
+        "included_candidate_source_count": len(included_candidate_sources),
+        "candidate_sources_truncated": len(candidate_sources)
+        > len(included_candidate_sources),
+        "supporting_catalog_evidence_ids": included_supporting_ids,
+        "supporting_evidence_count": len(supporting_ids),
+        "supporting_evidence_truncated": len(supporting_ids)
+        > len(included_supporting_ids),
+        "referenced_evidence_count": len(referenced_ids),
+        "omitted_evidence_count": len(referenced_ids) - len(supporting_ids),
+        "omitted_evidence_reasons": [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(omitted_reasons.items())
+        ],
+    }
+    if schema_fingerprint is not None:
+        result["schema_fingerprint"] = schema_fingerprint
+    if store_ids:
+        result["catalog_store_ids"] = included_store_ids
+        result["catalog_store_count"] = len(store_ids)
+        result["catalog_stores_truncated"] = len(store_ids) > len(included_store_ids)
+        if len(store_ids) == 1:
+            result["catalog_store_id"] = store_ids[0]
+    return result
+
+
+def _catalog_candidate_metadata(
+    evidence: tuple[Evidence, ...],
+) -> tuple[list[dict[str, Any]], bool]:
+    sources: list[dict[str, Any]] = []
+    truncated = False
+    for item in evidence:
+        payload = item.payload if isinstance(item.payload, Mapping) else {}
+        truncated = truncated or payload.get("truncated") is True
+        if item.kind != "schema.search_result":
+            continue
+        item_schema = catalog_schema_from_evidence((item,), ())
+        included_count = len(_safe_iterable(item_schema.get("tables")))
+        value = payload.get("total_matches")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            value = included_count
+        source_truncated = payload.get("truncated") is True or value > included_count
+        truncated = truncated or source_truncated
+        store_ids = sorted(_catalog_store_ids_for_evidence(item))
+        included_store_ids = store_ids[:_CATALOG_CONTEXT_EVIDENCE_LIMIT]
+        source = {
+            "evidence_id": item.id,
+            "candidate_count": value,
+            "included_candidate_count": included_count,
+            "truncated": source_truncated,
+            "catalog_store_ids": included_store_ids,
+            "catalog_store_count": len(store_ids),
+            "catalog_stores_truncated": len(store_ids) > len(included_store_ids),
+        }
+        if len(store_ids) == 1:
+            source["catalog_store_id"] = store_ids[0]
+        sources.append(source)
+    sources.sort(key=lambda item: str(item.get("evidence_id") or "").casefold())
+    return sources, truncated
+
+
+def _catalog_store_ids(evidence: tuple[Evidence, ...]) -> list[str]:
+    store_ids: set[str] = set()
+    for item in evidence:
+        store_ids.update(_catalog_store_ids_for_evidence(item))
+    return sorted(store_ids)
+
+
+def _catalog_store_ids_for_evidence(evidence: Evidence) -> set[str]:
+    payload = evidence.payload if isinstance(evidence.payload, Mapping) else {}
+    sources: list[Mapping[Any, Any]] = [payload]
+    for key in ("asset", "table"):
+        value = payload.get(key)
+        if isinstance(value, Mapping):
+            sources.append(value)
+    return {
+        store_id
+        for source in sources
+        if (store_id := _safe_optional_string(source.get("store_id"))) is not None
+    }
+
+
 def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
     summary = {
         "id": evidence.id,
@@ -79,6 +378,16 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
         "accepted": evidence.accepted,
         "task_id": evidence.task_id,
     }
+    bounded_payload = _bounded_evidence_payload_summary(evidence)
+    if bounded_payload is not None:
+        summary.update(bounded_payload)
+        payload_fingerprint = evidence.metadata.get("payload_fingerprint")
+        if payload_fingerprint:
+            summary["payload_fingerprint"] = str(payload_fingerprint)
+        task_input_hash = evidence.metadata.get("task_input_hash")
+        if task_input_hash:
+            summary["task_input_hash"] = str(task_input_hash)
+        return summary
     sql = _sql_from_evidence_payload(evidence.payload)
     if sql:
         summary["sql"] = sql
@@ -246,6 +555,495 @@ def _evidence_summary(evidence: Evidence) -> dict[str, Any]:
     if task_input_hash:
         summary["task_input_hash"] = str(task_input_hash)
     return summary
+
+
+def _bounded_evidence_payload_summary(
+    evidence: Evidence,
+) -> dict[str, Any] | None:
+    payload = evidence.payload if isinstance(evidence.payload, Mapping) else {}
+    if evidence.kind == "monitor.listing":
+        return _monitor_listing_summary(payload)
+    if evidence.kind == "monitor.inspection":
+        return _monitor_inspection_summary(payload)
+    if evidence.kind == "monitor.proposal":
+        return _monitor_proposal_summary(payload)
+    if evidence.kind == "monitor.approval_state":
+        return _monitor_approval_state_summary(payload)
+    if evidence.kind == "monitor.approval_resolution":
+        return _monitor_approval_resolution_summary(payload)
+    if evidence.kind == "schema.asset_profile" and (
+        not evidence.accepted or payload.get("success") is False
+    ):
+        return _failed_asset_profile_summary(payload)
+    return None
+
+
+def _monitor_listing_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    raw_monitors, included, truncated = _project_bounded_collection(
+        payload.get("monitors"),
+        projector=_safe_monitor_identities,
+        limit=_MONITOR_SUMMARY_ITEM_LIMIT,
+    )
+    return {
+        "monitors": included,
+        "monitor_count": len(raw_monitors),
+        "included_monitor_count": len(included),
+        "monitors_truncated": truncated,
+    }
+
+
+def _monitor_inspection_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    resolution = payload.get("resolution")
+    resolution = resolution if isinstance(resolution, Mapping) else {}
+    safe_resolution: dict[str, Any] = {}
+    for key, max_length in (
+        ("monitor_id", MAX_MONITOR_ID_LENGTH),
+        ("monitor_ref", _SUMMARY_STRING_LIMIT),
+        ("resolution_source", _SUMMARY_STRING_LIMIT),
+        ("definition_evidence_id", _SUMMARY_STRING_LIMIT),
+        ("proposal_evidence_id", _SUMMARY_STRING_LIMIT),
+        ("operation_id", _SUMMARY_STRING_LIMIT),
+    ):
+        _set_bounded_string(
+            safe_resolution,
+            key,
+            resolution.get(key),
+            max_length=max_length,
+        )
+    raw_matches, included_matches, matches_truncated = _project_bounded_collection(
+        resolution.get("matches"),
+        projector=_safe_monitor_candidates,
+        limit=_MONITOR_SUMMARY_CANDIDATE_LIMIT,
+    )
+    safe_resolution.update(
+        {
+            "matches": included_matches,
+            "match_count": len(raw_matches),
+            "included_match_count": len(included_matches),
+            "matches_truncated": matches_truncated,
+        }
+    )
+    for key, singular in (("warnings", "warning"), ("errors", "error")):
+        raw_values = _safe_iterable(resolution.get(key))
+        values, text_truncated_count = _bounded_string_values(raw_values)
+        included_values = values[:_MONITOR_SUMMARY_ERROR_LIMIT]
+        safe_resolution[key] = included_values
+        safe_resolution[f"{singular}_count"] = len(raw_values)
+        safe_resolution[f"included_{singular}_count"] = len(included_values)
+        safe_resolution[f"{singular}_text_truncated_count"] = text_truncated_count
+        safe_resolution[f"{key}_truncated"] = (
+            len(raw_values) > len(included_values) or text_truncated_count > 0
+        )
+    if safe_resolution:
+        result["resolution"] = safe_resolution
+
+    inspection = payload.get("inspection")
+    inspection = inspection if isinstance(inspection, Mapping) else {}
+    monitor = _safe_monitor_identity(
+        inspection.get("monitor") if "monitor" in inspection else payload.get("monitor")
+    )
+    if monitor:
+        result.update(
+            {
+                "monitor_id": monitor.get("id"),
+                "monitor_name": monitor.get("name"),
+                "monitor_status": monitor.get("status"),
+            }
+        )
+        if monitor.get("truncated_fields"):
+            result["monitor_truncated_fields"] = monitor["truncated_fields"]
+    elif safe_resolution.get("monitor_id"):
+        result["monitor_id"] = safe_resolution["monitor_id"]
+    return {key: value for key, value in result.items() if value is not None}
+
+
+def _monitor_proposal_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    action = _safe_optional_string(payload.get("action"))
+    if action is None:
+        operation_type = _safe_optional_string(payload.get("operation_type"))
+        action = operation_type.rsplit(".", 1)[-1] if operation_type else "create"
+    monitor_id, monitor_id_truncated = _bounded_optional_string(
+        payload.get("monitor_id"),
+        max_length=MAX_MONITOR_ID_LENGTH,
+    )
+    if monitor_id is None:
+        for key in ("after", "before"):
+            value = payload.get(key)
+            if isinstance(value, Mapping):
+                monitor_id, monitor_id_truncated = _bounded_optional_string(
+                    value.get("id"),
+                    max_length=MAX_MONITOR_ID_LENGTH,
+                )
+                if monitor_id is not None:
+                    break
+    validation = payload.get("validation")
+    validation = validation if isinstance(validation, Mapping) else {}
+    raw_errors = _safe_iterable(validation.get("errors"))
+    errors, error_text_truncated_count = _safe_error_codes(raw_errors)
+    included_errors = errors[:_MONITOR_SUMMARY_ERROR_LIMIT]
+
+    raw_candidates_value = payload.get("candidates")
+    if raw_candidates_value is None:
+        raw_candidates_value = payload.get("matches")
+    if raw_candidates_value is None:
+        diagnostics = validation.get("diagnostics")
+        if isinstance(diagnostics, Mapping):
+            raw_candidates_value = diagnostics.get("candidates")
+    raw_candidates, included_candidates, candidates_truncated = (
+        _project_bounded_collection(
+            raw_candidates_value,
+            projector=_safe_monitor_candidates,
+            limit=_MONITOR_SUMMARY_CANDIDATE_LIMIT,
+        )
+    )
+    result: dict[str, Any] = {
+        "action": action,
+        "validation_errors": included_errors,
+        "validation_error_count": len(raw_errors),
+        "included_validation_error_count": len(included_errors),
+        "validation_error_text_truncated_count": error_text_truncated_count,
+        "validation_errors_truncated": len(raw_errors) > len(included_errors)
+        or error_text_truncated_count > 0,
+        "candidates": included_candidates,
+        "candidate_count": len(raw_candidates),
+        "included_candidate_count": len(included_candidates),
+        "candidates_truncated": candidates_truncated,
+    }
+    if monitor_id is not None:
+        result["monitor_id"] = monitor_id
+    if monitor_id_truncated:
+        result["truncated_fields"] = ["monitor_id"]
+    return result
+
+
+def _monitor_approval_state_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    raw_approvals = _safe_iterable(payload.get("approvals"))
+    approvals = [_safe_approval_summary(item) for item in raw_approvals]
+    approvals = [item for item in approvals if item]
+    approvals = _dedupe_dicts(
+        approvals,
+        keys=("approval_id", "target_operation_id", "monitor_id", "policy_id"),
+    )
+    approvals.sort(
+        key=lambda item: (
+            str(item.get("approval_id") or "").casefold(),
+            str(item.get("target_operation_id") or "").casefold(),
+        )
+    )
+    included = approvals[:_MONITOR_SUMMARY_ITEM_LIMIT]
+    result: dict[str, Any] = {
+        "approvals": included,
+        "approval_count": len(raw_approvals),
+        "included_approval_count": len(included),
+        "approvals_truncated": len(raw_approvals) > len(included),
+    }
+    _set_bounded_string(
+        result,
+        "monitor_id",
+        payload.get("monitor_id"),
+        max_length=MAX_MONITOR_ID_LENGTH,
+    )
+    return result
+
+
+def _monitor_approval_resolution_summary(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for source_key, target_key, max_length in (
+        ("status", "resolution_status", _SUMMARY_STRING_LIMIT),
+        ("approval_id", "approval_id", _SUMMARY_STRING_LIMIT),
+        ("approval_status", "approval_status", _SUMMARY_STRING_LIMIT),
+        ("operation_id", "target_operation_id", _SUMMARY_STRING_LIMIT),
+    ):
+        _set_bounded_string(
+            result,
+            target_key,
+            payload.get(source_key),
+            max_length=max_length,
+        )
+    raw_approvals = _safe_iterable(payload.get("matched_approvals"))
+    approvals = [_safe_approval_summary(item) for item in raw_approvals]
+    approvals = [item for item in approvals if item]
+    approvals.sort(
+        key=lambda item: (
+            str(item.get("approval_id") or "").casefold(),
+            str(item.get("target_operation_id") or "").casefold(),
+        )
+    )
+    included = approvals[:_MONITOR_SUMMARY_ITEM_LIMIT]
+    result.update(
+        {
+            "matched_approvals": included,
+            "matched_approval_count": len(raw_approvals),
+            "included_matched_approval_count": len(included),
+            "matched_approvals_truncated": len(raw_approvals) > len(included),
+        }
+    )
+    return result
+
+
+def _failed_asset_profile_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    requested_asset = _safe_optional_string(
+        payload.get("asset_ref")
+        or payload.get("requested_asset")
+        or payload.get("target")
+    )
+    raw_candidates, included, truncated = _project_bounded_collection(
+        payload.get("candidates"),
+        projector=_safe_catalog_candidates,
+        limit=_MONITOR_SUMMARY_CANDIDATE_LIMIT,
+    )
+    result: dict[str, Any] = {
+        "candidates": included,
+        "candidate_count": len(raw_candidates),
+        "included_candidate_count": len(included),
+        "candidates_truncated": truncated,
+    }
+    if requested_asset is not None:
+        result["requested_asset"] = requested_asset
+    return result
+
+
+def _safe_monitor_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for source_key, target_key, max_length in (
+        ("id", "id", MAX_MONITOR_ID_LENGTH),
+        ("monitor_id", "id", MAX_MONITOR_ID_LENGTH),
+        ("name", "name", MAX_MONITOR_DISPLAY_NAME_LENGTH),
+        ("status", "status", _SUMMARY_STRING_LIMIT),
+    ):
+        if target_key in result:
+            continue
+        _set_bounded_string(
+            result,
+            target_key,
+            value.get(source_key),
+            max_length=max_length,
+        )
+    return result
+
+
+def _safe_monitor_identities(value: Any) -> list[dict[str, Any]]:
+    monitors = [
+        monitor
+        for item in _safe_iterable(value)
+        if (monitor := _safe_monitor_identity(item))
+    ]
+    monitors = _dedupe_dicts(monitors, keys=("id", "name", "status"))
+    monitors.sort(
+        key=lambda item: (
+            str(item.get("id") or "").casefold(),
+            str(item.get("name") or "").casefold(),
+            str(item.get("status") or "").casefold(),
+        )
+    )
+    return monitors
+
+
+def _project_bounded_collection(
+    value: Any,
+    *,
+    projector: Callable[[Any], list[dict[str, Any]]],
+    limit: int,
+) -> tuple[list[Any], list[dict[str, Any]], bool]:
+    raw_items = _safe_iterable(value)
+    projected = projector(raw_items)
+    included = projected[:limit]
+    return raw_items, included, len(raw_items) > len(included)
+
+
+def _safe_monitor_candidates(value: Any) -> list[dict[str, Any]]:
+    candidates = []
+    for item in _safe_iterable(value):
+        if isinstance(item, Mapping):
+            candidate_id, candidate_id_truncated = _bounded_optional_string(
+                item.get("monitor_id") or item.get("id"),
+                max_length=MAX_MONITOR_ID_LENGTH,
+            )
+            name, name_truncated = _bounded_optional_string(
+                item.get("name"),
+                max_length=MAX_MONITOR_DISPLAY_NAME_LENGTH,
+            )
+        elif isinstance(item, str):
+            candidate_id, candidate_id_truncated = _bounded_optional_string(
+                item,
+                max_length=MAX_MONITOR_ID_LENGTH,
+            )
+            name = None
+            name_truncated = False
+        else:
+            continue
+        candidate: dict[str, Any] = {}
+        if candidate_id is not None:
+            candidate["id"] = candidate_id
+        if name is not None:
+            candidate["name"] = name
+        truncated_fields = []
+        if candidate_id_truncated:
+            truncated_fields.append("id")
+        if name_truncated:
+            truncated_fields.append("name")
+        if truncated_fields:
+            candidate["truncated_fields"] = truncated_fields
+        if candidate:
+            candidates.append(candidate)
+    candidates = _dedupe_dicts(candidates, keys=("id", "name"))
+    candidates.sort(
+        key=lambda item: (
+            str(item.get("id") or "").casefold(),
+            str(item.get("name") or "").casefold(),
+        )
+    )
+    return candidates
+
+
+def _safe_catalog_candidates(value: Any) -> list[dict[str, Any]]:
+    candidates = []
+    for item in _safe_iterable(value):
+        if isinstance(item, Mapping):
+            asset_ref, asset_ref_truncated = _bounded_optional_string(
+                item.get("asset_ref") or item.get("name")
+            )
+            name, name_truncated = _bounded_optional_string(item.get("name"))
+        elif isinstance(item, str):
+            asset_ref, asset_ref_truncated = _bounded_optional_string(item)
+            name = None
+            name_truncated = False
+        else:
+            continue
+        candidate: dict[str, Any] = {}
+        if asset_ref is not None:
+            candidate["asset_ref"] = asset_ref
+        if name is not None:
+            candidate["name"] = name
+        truncated_fields = []
+        if asset_ref_truncated:
+            truncated_fields.append("asset_ref")
+        if name_truncated:
+            truncated_fields.append("name")
+        if truncated_fields:
+            candidate["truncated_fields"] = truncated_fields
+        if candidate:
+            candidates.append(candidate)
+    candidates = _dedupe_dicts(candidates, keys=("asset_ref", "name"))
+    candidates.sort(
+        key=lambda item: (
+            str(item.get("asset_ref") or "").casefold(),
+            str(item.get("name") or "").casefold(),
+        )
+    )
+    return candidates
+
+
+def _safe_approval_summary(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    context = value.get("context")
+    context = context if isinstance(context, Mapping) else {}
+    result: dict[str, Any] = {}
+    for target_key, raw_value, max_length in (
+        ("approval_id", value.get("approval_id"), _SUMMARY_STRING_LIMIT),
+        (
+            "target_operation_id",
+            value.get("target_operation_id") or value.get("operation_id"),
+            _SUMMARY_STRING_LIMIT,
+        ),
+        (
+            "monitor_id",
+            value.get("monitor_id") or context.get("monitor_id"),
+            MAX_MONITOR_ID_LENGTH,
+        ),
+        (
+            "policy_id",
+            value.get("policy_id") or value.get("requested_by_policy_id"),
+            _SUMMARY_STRING_LIMIT,
+        ),
+        ("status", value.get("status"), _SUMMARY_STRING_LIMIT),
+    ):
+        _set_bounded_string(
+            result,
+            target_key,
+            raw_value,
+            max_length=max_length,
+        )
+    return result
+
+
+def _safe_error_codes(value: Any) -> tuple[list[str], int]:
+    errors = []
+    truncated_count = 0
+    for item in _safe_iterable(value):
+        if isinstance(item, str):
+            code, truncated = _bounded_optional_string(item)
+        elif isinstance(item, Mapping):
+            code, truncated = _bounded_optional_string(
+                item.get("code") or item.get("kind")
+            )
+        else:
+            continue
+        if code is not None:
+            errors.append(code)
+            truncated_count += int(truncated)
+    return sorted(set(errors), key=str.casefold), truncated_count
+
+
+def _bounded_string_values(value: Any) -> tuple[list[str], int]:
+    values = []
+    truncated_count = 0
+    for item in _safe_iterable(value):
+        text, truncated = _bounded_optional_string(item)
+        if text is None:
+            continue
+        values.append(text)
+        truncated_count += int(truncated)
+    return sorted(set(values), key=str.casefold), truncated_count
+
+
+def _safe_string_values(value: Any) -> list[str]:
+    values = {
+        item.strip()
+        for item in _safe_iterable(value)
+        if isinstance(item, str) and item.strip()
+    }
+    return sorted(values, key=str.casefold)
+
+
+def _safe_optional_string(value: Any) -> str | None:
+    return _bounded_optional_string(value)[0]
+
+
+def _bounded_optional_string(
+    value: Any,
+    *,
+    max_length: int = _SUMMARY_STRING_LIMIT,
+) -> tuple[str | None, bool]:
+    if not isinstance(value, str):
+        return None, False
+    text = value.strip()
+    if not text:
+        return None, False
+    return text[:max_length], len(text) > max_length
+
+
+def _set_bounded_string(
+    result: dict[str, Any],
+    key: str,
+    value: Any,
+    *,
+    max_length: int = _SUMMARY_STRING_LIMIT,
+) -> None:
+    text, truncated = _bounded_optional_string(value, max_length=max_length)
+    if text is None:
+        return
+    result[key] = text
+    if truncated:
+        fields = result.setdefault("truncated_fields", [])
+        if key not in fields:
+            fields.append(key)
 
 
 def _safe_validation_items(value: Any) -> list[Any]:

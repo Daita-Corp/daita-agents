@@ -63,6 +63,7 @@ from .progress import (
 from .summaries import (
     _approval_task_id,
     _capability_summary,
+    _catalog_context_for_state,
     _evidence_ref,
     _evidence_summary,
     _task_ref,
@@ -621,6 +622,7 @@ class DbAgentLoop:
                 _capability_summary(capability)
                 for capability in self.runtime.registry.capabilities
             ),
+            catalog_context=_catalog_context_for_state(accepted),
             memory_context=_memory_context_for_state(
                 self.runtime,
                 operation,

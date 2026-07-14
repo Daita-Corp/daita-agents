@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from daita.db import DbAgent, DbMonitor, DbRuntime
+from daita.db.llm_agent_planner import _action_input_hints
 from daita.db.models import DbRequest
 from daita.db.planner_protocol import (
     DbPlannerAction,
@@ -255,6 +256,14 @@ async def test_prompt_monitor_request_without_llm_does_not_fall_back_to_regex_ro
     assert "DB LLM service is required" in result.answer
     assert snapshot.tasks == ()
     assert not [item for item in snapshot.evidence if item.kind == "planner.decision"]
+
+
+def test_monitor_create_action_hint_exposes_catalog_evidence_ids():
+    target = _action_input_hints()["monitor_action_inputs"]["plan_monitor_create"][
+        "intent"
+    ]["target"]
+
+    assert target["evidence"] == ["supporting_catalog_evidence_id"]
 
 
 def test_no_production_prompt_monitor_router_or_service_sources_remain():

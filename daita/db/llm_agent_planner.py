@@ -378,6 +378,7 @@ def _action_input_hints() -> dict[str, Any]:
                         "target_type": "table",
                         "name": "table_or_asset_name",
                         "source_scope": [],
+                        "evidence": ["supporting_catalog_evidence_id"],
                     },
                     "condition": {
                         "kind": "new_rows | rows_present | threshold | freshness | report",
