@@ -5,6 +5,7 @@ from daita.db.loop import DbAgentLoop
 from daita.db.loop.grounding import (
     _validation_grounding_runtime_continuation_action,
 )
+from daita.db.loop.progress import _LoopProgressGuard
 from daita.db.loop.summaries import _evidence_summary
 from daita.db.llm_agent_planner import DbLLMAgentPlanner
 from daita.db.llm_planner import DbLLMPlannerExecutor, DbLLMRepairExecutor
@@ -38,6 +39,25 @@ from daita.plugins.sqlite import SQLitePlugin
 import pytest
 
 from tests.db_evidence_helpers import assert_no_invalid_accepted_query_plans
+
+
+def test_genuine_repeated_no_progress_still_reaches_terminal_guard():
+    guard = _LoopProgressGuard()
+    facts = {
+        "sql_error_fingerprints": [],
+        "failed_action": False,
+        "new_accepted_evidence_refs": [],
+        "compiled_action_fingerprints": ["same-action"],
+        "no_progress": True,
+        "progress_fingerprint": "same-progress",
+    }
+
+    first = guard.evaluate(facts)
+    second = guard.evaluate(facts)
+
+    assert first.terminal_status is None
+    assert second.terminal_status == "blocked"
+    assert "db_agent_loop_no_progress" in second.warnings
 
 
 class PhaseTwoExecutor:

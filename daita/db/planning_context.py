@@ -126,6 +126,41 @@ class DbPlanningContext:
         }
 
 
+def authoritative_schema_identity_from_evidence(
+    evidence: Iterable[Evidence],
+) -> tuple[dict[str, Any], str | None]:
+    """Return the operation's authoritative structural schema identity."""
+    items = tuple(evidence)
+    for item in reversed(items):
+        if not item.accepted or item.kind != "planning.context":
+            continue
+        fingerprint = item.payload.get("schema_fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint.strip():
+            continue
+        schema = item.payload.get("schema")
+        return (
+            dict(schema) if isinstance(schema, dict) else {},
+            fingerprint.strip(),
+        )
+
+    connector_schema = next(
+        (item for item in reversed(items) if _connector_schema_payload(item)),
+        None,
+    )
+    schema, schema_fingerprint, _, _ = _planning_context_schema_identity(
+        connector_schema,
+        tuple(items),
+        tuple(
+            item
+            for item in items
+            if item.accepted
+            and item.owner == "catalog"
+            and item.kind == "schema.relationship_path"
+        ),
+    )
+    return schema, schema_fingerprint
+
+
 class DbPlanningContextBuilder:
     """Build bounded, auditable planning context from accepted evidence."""
 
@@ -146,21 +181,17 @@ class DbPlanningContextBuilder:
         capability_summaries: tuple[dict[str, Any], ...] = (),
         source: Any = None,
     ) -> DbPlanningContext:
-        catalog_structural_evidence = _catalog_structural_evidence(
+        (
+            schema,
+            schema_fingerprint,
+            schema_source,
+            catalog_structural_evidence,
+        ) = _planning_context_schema_identity(
             schema_evidence,
             catalog_evidence,
-        )
-        relationship_details = _relationship_evidence_details(relationship_evidence)
-        schema = catalog_schema_from_evidence(
-            catalog_structural_evidence,
             relationship_evidence,
         )
-        schema_source = "catalog" if schema else "connector"
-        if not schema:
-            schema = (
-                dict(schema_evidence.payload) if schema_evidence is not None else {}
-            )
-        schema_fingerprint = structural_schema_fingerprint(schema)
+        relationship_details = _relationship_evidence_details(relationship_evidence)
         dialect = (
             str(
                 schema.get("database_type")
@@ -532,6 +563,8 @@ def _catalog_structural_evidence(
             continue
         if item.owner != "catalog":
             continue
+        if item.payload.get("success") is False:
+            continue
         if item.kind in {
             "schema.asset_profile",
             "schema.search_result",
@@ -540,6 +573,51 @@ def _catalog_structural_evidence(
         }:
             evidence.append(item)
     return _dedupe_evidence(evidence)
+
+
+def _planning_context_schema_identity(
+    schema_evidence: Evidence | None,
+    catalog_evidence: tuple[Evidence, ...],
+    relationship_evidence: tuple[Evidence, ...],
+) -> tuple[dict[str, Any], str | None, str, tuple[Evidence, ...]]:
+    catalog_structural_evidence = tuple(
+        item
+        for item in _catalog_structural_evidence(schema_evidence, catalog_evidence)
+        if _catalog_evidence_is_normalizable(item)
+    )
+    schema = catalog_schema_from_evidence(
+        catalog_structural_evidence,
+        relationship_evidence,
+    )
+    schema_source = "catalog" if schema else "connector"
+    if not schema:
+        schema = _connector_schema_payload(schema_evidence)
+    return (
+        schema,
+        structural_schema_fingerprint(schema),
+        schema_source,
+        catalog_structural_evidence,
+    )
+
+
+def _catalog_evidence_is_normalizable(evidence: Evidence) -> bool:
+    try:
+        catalog_schema_from_evidence((evidence,), ())
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _connector_schema_payload(evidence: Evidence | None) -> dict[str, Any]:
+    if (
+        evidence is None
+        or not evidence.accepted
+        or evidence.kind != "schema.asset_profile"
+        or evidence.owner == "catalog"
+        or evidence.payload.get("success") is False
+    ):
+        return {}
+    return dict(evidence.payload)
 
 
 def catalog_schema_from_evidence(

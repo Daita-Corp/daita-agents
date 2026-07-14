@@ -7,12 +7,12 @@ from typing import Any, Mapping
 
 from daita.runtime import Evidence, Operation
 
-from ..analysis import structural_schema_fingerprint
 from ..context_projection import policy_summary_from_source
 from ..fingerprints import persisted_fingerprint
 from ..memory.config import db_memory_options_from_runtime_metadata
 from ..memory.recall import db_memory_planning_recall_decision
 from ..models import DbIntentKind
+from ..planning_context import authoritative_schema_identity_from_evidence
 from ..planner_protocol import DbLoopState, DbPlannerAction, DbPlannerActionKind
 from .actions import _summary_id
 from .utils import _float_option, _string_list
@@ -29,8 +29,7 @@ def _memory_context_for_state(
     if not memory_config:
         return {"enabled": False}
     prompt = str(operation.request.get("prompt") or "")
-    schema = _latest_schema_payload(accepted)
-    schema_fingerprint = structural_schema_fingerprint(schema) if schema else None
+    schema, schema_fingerprint = authoritative_schema_identity_from_evidence(accepted)
     decision = db_memory_planning_recall_decision(
         prompt=prompt,
         intent_kind=_memory_recall_intent_kind(operation),
@@ -228,15 +227,6 @@ def _matching_evidence_facts(evidence: Evidence) -> dict[str, Any]:
         "payload_fingerprint": evidence.metadata.get("payload_fingerprint"),
         "task_input_hash": evidence.metadata.get("task_input_hash"),
     }
-
-
-def _latest_schema_payload(accepted: tuple[Evidence, ...]) -> dict[str, Any]:
-    for evidence in reversed(accepted):
-        if evidence.kind == "schema.asset_profile" and isinstance(
-            evidence.payload, dict
-        ):
-            return dict(evidence.payload)
-    return {}
 
 
 def _memory_recall_intent_kind(operation: Operation) -> str:

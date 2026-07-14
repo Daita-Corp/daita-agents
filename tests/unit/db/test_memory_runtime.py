@@ -14,6 +14,7 @@ from daita.db import (
 )
 from daita.db.analysis import structural_schema_fingerprint
 from daita.db.loop import DbAgentLoop
+from daita.db.loop.memory import _memory_context_for_state
 from daita.db.llm_planner import _planner_messages
 import daita.db.memory as db_memory_package
 from daita.db.memory.calibration import (
@@ -45,7 +46,11 @@ from daita.db.memory.storage import (
     has_db_memory_marker,
     write_db_memory_record,
 )
-from daita.db.planning_context import DbPlanningContextBuilder
+from daita.db.planning_context import (
+    authoritative_schema_identity_from_evidence,
+    catalog_schema_from_evidence,
+    DbPlanningContextBuilder,
+)
 from daita.db.planner_protocol import (
     DbLoopState,
     DbPlannerAction,
@@ -72,6 +77,7 @@ from daita.runtime import (
     RiskLevel,
     Task,
     TaskDependency,
+    TaskStatus,
 )
 
 import pytest
@@ -153,6 +159,240 @@ def _board_revenue_schema():
             }
         ],
     }
+
+
+def _catalog_orders_profile(
+    *,
+    evidence_id: str = "catalog-orders-profile",
+    accepted: bool = True,
+    success: bool = True,
+) -> Evidence:
+    return Evidence(
+        id=evidence_id,
+        kind="schema.asset_profile",
+        owner="catalog",
+        accepted=accepted,
+        payload={
+            "success": success,
+            "asset": {
+                "name": "orders",
+                "asset_ref": "warehouse.orders",
+            },
+            "fields": [
+                {"name": "id", "type": "INTEGER", "is_primary_key": True},
+                {"name": "total_cents", "type": "REAL"},
+            ],
+        },
+    )
+
+
+def test_authoritative_schema_identity_prefers_latest_planning_context():
+    old_context = Evidence(
+        id="planning-context-old",
+        kind="planning.context",
+        owner="db_runtime",
+        payload={
+            "schema": {"tables": [{"name": "old_orders"}]},
+            "schema_fingerprint": "schema-old",
+        },
+    )
+    latest_context = Evidence(
+        id="planning-context-latest",
+        kind="planning.context",
+        owner="db_runtime",
+        payload={
+            "schema": {"tables": [{"name": "current_orders"}]},
+            "schema_fingerprint": "schema-latest",
+        },
+    )
+    rejected_context = replace(
+        latest_context,
+        id="planning-context-rejected",
+        accepted=False,
+        payload={"schema_fingerprint": "schema-rejected"},
+    )
+    empty_context = replace(
+        latest_context,
+        id="planning-context-empty",
+        payload={"schema": {}, "schema_fingerprint": ""},
+    )
+
+    schema, fingerprint = authoritative_schema_identity_from_evidence(
+        (
+            old_context,
+            _catalog_orders_profile(),
+            latest_context,
+            empty_context,
+            rejected_context,
+        )
+    )
+
+    assert fingerprint == "schema-latest"
+    assert schema == {"tables": [{"name": "current_orders"}]}
+
+
+def test_authoritative_schema_identity_uses_catalog_before_connector():
+    catalog = _catalog_orders_profile()
+    connector = Evidence(
+        id="connector-customers-profile",
+        kind="schema.asset_profile",
+        owner="sqlite",
+        payload={"tables": [{"name": "customers"}]},
+    )
+    expected_schema = catalog_schema_from_evidence((catalog,), ())
+
+    schema, fingerprint = authoritative_schema_identity_from_evidence(
+        (connector, catalog)
+    )
+
+    assert schema == expected_schema
+    assert fingerprint == structural_schema_fingerprint(expected_schema)
+    assert schema["tables"][0]["name"] == "orders"
+    assert schema["tables"][0]["metadata"]["catalog_asset_ref"] == ("warehouse.orders")
+
+
+def test_authoritative_schema_identity_uses_successful_connector_as_fallback():
+    connector_schema = {
+        "database_type": "sqlite",
+        "tables": [
+            {
+                "name": "orders",
+                "columns": [{"name": "id", "data_type": "INTEGER"}],
+            }
+        ],
+    }
+    connector = Evidence(
+        id="connector-orders-profile",
+        kind="schema.asset_profile",
+        owner="sqlite",
+        payload=connector_schema,
+    )
+
+    schema, fingerprint = authoritative_schema_identity_from_evidence((connector,))
+
+    assert schema == connector_schema
+    assert fingerprint == structural_schema_fingerprint(connector_schema)
+
+
+def test_authoritative_schema_identity_ignores_rejected_and_unsuccessful_connectors():
+    valid_schema = {
+        "database_type": "sqlite",
+        "tables": [{"name": "orders", "columns": [{"name": "id"}]}],
+    }
+    valid = Evidence(
+        id="connector-valid",
+        kind="schema.asset_profile",
+        owner="sqlite",
+        payload=valid_schema,
+    )
+    unsuccessful = Evidence(
+        id="connector-unsuccessful",
+        kind="schema.asset_profile",
+        owner="sqlite",
+        payload={"success": False, "tables": [{"name": "wrong"}]},
+    )
+    rejected = Evidence(
+        id="connector-rejected",
+        kind="schema.asset_profile",
+        owner="sqlite",
+        accepted=False,
+        payload={"tables": [{"name": "also_wrong"}]},
+    )
+
+    schema, fingerprint = authoritative_schema_identity_from_evidence(
+        (valid, unsuccessful, rejected)
+    )
+
+    assert schema == valid_schema
+    assert fingerprint == structural_schema_fingerprint(valid_schema)
+
+
+def test_invalid_scoped_schema_evidence_cannot_replace_catalog_identity():
+    catalog = _catalog_orders_profile()
+    malformed_catalog = Evidence(
+        id="catalog-malformed",
+        kind="schema.search_result",
+        owner="catalog",
+        payload={
+            "assets": [
+                {"name": "malformed", "metadata": "not-a-mapping"},
+            ]
+        },
+    )
+    empty_context = Evidence(
+        id="planning-context-empty",
+        kind="planning.context",
+        owner="db_runtime",
+        payload={"schema": {}, "schema_fingerprint": ""},
+    )
+    empty_connector = Evidence(
+        id="connector-empty",
+        kind="schema.asset_profile",
+        owner="sqlite",
+        payload={},
+    )
+    expected_schema = catalog_schema_from_evidence((catalog,), ())
+
+    schema, fingerprint = authoritative_schema_identity_from_evidence(
+        (catalog, malformed_catalog, empty_context, empty_connector)
+    )
+
+    assert schema == expected_schema
+    assert fingerprint == structural_schema_fingerprint(expected_schema)
+
+
+def test_connector_fallback_uses_existing_evidence_order_deterministically():
+    first = Evidence(
+        id="connector-first",
+        kind="schema.asset_profile",
+        owner="sqlite",
+        payload={"tables": [{"name": "first"}]},
+    )
+    second = Evidence(
+        id="connector-second",
+        kind="schema.asset_profile",
+        owner="sqlite",
+        payload={"tables": [{"name": "second"}]},
+    )
+
+    first_order = authoritative_schema_identity_from_evidence((first, second))
+    repeated = authoritative_schema_identity_from_evidence((first, second))
+    reversed_order = authoritative_schema_identity_from_evidence((second, first))
+
+    assert first_order == repeated
+    assert first_order[0]["tables"][0]["name"] == "second"
+    assert reversed_order[0]["tables"][0]["name"] == "first"
+
+
+def test_catalog_and_planning_context_produce_equivalent_schema_fingerprints():
+    catalog = _catalog_orders_profile()
+    builder = DbPlanningContextBuilder(DbRuntimeConfig())
+    context = builder.build(
+        request=DbRequest("Show order totals"),
+        intent=DbIntent(
+            kind=DbIntentKind.DATA_QUERY,
+            confidence=1.0,
+            access=AccessMode.READ,
+        ),
+        operation=Operation(
+            id="op-equivalent-schema-identity",
+            operation_type="data.query",
+        ),
+        schema_evidence=None,
+        catalog_evidence=(catalog,),
+    )
+    planning_context = builder.evidence_for(context)
+
+    catalog_identity = authoritative_schema_identity_from_evidence((catalog,))
+    planning_identity = authoritative_schema_identity_from_evidence(
+        (catalog, planning_context)
+    )
+
+    assert catalog_identity[1] == context.schema_fingerprint
+    assert planning_identity[1] == context.schema_fingerprint
+    assert structural_schema_fingerprint(catalog_identity[0]) == (
+        structural_schema_fingerprint(planning_identity[0])
+    )
 
 
 def _mock_db_memory_backend(results: list[dict]) -> MagicMock:
@@ -960,6 +1200,124 @@ async def test_required_memory_recall_is_in_first_planner_state_and_reused(tmp_p
     assert len(resumed_planner.states) == 1
     assert backend.recall_db_records.await_count == 1
     assert sum(task.capability_id == "memory.semantic.recall" for task in tasks) == 1
+    assert sum(task.capability_id == "db.planning.context.build" for task in tasks) == 1
+
+
+async def test_authoritative_schema_identity_reuses_completed_planning_context():
+    source_identity = "test:memory-runtime-source"
+    memory = MemoryPlugin()
+    memory.backend = _mock_db_memory_backend([])
+    runtime = _runtime_with_memory_source(memory)
+    await runtime.setup()
+    prompt = "What does recognized revenue mean for orders?"
+    operation = await runtime.kernel.create_operation(
+        operation_type="data.query",
+        request={"prompt": prompt, "source_scope": ["sqlite"]},
+        required_evidence=frozenset({"query.result"}),
+        metadata={"intent_kind": "metric.query"},
+        evaluate_governance=False,
+    )
+    catalog = replace(
+        _catalog_orders_profile(),
+        operation_id=operation.id,
+    )
+    planning_context_builder = DbPlanningContextBuilder(runtime.config)
+    built_context = planning_context_builder.build(
+        request=DbRequest(prompt, source_scope=("sqlite",)),
+        intent=DbIntent(
+            kind=DbIntentKind.DATA_QUERY,
+            confidence=1.0,
+            access=AccessMode.READ,
+        ),
+        operation=operation,
+        schema_evidence=None,
+        catalog_evidence=(catalog,),
+    )
+    schema_fingerprint = built_context.schema_fingerprint
+    safety_frame = {"max_access": "read"}
+    seed_memory_context = _memory_context_for_state(
+        runtime,
+        operation,
+        (catalog,),
+        safety_frame=safety_frame,
+    )
+    recall_binding = seed_memory_context["recall_binding"]
+    context_task_id = "task-existing-planning-context"
+    recall = Evidence(
+        id="memory-recall-existing",
+        kind="memory.semantic.recall",
+        owner="memory",
+        operation_id=operation.id,
+        payload={"results": [], "recall_binding": recall_binding},
+    )
+    selection = Evidence(
+        id="memory-selection-existing",
+        kind="db.memory.selection",
+        owner="db_runtime",
+        operation_id=operation.id,
+        task_id=context_task_id,
+        payload={
+            "source_identity": source_identity,
+            "schema_fingerprint": schema_fingerprint,
+            "recall_evidence_refs": [recall.id],
+            "budget_usage": {
+                "limit": 3,
+                "char_budget": 800,
+                "score_threshold": 0.45,
+            },
+        },
+    )
+    planning_context_evidence = planning_context_builder.evidence_for(built_context)
+    planning_context = replace(
+        planning_context_evidence,
+        id="planning-context-existing",
+        task_id=context_task_id,
+        payload={
+            **planning_context_evidence.payload,
+            "diagnostics": {
+                **planning_context_evidence.payload["diagnostics"],
+                "memory_recall_binding": recall_binding,
+            },
+        },
+    )
+    planner = _ScriptedPlanner(
+        DbPlannerDecision(
+            status=DbPlannerDecisionStatus.CLARIFY,
+            intent={"operation_type": "metric.query"},
+            clarification_question="Which revenue definition should I use?",
+        )
+    )
+    try:
+        await runtime.store.save_task(
+            Task(
+                id=context_task_id,
+                operation_id=operation.id,
+                capability_id="db.planning.context.build",
+                executor_id="db_runtime.planning.context.build",
+                status=TaskStatus.SUCCEEDED,
+            )
+        )
+        for item in (catalog, recall, selection, planning_context):
+            await runtime.store.save_evidence(item)
+
+        result = await DbAgentLoop(runtime, planner).run(
+            operation,
+            safety_frame=safety_frame,
+            max_turns=1,
+        )
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert schema_fingerprint is not None
+    assert structural_schema_fingerprint(catalog.payload) != schema_fingerprint
+    assert result.status == "clarification_required"
+    assert len(planner.states) == 1
+    assert planner.states[0].memory_context["has_matching_planning_context"] is True
+    assert (
+        planner.states[0].memory_context["recall_binding"]["schema_fingerprint"]
+        == schema_fingerprint
+    )
     assert sum(task.capability_id == "db.planning.context.build" for task in tasks) == 1
 
 
