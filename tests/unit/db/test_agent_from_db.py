@@ -80,8 +80,7 @@ class FailingRuntimeDbPlugin(BaseDatabasePlugin):
 
 async def _seed_sqlite(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script(
-        """
+    await plugin.execute_script("""
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL
@@ -93,22 +92,19 @@ async def _seed_sqlite(path):
         );
         INSERT INTO customers (name) VALUES ('Ada'), ('Linus');
         INSERT INTO orders (customer_id, total) VALUES (1, 10.0), (2, 20.0);
-        """
-    )
+        """)
     await plugin.disconnect()
 
 
 async def _seed_sqlite_with_cents(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script(
-        """
+    await plugin.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             total_cents INTEGER NOT NULL
         );
         INSERT INTO orders (total_cents) VALUES (1234);
-        """
-    )
+        """)
     await plugin.disconnect()
 
 
@@ -120,6 +116,26 @@ def _memory_backend(tmp_path):
         base_dir=tmp_path,
         embedder=MockEmbeddingProvider(dim=8),
     )
+
+
+def _hosted_monitor_proposal():
+    return {
+        "monitor_id": "hosted_delivery_watch",
+        "name": "Hosted Delivery Watch",
+        "target_name": "orders",
+        "source_scope": ["orders"],
+        "schedule": {"interval_seconds": 300},
+        "trigger": {"truthy": True},
+        "observation_plan": {
+            "kind": "plugin_source",
+            "source_kind": "test_source",
+            "value_path": "rows",
+        },
+        "action_plan": {
+            "kind": "notification",
+            "delivery_intent": {"payload_source": {"type": "monitor.report"}},
+        },
+    }
 
 
 def _write_catalog_snapshot(profile_key, schema, *, last_seen=None):
@@ -496,6 +512,17 @@ async def test_agent_from_db_consumes_host_runtime_extensions_before_setup(tmp_p
 
     try:
         inspection = await agent.describe()
+        hosted_capability = agent.runtime.registry.get_capability(
+            "monitor.delivery.in_app",
+            owner="hosted_monitor_delivery",
+        )
+        proposal_evidence = await agent.runtime.execute_capability(
+            "db.monitor.plan_create",
+            owner="db_runtime",
+            operation_type="monitor.create",
+            input={"proposal": _hosted_monitor_proposal()},
+        )
+        assert calls == []
         evidence = await agent.runtime.execute_capability(
             "monitor.delivery.in_app",
             owner="hosted_monitor_delivery",
@@ -513,6 +540,28 @@ async def test_agent_from_db_consumes_host_runtime_extensions_before_setup(tmp_p
     assert "hosted_monitor_delivery:monitor.delivery.in_app" in (
         inspection.capability_ids
     )
+    assert hosted_capability.metadata["default_target"] == {"type": "requesting_user"}
+    assert hosted_capability.metadata["accepted_target_types"] == ["requesting_user"]
+    assert hosted_capability.metadata["accepted_formats"] == [
+        "markdown",
+        "plain",
+        "text",
+    ]
+    normalized_delivery = proposal_evidence[0].payload["action_plan"]["delivery_intent"]
+    assert proposal_evidence[0].accepted is True
+    assert normalized_delivery["delivery_kind"] == "in_app"
+    assert normalized_delivery["target"] == {"type": "requesting_user"}
+    assert normalized_delivery["capability_id"] == "monitor.delivery.in_app"
+    assert normalized_delivery["capability_owner"] == "hosted_monitor_delivery"
+    delivery_diagnostics = proposal_evidence[0].payload["validation"]["diagnostics"][
+        "delivery_validation"
+    ]
+    assert delivery_diagnostics == {
+        "accepted": True,
+        "capability_id": "monitor.delivery.in_app",
+        "capability_owner": "hosted_monitor_delivery",
+        "delivery_kind": "in_app",
+    }
     assert calls[0]["delivery_kind"] == "in_app"
     assert calls[0]["target"] == {"type": "requesting_user"}
     assert calls[0]["payload_source"] == {"type": "monitor.report"}

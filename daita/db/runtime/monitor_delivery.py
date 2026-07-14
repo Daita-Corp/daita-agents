@@ -187,6 +187,18 @@ class DbRuntimeMonitorDeliveryMixin:
                 tick_operation_id=tick_operation_id,
             )
         except MonitorPluginPlanningBlocked as exc:
+            details = dict(exc.details or {})
+            blocked_capability = None
+            capability_id = details.get("capability_id")
+            capability_owner = details.get("owner") or details.get("capability_owner")
+            if isinstance(capability_id, str) and isinstance(capability_owner, str):
+                try:
+                    blocked_capability = self.registry.get_capability(
+                        capability_id,
+                        owner=capability_owner,
+                    )
+                except KeyError:
+                    blocked_capability = None
             blocked_plan_evidence = await self._persist_monitor_delivery_plan(
                 operation,
                 monitor_id=monitor_id,
@@ -195,9 +207,10 @@ class DbRuntimeMonitorDeliveryMixin:
                 delivery_intent=intent,
                 report=report,
                 source_evidence_refs=source_refs,
+                capability=blocked_capability,
                 accepted=False,
                 block_reason=exc.reason,
-                details=exc.details,
+                details=details,
             )
             return await self._persist_monitor_delivery_result(
                 operation,
@@ -205,9 +218,12 @@ class DbRuntimeMonitorDeliveryMixin:
                 monitor_run_id=monitor_run_id,
                 tick_operation_id=tick_operation_id,
                 delivery_kind=str(
-                    intent.get("delivery_kind") or intent.get("mode") or ""
+                    details.get("delivery_kind")
+                    or intent.get("delivery_kind")
+                    or intent.get("mode")
+                    or ""
                 ),
-                capability=None,
+                capability=blocked_capability,
                 action_plan_fingerprint=action_fingerprint,
                 report_fingerprint=report_fingerprint,
                 source_evidence_refs=source_refs,
@@ -236,7 +252,7 @@ class DbRuntimeMonitorDeliveryMixin:
             monitor_id=monitor_id,
             monitor_run_id=monitor_run_id,
             tick_operation_id=tick_operation_id,
-            delivery_intent=intent,
+            delivery_intent=plan.intent_payload,
             report=report,
             source_evidence_refs=source_refs,
             capability=capability,
@@ -354,7 +370,7 @@ class DbRuntimeMonitorDeliveryMixin:
             monitor_id=monitor_id,
             monitor_run_id=monitor_run_id,
             tick_operation_id=tick_operation_id,
-            delivery_kind=str(intent.get("delivery_kind") or intent.get("mode") or ""),
+            delivery_kind=str(plan.intent_payload.get("delivery_kind") or ""),
             capability=capability,
             action_plan_fingerprint=action_fingerprint,
             report_fingerprint=report_fingerprint,

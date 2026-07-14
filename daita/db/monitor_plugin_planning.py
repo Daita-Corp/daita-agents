@@ -6,6 +6,7 @@ task input mapping. Runtime execution remains owned by ``DbRuntime``.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -49,6 +50,18 @@ class MonitorDeliveryIntent:
     target: dict[str, Any]
     format: str | None = None
     subject: str | None = None
+    target_explicit: bool = False
+    target_mapping_valid: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = deepcopy(self.raw)
+        payload["delivery_kind"] = self.delivery_kind
+        payload["target"] = deepcopy(self.target)
+        if self.format is not None:
+            payload["format"] = self.format
+        if self.subject is not None:
+            payload["subject"] = self.subject
+        return payload
 
 
 @dataclass(frozen=True)
@@ -149,44 +162,37 @@ class MonitorPluginPlanner:
         monitor_run_id: str,
         tick_operation_id: str,
     ) -> MonitorPluginTaskPlan:
-        intent = _delivery_intent(delivery_intent, report=report)
+        intent, capability = self.normalize_delivery_intent(
+            delivery_intent,
+            fallback_format=str(report.payload.get("format") or ""),
+            fallback_subject=str(report.payload.get("title") or ""),
+        )
         report_fingerprint = monitor_report_fingerprint(report)
         action_fingerprint = str(report.payload.get("action_plan_fingerprint") or "")
-        capability = self._select_capability(
-            intent.raw,
-            role="delivery",
-            kind=intent.delivery_kind,
-            target=intent.target,
-            payload_kind=_payload_kind_from_delivery_intent(intent),
-            expected_evidence=(),
-            input_payload=None,
-        )
-        _validate_delivery_format(intent, capability)
         idempotency_key = persisted_fingerprint(
             {
                 "monitor_id": monitor_id,
                 "monitor_run_id": monitor_run_id,
                 "action_plan_fingerprint": action_fingerprint,
                 "report_fingerprint": report_fingerprint,
-                "target": intent.target,
+                "target": deepcopy(intent.target),
                 "capability_id": capability.id,
                 "capability_owner": capability.owner,
             }
         )
-        input_payload = {
-            "delivery_kind": intent.delivery_kind,
-            "target": intent.target,
-            "format": intent.format or report.payload.get("format"),
-            "subject": intent.subject or report.payload.get("title"),
-            "idempotency_key": idempotency_key,
-            "payload_source": {
+        input_payload = _delivery_input_payload(
+            intent,
+            idempotency_key=idempotency_key,
+            fallback_format=report.payload.get("format"),
+            fallback_subject=report.payload.get("title"),
+            payload_source={
                 "kind": "monitor.report",
                 "report_evidence_id": report.id,
                 "report_fingerprint": report_fingerprint,
                 "action_plan_fingerprint": action_fingerprint,
                 "source_evidence_refs": [dict(item) for item in source_evidence_refs],
             },
-        }
+        )
         _validate_capability_input_schema(capability, input_payload)
         return MonitorPluginTaskPlan(
             role="delivery",
@@ -201,37 +207,85 @@ class MonitorPluginPlanner:
                 "tick_operation_id": tick_operation_id,
                 "monitor_role": "delivery",
                 "monitor_delivery_kind": intent.delivery_kind,
-                "monitor_delivery_target": intent.target,
+                "monitor_delivery_target": deepcopy(intent.target),
                 "monitor_report_evidence_id": report.id,
                 "monitor_report_fingerprint": report_fingerprint,
                 "monitor_action_fingerprint": action_fingerprint,
                 "source_evidence_refs": [dict(item) for item in source_evidence_refs],
             },
-            intent_payload={
-                "delivery_kind": intent.delivery_kind,
-                "target": intent.target,
-                "format": intent.format,
-                "subject": intent.subject,
-            },
+            intent_payload=intent.to_dict(),
             source_evidence_refs=source_evidence_refs,
         )
+
+    def normalize_delivery_intent(
+        self,
+        delivery_intent: Mapping[str, Any],
+        *,
+        fallback_format: str = "",
+        fallback_subject: str = "",
+    ) -> tuple[MonitorDeliveryIntent, Capability]:
+        """Select a delivery capability and apply its target default safely."""
+        parsed = _delivery_intent_from_mapping(
+            delivery_intent,
+            fallback_format=fallback_format,
+            fallback_subject=fallback_subject,
+        )
+        if not parsed.delivery_kind:
+            raise MonitorPluginPlanningBlocked("missing_delivery_kind")
+        capability = self._select_capability(
+            parsed.raw,
+            role="delivery",
+            kind=parsed.delivery_kind,
+            target=parsed.target,
+            payload_kind=_payload_kind_from_delivery_intent(parsed),
+            expected_evidence=(),
+            input_payload=None,
+        )
+        target = _delivery_target_for_capability(parsed, capability)
+        normalized_raw = deepcopy(parsed.raw)
+        normalized_raw.update(
+            {
+                "delivery_kind": parsed.delivery_kind,
+                "target": deepcopy(target),
+                "capability_id": capability.id,
+                "capability_owner": capability.owner,
+            }
+        )
+        normalized = MonitorDeliveryIntent(
+            raw=normalized_raw,
+            delivery_kind=parsed.delivery_kind,
+            target=target,
+            target_explicit=True,
+            format=parsed.format,
+            subject=parsed.subject,
+        )
+        _validate_delivery_target_type(normalized, capability)
+        _validate_delivery_target_compatibility(normalized, capability)
+        _validate_delivery_format(normalized, capability)
+        _validate_capability_input_schema(
+            capability,
+            _delivery_input_payload(
+                normalized,
+                idempotency_key="monitor.delivery.proposal",
+                fallback_format="monitor.report.format",
+                fallback_subject="monitor.report.title",
+                payload_source={
+                    "kind": "monitor.report",
+                    "report_evidence_id": "monitor.report.evidence",
+                    "report_fingerprint": "monitor.report.fingerprint",
+                    "action_plan_fingerprint": "monitor.action_plan.fingerprint",
+                    "source_evidence_refs": [],
+                },
+            ),
+        )
+        return normalized, capability
 
     def select_delivery_capability(
         self,
         delivery_intent: Mapping[str, Any],
     ) -> Capability:
         """Select and validate the monitor delivery capability for an intent."""
-        intent = _delivery_intent_from_mapping(delivery_intent)
-        capability = self._select_capability(
-            intent.raw,
-            role="delivery",
-            kind=intent.delivery_kind,
-            target=intent.target,
-            payload_kind=_payload_kind_from_delivery_intent(intent),
-            expected_evidence=(),
-            input_payload=None,
-        )
-        _validate_delivery_format(intent, capability)
+        _, capability = self.normalize_delivery_intent(delivery_intent)
         return capability
 
     def _select_capability(
@@ -300,6 +354,7 @@ class MonitorPluginPlanner:
                 kind=kind,
                 expected_evidence=expected_evidence,
             )
+            and (owner is None or capability.owner == str(owner))
         ]
         payload_supported_candidates = candidates
         if role == "delivery" and payload_kind:
@@ -329,15 +384,16 @@ class MonitorPluginPlanner:
                 for capability in candidates
                 if not _capability_input_schema_errors(capability, input_payload)
             ]
-        candidates = [
-            capability
-            for capability in candidates
-            if _capability_accepts_target_shape(capability, target)
-        ]
+        if role != "delivery":
+            candidates = [
+                capability
+                for capability in candidates
+                if _capability_accepts_target_shape(capability, target)
+            ]
         if not candidates:
             raise MonitorPluginPlanningBlocked(
                 "missing_capability",
-                {"role": role, "kind": kind},
+                {"role": role, "kind": kind, **({"owner": owner} if owner else {})},
             )
         if len(candidates) > 1:
             raise MonitorPluginPlanningBlocked(
@@ -433,26 +489,18 @@ def _source_intent(
     )
 
 
-def _delivery_intent(
-    delivery_intent: Mapping[str, Any],
-    *,
-    report: Evidence,
-) -> MonitorDeliveryIntent:
-    return _delivery_intent_from_mapping(
-        delivery_intent,
-        fallback_subject=str(report.payload.get("title") or ""),
-    )
-
-
 def _delivery_intent_from_mapping(
     delivery_intent: Mapping[str, Any],
     *,
+    fallback_format: str = "",
     fallback_subject: str = "",
 ) -> MonitorDeliveryIntent:
-    raw = dict(delivery_intent)
+    raw = deepcopy(dict(delivery_intent))
     target = raw.get("target")
+    target_explicit = "target" in raw
+    target_mapping_valid = not target_explicit or isinstance(target, Mapping)
     normalized = (
-        {str(key): value for key, value in target.items() if value}
+        {str(key): deepcopy(value) for key, value in target.items()}
         if isinstance(target, Mapping)
         else {}
     )
@@ -465,21 +513,69 @@ def _delivery_intent_from_mapping(
         "endpoint",
         "path",
     ):
-        if raw.get(key) and key not in normalized:
-            normalized[key] = raw[key]
-    if not normalized:
-        raise MonitorPluginPlanningBlocked("missing_delivery_target")
+        if key in raw:
+            target_explicit = True
+            if key not in normalized:
+                normalized[key] = deepcopy(raw[key])
     return MonitorDeliveryIntent(
         raw=raw,
         delivery_kind=str(raw.get("delivery_kind") or raw.get("mode") or ""),
         target=normalized,
-        format=str(raw.get("format")) if raw.get("format") else None,
+        target_explicit=target_explicit,
+        target_mapping_valid=target_mapping_valid,
+        format=(
+            str(raw.get("format")) if raw.get("format") else fallback_format or None
+        ),
         subject=(
             str(raw.get("subject") or raw.get("title"))
             if raw.get("subject") or raw.get("title")
-            else fallback_subject
+            else fallback_subject or None
         ),
     )
+
+
+def _delivery_input_payload(
+    intent: MonitorDeliveryIntent,
+    *,
+    idempotency_key: str,
+    payload_source: Mapping[str, Any],
+    fallback_format: Any = None,
+    fallback_subject: Any = None,
+) -> dict[str, Any]:
+    return {
+        "delivery_kind": intent.delivery_kind,
+        "target": deepcopy(intent.target),
+        "format": intent.format or fallback_format,
+        "subject": intent.subject or fallback_subject,
+        "idempotency_key": idempotency_key,
+        "payload_source": deepcopy(dict(payload_source)),
+    }
+
+
+def _delivery_target_for_capability(
+    intent: MonitorDeliveryIntent,
+    capability: Capability,
+) -> dict[str, Any]:
+    details = {
+        "capability_id": capability.id,
+        "owner": capability.owner,
+        "delivery_kind": intent.delivery_kind,
+    }
+    if intent.target_explicit:
+        if not intent.target_mapping_valid:
+            raise MonitorPluginPlanningBlocked("invalid_delivery_target", details)
+        if not intent.target:
+            raise MonitorPluginPlanningBlocked("missing_delivery_target", details)
+        return deepcopy(intent.target)
+    declared = capability.metadata.get("default_target")
+    if declared is None:
+        raise MonitorPluginPlanningBlocked("missing_delivery_target", details)
+    if not isinstance(declared, Mapping):
+        raise MonitorPluginPlanningBlocked("invalid_delivery_target_default", details)
+    target = {str(key): deepcopy(value) for key, value in declared.items()}
+    if not target:
+        raise MonitorPluginPlanningBlocked("missing_delivery_target", details)
+    return target
 
 
 def _payload_kind_from_delivery_intent(intent: MonitorDeliveryIntent) -> str:
@@ -603,7 +699,46 @@ def _capability_accepts_target_shape(
     )
 
 
+def _validate_delivery_target_compatibility(
+    intent: MonitorDeliveryIntent,
+    capability: Capability,
+) -> None:
+    if not _capability_accepts_target_shape(capability, intent.target):
+        raise MonitorPluginPlanningBlocked(
+            "unsupported_delivery_target",
+            {
+                "capability_id": capability.id,
+                "owner": capability.owner,
+                "delivery_kind": intent.delivery_kind,
+            },
+        )
+
+
 def _validate_delivery_format(
+    intent: MonitorDeliveryIntent,
+    capability: Capability,
+) -> None:
+    if not intent.format:
+        return
+    accepted = {
+        str(item)
+        for item in capability.metadata.get("accepted_formats")
+        or capability.metadata.get("accepted_payload_formats")
+        or ()
+    }
+    if accepted and intent.format not in accepted:
+        raise MonitorPluginPlanningBlocked(
+            "unsupported_format",
+            {
+                "format": intent.format,
+                "accepted_formats": sorted(accepted),
+                "capability_id": capability.id,
+                "owner": capability.owner,
+            },
+        )
+
+
+def _validate_delivery_target_type(
     intent: MonitorDeliveryIntent,
     capability: Capability,
 ) -> None:
@@ -630,24 +765,6 @@ def _validate_delivery_format(
                     "owner": capability.owner,
                 },
             )
-    if not intent.format:
-        return
-    accepted = {
-        str(item)
-        for item in capability.metadata.get("accepted_formats")
-        or capability.metadata.get("accepted_payload_formats")
-        or ()
-    }
-    if accepted and intent.format not in accepted:
-        raise MonitorPluginPlanningBlocked(
-            "unsupported_format",
-            {
-                "format": intent.format,
-                "accepted_formats": sorted(accepted),
-                "capability_id": capability.id,
-                "owner": capability.owner,
-            },
-        )
 
 
 def _validate_capability_input_schema(

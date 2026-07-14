@@ -1,11 +1,18 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from daita.db import DbAgent, DbMonitor, DbRuntime
+from daita.db import (
+    DbAgent,
+    DbMonitor,
+    DbRuntime,
+    HostedInAppMonitorDeliveryPlugin,
+)
 from daita.db.llm_agent_planner import _action_input_hints
 from daita.db.models import DbRequest
+from daita.db.monitor_commands import DbMonitorPlanner, monitor_create_intent_from_dict
 from daita.db.planner_protocol import (
     DbPlannerAction,
     DbPlannerActionKind,
@@ -14,8 +21,10 @@ from daita.db.planner_protocol import (
 )
 from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.runtime import (
+    AccessMode,
     ApprovalRequest,
     ApprovalStatus,
+    Capability,
     OperationStatus,
     RiskLevel,
     TaskDependency,
@@ -209,6 +218,232 @@ async def test_prompt_monitor_create_commits_each_proposal_dependency():
                 task.dependencies[0].producer_task_id
                 == task_ids_by_action["plan_users"]
             )
+
+
+async def test_monitor_proposal_delivery_kind_defaults_preserve_explicit_semantics():
+    parsed = monitor_create_intent_from_dict({"delivery": {"target": {}}})
+    assert parsed.delivery is not None
+    assert parsed.delivery.delivery_kind == ""
+    assert parsed.delivery.to_action_plan_intent()["target"] == {}
+    omitted_target = monitor_create_intent_from_dict({"delivery": {}})
+    assert omitted_target.delivery is not None
+    assert "target" not in omitted_target.delivery.to_action_plan_intent()
+
+    runtime = DbRuntime(plugins=(HostedInAppMonitorDeliveryPlugin(),))
+    await runtime.setup()
+    try:
+        hosted, hosted_validation = DbMonitorPlanner(
+            registry=runtime.registry,
+            delivery_default="in_app",
+        ).create_structured_proposal(
+            _proposal_with_delivery({"payload_source": {"type": "monitor.report"}})
+        )
+        explicit, explicit_validation = DbMonitorPlanner(
+            registry=runtime.registry,
+            delivery_default="in_app",
+        ).create_structured_proposal(
+            _proposal_with_delivery(
+                {
+                    "delivery_kind": "local",
+                    "target": {"type": "runtime_console"},
+                    "payload_source": {"type": "monitor.report"},
+                }
+            )
+        )
+        empty_target, empty_target_validation = DbMonitorPlanner(
+            registry=runtime.registry,
+            delivery_default="in_app",
+        ).create_structured_proposal(
+            _proposal_with_delivery(
+                {
+                    "target": {},
+                    "payload_source": {"type": "monitor.report"},
+                }
+            )
+        )
+        missing, missing_validation = DbMonitorPlanner(
+            registry=runtime.registry,
+        ).create_structured_proposal(
+            _proposal_with_delivery({"payload_source": {"type": "monitor.report"}})
+        )
+        scheduled, scheduled_validation = DbMonitorPlanner(
+            registry=runtime.registry,
+            delivery_default="in_app",
+        ).create_structured_proposal(
+            _proposal_with_delivery(
+                {"payload_source": {"type": "monitor.report"}},
+                action_kind="scheduled_report",
+            )
+        )
+        scheduled_missing, scheduled_missing_validation = DbMonitorPlanner(
+            registry=runtime.registry,
+        ).create_structured_proposal(
+            _proposal_with_delivery(
+                {"payload_source": {"type": "monitor.report"}},
+                action_kind="scheduled_report",
+            )
+        )
+        scheduled_without_delivery_input = _proposal(
+            "scheduled_without_delivery",
+            "Scheduled Without Delivery",
+        )
+        scheduled_without_delivery_input["action_plan"] = {
+            "kind": "scheduled_report",
+            "steps": [],
+        }
+        scheduled_without_delivery, scheduled_without_delivery_validation = (
+            DbMonitorPlanner(
+                registry=runtime.registry,
+                delivery_default="in_app",
+            ).create_structured_proposal(scheduled_without_delivery_input)
+        )
+        malformed_request = monitor_create_intent_from_dict(
+            {
+                "delivery": {
+                    "delivery_kind": "in_app",
+                    "target": "requesting_user",
+                }
+            }
+        )
+        assert malformed_request.delivery is not None
+        malformed, malformed_validation = DbMonitorPlanner(
+            registry=runtime.registry,
+        ).create_structured_proposal(
+            _proposal_with_delivery(malformed_request.delivery.to_action_plan_intent())
+        )
+        no_delivery, no_delivery_validation = DbMonitorPlanner(
+            registry=runtime.registry,
+            delivery_default="in_app",
+        ).create_structured_proposal(_proposal("no_delivery", "No Delivery"))
+    finally:
+        await runtime.teardown()
+
+    hosted_intent = hosted["action_plan"]["delivery_intent"]
+    assert hosted_validation.accepted is True
+    assert hosted_intent["delivery_kind"] == "in_app"
+    assert hosted_intent["target"] == {"type": "requesting_user"}
+    assert hosted_intent["capability_id"] == "monitor.delivery.in_app"
+    assert hosted_intent["capability_owner"] == "hosted_monitor_delivery"
+
+    explicit_intent = explicit["action_plan"]["delivery_intent"]
+    assert explicit_validation.accepted is True
+    assert explicit_intent["delivery_kind"] == "local"
+    assert explicit_intent["target"] == {"type": "runtime_console"}
+    assert explicit_intent["capability_id"] == "monitor.delivery.local"
+
+    assert empty_target_validation.accepted is False
+    assert empty_target["action_plan"]["delivery_intent"]["target"] == {}
+    assert empty_target_validation.diagnostics["delivery_validation"]["reason"] == (
+        "missing_delivery_target"
+    )
+
+    assert missing_validation.accepted is False
+    assert "monitor.proposal_incomplete:delivery" in missing_validation.errors
+    assert missing["action_plan"]["delivery_intent"].get("delivery_kind") is None
+
+    scheduled_intent = scheduled["action_plan"]["delivery_intent"]
+    assert scheduled_validation.accepted is True
+    assert scheduled_intent["delivery_kind"] == "in_app"
+    assert scheduled_intent["target"] == {"type": "requesting_user"}
+    assert scheduled_intent["capability_id"] == "monitor.delivery.in_app"
+
+    assert scheduled_missing_validation.accepted is False
+    assert "monitor.proposal_incomplete:delivery" in scheduled_missing_validation.errors
+    assert (
+        scheduled_missing["action_plan"]["delivery_intent"].get("delivery_kind") is None
+    )
+
+    assert scheduled_without_delivery_validation.accepted is True
+    assert "delivery_intent" not in scheduled_without_delivery["action_plan"]
+
+    assert malformed_validation.accepted is False
+    assert malformed["action_plan"]["delivery_intent"]["target"] == {}
+    assert malformed_validation.diagnostics["delivery_validation"]["reason"] == (
+        "missing_delivery_target"
+    )
+
+    assert no_delivery_validation.accepted is True
+    assert no_delivery["action_plan"] == {"kind": "none", "steps": []}
+
+
+def test_monitor_proposal_rejects_delivery_inputs_runtime_cannot_construct():
+    capability = Capability(
+        id="monitor.delivery.test",
+        owner="test.delivery",
+        description="Test delivery",
+        domains=frozenset({"monitor", "test"}),
+        operation_types=frozenset({"monitor.delivery"}),
+        access=AccessMode.NONE,
+        risk=RiskLevel.LOW,
+        input_schema={
+            "type": "object",
+            "required": ["delivery_kind", "target", "payload_source", "tenant"],
+            "properties": {
+                "delivery_kind": {"type": "string"},
+                "target": {"type": "object"},
+                "payload_source": {"type": "object"},
+                "tenant": {"type": "string"},
+            },
+        },
+        output_evidence=frozenset({"test.delivery.result"}),
+        executor="test.delivery.execute",
+        runtime_only=True,
+        metadata={
+            "monitor_roles": ["delivery"],
+            "delivery_kind": "test",
+            "accepted_payload_kinds": ["monitor.report"],
+            "default_target": {"type": "test_inbox"},
+        },
+    )
+    planner = DbMonitorPlanner(
+        registry=SimpleNamespace(capabilities=(capability,)),  # type: ignore[arg-type]
+    )
+
+    proposal, validation = planner.create_structured_proposal(
+        _proposal_with_delivery(
+            {
+                "delivery_kind": "test",
+                "payload_source": {"type": "monitor.report"},
+            }
+        )
+    )
+
+    assert validation.accepted is False
+    assert "monitor.delivery_unsupported:invalid_capability_input" in validation.errors
+    diagnostics = validation.diagnostics["delivery_validation"]
+    assert diagnostics["capability_id"] == capability.id
+    assert diagnostics["capability_owner"] == capability.owner
+    assert diagnostics["details"]["errors"] == ("$.tenant:missing_required",)
+    assert proposal["action_plan"]["delivery_intent"].get("target") is None
+
+
+def test_monitor_validation_normalizes_a_copy_of_the_action_plan():
+    capabilities = HostedInAppMonitorDeliveryPlugin().declare_capabilities()
+    planner = DbMonitorPlanner(
+        registry=SimpleNamespace(capabilities=capabilities),  # type: ignore[arg-type]
+        delivery_default="in_app",
+    )
+    action_plan = {
+        "kind": "scheduled_report",
+        "delivery_intent": {"payload_source": {"type": "monitor.report"}},
+    }
+
+    validation = planner.validate(
+        action_steps=(),
+        actions=(),
+        source_scope=(),
+        policy={},
+        budgets={},
+        action_plan=action_plan,
+    )
+
+    assert action_plan == {
+        "kind": "scheduled_report",
+        "delivery_intent": {"payload_source": {"type": "monitor.report"}},
+    }
+    delivery_diagnostics = validation.diagnostics["delivery_validation"]
+    assert delivery_diagnostics["accepted"] is True
+    assert delivery_diagnostics["delivery_kind"] == "in_app"
 
 
 async def test_prompt_monitor_lifecycle_compiles_to_task_specs_and_execute_task():
@@ -1102,3 +1337,16 @@ def _proposal(monitor_id: str, name: str, *, target: str = "orders") -> dict:
             "side_effect_summary": "Creates a test monitor.",
         },
     }
+
+
+def _proposal_with_delivery(
+    delivery_intent: dict,
+    *,
+    action_kind: str = "notification",
+) -> dict:
+    proposal = _proposal("delivery_watch", "Delivery Watch")
+    proposal["action_plan"] = {
+        "kind": action_kind,
+        "delivery_intent": delivery_intent,
+    }
+    return proposal

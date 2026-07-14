@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 import re
-from typing import Any
+from typing import Any, Mapping
 
 from daita.plugins import ExtensionRegistry
 
@@ -94,7 +95,6 @@ class DbMonitorPlanner:
             else {"interval_seconds": 300}
         )
         trigger = _trigger_from_condition(intent.condition)
-        actions = intent.action.actions
         budgets = intent.budget.to_dict()
         policy = intent.policy.to_dict()
         action_steps = intent.action.steps
@@ -110,9 +110,8 @@ class DbMonitorPlanner:
             registry=self.registry,
         )
         action_plan = _notification_action_plan(intent)
-        validation = self.validate(
+        action_plan, validation = self._normalize_and_validate(
             action_steps=action_steps,
-            actions=actions,
             source_scope=effective_scope,
             policy=policy,
             budgets=budgets,
@@ -215,14 +214,8 @@ class DbMonitorPlanner:
             for step in action_plan.get("steps") or ()
             if isinstance(step, dict)
         )
-        actions = tuple(
-            str(step.get("kind") or step.get("instruction") or "")
-            for step in action_steps
-            if step.get("kind") or step.get("instruction")
-        )
-        validation = self.validate(
+        action_plan, validation = self._normalize_and_validate(
             action_steps=action_steps,
-            actions=actions,
             source_scope=effective_scope,
             policy=policy,
             budgets=budgets,
@@ -286,6 +279,36 @@ class DbMonitorPlanner:
         trigger: dict[str, Any] | None = None,
         action_plan: dict[str, Any] | None = None,
     ) -> DbMonitorValidation:
+        _, validation = self._normalize_and_validate(
+            action_steps=action_steps,
+            source_scope=source_scope,
+            policy=policy,
+            budgets=budgets,
+            observation_plan=observation_plan,
+            schedule=schedule,
+            stream=stream,
+            trigger=trigger,
+            action_plan=action_plan,
+        )
+        return validation
+
+    def _normalize_and_validate(
+        self,
+        *,
+        action_steps: tuple[dict[str, Any], ...],
+        source_scope: tuple[str, ...],
+        policy: dict[str, Any],
+        budgets: dict[str, Any],
+        observation_plan: dict[str, Any] | None = None,
+        schedule: dict[str, Any] | None = None,
+        stream: dict[str, Any] | None = None,
+        trigger: dict[str, Any] | None = None,
+        action_plan: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], DbMonitorValidation]:
+        normalized_action_plan = _action_plan_with_delivery_kind_default(
+            deepcopy(action_plan or {}),
+            delivery_default=self.delivery_default,
+        )
         capability_ids = (
             {capability.id for capability in self.registry.capabilities}
             if self.registry is not None
@@ -318,52 +341,60 @@ class DbMonitorPlanner:
             schedule=schedule,
             stream=stream,
             trigger=trigger or {},
-            action_plan=action_plan or {},
+            action_plan=normalized_action_plan,
         )
         delivery_errors: list[str] = []
         delivery_diagnostics: dict[str, Any] = {}
-        if (action_plan or {}).get("kind") == "notification" and not any(
+        delivery_intent = normalized_action_plan.get("delivery_intent")
+        if isinstance(delivery_intent, dict) and not any(
             error.startswith("monitor.proposal_incomplete:delivery")
             for error in plan_errors
         ):
-            delivery_intent = (action_plan or {}).get("delivery_intent")
-            if isinstance(delivery_intent, dict):
-                try:
-                    capability = MonitorPluginPlanner(
-                        tuple(self.registry.capabilities)
-                        if self.registry is not None
-                        else ()
-                    ).select_delivery_capability(delivery_intent)
-                except MonitorPluginPlanningBlocked as exc:
-                    missing_label = _delivery_missing_capability_label(
-                        exc,
-                        delivery_intent,
+            try:
+                normalized_intent, capability = MonitorPluginPlanner(
+                    tuple(self.registry.capabilities)
+                    if self.registry is not None
+                    else ()
+                ).normalize_delivery_intent(delivery_intent)
+            except MonitorPluginPlanningBlocked as exc:
+                details = dict(exc.details or {})
+                capability_id = details.get("capability_id")
+                missing_label = (
+                    capability_id
+                    if isinstance(capability_id, str) and capability_id
+                    else None
+                )
+                if missing_label is not None:
+                    required.append(missing_label)
+                if (
+                    exc.reason == "missing_capability"
+                    and missing_label is not None
+                    and missing_label not in capability_ids
+                ):
+                    unsupported.append(
+                        f"delivery:{delivery_intent.get('delivery_kind')}"
                     )
-                    if missing_label is not None:
-                        required.append(missing_label)
-                    if (
-                        exc.reason == "missing_capability"
-                        and missing_label is not None
-                        and missing_label not in capability_ids
-                    ):
-                        unsupported.append(
-                            f"delivery:{delivery_intent.get('delivery_kind')}"
-                        )
-                    delivery_errors.append(f"monitor.delivery_unsupported:{exc.reason}")
-                    delivery_diagnostics = {
-                        "accepted": False,
-                        "reason": exc.reason,
-                        "details": dict(exc.details or {}),
-                        "delivery_intent": dict(delivery_intent),
-                    }
-                else:
-                    required.append(capability.id)
-                    delivery_diagnostics = {
-                        "accepted": True,
-                        "capability_id": capability.id,
-                        "capability_owner": capability.owner,
-                        "delivery_kind": delivery_intent.get("delivery_kind"),
-                    }
+                delivery_errors.append(f"monitor.delivery_unsupported:{exc.reason}")
+                delivery_diagnostics = {
+                    "accepted": False,
+                    "reason": exc.reason,
+                    "details": details,
+                    "capability_id": capability_id,
+                    "capability_owner": details.get("owner"),
+                    "delivery_kind": details.get("delivery_kind")
+                    or delivery_intent.get("delivery_kind")
+                    or delivery_intent.get("mode"),
+                    "delivery_intent": dict(delivery_intent),
+                }
+            else:
+                normalized_action_plan["delivery_intent"] = normalized_intent.to_dict()
+                required.append(capability.id)
+                delivery_diagnostics = {
+                    "accepted": True,
+                    "capability_id": capability.id,
+                    "capability_owner": capability.owner,
+                    "delivery_kind": normalized_intent.delivery_kind,
+                }
         missing = tuple(
             capability_id
             for capability_id in dict.fromkeys(required)
@@ -377,23 +408,26 @@ class DbMonitorPlanner:
             )
         )
         warnings = tuple((*budget_warnings, *policy_warnings))
-        return DbMonitorValidation(
-            accepted=not errors,
-            warnings=warnings,
-            errors=errors,
-            required_capabilities=tuple(dict.fromkeys(required)),
-            missing_capabilities=missing,
-            unsupported_actions=tuple(unsupported),
-            diagnostics={
-                "capability_ids": sorted(capability_ids),
-                "source_scope": list(source_scope),
-                "connector_guardrails": {
-                    "sql_planning": "deferred_to_db_runtime",
-                    "execution": "deferred_to_runtime_capabilities",
+        return (
+            normalized_action_plan,
+            DbMonitorValidation(
+                accepted=not errors,
+                warnings=warnings,
+                errors=errors,
+                required_capabilities=tuple(dict.fromkeys(required)),
+                missing_capabilities=missing,
+                unsupported_actions=tuple(unsupported),
+                diagnostics={
+                    "capability_ids": sorted(capability_ids),
+                    "source_scope": list(source_scope),
+                    "connector_guardrails": {
+                        "sql_planning": "deferred_to_db_runtime",
+                        "execution": "deferred_to_runtime_capabilities",
+                    },
+                    "runtime_limits": dict(self.limits),
+                    "delivery_validation": delivery_diagnostics,
                 },
-                "runtime_limits": dict(self.limits),
-                "delivery_validation": delivery_diagnostics,
-            },
+            ),
         )
 
 
@@ -403,6 +437,11 @@ def monitor_create_intent_from_dict(data: dict[str, Any]) -> MonitorCreateIntent
     condition = dict(data.get("condition") or {})
     schedule = data.get("schedule")
     delivery = data.get("delivery")
+    delivery_data = dict(delivery) if isinstance(delivery, dict) else {}
+    raw_delivery_target = delivery_data.get("target")
+    delivery_target = (
+        dict(raw_delivery_target) if isinstance(raw_delivery_target, Mapping) else {}
+    )
     action = dict(data.get("action") or {})
     display = dict(data.get("display") or {})
     return MonitorCreateIntent(
@@ -434,15 +473,28 @@ def monitor_create_intent_from_dict(data: dict[str, Any]) -> MonitorCreateIntent
             None
             if delivery is None
             else MonitorDeliveryRequest(
-                delivery_kind=str(dict(delivery).get("delivery_kind") or "local"),
-                target=dict(dict(delivery).get("target") or {}),
-                explicit=bool(dict(delivery).get("explicit", True)),
-                payload_source=dict(
-                    dict(delivery).get("payload_source") or {"type": "monitor.report"}
+                delivery_kind=str(
+                    delivery_data.get("delivery_kind")
+                    or delivery_data.get("mode")
+                    or ""
                 ),
-                template=_optional_string(dict(delivery).get("template")),
+                target=delivery_target,
+                target_explicit="target" in delivery_data,
+                explicit=bool(delivery_data.get("explicit", True)),
+                payload_source=dict(
+                    delivery_data.get("payload_source") or {"type": "monitor.report"}
+                ),
+                capability_id=_optional_string(delivery_data.get("capability_id")),
+                capability_owner=_optional_string(
+                    delivery_data.get("capability_owner") or delivery_data.get("owner")
+                ),
+                format=_optional_string(delivery_data.get("format")),
+                subject=_optional_string(
+                    delivery_data.get("subject") or delivery_data.get("title")
+                ),
+                template=_optional_string(delivery_data.get("template")),
                 include_observed_rows=bool(
-                    dict(delivery).get("include_observed_rows", True)
+                    delivery_data.get("include_observed_rows", True)
                 ),
             )
         ),
@@ -878,19 +930,22 @@ def _notification_action_plan(intent: MonitorCreateIntent) -> dict[str, Any]:
     }
 
 
-def _delivery_missing_capability_label(
-    exc: MonitorPluginPlanningBlocked,
-    delivery_intent: dict[str, Any],
-) -> str | None:
-    details = dict(exc.details or {})
-    capability_id = details.get("capability_id")
-    if isinstance(capability_id, str) and capability_id:
-        return capability_id
-    delivery_kind = str(delivery_intent.get("delivery_kind") or "")
-    if exc.reason == "missing_capability":
-        if delivery_kind in {"in_app", "local"}:
-            return f"monitor.delivery.{delivery_kind}"
-    return None
+def _action_plan_with_delivery_kind_default(
+    action_plan: dict[str, Any],
+    *,
+    delivery_default: str | None,
+) -> dict[str, Any]:
+    delivery = action_plan.get("delivery_intent")
+    if not isinstance(delivery, dict):
+        return action_plan
+    normalized = dict(delivery)
+    explicit_kind = normalized.get("delivery_kind") or normalized.get("mode")
+    if explicit_kind:
+        normalized["delivery_kind"] = str(explicit_kind)
+    elif delivery_default:
+        normalized["delivery_kind"] = delivery_default
+    action_plan["delivery_intent"] = normalized
+    return action_plan
 
 
 def _proposal_validation_errors(
@@ -925,7 +980,8 @@ def _proposal_validation_errors(
         key in trigger for key in ("gt", "gte", "lt", "lte", "equals", "truthy")
     ):
         errors.append("monitor.proposal_incomplete:trigger")
-    if action_plan.get("kind") == "notification":
+    delivery_present = "delivery_intent" in action_plan
+    if action_plan.get("kind") == "notification" or delivery_present:
         delivery = action_plan.get("delivery_intent")
         if not isinstance(delivery, dict) or not delivery.get("delivery_kind"):
             errors.append("monitor.proposal_incomplete:delivery")

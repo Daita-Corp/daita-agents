@@ -83,6 +83,11 @@ class MonitorDeliveryRequest:
     )
     template: str | None = None
     include_observed_rows: bool = True
+    capability_id: str | None = None
+    capability_owner: str | None = None
+    format: str | None = None
+    subject: str | None = None
+    target_explicit: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "target", dict(self.target))
@@ -92,8 +97,13 @@ class MonitorDeliveryRequest:
         return {
             "delivery_kind": self.delivery_kind,
             "target": dict(self.target),
+            "target_explicit": self.target_explicit,
             "explicit": self.explicit,
             "payload_source": dict(self.payload_source),
+            "capability_id": self.capability_id,
+            "capability_owner": self.capability_owner,
+            "format": self.format,
+            "subject": self.subject,
             "template": self.template,
             "include_observed_rows": self.include_observed_rows,
         }
@@ -101,10 +111,19 @@ class MonitorDeliveryRequest:
     def to_action_plan_intent(self) -> dict[str, Any]:
         payload = {
             "delivery_kind": self.delivery_kind,
-            "target": dict(self.target),
             "payload_source": dict(self.payload_source),
             "include_observed_rows": self.include_observed_rows,
         }
+        if self.target_explicit or self.target:
+            payload["target"] = dict(self.target)
+        if self.capability_id is not None:
+            payload["capability_id"] = self.capability_id
+        if self.capability_owner is not None:
+            payload["capability_owner"] = self.capability_owner
+        if self.format is not None:
+            payload["format"] = self.format
+        if self.subject is not None:
+            payload["subject"] = self.subject
         if self.template is not None:
             payload["template"] = self.template
         return payload

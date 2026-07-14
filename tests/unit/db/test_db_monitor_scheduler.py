@@ -539,6 +539,8 @@ class MonitorCapabilityProbePlugin(RuntimeExtensionPlugin):
         access=AccessMode.WRITE,
         side_effecting=True,
         accepted_formats=("markdown",),
+        accepted_target_types=(),
+        default_target=None,
         requires_approval=False,
         input_schema=None,
         fail=False,
@@ -563,6 +565,8 @@ class MonitorCapabilityProbePlugin(RuntimeExtensionPlugin):
         self.access = access
         self.side_effecting = side_effecting
         self.accepted_formats = tuple(accepted_formats)
+        self.accepted_target_types = tuple(accepted_target_types)
+        self.default_target = default_target
         self.requires_approval = requires_approval
         self.input_schema = input_schema or {
             "type": "object",
@@ -583,6 +587,10 @@ class MonitorCapabilityProbePlugin(RuntimeExtensionPlugin):
             "supports_dry_run": True,
             "replay_safe": False,
         }
+        if self.accepted_target_types:
+            metadata["accepted_target_types"] = list(self.accepted_target_types)
+        if self.default_target is not None:
+            metadata["default_target"] = self.default_target
         return [
             Capability(
                 id=self.capability_id,
@@ -1812,7 +1820,7 @@ async def test_scheduled_report_action_uses_validated_reads_and_blocks_vague_del
     )
     assert delivery_result.accepted is False
     assert delivery_result.payload["status"] == "blocked"
-    assert delivery_result.payload["block_reason"] == "missing_delivery_target"
+    assert delivery_result.payload["block_reason"] == "missing_capability"
     assert run.summary["delivery_status"] == "blocked"
 
 
@@ -2122,6 +2130,163 @@ async def test_delivery_selection_is_generic_for_email_webhook_and_rest(
     assert delivery_task.input["target"] == target
     assert delivery_result.payload["capability_id"] == capability_id
     assert delivery_result.payload["capability_owner"] == plugin_id
+
+
+@pytest.mark.parametrize(
+    ("explicit_target", "expected_target", "expected_reason"),
+    [
+        (None, {"type": "team_inbox", "name": "default"}, None),
+        (
+            {"type": "team_inbox", "name": "explicit"},
+            {"type": "team_inbox", "name": "explicit"},
+            None,
+        ),
+        (
+            {"type": "pager", "name": "explicit"},
+            {"type": "pager", "name": "explicit"},
+            "unsupported_delivery_target",
+        ),
+        ({}, {}, "missing_delivery_target"),
+    ],
+)
+async def test_delivery_default_target_normalizes_runtime_contract_without_overrides(
+    explicit_target,
+    expected_target,
+    expected_reason,
+):
+    declared_default = {"type": "team_inbox", "name": "default"}
+    db_plugin = MonitorReadProbePlugin(rows=[{"pending_count": 12}])
+    delivery_plugin = MonitorCapabilityProbePlugin(
+        plugin_id="team_delivery_probe",
+        capability_id="team.inbox.send",
+        evidence_kind="team.delivery.result",
+        role="delivery",
+        kind="team",
+        accepted_target_types=("team_inbox",),
+        default_target=declared_default,
+    )
+    runtime = DbRuntime(
+        runtime_id=f"db-monitor-delivery-default-{expected_reason or 'accepted'}-"
+        f"{(explicit_target or {}).get('name', 'omitted')}",
+        plugins=(db_plugin, delivery_plugin),
+    )
+    intent = {"delivery_kind": "team", "format": "markdown"}
+    if explicit_target is not None:
+        intent["target"] = explicit_target
+    await _create_monitor(
+        runtime,
+        "default_target_monitor",
+        schedule={"interval_seconds": 0},
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+        action_plan=_notification_action(intent),
+    )
+
+    run = (await runtime.tick_monitors(now=NOW))[0]
+    snapshot = await runtime.inspect_operation(run.summary["triggered_operation_id"])
+    delivery_plan = next(
+        item for item in snapshot.evidence if item.kind == "monitor.delivery_plan"
+    )
+    delivery_result = next(
+        item for item in snapshot.evidence if item.kind == "monitor.delivery_result"
+    )
+
+    assert delivery_plan.payload["delivery_intent"]["target"] == expected_target
+    assert delivery_result.payload["delivery_target"] == expected_target
+    assert declared_default == {"type": "team_inbox", "name": "default"}
+    if expected_reason is None:
+        delivery_task = next(
+            task for task in snapshot.tasks if task.capability_id == "team.inbox.send"
+        )
+        assert delivery_plugin.executor.calls == 1
+        assert delivery_task.input["target"] == expected_target
+        assert delivery_task.metadata["monitor_delivery_target"] == expected_target
+        assert delivery_result.accepted is True
+    else:
+        assert delivery_plugin.executor.calls == 0
+        assert delivery_plan.payload["block_reason"] == expected_reason
+        assert delivery_plan.payload["capability_id"] == "team.inbox.send"
+        assert delivery_result.payload["block_reason"] == expected_reason
+        assert not any(
+            task.capability_id == "team.inbox.send" for task in snapshot.tasks
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("missing", "missing_delivery_target"),
+        ("ambiguous", "ambiguous_capability"),
+        ("malformed", "invalid_delivery_target_default"),
+        ("unsupported", "unsupported_delivery_target"),
+    ],
+)
+async def test_delivery_default_target_blocks_before_plugin_execution(case, reason):
+    db_plugin = MonitorReadProbePlugin(rows=[{"pending_count": 12}])
+    common = {
+        "capability_id": "team.inbox.send",
+        "evidence_kind": "team.delivery.result",
+        "role": "delivery",
+        "kind": "team",
+        "accepted_target_types": ("team_inbox",),
+    }
+    first = MonitorCapabilityProbePlugin(
+        plugin_id="team_delivery_probe_a",
+        default_target=(
+            None
+            if case == "missing"
+            else (
+                []
+                if case == "malformed"
+                else (
+                    {"type": "pager"}
+                    if case == "unsupported"
+                    else {"type": "team_inbox", "name": "a"}
+                )
+            )
+        ),
+        **common,
+    )
+    delivery_plugins = [first]
+    if case == "ambiguous":
+        delivery_plugins.append(
+            MonitorCapabilityProbePlugin(
+                plugin_id="team_delivery_probe_b",
+                default_target={"type": "team_inbox", "name": "b"},
+                **common,
+            )
+        )
+    runtime = DbRuntime(
+        runtime_id=f"db-monitor-delivery-default-block-{case}",
+        plugins=(db_plugin, *delivery_plugins),
+    )
+    await _create_monitor(
+        runtime,
+        f"default_target_{case}_monitor",
+        schedule={"interval_seconds": 0},
+        observation_plan=_metric_observation(),
+        trigger={"path": "pending_count", "gt": 10},
+        action_plan=_notification_action(
+            {"delivery_kind": "team", "format": "markdown"}
+        ),
+    )
+
+    run = (await runtime.tick_monitors(now=NOW))[0]
+    snapshot = await runtime.inspect_operation(run.summary["triggered_operation_id"])
+    delivery_plan = next(
+        item for item in snapshot.evidence if item.kind == "monitor.delivery_plan"
+    )
+    delivery_result = next(
+        item for item in snapshot.evidence if item.kind == "monitor.delivery_result"
+    )
+
+    assert delivery_plan.accepted is False
+    assert delivery_plan.payload["block_reason"] == reason
+    assert delivery_result.payload["block_reason"] == reason
+    assert all(plugin.executor.calls == 0 for plugin in delivery_plugins)
+    assert not any(
+        task.metadata.get("reason") == "monitor_delivery" for task in snapshot.tasks
+    )
 
 
 @pytest.mark.parametrize(

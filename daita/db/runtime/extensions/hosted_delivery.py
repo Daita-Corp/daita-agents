@@ -70,6 +70,7 @@ class HostedInAppMonitorDeliveryPlugin(RuntimeExtensionPlugin):
                     "accepted_payload_kinds": ["monitor.report"],
                     "accepted_formats": ["markdown", "plain", "text"],
                     "accepted_target_types": ["requesting_user"],
+                    "default_target": {"type": "requesting_user"},
                     "supports_idempotency_key": True,
                 },
             ),
