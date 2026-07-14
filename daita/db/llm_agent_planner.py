@@ -252,7 +252,29 @@ def _planner_messages(state: DbLoopState) -> list[dict[str, str]]:
                 "clarify. For explicit SQL writes, put the concrete SQL in "
                 "input.sql: use propose_sql_write for write.propose, "
                 "execute_validated_write for write.execute, and propose_sql_write "
-                "for destructive SQL so policy can deny it before execution."
+                "for destructive SQL so policy can deny it before execution. "
+                "For runtime monitor control-plane requests, list, inspect, or "
+                "explain monitors with read_monitor_state. Create with "
+                "plan_monitor_create plus commit_monitor_create whose depends_on "
+                "names the plan action; update, pause, resume, disable, or delete "
+                "with plan_monitor_lifecycle plus an equivalently dependent "
+                "commit_monitor_lifecycle. If an approval id is not grounded, "
+                "first use read_monitor_state with read_kind='approvals' and "
+                "pending_only=true; use resolve_monitor_approval only after "
+                "accepted evidence grounds exactly one pending approval. Approval "
+                "resolution changes approval state only and never resumes its "
+                "target operation. Runtime monitor management is control-plane "
+                "work, distinct from querying a monitor-like source table; set "
+                "intent.operation_type='data.query' and use SQL actions only when "
+                "the user explicitly asks for source data, SQL, rows, or analysis "
+                "of that table. Ambiguous "
+                "monitor references require evidence gathering and clarification; "
+                "never guess a candidate or emit a mutating commit. For monitor "
+                "creation, select one catalog_context.assets[] candidate by name, "
+                "or by asset_ref only when needed to disambiguate, and cite one of "
+                "that asset's evidence_ids. Treat asset_ref only as catalog "
+                "selection identity; the accepted catalog profile's name remains "
+                "the SQL table identity."
             ),
         },
         {
@@ -371,14 +393,32 @@ def _action_input_hints() -> dict[str, Any]:
         "clarification_question": None,
         "rationale": "optional",
         "metadata": {},
+        "monitor_state_fact_sources": {
+            "catalog_assets": (
+                "state.catalog_context.assets[] exposes distinct canonical name, "
+                "catalog asset_ref, and supporting evidence_ids"
+            ),
+            "monitor_evidence": (
+                "state accepted/rejected evidence summaries expose bounded monitor "
+                "ids, names, statuses, and resolution candidates"
+            ),
+            "approval_scope": (
+                "state.approval_state is current-operation scope only; accepted "
+                "monitor.approval_state evidence is the bounded monitor inbox with "
+                "approval_id, target_operation_id, monitor_id, policy_id, and status"
+            ),
+        },
         "monitor_action_inputs": {
             "plan_monitor_create": {
                 "intent": {
                     "target": {
                         "target_type": "table",
-                        "name": "table_or_asset_name",
-                        "source_scope": [],
-                        "evidence": ["supporting_catalog_evidence_id"],
+                        "name": (
+                            "catalog_context asset name, or its asset_ref only "
+                            "to disambiguate selection"
+                        ),
+                        "source_scope": ["selected asset's canonical name"],
+                        "evidence": ["supporting catalog asset evidence_id"],
                     },
                     "condition": {
                         "kind": "new_rows | rows_present | threshold | freshness | report",
@@ -422,7 +462,9 @@ def _action_input_hints() -> dict[str, Any]:
             },
             "plan_monitor_lifecycle": {
                 "action": "update | pause | resume | delete | disable",
-                "monitor_id": "structured monitor id or reference",
+                "monitor_id": (
+                    "grounded monitor id or bounded reference from monitor evidence"
+                ),
                 "patch": {},
                 "paused_until": "optional ISO timestamp",
             },
@@ -432,14 +474,19 @@ def _action_input_hints() -> dict[str, Any]:
             },
             "read_monitor_state": {
                 "read_kind": "list | inspect | explain_run | approvals",
-                "monitor_id": "optional structured monitor id or reference",
+                "monitor_id": (
+                    "optional grounded monitor id or bounded reference from evidence"
+                ),
                 "status": "optional status filter for list",
                 "pending_only": True,
             },
             "resolve_monitor_approval": {
                 "approval_action": "approve | reject | cancel",
-                "approval_id": "optional approval id",
-                "monitor_id": "optional structured monitor id or reference",
+                "approval_id": (
+                    "exact id grounded by exactly one pending "
+                    "monitor.approval_state item"
+                ),
+                "monitor_id": "optional grounded monitor id from approval evidence",
             },
         },
     }

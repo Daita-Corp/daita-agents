@@ -12,7 +12,7 @@ from daita.db import (
     DbRuntimeConfig,
     HostedInAppMonitorDeliveryPlugin,
 )
-from daita.db.llm_agent_planner import _action_input_hints
+from daita.db.llm_agent_planner import _action_input_hints, _planner_messages
 from daita.db.loop import DbAgentLoop
 from daita.db.loop.summaries import _capability_summary
 from daita.db.models import DbRequest
@@ -1211,12 +1211,24 @@ async def test_prompt_monitor_request_without_llm_does_not_fall_back_to_regex_ro
 
 
 def test_monitor_create_action_hint_exposes_catalog_evidence_ids():
-    intent = _action_input_hints()["monitor_action_inputs"]["plan_monitor_create"][
-        "intent"
-    ]
+    hints = _action_input_hints()
+    intent = hints["monitor_action_inputs"]["plan_monitor_create"]["intent"]
     target = intent["target"]
 
-    assert target["evidence"] == ["supporting_catalog_evidence_id"]
+    assert target == {
+        "target_type": "table",
+        "name": (
+            "catalog_context asset name, or its asset_ref only "
+            "to disambiguate selection"
+        ),
+        "source_scope": ["selected asset's canonical name"],
+        "evidence": ["supporting catalog asset evidence_id"],
+    }
+    assert (
+        "distinct canonical name"
+        in hints["monitor_state_fact_sources"]["catalog_assets"]
+    )
+    assert "catalog asset_ref" in hints["monitor_state_fact_sources"]["catalog_assets"]
     assert intent["observation"] == {
         "filters": [
             {
@@ -1228,6 +1240,74 @@ def test_monitor_create_action_hint_exposes_catalog_evidence_ids():
         ],
         "value_path": "rows",
     }
+
+
+def test_outer_planner_prompt_contains_compact_monitor_control_plane_rules():
+    state = DbLoopState(
+        operation_id="monitor-planner-guidance",
+        normalized_user_request={"prompt": "manage runtime monitors"},
+    )
+
+    system_message = _planner_messages(state)[0]["content"]
+
+    for clause in (
+        "list, inspect, or explain monitors with read_monitor_state",
+        "plan_monitor_create plus commit_monitor_create whose depends_on",
+        "update, pause, resume, disable, or delete",
+        "plan_monitor_lifecycle plus an equivalently dependent",
+        "first use read_monitor_state with read_kind='approvals' and pending_only=true",
+        "only after accepted evidence grounds exactly one pending approval",
+        "Approval resolution changes approval state only and never resumes",
+        "Runtime monitor management is control-plane work",
+        "intent.operation_type='data.query' and use SQL actions only when",
+        "explicitly asks for source data, SQL, rows, or analysis",
+        "Ambiguous monitor references require evidence gathering and clarification",
+        "never guess a candidate or emit a mutating commit",
+        "select one catalog_context.assets[] candidate by name",
+        "asset_ref only when needed to disambiguate",
+        "Treat asset_ref only as catalog selection identity",
+        "accepted catalog profile's name remains the SQL table identity",
+    ):
+        assert clause in system_message
+
+
+def test_monitor_action_hints_are_bounded_and_preserve_dependency_contracts():
+    hints = _action_input_hints()
+    monitor_hints = hints["monitor_action_inputs"]
+
+    assert monitor_hints["commit_monitor_create"]["depends_on"] == [
+        "plan_monitor_create_action_id"
+    ]
+    assert monitor_hints["commit_monitor_lifecycle"]["depends_on"] == [
+        "plan_monitor_lifecycle_action_id"
+    ]
+    assert "bounded monitor" in hints["monitor_state_fact_sources"]["monitor_evidence"]
+    assert (
+        "current-operation scope only"
+        in hints["monitor_state_fact_sources"]["approval_scope"]
+    )
+    assert (
+        "bounded monitor inbox" in hints["monitor_state_fact_sources"]["approval_scope"]
+    )
+    assert (
+        "target_operation_id" in hints["monitor_state_fact_sources"]["approval_scope"]
+    )
+    assert (
+        "exactly one pending"
+        in monitor_hints["resolve_monitor_approval"]["approval_id"]
+    )
+
+    serialized = json.dumps(monitor_hints, sort_keys=True)
+    for forbidden in (
+        "raw_prompt",
+        '"sql"',
+        '"prompt"',
+        '"proposal"',
+        "payload_source",
+        "delivery_target",
+        "governance",
+    ):
+        assert forbidden not in serialized
 
 
 def test_monitor_create_observation_round_trips_as_a_defensive_bounded_copy():
@@ -1469,6 +1549,11 @@ def test_no_production_prompt_monitor_router_or_service_sources_remain():
                 matches.append(f"{path.relative_to(Path(__file__).parents[3])}:{token}")
 
     assert matches == []
+    planner_source = (
+        Path(__file__).parents[3] / "daita" / "db" / "llm_agent_planner.py"
+    ).read_text()
+    assert "import re" not in planner_source
+    assert "from re import" not in planner_source
 
 
 async def test_monitor_approval_read_and_ambiguous_resolution_use_bounded_inbox_evidence(
