@@ -750,6 +750,19 @@ class DbRuntimeMonitorDeliveryMixin:
                     ),
                 }
             )
+        if (
+            not context.get("monitor_id")
+            and metadata.get("control_plane") == "db.monitor"
+            and metadata.get("monitor_id")
+        ):
+            command_kind = str(metadata.get("command_kind") or "approval")
+            context.update(
+                {
+                    "kind": f"monitor.{command_kind}",
+                    "monitor_id": metadata["monitor_id"],
+                    "operation_id": approval.operation_id,
+                }
+            )
         governance_facts = (
             approval.proposed_action.get("request", {}).get("governance_facts", {})
             if isinstance(approval.proposed_action.get("request"), dict)

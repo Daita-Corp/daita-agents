@@ -10,6 +10,7 @@ from daita.runtime import Evidence, Operation, Task
 from ...fingerprints import persisted_fingerprint
 from ...monitor_commands.resolver import DbMonitorResolver
 from ...monitor_commands.types import DbMonitorCommand, DbMonitorResolution
+from .monitor_evidence import evidence_matches_dependency
 
 if TYPE_CHECKING:
     from .plugin import DbRuntimePlanningPlugin
@@ -91,17 +92,20 @@ class DbMonitorReadExecutor:
 
         if read_kind == "approvals":
             monitor_id = _optional_string(task.input.get("monitor_id"))
+            pending_only = bool(task.input.get("pending_only", True))
             approvals = await runtime.list_monitor_approvals(
                 monitor_id=monitor_id,
                 monitor_run_id=_optional_string(task.input.get("monitor_run_id")),
-                pending_only=bool(task.input.get("pending_only", True)),
+                pending_only=pending_only,
             )
-            payload = {
-                "read_kind": "approvals",
-                "monitor_id": monitor_id,
-                "approvals": [dict(item) for item in approvals],
-                "pending_only": bool(task.input.get("pending_only", True)),
-            }
+            payload = _bounded_approval_state_payload(
+                {
+                    "read_kind": "approvals",
+                    "monitor_id": monitor_id,
+                    "approvals": [dict(item) for item in approvals],
+                    "pending_only": pending_only,
+                }
+            )
             return [
                 _monitor_evidence("monitor.approval_state", operation, task, payload)
             ]
@@ -128,46 +132,104 @@ class DbMonitorResolveApprovalExecutor:
         action = str(task.input.get("approval_action") or "approve").lower()
         if action not in {"approve", "reject", "cancel"}:
             raise ValueError(f"unsupported monitor approval action: {action!r}")
-        approval_id = _optional_string(task.input.get("approval_id"))
+        approval_id = _exact_approval_id(task.input.get("approval_id"))
         monitor_id = _optional_string(task.input.get("monitor_id"))
-        approvals: tuple[dict[str, Any], ...] = tuple(
-            dict(item)
-            for item in await runtime.list_monitor_approvals(
-                monitor_id=monitor_id,
-                pending_only=True,
-            )
-        )
+        approvals: tuple[dict[str, Any], ...]
+        candidate_count: int
+        candidates_truncated = False
         if approval_id is not None:
             approvals = tuple(
-                approval
-                for approval in approvals
-                if approval.get("approval_id") == approval_id
+                dict(item)
+                for item in await runtime.list_monitor_approvals(
+                    monitor_id=monitor_id,
+                    pending_only=True,
+                )
+                if item.get("approval_id") == approval_id
             )
+            candidate_count = len(approvals)
+        else:
+            approval_state = await _approval_state_dependency(
+                runtime,
+                operation,
+                task,
+                monitor_id=monitor_id,
+            )
+            if approval_state is None:
+                payload = _bounded_approval_resolution_payload(
+                    {
+                        "approval_action": action,
+                        "approval_id": None,
+                        "monitor_id": monitor_id,
+                        "matched_approvals": [],
+                        "matched_approval_count": 0,
+                        "matched_approvals_truncated": False,
+                        "status": "inbox_required",
+                    }
+                )
+                return [
+                    _monitor_evidence(
+                        "monitor.approval_resolution",
+                        operation,
+                        task,
+                        payload,
+                    )
+                ]
+            raw_approvals = approval_state.payload.get("approvals")
+            approvals = tuple(
+                dict(item)
+                for item in (
+                    raw_approvals if isinstance(raw_approvals, (list, tuple)) else ()
+                )
+                if isinstance(item, Mapping)
+            )
+            reported_count = approval_state.payload.get("approval_count")
+            candidate_count = len(approvals)
+            if (
+                isinstance(reported_count, int)
+                and not isinstance(reported_count, bool)
+                and reported_count >= candidate_count
+            ):
+                candidate_count = reported_count
+            candidates_truncated = approval_state.payload.get(
+                "approvals_truncated"
+            ) is True or candidate_count > len(approvals)
         payload: dict[str, Any] = {
             "approval_action": action,
             "approval_id": approval_id,
             "monitor_id": monitor_id,
             "matched_approvals": [dict(item) for item in approvals],
+            "matched_approval_count": candidate_count,
+            "matched_approvals_truncated": candidates_truncated,
         }
-        matched_approval = next(iter(approvals), None)
-        if matched_approval is None:
+        if candidate_count == 0:
             payload["status"] = "not_found"
             return [
                 _monitor_evidence(
                     "monitor.approval_resolution",
                     operation,
                     task,
-                    payload,
+                    _bounded_approval_resolution_payload(payload),
                 )
             ]
-        if len(approvals) > 1:
+        if candidate_count > 1:
             payload["status"] = "ambiguous"
             return [
                 _monitor_evidence(
                     "monitor.approval_resolution",
                     operation,
                     task,
-                    payload,
+                    _bounded_approval_resolution_payload(payload),
+                )
+            ]
+        matched_approval = next(iter(approvals), None)
+        if matched_approval is None:
+            payload["status"] = "inbox_incomplete"
+            return [
+                _monitor_evidence(
+                    "monitor.approval_resolution",
+                    operation,
+                    task,
+                    _bounded_approval_resolution_payload(payload),
                 )
             ]
 
@@ -191,7 +253,7 @@ class DbMonitorResolveApprovalExecutor:
                 "monitor.approval_resolution",
                 operation,
                 task,
-                payload,
+                _bounded_approval_resolution_payload(payload),
             )
         ]
 
@@ -231,3 +293,53 @@ def _optional_string(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _exact_approval_id(value: Any) -> str | None:
+    if not isinstance(value, str) or value == "":
+        return None
+    return value
+
+
+async def _approval_state_dependency(
+    runtime: Any,
+    operation: Operation,
+    task: Task,
+    *,
+    monitor_id: str | None,
+) -> Evidence | None:
+    evidence = await runtime.store.list_evidence(operation.id)
+    for dependency in task.dependencies:
+        if dependency.kind_value != "evidence":
+            continue
+        if dependency.evidence_kind != "monitor.approval_state":
+            continue
+        for item in reversed(evidence):
+            if not evidence_matches_dependency(item, dependency):
+                continue
+            payload = item.payload if isinstance(item.payload, Mapping) else {}
+            if payload.get("read_kind") != "approvals":
+                continue
+            if payload.get("pending_only") is not True:
+                continue
+            if (
+                monitor_id is not None
+                and _optional_string(payload.get("monitor_id")) != monitor_id
+            ):
+                continue
+            return item
+    return None
+
+
+def _bounded_approval_state_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    from ...loop.summaries import _monitor_approval_state_summary
+
+    return _monitor_approval_state_summary(payload)
+
+
+def _bounded_approval_resolution_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    from ...loop.summaries import _bounded_monitor_approval_resolution_payload
+
+    return _bounded_monitor_approval_resolution_payload(payload)

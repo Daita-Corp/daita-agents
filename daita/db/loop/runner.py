@@ -935,6 +935,7 @@ class DbAgentLoop:
     async def _approval_state(self, operation_id: str) -> dict[str, Any]:
         approvals = await self.runtime.store.list_approval_requests(operation_id)
         return {
+            "scope": "current_operation",
             "requests": [
                 {
                     "approval_id": item.approval_id,
@@ -943,7 +944,7 @@ class DbAgentLoop:
                     "task_id": _approval_task_id(item),
                 }
                 for item in approvals
-            ]
+            ],
         }
 
     async def _operation_finalizable(

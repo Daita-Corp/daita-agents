@@ -835,6 +835,22 @@ def test_monitor_and_failed_catalog_evidence_summaries_are_safe_and_bounded():
         assert forbidden not in serialized
 
 
+def test_monitor_approval_resolution_summary_preserves_exact_approval_id():
+    summary = _evidence_summary(
+        Evidence(
+            kind="monitor.approval_resolution",
+            payload={
+                "status": "not_found",
+                "approval_id": "approval-1 ",
+                "matched_approvals": [],
+            },
+        )
+    )
+
+    assert summary["resolution_status"] == "not_found"
+    assert summary["approval_id"] == "approval-1 "
+
+
 def test_monitor_evidence_summaries_bound_scalar_text_and_report_truncation():
     oversized = "x" * 100_000
     listing = _evidence_summary(
@@ -3093,6 +3109,7 @@ async def test_approval_state_uses_requested_policy_id():
 
     state = await DbAgentLoop(runtime, FakePlanner())._approval_state(operation.id)
 
+    assert state["scope"] == "current_operation"
     assert state["requests"] == [
         {
             "approval_id": "approval-1",
@@ -3101,6 +3118,27 @@ async def test_approval_state_uses_requested_policy_id():
             "task_id": None,
         }
     ]
+
+
+async def test_empty_current_operation_approval_state_does_not_project_global_inbox():
+    runtime, operation = await _runtime_and_operation(
+        "phase-three-current-operation-approval-scope"
+    )
+    await runtime.store.save_approval_request(
+        ApprovalRequest(
+            approval_id="approval-for-another-operation",
+            operation_id="another-operation",
+            reason="Approve a monitor change.",
+            risk=RiskLevel.MEDIUM,
+            requested_by_policy_id="monitor_policy",
+            proposed_action={"approval": "human"},
+            status=ApprovalStatus.PENDING,
+        )
+    )
+
+    state = await DbAgentLoop(runtime, FakePlanner())._approval_state(operation.id)
+
+    assert state == {"scope": "current_operation", "requests": []}
 
 
 async def test_latest_accepted_query_plan_ref_ignores_rejected_plan_evidence():

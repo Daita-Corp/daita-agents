@@ -375,9 +375,95 @@ async def test_monitor_update_requires_approval_then_resumes_from_proposal():
     }
     assert len(snapshot.approval_requests) == 1
     assert snapshot.approval_requests[0].status is ApprovalStatus.PENDING
+    approval = snapshot.approval_requests[0]
+    inbox = await runtime.list_monitor_approvals(monitor_id=monitor.id)
+    assert [item["approval_id"] for item in inbox] == [approval.approval_id]
+    plan_task, commit_task = snapshot.tasks
+    proposal = snapshot.evidence[0]
+    dependency = commit_task.dependencies[0]
+    assert dependency.evidence_kind == "monitor.proposal"
+    assert dependency.evidence_accepted is True
+    assert dependency.producer_task_id == plan_task.id
+    assert dependency.producer_capability_id == plan_task.capability_id
+    assert dependency.producer_executor_id == plan_task.executor_id
+    assert proposal.task_id == plan_task.id
 
-    await runtime.approval_channel.approve(snapshot.approval_requests[0].approval_id)
-    resumed = await runtime.resume_operation(result.operation_id)
+    original_resume_operation = runtime.resume_operation
+    resume_calls = []
+
+    async def unexpected_resume(operation_id):
+        resume_calls.append(operation_id)
+        raise AssertionError("approval resolution must not resume execution")
+
+    runtime.resume_operation = unexpected_resume
+    try:
+        resolution_operation = await runtime.kernel.create_operation(
+            operation_type="monitor.approval",
+            request={"kind": "monitor.approval"},
+            required_evidence=frozenset({"monitor.approval_resolution"}),
+            metadata={
+                "runtime_id": runtime.runtime_id,
+                "runtime_kind": runtime.runtime_kind,
+            },
+            evaluate_governance=False,
+        )
+        resolution_plan = await runtime.plan_task_specs(
+            resolution_operation,
+            (
+                DbTaskSpec(
+                    capability_id="db.monitor.resolve_approval",
+                    owner="db_runtime",
+                    input={
+                        "approval_action": "approve",
+                        "approval_id": approval.approval_id,
+                        "monitor_id": monitor.id,
+                    },
+                    reason="test_monitor_approval_resolution",
+                ),
+            ),
+        )
+        resolution_evidence = await runtime.execute_task(
+            resolution_plan.tasks[0],
+            resolution_operation,
+        )
+    finally:
+        runtime.resume_operation = original_resume_operation
+
+    assert resume_calls == []
+    assert len(resolution_evidence) == 1
+    assert resolution_evidence[0].kind == "monitor.approval_resolution"
+    assert resolution_evidence[0].payload["status"] == "resolved"
+    assert resolution_evidence[0].payload["approval_id"] == approval.approval_id
+    assert resolution_evidence[0].payload["approval_status"] == "approved"
+    assert resolution_evidence[0].payload["operation_id"] == result.operation_id
+    resolved_target = await runtime.inspect_operation(result.operation_id)
+    unchanged_after_resolution = await agent.inspect_monitor(monitor.id)
+    assert resolved_target.operation.status is OperationStatus.BLOCKED
+    assert [task.status for task in resolved_target.tasks] == [
+        TaskStatus.SUCCEEDED,
+        TaskStatus.BLOCKED,
+    ]
+    assert resolved_target.approval_requests[0].status is ApprovalStatus.APPROVED
+    assert unchanged_after_resolution.monitor.budgets == {}
+    assert not any(
+        item.kind == "monitor.approval_resolution" for item in resolved_target.evidence
+    )
+    approval_updates = [
+        event
+        for event in resolved_target.events
+        if event.type is RuntimeEventType.APPROVAL_UPDATED
+    ]
+    assert len(approval_updates) == 1
+
+    mutations = []
+    original_commit_monitor_mutation = runtime.commit_monitor_mutation
+
+    async def commit_monitor_mutation_spy(mutation):
+        mutations.append(mutation)
+        return await original_commit_monitor_mutation(mutation)
+
+    runtime.commit_monitor_mutation = commit_monitor_mutation_spy
+    resumed = await original_resume_operation(result.operation_id)
     updated = await agent.inspect_monitor(monitor.id)
 
     assert resumed.operation.status is OperationStatus.SUCCEEDED
@@ -390,11 +476,23 @@ async def test_monitor_update_requires_approval_then_resumes_from_proposal():
         "monitor.proposal",
         "monitor.state_update",
     ]
-    resumed_again = await runtime.resume_operation(result.operation_id)
+    lifecycle_evidence = [
+        item for item in resumed.evidence if item.kind == "monitor.state_update"
+    ]
+    assert len(lifecycle_evidence) == 1
+    assert len(mutations) == 1
+
+    resumed_again = await original_resume_operation(result.operation_id)
     assert [task.status for task in resumed_again.tasks] == [
         TaskStatus.SUCCEEDED,
         TaskStatus.SUCCEEDED,
     ]
+    assert [
+        item.id
+        for item in resumed_again.evidence
+        if item.kind == "monitor.state_update"
+    ] == [item.id for item in lifecycle_evidence]
+    assert len(mutations) == 1
     assert updated.monitor == (await agent.inspect_monitor(monitor.id)).monitor
 
 

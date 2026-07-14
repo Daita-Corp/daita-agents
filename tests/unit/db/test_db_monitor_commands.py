@@ -13,7 +13,14 @@ from daita.db.planner_protocol import (
     DbPlannerDecisionStatus,
 )
 from daita.db.runtime.tasks.models import DbTaskSpec
-from daita.runtime import OperationStatus, TaskStatus
+from daita.runtime import (
+    ApprovalRequest,
+    ApprovalStatus,
+    OperationStatus,
+    RiskLevel,
+    TaskDependency,
+    TaskStatus,
+)
 
 
 class FakeMonitorPlanner:
@@ -526,6 +533,415 @@ def test_no_production_prompt_monitor_router_or_service_sources_remain():
     assert matches == []
 
 
+async def test_monitor_approval_read_and_ambiguous_resolution_use_bounded_inbox_evidence(
+    monkeypatch,
+):
+    secret = "MONITOR_APPROVAL_SECRET"
+    runtime = DbRuntime(runtime_id="monitor-approval-bounded-inbox")
+    calls = []
+    approvals = tuple(
+        {
+            "approval_id": f"approval_{index:02d}",
+            "operation_id": f"target_operation_{index:02d}",
+            "status": "pending",
+            "requested_by_policy_id": "monitor-policy",
+            "context": {
+                "monitor_id": "pending_orders",
+                "governance": {"raw_prompt": secret, "sql": secret},
+            },
+            "reason": secret,
+            "delivery_target": secret,
+            "metadata": {"secret": secret},
+        }
+        for index in reversed(range(25))
+    )
+
+    async def list_monitor_approvals_spy(
+        *, monitor_id=None, monitor_run_id=None, pending_only=True
+    ):
+        calls.append(
+            {
+                "monitor_id": monitor_id,
+                "monitor_run_id": monitor_run_id,
+                "pending_only": pending_only,
+            }
+        )
+        return approvals
+
+    mutations = []
+    resume_calls = []
+
+    async def approve_spy(approval_id):
+        mutations.append(approval_id)
+        raise AssertionError("ambiguous resolution must not approve a candidate")
+
+    async def resume_spy(operation_id):
+        resume_calls.append(operation_id)
+        raise AssertionError("approval resolution must not resume an operation")
+
+    monkeypatch.setattr(runtime, "list_monitor_approvals", list_monitor_approvals_spy)
+    monkeypatch.setattr(runtime, "approve_monitor_approval", approve_spy)
+    monkeypatch.setattr(runtime, "resume_operation", resume_spy)
+    operation = await _monitor_control_operation(runtime, "bounded-approval-inbox")
+    read_task, read_evidence = await _execute_monitor_task(
+        runtime,
+        operation,
+        capability_id="db.monitor.read",
+        task_input={
+            "read_kind": "approvals",
+            "monitor_id": "pending_orders",
+            "monitor_run_id": "run-1",
+            "pending_only": True,
+        },
+    )
+
+    assert calls == [
+        {
+            "monitor_id": "pending_orders",
+            "monitor_run_id": "run-1",
+            "pending_only": True,
+        }
+    ]
+    assert read_evidence.kind == "monitor.approval_state"
+    assert read_evidence.payload["read_kind"] == "approvals"
+    assert read_evidence.payload["monitor_id"] == "pending_orders"
+    assert read_evidence.payload["pending_only"] is True
+    assert read_evidence.payload["approval_count"] == 25
+    assert read_evidence.payload["included_approval_count"] == 20
+    assert read_evidence.payload["approvals_truncated"] is True
+    assert read_evidence.payload["approvals"][0] == {
+        "approval_id": "approval_00",
+        "target_operation_id": "target_operation_00",
+        "monitor_id": "pending_orders",
+        "policy_id": "monitor-policy",
+        "status": "pending",
+    }
+    serialized = json.dumps(read_evidence.payload, sort_keys=True)
+    assert secret not in serialized
+    for forbidden in (
+        "raw_prompt",
+        "sql",
+        "delivery_target",
+        "governance",
+        "metadata",
+    ):
+        assert forbidden not in serialized
+
+    dependency = _approval_state_dependency(
+        read_task,
+        read_evidence,
+        operation_id=operation.id,
+    )
+    _, resolution = await _execute_monitor_task(
+        runtime,
+        operation,
+        capability_id="db.monitor.resolve_approval",
+        task_input={"approval_action": "approve"},
+        dependencies=(dependency,),
+    )
+
+    assert calls == [
+        {
+            "monitor_id": "pending_orders",
+            "monitor_run_id": "run-1",
+            "pending_only": True,
+        }
+    ]
+    assert resolution.payload["status"] == "ambiguous"
+    assert resolution.payload["matched_approval_count"] == 25
+    assert resolution.payload["included_matched_approval_count"] == 20
+    assert resolution.payload["matched_approvals_truncated"] is True
+    assert resolution.payload["matched_approvals"] == read_evidence.payload["approvals"]
+    assert secret not in json.dumps(resolution.payload, sort_keys=True)
+    assert mutations == []
+    assert resume_calls == []
+
+
+async def test_monitor_approval_resolution_from_empty_inbox_is_not_found(
+    monkeypatch,
+):
+    runtime = DbRuntime(runtime_id="monitor-approval-empty-inbox")
+    mutations = []
+    resume_calls = []
+
+    async def empty_inbox(**kwargs):
+        return ()
+
+    async def approve_spy(approval_id):
+        mutations.append(approval_id)
+        raise AssertionError("missing approval must not be mutated")
+
+    async def resume_spy(operation_id):
+        resume_calls.append(operation_id)
+        raise AssertionError("missing approval must not resume an operation")
+
+    monkeypatch.setattr(runtime, "list_monitor_approvals", empty_inbox)
+    monkeypatch.setattr(runtime, "approve_monitor_approval", approve_spy)
+    monkeypatch.setattr(runtime, "resume_operation", resume_spy)
+    operation = await _monitor_control_operation(runtime, "empty-approval-inbox")
+    read_task, read_evidence = await _execute_monitor_task(
+        runtime,
+        operation,
+        capability_id="db.monitor.read",
+        task_input={"read_kind": "approvals", "pending_only": True},
+    )
+    dependency = _approval_state_dependency(
+        read_task,
+        read_evidence,
+        operation_id=operation.id,
+    )
+
+    _, resolution = await _execute_monitor_task(
+        runtime,
+        operation,
+        capability_id="db.monitor.resolve_approval",
+        task_input={"approval_action": "approve"},
+        dependencies=(dependency,),
+    )
+
+    assert resolution.payload == {
+        "status": "not_found",
+        "approval_action": "approve",
+        "matched_approvals": [],
+        "matched_approval_count": 0,
+        "included_matched_approval_count": 0,
+        "matched_approvals_truncated": False,
+    }
+    assert mutations == []
+    assert resume_calls == []
+
+
+async def test_ungrounded_monitor_approval_resolution_mutates_exactly_one_inbox_candidate(
+    monkeypatch,
+):
+    runtime = DbRuntime(runtime_id="monitor-approval-single-inbox-candidate")
+    inbox_calls = []
+    mutations = []
+    resume_calls = []
+    candidate = {
+        "approval_id": "approval-1",
+        "operation_id": "target-operation",
+        "status": "pending",
+        "requested_by_policy_id": "monitor-policy",
+        "context": {"monitor_id": "pending_orders"},
+    }
+
+    async def list_monitor_approvals_spy(**kwargs):
+        inbox_calls.append(kwargs)
+        return (candidate,)
+
+    async def approve_spy(approval_id):
+        mutations.append(approval_id)
+        return ApprovalRequest(
+            approval_id=approval_id,
+            operation_id="target-operation",
+            reason="Approve monitor update.",
+            proposed_action={"approval": "human"},
+            risk=RiskLevel.MEDIUM,
+            requested_by_policy_id="monitor.policy",
+            status=ApprovalStatus.APPROVED,
+        )
+
+    async def resume_spy(operation_id):
+        resume_calls.append(operation_id)
+        raise AssertionError("approval resolution must not resume an operation")
+
+    monkeypatch.setattr(runtime, "list_monitor_approvals", list_monitor_approvals_spy)
+    monkeypatch.setattr(runtime, "approve_monitor_approval", approve_spy)
+    monkeypatch.setattr(runtime, "resume_operation", resume_spy)
+    operation = await _monitor_control_operation(runtime, "single-approval-candidate")
+    read_task, read_evidence = await _execute_monitor_task(
+        runtime,
+        operation,
+        capability_id="db.monitor.read",
+        task_input={
+            "read_kind": "approvals",
+            "monitor_id": "pending_orders",
+            "pending_only": True,
+        },
+    )
+    dependency = _approval_state_dependency(
+        read_task,
+        read_evidence,
+        operation_id=operation.id,
+    )
+
+    _, resolution = await _execute_monitor_task(
+        runtime,
+        operation,
+        capability_id="db.monitor.resolve_approval",
+        task_input={
+            "approval_action": "approve",
+            "monitor_id": "pending_orders",
+        },
+        dependencies=(dependency,),
+    )
+
+    assert inbox_calls == [
+        {
+            "monitor_id": "pending_orders",
+            "monitor_run_id": None,
+            "pending_only": True,
+        }
+    ]
+    assert mutations == ["approval-1"]
+    assert resume_calls == []
+    assert resolution.payload["status"] == "resolved"
+    assert resolution.payload["approval_id"] == "approval-1"
+    assert resolution.payload["approval_status"] == "approved"
+    assert resolution.payload["operation_id"] == "target-operation"
+
+
+async def test_ungrounded_monitor_approval_resolution_requires_inbox_evidence(
+    monkeypatch,
+):
+    runtime = DbRuntime(runtime_id="monitor-approval-read-required")
+
+    async def unexpected_inbox_read(**kwargs):
+        raise AssertionError("resolve executor must not bypass db.monitor.read")
+
+    monkeypatch.setattr(runtime, "list_monitor_approvals", unexpected_inbox_read)
+    operation = await _monitor_control_operation(runtime, "approval-read-required")
+
+    _, resolution = await _execute_monitor_task(
+        runtime,
+        operation,
+        capability_id="db.monitor.resolve_approval",
+        task_input={"approval_action": "approve"},
+    )
+
+    assert resolution.payload["status"] == "inbox_required"
+    assert resolution.payload["matched_approval_count"] == 0
+
+
+@pytest.mark.parametrize(
+    (
+        "requested_id",
+        "approval_action",
+        "expected_status",
+        "expected_mutations",
+        "expected_approval_status",
+    ),
+    (
+        (
+            "approval-1",
+            "approve",
+            "resolved",
+            [("approve", "approval-1")],
+            "approved",
+        ),
+        (
+            "approval-1",
+            "reject",
+            "resolved",
+            [("reject", "approval-1")],
+            "rejected",
+        ),
+        (
+            "approval-1",
+            "cancel",
+            "resolved",
+            [("cancel", "approval-1")],
+            "cancelled",
+        ),
+        ("approval", "approve", "not_found", [], None),
+        ("Approval-1", "approve", "not_found", [], None),
+        ("approval-1 ", "approve", "not_found", [], None),
+    ),
+)
+async def test_grounded_monitor_approval_id_uses_exact_equality_and_action_channel(
+    monkeypatch,
+    requested_id,
+    approval_action,
+    expected_status,
+    expected_mutations,
+    expected_approval_status,
+):
+    runtime = DbRuntime(
+        runtime_id=f"monitor-approval-exact-{approval_action}-{expected_status}"
+    )
+    mutations = []
+    resume_calls = []
+    candidate = {
+        "approval_id": "approval-1",
+        "operation_id": "target-operation",
+        "status": "pending",
+        "requested_by_policy_id": "monitor-policy",
+        "context": {"monitor_id": "pending_orders"},
+    }
+
+    async def list_monitor_approvals_spy(**kwargs):
+        assert kwargs == {"monitor_id": "pending_orders", "pending_only": True}
+        return (candidate,)
+
+    async def mutation_spy(approval_id, *, action, status):
+        mutations.append((action, approval_id))
+        return ApprovalRequest(
+            approval_id=approval_id,
+            operation_id="target-operation",
+            reason="Approve monitor update.",
+            proposed_action={"approval": "human"},
+            risk=RiskLevel.MEDIUM,
+            requested_by_policy_id="monitor.policy",
+            status=status,
+        )
+
+    async def approve_spy(approval_id):
+        return await mutation_spy(
+            approval_id,
+            action="approve",
+            status=ApprovalStatus.APPROVED,
+        )
+
+    async def reject_spy(approval_id):
+        return await mutation_spy(
+            approval_id,
+            action="reject",
+            status=ApprovalStatus.REJECTED,
+        )
+
+    async def cancel_spy(approval_id):
+        return await mutation_spy(
+            approval_id,
+            action="cancel",
+            status=ApprovalStatus.CANCELLED,
+        )
+
+    async def resume_spy(operation_id):
+        resume_calls.append(operation_id)
+        raise AssertionError("approval resolution must not resume an operation")
+
+    monkeypatch.setattr(runtime, "list_monitor_approvals", list_monitor_approvals_spy)
+    monkeypatch.setattr(runtime, "approve_monitor_approval", approve_spy)
+    monkeypatch.setattr(runtime, "reject_monitor_approval", reject_spy)
+    monkeypatch.setattr(runtime, "cancel_monitor_approval", cancel_spy)
+    monkeypatch.setattr(runtime, "resume_operation", resume_spy)
+    operation = await _monitor_control_operation(
+        runtime,
+        f"exact-approval-{requested_id}",
+    )
+
+    _, resolution = await _execute_monitor_task(
+        runtime,
+        operation,
+        capability_id="db.monitor.resolve_approval",
+        task_input={
+            "approval_action": approval_action,
+            "approval_id": requested_id,
+            "monitor_id": "pending_orders",
+        },
+    )
+
+    assert resolution.payload["status"] == expected_status
+    assert resolution.payload["approval_id"] == requested_id
+    assert mutations == expected_mutations
+    assert resume_calls == []
+    if expected_status == "resolved":
+        assert resolution.payload["approval_id"] == "approval-1"
+        assert resolution.payload["approval_status"] == expected_approval_status
+        assert resolution.payload["operation_id"] == "target-operation"
+
+
 def _lifecycle_decision(monitor_ref, *, action):
     return DbPlannerDecision(
         status=DbPlannerDecisionStatus.CONTINUE,
@@ -543,6 +959,61 @@ def _lifecycle_decision(monitor_ref, *, action):
                 depends_on=(f"plan_{action}",),
             ),
         ),
+    )
+
+
+async def _monitor_control_operation(runtime, operation_id):
+    await runtime.setup()
+    return await runtime.kernel.create_operation(
+        operation_id=operation_id,
+        operation_type="monitor.approval",
+        request={"kind": "monitor.approval"},
+        required_evidence=frozenset(),
+        metadata={
+            "runtime_id": runtime.runtime_id,
+            "runtime_kind": runtime.runtime_kind,
+        },
+        evaluate_governance=False,
+    )
+
+
+async def _execute_monitor_task(
+    runtime,
+    operation,
+    *,
+    capability_id,
+    task_input,
+    dependencies=(),
+):
+    plan = await runtime.plan_task_specs(
+        operation,
+        (
+            DbTaskSpec(
+                capability_id=capability_id,
+                owner="db_runtime",
+                input=task_input,
+                reason=f"test:{capability_id}",
+                dependencies=dependencies,
+            ),
+        ),
+    )
+    task = plan.tasks[0]
+    evidence = await runtime.execute_task(task, operation)
+    assert len(evidence) == 1
+    return task, evidence[0]
+
+
+def _approval_state_dependency(read_task, read_evidence, *, operation_id):
+    return TaskDependency(
+        kind="evidence",
+        evidence_kind="monitor.approval_state",
+        evidence_id=read_evidence.id,
+        evidence_owner=read_evidence.owner,
+        producer_task_id=read_task.id,
+        producer_capability_id=read_task.capability_id,
+        producer_executor_id=read_task.executor_id,
+        evidence_accepted=True,
+        operation_id=operation_id,
     )
 
 

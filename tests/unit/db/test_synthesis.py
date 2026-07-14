@@ -11,6 +11,8 @@ from daita.db.synthesis import (
     DbAnswerSynthesisPayload,
     DbSynthesizer,
     _apply_schema_db_memory_annotation,
+    _monitor_answer,
+    _monitor_answer_from_evidence,
     build_synthesis_context,
     deterministic_synthesis_payload,
 )
@@ -64,6 +66,85 @@ def _query_result(
         accepted=True,
         task_id="task-2",
         payload=payload,
+    )
+
+
+def test_monitor_synthesis_prefers_resolution_over_prior_inbox_state():
+    answer = _monitor_answer(
+        (
+            Evidence(
+                kind="monitor.approval_state",
+                payload={
+                    "approvals": [
+                        {
+                            "approval_id": "approval-1",
+                            "status": "pending",
+                            "monitor_id": "pending_orders",
+                        }
+                    ]
+                },
+            ),
+            Evidence(
+                kind="monitor.approval_resolution",
+                payload={
+                    "status": "resolved",
+                    "approval_action": "approve",
+                    "approval_id": "approval-1",
+                    "approval_status": "approved",
+                },
+            ),
+        )
+    )
+
+    assert answer == "Approved monitor approval approval-1; approval is approved."
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        (
+            "inbox_required",
+            "Read the pending monitor approval inbox before resolving an approval.",
+        ),
+        (
+            "inbox_incomplete",
+            "The monitor approval inbox result was incomplete; no approval was changed.",
+        ),
+        ("unexpected", "The monitor approval was not changed."),
+    ),
+)
+def test_monitor_synthesis_does_not_report_unresolved_approval_as_success(
+    status,
+    expected,
+):
+    answer = _monitor_answer_from_evidence(
+        Evidence(
+            kind="monitor.approval_resolution",
+            payload={"status": status, "approval_action": "approve"},
+        )
+    )
+
+    assert answer == expected
+
+
+def test_monitor_approval_state_synthesis_uses_bounded_monitor_id():
+    answer = _monitor_answer_from_evidence(
+        Evidence(
+            kind="monitor.approval_state",
+            payload={
+                "approvals": [
+                    {
+                        "approval_id": "approval-1",
+                        "status": "pending",
+                        "monitor_id": "pending_orders",
+                    }
+                ]
+            },
+        )
+    )
+
+    assert (
+        answer == "Pending monitor approvals:\n- approval-1: pending for pending_orders"
     )
 
 

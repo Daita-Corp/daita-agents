@@ -24,7 +24,6 @@ from .utils import (
     _string_list,
 )
 
-
 _CATALOG_CONTEXT_ASSET_LIMIT = 8
 _CATALOG_CONTEXT_COLUMN_LIMIT = 20
 _CATALOG_CONTEXT_EVIDENCE_LIMIT = 8
@@ -748,16 +747,32 @@ def _monitor_approval_state_summary(payload: Mapping[str, Any]) -> dict[str, Any
     approvals.sort(
         key=lambda item: (
             str(item.get("approval_id") or "").casefold(),
+            str(item.get("approval_id") or ""),
             str(item.get("target_operation_id") or "").casefold(),
+            str(item.get("target_operation_id") or ""),
         )
     )
     included = approvals[:_MONITOR_SUMMARY_ITEM_LIMIT]
+    approval_count = len(raw_approvals)
+    reported_approval_count = payload.get("approval_count")
+    if (
+        isinstance(reported_approval_count, int)
+        and not isinstance(reported_approval_count, bool)
+        and reported_approval_count >= approval_count
+    ):
+        approval_count = reported_approval_count
     result: dict[str, Any] = {
         "approvals": included,
-        "approval_count": len(raw_approvals),
+        "approval_count": approval_count,
         "included_approval_count": len(included),
-        "approvals_truncated": len(raw_approvals) > len(included),
+        "approvals_truncated": payload.get("approvals_truncated") is True
+        or approval_count > len(included),
     }
+    read_kind = _safe_optional_string(payload.get("read_kind"))
+    if read_kind == "approvals":
+        result["read_kind"] = read_kind
+    if isinstance(payload.get("pending_only"), bool):
+        result["pending_only"] = payload["pending_only"]
     _set_bounded_string(
         result,
         "monitor_id",
@@ -770,35 +785,93 @@ def _monitor_approval_state_summary(payload: Mapping[str, Any]) -> dict[str, Any
 def _monitor_approval_resolution_summary(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
+    bounded = _bounded_monitor_approval_resolution_payload(payload)
+    result = {
+        key: value
+        for key, value in bounded.items()
+        if key not in {"status", "operation_id", "truncated_fields"}
+    }
+    if "status" in bounded:
+        result["resolution_status"] = bounded["status"]
+    if "operation_id" in bounded:
+        result["target_operation_id"] = bounded["operation_id"]
+    truncated_fields = bounded.get("truncated_fields")
+    if isinstance(truncated_fields, list):
+        result["truncated_fields"] = [
+            {
+                "status": "resolution_status",
+                "operation_id": "target_operation_id",
+            }.get(field, field)
+            for field in truncated_fields
+        ]
+    return result
+
+
+def _bounded_monitor_approval_resolution_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for source_key, target_key, max_length in (
-        ("status", "resolution_status", _SUMMARY_STRING_LIMIT),
+        ("status", "status", _SUMMARY_STRING_LIMIT),
         ("approval_id", "approval_id", _SUMMARY_STRING_LIMIT),
         ("approval_status", "approval_status", _SUMMARY_STRING_LIMIT),
-        ("operation_id", "target_operation_id", _SUMMARY_STRING_LIMIT),
+        ("operation_id", "operation_id", _SUMMARY_STRING_LIMIT),
     ):
-        _set_bounded_string(
+        value = payload.get(source_key)
+        if source_key == "status" and value is None:
+            value = payload.get("resolution_status")
+        if source_key == "operation_id" and value is None:
+            value = payload.get("target_operation_id")
+        setter = (
+            _set_bounded_exact_string
+            if source_key == "approval_id"
+            else _set_bounded_string
+        )
+        setter(
             result,
             target_key,
-            payload.get(source_key),
+            value,
             max_length=max_length,
         )
+    _set_bounded_string(
+        result,
+        "approval_action",
+        payload.get("approval_action"),
+    )
+    _set_bounded_string(
+        result,
+        "monitor_id",
+        payload.get("monitor_id"),
+        max_length=MAX_MONITOR_ID_LENGTH,
+    )
     raw_approvals = _safe_iterable(payload.get("matched_approvals"))
     approvals = [_safe_approval_summary(item) for item in raw_approvals]
     approvals = [item for item in approvals if item]
     approvals.sort(
         key=lambda item: (
             str(item.get("approval_id") or "").casefold(),
+            str(item.get("approval_id") or ""),
             str(item.get("target_operation_id") or "").casefold(),
+            str(item.get("target_operation_id") or ""),
         )
     )
     included = approvals[:_MONITOR_SUMMARY_ITEM_LIMIT]
+    matched_approval_count = len(raw_approvals)
+    reported_matched_count = payload.get("matched_approval_count")
+    if (
+        isinstance(reported_matched_count, int)
+        and not isinstance(reported_matched_count, bool)
+        and reported_matched_count >= matched_approval_count
+    ):
+        matched_approval_count = reported_matched_count
     result.update(
         {
             "matched_approvals": included,
-            "matched_approval_count": len(raw_approvals),
+            "matched_approval_count": matched_approval_count,
             "included_matched_approval_count": len(included),
-            "matched_approvals_truncated": len(raw_approvals) > len(included),
+            "matched_approvals_truncated": payload.get("matched_approvals_truncated")
+            is True
+            or matched_approval_count > len(included),
         }
     )
     return result
@@ -995,7 +1068,12 @@ def _safe_approval_summary(value: Any) -> dict[str, Any]:
         ),
         ("status", value.get("status"), _SUMMARY_STRING_LIMIT),
     ):
-        _set_bounded_string(
+        setter = (
+            _set_bounded_exact_string
+            if target_key == "approval_id"
+            else _set_bounded_string
+        )
+        setter(
             result,
             target_key,
             raw_value,
@@ -1072,6 +1150,22 @@ def _set_bounded_string(
         return
     result[key] = text
     if truncated:
+        fields = result.setdefault("truncated_fields", [])
+        if key not in fields:
+            fields.append(key)
+
+
+def _set_bounded_exact_string(
+    result: dict[str, Any],
+    key: str,
+    value: Any,
+    *,
+    max_length: int = _SUMMARY_STRING_LIMIT,
+) -> None:
+    if not isinstance(value, str) or value == "":
+        return
+    result[key] = value[:max_length]
+    if len(value) > max_length:
         fields = result.setdefault("truncated_fields", [])
         if key not in fields:
             fields.append(key)

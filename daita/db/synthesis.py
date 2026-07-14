@@ -1073,8 +1073,8 @@ def _monitor_answer(evidence: tuple[Evidence, ...]) -> str:
         "monitor.listing",
         "monitor.inspection",
         "monitor.run_summary",
-        "monitor.approval_state",
         "monitor.approval_resolution",
+        "monitor.approval_state",
         "monitor.proposal",
     ):
         item = next(
@@ -1131,7 +1131,11 @@ def _monitor_answer_from_evidence(evidence: Evidence) -> str:
         lines = ["Pending monitor approvals:"]
         for approval in approvals:
             context = dict(approval.get("context") or {})
-            monitor_id = context.get("monitor_id") or payload.get("monitor_id")
+            monitor_id = (
+                approval.get("monitor_id")
+                or context.get("monitor_id")
+                or payload.get("monitor_id")
+            )
             lines.append(
                 f"- {approval.get('approval_id')}: {approval.get('status')}"
                 + (f" for {monitor_id}" if monitor_id else "")
@@ -1143,6 +1147,14 @@ def _monitor_answer_from_evidence(evidence: Evidence) -> str:
             return "No matching pending monitor approval was found."
         if status == "ambiguous":
             return "Multiple pending monitor approvals matched; specify an approval id."
+        if status == "inbox_required":
+            return (
+                "Read the pending monitor approval inbox before resolving an approval."
+            )
+        if status == "inbox_incomplete":
+            return "The monitor approval inbox result was incomplete; no approval was changed."
+        if status != "resolved":
+            return "The monitor approval was not changed."
         action = str(payload.get("approval_action") or "approve").lower()
         verb = {
             "approve": "Approved",
