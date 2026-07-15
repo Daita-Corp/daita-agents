@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from .postgres_scale_fixtures import (
@@ -15,8 +17,10 @@ from .scale_runner import (
     artifact_output_dir,
     assert_latency_gates,
     live_llm_required,
+    measured_agent_operation_factory,
     postgres_live_required,
     run_scale_benchmark,
+    write_artifact,
 )
 
 pytestmark = [
@@ -40,19 +44,28 @@ async def test_postgres_large_schema_table_selection_load(tmp_path):
                 scenario="table-selection",
                 extra={"table_count": table_count, "row_count": row_count},
             ),
-            operation_factory=lambda _index: harness.agent.run_detailed(
-                "How many operational events are open and high severity?"
+            operation_factory=measured_agent_operation_factory(
+                harness.agent,
+                "How many operational events are open and high severity?",
+                measurement=_large_measurement(
+                    version, table_count, row_count, state="cold_mixed"
+                ),
             ),
             output_dir=artifact_output_dir(tmp_path, "postgres-large-schema-load"),
             environment={
                 "postgres_version": version,
-                "model": "openai",
+                "provider": "openai",
+                "model": os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+                "model_parameters": {"temperature": 0},
                 "dataset": "large_operational_schema",
+                "database_type": "postgresql",
+                "fixture_revision": _large_fixture_revision(table_count, row_count),
             },
         )
         assert_latency_gates(artifact, success_rate=0.99, p95_ms=5000)
         _assert_no_decoy_sql(artifact)
         _assert_sql_validation_precedes_execution(artifact)
+        _persist_asserted_correctness(artifact, tmp_path)
     finally:
         await harness.stop()
 
@@ -70,14 +83,22 @@ async def test_postgres_large_schema_join_path_load(tmp_path):
                 scenario="join-path",
                 extra={"table_count": table_count, "row_count": row_count},
             ),
-            operation_factory=lambda _index: harness.agent.run_detailed(
-                "Which accounts have open high severity incidents?"
+            operation_factory=measured_agent_operation_factory(
+                harness.agent,
+                "Which accounts have open high severity incidents?",
+                measurement=_large_measurement(
+                    version, table_count, row_count, state="cold_mixed"
+                ),
             ),
             output_dir=artifact_output_dir(tmp_path, "postgres-large-schema-load"),
             environment={
                 "postgres_version": version,
-                "model": "openai",
+                "provider": "openai",
+                "model": os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+                "model_parameters": {"temperature": 0},
                 "dataset": "large_operational_schema",
+                "database_type": "postgresql",
+                "fixture_revision": _large_fixture_revision(table_count, row_count),
             },
         )
         assert_latency_gates(artifact, success_rate=0.99, p95_ms=10000)
@@ -87,6 +108,7 @@ async def test_postgres_large_schema_join_path_load(tmp_path):
             for operation in artifact["operations"]
             if operation["success"]
         ), artifact["summary"]["capability_sequences"]
+        _persist_asserted_correctness(artifact, tmp_path)
     finally:
         await harness.stop()
 
@@ -104,19 +126,28 @@ async def test_postgres_large_table_query_latency_load(tmp_path):
                 scenario="indexed-large-table-read",
                 extra={"table_count": table_count, "row_count": row_count},
             ),
-            operation_factory=lambda _index: harness.agent.run_detailed(
-                "Count operational events where status is open and severity is high."
+            operation_factory=measured_agent_operation_factory(
+                harness.agent,
+                "Count operational events where status is open and severity is high.",
+                measurement=_large_measurement(
+                    version, table_count, row_count, state="cold_mixed"
+                ),
             ),
             output_dir=artifact_output_dir(tmp_path, "postgres-large-schema-load"),
             environment={
                 "postgres_version": version,
-                "model": "openai",
+                "provider": "openai",
+                "model": os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+                "model_parameters": {"temperature": 0},
                 "dataset": "large_operational_schema",
+                "database_type": "postgresql",
+                "fixture_revision": _large_fixture_revision(table_count, row_count),
             },
         )
         assert_latency_gates(artifact, success_rate=0.99, p95_ms=10000)
         _assert_no_decoy_sql(artifact)
         _assert_sql_validation_precedes_execution(artifact)
+        _persist_asserted_correctness(artifact, tmp_path)
     finally:
         await harness.stop()
 
@@ -131,6 +162,61 @@ async def _large_harness():
         llm=True,
     )
     return harness, await postgres_version(harness.url), table_count, row_count
+
+
+def _large_measurement(
+    version: str,
+    table_count: int,
+    row_count: int,
+    *,
+    state: str,
+) -> dict:
+    return {
+        "control_label": "baseline",
+        "provider": "openai",
+        "model": os.environ.get("OPENAI_TEST_MODEL", "gpt-5.4-mini"),
+        "model_parameters": {"temperature": 0},
+        "database": {"type": "postgresql", "version": version},
+        "fixture_revision": _large_fixture_revision(table_count, row_count),
+        "state": state,
+        "concurrency": 3,
+        "correctness": {
+            "answer": {
+                "passed": None,
+                "evaluation_source": "existing scale benchmark assertions",
+            },
+            "sql": {
+                "passed": None,
+                "evaluation_source": "existing scale benchmark assertions",
+            },
+        },
+    }
+
+
+def _large_fixture_revision(table_count: int, row_count: int) -> str:
+    return f"large_operational_schema:tables={table_count}:rows={row_count}"
+
+
+def _persist_asserted_correctness(artifact: dict, tmp_path) -> None:
+    for operation in artifact["operations"]:
+        operation["correctness"] = {
+            "answer": {
+                "passed": bool(operation["success"]),
+                "evaluation_source": "existing scale benchmark assertions",
+            },
+            "sql": {
+                "passed": True,
+                "evaluation_source": "existing scale benchmark assertions",
+            },
+        }
+    suite = artifact["suite"]
+    scenario = artifact["parameters"]["scenario"]
+    concurrency = artifact["parameters"]["concurrency"]
+    write_artifact(
+        artifact,
+        artifact_output_dir(tmp_path, suite)
+        / f"{suite}-{scenario}-c{concurrency}.json",
+    )
 
 
 def _assert_no_decoy_sql(artifact: dict) -> None:

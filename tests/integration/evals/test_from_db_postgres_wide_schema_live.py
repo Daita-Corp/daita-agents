@@ -6,6 +6,7 @@ import pytest
 
 from daita.evals import EvalSuite, EvalSuiteConfig
 from daita.evals.reporters import render_pretty
+from tests.performance.from_db.scale_runner import apply_eval_report_correctness
 
 from .from_db_postgres_live_helpers import (
     output_dir,
@@ -157,6 +158,9 @@ async def test_eval_live_from_db_postgres_wide_schema_benchmark(tmp_path):
 
     report = await EvalSuite(config).run(output_dir=output_dir(tmp_path, config.name))
     show_report(report)
+    captured = apply_eval_report_correctness(report)
 
     assert report.status == "passed", render_pretty(report)
     assert report.summary.cases_total == 4
+    if captured:
+        assert captured == report.summary.runs_total
