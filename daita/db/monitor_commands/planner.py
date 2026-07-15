@@ -1106,7 +1106,7 @@ def _cursor_strategy_from_schema(
     columns = [
         column for column in table.get("columns") or [] if isinstance(column, dict)
     ]
-    timestamp = _timestamp_cursor_column(columns)
+    timestamp = _timestamp_cursor_column(columns, table=table, schema=schema)
     if timestamp is not None:
         field = column_name(timestamp)
         return {
@@ -1118,7 +1118,7 @@ def _cursor_strategy_from_schema(
             "source": "schema_column",
             "column_type": column_type_metadata(table, timestamp, schema),
         }
-    primary_key = _auto_increment_primary_key(columns)
+    primary_key = _auto_increment_primary_key(columns, table=table, schema=schema)
     if primary_key is not None:
         field = column_name(primary_key)
         return {
@@ -1133,7 +1133,12 @@ def _cursor_strategy_from_schema(
     return None
 
 
-def _timestamp_cursor_column(columns: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _timestamp_cursor_column(
+    columns: list[dict[str, Any]],
+    *,
+    table: dict[str, Any],
+    schema: dict[str, Any],
+) -> dict[str, Any] | None:
     preferred_names = (
         "created_at",
         "inserted_at",
@@ -1145,24 +1150,37 @@ def _timestamp_cursor_column(columns: list[dict[str, Any]]) -> dict[str, Any] | 
     by_name = {column_name(column).lower(): column for column in columns}
     for name in preferred_names:
         column = by_name.get(name)
-        if column is not None and _looks_timestamp_type(column.get("data_type")):
+        if column is not None and _column_has_timestamp_semantics(
+            column,
+            table=table,
+            schema=schema,
+        ):
             return column
     for column in columns:
         name = column_name(column).lower()
-        if ("created" in name or "inserted" in name) and _looks_timestamp_type(
-            column.get("data_type")
+        if ("created" in name or "inserted" in name) and (
+            _column_has_timestamp_semantics(
+                column,
+                table=table,
+                schema=schema,
+            )
         ):
             return column
     return None
 
 
-def _auto_increment_primary_key(columns: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _auto_increment_primary_key(
+    columns: list[dict[str, Any]],
+    *,
+    table: dict[str, Any],
+    schema: dict[str, Any],
+) -> dict[str, Any] | None:
     for column in columns:
         if not column.get("is_primary_key"):
             continue
         if not is_numeric_type(str(column.get("data_type") or "")):
             continue
-        if _looks_auto_incrementing(column):
+        if _looks_auto_incrementing(column, table=table, schema=schema):
             return column
     return None
 
@@ -1172,7 +1190,39 @@ def _looks_timestamp_type(type_name: Any) -> bool:
     return any(token in lowered for token in ("timestamp", "datetime", "date"))
 
 
-def _looks_auto_incrementing(column: dict[str, Any]) -> bool:
+def _looks_auto_incrementing(
+    column: dict[str, Any],
+    *,
+    table: dict[str, Any],
+    schema: dict[str, Any],
+) -> bool:
+    identity_proof = column.get("identity_proof")
+    if (
+        column.get("is_identity") is True
+        and column.get("is_generated") is True
+        and column.get("is_monotonic") is True
+        and column.get("is_autoincrement") is True
+        and isinstance(identity_proof, Mapping)
+        and identity_proof.get("generated") is True
+        and identity_proof.get("monotonic") is True
+        and identity_proof.get("autoincrement") is True
+        and _catalog_trait_proof_is_bound(
+            column,
+            identity_proof,
+            table=table,
+            schema=schema,
+            source_kinds={"sqlite_schema", "declared_identity"},
+        )
+    ):
+        return True
+    dialect = str(
+        schema.get("sql_dialect")
+        or schema.get("database_dialect")
+        or schema.get("database_type")
+        or ""
+    ).lower()
+    if dialect == "sqlite":
+        return False
     data_type = str(column.get("data_type") or "").lower()
     default = str(
         column.get("default_value")
@@ -1193,6 +1243,84 @@ def _looks_auto_incrementing(column: dict[str, Any]) -> bool:
             "auto_increment",
             "autoincrement",
         )
+    )
+
+
+def _column_has_timestamp_semantics(
+    column: dict[str, Any],
+    *,
+    table: dict[str, Any],
+    schema: dict[str, Any],
+) -> bool:
+    physical_type = column.get("physical_type") or column.get("data_type")
+    if _looks_timestamp_type(physical_type):
+        return True
+    logical_type = str(column.get("logical_type") or "").lower()
+    proof = column.get("logical_type_proof")
+    if logical_type not in {"timestamp", "date"} or not isinstance(proof, Mapping):
+        return False
+    if proof.get("source_kind") != "schema.column_value_profile":
+        return False
+    if proof.get("representation") not in {"iso8601_utc_second"}:
+        return False
+    if (
+        proof.get("all_values_matched") is not True
+        or proof.get("lexicographically_sortable") is not True
+    ):
+        return False
+    try:
+        confidence = float(proof.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return confidence >= 0.9 and _catalog_trait_proof_is_bound(
+        column,
+        proof,
+        table=table,
+        schema=schema,
+        source_kinds={"schema.column_value_profile"},
+    )
+
+
+def _catalog_trait_proof_is_bound(
+    column: Mapping[str, Any],
+    proof: Mapping[str, Any],
+    *,
+    table: Mapping[str, Any],
+    schema: Mapping[str, Any],
+    source_kinds: set[str],
+) -> bool:
+    catalog_evidence = column.get("catalog_evidence")
+    if not isinstance(catalog_evidence, Mapping):
+        return False
+    if (
+        catalog_evidence.get("owner") != "catalog"
+        or catalog_evidence.get("kind") != "schema.asset_profile"
+        or catalog_evidence.get("accepted") is not True
+        or proof.get("owner") != "catalog"
+        or str(proof.get("source_kind") or "") not in source_kinds
+    ):
+        return False
+    table_name_value = str(table.get("name") or table.get("table_name") or "")
+    column_name_value = column_name(column)
+    metadata = table.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    asset_ref = str(metadata.get("catalog_asset_ref") or table_name_value)
+    store_id = str(metadata.get("catalog_store_id") or "")
+    dialect = str(
+        schema.get("sql_dialect")
+        or schema.get("database_dialect")
+        or schema.get("database_type")
+        or ""
+    )
+    return (
+        bool(catalog_evidence.get("id"))
+        and str(catalog_evidence.get("asset_ref") or "") == asset_ref
+        and str(catalog_evidence.get("column") or "") == column_name_value
+        and str(catalog_evidence.get("store_id") or "") == store_id
+        and str(proof.get("asset_ref") or "") == asset_ref
+        and str(proof.get("column") or "") == column_name_value
+        and str(proof.get("store_id") or "") == store_id
+        and str(proof.get("database_dialect") or "") == dialect
     )
 
 

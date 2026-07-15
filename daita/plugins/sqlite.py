@@ -5,9 +5,12 @@ File-based (or in-memory) async SQLite access via aiosqlite.
 """
 
 import asyncio
+from datetime import datetime
 import logging
+import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from daita.core.db_type_metadata import native_type_from_db_type
 from .base import PluginContext
 from .base_db import BaseDatabasePlugin
 from daita.runtime import EvidenceWrappingExecutor
@@ -229,9 +232,21 @@ class SQLitePlugin(BaseDatabasePlugin):
                         {
                             "name": column["column_name"],
                             "data_type": column["data_type"],
+                            "physical_type": column["physical_type"],
+                            "native_type": column["native_type"],
+                            "database_dialect": "sqlite",
                             "is_nullable": column["is_nullable"],
                             "default_value": column["default_value"],
                             "is_primary_key": column["is_primary_key"],
+                            "is_identity": column["is_identity"],
+                            "is_generated": column["is_generated"],
+                            "is_autoincrement": column["is_autoincrement"],
+                            "is_monotonic": column["is_monotonic"],
+                            **(
+                                {"identity_proof": column["identity_proof"]}
+                                if column.get("identity_proof")
+                                else {}
+                            ),
                         }
                         for column in columns
                     ],
@@ -326,10 +341,11 @@ class SQLitePlugin(BaseDatabasePlugin):
         }
         include_sample_values = bool(self.include_sample_values)
         redact_pii_columns = bool(self.redact_pii_columns)
+        profile_kind = str(args.get("profile_kind") or "categorical_values").strip()
         profile: Dict[str, Any] = {
             "table": table,
             "column": column,
-            "profile_kind": "categorical_values",
+            "profile_kind": profile_kind,
             "profile_status": "profiled",
             "max_values": max_values,
             "sampled": False,
@@ -418,6 +434,15 @@ class SQLitePlugin(BaseDatabasePlugin):
                     "include_source_revision": True,
                 },
             }
+        if profile_kind == "logical_type_validation":
+            return await self._logical_type_validation_profile(
+                profile,
+                table=table,
+                column=column,
+                max_values=max_values,
+                max_value_length=max_value_length,
+                timeout_seconds=timeout_seconds,
+            )
 
         quoted_table = _quote_sqlite_identifier(table)
         quoted_column = _quote_sqlite_identifier(column)
@@ -492,6 +517,75 @@ class SQLitePlugin(BaseDatabasePlugin):
         ]
         profile["truncated"] = distinct_count > len(rows)
         return profile
+
+    async def _logical_type_validation_profile(
+        self,
+        profile: Dict[str, Any],
+        *,
+        table: str,
+        column: str,
+        max_values: int,
+        max_value_length: int,
+        timeout_seconds: int,
+    ) -> Dict[str, Any]:
+        """Validate a bounded sample without returning or persisting raw values."""
+        quoted_table = _quote_sqlite_identifier(table)
+        quoted_column = _quote_sqlite_identifier(column)
+        try:
+            rows = await asyncio.wait_for(
+                self.query(
+                    f"SELECT SUBSTR(CAST({quoted_column} AS TEXT), 1, ?) AS value "
+                    f"FROM {quoted_table} "
+                    f"WHERE {quoted_column} IS NOT NULL LIMIT ?",
+                    [max_value_length + 1, max_values],
+                ),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return {
+                **profile,
+                "profile_status": "skipped",
+                "skipped_reason": "profile_timeout",
+            }
+
+        values = [row.get("value") for row in rows]
+        sample_size = len(values)
+        matched = sample_size >= 2 and all(
+            _is_sortable_iso8601_utc_second(value) for value in values
+        )
+        result: Dict[str, Any] = {
+            **profile,
+            "sampled": True,
+            "truncated": sample_size >= max_values,
+            "top_values": [],
+            "sample_size": sample_size,
+            "policy": {
+                **dict(profile.get("policy") or {}),
+                "bounded_value_sample": True,
+                "sample_limit": max_values,
+                "raw_values_persisted": False,
+                "logical_type_validation": True,
+            },
+        }
+        if not matched:
+            return result
+        result.update(
+            {
+                "logical_type": "timestamp",
+                "logical_type_proof": {
+                    "method": "bounded_value_profile",
+                    "representation": "iso8601_utc_second",
+                    "sample_size": sample_size,
+                    "sample_limit": max_values,
+                    "all_values_matched": True,
+                    "lexicographically_sortable": True,
+                    "confidence": 0.95,
+                    "values_exposed": False,
+                    "source_owner": "sqlite",
+                },
+            }
+        )
+        return result
 
     async def disconnect(self) -> None:
         """Close the SQLite database connection."""
@@ -639,17 +733,15 @@ class SQLitePlugin(BaseDatabasePlugin):
         Returns:
             List of column descriptor dicts.
         """
-        rows = await self.query(f"PRAGMA table_info({table})")
-        return [
-            {
-                "column_name": row["name"],
-                "data_type": row["type"],
-                "is_nullable": "NO" if row["notnull"] else "YES",
-                "default_value": row["dflt_value"],
-                "is_primary_key": bool(row["pk"]),
-            }
-            for row in rows
-        ]
+        quoted_table = _quote_sqlite_identifier(_validate_sqlite_identifier(table))
+        rows = await self.query(f"PRAGMA table_xinfo({quoted_table})")
+        schema_rows = await self.query(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            [table],
+        )
+        create_sql = str(schema_rows[0].get("sql") or "") if schema_rows else ""
+        autoincrement_columns = _sqlite_autoincrement_columns(create_sql)
+        return [_sqlite_column_descriptor(row, autoincrement_columns) for row in rows]
 
     async def foreign_keys(self) -> List[Dict[str, Any]]:
         """Return declared SQLite foreign key relationships."""
@@ -815,8 +907,6 @@ def sqlite(**kwargs) -> SQLitePlugin:
 
 
 def _validate_sqlite_identifier(value: str) -> str:
-    import re
-
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value or ""):
         from ..core.exceptions import ValidationError
 
@@ -826,6 +916,82 @@ def _validate_sqlite_identifier(value: str) -> str:
 
 def _quote_sqlite_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
+
+
+def _sqlite_column_descriptor(
+    row: Dict[str, Any],
+    autoincrement_columns: set[str],
+) -> Dict[str, Any]:
+    name = str(row.get("name") or "")
+    physical_type = str(row.get("type") or "")
+    generated_column = int(row.get("hidden") or 0) in {2, 3}
+    is_primary_key = bool(row.get("pk"))
+    is_identity = (
+        is_primary_key
+        and physical_type.strip().upper() == "INTEGER"
+        and not generated_column
+    )
+    is_autoincrement = is_identity and name.casefold() in autoincrement_columns
+    identity_proof: Dict[str, Any] = {}
+    if is_identity:
+        identity_proof = {
+            "source_kind": "sqlite_schema",
+            "method": "sqlite_integer_primary_key",
+            "confidence": 1.0,
+            "generated": True,
+            "autoincrement": is_autoincrement,
+            "monotonic": is_autoincrement,
+            "rowid_reuse_possible": not is_autoincrement,
+        }
+    return {
+        "column_name": name,
+        "data_type": physical_type,
+        "physical_type": physical_type,
+        "native_type": native_type_from_db_type(physical_type),
+        "database_dialect": "sqlite",
+        "is_nullable": "NO" if row.get("notnull") else "YES",
+        "default_value": row.get("dflt_value"),
+        "is_primary_key": is_primary_key,
+        "is_identity": is_identity,
+        "is_generated": is_identity or generated_column,
+        "is_autoincrement": is_autoincrement,
+        "is_monotonic": is_autoincrement,
+        "identity_proof": identity_proof,
+    }
+
+
+def _sqlite_autoincrement_columns(create_sql: str) -> set[str]:
+    if not create_sql or "autoincrement" not in create_sql.lower():
+        return set()
+    columns: set[str] = set()
+    for match in re.finditer(
+        r"(?:^|[,(])\s*(?:\"([^\"]+)\"|`([^`]+)`|\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_]*))"
+        r"\s+INTEGER\b([^,]*)",
+        create_sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        definition = match.group(5) or ""
+        if re.search(r"\bPRIMARY\s+KEY\b", definition, re.IGNORECASE) and re.search(
+            r"\bAUTOINCREMENT\b", definition, re.IGNORECASE
+        ):
+            columns.add(
+                next(
+                    value for value in match.groups()[:4] if value is not None
+                ).casefold()
+            )
+    return columns
+
+
+def _is_sortable_iso8601_utc_second(value: Any) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value
+    ):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
 
 
 def _looks_sensitive_column(column: str) -> bool:

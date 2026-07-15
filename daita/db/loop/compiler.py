@@ -92,6 +92,7 @@ from .types import DbActionCompilation
 
 _MONITOR_CATALOG_CANDIDATE_LIMIT = 8
 _MONITOR_CATALOG_TEXT_LIMIT = 256
+_MONITOR_LOGICAL_PROFILE_COLUMN_LIMIT = 4
 
 
 def _bounded_monitor_catalog_text(value: Any) -> str:
@@ -192,9 +193,54 @@ def _monitor_catalog_asset_selection(
             "asset_ref": asset_ref,
             "store_id": store_ids[0],
             "evidence_ids": cited_ids,
+            "columns": [
+                dict(column)
+                for column in selected.get("columns") or ()
+                if isinstance(column, Mapping)
+            ],
         },
         None,
     )
+
+
+def _monitor_logical_profile_columns(
+    selected_catalog_asset: Mapping[str, Any],
+    state: DbLoopState,
+) -> list[str]:
+    dialect = str(
+        state.catalog_context.get("database_dialect")
+        or state.catalog_context.get("database_type")
+        or ""
+    ).lower()
+    if dialect != "sqlite":
+        return []
+    columns = []
+    for column in selected_catalog_asset.get("columns") or ():
+        if not isinstance(column, Mapping):
+            continue
+        name = str(column.get("name") or "").strip()
+        physical_type = str(
+            column.get("physical_type")
+            or column.get("data_type")
+            or column.get("type")
+            or ""
+        ).lower()
+        lowered_name = name.lower()
+        temporal_candidate = lowered_name.endswith(
+            ("_at", "_on", "_date", "_time", "_ts")
+        ) or any(
+            token in lowered_name
+            for token in ("created", "inserted", "updated", "timestamp", "datetime")
+        )
+        if (
+            name
+            and temporal_candidate
+            and any(
+                token in physical_type for token in ("text", "char", "clob", "string")
+            )
+        ):
+            columns.append(name)
+    return list(dict.fromkeys(columns))[:_MONITOR_LOGICAL_PROFILE_COLUMN_LIMIT]
 
 
 def _monitor_catalog_selection_error(
@@ -1577,8 +1623,10 @@ class DbActionCompiler:
             reason: str,
             deterministic_key: str,
             extra_dependencies: tuple[TaskDependency, ...] = (),
+            owner: str | None = "catalog",
+            expose_dependency: bool = True,
         ) -> TaskDependency | None:
-            resolved = self._resolve_capability(capability_id, owner="catalog")
+            resolved = self._resolve_capability(capability_id, owner=owner)
             error = self._capability_error(action, resolved)
             if error is not None:
                 errors.append(error)
@@ -1615,12 +1663,71 @@ class DbActionCompiler:
                 action_id=action.action_id,
                 consumer_capability_id=consumer_capability_id,
             )
-            dependencies.append(dependency)
+            if expose_dependency:
+                dependencies.append(dependency)
             return dependency
 
         if selected_catalog_asset is not None:
             asset_ref = str(selected_catalog_asset["asset_ref"])
+            asset_name = str(selected_catalog_asset["asset_name"])
             store_id = str(selected_catalog_asset["store_id"])
+            profile_columns = _monitor_logical_profile_columns(
+                selected_catalog_asset,
+                state,
+            )
+            capability_ids = {
+                str(summary.get("id") or "") for summary in state.capability_summaries
+            }
+            profile_owners = {
+                str(summary.get("owner") or "")
+                for summary in state.capability_summaries
+                if summary.get("id") == "db.column_values.profile"
+                and str(summary.get("owner") or "")
+            }
+            profile_dependencies: list[TaskDependency] = []
+            if {
+                "db.column_values.profile",
+                "catalog.column_values.register",
+            } <= capability_ids and len(profile_owners) == 1:
+                source_owner = next(iter(profile_owners))
+                for column in profile_columns:
+                    profile_dependency = add_spec(
+                        "db.column_values.profile",
+                        owner=source_owner,
+                        task_input={
+                            "table": asset_name,
+                            "column": column,
+                            "profile_kind": "logical_type_validation",
+                            "max_values": 64,
+                        },
+                        reason=("runtime_prerequisite:catalog_logical_type_profile"),
+                        deterministic_key=(
+                            f"{action.action_id}:db.column_values.profile:"
+                            f"{asset_name}.{column}:logical_type_validation"
+                        ),
+                        extra_dependencies=upstream_dependencies,
+                        expose_dependency=False,
+                    )
+                    if profile_dependency is None:
+                        continue
+                    register_dependency = add_spec(
+                        "catalog.column_values.register",
+                        task_input={
+                            "store_id": store_id,
+                            "table": asset_name,
+                            "column": column,
+                            "profile_kind": "logical_type_validation",
+                        },
+                        reason=("runtime_prerequisite:catalog_logical_type_register"),
+                        deterministic_key=(
+                            f"{action.action_id}:catalog.column_values.register:"
+                            f"{store_id}:{asset_name}.{column}:logical_type_validation"
+                        ),
+                        extra_dependencies=(profile_dependency,),
+                        expose_dependency=False,
+                    )
+                    if register_dependency is not None:
+                        profile_dependencies.append(register_dependency)
             add_spec(
                 "catalog.asset.inspect",
                 task_input={
@@ -1633,7 +1740,11 @@ class DbActionCompiler:
                 deterministic_key=(
                     f"{action.action_id}:catalog.asset.inspect:{store_id}:{asset_ref}"
                 ),
-                extra_dependencies=upstream_dependencies,
+                extra_dependencies=(
+                    tuple(profile_dependencies)
+                    if profile_dependencies
+                    else upstream_dependencies
+                ),
             )
             return specs, selected, dependencies, errors
 
@@ -1757,7 +1868,7 @@ class DbActionCompiler:
             )
             if prerequisite_errors:
                 return [], [], prerequisite_errors
-            if len(prerequisite_specs) != 1 or len(prerequisite_dependencies) != 1:
+            if len(prerequisite_dependencies) != 1:
                 return (
                     [],
                     [],

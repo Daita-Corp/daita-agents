@@ -24,6 +24,22 @@ def _dict_to_normalized_schema(
                 nullable=c.get("nullable", True),
                 is_primary_key=c.get("is_primary_key", False),
                 comment=c.get("column_comment"),
+                physical_type=c.get("physical_type") or c.get("type"),
+                native_type=c.get("native_type"),
+                database_dialect=c.get("database_dialect") or d.get("database_type"),
+                logical_type=c.get("logical_type"),
+                logical_type_proof=dict(c.get("logical_type_proof", {}) or {}),
+                is_identity=c.get("is_identity"),
+                is_generated=c.get("is_generated"),
+                is_autoincrement=c.get("is_autoincrement"),
+                is_monotonic=c.get("is_monotonic"),
+                identity_proof=dict(c.get("identity_proof", {}) or {}),
+                default_value=(
+                    c.get("default_value")
+                    if "default_value" in c
+                    else c.get("column_default")
+                ),
+                extra=c.get("extra"),
             )
             for c in t.get("columns", [])
         ]

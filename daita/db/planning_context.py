@@ -631,11 +631,24 @@ def catalog_schema_from_evidence(
     foreign_keys: list[dict[str, Any]] = []
     database_type: str | None = None
     database_name: str | None = None
+    database_dialect: str | None = None
+    structural_evidence_ids: list[str] = []
 
     for evidence in catalog_evidence:
+        if (
+            not evidence.accepted
+            or evidence.owner != "catalog"
+            or evidence.payload.get("success") is False
+        ):
+            continue
+        if evidence.id:
+            structural_evidence_ids.append(evidence.id)
         payload = dict(evidence.payload)
         database_type = database_type or _optional_string(payload.get("database_type"))
         database_name = database_name or _optional_string(payload.get("database_name"))
+        database_dialect = database_dialect or _optional_string(
+            payload.get("database_dialect") or payload.get("sql_dialect")
+        )
         schema = payload.get("schema")
         if isinstance(schema, dict):
             database_type = database_type or _optional_string(
@@ -644,20 +657,29 @@ def catalog_schema_from_evidence(
             database_name = database_name or _optional_string(
                 schema.get("database_name")
             )
-            _merge_catalog_tables(tables, schema.get("tables"))
+            database_dialect = database_dialect or _optional_string(
+                schema.get("database_dialect")
+                or schema.get("sql_dialect")
+                or schema.get("database_type")
+            )
+            _merge_catalog_tables(tables, schema.get("tables"), evidence=evidence)
             foreign_keys.extend(_foreign_keys_from_payload(schema))
         if evidence.kind == "schema.asset_profile":
-            table = _table_from_asset_profile(payload)
+            table = _table_from_asset_profile(payload, evidence=evidence)
             if table is not None:
                 _merge_table(tables, table)
             foreign_keys.extend(_foreign_keys_from_payload(payload))
         elif evidence.kind == "schema.search_result":
             _merge_catalog_tables(
-                tables, payload.get("tables") or payload.get("assets")
+                tables,
+                payload.get("tables") or payload.get("assets"),
+                evidence=evidence,
             )
         elif evidence.kind == "catalog.profile":
             _merge_catalog_tables(
-                tables, payload.get("tables") or payload.get("assets")
+                tables,
+                payload.get("tables") or payload.get("assets"),
+                evidence=evidence,
             )
             foreign_keys.extend(_foreign_keys_from_payload(payload))
 
@@ -683,14 +705,25 @@ def catalog_schema_from_evidence(
     return {
         "database_type": database_type,
         "database_name": database_name,
+        "database_dialect": database_dialect or database_type,
+        "sql_dialect": database_dialect or database_type,
         "table_count": len(tables),
         "tables": list(tables.values()),
         "foreign_keys": _dedupe_foreign_keys(foreign_keys),
-        "metadata": {"structural_source": "catalog"},
+        "metadata": {
+            "structural_source": "catalog",
+            "catalog_structural_evidence_ids": list(
+                dict.fromkeys(structural_evidence_ids)
+            ),
+        },
     }
 
 
-def _table_from_asset_profile(payload: dict[str, Any]) -> dict[str, Any] | None:
+def _table_from_asset_profile(
+    payload: dict[str, Any],
+    *,
+    evidence: Evidence | None = None,
+) -> dict[str, Any] | None:
     asset = payload.get("asset") if isinstance(payload.get("asset"), dict) else None
     table = payload.get("table") if isinstance(payload.get("table"), dict) else None
     source = table or asset
@@ -707,12 +740,31 @@ def _table_from_asset_profile(payload: dict[str, Any]) -> dict[str, Any] | None:
     if not name:
         return None
     columns = payload.get("fields") or payload.get("columns") or source.get("columns")
+    store_id = payload.get("store_id") or source.get("store_id")
     return {
         "name": name,
-        "columns": [_column_from_catalog_field(item) for item in columns or ()],
+        "columns": [
+            _column_from_catalog_field(
+                item,
+                evidence=evidence,
+                table_name=name,
+                store_id=store_id,
+            )
+            for item in columns or ()
+        ],
         "metadata": {
             **dict(source.get("metadata") or {}),
             "catalog_asset_ref": source.get("asset_ref") or name,
+            "catalog_store_id": store_id,
+            **(
+                {
+                    "catalog_evidence_id": evidence.id,
+                    "catalog_evidence_owner": evidence.owner,
+                    "catalog_evidence_kind": evidence.kind,
+                }
+                if evidence is not None
+                else {}
+            ),
         },
     }
 
@@ -720,6 +772,8 @@ def _table_from_asset_profile(payload: dict[str, Any]) -> dict[str, Any] | None:
 def _merge_catalog_tables(
     tables: dict[str, dict[str, Any]],
     raw_tables: Any,
+    *,
+    evidence: Evidence | None = None,
 ) -> None:
     if not isinstance(raw_tables, list):
         return
@@ -734,8 +788,27 @@ def _merge_catalog_tables(
         )
         table = {
             "name": name,
-            "columns": [_column_from_catalog_field(item) for item in raw_columns or ()],
-            "metadata": dict(raw.get("metadata") or {}),
+            "columns": [
+                _column_from_catalog_field(
+                    item,
+                    evidence=evidence,
+                    table_name=name,
+                    store_id=(evidence.payload.get("store_id") if evidence else None),
+                )
+                for item in raw_columns or ()
+            ],
+            "metadata": {
+                **dict(raw.get("metadata") or {}),
+                **(
+                    {
+                        "catalog_evidence_id": evidence.id,
+                        "catalog_evidence_owner": evidence.owner,
+                        "catalog_evidence_kind": evidence.kind,
+                    }
+                    if evidence is not None
+                    else {}
+                ),
+            },
         }
         _merge_table(tables, table)
 
@@ -765,30 +838,81 @@ def _merge_column(table: dict[str, Any], column: dict[str, Any]) -> None:
     if not name:
         return
     columns = table.setdefault("columns", [])
-    existing_names = {
-        str(item.get("name") or "").lower()
-        for item in columns
-        if isinstance(item, dict)
-    }
-    if name.lower() in existing_names:
-        return
-    columns.append(
-        {
-            "name": name,
-            "data_type": column.get("data_type") or column.get("type"),
-            "is_primary_key": column.get("is_primary_key"),
-        }
+    existing = next(
+        (
+            item
+            for item in columns
+            if isinstance(item, dict)
+            and str(item.get("name") or "").lower() == name.lower()
+        ),
+        None,
     )
+    normalized = _column_from_catalog_field(column)
+    if existing is None:
+        columns.append(normalized)
+        return
+    for key, value in normalized.items():
+        if key == "name" or value is None:
+            continue
+        if key in {"logical_type_proof", "identity_proof", "catalog_evidence"}:
+            if isinstance(value, dict):
+                existing[key] = {**dict(existing.get(key) or {}), **value}
+            continue
+        if key == "is_primary_key":
+            existing[key] = bool(existing.get(key)) or bool(value)
+            continue
+        existing[key] = value
 
 
-def _column_from_catalog_field(value: Any) -> dict[str, Any]:
+def _column_from_catalog_field(
+    value: Any,
+    *,
+    evidence: Evidence | None = None,
+    table_name: str | None = None,
+    store_id: Any = None,
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
-    return {
+    result = {
         "name": value.get("name"),
         "data_type": value.get("data_type") or value.get("type"),
+        "physical_type": value.get("physical_type")
+        or value.get("data_type")
+        or value.get("type"),
+        "native_type": value.get("native_type"),
+        "database_dialect": value.get("database_dialect") or value.get("dialect"),
+        "is_nullable": (
+            value.get("is_nullable")
+            if "is_nullable" in value
+            else value.get("nullable")
+        ),
         "is_primary_key": value.get("is_primary_key"),
+        "default_value": (
+            value.get("default_value")
+            if "default_value" in value
+            else value.get("column_default")
+        ),
+        "extra": value.get("extra"),
+        "logical_type": value.get("logical_type"),
+        "logical_type_proof": dict(value.get("logical_type_proof", {}) or {}),
+        "is_identity": value.get("is_identity"),
+        "is_generated": value.get("is_generated"),
+        "is_autoincrement": value.get("is_autoincrement"),
+        "is_monotonic": value.get("is_monotonic"),
+        "identity_proof": dict(value.get("identity_proof", {}) or {}),
+        "catalog_evidence": dict(value.get("catalog_evidence", {}) or {}),
     }
+    if evidence is not None:
+        result["catalog_evidence"] = {
+            "id": evidence.id,
+            "kind": evidence.kind,
+            "owner": evidence.owner,
+            "accepted": evidence.accepted,
+            "store_id": store_id,
+            "asset_ref": table_name,
+            "column": value.get("name"),
+        }
+    return result
 
 
 def _foreign_keys_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:

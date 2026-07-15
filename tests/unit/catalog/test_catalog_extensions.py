@@ -1,6 +1,7 @@
 import pytest
 
 from daita.db import DbRuntime
+from daita.db.planning_context import catalog_schema_from_evidence
 from daita.plugins import ExtensionRegistry, PluginKind
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.catalog.base_profiler import NormalizedColumn
@@ -328,6 +329,233 @@ async def test_catalog_inspect_relationship_and_profile_executors_return_evidenc
     assert relationship_evidence[0].payload["reachable"] is True
     assert profile_evidence[0].kind == "catalog.profile"
     assert profile_evidence[0].payload["table_count"] == 2
+
+
+async def test_catalog_inspection_projects_bounded_column_traits_without_raw_values():
+    catalog = CatalogPlugin(auto_persist=False)
+    await catalog.register_schema(
+        {
+            "database_type": "sqlite",
+            "database_name": "orders",
+            "tables": [
+                {
+                    "name": "orders",
+                    "columns": [
+                        {
+                            "name": "order_id",
+                            "data_type": "INTEGER",
+                            "is_primary_key": True,
+                            "is_identity": True,
+                            "is_generated": True,
+                            "is_autoincrement": True,
+                            "is_monotonic": True,
+                            "identity_proof": {
+                                "source_kind": "sqlite_schema",
+                                "method": "sqlite_integer_primary_key",
+                                "generated": True,
+                                "autoincrement": True,
+                                "monotonic": True,
+                                "confidence": 1.0,
+                            },
+                        },
+                        {
+                            "name": "created_at",
+                            "data_type": "TEXT",
+                            "is_primary_key": False,
+                        },
+                    ],
+                }
+            ],
+        },
+        store_type="sqlite",
+        store_id="store:orders",
+        persist=False,
+    )
+    await catalog.register_column_value_profiles(
+        "store:orders",
+        [
+            {
+                "table": "orders",
+                "column": "created_at",
+                "profile_kind": "logical_type_validation",
+                "profile_status": "profiled",
+                "sampled": True,
+                "top_values": [
+                    {"value": "2026-01-02T10:00:00Z"},
+                    {"value": "2026-01-03T11:00:00Z"},
+                ],
+                "logical_type": "timestamp",
+                "logical_type_proof": {
+                    "method": "bounded_value_profile",
+                    "representation": "iso8601_utc_second",
+                    "sample_size": 2,
+                    "sample_limit": 64,
+                    "all_values_matched": True,
+                    "lexicographically_sortable": True,
+                    "confidence": 0.95,
+                    "values_exposed": False,
+                },
+            }
+        ],
+        source_evidence_id="sqlite-profile-created-at",
+        persist=False,
+    )
+    registry = ExtensionRegistry()
+    registry.register(catalog)
+    operation = Operation(id="op-traits", operation_type="monitor.create")
+
+    evidence = await _executor(registry, "catalog.inspect_asset").execute(
+        Task(
+            id="task-traits",
+            operation_id=operation.id,
+            capability_id="catalog.asset.inspect",
+            executor_id="catalog.inspect_asset",
+            input={"store_id": "store:orders", "asset_ref": "orders"},
+        ),
+        operation,
+        {},
+    )
+
+    payload = evidence[0].payload
+    assert payload["database_type"] == "sqlite"
+    assert payload["database_name"] == "orders"
+    assert payload["database_dialect"] == "sqlite"
+    fields = {field["name"]: field for field in payload["fields"]}
+    assert fields["order_id"]["physical_type"] == "INTEGER"
+    assert fields["order_id"]["native_type"] == "integer"
+    assert fields["order_id"]["is_identity"] is True
+    assert fields["order_id"]["is_generated"] is True
+    assert fields["order_id"]["is_autoincrement"] is True
+    assert fields["order_id"]["is_monotonic"] is True
+    assert fields["order_id"]["identity_proof"]["asset_ref"] == "orders"
+    created_at = fields["created_at"]
+    assert created_at["physical_type"] == "TEXT"
+    assert created_at["native_type"] == "string"
+    assert created_at["logical_type"] == "timestamp"
+    assert created_at["logical_type_proof"]["owner"] == "catalog"
+    assert created_at["logical_type_proof"]["source_kind"] == (
+        "schema.column_value_profile"
+    )
+    assert created_at["logical_type_proof"]["profile_ref"] == "orders.created_at"
+    assert created_at["logical_type_proof"]["column"] == "created_at"
+    assert "column_value_hint" not in created_at
+    serialized = str(payload)
+    assert "2026-01-02T10:00:00Z" not in serialized
+    assert "2026-01-03T11:00:00Z" not in serialized
+
+
+def test_catalog_schema_normalization_preserves_and_merges_column_traits():
+    search = Evidence(
+        id="catalog-search-orders",
+        kind="schema.search_result",
+        owner="catalog",
+        operation_id="op-normalize-traits",
+        accepted=True,
+        payload={
+            "database_type": "sqlite",
+            "store_id": "store:orders",
+            "tables": [
+                {
+                    "name": "orders",
+                    "fields": [
+                        {"name": "created_at", "type": "TEXT"},
+                        {"name": "order_id", "type": "INTEGER"},
+                    ],
+                }
+            ],
+        },
+    )
+    inspect = Evidence(
+        id="catalog-inspect-orders",
+        kind="schema.asset_profile",
+        owner="catalog",
+        operation_id="op-normalize-traits",
+        accepted=True,
+        payload={
+            "database_type": "sqlite",
+            "database_dialect": "sqlite",
+            "store_id": "store:orders",
+            "asset": {"name": "orders", "asset_ref": "orders"},
+            "fields": [
+                {
+                    "name": "created_at",
+                    "type": "TEXT",
+                    "physical_type": "TEXT",
+                    "native_type": "string",
+                    "database_dialect": "sqlite",
+                    "logical_type": "timestamp",
+                    "logical_type_proof": {
+                        "owner": "catalog",
+                        "source_kind": "schema.column_value_profile",
+                        "profile_ref": "orders.created_at",
+                        "store_id": "store:orders",
+                        "asset_ref": "orders",
+                        "column": "created_at",
+                        "database_dialect": "sqlite",
+                        "representation": "iso8601_utc_second",
+                        "all_values_matched": True,
+                        "lexicographically_sortable": True,
+                        "confidence": 0.95,
+                    },
+                },
+                {
+                    "name": "order_id",
+                    "type": "INTEGER",
+                    "is_primary_key": True,
+                    "is_identity": True,
+                    "is_generated": True,
+                    "is_autoincrement": True,
+                    "is_monotonic": True,
+                    "identity_proof": {
+                        "owner": "catalog",
+                        "source_kind": "sqlite_schema",
+                        "generated": True,
+                        "autoincrement": True,
+                        "monotonic": True,
+                        "store_id": "store:orders",
+                        "asset_ref": "orders",
+                        "column": "order_id",
+                        "database_dialect": "sqlite",
+                    },
+                },
+            ],
+        },
+    )
+    rejected = Evidence(
+        id="catalog-rejected-conflict",
+        kind="schema.asset_profile",
+        owner="catalog",
+        operation_id="op-normalize-traits",
+        accepted=False,
+        payload={
+            "database_type": "sqlite",
+            "store_id": "store:orders",
+            "asset": {"name": "orders", "asset_ref": "orders"},
+            "fields": [{"name": "status", "type": "TEXT", "logical_type": "timestamp"}],
+        },
+    )
+
+    schema = catalog_schema_from_evidence((search, inspect, rejected), ())
+
+    assert schema["database_type"] == "sqlite"
+    assert schema["sql_dialect"] == "sqlite"
+    table = schema["tables"][0]
+    columns = {column["name"]: column for column in table["columns"]}
+    assert set(columns) == {"created_at", "order_id"}
+    assert columns["created_at"]["physical_type"] == "TEXT"
+    assert columns["created_at"]["native_type"] == "string"
+    assert columns["created_at"]["logical_type"] == "timestamp"
+    assert columns["created_at"]["catalog_evidence"] == {
+        "id": "catalog-inspect-orders",
+        "kind": "schema.asset_profile",
+        "owner": "catalog",
+        "accepted": True,
+        "store_id": "store:orders",
+        "asset_ref": "orders",
+        "column": "created_at",
+    }
+    assert columns["order_id"]["is_monotonic"] is True
+    assert "column_value_hint" not in columns["created_at"]
 
 
 async def test_catalog_executor_rejects_explicit_unsuccessful_asset_inspection():

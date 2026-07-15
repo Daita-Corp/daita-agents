@@ -48,6 +48,13 @@ class DbTaskCatalog:
             # must not bootstrap itself through connector schema inspection or
             # re-register an asset-profile payload as a whole catalog schema.
             return {**task_input, "store_id": store_id}
+        if task.capability_id == "catalog.column_values.register":
+            task_input = await self._column_value_registration_input(
+                task,
+                operation,
+                task_input=task_input,
+            )
+            return {**task_input, "store_id": store_id}
         schema_evidence = await latest_evidence(
             self.context,
             operation.id,
@@ -97,6 +104,86 @@ class DbTaskCatalog:
                 parent_task=task,
             )
         return {**task_input, "store_id": store_id}
+
+    async def _column_value_registration_input(
+        self,
+        task: Task,
+        operation: Operation,
+        *,
+        task_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        if "profiles" in task_input:
+            return task_input
+        dependencies = [
+            dependency
+            for dependency in task.dependencies
+            if dependency.kind_value == "evidence"
+            and dependency.evidence_kind == "column_values.profile"
+        ]
+        if len(dependencies) != 1:
+            raise RuntimeError("catalog.column_value_profile_dependency_required")
+        dependency = dependencies[0]
+        if (
+            not dependency.evidence_owner
+            or not dependency.producer_task_id
+            or dependency.producer_capability_id != "db.column_values.profile"
+            or not dependency.producer_executor_id
+            or dependency.evidence_accepted is not True
+            or dependency.operation_id != operation.id
+        ):
+            raise RuntimeError(
+                "catalog.column_value_profile_dependency_identity_mismatch"
+            )
+        producer = await self.context.store.load_task(dependency.producer_task_id)
+        if producer is None:
+            raise RuntimeError("catalog.column_value_profile_dependency_task_missing")
+        if (
+            producer.operation_id != operation.id
+            or producer.capability_id != dependency.producer_capability_id
+            or producer.executor_id != dependency.producer_executor_id
+            or producer.metadata.get("owner") != dependency.evidence_owner
+            or (
+                dependency.input_hash is not None
+                and producer.metadata.get("input_hash") != dependency.input_hash
+            )
+        ):
+            raise RuntimeError(
+                "catalog.column_value_profile_dependency_identity_mismatch"
+            )
+        profile = await accepted_evidence_for_dependency(
+            self.context,
+            operation.id,
+            dependency,
+        )
+        if profile is None:
+            raise RuntimeError("catalog.column_value_profile_evidence_missing")
+        expected_table = str(task_input.get("table") or "").strip()
+        expected_column = str(task_input.get("column") or "").strip()
+        expected_kind = str(task_input.get("profile_kind") or "").strip()
+        actual_table = str(profile.payload.get("table") or "").strip()
+        actual_column = str(profile.payload.get("column") or "").strip()
+        actual_kind = str(profile.payload.get("profile_kind") or "").strip()
+        producer_table = str(producer.input.get("table") or "").strip()
+        producer_column = str(producer.input.get("column") or "").strip()
+        producer_kind = str(producer.input.get("profile_kind") or "").strip()
+        if (
+            not expected_table
+            or not expected_column
+            or not expected_kind
+            or actual_table != expected_table
+            or actual_column != expected_column
+            or actual_kind != expected_kind
+            or producer_table != expected_table
+            or producer_column != expected_column
+            or producer_kind != expected_kind
+        ):
+            raise RuntimeError("catalog.column_value_profile_selection_mismatch")
+        return {
+            **task_input,
+            "profiles": [dict(profile.payload)],
+            "source_evidence_id": profile.id,
+            "persist": False,
+        }
 
     async def _ensure_catalog_value_grounding_plan(
         self,

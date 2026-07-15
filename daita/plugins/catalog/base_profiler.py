@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from daita.core.db_type_metadata import native_type_from_db_type, nullable_value
+
 from .base_discoverer import DiscoveredStore
 
 
@@ -21,6 +23,18 @@ class NormalizedColumn:
     nullable: bool
     is_primary_key: bool
     comment: Optional[str] = None
+    physical_type: Optional[str] = None
+    native_type: Optional[str] = None
+    database_dialect: Optional[str] = None
+    logical_type: Optional[str] = None
+    logical_type_proof: Dict[str, Any] = field(default_factory=dict)
+    is_identity: Optional[bool] = None
+    is_generated: Optional[bool] = None
+    is_autoincrement: Optional[bool] = None
+    is_monotonic: Optional[bool] = None
+    identity_proof: Dict[str, Any] = field(default_factory=dict)
+    default_value: Any = None
+    extra: Optional[str] = None
 
 
 @dataclass
@@ -76,6 +90,8 @@ class NormalizedColumnValueProfile:
     source_fingerprint_status: Optional[str] = None
     source_fingerprint_reason: Optional[str] = None
     source_revision: Optional[str] = None
+    logical_type: Optional[str] = None
+    logical_type_proof: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def ref(self) -> str:
@@ -105,9 +121,12 @@ class NormalizedColumnValueProfile:
             ("source_fingerprint_status", self.source_fingerprint_status),
             ("source_fingerprint_reason", self.source_fingerprint_reason),
             ("source_revision", self.source_revision),
+            ("logical_type", self.logical_type),
         ):
             if value is not None:
                 result[key] = value
+        if self.logical_type_proof:
+            result["logical_type_proof"] = dict(self.logical_type_proof)
         return result
 
     @classmethod
@@ -137,6 +156,8 @@ class NormalizedColumnValueProfile:
             source_fingerprint_status=value.get("source_fingerprint_status"),
             source_fingerprint_reason=value.get("source_fingerprint_reason"),
             source_revision=value.get("source_revision"),
+            logical_type=value.get("logical_type"),
+            logical_type_proof=dict(value.get("logical_type_proof", {}) or {}),
         )
 
 
@@ -219,6 +240,58 @@ class NormalizedSchema:
                             "nullable": c.nullable,
                             "is_primary_key": c.is_primary_key,
                             **({"column_comment": c.comment} if c.comment else {}),
+                            **(
+                                {"physical_type": c.physical_type}
+                                if c.physical_type
+                                else {}
+                            ),
+                            **({"native_type": c.native_type} if c.native_type else {}),
+                            **(
+                                {"database_dialect": c.database_dialect}
+                                if c.database_dialect
+                                else {}
+                            ),
+                            **(
+                                {"logical_type": c.logical_type}
+                                if c.logical_type
+                                else {}
+                            ),
+                            **(
+                                {"logical_type_proof": c.logical_type_proof}
+                                if c.logical_type_proof
+                                else {}
+                            ),
+                            **(
+                                {"is_identity": c.is_identity}
+                                if c.is_identity is not None
+                                else {}
+                            ),
+                            **(
+                                {"is_generated": c.is_generated}
+                                if c.is_generated is not None
+                                else {}
+                            ),
+                            **(
+                                {"is_autoincrement": c.is_autoincrement}
+                                if c.is_autoincrement is not None
+                                else {}
+                            ),
+                            **(
+                                {"is_monotonic": c.is_monotonic}
+                                if c.is_monotonic is not None
+                                else {}
+                            ),
+                            **(
+                                {"identity_proof": c.identity_proof}
+                                if c.identity_proof
+                                else {}
+                            ),
+                            **(
+                                {"default_value": c.default_value}
+                                if c.default_value is not None
+                                else {}
+                            ),
+                            **({"extra": c.extra} if c.extra else {}),
                         }
                         for c in t.columns
                     ],
@@ -260,16 +333,68 @@ class NormalizedSchema:
         """Hydrate a NormalizedSchema from a persisted catalog record."""
         tables = []
         for table in value.get("tables", []) or []:
-            columns = [
-                NormalizedColumn(
-                    name=str(column.get("name", "")),
-                    type=str(column.get("type") or column.get("data_type") or ""),
-                    nullable=bool(column.get("nullable", True)),
-                    is_primary_key=bool(column.get("is_primary_key", False)),
-                    comment=column.get("column_comment") or column.get("comment"),
+            columns = []
+            for column in table.get("columns", []) or []:
+                physical_type = str(
+                    column.get("physical_type")
+                    or column.get("data_type")
+                    or column.get("type")
+                    or ""
                 )
-                for column in table.get("columns", []) or []
-            ]
+                nullable = nullable_value(
+                    column.get("nullable")
+                    if "nullable" in column
+                    else column.get("is_nullable")
+                )
+                columns.append(
+                    NormalizedColumn(
+                        name=str(column.get("name", "")),
+                        type=str(
+                            column.get("type")
+                            or column.get("data_type")
+                            or physical_type
+                        ),
+                        nullable=True if nullable is None else nullable,
+                        is_primary_key=bool(column.get("is_primary_key", False)),
+                        comment=column.get("column_comment") or column.get("comment"),
+                        physical_type=physical_type or None,
+                        native_type=(
+                            str(column.get("native_type"))
+                            if column.get("native_type")
+                            else native_type_from_db_type(physical_type)
+                        ),
+                        database_dialect=str(
+                            column.get("database_dialect")
+                            or column.get("dialect")
+                            or value.get("database_type")
+                            or ""
+                        )
+                        or None,
+                        logical_type=(
+                            str(column.get("logical_type"))
+                            if column.get("logical_type")
+                            else None
+                        ),
+                        logical_type_proof=dict(
+                            column.get("logical_type_proof", {}) or {}
+                        ),
+                        is_identity=_optional_bool(column.get("is_identity")),
+                        is_generated=_optional_bool(column.get("is_generated")),
+                        is_autoincrement=_optional_bool(column.get("is_autoincrement")),
+                        is_monotonic=_optional_bool(column.get("is_monotonic")),
+                        identity_proof=dict(column.get("identity_proof", {}) or {}),
+                        default_value=(
+                            column.get("default_value")
+                            if "default_value" in column
+                            else column.get("column_default")
+                        ),
+                        extra=(
+                            str(column.get("extra"))
+                            if column.get("extra") is not None
+                            else None
+                        ),
+                    )
+                )
             indexes = [
                 NormalizedIndex(
                     name=str(index.get("name", "")),
@@ -310,6 +435,19 @@ class NormalizedSchema:
             profiled_at=value.get("profiled_at"),
             metadata=dict(value.get("metadata", {}) or {}),
         )
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    lowered = str(value).strip().lower()
+    if lowered in {"true", "yes", "1"}:
+        return True
+    if lowered in {"false", "no", "0"}:
+        return False
+    return None
 
 
 class BaseProfiler(ABC):

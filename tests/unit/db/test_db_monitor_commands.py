@@ -21,6 +21,7 @@ from daita.db.monitor_commands import (
     DbMonitorPlanner,
     monitor_create_intent_from_dict,
 )
+from daita.db.monitor_commands.planner import _cursor_strategy_from_schema
 from daita.db.planner_protocol import (
     DbPlannerAction,
     DbPlannerActionKind,
@@ -31,6 +32,7 @@ from daita.db.planner_protocol import (
 from daita.db.runtime.tasks.models import DbTaskSpec
 from daita.db.runtime import DbRuntimeTaskNotRunnable
 from daita.plugins.catalog import CatalogPlugin
+from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import (
     AccessMode,
     ApprovalRequest,
@@ -257,6 +259,123 @@ async def test_prompt_monitor_create_persists_loop_and_monitor_evidence():
     ]
     assert not any(task.capability_id == "db.schema.inspect" for task in snapshot.tasks)
     assert len(planner.states) == 2
+
+
+async def test_rich_sqlite_monitor_create_uses_catalog_cursor_proof(tmp_path):
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=str(tmp_path / "monitor-cursor.sqlite"))
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            order_id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            total REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO orders (
+            order_id, status, total, created_at, updated_at
+        ) VALUES
+            (100, 'complete', 120.0, '2026-01-02T10:00:00Z', '2026-01-02T10:00:00Z'),
+            (101, 'pending', 80.0, '2026-01-03T11:00:00Z', '2026-01-03T11:30:00Z'),
+            (102, 'pending', 210.0, '2026-01-06T15:00:00Z', '2026-01-06T15:20:00Z');
+        """)
+    planner = CatalogCreatePlanner(("orders",), filtered=True, delivery=True)
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            limits=DbLimits(max_rows=1000),
+            metadata={
+                "catalog_store_id": "store:rich-sqlite-monitor",
+                "host_runtime": {"delivery_defaults": ["in_app"]},
+            },
+        ),
+        plugins=(catalog, sqlite, HostedInAppMonitorDeliveryPlugin()),
+        host_services={"db_agent_planner": planner},
+    )
+    agent = DbAgent(runtime=runtime)
+
+    try:
+        await runtime.setup(agent_id="rich-sqlite-monitor")
+        schema_evidence = await runtime.execute_capability(
+            "db.schema.inspect",
+            owner="sqlite",
+            operation_type="schema.query",
+        )
+        await runtime.execute_capability(
+            "catalog.source.register",
+            owner="catalog",
+            operation_type="schema.register",
+            input={
+                "schema": schema_evidence[0].payload,
+                "store_type": "sqlite",
+                "store_id": "store:rich-sqlite-monitor",
+                "persist": False,
+            },
+        )
+        status_profile = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={"table": "orders", "column": "status", "max_values": 25},
+        )
+        await runtime.execute_capability(
+            "catalog.column_values.register",
+            owner="catalog",
+            operation_type="source.profile",
+            input={
+                "store_id": "store:rich-sqlite-monitor",
+                "profiles": [status_profile[0].payload],
+                "source_evidence_id": status_profile[0].id,
+            },
+        )
+        result = await agent.run_detailed(
+            "create a monitor for pending orders over 500 every 15 minutes"
+        )
+        snapshot = await runtime.inspect_operation(result.operation_id)
+        committed = await runtime.inspect_monitor("orders_watch")
+    finally:
+        await runtime.teardown()
+
+    assert result.status is OperationStatus.SUCCEEDED, [
+        item.payload.get("validation")
+        for item in snapshot.evidence
+        if item.kind == "monitor.proposal"
+    ]
+    assert committed is not None
+    observation = committed.monitor.observation_plan
+    assert "from orders" in observation["sql"].lower()
+    assert "status = ?" in observation["sql"]
+    assert observation["parameters"][0]["value"] == "pending"
+    assert observation["cursor"]["field"] == "created_at"
+    assert observation["cursor"]["strategy"] == "insert_timestamp"
+    assert observation["cursor_update"] == {"last_created_at": "max(rows.created_at)"}
+    assert observation["value_path"] == "rows"
+    delivery_intent = committed.monitor.action_plan["delivery_intent"]
+    assert delivery_intent["delivery_kind"] == "in_app"
+    assert delivery_intent["target"] == {"type": "requesting_user"}
+    logical_profiles = [
+        task
+        for task in snapshot.tasks
+        if task.capability_id == "db.column_values.profile"
+        and task.input.get("profile_kind") == "logical_type_validation"
+    ]
+    assert {task.input["column"] for task in logical_profiles} == {
+        "created_at",
+        "updated_at",
+    }
+    inspect = next(
+        task
+        for task in snapshot.tasks
+        if task.capability_id == "catalog.asset.inspect"
+        and task.metadata.get("planner_action_id") == "plan_orders"
+    )
+    assert {dependency.evidence_kind for dependency in inspect.dependencies} == {
+        "schema.column_value_profile"
+    }
+    proposal = next(
+        item for item in snapshot.evidence if item.kind == "monitor.proposal"
+    )
+    assert proposal.accepted is True
+    assert "missing_reliable_cursor" not in proposal.payload["validation"]["errors"]
 
 
 async def test_prompt_monitor_create_commits_each_proposal_dependency():
@@ -557,6 +676,14 @@ def test_monitor_create_compiler_bounds_catalog_candidate_text():
             "accepted",
             None,
         ),
+        (
+            "mismatched_proof",
+            "orders",
+            "orders",
+            ["orders"],
+            "rejected",
+            "missing_reliable_cursor",
+        ),
     ),
 )
 async def test_monitor_plan_dependency_outcomes_execute_through_kernel(
@@ -601,7 +728,36 @@ async def test_monitor_plan_dependency_outcomes_execute_through_kernel(
         )
         producer = producer_plan.tasks[0]
         if evidence_state != "missing":
-            accepted = evidence_state == "accepted"
+            accepted = evidence_state != "rejected"
+            fields = [
+                {"name": "created_at", "type": "TIMESTAMP"},
+                {"name": "status", "type": "TEXT"},
+            ]
+            if evidence_state == "mismatched_proof":
+                fields = [
+                    {
+                        "name": "created_at",
+                        "type": "TEXT",
+                        "physical_type": "TEXT",
+                        "native_type": "string",
+                        "database_dialect": "sqlite",
+                        "logical_type": "timestamp",
+                        "logical_type_proof": {
+                            "owner": "catalog",
+                            "source_kind": "schema.column_value_profile",
+                            "profile_ref": "orders.updated_at",
+                            "store_id": "store:monitor-tests",
+                            "asset_ref": "orders",
+                            "column": "updated_at",
+                            "database_dialect": "sqlite",
+                            "method": "bounded_value_profile",
+                            "representation": "iso8601_utc_second",
+                            "all_values_matched": True,
+                            "lexicographically_sortable": True,
+                            "confidence": 0.95,
+                        },
+                    }
+                ]
             await runtime.store.save_evidence(
                 Evidence(
                     id="catalog-profile-orders",
@@ -612,16 +768,15 @@ async def test_monitor_plan_dependency_outcomes_execute_through_kernel(
                     accepted=accepted,
                     payload={
                         "success": accepted,
+                        "database_type": "sqlite",
+                        "database_dialect": "sqlite",
                         "store_id": "store:monitor-tests",
                         "asset": {
                             "store_id": "store:monitor-tests",
                             "name": "orders",
                             "asset_ref": asset_ref,
                         },
-                        "fields": [
-                            {"name": "created_at", "type": "TIMESTAMP"},
-                            {"name": "status", "type": "TEXT"},
-                        ],
+                        "fields": fields,
                     },
                     metadata={"task_input_hash": producer.metadata["input_hash"]},
                 )
@@ -681,7 +836,10 @@ async def test_monitor_plan_dependency_outcomes_execute_through_kernel(
     assert evidence[0].kind == "monitor.proposal"
     assert evidence[0].accepted is (outcome == "accepted")
     if expected_error is not None:
-        assert expected_error in evidence[0].payload["validation"]["errors"]
+        assert any(
+            expected_error in error
+            for error in evidence[0].payload["validation"]["errors"]
+        )
     else:
         assert evidence[0].payload["metadata"]["schema_evidence_id"] == (
             "catalog-profile-orders"
@@ -693,9 +851,12 @@ async def test_monitor_plan_dependency_outcomes_execute_through_kernel(
 
 
 async def test_monitor_proposal_delivery_kind_defaults_preserve_explicit_semantics():
-    parsed = monitor_create_intent_from_dict({"delivery": {"target": {}}})
+    parsed = monitor_create_intent_from_dict(
+        {"delivery": {"delivery_kind": "in_app", "target": {}}}
+    )
     assert parsed.delivery is not None
-    assert parsed.delivery.delivery_kind == ""
+    assert parsed.delivery.delivery_kind == "in_app"
+    assert parsed.delivery.target_explicit is True
     assert parsed.delivery.to_action_plan_intent()["target"] == {}
     omitted_target = monitor_create_intent_from_dict({"delivery": {}})
     assert omitted_target.delivery is not None
@@ -1208,6 +1369,37 @@ async def test_prompt_monitor_request_without_llm_does_not_fall_back_to_regex_ro
     assert "DB LLM service is required" in result.answer
     assert snapshot.tasks == ()
     assert not [item for item in snapshot.evidence if item.kind == "planner.decision"]
+
+
+def test_monitor_create_action_hint_preserves_omitted_delivery_target_contract():
+    hints = _action_input_hints()
+    create_hint = hints["monitor_action_inputs"]["plan_monitor_create"]
+    delivery_example = create_hint["intent"]["delivery"]
+
+    assert delivery_example == {
+        "delivery_kind": "registered monitor delivery kind",
+    }
+    assert create_hint["delivery_contract"] == {
+        "optional": "target is optional.",
+        "omission": "Omit target when the user did not provide a delivery target.",
+        "grounding": (
+            "Include an explicit target only when grounded in the user request "
+            "or runtime state."
+        ),
+        "explicit_empty": (
+            "An explicit empty object is not equivalent to omission and is invalid."
+        ),
+    }
+
+    model_shaped_intent = monitor_create_intent_from_dict(
+        {"delivery": dict(delivery_example)}
+    )
+    assert model_shaped_intent.delivery is not None
+    assert model_shaped_intent.delivery.target_explicit is False
+    assert "target" not in model_shaped_intent.delivery.to_action_plan_intent()
+
+    serialized_hint = json.dumps(create_hint, sort_keys=True)
+    assert "local | in_app | email | slack" not in serialized_hint
 
 
 def test_monitor_create_action_hint_exposes_catalog_evidence_ids():
@@ -2245,6 +2437,163 @@ def _monitor_schema(dialect):
             }
         ],
     }
+
+
+def _catalog_cursor_schema(*columns):
+    return {
+        "database_type": "sqlite",
+        "database_dialect": "sqlite",
+        "sql_dialect": "sqlite",
+        "tables": [
+            {
+                "name": "orders",
+                "metadata": {
+                    "catalog_asset_ref": "orders",
+                    "catalog_store_id": "store:orders",
+                },
+                "columns": list(columns),
+            }
+        ],
+    }
+
+
+def _catalog_column(name, data_type, **traits):
+    return {
+        "name": name,
+        "data_type": data_type,
+        "physical_type": data_type,
+        "native_type": "integer" if data_type == "INTEGER" else "string",
+        "database_dialect": "sqlite",
+        "catalog_evidence": {
+            "id": "catalog-inspect-orders",
+            "kind": "schema.asset_profile",
+            "owner": "catalog",
+            "accepted": True,
+            "store_id": "store:orders",
+            "asset_ref": "orders",
+            "column": name,
+        },
+        **traits,
+    }
+
+
+def test_sqlite_text_timestamp_cursor_requires_bound_catalog_proof():
+    proof = {
+        "owner": "catalog",
+        "source_kind": "schema.column_value_profile",
+        "profile_ref": "orders.created_at",
+        "store_id": "store:orders",
+        "asset_ref": "orders",
+        "column": "created_at",
+        "database_dialect": "sqlite",
+        "method": "bounded_value_profile",
+        "representation": "iso8601_utc_second",
+        "all_values_matched": True,
+        "lexicographically_sortable": True,
+        "confidence": 0.95,
+    }
+    schema = _catalog_cursor_schema(
+        _catalog_column(
+            "created_at",
+            "TEXT",
+            logical_type="timestamp",
+            logical_type_proof=proof,
+        )
+    )
+
+    cursor = _cursor_strategy_from_schema("orders", schema)
+
+    assert cursor is not None
+    assert cursor["field"] == "created_at"
+    assert cursor["strategy"] == "insert_timestamp"
+    assert cursor["column_type"]["db_type"] == "TEXT"
+    assert cursor["column_type"]["logical_type"] == "timestamp"
+    assert cursor["column_type"]["logical_representation"] == ("iso8601_utc_second")
+
+
+@pytest.mark.parametrize(
+    "column",
+    (
+        _catalog_column("created_at", "TEXT"),
+        _catalog_column("timestamp_named_only", "TEXT"),
+        _catalog_column(
+            "created_at",
+            "TEXT",
+            logical_type="timestamp",
+            logical_type_proof={
+                "owner": "catalog",
+                "source_kind": "schema.column_value_profile",
+                "profile_ref": "orders.updated_at",
+                "store_id": "store:orders",
+                "asset_ref": "orders",
+                "column": "updated_at",
+                "database_dialect": "sqlite",
+                "method": "bounded_value_profile",
+                "representation": "iso8601_utc_second",
+                "all_values_matched": True,
+                "lexicographically_sortable": True,
+                "confidence": 0.95,
+            },
+        ),
+    ),
+)
+def test_sqlite_text_cursor_rejects_unproven_or_mismatched_traits(column):
+    assert (
+        _cursor_strategy_from_schema("orders", _catalog_cursor_schema(column)) is None
+    )
+
+
+def test_sqlite_numeric_cursor_requires_proven_monotonic_identity():
+    proven = _catalog_column(
+        "order_id",
+        "INTEGER",
+        is_primary_key=True,
+        is_identity=True,
+        is_generated=True,
+        is_autoincrement=True,
+        is_monotonic=True,
+        identity_proof={
+            "owner": "catalog",
+            "source_kind": "sqlite_schema",
+            "store_id": "store:orders",
+            "asset_ref": "orders",
+            "column": "order_id",
+            "database_dialect": "sqlite",
+            "generated": True,
+            "autoincrement": True,
+            "monotonic": True,
+        },
+    )
+    ordinary = _catalog_column(
+        "order_id",
+        "INTEGER",
+        is_primary_key=True,
+        is_identity=True,
+        is_generated=True,
+        is_autoincrement=False,
+        is_monotonic=False,
+        identity_proof={
+            "owner": "catalog",
+            "source_kind": "sqlite_schema",
+            "store_id": "store:orders",
+            "asset_ref": "orders",
+            "column": "order_id",
+            "database_dialect": "sqlite",
+            "generated": True,
+            "autoincrement": False,
+            "monotonic": False,
+            "rowid_reuse_possible": True,
+        },
+    )
+
+    cursor = _cursor_strategy_from_schema("orders", _catalog_cursor_schema(proven))
+
+    assert cursor is not None
+    assert cursor["field"] == "order_id"
+    assert cursor["strategy"] == "auto_increment_primary_key"
+    assert (
+        _cursor_strategy_from_schema("orders", _catalog_cursor_schema(ordinary)) is None
+    )
 
 
 def _monitor_sql_registry(dialect):

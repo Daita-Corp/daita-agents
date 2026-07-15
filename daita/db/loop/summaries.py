@@ -282,6 +282,10 @@ def _catalog_context_for_state(evidence: tuple[Evidence, ...]) -> dict[str, Any]
     result: dict[str, Any] = {
         "planning_context_evidence_id": planning_context.id,
         "structural_source": structural_source,
+        "database_type": normalized_schema.get("database_type"),
+        "database_dialect": normalized_schema.get("database_dialect")
+        or normalized_schema.get("sql_dialect")
+        or normalized_schema.get("database_type"),
         "assets": included_assets,
         "candidate_count": len(assets),
         "included_candidate_count": len(included_assets),

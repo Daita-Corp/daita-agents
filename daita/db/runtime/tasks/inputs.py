@@ -23,6 +23,7 @@ async def executable_input_for_task(
         "catalog.schema.search",
         "catalog.asset.inspect",
         "catalog.relationship_paths.find",
+        "catalog.column_values.register",
         "catalog.column_values.search",
         "catalog.column_value_hints.resolve",
         "catalog.value_grounding.plan",

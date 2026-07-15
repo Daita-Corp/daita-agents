@@ -3,6 +3,7 @@ import json
 
 from daita.core.exceptions import ValidationError
 from daita.db import DbRuntime, DbRuntimeConfig
+from daita.db.fingerprints import persisted_fingerprint
 from daita.db.loop import DbAgentLoop
 from daita.db.llm_service import DbLLMResponse
 from daita.db.plan_validation import DbQueryPlanValidator
@@ -18,7 +19,14 @@ from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins import PluginKind, PluginManifest, RuntimeExtensionPlugin
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
-from daita.runtime import AccessMode, Capability, Evidence, RiskLevel, TaskStatus
+from daita.runtime import (
+    AccessMode,
+    Capability,
+    Evidence,
+    RiskLevel,
+    TaskDependency,
+    TaskStatus,
+)
 import pytest
 
 from tests.db_evidence_helpers import assert_no_invalid_accepted_query_plans
@@ -647,6 +655,45 @@ async def test_sqlite_schema_inspect_returns_typed_evidence_through_runtime():
         "orders",
     }
     assert evidence[0].payload["foreign_keys"][0]["source_table"] == "orders"
+
+
+async def test_sqlite_schema_inspect_distinguishes_rowid_reuse_from_autoincrement():
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(plugins=(sqlite,))
+    await runtime.setup()
+    await sqlite.execute_script("""
+        CREATE TABLE ordinary_ids (
+            id INTEGER PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE monotonic_ids (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            value TEXT NOT NULL
+        );
+        """)
+
+    try:
+        evidence = await runtime.execute_capability(
+            "db.schema.inspect",
+            owner="sqlite",
+            operation_type="schema.query",
+        )
+    finally:
+        await runtime.teardown()
+
+    tables = {table["name"]: table for table in evidence[0].payload["tables"]}
+    ordinary = tables["ordinary_ids"]["columns"][0]
+    monotonic = tables["monotonic_ids"]["columns"][0]
+    assert ordinary["is_identity"] is True
+    assert ordinary["is_generated"] is True
+    assert ordinary["is_autoincrement"] is False
+    assert ordinary["is_monotonic"] is False
+    assert ordinary["identity_proof"]["rowid_reuse_possible"] is True
+    assert monotonic["is_identity"] is True
+    assert monotonic["is_generated"] is True
+    assert monotonic["is_autoincrement"] is True
+    assert monotonic["is_monotonic"] is True
+    assert monotonic["identity_proof"]["rowid_reuse_possible"] is False
 
 
 async def test_sqlite_read_query_returns_typed_query_result_through_runtime():
@@ -2448,6 +2495,122 @@ async def test_catalog_column_value_profile_ambiguous_source_owner_blocks_prepar
     assert diagnostic["candidate_owners"] == ["source_alpha", "source_beta"]
 
 
+async def _sqlite_column_value_registration_runtime(*, register_store=True):
+    catalog = CatalogPlugin(auto_persist=False)
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(plugins=(catalog, sqlite))
+    await runtime.setup(agent_id="column-value-registration-test")
+    await sqlite.execute_script("""
+        CREATE TABLE orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL
+        );
+        INSERT INTO orders (status) VALUES ('complete'), ('pending');
+        """)
+    if register_store:
+        await catalog.register_schema(
+            {
+                "database_type": "sqlite",
+                "database_name": "registration-tests",
+                "tables": [
+                    {
+                        "name": "orders",
+                        "columns": [
+                            {"name": "id", "data_type": "INTEGER"},
+                            {"name": "status", "data_type": "TEXT"},
+                        ],
+                    }
+                ],
+            },
+            store_type="sqlite",
+            store_id="store:sqlite-registration",
+            persist=False,
+        )
+    return runtime, catalog, sqlite
+
+
+async def _plan_evidence_derived_column_value_registration(
+    runtime,
+    *,
+    operation_id="evidence-derived-column-value-registration",
+    store_id="store:sqlite-registration",
+    register_input=None,
+    include_dependency=True,
+    duplicate_dependency=False,
+    dependency_overrides=None,
+):
+    operation = await runtime.kernel.create_operation(
+        operation_id=operation_id,
+        operation_type="source.profile",
+        request={"prompt": "register the profiled orders.status values"},
+        evaluate_governance=False,
+    )
+    profile_input = {
+        "table": "orders",
+        "column": "status",
+        "profile_kind": "categorical_values",
+        "max_values": 25,
+    }
+    profile_task_id = f"{operation_id}-profile"
+    profile_capability = runtime.registry.get_capability(
+        "db.column_values.profile",
+        owner="sqlite",
+    )
+    dependency_values = {
+        "kind": "evidence",
+        "evidence_kind": "column_values.profile",
+        "evidence_owner": profile_capability.owner,
+        "producer_task_id": profile_task_id,
+        "producer_capability_id": profile_capability.id,
+        "producer_executor_id": profile_capability.executor,
+        "evidence_accepted": True,
+        "input_hash": persisted_fingerprint(profile_input),
+        "operation_id": operation.id,
+    }
+    dependency_values.update(dependency_overrides or {})
+    dependency = TaskDependency(**dependency_values)
+    dependencies = (dependency,) if include_dependency else ()
+    if duplicate_dependency:
+        dependencies = (
+            dependency,
+            TaskDependency(
+                **{
+                    **dependency_values,
+                    "metadata": {"duplicate_dependency": True},
+                }
+            ),
+        )
+    registration_input = register_input or {
+        "store_id": store_id,
+        "table": "orders",
+        "column": "status",
+        "profile_kind": "categorical_values",
+    }
+    plan = await runtime.plan_task_specs(
+        operation,
+        (
+            DbTaskSpec(
+                capability_id="db.column_values.profile",
+                task_id=profile_task_id,
+                owner="sqlite",
+                input=profile_input,
+                reason="test_profile_dependency",
+                sequence=1,
+            ),
+            DbTaskSpec(
+                capability_id="catalog.column_values.register",
+                task_id=f"{operation_id}-register",
+                owner="catalog",
+                input=registration_input,
+                reason="test_evidence_derived_registration",
+                sequence=2,
+                dependencies=dependencies,
+            ),
+        ),
+    )
+    return operation, plan.tasks[0], plan.tasks[1]
+
+
 async def test_sqlite_column_value_profile_registers_with_catalog():
     catalog = CatalogPlugin(auto_persist=False)
     sqlite = SQLitePlugin(path=":memory:")
@@ -2514,6 +2677,410 @@ async def test_sqlite_column_value_profile_registers_with_catalog():
         stored["orders.status"]["source_fingerprint"]
         == raw_profile[0].payload["source_fingerprint"]
     )
+
+
+async def test_sqlite_explicit_profile_registration_skips_schema_inspection():
+    runtime, _, sqlite = await _sqlite_column_value_registration_runtime()
+
+    async def fail_schema_inspection():
+        raise AssertionError("explicit registration must not inspect schema")
+
+    sqlite.tables = fail_schema_inspection
+    try:
+        raw_profile = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={"table": "orders", "column": "status", "max_values": 25},
+        )
+        registered = await runtime.execute_capability(
+            "catalog.column_values.register",
+            owner="catalog",
+            operation_type="source.profile",
+            operation_id="sqlite-explicit-profile-registration",
+            input={
+                "store_id": "store:sqlite-registration",
+                "profiles": [raw_profile[0].payload],
+                "source_evidence_id": raw_profile[0].id,
+            },
+        )
+        tasks = await runtime.store.list_tasks(
+            "sqlite-explicit-profile-registration"
+        )
+    finally:
+        await runtime.teardown()
+
+    assert registered[0].accepted is True
+    assert [task.capability_id for task in tasks] == [
+        "catalog.column_values.register"
+    ]
+
+
+async def test_explicit_empty_profiles_remain_explicit_without_bootstrap():
+    runtime, _, _ = await _sqlite_column_value_registration_runtime()
+    try:
+        registered = await runtime.execute_capability(
+            "catalog.column_values.register",
+            owner="catalog",
+            operation_type="source.profile",
+            operation_id="explicit-empty-profile-registration",
+            input={
+                "store_id": "store:sqlite-registration",
+                "profiles": [],
+            },
+        )
+        tasks = await runtime.store.list_tasks("explicit-empty-profile-registration")
+    finally:
+        await runtime.teardown()
+
+    assert registered[0].accepted is True
+    assert registered[0].payload["profile_count"] == 0
+    assert len(tasks) == 1
+    assert tasks[0].capability_id == "catalog.column_values.register"
+    assert tasks[0].dependencies == ()
+
+
+async def test_evidence_derived_registration_consumes_exact_profile_dependency():
+    runtime, _, _ = await _sqlite_column_value_registration_runtime()
+    try:
+        operation, profile_task, registration_task = (
+            await _plan_evidence_derived_column_value_registration(runtime)
+        )
+        profile_evidence = await runtime.execute_task(profile_task, operation)
+        registered = await runtime.execute_task(registration_task, operation)
+        hydrated = await runtime.store.load_task(registration_task.id)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert registered[0].accepted is True
+    assert hydrated is not None
+    assert hydrated.input["profiles"] == [profile_evidence[0].payload]
+    assert hydrated.input["source_evidence_id"] == profile_evidence[0].id
+    assert hydrated.input["persist"] is False
+    assert len(registration_task.dependencies) == 1
+    dependency = registration_task.dependencies[0]
+    assert dependency.producer_task_id == profile_task.id
+    assert dependency.producer_capability_id == "db.column_values.profile"
+    assert dependency.producer_executor_id == "sqlite.column_values.profile"
+    assert {task.capability_id for task in tasks} == {
+        "db.column_values.profile",
+        "catalog.column_values.register",
+    }
+
+
+@pytest.mark.parametrize(
+    "register_input",
+    (
+        {
+            "store_id": "store:sqlite-registration",
+            "table": "orders",
+            "column": "status",
+        },
+        {
+            "store_id": "store:sqlite-registration",
+            "table": "orders",
+            "column": "status",
+            "profile_kind": "",
+        },
+        {
+            "store_id": "store:sqlite-registration",
+            "table": "shipments",
+            "column": "status",
+            "profile_kind": "categorical_values",
+        },
+        {
+            "store_id": "store:sqlite-registration",
+            "table": "orders",
+            "column": "state",
+            "profile_kind": "categorical_values",
+        },
+        {
+            "store_id": "store:sqlite-registration",
+            "table": "orders",
+            "column": "status",
+            "profile_kind": "logical_type_validation",
+        },
+    ),
+    ids=(
+        "missing-kind",
+        "empty-kind",
+        "wrong-table",
+        "wrong-column",
+        "wrong-kind",
+    ),
+)
+async def test_evidence_derived_registration_rejects_incomplete_or_wrong_selection(
+    register_input,
+):
+    runtime, _, _ = await _sqlite_column_value_registration_runtime()
+    try:
+        operation, profile_task, registration_task = (
+            await _plan_evidence_derived_column_value_registration(
+                runtime,
+                register_input=register_input,
+            )
+        )
+        await runtime.execute_task(profile_task, operation)
+        with pytest.raises(
+            RuntimeError,
+            match="catalog.column_value_profile_selection_mismatch",
+        ):
+            await runtime.execute_task(registration_task, operation)
+        tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    assert not any(task.capability_id == "db.schema.inspect" for task in tasks)
+    assert not any(task.capability_id == "catalog.source.register" for task in tasks)
+
+
+@pytest.mark.parametrize(
+    ("include_dependency", "duplicate_dependency", "execute_profile"),
+    (
+        (False, False, False),
+        (True, True, True),
+    ),
+    ids=("missing", "ambiguous"),
+)
+async def test_evidence_derived_registration_requires_exactly_one_dependency(
+    include_dependency,
+    duplicate_dependency,
+    execute_profile,
+):
+    runtime, _, _ = await _sqlite_column_value_registration_runtime()
+    try:
+        operation, profile_task, registration_task = (
+            await _plan_evidence_derived_column_value_registration(
+                runtime,
+                include_dependency=include_dependency,
+                duplicate_dependency=duplicate_dependency,
+            )
+        )
+        if execute_profile:
+            await runtime.execute_task(profile_task, operation)
+        with pytest.raises(
+            RuntimeError,
+            match="catalog.column_value_profile_dependency_required",
+        ):
+            await runtime.execute_task(registration_task, operation)
+    finally:
+        await runtime.teardown()
+
+
+@pytest.mark.parametrize(
+    ("dependency_overrides", "expected_error"),
+    (
+        (
+            {"evidence_owner": "catalog"},
+            "catalog.column_value_profile_dependency_identity_mismatch",
+        ),
+        (
+            {"producer_capability_id": "db.schema.inspect"},
+            "catalog.column_value_profile_dependency_identity_mismatch",
+        ),
+        (
+            {"producer_executor_id": "sqlite.schema.inspect"},
+            "catalog.column_value_profile_dependency_identity_mismatch",
+        ),
+        (
+            {"operation_id": "other-operation"},
+            "catalog.column_value_profile_dependency_identity_mismatch",
+        ),
+        (
+            {"input_hash": "wrong-input-hash"},
+            "catalog.column_value_profile_dependency_identity_mismatch",
+        ),
+        (
+            {"producer_task_id": "missing-profile-task"},
+            "catalog.column_value_profile_dependency_task_missing",
+        ),
+    ),
+    ids=(
+        "wrong-owner",
+        "wrong-capability",
+        "wrong-executor",
+        "wrong-operation",
+        "wrong-input",
+        "missing-producer-task",
+    ),
+)
+async def test_evidence_derived_registration_rejects_wrong_dependency_identity(
+    dependency_overrides,
+    expected_error,
+):
+    runtime, _, _ = await _sqlite_column_value_registration_runtime()
+    try:
+        operation, profile_task, registration_task = (
+            await _plan_evidence_derived_column_value_registration(
+                runtime,
+                dependency_overrides=dependency_overrides,
+            )
+        )
+        await runtime.execute_task(profile_task, operation)
+        with pytest.raises(RuntimeError, match=expected_error):
+            await runtime.execute_task(registration_task, operation)
+    finally:
+        await runtime.teardown()
+
+
+async def test_evidence_derived_registration_rejects_missing_profile_evidence():
+    runtime, _, _ = await _sqlite_column_value_registration_runtime()
+    try:
+        operation, _, registration_task = (
+            await _plan_evidence_derived_column_value_registration(runtime)
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="catalog.column_value_profile_evidence_missing",
+        ):
+            await runtime.execute_task(registration_task, operation)
+    finally:
+        await runtime.teardown()
+
+
+async def test_evidence_derived_registration_rejects_rejected_profile_evidence():
+    runtime, _, _ = await _sqlite_column_value_registration_runtime()
+    try:
+        operation, profile_task, registration_task = (
+            await _plan_evidence_derived_column_value_registration(
+                runtime,
+                dependency_overrides={"evidence_accepted": False},
+            )
+        )
+        await runtime.store.save_evidence(
+            Evidence(
+                id="rejected-column-value-profile",
+                kind="column_values.profile",
+                owner="sqlite",
+                operation_id=operation.id,
+                task_id=profile_task.id,
+                accepted=False,
+                payload={
+                    "table": "orders",
+                    "column": "status",
+                    "profile_kind": "categorical_values",
+                },
+                metadata={"task_input_hash": profile_task.metadata["input_hash"]},
+            )
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="catalog.column_value_profile_dependency_identity_mismatch",
+        ):
+            await runtime.execute_task(registration_task, operation)
+    finally:
+        await runtime.teardown()
+
+
+async def test_missing_catalog_store_response_is_bounded_for_both_registration_modes():
+    runtime, _, _ = await _sqlite_column_value_registration_runtime(
+        register_store=False
+    )
+    try:
+        explicit = await runtime.execute_capability(
+            "catalog.column_values.register",
+            owner="catalog",
+            operation_type="source.profile",
+            operation_id="missing-store-explicit-registration",
+            input={
+                "store_id": "store:missing",
+                "profiles": [
+                    {
+                        "table": "orders",
+                        "column": "status",
+                        "profile_kind": "categorical_values",
+                    }
+                ],
+            },
+        )
+        operation, profile_task, registration_task = (
+            await _plan_evidence_derived_column_value_registration(
+                runtime,
+                operation_id="missing-store-evidence-registration",
+                store_id="store:missing",
+            )
+        )
+        await runtime.execute_task(profile_task, operation)
+        evidence_derived = await runtime.execute_task(registration_task, operation)
+        explicit_tasks = await runtime.store.list_tasks(
+            "missing-store-explicit-registration"
+        )
+        evidence_tasks = await runtime.store.list_tasks(operation.id)
+    finally:
+        await runtime.teardown()
+
+    for evidence in (explicit[0], evidence_derived[0]):
+        assert evidence.accepted is False
+        assert evidence.payload == {
+            "success": False,
+            "store_id": "store:missing",
+            "error": (
+                "No profiled schema for store 'store:missing'. "
+                "Profile or register the schema first."
+            ),
+        }
+    all_tasks = (*explicit_tasks, *evidence_tasks)
+    assert not any(task.capability_id == "db.schema.inspect" for task in all_tasks)
+    assert not any(
+        task.capability_id == "catalog.source.register" for task in all_tasks
+    )
+
+
+async def test_sqlite_logical_type_profile_is_bounded_and_exposes_no_values():
+    sqlite = SQLitePlugin(path=":memory:")
+    runtime = DbRuntime(plugins=(sqlite,))
+    await runtime.setup(agent_id="db-runtime-test")
+    await sqlite.execute_script("""
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            timestamp_named_only TEXT NOT NULL
+        );
+        INSERT INTO events (id, created_at, timestamp_named_only) VALUES
+            (1, '2026-01-02T10:00:00Z', 'not a timestamp'),
+            (2, '2026-01-03T11:00:00Z', 'still arbitrary');
+        """)
+
+    try:
+        proven = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={
+                "table": "events",
+                "column": "created_at",
+                "profile_kind": "logical_type_validation",
+                "max_values": 64,
+            },
+        )
+        arbitrary = await runtime.execute_capability(
+            "db.column_values.profile",
+            owner="sqlite",
+            operation_type="source.profile",
+            input={
+                "table": "events",
+                "column": "timestamp_named_only",
+                "profile_kind": "logical_type_validation",
+                "max_values": 64,
+            },
+        )
+    finally:
+        await runtime.teardown()
+
+    payload = proven[0].payload
+    assert payload["logical_type"] == "timestamp"
+    assert payload["logical_type_proof"]["method"] == "bounded_value_profile"
+    assert payload["logical_type_proof"]["representation"] == ("iso8601_utc_second")
+    assert payload["logical_type_proof"]["all_values_matched"] is True
+    assert payload["logical_type_proof"]["values_exposed"] is False
+    assert payload["policy"]["sample_limit"] == 64
+    assert payload["policy"]["raw_values_persisted"] is False
+    assert payload["top_values"] == []
+    assert "2026-01-02T10:00:00Z" not in str(payload)
+    assert "logical_type" not in arbitrary[0].payload
+    assert arbitrary[0].payload["top_values"] == []
+    assert "not a timestamp" not in str(arbitrary[0].payload)
 
 
 async def test_sqlite_column_value_profile_fingerprint_only_uses_live_revision():

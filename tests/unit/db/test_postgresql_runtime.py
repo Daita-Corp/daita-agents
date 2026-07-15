@@ -437,6 +437,75 @@ async def test_postgresql_column_value_profile_uses_bounded_aggregate_sql():
     )
 
 
+async def test_postgresql_explicit_profile_registration_skips_schema_inspection():
+    postgres = _postgres()
+    captured = []
+
+    async def fake_query(sql, params=None):
+        captured.append((sql, params))
+        if "COUNT(DISTINCT" in sql:
+            return [
+                {
+                    "row_count": 1,
+                    "null_count": 0,
+                    "distinct_count": 1,
+                    "max_value_length": 8,
+                }
+            ]
+        return [{"value": "complete", "count": 1}]
+
+    async def fail_schema_inspection():
+        raise AssertionError("explicit registration must not inspect schema")
+
+    postgres.query = fake_query
+    postgres.tables = fail_schema_inspection
+    postgres.connect = _noop_connect
+    catalog = CatalogPlugin(auto_persist=False)
+    await catalog.register_schema(
+        {
+            "database_type": "postgresql",
+            "database_name": "shop",
+            "tables": [
+                {
+                    "name": "orders",
+                    "columns": [{"name": "status", "data_type": "text"}],
+                }
+            ],
+        },
+        store_type="postgresql",
+        store_id="store:pg-explicit",
+        persist=False,
+    )
+    runtime = DbRuntime(plugins=(catalog, postgres))
+
+    raw_profile = await runtime.execute_capability(
+        "db.column_values.profile",
+        owner="postgresql",
+        operation_type="source.profile",
+        input={"table": "orders", "column": "status", "max_values": 25},
+    )
+    registered = await runtime.execute_capability(
+        "catalog.column_values.register",
+        owner="catalog",
+        operation_type="source.profile",
+        operation_id="postgresql-explicit-profile-registration",
+        input={
+            "store_id": "store:pg-explicit",
+            "profiles": [raw_profile[0].payload],
+            "source_evidence_id": raw_profile[0].id,
+        },
+    )
+    tasks = await runtime.store.list_tasks(
+        "postgresql-explicit-profile-registration"
+    )
+
+    assert len(captured) == 2
+    assert registered[0].accepted is True
+    assert [task.capability_id for task in tasks] == [
+        "catalog.column_values.register"
+    ]
+
+
 async def test_postgresql_column_value_profile_fingerprint_only_uses_catalog_stats():
     postgres = _postgres()
     captured = []

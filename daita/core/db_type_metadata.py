@@ -99,13 +99,20 @@ def column_type_metadata(
     """Build the typed monitor parameter column contract from schema metadata."""
 
     db_type = (
-        column.get("data_type")
+        column.get("physical_type")
+        or column.get("data_type")
         or column.get("type")
         or column.get("column_type")
         or column.get("db_type")
     )
     native_type = column.get("native_type") or native_type_from_db_type(db_type)
-    dialect = schema.get("sql_dialect") or schema.get("database_type")
+    dialect = (
+        column.get("database_dialect")
+        or column.get("dialect")
+        or schema.get("sql_dialect")
+        or schema.get("database_dialect")
+        or schema.get("database_type")
+    )
     if not (db_type and native_type and dialect):
         return None
     payload: dict[str, Any] = {
@@ -118,6 +125,12 @@ def column_type_metadata(
     nullable = nullable_value(column.get("is_nullable"))
     if nullable is not None:
         payload["nullable"] = nullable
+    logical_type = str(column.get("logical_type") or "").strip()
+    if logical_type:
+        payload["logical_type"] = logical_type
+    proof = column.get("logical_type_proof")
+    if isinstance(proof, Mapping) and proof.get("representation"):
+        payload["logical_representation"] = str(proof["representation"])
     return payload
 
 

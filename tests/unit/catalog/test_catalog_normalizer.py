@@ -5,6 +5,7 @@ Tests for catalog normalizer: deduplication, fingerprinting, and environment inf
 import pytest
 
 from daita.plugins.catalog.base_discoverer import DiscoveredStore
+from daita.plugins.catalog.base_profiler import NormalizedSchema
 from daita.plugins.catalog.normalizer import (
     deduplicate_stores,
     infer_environment,
@@ -30,6 +31,58 @@ def _make_store(**kwargs) -> DiscoveredStore:
     }
     defaults.update(kwargs)
     return DiscoveredStore(**defaults)
+
+
+def test_normalized_schema_preserves_generic_column_traits():
+    schema = NormalizedSchema.from_dict(
+        {
+            "database_type": "sqlite",
+            "database_name": "orders",
+            "tables": [
+                {
+                    "name": "events",
+                    "columns": [
+                        {
+                            "name": "event_id",
+                            "data_type": "INTEGER",
+                            "is_nullable": "NO",
+                            "is_primary_key": True,
+                            "physical_type": "INTEGER",
+                            "native_type": "integer",
+                            "database_dialect": "sqlite",
+                            "is_identity": True,
+                            "is_generated": True,
+                            "is_autoincrement": True,
+                            "is_monotonic": True,
+                            "identity_proof": {
+                                "source_kind": "sqlite_schema",
+                                "monotonic": True,
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    ).to_dict()
+
+    column = schema["tables"][0]["columns"][0]
+    assert column == {
+        "name": "event_id",
+        "type": "INTEGER",
+        "nullable": False,
+        "is_primary_key": True,
+        "physical_type": "INTEGER",
+        "native_type": "integer",
+        "database_dialect": "sqlite",
+        "is_identity": True,
+        "is_generated": True,
+        "is_autoincrement": True,
+        "is_monotonic": True,
+        "identity_proof": {
+            "source_kind": "sqlite_schema",
+            "monotonic": True,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

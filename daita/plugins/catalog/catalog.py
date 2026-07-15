@@ -15,6 +15,8 @@ from collections import deque
 from dataclasses import asdict
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from daita.core.db_type_metadata import native_type_from_db_type
+
 from ..base import DomainServicePlugin, PluginContext
 from .base_discoverer import (
     BaseDiscoverer,
@@ -793,6 +795,9 @@ class CatalogPlugin(DomainServicePlugin):
         result: Dict[str, Any] = {
             "success": True,
             "store_id": store_id,
+            "database_type": schema.get("database_type"),
+            "database_name": schema.get("database_name") or schema.get("schema"),
+            "database_dialect": schema.get("database_type"),
             "asset": _asset_summary(table, store_id=store_id),
         }
         value_profiles = _column_value_profiles(schema)
@@ -803,6 +808,9 @@ class CatalogPlugin(DomainServicePlugin):
                         _field_summary(
                             field,
                             blocked_fields=blocked,
+                            store_id=store_id,
+                            asset_ref=str(table.get("name") or asset_ref),
+                            database_dialect=str(schema.get("database_type") or ""),
                             value_profile=_fresh_column_value_profile(
                                 value_profiles.get(
                                     f"{table.get('name')}.{field.get('name')}"
@@ -1042,6 +1050,7 @@ class CatalogPlugin(DomainServicePlugin):
                     "match_reasons": reasons[:8],
                     "distinct_count": profile.get("distinct_count"),
                     "top_values": list(profile.get("top_values") or [])[:25],
+                    "profile_kind": profile.get("profile_kind") or "categorical_values",
                     "profile_status": profile.get("profile_status") or "profiled",
                     "sampled": bool(profile.get("sampled", False)),
                     "redacted": bool(profile.get("redacted", False)),
@@ -1684,14 +1693,84 @@ def _field_summary(
     field: Dict[str, Any],
     *,
     blocked_fields: set[str],
+    store_id: str,
+    asset_ref: str,
+    database_dialect: str,
     value_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    physical_type = field.get("physical_type") or field.get("type")
+    native_type = field.get("native_type") or native_type_from_db_type(physical_type)
     out = {
         "name": field.get("name"),
         "type": field.get("type"),
+        "physical_type": physical_type,
+        "native_type": native_type,
+        "database_dialect": field.get("database_dialect") or database_dialect,
         "nullable": field.get("nullable"),
         "is_primary_key": bool(field.get("is_primary_key")),
     }
+    for key in (
+        "is_identity",
+        "is_generated",
+        "is_autoincrement",
+        "is_monotonic",
+        "default_value",
+        "extra",
+    ):
+        if field.get(key) is not None:
+            out[key] = field[key]
+
+    field_name = str(field.get("name") or "")
+    identity_proof = field.get("identity_proof")
+    if isinstance(identity_proof, dict) and identity_proof:
+        out["identity_proof"] = {
+            **identity_proof,
+            "owner": "catalog",
+            "store_id": store_id,
+            "asset_ref": asset_ref,
+            "column": field_name,
+            "database_dialect": database_dialect,
+        }
+
+    logical_type = field.get("logical_type")
+    logical_type_proof = field.get("logical_type_proof")
+    if not logical_type:
+        if native_type == "datetime":
+            logical_type = "timestamp"
+        elif native_type == "date":
+            logical_type = "date"
+        if logical_type:
+            logical_type_proof = {
+                "owner": "catalog",
+                "source_kind": "declared_physical_type",
+                "confidence": 1.0,
+                "physical_type": physical_type,
+                "store_id": store_id,
+                "asset_ref": asset_ref,
+                "column": field_name,
+                "database_dialect": database_dialect,
+            }
+
+    profiled_logical_type = _profiled_logical_type_trait(
+        value_profile,
+        store_id=store_id,
+        asset_ref=asset_ref,
+        column=field_name,
+        database_dialect=database_dialect,
+    )
+    if profiled_logical_type is not None:
+        logical_type, logical_type_proof = profiled_logical_type
+    if logical_type:
+        out["logical_type"] = logical_type
+    if isinstance(logical_type_proof, dict) and logical_type_proof:
+        out["logical_type_proof"] = {
+            **logical_type_proof,
+            "owner": "catalog",
+            "store_id": store_id,
+            "asset_ref": asset_ref,
+            "column": field_name,
+            "database_dialect": database_dialect,
+        }
     comment = field.get("column_comment") or field.get("comment")
     if comment:
         out["comment"] = _truncate(str(comment), 160)
@@ -1700,6 +1779,59 @@ def _field_summary(
     if value_profile and _catalog_inline_value_profile_eligible(value_profile):
         out["column_value_hint"] = _column_value_hint_projection(value_profile)
     return out
+
+
+def _profiled_logical_type_trait(
+    profile: Optional[Dict[str, Any]],
+    *,
+    store_id: str,
+    asset_ref: str,
+    column: str,
+    database_dialect: str,
+) -> tuple[str, Dict[str, Any]] | None:
+    if not isinstance(profile, dict):
+        return None
+    if (
+        profile.get("profile_status") != "profiled"
+        or profile.get("stale")
+        or profile.get("redacted")
+    ):
+        return None
+    logical_type = str(profile.get("logical_type") or "").strip().lower()
+    proof = profile.get("logical_type_proof")
+    if logical_type not in {"timestamp", "date"} or not isinstance(proof, dict):
+        return None
+    try:
+        confidence = float(proof.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        proof.get("method") != "bounded_value_profile"
+        or proof.get("all_values_matched") is not True
+        or proof.get("lexicographically_sortable") is not True
+        or not profile.get("source_evidence_id")
+        or confidence < 0.9
+    ):
+        return None
+    profile_table = str(profile.get("table") or "")
+    profile_column = str(profile.get("column") or "")
+    if profile_table != asset_ref or profile_column != column:
+        return None
+    return (
+        logical_type,
+        {
+            **proof,
+            "owner": "catalog",
+            "source_kind": "schema.column_value_profile",
+            "profile_ref": f"{profile_table}.{profile_column}",
+            "source_evidence_id": profile.get("source_evidence_id"),
+            "source_fingerprint": profile.get("source_fingerprint"),
+            "store_id": store_id,
+            "asset_ref": asset_ref,
+            "column": column,
+            "database_dialect": database_dialect,
+        },
+    )
 
 
 def _column_value_profiles(schema: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -1794,8 +1926,18 @@ def _schema_structure_fingerprint(schema: Dict[str, Any]) -> str:
                     {
                         "name": column.get("name"),
                         "type": column.get("type") or column.get("data_type"),
+                        "physical_type": column.get("physical_type"),
+                        "native_type": column.get("native_type"),
+                        "database_dialect": column.get("database_dialect"),
                         "nullable": column.get("nullable"),
                         "is_primary_key": column.get("is_primary_key"),
+                        "is_identity": column.get("is_identity"),
+                        "is_generated": column.get("is_generated"),
+                        "is_autoincrement": column.get("is_autoincrement"),
+                        "is_monotonic": column.get("is_monotonic"),
+                        "identity_proof": column.get("identity_proof"),
+                        "logical_type": column.get("logical_type"),
+                        "logical_type_proof": column.get("logical_type_proof"),
                         "comment": column.get("column_comment")
                         or column.get("comment"),
                     }
@@ -1853,6 +1995,8 @@ def _fresh_column_value_profile(
 
 
 def _catalog_inline_value_profile_eligible(profile: Dict[str, Any]) -> bool:
+    if profile.get("profile_kind") != "categorical_values":
+        return False
     if profile.get("profile_status") != "profiled":
         return False
     if profile.get("stale") or profile.get("redacted") or profile.get("sampled"):
@@ -2304,6 +2448,12 @@ def _normalize_column_value_profile(
         else:
             normalized_values.append(NormalizedColumnValue(value=item))
 
+    logical_type_proof = dict(raw.get("logical_type_proof", {}) or {})
+    if logical_type_proof:
+        logical_type_proof.setdefault("source_evidence_id", source_evidence_id)
+        logical_type_proof.setdefault(
+            "source_owner", str(raw.get("source_owner") or "connector")
+        )
     profile = NormalizedColumnValueProfile(
         table=str(raw.get("table") or raw.get("table_name") or ""),
         column=str(raw.get("column") or raw.get("column_name") or ""),
@@ -2325,6 +2475,8 @@ def _normalize_column_value_profile(
         source_fingerprint_status=raw.get("source_fingerprint_status"),
         source_fingerprint_reason=raw.get("source_fingerprint_reason"),
         source_revision=raw.get("source_revision"),
+        logical_type=raw.get("logical_type"),
+        logical_type_proof=logical_type_proof,
     )
     if profile.profile_status == "profiled" and profile.redacted:
         profile.profile_status = "redacted"

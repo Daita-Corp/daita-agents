@@ -444,8 +444,7 @@ def _action_input_hints() -> dict[str, Any]:
                         "interval_seconds": 300,
                     },
                     "delivery": {
-                        "delivery_kind": "local | in_app | email | slack",
-                        "target": {},
+                        "delivery_kind": "registered monitor delivery kind",
                     },
                     "display": {
                         "explicit_name": "optional name",
@@ -453,6 +452,21 @@ def _action_input_hints() -> dict[str, Any]:
                     },
                     "policy": {},
                     "budget": {},
+                },
+                "delivery_contract": {
+                    "optional": "target is optional.",
+                    "omission": (
+                        "Omit target when the user did not provide a delivery "
+                        "target."
+                    ),
+                    "grounding": (
+                        "Include an explicit target only when grounded in the user "
+                        "request or runtime state."
+                    ),
+                    "explicit_empty": (
+                        "An explicit empty object is not equivalent to omission "
+                        "and is invalid."
+                    ),
                 },
                 "owner": {},
             },
