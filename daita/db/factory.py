@@ -199,6 +199,8 @@ async def from_db(
     )
     try:
         await db_runtime.setup(agent_id=name)
+        if source_plugin.manifest.id == "sqlite" and db_llm_service.available:
+            await db_runtime.prepare_sqlite_slim_source()
         if memory_config.enabled and memory_config.calibrate:
             await calibrate_db_memory(
                 db_runtime,

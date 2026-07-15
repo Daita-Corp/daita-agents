@@ -19,7 +19,8 @@ from daita.runtime import (
 )
 
 from ..evidence import evidence_in_task_plan_order
-from ..loop import DbAgentLoop, DbLoopResult
+from ..loop import DbLoopResult
+from ..loop.legacy import DbLegacyAgentLoop as DbAgentLoop
 from ..models import (
     DbIntent,
     DbIntentKind,

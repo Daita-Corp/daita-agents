@@ -3,7 +3,7 @@ import json
 
 from daita.core.exceptions import ValidationError
 from daita.db import DbRuntime, DbRuntimeConfig
-from daita.db.loop import DbAgentLoop
+from daita.db.loop.legacy import DbLegacyAgentLoop as DbAgentLoop
 from daita.db.llm_service import DbLLMResponse
 from daita.db.plan_validation import DbQueryPlanValidator
 from daita.db.planner_protocol import (
@@ -426,13 +426,15 @@ async def test_blocked_column_sql_validation_is_terminal_blocked():
     sqlite = SQLitePlugin(path=":memory:", blocked_columns=["refunds.amount"])
     runtime = DbRuntime(plugins=(catalog, sqlite))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE refunds (
             id INTEGER PRIMARY KEY,
             amount REAL NOT NULL
         );
         INSERT INTO refunds (id, amount) VALUES (1, 35.0);
-        """)
+        """
+    )
     planner = _BlockedColumnPlanner()
 
     try:
@@ -466,7 +468,8 @@ async def test_blocked_column_sql_validation_is_terminal_blocked():
 
 
 async def _seed(plugin: SQLitePlugin) -> None:
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             email TEXT NOT NULL
@@ -478,7 +481,8 @@ async def _seed(plugin: SQLitePlugin) -> None:
         );
         INSERT INTO customers (id, email) VALUES (1, 'ada@example.com');
         INSERT INTO orders (id, customer_id, total) VALUES (10, 1, 42.5);
-        """)
+        """
+    )
 
 
 async def test_propose_sql_read_builds_context_prerequisite_and_query_plan_succeeds():
@@ -514,14 +518,16 @@ async def test_propose_sql_read_builds_context_prerequisite_and_query_plan_succe
         db_llm_service=llm_service,
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'pending');
-        """)
+        """
+    )
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -890,14 +896,16 @@ async def test_catalog_column_value_search_profiles_dotted_target_before_search(
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'complete'), (3, 'pending');
-        """)
+        """
+    )
     try:
         operation = await runtime.kernel.create_operation(
             operation_type="data.query",
@@ -971,14 +979,16 @@ async def test_catalog_column_value_search_profiles_dotted_input_target_before_s
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'complete'), (3, 'pending');
-        """)
+        """
+    )
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -1039,7 +1049,8 @@ async def test_planning_context_value_hints_profile_catalog_target_before_contex
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
@@ -1047,7 +1058,8 @@ async def test_planning_context_value_hints_profile_catalog_target_before_contex
         );
         INSERT INTO orders (id, status, total)
         VALUES (1, 'complete', 120.0), (2, 'pending', 80.0);
-        """)
+        """
+    )
     executed_capabilities = []
     original_execute_task = runtime.kernel.execute_task
 
@@ -1170,7 +1182,8 @@ async def test_planning_context_value_grounding_does_not_require_known_prompt_ke
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE account_revenue (
             id INTEGER PRIMARY KEY,
             loyalty_band TEXT NOT NULL,
@@ -1178,7 +1191,8 @@ async def test_planning_context_value_grounding_does_not_require_known_prompt_ke
         );
         INSERT INTO account_revenue (id, loyalty_band, amount)
         VALUES (1, 'platinum', 1200.0), (2, 'gold', 800.0);
-        """)
+        """
+    )
 
     try:
         schema = await runtime.execute_capability(
@@ -1285,7 +1299,8 @@ async def test_planning_context_general_prompt_does_not_profile_values_without_f
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             lifecycle_state TEXT NOT NULL,
@@ -1294,7 +1309,8 @@ async def test_planning_context_general_prompt_does_not_profile_values_without_f
         );
         INSERT INTO customers (id, lifecycle_state, customer_segment, revenue)
         VALUES (1, 'active', 'enterprise', 1200.0), (2, 'active', 'startup', 800.0);
-        """)
+        """
+    )
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -1359,7 +1375,8 @@ async def test_validation_fact_value_grounding_profiles_only_target_column():
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
@@ -1373,7 +1390,8 @@ async def test_validation_fact_value_grounding_profiles_only_target_column():
         VALUES (1, 'complete', 'web'), (2, 'pending', 'store');
         INSERT INTO customers (id, status)
         VALUES (1, 'active'), (2, 'inactive');
-        """)
+        """
+    )
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -1508,7 +1526,8 @@ async def test_validation_grounding_runtime_context_precedes_planner_search_choi
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
@@ -1516,7 +1535,8 @@ async def test_validation_grounding_runtime_context_precedes_planner_search_choi
         );
         INSERT INTO orders (id, status, channel)
         VALUES (1, 'complete', 'web'), (2, 'pending', 'store');
-        """)
+        """
+    )
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -1785,7 +1805,8 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
         db_llm_service=llm_service,
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
@@ -1793,7 +1814,8 @@ async def test_validation_grounding_repair_replans_with_refreshed_context():
         );
         INSERT INTO orders (id, status, channel)
         VALUES (1, 'complete', 'web'), (2, 'pending', 'store');
-        """)
+        """
+    )
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -1946,7 +1968,8 @@ async def test_runtime_validation_repair_executes_after_plan_is_durable():
         db_llm_service=llm_service,
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
@@ -1954,7 +1977,8 @@ async def test_runtime_validation_repair_executes_after_plan_is_durable():
         );
         INSERT INTO orders (id, status, channel)
         VALUES (1, 'complete', 'web'), (2, 'pending', 'store');
-        """)
+        """
+    )
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -2024,7 +2048,8 @@ async def test_session_scope_value_grounding_profiles_non_keyword_value():
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             fulfillment_status TEXT NOT NULL,
@@ -2032,7 +2057,8 @@ async def test_session_scope_value_grounding_profiles_non_keyword_value():
         );
         INSERT INTO orders (id, fulfillment_status, channel)
         VALUES (1, 'fulfilled', 'web'), (2, 'queued', 'store');
-        """)
+        """
+    )
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -2123,14 +2149,16 @@ async def test_existing_catalog_profile_grounding_does_not_profile_again():
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'pending');
-        """)
+        """
+    )
 
     try:
         schema = await runtime.execute_capability(
@@ -2231,14 +2259,16 @@ async def test_value_grounding_skipped_budget_target_does_not_profile():
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'pending');
-        """)
+        """
+    )
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -2315,14 +2345,16 @@ async def test_catalog_column_value_profile_prerequisite_requires_contract_decla
         plugins=(catalog, sqlite),
     )
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status)
         VALUES (1, 'complete'), (2, 'pending');
-        """)
+        """
+    )
 
     try:
         operation = await runtime.kernel.create_operation(
@@ -2453,14 +2485,16 @@ async def test_sqlite_column_value_profile_registers_with_catalog():
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(catalog, sqlite))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status)
         VALUES ('complete'), ('complete'), ('pending');
-        """)
+        """
+    )
 
     try:
         schema_evidence = await runtime.execute_capability(
@@ -2520,13 +2554,15 @@ async def test_sqlite_column_value_profile_fingerprint_only_uses_live_revision()
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(sqlite,))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status) VALUES ('complete'), ('pending');
-        """)
+        """
+    )
 
     try:
         fingerprint = await runtime.execute_capability(
@@ -2658,10 +2694,12 @@ async def test_sqlite_column_value_profile_honors_source_value_policy():
     sqlite = SQLitePlugin(path=":memory:", redact_pii_columns=False)
     runtime = DbRuntime(plugins=(sqlite,))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE customers (email TEXT NOT NULL);
         INSERT INTO customers (email) VALUES ('user@example.com');
-        """)
+        """
+    )
     try:
         profiled = await runtime.execute_capability(
             "db.column_values.profile",
@@ -2684,14 +2722,16 @@ async def test_sqlite_column_value_profile_skips_when_row_count_exceeds_limit():
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(plugins=(sqlite,))
     await runtime.setup(agent_id="db-runtime-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (status)
         VALUES ('complete'), ('complete'), ('pending');
-        """)
+        """
+    )
 
     try:
         raw_profile = await runtime.execute_capability(

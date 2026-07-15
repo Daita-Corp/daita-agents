@@ -474,6 +474,12 @@ def aggregate_model_calls(
     diagnostic_calls = _deduplicate_diagnostic_calls(diagnostic_calls)
     trace_calls = _model_calls_from_traces(traces)
     calls = _merge_trace_and_diagnostic_calls(trace_calls, diagnostic_calls)
+    calls.sort(
+        key=lambda call: (
+            call.get("turn") is None,
+            int(call.get("turn") or 0),
+        )
+    )
     summary = _model_call_summary(calls, provider_delta=provider_delta)
     return {"calls": calls, "summary": summary}
 
@@ -506,7 +512,7 @@ def _model_calls_from_record(
     return [
         _normalized_model_call(
             candidate,
-            stage=stage,
+            stage=_provider_native_stage(candidate) or stage,
             turn=turn,
             task_id=task_id,
             source=source,
@@ -761,6 +767,13 @@ def _merge_trace_and_diagnostic_calls(
                 trace[key] = _unique_mappings(
                     [*trace.get(key, ()), *diagnostic.get(key, ())]
                 )
+            elif key == "stage" and value in {
+                "operation_selection",
+                "final_answer",
+            }:
+                trace[key] = value
+            elif key == "model_parameters" and value and not trace.get(key):
+                trace[key] = value
             elif value is not None and (trace.get(key) is None or key in _TOKEN_FIELDS):
                 trace[key] = value
     return merged
@@ -1227,6 +1240,15 @@ def _model_stage(*, kind: str, capability_id: str) -> str:
     return "unknown"
 
 
+def _provider_native_stage(diagnostics: dict[str, Any]) -> str | None:
+    purpose = str(diagnostics.get("purpose") or "")
+    if purpose == "operation":
+        return "operation_selection"
+    if purpose == "final_answer":
+        return "final_answer"
+    return None
+
+
 def _explicit_call_id(diagnostics: dict[str, Any]) -> str | None:
     for key in ("model_call_id", "call_id", "response_id", "request_id"):
         if diagnostics.get(key):
@@ -1324,6 +1346,9 @@ def _sql_measurement(
 ) -> dict[str, Any]:
     planned = None
     executed = None
+    validated_fingerprint = None
+    execution_input_fingerprint = None
+    safety_facts: dict[str, Any] = {}
     execution = _mapping(diagnostics.get("execution"))
     if isinstance(execution.get("planned_sql"), str):
         planned = execution["planned_sql"]
@@ -1335,12 +1360,29 @@ def _sql_measurement(
             continue
         if record.get("kind") == "query.result" and record.get("accepted", True):
             executed = sql
+            execution_input_fingerprint = _optional_string(
+                payload.get("sql_fingerprint")
+            )
         elif record.get("kind") in {
             "query.plan.proposal",
             "query.plan.validation",
             "sql.validation",
         }:
             planned = sql
+            if record.get("kind") == "sql.validation":
+                validated_fingerprint = _optional_string(payload.get("sql_fingerprint"))
+                safety_facts = {
+                    key: payload[key]
+                    for key in (
+                        "valid",
+                        "statement_type",
+                        "is_read",
+                        "has_limit",
+                        "tables",
+                        "columns",
+                    )
+                    if key in payload
+                }
     if planned is None:
         for task in tasks:
             planned = _first_sql(_mapping(_record_value(task, "input"))) or planned
@@ -1350,6 +1392,14 @@ def _sql_measurement(
         "read_only": _sql_read_only(executed or planned),
         "planned_present": planned is not None,
         "executed_present": executed is not None,
+        "validated_fingerprint": validated_fingerprint,
+        "execution_input_fingerprint": execution_input_fingerprint,
+        "fingerprint_preserved": bool(
+            validated_fingerprint
+            and execution_input_fingerprint
+            and validated_fingerprint == execution_input_fingerprint
+        ),
+        "safety_facts": safety_facts,
     }
 
 
@@ -1380,6 +1430,17 @@ def _context_size_measurement(
         _optional_number(call.get("prompt_chars"))
         for call in model_call_telemetry.get("calls", ())
     ]
+    if observation_chars == 0:
+        observed_call_sizes = [
+            _optional_number(call.get("observation_chars"))
+            for call in model_call_telemetry.get("calls", ())
+        ]
+        observation_chars = int(
+            max(
+                (value for value in observed_call_sizes if value is not None),
+                default=0,
+            )
+        )
     return {
         "prompt_context_chars_by_section": sections,
         "model_visible_observation_chars": observation_chars,
@@ -1388,9 +1449,10 @@ def _context_size_measurement(
 
 
 def _repair_count(tasks: Iterable[Any], evidence: Iterable[Any]) -> int:
+    task_tuple = tuple(tasks)
     repair_task_ids = {
         str(_record_value(task, "id"))
-        for task in tasks
+        for task in task_tuple
         if _record_value(task, "capability_id") == "db.query.repair"
     }
     repair_evidence_task_ids = {
@@ -1399,7 +1461,16 @@ def _repair_count(tasks: Iterable[Any], evidence: Iterable[Any]) -> int:
         if _record_value(item, "kind") == "query.plan.repair"
         and _record_value(item, "task_id")
     }
-    return len(repair_task_ids | repair_evidence_task_ids)
+    slim_repair_attempts = {
+        int(attempt)
+        for task in task_tuple
+        if _record_value(task, "capability_id") == "db.sql.validate"
+        and (attempt := _mapping(_record_value(task, "metadata")).get("query_attempt"))
+        and isinstance(attempt, int)
+        and not isinstance(attempt, bool)
+        and attempt > 1
+    }
+    return len(repair_task_ids | repair_evidence_task_ids) + len(slim_repair_attempts)
 
 
 def _catalog_measurement(
@@ -1957,7 +2028,8 @@ def _db_model_call_owners(files: Iterable[Path], repository: Path) -> dict[str, 
                     child.attr
                     for child in ast.walk(node)
                     if isinstance(child, ast.Attribute)
-                    and child.attr in {"generate_json", "generate_synthesis_json"}
+                    and child.attr
+                    in {"generate", "generate_json", "generate_synthesis_json"}
                 }
             )
             if calls:

@@ -548,8 +548,8 @@ async def persist_session_query_scopes(
 ) -> tuple[Evidence, ...]:
     """Persist deterministic query scopes during successful ``db.run`` finalization."""
 
-    if operation.operation_type != "db.run" or not _operation_has_session_scope(
-        operation
+    if operation.operation_type not in {"db.run", "data.query"} or not (
+        _operation_has_session_scope(operation)
     ):
         return ()
 

@@ -10,7 +10,6 @@ import pytest
 from .scale_runner import (
     ScaleBenchmarkParameters,
     aggregate_model_calls,
-    collect_architecture_inventory,
     neutral_artifact_schema,
     operation_record,
     run_scale_benchmark,
@@ -115,6 +114,67 @@ def test_operation_record_accepts_explicit_errors_without_live_dependencies():
         "type": "RuntimeError",
         "message": "connection refused",
     }
+
+
+def test_operation_record_measures_slim_repair_and_model_observation_size():
+    snapshot = type(
+        "Snapshot",
+        (),
+        {
+            "tasks": (
+                {
+                    "id": "validate-1",
+                    "capability_id": "db.sql.validate",
+                    "metadata": {"query_attempt": 1},
+                },
+                {
+                    "id": "validate-2",
+                    "capability_id": "db.sql.validate",
+                    "metadata": {"query_attempt": 2},
+                },
+            ),
+            "evidence": (),
+            "events": (
+                {
+                    "id": "llm-2",
+                    "type": "llm.completed",
+                    "payload": {
+                        "turn": 2,
+                        "slim_model_turn": {
+                            "call_id": "op-1:sqlite-slim:2",
+                            "mode": "llm",
+                            "purpose": "operation",
+                            "provider": "openai",
+                            "model": "contract-model",
+                            "model_parameters": {"temperature": 0},
+                            "prompt_chars": 500,
+                            "observation_chars": 321,
+                            "latency_ms": 10,
+                            "tokens": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 5,
+                                "total_tokens": 15,
+                            },
+                        },
+                    },
+                },
+            ),
+        },
+    )()
+
+    record = operation_record(
+        index=0,
+        latency_ms=20,
+        started_at="2026-01-01T00:00:00+00:00",
+        result=_FakeResult(),
+        snapshot=snapshot,
+    )
+
+    assert record["repair_count"] == 1
+    assert record["context_sizes"]["model_visible_observation_chars"] == 321
+    assert record["model_call_summary"]["call_count"] == 1
+    assert record["model_calls"][0]["stage"] == "operation_selection"
+    assert record["model_calls"][0]["model_parameters"] == {"temperature": 0}
 
 
 def test_model_call_aggregation_counts_all_stages_and_deduplicates_sources():
@@ -352,7 +412,13 @@ def test_operation_record_exposes_synthesis_only_public_telemetry_discrepancy():
 
 
 def test_phase0_inventory_matches_documented_starting_counts():
-    inventory = collect_architecture_inventory(Path.cwd())
+    inventory_path = (
+        Path.cwd()
+        / ".daita/slim-experiment/phase0"
+        / "b87df31873d33fffbf50498f5dc4d8892115e8f8"
+        / "architecture_inventory.json"
+    )
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
 
     for key in (
         "daita_db_lines",
@@ -364,7 +430,7 @@ def test_phase0_inventory_matches_documented_starting_counts():
         "planner_action_members",
     ):
         assert inventory["expected_reconciliation"][key]["matches"]
-    assert inventory["expected_reconciliation"]["db_test_lines"]["delta"] > 0
+    assert inventory["expected_reconciliation"]["db_test_lines"]["matches"]
     assert inventory["db_specific_model_call_owners"]["count"] == 7
     assert inventory["registered_runtime"]["model_visible_tool_view_count"] == 5
     assert inventory["planner_action_kind"]["member_count"] == 27

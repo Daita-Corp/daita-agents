@@ -19,7 +19,79 @@ class DbRuntimeCacheMixin:
     if TYPE_CHECKING:
         config: DbRuntimeConfig
         _schema_profile_cache: dict[str, Any] | None
-        _catalog_source_cache: _SourcePreparationSnapshot | None
+    _catalog_source_cache: _SourcePreparationSnapshot | None
+
+    async def prepare_sqlite_slim_source(self) -> None:
+        """Warm the existing schema/catalog owners before SQLite model turns."""
+
+        registry = getattr(self, "registry", None)
+        if registry is None or "sqlite" not in registry.plugin_ids:
+            return
+        schema_evidence = self.cached_schema_evidence(operation_id="sqlite-slim-warm")
+        if schema_evidence is None:
+            schema_evidence = self.persisted_schema_evidence(
+                operation_id="sqlite-slim-warm"
+            )
+        if schema_evidence is None:
+            inspected = await self.execute_capability(
+                "db.schema.inspect",
+                owner="sqlite",
+                operation_type="source.profile",
+                input={},
+            )
+            schema_evidence = next(
+                (
+                    item
+                    for item in inspected
+                    if item.accepted and item.kind == "schema.asset_profile"
+                ),
+                None,
+            )
+            if schema_evidence is not None:
+                self.remember_schema_evidence(schema_evidence)
+        if schema_evidence is None:
+            return
+
+        options = _from_db_options(self.config.metadata)
+        store_id = str(options.get("catalog_store_id") or "")
+        if not store_id:
+            return
+        try:
+            registry.get_capability("catalog.source.register", owner="catalog")
+        except KeyError:
+            return
+        cached_registration = self.cached_catalog_source_evidence(
+            operation_id="sqlite-slim-warm",
+            schema=dict(schema_evidence.payload),
+            store_id=store_id,
+        )
+        if cached_registration is not None:
+            return
+        registered = await self.execute_capability(
+            "catalog.source.register",
+            owner="catalog",
+            operation_type="source.profile",
+            input={
+                "schema": dict(schema_evidence.payload),
+                "store_type": "sqlite",
+                "store_id": store_id,
+                "persist": False,
+            },
+        )
+        registration = next(
+            (
+                item
+                for item in registered
+                if item.accepted and item.kind == "catalog.source_registered"
+            ),
+            None,
+        )
+        if registration is not None:
+            self.remember_catalog_source_evidence(
+                registration,
+                schema=dict(schema_evidence.payload),
+                store_id=store_id,
+            )
 
     def cached_schema_evidence(self, *, operation_id: str) -> Evidence | None:
         """Return cached schema profile evidence when the runtime cache is fresh."""

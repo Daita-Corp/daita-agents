@@ -246,37 +246,81 @@ class SQLitePlugin(BaseDatabasePlugin):
         }
 
     async def _execute_sql_validate(self, payload: Any) -> Dict[str, Any]:
-        from daita.db.query_sql_validation import sql_statement_facts
+        from daita.core.exceptions import ValidationError
+        from daita.db.query_sql_validation import (
+            sql_fingerprint,
+            sql_statement_facts,
+            validate_sql_against_schema,
+        )
 
         args = dict(payload or {})
         sql = self._normalize_sql(str(args.get("sql") or ""))
         operation = str(args.get("operation") or "query")
         analysis = self._validate_sql_policy(sql, operation=operation)
+        schema = args.get("schema")
+        if isinstance(schema, dict):
+            preflight = validate_sql_against_schema(
+                sql,
+                schema,
+                dialect="sqlite",
+                analysis=analysis,
+            )
+            if preflight.get("ok") is not True:
+                safe_keys = {
+                    "available_columns",
+                    "available_tables",
+                    "column_candidates",
+                    "do_not_retry_same_sql",
+                    "error_type",
+                    "inspect_tables",
+                    "missing_columns",
+                    "repair_required",
+                    "sql_fingerprint",
+                    "table_candidates",
+                    "unknown_tables",
+                }
+                raise ValidationError(
+                    "SQL validation failed against the current catalog schema.",
+                    field="sql",
+                    context={
+                        key: preflight[key] for key in safe_keys if key in preflight
+                    },
+                )
+        statement_facts = sql_statement_facts(sql, analysis)
         return {
             "valid": True,
             "sql": sql,
+            "sql_fingerprint": sql_fingerprint(sql),
             "operation": operation,
             "statement_type": analysis.statement_type,
             "is_read": analysis.is_read,
             "has_limit": analysis.has_limit,
             "tables": [table.short_key for table in analysis.tables],
             "columns": sorted(analysis.referenced_column_names),
-            "statement_facts": sql_statement_facts(sql, analysis),
+            "statement_facts": statement_facts,
         }
 
     async def _execute_sql_read(self, payload: Any) -> Dict[str, Any]:
+        from daita.db.query_sql_validation import sql_fingerprint
+
         args = dict(payload or {})
+        sql = str(args.get("sql") or "")
         params = coerce_sql_params(
             list(args.get("params") or []),
             param_specs_from_payload(args),
             dialect="sqlite",
             json_binding="text",
         )
-        return await self._run_guarded_tool_query(
-            str(args.get("sql") or ""),
+        result = await self._run_guarded_tool_query(
+            sql,
             params,
             args.get("focus"),
         )
+        return {
+            **result,
+            "sql_fingerprint": str(args.get("sql_fingerprint") or sql_fingerprint(sql)),
+            "executed_sql_fingerprint": sql_fingerprint(str(result.get("sql") or "")),
+        }
 
     async def _execute_sql_write(self, payload: Any) -> Dict[str, Any]:
         args = dict(payload or {})

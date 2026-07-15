@@ -1,7 +1,7 @@
 import json
 
 from daita.db import DbRuntime, DbRuntimeConfig
-from daita.db.loop import DbAgentLoop
+from daita.db.loop.legacy import DbLegacyAgentLoop as DbAgentLoop
 from daita.db.loop.grounding import (
     _validation_grounding_runtime_continuation_action,
 )

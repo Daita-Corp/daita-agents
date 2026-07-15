@@ -18,7 +18,11 @@ from .evidence import (
 from .execution import DbTaskExecutor
 from .inputs import executable_input_for_task
 from .models import DbTaskPlan, DbTaskSpec
-from .planning import _validation_capability_for_sql_execute, plan_task_specs
+from .planning import (
+    _validation_capability_for_sql_execute,
+    plan_sqlite_read_recipe,
+    plan_task_specs,
+)
 from .readiness import task_readiness
 from .synthesis import execute_answer_synthesis
 
@@ -67,6 +71,26 @@ class DbTaskRuntime:
             operation,
             specs,
             contract=contract,
+        )
+
+    async def plan_sqlite_read_recipe(
+        self,
+        operation: Operation,
+        *,
+        sql: str,
+        params: Iterable[Any] = (),
+        param_specs: Iterable[Mapping[str, Any]] = (),
+        schema: Mapping[str, Any] | None = None,
+        attempt: int = 1,
+    ) -> DbTaskPlan:
+        return await plan_sqlite_read_recipe(
+            self.context,
+            operation,
+            sql=sql,
+            params=params,
+            param_specs=param_specs,
+            schema=schema,
+            attempt=attempt,
         )
 
     async def task_readiness(

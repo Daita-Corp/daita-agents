@@ -1,5 +1,5 @@
 from daita.db import DbRuntime, DbRuntimeConfig
-from daita.db.loop import DbAgentLoop
+from daita.db.loop.legacy import DbLegacyAgentLoop as DbAgentLoop
 from daita.db.models import DbIntent, DbIntentKind, DbOperationContract, DbRequest
 from daita.db.planner_protocol import (
     DbLoopState,

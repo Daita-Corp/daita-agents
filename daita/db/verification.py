@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from daita.runtime import Evidence, Task
 
 from .models import DbIntent, DbIntentKind, DbOperationContract
+from .sql_evidence import blocked_scope_resources, sql_validation_facts_from_evidence
 
 DB_FINALIZATION_CONTROL_EVIDENCE_KINDS = frozenset(
     {
@@ -20,6 +21,139 @@ DB_FINALIZATION_CONTROL_EVIDENCE_KINDS = frozenset(
         "answer.synthesis",
     }
 )
+
+
+@dataclass(frozen=True)
+class DbSlimReadiness:
+    """Deterministic final-text readiness for the SQLite slim read slice."""
+
+    ready: bool
+    reasons: tuple[str, ...]
+    warnings: tuple[str, ...]
+    query_result: Evidence | None = None
+    validation: Evidence | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ready": self.ready,
+            "reasons": list(self.reasons),
+            "warnings": list(self.warnings),
+            "query_result_ref": _evidence_ref(self.query_result),
+            "validation_ref": _evidence_ref(self.validation),
+            "truncated": bool(
+                self.query_result is not None
+                and self.query_result.payload.get("truncated") is True
+            ),
+        }
+
+
+def db_sqlite_slim_readiness_check(
+    *,
+    operation: Any,
+    evidence: tuple[Evidence, ...],
+    tasks: tuple[Task, ...],
+    answer: str | None = None,
+    expected_owner: str = "sqlite",
+) -> DbSlimReadiness:
+    """Require an applicable accepted read result before accepting DB claims."""
+
+    operation_id = str(getattr(operation, "id", "") or "")
+    request = getattr(operation, "request", None)
+    request = request if isinstance(request, Mapping) else {}
+    metadata = getattr(operation, "metadata", None)
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    raw_scope = request.get("source_scope") or metadata.get("source_scope") or ()
+    source_scope = (
+        (str(raw_scope),)
+        if isinstance(raw_scope, str)
+        else tuple(str(item) for item in raw_scope)
+    )
+    task_order = {task.id: index for index, task in enumerate(tasks)}
+    tasks_by_id = {task.id: task for task in tasks}
+    accepted_validations = {
+        item.task_id: item
+        for item in evidence
+        if item.accepted
+        and item.kind == "sql.validation"
+        and item.operation_id == operation_id
+        and item.owner == expected_owner
+        and item.task_id
+    }
+    applicable: list[tuple[int, Evidence, Evidence]] = []
+    rejection_reasons: set[str] = set()
+    for result in evidence:
+        if result.kind != "query.result" or not result.accepted:
+            continue
+        if result.operation_id != operation_id:
+            rejection_reasons.add("query_result_wrong_operation")
+            continue
+        if result.owner != expected_owner:
+            rejection_reasons.add("query_result_wrong_source")
+            continue
+        task = tasks_by_id.get(str(result.task_id or ""))
+        if task is None or task.capability_id != "db.sql.execute_read":
+            rejection_reasons.add("query_result_missing_read_task")
+            continue
+        if str(task.metadata.get("owner") or "") != expected_owner:
+            rejection_reasons.add("query_task_wrong_source")
+            continue
+        dependency = next(
+            (
+                item
+                for item in task.dependencies
+                if item.kind_value == "evidence"
+                and item.evidence_kind == "sql.validation"
+                and item.operation_id == operation_id
+            ),
+            None,
+        )
+        validation = (
+            accepted_validations.get(dependency.producer_task_id)
+            if dependency is not None
+            else None
+        )
+        if validation is None:
+            rejection_reasons.add("applicable_sql_validation_missing")
+            continue
+        facts = sql_validation_facts_from_evidence(validation)
+        if facts.valid is not True or facts.is_read is not True:
+            rejection_reasons.add("applicable_sql_validation_not_read")
+            continue
+        if blocked_scope_resources(facts.target_resources, source_scope):
+            rejection_reasons.add("query_result_outside_source_scope")
+            continue
+        if task_order.get(str(validation.task_id), -1) >= task_order.get(task.id, -1):
+            rejection_reasons.add("sql_validation_did_not_precede_query_result")
+            continue
+        if not isinstance(result.payload.get("rows"), list):
+            rejection_reasons.add("query_result_rows_not_list")
+            continue
+        applicable.append((task_order.get(task.id, -1), result, validation))
+
+    if not applicable:
+        reasons = tuple(sorted(rejection_reasons)) or (
+            "accepted_current_query_result_required",
+        )
+        return DbSlimReadiness(False, reasons, ())
+
+    _order, query_result, validation = max(applicable, key=lambda item: item[0])
+    warnings: list[str] = []
+    reasons: list[str] = []
+    if query_result.payload.get("truncated") is True:
+        warnings.append("query_result_truncated")
+        normalized_answer = str(answer or "").lower()
+        if answer is not None and not any(
+            marker in normalized_answer
+            for marker in ("truncat", "limited", "first ", "partial")
+        ):
+            reasons.append("truncation_disclosure_required")
+    return DbSlimReadiness(
+        ready=not reasons,
+        reasons=tuple(reasons),
+        warnings=tuple(warnings),
+        query_result=query_result,
+        validation=validation,
+    )
 
 
 @dataclass(frozen=True)
@@ -361,3 +495,14 @@ def _evidence_refs(evidence: tuple[Evidence, ...]) -> tuple[dict[str, str | None
         }
         for item in evidence
     )
+
+
+def _evidence_ref(evidence: Evidence | None) -> dict[str, str | None] | None:
+    if evidence is None:
+        return None
+    return {
+        "id": evidence.id,
+        "kind": evidence.kind,
+        "owner": evidence.owner,
+        "task_id": evidence.task_id,
+    }

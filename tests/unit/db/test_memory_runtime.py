@@ -13,7 +13,7 @@ from daita.db import (
     DbRuntimeConfig,
 )
 from daita.db.analysis import structural_schema_fingerprint
-from daita.db.loop import DbAgentLoop
+from daita.db.loop.legacy import DbLegacyAgentLoop as DbAgentLoop
 from daita.db.llm_planner import _planner_messages
 import daita.db.memory as db_memory_package
 from daita.db.memory.calibration import (

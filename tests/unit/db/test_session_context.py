@@ -5,6 +5,7 @@ import pytest
 from daita.agents.agent import Agent
 from daita.agents.conversation import ConversationHistory
 from daita.db import DbAgent, DbRequest, DbRuntime, DbRuntimeConfig
+from daita.db.llm_service import DbLLMConfig, DbLLMService
 from daita.db.models import (
     DbIntent,
     DbIntentKind,
@@ -86,6 +87,25 @@ class _SessionReadPlanner:
         )
 
 
+class _SessionSlimProvider:
+    provider_name = "scripted"
+    model = "session-slim-test"
+    model_name = model
+
+    def __init__(self, *responses) -> None:
+        self.responses = list(responses)
+
+    async def generate(self, messages, tools=None, stream=False, **kwargs):
+        assert stream is False
+        return self.responses.pop(0)
+
+    def _get_last_token_usage(self):
+        return {}
+
+    def _estimate_cost(self, usage):
+        return 0.0
+
+
 def _scope_read_facts(
     operation_id: str,
     suffix: str,
@@ -154,7 +174,8 @@ def _scope_read_facts(
 
 async def _seed_agent_schema(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE agent_profiles (
             id INTEGER PRIMARY KEY,
             agent_name TEXT NOT NULL
@@ -171,7 +192,8 @@ async def _seed_agent_schema(path):
         INSERT INTO agent_profiles (agent_name) VALUES ('alpha');
         INSERT INTO agent_runs (profile_id, status) VALUES (1, 'ok');
         INSERT INTO billing_events (amount_cents) VALUES (100);
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
@@ -372,30 +394,41 @@ def test_session_query_scope_evidence_captures_safe_runtime_facts():
 
 async def test_successful_db_run_persists_one_scope_and_follow_up_retrieves_it():
     sqlite = SQLitePlugin(path=":memory:")
-    runtime = DbRuntime(
-        config=DbRuntimeConfig(plugins=(sqlite,)),
-        host_services={
-            "db_agent_planner": _SessionReadPlanner(
-                "SELECT id FROM orders WHERE status = 'complete'"
-            )
-        },
+    service = DbLLMService(
+        DbLLMConfig(provider="mock", model="session-slim-test"),
+        agent_id="db-session-scope-test",
     )
-    verification_evidence_kinds = []
-    original_verify = runtime.verifier.verify
-
-    def capture_verification_evidence(contract, intent, evidence, tasks):
-        verification_evidence_kinds.append(tuple(item.kind for item in evidence))
-        return original_verify(contract, intent, evidence, tasks)
-
-    runtime.verifier.verify = capture_verification_evidence
+    service._provider = _SessionSlimProvider(
+        {
+            "tool_calls": [
+                {
+                    "id": "session-query",
+                    "name": "query",
+                    "arguments": {
+                        "sql": ("SELECT id FROM orders WHERE status = 'complete'"),
+                        "params": [],
+                    },
+                }
+            ]
+        },
+        "Order 1 is complete.",
+    )
+    runtime = DbRuntime(
+        source=sqlite,
+        config=DbRuntimeConfig(plugins=(sqlite,)),
+        db_llm_service=service,
+    )
     await runtime.setup(agent_id="db-session-scope-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status) VALUES (1, 'complete'), (2, 'pending');
-        """)
+        """
+    )
+    await runtime.prepare_sqlite_slim_source()
 
     try:
         result = await runtime.run(
@@ -425,8 +458,7 @@ async def test_successful_db_run_persists_one_scope_and_follow_up_retrieves_it()
         item for item in evidence_after_repeat if item.kind == "session.query_scope"
     ]
     assert result.status is OperationStatus.SUCCEEDED
-    assert verification_evidence_kinds
-    assert "session.query_scope" in verification_evidence_kinds[-1]
+    assert result.diagnostics["verification"]["passed"] is True
     assert len(scopes) == 1
     assert repeated == ()
     assert [item.id for item in scopes_after_repeat] == [item.id for item in scopes]
@@ -602,10 +634,12 @@ async def test_direct_capability_execution_does_not_persist_session_scope():
     sqlite = SQLitePlugin(path=":memory:")
     runtime = DbRuntime(config=DbRuntimeConfig(plugins=(sqlite,)))
     await runtime.setup(agent_id="db-direct-scope-test")
-    await sqlite.execute_script("""
+    await sqlite.execute_script(
+        """
         CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT NOT NULL);
         INSERT INTO orders (id, status) VALUES (1, 'complete');
-        """)
+        """
+    )
 
     try:
         result_evidence = await runtime.execute_capability(

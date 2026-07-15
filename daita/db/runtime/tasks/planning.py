@@ -10,6 +10,7 @@ from daita.runtime import Capability, Operation, Task
 
 from ...fingerprints import persisted_fingerprint
 from ...models import DbOperationContract
+from ...query_sql_validation import sql_fingerprint
 from .common import _json_dict
 from .context import DbTaskContext
 from .dependencies import (
@@ -182,6 +183,89 @@ async def plan_task_specs(
             diagnostics["planned_task_count"] += 1
         prior_by_capability_owner[(capability.id, capability.owner)] = planned[-1]
     return DbTaskPlan(tasks=tuple(planned), diagnostics=diagnostics)
+
+
+async def plan_sqlite_read_recipe(
+    context: DbTaskContext,
+    operation: Operation,
+    *,
+    sql: str,
+    params: Iterable[Any] = (),
+    param_specs: Iterable[Mapping[str, Any]] = (),
+    schema: Mapping[str, Any] | None = None,
+    attempt: int = 1,
+) -> DbTaskPlan:
+    """Plan the fixed SQLite validation/governance/read recipe.
+
+    The model supplies SQL and typed parameter values only. Capability,
+    executor, task, dependency, operation, and source identities remain
+    runtime-owned.
+    """
+
+    validation = context.registry.get_capability("db.sql.validate", owner="sqlite")
+    execute = context.registry.get_capability("db.sql.execute_read", owner="sqlite")
+    normalized_params = list(params)
+    normalized_specs = [dict(item) for item in param_specs]
+    fingerprint = sql_fingerprint(sql)
+    recipe_identity = persisted_fingerprint(
+        {
+            "sql_fingerprint": fingerprint,
+            "params": normalized_params,
+            "param_specs": normalized_specs,
+        }
+    )
+    source_scope = operation.request.get("source_scope") or operation.metadata.get(
+        "source_scope"
+    )
+    if isinstance(source_scope, str):
+        source_scope = (source_scope,)
+    metadata = {
+        "slim_recipe": "sqlite.read",
+        "query_attempt": max(1, int(attempt)),
+        "sql_fingerprint": fingerprint,
+        "source_scope": list(source_scope or ()),
+    }
+    validation_input: dict[str, Any] = {
+        "sql": sql,
+        "operation": "query",
+    }
+    if schema:
+        validation_input["schema"] = dict(schema)
+    specs = (
+        DbTaskSpec(
+            capability_id=validation.id,
+            owner=validation.owner,
+            input=validation_input,
+            reason="slim_sqlite_read:validation",
+            sequence=1,
+            metadata=metadata,
+            deterministic_key=f"slim:sqlite:validate:{recipe_identity}",
+        ),
+        DbTaskSpec(
+            capability_id=execute.id,
+            owner=execute.owner,
+            input={
+                "sql_ref": "sql.validation",
+                "sql_fingerprint": fingerprint,
+                "params": normalized_params,
+                **({"param_specs": normalized_specs} if normalized_specs else {}),
+            },
+            reason="slim_sqlite_read:execute",
+            sequence=2,
+            metadata=metadata,
+            deterministic_key=f"slim:sqlite:execute:{recipe_identity}",
+        ),
+    )
+    plan = await plan_task_specs(context, operation, specs)
+    return DbTaskPlan(
+        tasks=plan.tasks,
+        diagnostics={
+            **plan.diagnostics,
+            "recipe": "db.sql.validate -> governance -> db.sql.execute_read",
+            "sql_fingerprint": fingerprint,
+            "query_attempt": max(1, int(attempt)),
+        },
+    )
 
 
 async def plan_kernel_task(context: DbTaskContext, task: Task) -> Task:

@@ -32,6 +32,7 @@ from daita.skills import SkillResolution, SkillResolver
 
 from ..evidence import evidence_in_task_plan_order
 from ..loop import DbAgentLoop, DbLoopResult
+from ..loop.legacy import DbLegacyAgentLoop
 from ..llm_agent_planner import DbLLMAgentPlanner
 from ..llm_service import DbLLMService
 from ..models import (
@@ -52,7 +53,11 @@ from ..session_context import (
     persist_session_query_scopes,
 )
 from ..synthesis import DbSynthesizer
-from ..verification import DbVerifier, db_run_finalization_check
+from ..verification import (
+    DbVerifier,
+    db_run_finalization_check,
+    db_sqlite_slim_readiness_check,
+)
 from .analysis import DbRuntimeAnalysisMixin
 from .cache import DbRuntimeCacheMixin
 from .extensions import DbRuntimePlanningPlugin
@@ -438,17 +443,28 @@ class DbRuntime(
             await self.setup()
         skill_resolution = self._resolve_skills(db_request)
         safety_frame = build_safety_frame(self.registry, self.config, db_request)
-        intent = _neutral_run_intent()
-        contract = _neutral_run_contract(
-            self.config,
-            request=db_request,
-            registry=self.registry,
-            safety_frame=safety_frame.to_dict(),
-            skill_resolution=skill_resolution,
-        )
+        sqlite_slim = self._uses_sqlite_slim_read()
+        if sqlite_slim:
+            intent = _sqlite_slim_read_intent()
+            contract = _sqlite_slim_read_contract(
+                self.config,
+                request=db_request,
+                registry=self.registry,
+                safety_frame=safety_frame.to_dict(),
+                skill_resolution=skill_resolution,
+            )
+        else:
+            intent = _neutral_run_intent()
+            contract = _neutral_run_contract(
+                self.config,
+                request=db_request,
+                registry=self.registry,
+                safety_frame=safety_frame.to_dict(),
+                skill_resolution=skill_resolution,
+            )
         operation = await self.kernel.create_operation(
             operation_id=operation_id,
-            operation_type="db.run",
+            operation_type=contract.operation_type,
             request={
                 "prompt": db_request.prompt,
                 "user_id": db_request.user_id,
@@ -460,7 +476,7 @@ class DbRuntime(
                 "metadata": db_request.metadata,
                 "session_context": db_request.session_context,
             },
-            required_evidence=frozenset(),
+            required_evidence=frozenset(contract.required_evidence),
             metadata={
                 "intent_kind": intent.kind.value,
                 "access": contract.access.value,
@@ -478,7 +494,12 @@ class DbRuntime(
                 "skills": skill_resolution.to_metadata(),
                 "runtime_limits": self.config.limits.to_dict(),
                 "safety_frame": safety_frame.to_dict(),
-                "loop_state": {"status": "bootstrap"},
+                "loop_state": {
+                    "status": "bootstrap",
+                    "implementation": (
+                        "sqlite_provider_native" if sqlite_slim else "legacy_planner"
+                    ),
+                },
                 "resume_context": {
                     "request": _db_request_context(db_request),
                     "intent": _db_intent_context(intent),
@@ -507,8 +528,10 @@ class DbRuntime(
         if session_context is not None:
             base_diagnostics["session_context"] = session_context.to_diagnostic_dict()
 
-        planner = self._select_db_agent_planner()
-        if planner is None:
+        planner = None if sqlite_slim else self._select_db_agent_planner()
+        if (sqlite_slim and not self.db_llm_service.available) or (
+            not sqlite_slim and planner is None
+        ):
             return await self._record_operation_result(
                 DbOperationResult(
                     operation_id=operation_id,
@@ -530,10 +553,20 @@ class DbRuntime(
             )
 
         try:
-            loop_result = await DbAgentLoop(self, planner).run(
-                operation,
-                safety_frame=safety_frame.to_dict(),
-            )
+            if sqlite_slim:
+                loop_result = await DbAgentLoop(
+                    self,
+                    self.db_llm_service.provider,
+                ).run(
+                    operation,
+                    safety_frame=safety_frame.to_dict(),
+                )
+            else:
+                assert planner is not None
+                loop_result = await DbLegacyAgentLoop(self, planner).run(
+                    operation,
+                    safety_frame=safety_frame.to_dict(),
+                )
         except DbRuntimeGovernanceBlocked as exc:
             return await self._record_operation_result(
                 DbOperationResult(
@@ -559,7 +592,7 @@ class DbRuntime(
                     intent=intent,
                     contract=contract,
                     status=OperationStatus.FAILED,
-                    answer="DB operation failed before final synthesis.",
+                    answer="DB operation failed before completion.",
                     warnings=("db_runtime_execution_failed",),
                     diagnostics={
                         **base_diagnostics,
@@ -570,6 +603,15 @@ class DbRuntime(
             )
 
         if loop_result.status == "finished":
+            if sqlite_slim:
+                return await self._finalize_sqlite_slim_run(
+                    operation_id=operation_id,
+                    request=db_request,
+                    intent=intent,
+                    contract=contract,
+                    loop_result=loop_result,
+                    base_diagnostics=base_diagnostics,
+                )
             return await self._finalize_run_operation(
                 operation_id=operation_id,
                 request=db_request,
@@ -597,7 +639,14 @@ class DbRuntime(
                 warnings=tuple(loop_result.warnings),
                 diagnostics={
                     **base_diagnostics,
-                    "planner": _planner_diagnostics(loop_result),
+                    ("loop" if sqlite_slim else "planner"): _planner_diagnostics(
+                        loop_result
+                    ),
+                    **(
+                        {"telemetry": loop_result.diagnostics["telemetry"]}
+                        if isinstance(loop_result.diagnostics.get("telemetry"), dict)
+                        else {}
+                    ),
                     "execution": _execution_diagnostics(
                         operation=current_operation,
                         tasks=tasks,
@@ -606,6 +655,96 @@ class DbRuntime(
                 },
             ),
             operation=current_operation,
+        )
+
+    def _uses_sqlite_slim_read(self) -> bool:
+        """Select the canonical implementation from the registered connector."""
+
+        return "sqlite" in self.registry.plugin_ids
+
+    async def _finalize_sqlite_slim_run(
+        self,
+        *,
+        operation_id: str,
+        request: DbRequest,
+        intent: DbIntent,
+        contract: DbOperationContract,
+        loop_result: DbLoopResult,
+        base_diagnostics: dict[str, Any],
+    ) -> DbOperationResult:
+        operation = await self.store.load_operation(operation_id)
+        if operation is None:
+            raise KeyError(operation_id)
+        tasks = tuple(await self.store.list_tasks(operation_id))
+        evidence = evidence_in_task_plan_order(
+            await self.store.list_evidence(operation_id),
+            tasks,
+        )
+        await persist_session_query_scopes(
+            self.store,
+            operation,
+            tasks,
+            evidence,
+        )
+        evidence = evidence_in_task_plan_order(
+            await self.store.list_evidence(operation_id),
+            tasks,
+        )
+        answer = str(loop_result.diagnostics.get("final_answer") or "").strip()
+        readiness = db_sqlite_slim_readiness_check(
+            operation=operation,
+            evidence=evidence,
+            tasks=tasks,
+            answer=answer,
+        )
+        if not readiness.ready:
+            return await self._record_operation_result(
+                DbOperationResult(
+                    operation_id=operation_id,
+                    request=request,
+                    intent=intent,
+                    contract=contract,
+                    status=OperationStatus.FAILED,
+                    answer="DB operation could not be grounded in current query evidence.",
+                    evidence=evidence,
+                    warnings=tuple((*loop_result.warnings, *readiness.reasons)),
+                    diagnostics={
+                        **base_diagnostics,
+                        "loop": _planner_diagnostics(loop_result),
+                        "execution": _execution_diagnostics(
+                            operation=operation,
+                            tasks=tasks,
+                            evidence=evidence,
+                        ),
+                        "verification": readiness.to_dict(),
+                        "telemetry": loop_result.diagnostics.get("telemetry", {}),
+                    },
+                ),
+                operation=operation,
+            )
+        return await self._record_operation_result(
+            DbOperationResult(
+                operation_id=operation_id,
+                request=request,
+                intent=intent,
+                contract=contract,
+                status=OperationStatus.SUCCEEDED,
+                answer=answer,
+                evidence=evidence,
+                warnings=tuple((*loop_result.warnings, *readiness.warnings)),
+                diagnostics={
+                    **base_diagnostics,
+                    "loop": _planner_diagnostics(loop_result),
+                    "execution": _execution_diagnostics(
+                        operation=operation,
+                        tasks=tasks,
+                        evidence=evidence,
+                    ),
+                    "verification": readiness.to_dict(),
+                    "telemetry": loop_result.diagnostics.get("telemetry", {}),
+                },
+            ),
+            operation=operation,
         )
 
     def _select_db_agent_planner(self) -> DbAgentPlanner | None:
@@ -971,6 +1110,50 @@ def _neutral_run_intent() -> DbIntent:
     )
 
 
+def _sqlite_slim_read_intent() -> DbIntent:
+    return DbIntent(
+        kind=DbIntentKind.DATA_QUERY,
+        confidence=1.0,
+        access=AccessMode.READ,
+        evidence_mode="sqlite_provider_native",
+        diagnostics={"source": "sqlite_slim_read_slice"},
+    )
+
+
+def _sqlite_slim_read_contract(
+    config: DbRuntimeConfig,
+    *,
+    request: DbRequest,
+    registry: ExtensionRegistry,
+    safety_frame: dict[str, Any],
+    skill_resolution: SkillResolution,
+) -> DbOperationContract:
+    base = _neutral_run_contract(
+        config,
+        request=request,
+        registry=registry,
+        safety_frame=safety_frame,
+        skill_resolution=skill_resolution,
+    )
+    return DbOperationContract(
+        operation_type="data.query",
+        required_capabilities=("db.sql.validate", "db.sql.execute_read"),
+        required_evidence=("query.result",),
+        access=AccessMode.READ,
+        limits=config.limits,
+        policy_ids=base.policy_ids,
+        metadata={
+            **base.metadata,
+            "planned_operation": {
+                "operation_type": "data.query",
+                "access": AccessMode.READ.value,
+                "source": "sqlite_slim_read_slice",
+            },
+            "slim_sqlite": True,
+        },
+    )
+
+
 def _neutral_run_contract(
     config: DbRuntimeConfig,
     *,
@@ -1120,7 +1303,7 @@ def _answer_from_loop_result(loop_result: DbLoopResult) -> str:
         return "This operation was blocked before execution completed."
     if loop_result.status == "budget_exhausted":
         return "The DB planner exhausted its turn budget before finishing."
-    return "DB operation failed before final synthesis."
+    return "DB operation failed before completion."
 
 
 def _intent_diagnostics(intent: DbIntent) -> dict[str, Any]:

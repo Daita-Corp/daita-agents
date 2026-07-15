@@ -35,6 +35,13 @@ class _BlockedPlanner:
         )
 
 
+class _BlockedProjectionSource:
+    read_only = True
+    allowed_tables = set()
+    blocked_tables = set()
+    blocked_columns = {"customers.loyalty_band"}
+
+
 def _projection(mode=ProjectionMode.PLANNER):
     return ProjectionContext(
         mode=mode,
@@ -856,7 +863,7 @@ def test_operation_result_projection_rebuilds_diagnostics_from_allowlists():
     dumped = json.dumps(asdict(projected), default=str, sort_keys=True)
     assert canary not in dumped
     assert projected is not raw_result
-    assert projected.answer == "DB operation failed before final synthesis."
+    assert projected.answer == "DB operation failed before completion."
     assert raw.payload["rows"][0]["loyalty_band"] == canary
     assert raw.metadata["internal"] == canary
     assert raw_result.diagnostics["internal"] == canary
@@ -890,7 +897,7 @@ def test_operation_result_projection_rebuilds_diagnostics_from_allowlists():
         "code": "db_runtime_validation_failed",
     }
     assert projected.diagnostics["trace"] == {"trace_id": "trace-1"}
-    assert projected.diagnostics["synthesis"] == projected.telemetry
+    assert "synthesis" not in projected.diagnostics
     assert projected.evidence[0].metadata == {
         "projection_mode": "public_result",
         "projected": True,
@@ -898,10 +905,9 @@ def test_operation_result_projection_rebuilds_diagnostics_from_allowlists():
 
 
 async def test_non_finished_runtime_result_returns_public_projected_evidence():
-    sqlite = SQLitePlugin(path=":memory:", blocked_columns=["customers.loyalty_band"])
     runtime = DbRuntime(
-        source=sqlite,
-        config=DbRuntimeConfig(plugins=(sqlite,)),
+        source=_BlockedProjectionSource(),
+        config=DbRuntimeConfig(),
         host_services={"db_agent_planner": _BlockedPlanner()},
     )
 

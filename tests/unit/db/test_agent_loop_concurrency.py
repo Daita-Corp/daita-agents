@@ -5,7 +5,7 @@ import pytest
 
 from daita.db import DbRuntime
 from daita.db.evidence import evidence_in_task_plan_order
-from daita.db.loop import DbAgentLoop
+from daita.db.loop.legacy import DbLegacyAgentLoop as DbAgentLoop
 from daita.db.loop.execution import DbLoopTaskBatchExecutor
 from daita.db.models import DbExecutionConfig, DbRuntimeConfig
 from daita.db.planner_protocol import (
@@ -782,27 +782,8 @@ async def test_real_db_agent_loop_max_one_preserves_interleaved_serial_order():
     ]
 
 
-async def test_real_db_agent_loop_overlaps_actual_sqlite_connector_reads():
+async def test_sqlite_runtime_does_not_fallback_to_injected_legacy_planner():
     sqlite = SQLitePlugin(path=":memory:", query_default_limit=10)
-    original_query = sqlite.query
-    both_started = asyncio.Event()
-    release = asyncio.Event()
-    active = 0
-    maximum = 0
-
-    async def synchronized_query(sql, params=None):
-        nonlocal active, maximum
-        active += 1
-        maximum = max(maximum, active)
-        if active == 2:
-            both_started.set()
-        try:
-            await release.wait()
-            return await original_query(sql, params)
-        finally:
-            active -= 1
-
-    sqlite.query = synchronized_query
     runtime = DbRuntime(
         config=DbRuntimeConfig(
             plugins=(sqlite,),
@@ -810,30 +791,15 @@ async def test_real_db_agent_loop_overlaps_actual_sqlite_connector_reads():
         ),
         host_services={"db_agent_planner": _TwoReadPlanner(owner="sqlite")},
     )
-    running = asyncio.create_task(runtime.run("Compare two independent SQLite values."))
     try:
-        try:
-            async with asyncio.timeout(1):
-                await both_started.wait()
-        finally:
-            release.set()
-        result = await asyncio.wait_for(running, timeout=2)
+        result = await runtime.run("Compare two independent SQLite values.")
         snapshot = await runtime.inspect_operation(result.operation_id)
     finally:
-        release.set()
-        if not running.done():
-            running.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await running
         await runtime.teardown()
 
-    assert result.status is OperationStatus.SUCCEEDED
-    assert maximum == 2
-    assert [
-        item.payload["rows"]
-        for item in snapshot.evidence
-        if item.kind == "query.result"
-    ] == [[{"value": 1}], [{"value": 2}]]
+    assert result.status is OperationStatus.BLOCKED
+    assert snapshot.tasks == ()
+    assert snapshot.evidence == ()
 
 
 async def test_unrelated_task_remains_a_plan_order_barrier_for_read_cohort():

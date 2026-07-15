@@ -99,7 +99,11 @@ def validate_sql_against_schema(
 
 
 def sql_fingerprint(sql: str) -> str:
-    normalized = re.sub(r"\s+", " ", (sql or "").strip().lower())
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        (sql or "").strip().rstrip(";").rstrip().lower(),
+    )
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 

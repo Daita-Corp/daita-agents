@@ -3,7 +3,7 @@ from __future__ import annotations
 from daita.agents.agent import Agent
 from daita.core.tracing import TraceType, get_trace_manager
 from daita.db import DbRuntime, DbSourceOptions
-from daita.db.llm_service import DbLLMResponse
+from daita.db.llm_service import DbLLMConfig, DbLLMResponse
 from daita.db.models import (
     DbIntent,
     DbIntentKind,
@@ -31,13 +31,15 @@ from daita.runtime import (
 
 async def _seed_sqlite(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script("""
+    await plugin.execute_script(
+        """
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL
         );
         INSERT INTO customers (name) VALUES ('Ada'), ('Linus');
-        """)
+        """
+    )
     await plugin.disconnect()
 
 
@@ -113,6 +115,39 @@ class FakeTraceMonitorPlanner:
         )
 
 
+class FakeTraceSlimProvider:
+    provider_name = "scripted"
+    model = "trace-slim-test"
+    model_name = model
+
+    def __init__(self):
+        self.responses = [
+            {
+                "tool_calls": [
+                    {
+                        "id": "trace-query",
+                        "name": "query",
+                        "arguments": {
+                            "sql": "SELECT COUNT(*) AS customer_count FROM customers",
+                            "params": [],
+                        },
+                    }
+                ]
+            },
+            "There are 2 customers.",
+        ]
+
+    async def generate(self, messages, tools=None, stream=False, **kwargs):
+        assert stream is False
+        return self.responses.pop(0)
+
+    def _get_last_token_usage(self):
+        return {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+
+    def _estimate_cost(self, usage):
+        return 0.0
+
+
 def _reset_traces():
     trace_manager = get_trace_manager()
     trace_manager.flush(timeout_millis=2000)
@@ -136,37 +171,40 @@ def _finished_span_dicts(trace_manager):
     ]
 
 
-async def test_prompt_monitor_loop_result_has_trace_correlation(tmp_path):
+async def test_sqlite_slim_loop_result_has_trace_correlation(tmp_path):
     trace_manager = _reset_traces()
     db_path = tmp_path / "monitor_trace.sqlite"
     await _seed_sqlite(db_path)
-    planner = FakeTraceMonitorPlanner()
-    host_context = HostRuntimeContext(services={"db_agent_planner": planner})
-    with host_runtime_context(host_context):
-        agent = await Agent.from_db(
-            str(db_path),
-            name="MonitorTraceTest",
-            source_options=DbSourceOptions(cache_ttl=0),
-        )
+    agent = await Agent.from_db(
+        str(db_path),
+        name="SlimTraceTest",
+        source_options=DbSourceOptions(cache_ttl=0),
+        llm=DbLLMConfig(provider="mock", model="trace-slim-test"),
+    )
+    agent.runtime.db_llm_service._provider = FakeTraceSlimProvider()
 
     try:
-        result = await agent.run_detailed("List monitors", session_id="monitor-session")
+        result = await agent.run_detailed(
+            "How many customers?", session_id="trace-session"
+        )
         snapshot = await agent.runtime.inspect_operation(result.operation_id)
     finally:
         await agent.stop()
 
     assert result.status is OperationStatus.SUCCEEDED
     assert snapshot is not None
-    assert len(planner.states) == 1
     trace = result.diagnostics["trace"]
     assert trace == {
         key: value
         for key, value in snapshot.operation.metadata["trace"].items()
         if key in {"trace_id", "root_span_id"}
     }
-    assert snapshot.operation.operation_type == "db.run"
-    assert any(item.kind == "monitor.listing" for item in snapshot.evidence)
-    assert any(item.kind == "answer.synthesis" for item in snapshot.evidence)
+    assert snapshot.operation.operation_type == "data.query"
+    assert {item.kind for item in snapshot.evidence} >= {
+        "sql.validation",
+        "query.result",
+    }
+    assert not any(item.kind == "answer.synthesis" for item in snapshot.evidence)
     assert all(event.trace_id == trace["trace_id"] for event in snapshot.events)
 
     spans = _finished_span_dicts(trace_manager)
@@ -177,7 +215,7 @@ async def test_prompt_monitor_loop_result_has_trace_correlation(tmp_path):
         and span["attributes"].get("daita.trace.type")
         == TraceType.AGENT_EXECUTION.value
     )
-    assert root["attributes"]["daita.operation.type"] == "db.run"
+    assert root["attributes"]["daita.operation.type"] == "data.query"
 
 
 async def test_blocked_operation_keeps_trace_correlation(tmp_path):

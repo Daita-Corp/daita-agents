@@ -43,6 +43,10 @@ class DbTaskCatalog:
         store_id = _catalog_store_id(task_input, self.context.config.metadata)
         if not store_id:
             return task_input
+        if task.metadata.get("slim_catalog_prepared") is True:
+            # The SQLite slim setup recipe registered this store before the
+            # interactive operation. Do not recreate hidden bootstrap tasks.
+            return {**task_input, "store_id": store_id}
         schema_evidence = await latest_evidence(
             self.context,
             operation.id,
