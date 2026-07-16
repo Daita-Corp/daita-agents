@@ -6,7 +6,7 @@ from uuid import UUID
 import pytest
 
 from daita.core.exceptions import ValidationError
-from daita.db import DbRequest, DbRuntime
+from daita.db import DbRequest, DbRuntime, DbRuntimeConfig
 from daita.db.runtime import DbRuntimeGovernanceBlocked
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.postgresql import PostgreSQLPlugin
@@ -15,6 +15,34 @@ from daita.plugins.sql_params import SQLParameterCoercionError, coerce_sql_param
 
 def _postgres() -> PostgreSQLPlugin:
     return PostgreSQLPlugin(connection_string="postgresql://localhost/testdb")
+
+
+def _runtime_with_ready_catalog(postgres: PostgreSQLPlugin) -> DbRuntime:
+    catalog = CatalogPlugin(auto_persist=False)
+
+    async def prepare(runtime, *, source_owner, store_id, profile_key, **_kwargs):
+        catalog._runtime_source_binding = {
+            "runtime": runtime,
+            "source_owner": source_owner,
+            "store_id": store_id,
+            "profile_key": profile_key,
+        }
+        catalog._runtime_source_state = {"status": "ready", "freshness": "fresh"}
+        return dict(catalog._runtime_source_state)
+
+    catalog.prepare_runtime_source = prepare
+    return DbRuntime(
+        config=DbRuntimeConfig(
+            plugins=(catalog, postgres),
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "postgresql-runtime:test",
+                    "catalog_profile_key": "postgresql-runtime:test",
+                    "source_options": {"include_sample_values": False},
+                }
+            },
+        )
+    )
 
 
 async def test_postgresql_registers_provider_neutral_db_capabilities():
@@ -83,7 +111,7 @@ async def test_postgresql_schema_inspect_returns_typed_evidence_through_runtime(
     postgres.describe = fake_describe
     postgres.foreign_keys = fake_foreign_keys
     postgres.connect = _noop_connect
-    runtime = DbRuntime(plugins=(postgres,))
+    runtime = _runtime_with_ready_catalog(postgres)
 
     evidence = await runtime.execute_capability(
         "db.schema.inspect",
@@ -116,7 +144,7 @@ async def test_postgresql_sql_executors_return_typed_evidence_without_live_db():
     postgres.query = fake_query
     postgres.execute = fake_execute
     postgres.connect = _noop_connect
-    runtime = DbRuntime(plugins=(postgres,))
+    runtime = _runtime_with_ready_catalog(postgres)
 
     validation = await runtime.execute_capability(
         "db.sql.validate",
@@ -201,7 +229,7 @@ async def test_postgresql_runtime_supports_two_safe_reads_through_one_pool():
             return None
 
     postgres._pool = Pool()
-    runtime = DbRuntime(plugins=(postgres,))
+    runtime = _runtime_with_ready_catalog(postgres)
     first = asyncio.create_task(
         runtime.execute_capability(
             "db.sql.execute_read",
@@ -368,7 +396,7 @@ async def test_postgresql_column_value_profile_uses_bounded_aggregate_sql():
 
     postgres.query = fake_query
     postgres.connect = _noop_connect
-    runtime = DbRuntime(plugins=(CatalogPlugin(auto_persist=False), postgres))
+    runtime = _runtime_with_ready_catalog(postgres)
 
     raw_profile = await runtime.execute_capability(
         "db.column_values.profile",
@@ -458,7 +486,7 @@ async def test_postgresql_column_value_profile_fingerprint_only_uses_catalog_sta
 
     postgres.query = fake_query
     postgres.connect = _noop_connect
-    runtime = DbRuntime(plugins=(postgres,))
+    runtime = _runtime_with_ready_catalog(postgres)
 
     fingerprint = await runtime.execute_capability(
         "db.column_values.profile",
@@ -492,7 +520,7 @@ async def test_postgresql_column_value_profile_fingerprint_unavailable_has_no_fa
 
     postgres.query = fake_query
     postgres.connect = _noop_connect
-    runtime = DbRuntime(plugins=(postgres,))
+    runtime = _runtime_with_ready_catalog(postgres)
 
     fingerprint = await runtime.execute_capability(
         "db.column_values.profile",
@@ -526,7 +554,7 @@ async def test_postgresql_column_value_profile_fingerprint_only_respects_blocked
 
     postgres.query = fail_query
     postgres.connect = _noop_connect
-    runtime = DbRuntime(plugins=(postgres,))
+    runtime = _runtime_with_ready_catalog(postgres)
 
     full_profile = await runtime.execute_capability(
         "db.column_values.profile",
@@ -562,7 +590,7 @@ async def test_postgresql_column_value_profile_fingerprint_only_respects_sensiti
 
     postgres.query = fail_query
     postgres.connect = _noop_connect
-    runtime = DbRuntime(plugins=(postgres,))
+    runtime = _runtime_with_ready_catalog(postgres)
 
     full_profile = await runtime.execute_capability(
         "db.column_values.profile",
@@ -610,7 +638,7 @@ async def test_postgresql_column_value_profile_handles_schema_qualified_table():
 
     postgres.query = fake_query
     postgres.connect = _noop_connect
-    runtime = DbRuntime(plugins=(postgres,))
+    runtime = _runtime_with_ready_catalog(postgres)
 
     evidence = await runtime.execute_capability(
         "db.column_values.profile",
@@ -633,7 +661,7 @@ async def test_postgresql_column_value_profile_skips_sensitive_columns_without_q
 
     postgres.query = fake_query
     postgres.connect = _noop_connect
-    runtime = DbRuntime(plugins=(postgres,))
+    runtime = _runtime_with_ready_catalog(postgres)
 
     evidence = await runtime.execute_capability(
         "db.column_values.profile",
@@ -658,7 +686,7 @@ async def test_postgresql_column_value_profile_honors_source_value_policy():
 
     samples_disabled.query = fail_query
     samples_disabled.connect = _noop_connect
-    disabled_runtime = DbRuntime(plugins=(samples_disabled,))
+    disabled_runtime = _runtime_with_ready_catalog(samples_disabled)
 
     disabled = await disabled_runtime.execute_capability(
         "db.column_values.profile",
@@ -690,7 +718,7 @@ async def test_postgresql_column_value_profile_honors_source_value_policy():
 
     pii_allowed.query = fake_query
     pii_allowed.connect = _noop_connect
-    pii_runtime = DbRuntime(plugins=(pii_allowed,))
+    pii_runtime = _runtime_with_ready_catalog(pii_allowed)
     profiled = await pii_runtime.execute_capability(
         "db.column_values.profile",
         owner="postgresql",
@@ -725,7 +753,7 @@ async def test_postgresql_column_value_profile_skips_when_row_count_exceeds_limi
 
     postgres.query = fake_query
     postgres.connect = _noop_connect
-    runtime = DbRuntime(plugins=(postgres,))
+    runtime = _runtime_with_ready_catalog(postgres)
 
     evidence = await runtime.execute_capability(
         "db.column_values.profile",

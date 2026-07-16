@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 
 from daita.db import DbRuntime
@@ -159,9 +161,10 @@ def test_catalog_capabilities_are_visible_in_extension_registry():
         "schema.comparison",
     } <= evidence_kinds
     assert {
-        "catalog_search_schema",
-        "catalog_inspect_asset",
-        "catalog_find_relationship_paths",
+        "search_schema",
+        "inspect_asset",
+        "find_relationships",
+        "search_column_values",
     } <= tool_view_names
 
     plan_capability = next(
@@ -188,17 +191,31 @@ def test_catalog_tool_views_expose_strict_required_schemas():
         view.name: view for view in CatalogPlugin(auto_persist=False).get_tool_views()
     }
 
-    search = views["catalog_search_schema"].parameters
-    inspect = views["catalog_inspect_asset"].parameters
-    paths = views["catalog_find_relationship_paths"].parameters
+    search = views["search_schema"].parameters
+    inspect = views["inspect_asset"].parameters
+    paths = views["find_relationships"].parameters
+    values = views["search_column_values"].parameters
 
-    assert search["required"] == ["store_id"]
+    assert search["required"] == ["query"]
     assert search["additionalProperties"] is False
     assert search["properties"]["limit"]["maximum"] == 50
-    assert inspect["required"] == ["store_id", "asset_ref"]
+    assert inspect["required"] == ["asset_ref"]
     assert inspect["additionalProperties"] is False
-    assert paths["required"] == ["store_id", "from_assets", "to_assets"]
+    assert paths["required"] == ["from_assets", "to_assets"]
     assert paths["additionalProperties"] is False
+    assert values["required"] == ["query"]
+    assert values["additionalProperties"] is False
+    assert all(
+        "store_id" not in view.parameters["properties"] for view in views.values()
+    )
+    assert all(
+        "store_id" in view.metadata["runtime_bound_arguments"]
+        for view in views.values()
+    )
+    assert "max_profile_age_seconds" in values.get("properties", {}) or (
+        "max_profile_age_seconds"
+        in views["search_column_values"].metadata["runtime_bound_arguments"]
+    )
 
 
 async def test_catalog_register_and_search_executors_return_typed_evidence():
@@ -363,6 +380,9 @@ async def test_catalog_registers_searches_and_resolves_column_value_profiles():
                             {"value": "complete", "count": 4},
                             {"value": "pending", "count": 1},
                         ],
+                        "profiled_at": datetime.now(timezone.utc).isoformat(),
+                        "source_fingerprint": "shop:shipments:status:v1",
+                        "source_fingerprint_status": "authoritative",
                     }
                 ],
             },
@@ -405,7 +425,60 @@ async def test_catalog_registers_searches_and_resolves_column_value_profiles():
         hints[0].payload["hints"][0]["candidate_mapping"]["closest_value"] == "complete"
     )
     status = next(field for field in inspected["fields"] if field["name"] == "status")
-    assert status["column_value_hint"]["top_values"] == ["complete", "pending"]
+    assert "column_value_hint" not in status
+    assert "complete" not in str(inspected)
+
+
+async def test_catalog_suppresses_literals_without_current_freshness_proof():
+    catalog, _registry = await _value_grounding_catalog()
+    await catalog.register_column_value_profiles(
+        "store:shop",
+        [
+            {
+                "table": "orders",
+                "column": "status",
+                "top_values": [{"value": "unproved-secret", "count": 1}],
+                "profiled_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ],
+    )
+
+    unknown = catalog.search_column_value_profiles(
+        "store:shop",
+        "status",
+        tables=["orders"],
+        columns=["status"],
+    )["profiles"][0]
+
+    assert unknown["value_freshness"] == "unknown"
+    assert unknown["stale"] is True
+    assert unknown["top_values"] == []
+    assert "unproved-secret" not in str(unknown["top_values"])
+
+    await catalog.register_column_value_profiles(
+        "store:shop",
+        [
+            {
+                "table": "orders",
+                "column": "status",
+                "top_values": [{"value": "expired-secret", "count": 1}],
+                "profiled_at": "2000-01-01T00:00:00+00:00",
+                "source_fingerprint": "shop:orders:status:old",
+                "source_fingerprint_status": "authoritative",
+            }
+        ],
+    )
+
+    expired = catalog.search_column_value_profiles(
+        "store:shop",
+        "status",
+        tables=["orders"],
+        columns=["status"],
+    )["profiles"][0]
+
+    assert expired["value_freshness"] == "stale"
+    assert expired["stale_reason"] == "profile_ttl_expired"
+    assert expired["top_values"] == []
 
 
 async def test_catalog_value_grounding_plan_targets_validation_fact():
@@ -520,6 +593,9 @@ async def test_catalog_value_grounding_plan_surfaces_existing_profiles_without_r
                     {"value": "complete", "count": 4},
                     {"value": "pending", "count": 1},
                 ],
+                "profiled_at": datetime.now(timezone.utc).isoformat(),
+                "source_fingerprint": "shop:orders:status:v1",
+                "source_fingerprint_status": "authoritative",
             }
         ],
     )

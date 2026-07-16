@@ -310,12 +310,32 @@ async def _inspect_monitor_target_schema(
     *,
     target: str,
 ) -> Evidence | None:
-    cached = runtime.cached_schema_evidence(operation_id=operation.id)
-    if cached is not None:
-        return await _persist_monitor_schema_evidence(runtime, operation, cached)
-    persisted = runtime.persisted_schema_evidence(operation_id=operation.id)
-    if persisted is not None:
-        return await _persist_monitor_schema_evidence(runtime, operation, persisted)
+    blocks = await runtime.render_context(prompt=target, token_budget=3_000)
+    catalog_block = next(
+        (
+            item
+            for item in blocks
+            if item.owner == "catalog" and item.id == "catalog.summary"
+        ),
+        None,
+    )
+    schema = (
+        catalog_block.metadata.get("validation_schema")
+        if catalog_block is not None
+        else None
+    )
+    if isinstance(schema, dict) and schema.get("tables"):
+        return await _persist_monitor_schema_evidence(
+            runtime,
+            operation,
+            Evidence(
+                kind="schema.asset_profile",
+                owner=str(schema.get("database_type") or "catalog"),
+                operation_id=operation.id,
+                payload=dict(schema),
+                metadata={"catalog_context": "hit"},
+            ),
+        )
     capability = _first_capability(runtime, "db.schema.inspect")
     if capability is None:
         return None
@@ -337,8 +357,6 @@ async def _inspect_monitor_target_schema(
         (item for item in evidence if item.kind == "schema.asset_profile"),
         None,
     )
-    if schema_evidence is not None:
-        runtime.remember_schema_evidence(schema_evidence)
     return schema_evidence
 
 

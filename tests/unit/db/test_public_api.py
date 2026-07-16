@@ -165,7 +165,6 @@ async def test_record_api_merges_restrictively_and_deterministically(tmp_path):
         config=config,
         source_options=explicit,
         memory=DbMemoryConfig(enabled=False),
-        catalog=False,
     )
     try:
         source = agent.runtime.registry.get_plugin("sqlite")
@@ -201,7 +200,6 @@ async def test_disjoint_allowed_table_sets_deny_every_table(tmp_path):
         ),
         source_options=DbSourceOptions(allowed_tables=("customers",)),
         memory=DbMemoryConfig(enabled=False),
-        catalog=False,
     )
     try:
         source = agent.runtime.registry.get_plugin("sqlite")
@@ -219,7 +217,6 @@ async def test_mode_defaults_apply_without_record_override(tmp_path):
         str(tmp_path / "mode.sqlite"),
         mode="simple",
         memory=DbMemoryConfig(enabled=False),
-        catalog=False,
     )
     try:
         source = agent.runtime.registry.get_plugin("sqlite")
@@ -248,7 +245,6 @@ async def test_default_analyst_mode_remains_read_only(tmp_path):
         str(tmp_path / "writable.sqlite"),
         source_options=DbSourceOptions(read_only=False),
         memory=DbMemoryConfig(enabled=False),
-        catalog=False,
     )
     try:
         source = agent.runtime.registry.get_plugin("sqlite")
@@ -274,7 +270,6 @@ async def test_llm_secrets_stay_at_live_service_boundary(tmp_path):
         llm=llm,
         runtime=DbRuntimeOptions(store="sqlite", store_path=store_path),
         memory=DbMemoryConfig(enabled=False),
-        catalog=False,
     )
     try:
 
@@ -347,7 +342,6 @@ async def test_memory_record_owns_enablement_backend_and_calibration(tmp_path):
     agent = await db.from_db(
         str(tmp_path / "memory.sqlite"),
         memory=memory,
-        catalog=False,
     )
     try:
         inspection = await agent.describe()

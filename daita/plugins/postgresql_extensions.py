@@ -47,7 +47,21 @@ def postgresql_capabilities() -> tuple[Capability, ...]:
             input_schema=common_schema,
             output_evidence=frozenset({"schema.asset_profile"}),
             executor="postgresql.schema.inspect",
-            model_visible=True,
+            runtime_only=True,
+            side_effecting=False,
+        ),
+        Capability(
+            id="db.source.revision",
+            owner="postgresql",
+            description="Read the connector-owned PostgreSQL structural revision.",
+            domains=frozenset({"db"}),
+            operation_types=frozenset({"source.profile"}),
+            access=AccessMode.METADATA_READ,
+            risk=RiskLevel.LOW,
+            input_schema=common_schema,
+            output_evidence=frozenset({"source.revision"}),
+            executor="postgresql.source.revision",
+            runtime_only=True,
             side_effecting=False,
         ),
         Capability(
@@ -154,6 +168,12 @@ def postgresql_evidence_schemas() -> tuple[EvidenceSchema, ...]:
             description="PostgreSQL schema profile.",
         ),
         EvidenceSchema(
+            kind="source.revision",
+            owner="postgresql",
+            json_schema=object_schema,
+            description="PostgreSQL structural source revision.",
+        ),
+        EvidenceSchema(
             kind="sql.validation",
             owner="postgresql",
             json_schema=object_schema,
@@ -187,19 +207,43 @@ def postgresql_evidence_schemas() -> tuple[EvidenceSchema, ...]:
 
 
 def postgresql_tool_views() -> tuple[ToolView, ...]:
-    parameters = {"type": "object"}
+    json_value_schema = {
+        "type": ["string", "number", "integer", "boolean", "object", "array", "null"]
+    }
+    param_spec_schema = {
+        "type": "object",
+        "properties": {
+            "ref": {"type": "string"},
+            "db_type": {"type": "string"},
+            "native_type": {"type": "string"},
+            "dialect": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    parameters = {
+        "type": "object",
+        "properties": {
+            "sql": {"type": "string", "minLength": 1},
+            "params": {"type": "array", "items": json_value_schema},
+            "param_specs": {"type": "array", "items": param_spec_schema},
+        },
+        "required": ["sql", "params"],
+        "additionalProperties": False,
+    }
     return (
         ToolView(
-            name="postgres_query",
+            name="query",
             capability_id="db.sql.execute_read",
             description="Run a guarded PostgreSQL read query.",
             parameters=parameters,
-        ),
-        ToolView(
-            name="postgres_inspect",
-            capability_id="db.schema.inspect",
-            description="Inspect PostgreSQL schema metadata.",
-            parameters=parameters,
+            metadata={
+                "db_slim_phase": 2,
+                "runtime_bound_arguments": [
+                    "schema",
+                    "source_owner",
+                    "source_scope",
+                ],
+            },
         ),
     )
 

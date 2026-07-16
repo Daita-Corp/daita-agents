@@ -8,6 +8,7 @@ registration, profiling, search, relationships, comparison, and diagrams.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any, Awaitable, Callable, Mapping
 
 from daita.runtime import (
@@ -146,7 +147,7 @@ def catalog_capabilities() -> tuple[Capability, ...]:
             input_schema=common_schema,
             output_evidence=frozenset({"schema.column_value_search_result"}),
             executor="catalog.search_column_values",
-            runtime_only=True,
+            model_visible=True,
             side_effecting=False,
         ),
         Capability(
@@ -368,14 +369,10 @@ def catalog_evidence_schemas() -> tuple[EvidenceSchema, ...]:
 
 
 def catalog_tool_views() -> tuple[ToolView, ...]:
-    """Return optional model-visible tool views over catalog capabilities."""
+    """Return the catalog-owned portion of the Phase 2 DB operation surface."""
     search_parameters = {
         "type": "object",
         "properties": {
-            "store_id": {
-                "type": "string",
-                "description": "Catalog store id to search.",
-            },
             "query": {
                 "type": "string",
                 "description": "Natural language or schema term to search for.",
@@ -387,16 +384,12 @@ def catalog_tool_views() -> tuple[ToolView, ...]:
                 "description": "Maximum number of matching assets to return.",
             },
         },
-        "required": ["store_id"],
+        "required": ["query"],
         "additionalProperties": False,
     }
     inspect_parameters = {
         "type": "object",
         "properties": {
-            "store_id": {
-                "type": "string",
-                "description": "Catalog store id containing the asset.",
-            },
             "asset_ref": {
                 "type": "string",
                 "description": "Asset name or reference to inspect.",
@@ -416,34 +409,13 @@ def catalog_tool_views() -> tuple[ToolView, ...]:
                 "maximum": 200,
                 "description": "Maximum number of fields to return.",
             },
-            "include_fields": {
-                "type": "boolean",
-                "description": "Whether to include field details.",
-            },
-            "include_indexes": {
-                "type": "boolean",
-                "description": "Whether to include index metadata.",
-            },
-            "include_relationships": {
-                "type": "boolean",
-                "description": "Whether to include relationship metadata.",
-            },
-            "blocked_fields": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Field names whose values should be omitted.",
-            },
         },
-        "required": ["store_id", "asset_ref"],
+        "required": ["asset_ref"],
         "additionalProperties": False,
     }
     relationship_parameters = {
         "type": "object",
         "properties": {
-            "store_id": {
-                "type": "string",
-                "description": "Catalog store id containing the assets.",
-            },
             "from_assets": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -455,11 +427,6 @@ def catalog_tool_views() -> tuple[ToolView, ...]:
                 "items": {"type": "string"},
                 "minItems": 1,
                 "description": "Destination asset names or references.",
-            },
-            "relationship_types": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional relationship types to include.",
             },
             "max_hops": {
                 "type": "integer",
@@ -474,27 +441,78 @@ def catalog_tool_views() -> tuple[ToolView, ...]:
                 "description": "Maximum relationship paths to return.",
             },
         },
-        "required": ["store_id", "from_assets", "to_assets"],
+        "required": ["from_assets", "to_assets"],
         "additionalProperties": False,
     }
+    column_value_parameters = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Value or phrase to ground against fresh profiles.",
+            },
+            "tables": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "columns": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "limit": {"type": "integer", "minimum": 1, "maximum": 25},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    }
+    runtime_bound = [
+        "store_id",
+        "allowed_tables",
+        "blocked_tables",
+        "blocked_columns",
+    ]
     return (
         ToolView(
-            name="catalog_search_schema",
+            name="search_schema",
             capability_id="catalog.schema.search",
             description="Search catalog schema assets and fields.",
             parameters=search_parameters,
+            metadata={
+                "db_slim_phase": 2,
+                "runtime_bound_arguments": runtime_bound,
+            },
         ),
         ToolView(
-            name="catalog_inspect_asset",
+            name="inspect_asset",
             capability_id="catalog.asset.inspect",
             description="Inspect one catalog asset.",
             parameters=inspect_parameters,
+            metadata={
+                "db_slim_phase": 2,
+                "runtime_bound_arguments": runtime_bound,
+            },
         ),
         ToolView(
-            name="catalog_find_relationship_paths",
+            name="find_relationships",
             capability_id="catalog.relationship_paths.find",
             description="Find relationship paths between catalog assets.",
             parameters=relationship_parameters,
+            metadata={
+                "db_slim_phase": 2,
+                "runtime_bound_arguments": runtime_bound,
+            },
+        ),
+        ToolView(
+            name="search_column_values",
+            capability_id="catalog.column_values.search",
+            description="Search fresh, bounded catalog column-value profiles.",
+            parameters=column_value_parameters,
+            metadata={
+                "db_slim_phase": 2,
+                "runtime_bound_arguments": [
+                    *runtime_bound,
+                    "max_profile_age_seconds",
+                ],
+            },
         ),
     )
 
@@ -552,21 +570,147 @@ class CatalogSummaryContextProvider:
     ) -> ContextBlock | None:
         if audience not in self.audiences:
             return None
-        store_count = len(getattr(self.plugin, "_discovered_stores", {}))
-        schema_count = len(getattr(self.plugin, "_schemas", {}))
-        last_scan = getattr(self.plugin, "_last_scan", None) or "never"
-        if store_count == 0 and schema_count == 0:
-            content = "Catalog has no registered stores or profiled schemas."
-        else:
+        max_chars = min(12_000, max(1_000, max(0, int(token_budget)) * 4))
+        if getattr(self.plugin, "_runtime_source_binding", None) is None:
+            store_count = len(getattr(self.plugin, "_discovered_stores", {}))
+            schema_count = len(getattr(self.plugin, "_schemas", {}))
+            last_scan = getattr(self.plugin, "_last_scan", None) or "never"
             content = (
-                f"Catalog has {store_count} known stores and {schema_count} "
-                f"profiled schemas. Last scan: {last_scan}."
+                "Catalog has no registered stores or profiled schemas."
+                if store_count == 0 and schema_count == 0
+                else (
+                    f"Catalog has {store_count} known stores and {schema_count} "
+                    f"profiled schemas. Last scan: {last_scan}."
+                )
             )
+            return ContextBlock(
+                id=self.id,
+                owner=self.owner,
+                audience=audience,
+                content=content[:max_chars],
+                priority=10,
+                metadata={
+                    "store_count": store_count,
+                    "schema_count": schema_count,
+                    "context_chars": min(len(content), max_chars),
+                    "context_limit": max_chars,
+                    "truncated": len(content) > max_chars,
+                },
+            )
+        policy_summary = context.get("policy_summary")
+        policy_summary = policy_summary if isinstance(policy_summary, Mapping) else {}
+        safety_frame = context.get("safety_frame")
+        safety_frame = safety_frame if isinstance(safety_frame, Mapping) else {}
+        allowed_tables = tuple(policy_summary.get("allowed_tables") or ())
+        source_scope = tuple(context.get("source_scope") or ())
+        requested_tables = tuple(
+            str(item)
+            for item in source_scope
+            if str(item) != str(context.get("source_owner") or "")
+        )
+        if requested_tables:
+            if allowed_tables:
+                wanted = {item.lower() for item in requested_tables}
+                allowed_tables = tuple(
+                    item
+                    for item in allowed_tables
+                    if str(item).lower() in wanted
+                    or str(item).split(".")[-1].lower() in wanted
+                )
+            else:
+                allowed_tables = requested_tables
+        projection = await self.plugin.runtime_relevant_projection(
+            str(context.get("prompt") or ""),
+            max_chars=max(256, max_chars - 512),
+            policy_scope={
+                "allowed_tables": allowed_tables,
+                "allowed_tables_restricted": bool(
+                    policy_summary.get("allowed_tables_restricted", False)
+                    or requested_tables
+                ),
+                "blocked_tables": tuple(
+                    dict.fromkeys(
+                        (
+                            *tuple(policy_summary.get("blocked_tables") or ()),
+                            *tuple(safety_frame.get("blocked_tables") or ()),
+                        )
+                    )
+                ),
+                "blocked_columns": tuple(
+                    dict.fromkeys(
+                        (
+                            *tuple(policy_summary.get("blocked_columns") or ()),
+                            *tuple(safety_frame.get("blocked_columns") or ()),
+                        )
+                    )
+                ),
+            },
+        )
+        content = json.dumps(
+            projection,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        metadata = {
+            "context_chars": len(content),
+            "context_limit": max_chars,
+            "truncated": bool(projection.get("truncated", False)),
+            "freshness": (
+                projection.get("freshness", {}).get("status")
+                if isinstance(projection.get("freshness"), Mapping)
+                else projection.get("freshness")
+            ),
+            "data_boundary": "untrusted_catalog_data",
+        }
+        serialized_chars = _context_block_serialized_chars(content, metadata)
+        if serialized_chars > max_chars:
+            content = json.dumps(
+                {
+                    "status": "ready",
+                    "freshness": projection.get("freshness"),
+                    "assets": [],
+                    "truncated": True,
+                    "truncation": {
+                        "character_limit": max_chars,
+                        "character_limit_reached": True,
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            metadata.update(
+                {
+                    "context_chars": len(content),
+                    "truncated": True,
+                }
+            )
+            serialized_chars = _context_block_serialized_chars(content, metadata)
+        metadata["serialized_chars"] = serialized_chars
+        final_size = _context_block_serialized_chars(content, metadata)
+        metadata["serialized_chars"] = final_size
+        if _context_block_serialized_chars(content, metadata) > max_chars:
+            raise RuntimeError("catalog context serialization exceeded its hard limit")
         return ContextBlock(
             id=self.id,
             owner=self.owner,
             audience=audience,
-            content=content[: max(token_budget, 0)] if token_budget else content,
+            content=content,
             priority=10,
-            metadata={"store_count": store_count, "schema_count": schema_count},
+            metadata=metadata,
         )
+
+
+def _context_block_serialized_chars(
+    content: str,
+    metadata: Mapping[str, Any],
+) -> int:
+    return len(
+        json.dumps(
+            {"content": content, "metadata": metadata},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    )

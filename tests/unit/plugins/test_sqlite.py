@@ -211,8 +211,7 @@ async def test_pragma_write(db):
 
 async def test_projected_tools_return_correct_tools(db):
     names = projected_tool_names(db)
-    assert "sqlite_query" in names
-    assert "sqlite_inspect" in names
+    assert names == {"query"}
     assert "db.sql.execute_write" in {
         capability.id for capability in db.declare_capabilities()
     }

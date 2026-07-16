@@ -121,9 +121,9 @@ async def test_current_behavior_catalog_search_inspect_and_relationship_paths():
     assert paths["reachable"] is True
     assert paths["path_count"] == 1
     assert {
-        "catalog_search_schema",
-        "catalog_inspect_asset",
-        "catalog_find_relationship_paths",
+        "search_schema",
+        "inspect_asset",
+        "find_relationships",
     } <= tool_view_names
 
 

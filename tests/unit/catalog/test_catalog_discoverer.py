@@ -346,9 +346,10 @@ async def test_catalog_exposes_registry_tool_views_not_legacy_agent_tools():
 
     assert not hasattr(plugin, "get_tools")
     assert names == {
-        "catalog_search_schema",
-        "catalog_inspect_asset",
-        "catalog_find_relationship_paths",
+        "search_schema",
+        "inspect_asset",
+        "find_relationships",
+        "search_column_values",
     }
 
 

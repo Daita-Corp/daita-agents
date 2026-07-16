@@ -80,8 +80,7 @@ class FailingRuntimeDbPlugin(BaseDatabasePlugin):
 
 async def _seed_sqlite(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script(
-        """
+    await plugin.execute_script("""
         CREATE TABLE customers (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL
@@ -93,22 +92,19 @@ async def _seed_sqlite(path):
         );
         INSERT INTO customers (name) VALUES ('Ada'), ('Linus');
         INSERT INTO orders (customer_id, total) VALUES (1, 10.0), (2, 20.0);
-        """
-    )
+        """)
     await plugin.disconnect()
 
 
 async def _seed_sqlite_with_cents(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script(
-        """
+    await plugin.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             total_cents INTEGER NOT NULL
         );
         INSERT INTO orders (total_cents) VALUES (1234);
-        """
-    )
+        """)
     await plugin.disconnect()
 
 
@@ -686,8 +682,24 @@ async def test_agent_from_db_resolves_postgresql_sources_to_db_runtime(monkeypat
     async def fake_disconnect(self):
         self._pool = None
 
+    async def fake_tables(self):
+        return []
+
+    async def fake_foreign_keys(self):
+        return []
+
+    async def fake_revision(self, _payload):
+        return {
+            "revision": "postgresql-schema:empty",
+            "status": "authoritative",
+            "reason": "test_fixture",
+        }
+
     monkeypatch.setattr(PostgreSQLPlugin, "connect", fake_connect)
     monkeypatch.setattr(PostgreSQLPlugin, "disconnect", fake_disconnect)
+    monkeypatch.setattr(PostgreSQLPlugin, "tables", fake_tables)
+    monkeypatch.setattr(PostgreSQLPlugin, "foreign_keys", fake_foreign_keys)
+    monkeypatch.setattr(PostgreSQLPlugin, "_execute_source_revision", fake_revision)
 
     agent = await Agent.from_db("postgresql://localhost/testdb")
 
@@ -988,7 +1000,7 @@ async def test_agent_from_db_calibrate_memory_skips_when_exact_marker_exists(
         await agent.stop()
 
     assert "memory" in inspection.plugin_ids
-    source._execute_schema_inspect.assert_not_awaited()
+    source._execute_schema_inspect.assert_awaited_once()
     backend.upsert_db_record.assert_not_awaited()
 
 
@@ -1139,13 +1151,12 @@ async def test_agent_from_db_uses_typed_source_and_llm_configuration(tmp_path):
     assert service_config is llm
 
 
-async def test_agent_from_db_does_not_profile_schema_during_construction(tmp_path):
-    db_path = tmp_path / "phase13_no_construction_profile.sqlite"
+async def test_agent_from_db_prepares_catalog_schema_during_construction(tmp_path):
+    db_path = tmp_path / "phase2_construction_catalog.sqlite"
     await _seed_sqlite(db_path)
     source = SQLitePlugin(path=str(db_path))
-    source._execute_schema_inspect = AsyncMock(
-        side_effect=AssertionError("schema profiling should be operation-time work")
-    )
+    original_schema_inspect = source._execute_schema_inspect
+    source._execute_schema_inspect = AsyncMock(side_effect=original_schema_inspect)
 
     agent = await Agent.from_db(source)
 
@@ -1155,7 +1166,11 @@ async def test_agent_from_db_does_not_profile_schema_during_construction(tmp_pat
         await agent.stop()
 
     assert "sqlite" in inspection.plugin_ids
-    source._execute_schema_inspect.assert_not_awaited()
+    source._execute_schema_inspect.assert_awaited_once()
+    catalog = agent.runtime.registry.get_plugin("catalog")
+    state = catalog.runtime_source_state()
+    assert state["freshness"] == "fresh"
+    assert state["inspection_task_count"] == 1
 
 
 async def test_agent_from_db_rejects_unknown_mode_on_new_path(tmp_path):

@@ -41,7 +41,21 @@ def sqlite_capabilities() -> tuple[Capability, ...]:
             input_schema=common_schema,
             output_evidence=frozenset({"schema.asset_profile"}),
             executor="sqlite.schema.inspect",
-            model_visible=True,
+            runtime_only=True,
+            side_effecting=False,
+        ),
+        Capability(
+            id="db.source.revision",
+            owner="sqlite",
+            description="Read the connector-owned SQLite structural revision.",
+            domains=frozenset({"db"}),
+            operation_types=frozenset({"source.profile"}),
+            access=AccessMode.METADATA_READ,
+            risk=RiskLevel.LOW,
+            input_schema=common_schema,
+            output_evidence=frozenset({"source.revision"}),
+            executor="sqlite.source.revision",
+            runtime_only=True,
             side_effecting=False,
         ),
         Capability(
@@ -147,6 +161,12 @@ def sqlite_evidence_schemas() -> tuple[EvidenceSchema, ...]:
             description="SQLite schema profile.",
         ),
         EvidenceSchema(
+            kind="source.revision",
+            owner="sqlite",
+            json_schema=object_schema,
+            description="SQLite structural source revision.",
+        ),
+        EvidenceSchema(
             kind="sql.validation",
             owner="sqlite",
             json_schema=object_schema,
@@ -180,18 +200,42 @@ def sqlite_evidence_schemas() -> tuple[EvidenceSchema, ...]:
 
 
 def sqlite_tool_views() -> tuple[ToolView, ...]:
-    parameters = {"type": "object"}
+    json_value_schema = {
+        "type": ["string", "number", "integer", "boolean", "object", "array", "null"]
+    }
+    param_spec_schema = {
+        "type": "object",
+        "properties": {
+            "ref": {"type": "string"},
+            "db_type": {"type": "string"},
+            "native_type": {"type": "string"},
+            "dialect": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    parameters = {
+        "type": "object",
+        "properties": {
+            "sql": {"type": "string", "minLength": 1},
+            "params": {"type": "array", "items": json_value_schema},
+            "param_specs": {"type": "array", "items": param_spec_schema},
+        },
+        "required": ["sql", "params"],
+        "additionalProperties": False,
+    }
     return (
         ToolView(
-            name="sqlite_query",
+            name="query",
             capability_id="db.sql.execute_read",
             description="Run a guarded SQLite read query.",
             parameters=parameters,
-        ),
-        ToolView(
-            name="sqlite_inspect",
-            capability_id="db.schema.inspect",
-            description="Inspect SQLite schema metadata.",
-            parameters=parameters,
+            metadata={
+                "db_slim_phase": 2,
+                "runtime_bound_arguments": [
+                    "schema",
+                    "source_owner",
+                    "source_scope",
+                ],
+            },
         ),
     )

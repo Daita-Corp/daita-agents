@@ -20,7 +20,6 @@ from daita.runtime import (
 
 from ..evidence import evidence_in_task_plan_order
 from ..loop import DbLoopResult
-from ..loop.legacy import DbLegacyAgentLoop as DbAgentLoop
 from ..models import (
     DbIntent,
     DbIntentKind,
@@ -29,9 +28,11 @@ from ..models import (
     DbOperationResult,
     DbRequest,
 )
-from ..planner_protocol import DbAgentPlanner
 from .tasks.runtime import DbTaskRuntime
 from .types import DbRuntimeGovernanceBlocked, DbRuntimeTaskNotRunnable
+
+if TYPE_CHECKING:
+    from ..planner_protocol import DbAgentPlanner
 
 
 class DbRuntimeResumeMixin:
@@ -464,6 +465,8 @@ class DbRuntimeResumeMixin:
             message=f"Operation {operation_id} resumed DB agent loop.",
         )
         safety_frame = operation.metadata.get("safety_frame")
+        from ..loop.legacy import DbLegacyAgentLoop as DbAgentLoop
+
         loop_result = await DbAgentLoop(self, planner).run(
             operation,
             safety_frame=safety_frame if isinstance(safety_frame, dict) else None,

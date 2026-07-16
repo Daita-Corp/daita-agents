@@ -41,8 +41,6 @@ async def calibrate_db_memory(
         operation_type="source.profile",
         input={},
     )
-    if schema_evidence:
-        runtime.remember_schema_evidence(schema_evidence[0])
     schema = schema_evidence[0].payload if schema_evidence else {}
     records = unit_records_from_schema(schema)
     results = [

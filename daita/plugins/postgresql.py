@@ -175,6 +175,12 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 handler=self._execute_schema_inspect,
             ),
             PostgreSQLExecutor(
+                id="postgresql.source.revision",
+                capability_ids=frozenset({"db.source.revision"}),
+                evidence_kind="source.revision",
+                handler=self._execute_source_revision,
+            ),
+            PostgreSQLExecutor(
                 id="postgresql.sql.validate",
                 capability_ids=frozenset({"db.sql.validate"}),
                 evidence_kind="sql.validation",
@@ -248,16 +254,91 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             "foreign_keys": await self.foreign_keys(),
         }
 
+    async def _execute_source_revision(self, _payload: Any) -> Dict[str, Any]:
+        """Return the declared PostgreSQL structural revision."""
+
+        rows = await self.query(
+            """
+            SELECT md5(COALESCE(string_agg(definition, '|' ORDER BY definition), ''))
+                AS revision
+            FROM (
+                SELECT concat_ws(':', table_schema, table_name, column_name,
+                                 data_type, is_nullable, COALESCE(column_default, ''))
+                    AS definition
+                FROM information_schema.columns
+                WHERE table_schema = $1
+                UNION ALL
+                SELECT concat_ws(':', tc.table_schema, tc.table_name,
+                                 tc.constraint_type, tc.constraint_name,
+                                 COALESCE(kcu.column_name, ''),
+                                 COALESCE(ccu.table_name, ''),
+                                 COALESCE(ccu.column_name, '')) AS definition
+                FROM information_schema.table_constraints tc
+                LEFT JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_catalog = kcu.constraint_catalog
+                 AND tc.constraint_schema = kcu.constraint_schema
+                 AND tc.constraint_name = kcu.constraint_name
+                LEFT JOIN information_schema.constraint_column_usage ccu
+                  ON tc.constraint_catalog = ccu.constraint_catalog
+                 AND tc.constraint_schema = ccu.constraint_schema
+                 AND tc.constraint_name = ccu.constraint_name
+                WHERE tc.table_schema = $1
+            ) structural_catalog
+            """,
+            [self.schema],
+        )
+        revision = rows[0].get("revision") if rows else None
+        return {
+            "revision": f"postgresql-schema:{revision}" if revision else None,
+            "status": "authoritative" if revision else "unavailable",
+            "reason": "postgresql_information_schema",
+        }
+
     async def _execute_sql_validate(self, payload: Any) -> Dict[str, Any]:
-        from daita.db.query_sql_validation import sql_statement_facts
+        from daita.core.exceptions import ValidationError
+        from daita.db.query_sql_validation import (
+            sql_fingerprint,
+            sql_statement_facts,
+            validate_sql_against_schema,
+        )
 
         args = dict(payload or {})
         sql = self._normalize_sql(str(args.get("sql") or ""))
         operation = str(args.get("operation") or "query")
         analysis = self._validate_sql_policy(sql, operation=operation)
+        schema = args.get("schema")
+        if isinstance(schema, dict):
+            preflight = validate_sql_against_schema(
+                sql,
+                schema,
+                dialect="postgresql",
+                analysis=analysis,
+            )
+            if preflight.get("ok") is not True:
+                safe_keys = {
+                    "available_columns",
+                    "available_tables",
+                    "column_candidates",
+                    "do_not_retry_same_sql",
+                    "error_type",
+                    "inspect_tables",
+                    "missing_columns",
+                    "repair_required",
+                    "sql_fingerprint",
+                    "table_candidates",
+                    "unknown_tables",
+                }
+                raise ValidationError(
+                    "SQL validation failed against the current catalog schema.",
+                    field="sql",
+                    context={
+                        key: preflight[key] for key in safe_keys if key in preflight
+                    },
+                )
         return {
             "valid": True,
             "sql": sql,
+            "sql_fingerprint": sql_fingerprint(sql),
             "operation": operation,
             "statement_type": analysis.statement_type,
             "is_read": analysis.is_read,
@@ -268,6 +349,8 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
         }
 
     async def _execute_sql_read(self, payload: Any) -> Dict[str, Any]:
+        from daita.db.query_sql_validation import sql_fingerprint
+
         args = dict(payload or {})
         params = coerce_sql_params(
             list(args.get("params") or []),
@@ -275,11 +358,19 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             dialect="postgresql",
             json_binding="text",
         )
-        return await self._run_guarded_tool_query(
+        result = await self._run_guarded_tool_query(
             str(args.get("sql") or ""),
             params,
             args.get("focus"),
         )
+        return {
+            **result,
+            "sql_fingerprint": str(
+                args.get("sql_fingerprint")
+                or sql_fingerprint(str(args.get("sql") or ""))
+            ),
+            "executed_sql_fingerprint": sql_fingerprint(str(result.get("sql") or "")),
+        }
 
     async def _execute_sql_write(self, payload: Any) -> Dict[str, Any]:
         args = dict(payload or {})

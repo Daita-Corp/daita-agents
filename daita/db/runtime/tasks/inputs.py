@@ -8,9 +8,25 @@ from daita.runtime import Operation, Task
 
 from ...fingerprints import persisted_fingerprint
 from ...sql_evidence import blocked_scope_resources, sql_validation_facts_from_evidence
-from .catalog import catalog_executable_input_for_task
 from .context import DbTaskContext
 from .evidence import accepted_evidence_for_dependency, latest_accepted_evidence
+
+_PHASE2_CATALOG_CAPABILITIES = frozenset(
+    {
+        "catalog.schema.search",
+        "catalog.asset.inspect",
+        "catalog.relationship_paths.find",
+        "catalog.column_values.search",
+    }
+)
+_LEGACY_CATALOG_CAPABILITIES = frozenset(
+    {
+        *_PHASE2_CATALOG_CAPABILITIES,
+        "catalog.column_value_hints.resolve",
+        "catalog.value_grounding.plan",
+    }
+)
+_PHASE2_SOURCE_OWNERS = frozenset({"sqlite", "postgresql"})
 
 
 async def executable_input_for_task(
@@ -19,14 +35,22 @@ async def executable_input_for_task(
     operation: Operation,
 ) -> dict[str, Any]:
     """Hydrate DB task input from authoritative validation evidence."""
-    if task.capability_id in {
-        "catalog.schema.search",
-        "catalog.asset.inspect",
-        "catalog.relationship_paths.find",
-        "catalog.column_values.search",
-        "catalog.column_value_hints.resolve",
-        "catalog.value_grounding.plan",
-    }:
+    if task.capability_id in _LEGACY_CATALOG_CAPABILITIES:
+        source_owner = _catalog_source_owner(context, task, operation)
+        if source_owner in _PHASE2_SOURCE_OWNERS:
+            if task.capability_id not in _PHASE2_CATALOG_CAPABILITIES:
+                raise RuntimeError(
+                    f"{task.capability_id} is not part of the Phase 2 operation surface"
+                )
+            if not task.input.get("store_id"):
+                raise RuntimeError(
+                    "Phase 2 catalog task is missing runtime-bound input"
+                )
+            return task.input
+        # Phase 5 deletion condition: remove this explicit unsupported-connector
+        # quarantine after those connectors adopt the closed recipe owner.
+        from .catalog import catalog_executable_input_for_task
+
         return await catalog_executable_input_for_task(context, task, operation)
     if task.capability_id not in {
         "db.sql.execute_read",
@@ -100,3 +124,31 @@ async def executable_input_for_task(
         "validated_evidence_id": validation.id,
         "validated_task_id": validation.task_id,
     }
+
+
+def _catalog_source_owner(
+    context: DbTaskContext,
+    task: Task,
+    operation: Operation,
+) -> str:
+    candidates = (
+        task.metadata.get("source_owner"),
+        operation.metadata.get("source_owner"),
+        (operation.metadata.get("planned_operation") or {}).get("source_owner"),
+        (operation.metadata.get("loop_state") or {}).get("source_owner"),
+        task.metadata.get("owner"),
+    )
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+    connector_ids = [
+        manifest.id
+        for manifest in context.registry.manifests
+        if str(getattr(manifest.kind, "value", manifest.kind)) == "connector"
+        and manifest.id not in {"catalog", "db_runtime"}
+    ]
+    if len(connector_ids) == 1 and connector_ids[0] not in _PHASE2_SOURCE_OWNERS:
+        return connector_ids[0]
+    raise RuntimeError(
+        "Catalog prerequisite routing requires explicit connector identity"
+    )

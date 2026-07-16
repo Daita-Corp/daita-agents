@@ -687,8 +687,7 @@ class TestToolRegistration:
     def test_expected_default_tools_present(self):
         plugin = make_plugin()
         names = projected_tool_names(plugin)
-        assert "postgres_query" in names
-        assert "postgres_inspect" in names
+        assert names == {"query"}
 
     def test_list_tables_not_in_default_tools(self):
         plugin = make_plugin()

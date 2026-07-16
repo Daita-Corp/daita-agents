@@ -218,7 +218,7 @@ def _valid_schema_response(answer):
     return responder
 
 
-async def test_from_db_model_registers_answer_synthesis_capability(tmp_path):
+async def test_from_db_model_does_not_register_obsolete_synthesis_capability(tmp_path):
     db_path = tmp_path / "from_db_answer_synthesis.sqlite"
     sqlite = SQLitePlugin(path=str(db_path))
     await sqlite.execute_script("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
@@ -232,8 +232,8 @@ async def test_from_db_model_registers_answer_synthesis_capability(tmp_path):
     finally:
         await agent.stop()
 
-    assert "db_runtime:db.answer.synthesize" in inspection.capability_ids
-    assert "db_runtime:answer.synthesis" in inspection.evidence_schema_kinds
+    assert "db_runtime:db.answer.synthesize" not in inspection.capability_ids
+    assert "db_runtime:answer.synthesis" not in inspection.evidence_schema_kinds
     assert "db_runtime:verification.result" in inspection.evidence_schema_kinds
 
 

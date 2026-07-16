@@ -5,6 +5,8 @@ Evidence verification for DB runtime operations.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import re
 from typing import Any, Mapping
 
 from daita.runtime import Evidence, Task
@@ -32,6 +34,8 @@ class DbSlimReadiness:
     warnings: tuple[str, ...]
     query_result: Evidence | None = None
     validation: Evidence | None = None
+    catalog_evidence: Evidence | None = None
+    answer_kind: str = "query"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -40,20 +44,24 @@ class DbSlimReadiness:
             "warnings": list(self.warnings),
             "query_result_ref": _evidence_ref(self.query_result),
             "validation_ref": _evidence_ref(self.validation),
+            "catalog_evidence_ref": _evidence_ref(self.catalog_evidence),
             "truncated": bool(
                 self.query_result is not None
                 and self.query_result.payload.get("truncated") is True
             ),
+            "answer_kind": self.answer_kind,
         }
 
 
-def db_sqlite_slim_readiness_check(
+def db_slim_readiness_check(
     *,
     operation: Any,
     evidence: tuple[Evidence, ...],
     tasks: tuple[Task, ...],
     answer: str | None = None,
     expected_owner: str = "sqlite",
+    allow_catalog_answer: bool = False,
+    catalog_operation_name: str | None = None,
 ) -> DbSlimReadiness:
     """Require an applicable accepted read result before accepting DB claims."""
 
@@ -81,6 +89,59 @@ def db_sqlite_slim_readiness_check(
     }
     applicable: list[tuple[int, Evidence, Evidence]] = []
     rejection_reasons: set[str] = set()
+    if allow_catalog_answer:
+        if not _operation_requests_structural_answer(operation):
+            allow_catalog_answer = False
+            rejection_reasons.add("catalog_answer_not_explicitly_requested")
+    if allow_catalog_answer:
+        catalog_task_ids = {
+            task.id
+            for task in tasks
+            if task.capability_id
+            in {
+                "catalog.schema.search",
+                "catalog.asset.inspect",
+                "catalog.relationship_paths.find",
+            }
+            and str(task.metadata.get("owner") or "") == "catalog"
+            and str(task.metadata.get("slim_operation") or "")
+            == str(catalog_operation_name or "")
+            and task.status.value == "succeeded"
+        }
+        catalog_evidence = next(
+            (
+                item
+                for item in reversed(evidence)
+                if item.accepted
+                and item.operation_id == operation_id
+                and item.owner == "catalog"
+                and item.task_id in catalog_task_ids
+                and item.kind
+                in {
+                    "schema.search_result",
+                    "schema.asset_profile",
+                    "schema.relationship_path",
+                }
+            ),
+            None,
+        )
+        if catalog_evidence is not None:
+            if _catalog_answer_contains_data_claim(answer, catalog_evidence):
+                return DbSlimReadiness(
+                    False,
+                    ("catalog_answer_contains_ungrounded_data_claim",),
+                    (),
+                    catalog_evidence=catalog_evidence,
+                    answer_kind="catalog",
+                )
+            return DbSlimReadiness(
+                True,
+                (),
+                (),
+                catalog_evidence=catalog_evidence,
+                answer_kind="catalog",
+            )
+        rejection_reasons.add("accepted_current_catalog_evidence_required")
     for result in evidence:
         if result.kind != "query.result" or not result.accepted:
             continue
@@ -96,6 +157,9 @@ def db_sqlite_slim_readiness_check(
             continue
         if str(task.metadata.get("owner") or "") != expected_owner:
             rejection_reasons.add("query_task_wrong_source")
+            continue
+        if task.status.value != "succeeded":
+            rejection_reasons.add("query_task_not_succeeded")
             continue
         dependency = next(
             (
@@ -114,6 +178,28 @@ def db_sqlite_slim_readiness_check(
         )
         if validation is None:
             rejection_reasons.add("applicable_sql_validation_missing")
+            continue
+        validation_task = tasks_by_id.get(str(validation.task_id or ""))
+        if validation_task is None or validation_task.status.value != "succeeded":
+            rejection_reasons.add("sql_validation_task_not_succeeded")
+            continue
+        if validation_task.metadata.get("query_attempt") != task.metadata.get(
+            "query_attempt"
+        ):
+            rejection_reasons.add("query_attempt_mismatch")
+            continue
+        validation_fingerprint = str(
+            validation.payload.get("sql_fingerprint")
+            or validation_task.metadata.get("sql_fingerprint")
+            or ""
+        )
+        result_fingerprint = str(
+            result.payload.get("sql_fingerprint")
+            or task.metadata.get("sql_fingerprint")
+            or ""
+        )
+        if not validation_fingerprint or result_fingerprint != validation_fingerprint:
+            rejection_reasons.add("query_sql_fingerprint_mismatch")
             continue
         facts = sql_validation_facts_from_evidence(validation)
         if facts.valid is not True or facts.is_read is not True:
@@ -153,6 +239,46 @@ def db_sqlite_slim_readiness_check(
         warnings=tuple(warnings),
         query_result=query_result,
         validation=validation,
+    )
+
+
+def _operation_requests_structural_answer(operation: Any) -> bool:
+    request = getattr(operation, "request", None)
+    request = request if isinstance(request, Mapping) else {}
+    mode = str(request.get("mode") or "").strip().lower()
+    if mode in {
+        "schema",
+        "schema.query",
+        "relationships",
+        "relationship",
+        "schema.relationship_query",
+    }:
+        return True
+
+    prompt = str(request.get("prompt") or "").strip().lower()
+    return bool(
+        re.search(
+            r"\b(schema|structure|columns?|fields?|relationships?)\b",
+            prompt,
+        )
+        or re.search(r"\bdescribe\b", prompt)
+    )
+
+
+def _catalog_answer_contains_data_claim(
+    answer: str | None,
+    evidence: Evidence,
+) -> bool:
+    text = str(answer or "").strip().lower()
+    if re.search(
+        r"\b(rows?|records?|results?|returned|count|sum|average|total|minimum|maximum)\b",
+        text,
+    ):
+        return True
+    evidence_text = json.dumps(evidence.payload, sort_keys=True, default=str).lower()
+    return any(
+        token not in evidence_text
+        for token in re.findall(r"(?<![a-z0-9_])-?\d+(?:\.\d+)?", text)
     )
 
 

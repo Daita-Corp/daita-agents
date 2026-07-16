@@ -61,14 +61,6 @@ class _AnalysisPlanState:
         return self.revision_evidence or self.plan_evidence
 
 
-@dataclass(frozen=True)
-class _SourcePreparationSnapshot:
-    evidence: Evidence
-    store_id: str
-    schema_fingerprint: str
-    cached_at: float
-
-
 class DbRuntimeGovernanceBlocked(PermissionError):
     """Raised when persisted runtime governance blocks executor invocation."""
 

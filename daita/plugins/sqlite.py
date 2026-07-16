@@ -168,6 +168,13 @@ class SQLitePlugin(BaseDatabasePlugin):
                 handler=self._execute_schema_inspect,
             ),
             EvidenceWrappingExecutor(
+                id="sqlite.source.revision",
+                owner="sqlite",
+                capability_ids=frozenset({"db.source.revision"}),
+                evidence_kind="source.revision",
+                handler=self._execute_source_revision,
+            ),
+            EvidenceWrappingExecutor(
                 id="sqlite.sql.validate",
                 owner="sqlite",
                 capability_ids=frozenset({"db.sql.validate"}),
@@ -243,6 +250,21 @@ class SQLitePlugin(BaseDatabasePlugin):
             "table_count": len(tables),
             "tables": tables,
             "foreign_keys": await self.foreign_keys(),
+        }
+
+    async def _execute_source_revision(self, _payload: Any) -> Dict[str, Any]:
+        """Return the declared SQLite structural revision."""
+
+        cursor = await self.db.execute("PRAGMA schema_version")
+        try:
+            row = await cursor.fetchone()
+        finally:
+            await cursor.close()
+        revision = int(row[0]) if row else None
+        return {
+            "revision": f"sqlite-schema:{revision}" if revision is not None else None,
+            "status": "authoritative" if revision is not None else "unavailable",
+            "reason": "sqlite_schema_version",
         }
 
     async def _execute_sql_validate(self, payload: Any) -> Dict[str, Any]:

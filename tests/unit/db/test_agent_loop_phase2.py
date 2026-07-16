@@ -1108,17 +1108,9 @@ async def test_propose_sql_read_does_not_reuse_catalog_hint_only_context():
     finally:
         await runtime.teardown()
 
-    assert compilation.rejected_action_summaries == ()
-    assert [spec.capability_id for spec in compilation.task_specs] == [
-        "db.schema.inspect",
-        "catalog.schema.search",
-        "db.planning.context.build",
-        "db.query.plan",
-    ]
-    query_plan = compilation.task_specs[-1]
-    assert "planning_context_evidence_id" not in query_plan.input
-    assert query_plan.dependencies[0].producer_task_id == (
-        compilation.task_specs[-2].task_id
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "missing_capability:db.query.plan"
     )
 
 
@@ -1154,26 +1146,10 @@ async def test_propose_sql_read_inserts_catalog_search_and_asset_prerequisites()
     finally:
         await runtime.teardown()
 
-    assert compilation.rejected_action_summaries == ()
-    assert [spec.capability_id for spec in compilation.task_specs] == [
-        "db.schema.inspect",
-        "catalog.schema.search",
-        "catalog.asset.inspect",
-        "db.planning.context.build",
-        "db.query.plan",
-    ]
-    search = compilation.task_specs[1]
-    asset = compilation.task_specs[2]
-    context = compilation.task_specs[3]
-    query_plan = compilation.task_specs[4]
-    assert search.input["query"] == "phase two catalog"
-    assert asset.input["asset_ref"] == "orders"
-    assert asset.dependencies[0].producer_task_id == search.task_id
-    assert {dependency.evidence_kind for dependency in context.dependencies} == {
-        "schema.asset_profile",
-        "schema.search_result",
-    }
-    assert query_plan.dependencies[0].producer_task_id == context.task_id
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "missing_capability:db.query.plan"
+    )
 
 
 async def test_relationship_path_action_does_not_guess_assets_from_prompt_text():
@@ -1184,6 +1160,8 @@ async def test_relationship_path_action_does_not_guess_assets_from_prompt_text()
             metadata={
                 "from_db_options": {
                     "catalog_store_id": "store:sqlite",
+                    "catalog_profile_key": "phase-two:sqlite",
+                    "source_options": {"include_sample_values": False},
                 }
             },
         ),
@@ -1291,26 +1269,9 @@ async def test_execute_joined_query_plan_inserts_relationship_path_prerequisite(
     finally:
         await runtime.teardown()
 
-    assert compilation.rejected_action_summaries == ()
-    assert [spec.capability_id for spec in compilation.task_specs] == [
-        "catalog.schema.search",
-        "catalog.relationship_paths.find",
-        "db.planning.context.build",
-        "db.query.plan.validate",
-        "db.sql.validate",
-        "db.sql.execute_read",
-    ]
-    relationship = compilation.task_specs[1]
-    refreshed_context = compilation.task_specs[2]
-    plan_validation = compilation.task_specs[3]
-    assert relationship.input["from_assets"] == ["orders"]
-    assert relationship.input["to_assets"] == ["customers"]
-    assert refreshed_context.dependencies[-1].producer_task_id == relationship.task_id
-    assert "planning_context_evidence_id" not in plan_validation.input
-    assert any(
-        dependency.evidence_kind == "planning.context"
-        and dependency.producer_task_id == refreshed_context.task_id
-        for dependency in plan_validation.dependencies
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "missing_capability:db.query.plan.validate"
     )
 
 
@@ -2677,6 +2638,8 @@ async def test_validation_grounding_repair_targets_only_validation_column():
             metadata={
                 "from_db_options": {
                     "catalog_store_id": "store:sqlite",
+                    "catalog_profile_key": "phase-two:sqlite",
+                    "source_options": {"include_sample_values": False},
                 }
             },
         ),
@@ -2780,24 +2743,10 @@ async def test_validation_grounding_repair_targets_only_validation_column():
     finally:
         await runtime.teardown()
 
-    grounding_specs = [
-        spec
-        for spec in compilation.task_specs
-        if spec.capability_id
-        in {
-            "catalog.value_grounding.plan",
-            "catalog.column_value_hints.resolve",
-        }
-    ]
-    assert grounding_specs
-    targets = {
-        (target["table"], target["column"])
-        for spec in grounding_specs
-        for target in _phase0_value_grounding_targets(spec.input)
-    }
-    assert ("orders", "status") in targets
-    assert ("orders", "channel") not in targets
-    assert ("customers", "status") not in targets
+    assert compilation.task_specs == ()
+    assert compilation.rejected_action_summaries[0]["error"] == (
+        "missing_capability:db.planning.context.build"
+    )
 
 
 def test_validation_grounding_continues_from_refresh_to_repair_then_execution():
@@ -3837,6 +3786,8 @@ async def _catalog_runtime_and_operation(operation_id):
             metadata={
                 "from_db_options": {
                     "catalog_store_id": "store:sqlite",
+                    "catalog_profile_key": "phase-two:sqlite",
+                    "source_options": {"include_sample_values": False},
                 }
             },
             plugins=(CatalogPlugin(auto_persist=False), SQLitePlugin(path=":memory:")),

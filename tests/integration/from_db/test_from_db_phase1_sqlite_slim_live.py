@@ -73,6 +73,7 @@ async def _agent(path: Path, *, name: str):
 
 async def _run_case(agent, prompt: str, *, scenario: str, tmp_path: Path):
     captured = {}
+    control_label = os.environ.get("DAITA_SLIM_EXPERIMENT_LABEL", "phase1-provisional")
 
     def correctness(result, snapshot):
         query_result = _raw_evidence(snapshot, "query.result")
@@ -99,7 +100,7 @@ async def _run_case(agent, prompt: str, *, scenario: str, tmp_path: Path):
             measurement={
                 "scenario": scenario,
                 "run_id": "run-001",
-                "control_label": "phase1-provisional",
+                "control_label": control_label,
                 "provider": "openai",
                 "model": _require_live_config().model,
                 "model_parameters": {"temperature": 0},
@@ -123,12 +124,15 @@ async def _run_case(agent, prompt: str, *, scenario: str, tmp_path: Path):
 
     output_root = Path(
         os.environ.get(
-            "DAITA_SLIM_PHASE1_ARTIFACT_ROOT",
-            str(tmp_path / "phase1-neutral-artifacts"),
+            "DAITA_SLIM_ARTIFACT_ROOT",
+            os.environ.get(
+                "DAITA_SLIM_PHASE1_ARTIFACT_ROOT",
+                str(tmp_path / "phase1-neutral-artifacts"),
+            ),
         )
     )
     artifact = await run_scale_benchmark(
-        suite="from-db-phase1-sqlite-slim-read",
+        suite=f"from-db-{control_label.removesuffix('-provisional')}-sqlite-slim-read",
         parameters=ScaleBenchmarkParameters(
             concurrency=1,
             operations=1,
@@ -138,7 +142,7 @@ async def _run_case(agent, prompt: str, *, scenario: str, tmp_path: Path):
         output_dir=output_root,
         artifact_name=f"{scenario}.json",
         environment=default_environment_metadata(
-            control_label="phase1-provisional",
+            control_label=control_label,
             database_type="sqlite",
             database_version=sqlite3.sqlite_version,
             dataset="rich_sqlite_production_contract",

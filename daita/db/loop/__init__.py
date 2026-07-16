@@ -1,16 +1,11 @@
 """DB agent loop package."""
 
-from .runner import (
-    DbAgentLoop,
-    SLIM_SQLITE_OPERATION_NAMES,
-    SLIM_SQLITE_TOOL_VIEWS,
-)
+from .runner import DbAgentLoop, SLIM_READ_OPERATION_NAMES
 from .types import DbActionCompilation, DbLoopResult
 
 __all__ = [
     "DbAgentLoop",
     "DbActionCompilation",
     "DbLoopResult",
-    "SLIM_SQLITE_OPERATION_NAMES",
-    "SLIM_SQLITE_TOOL_VIEWS",
+    "SLIM_READ_OPERATION_NAMES",
 ]

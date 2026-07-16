@@ -132,6 +132,17 @@ async def from_db(
         options=effective_source_options,
     )
     _ensure_converted_plugin(source_plugin)
+    if source_plugin.manifest.id in {"sqlite", "postgresql"} and catalog is False:
+        raise ValueError(
+            "SQLite/PostgreSQL Phase 2 from_db requires a CatalogPlugin; "
+            "catalog=False is not supported"
+        )
+    if (
+        catalog is not None
+        and catalog is not False
+        and not isinstance(catalog, CatalogPlugin)
+    ):
+        raise TypeError("catalog must be a CatalogPlugin, False, or None")
     profile_key = catalog_profile_key(source, db_schema=effective_source_options.schema)
     source_identity = _source_identity(source_plugin, profile_key)
     memory_config = _resolve_memory_config(
@@ -147,6 +158,7 @@ async def from_db(
         catalog_profile_key=profile_key,
         catalog_store_id=f"from_db:{profile_key}",
         catalog_keys=[f"from_db:{profile_key}"],
+        catalog_persist=True,
         memory=memory_config.to_dict(),
     )
     if host_context is not None:
@@ -199,8 +211,6 @@ async def from_db(
     )
     try:
         await db_runtime.setup(agent_id=name)
-        if source_plugin.manifest.id == "sqlite" and db_llm_service.available:
-            await db_runtime.prepare_sqlite_slim_source()
         if memory_config.enabled and memory_config.calibrate:
             await calibrate_db_memory(
                 db_runtime,

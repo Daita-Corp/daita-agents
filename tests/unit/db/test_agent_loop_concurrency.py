@@ -792,14 +792,10 @@ async def test_sqlite_runtime_does_not_fallback_to_injected_legacy_planner():
         host_services={"db_agent_planner": _TwoReadPlanner(owner="sqlite")},
     )
     try:
-        result = await runtime.run("Compare two independent SQLite values.")
-        snapshot = await runtime.inspect_operation(result.operation_id)
+        with pytest.raises(RuntimeError, match="requires one CatalogPlugin"):
+            await runtime.run("Compare two independent SQLite values.")
     finally:
         await runtime.teardown()
-
-    assert result.status is OperationStatus.BLOCKED
-    assert snapshot.tasks == ()
-    assert snapshot.evidence == ()
 
 
 async def test_unrelated_task_remains_a_plan_order_barrier_for_read_cohort():

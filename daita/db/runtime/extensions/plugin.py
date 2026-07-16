@@ -8,8 +8,6 @@ from daita.plugins import PluginContext, PluginKind, PluginManifest
 from daita.plugins.base import RuntimeExtensionPlugin
 from daita.runtime import AccessMode, Capability, EvidenceSchema, RiskLevel, Worker
 
-from ...llm_planner import DbLLMPlannerExecutor, DbLLMRepairExecutor
-from ...synthesis import DbAnswerSynthesisExecutor
 from .analysis import (
     DbAnalysisCheckpointExecutor,
     DbAnalysisPlanExecutor,
@@ -38,9 +36,24 @@ from .monitor_read import (
     DbMonitorReadExecutor,
     DbMonitorResolveApprovalExecutor,
 )
-from .query import (
-    DbPlanningContextExecutor,
-    DbQueryPlanValidationExecutor,
+
+_SLIM_REMOVED_CAPABILITIES = frozenset(
+    {
+        "db.planning.context.build",
+        "db.query.plan",
+        "db.query.plan.validate",
+        "db.query.repair",
+        "db.answer.synthesize",
+    }
+)
+_SLIM_REMOVED_EVIDENCE = frozenset(
+    {
+        "planning.context",
+        "query.plan.proposal",
+        "query.plan.validation",
+        "query.plan.repair",
+        "answer.synthesis",
+    }
 )
 
 
@@ -56,8 +69,14 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
         provides=frozenset({"planning"}),
     )
 
-    def __init__(self, *, llm_capable: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        llm_capable: bool = False,
+        slim_read: bool = False,
+    ) -> None:
         self.llm_capable = llm_capable
+        self.slim_read = slim_read
         self._runtime: Any | None = None
 
     @property
@@ -489,7 +508,7 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 },
             ),
         ]
-        if self.llm_capable:
+        if self.llm_capable and not self.slim_read:
             capabilities.extend(
                 [
                     Capability(
@@ -524,13 +543,16 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                     ),
                 ]
             )
+        if self.slim_read:
+            capabilities = [
+                capability
+                for capability in capabilities
+                if capability.id not in _SLIM_REMOVED_CAPABILITIES
+            ]
         return tuple(capabilities)
 
     def get_executors(self) -> tuple[Any, ...]:
         executors: list[Any] = [
-            DbPlanningContextExecutor(self),
-            DbQueryPlanValidationExecutor(self),
-            DbAnswerSynthesisExecutor(runtime=self),
             DbAnalysisPlanExecutor(self),
             DbAnalysisPlanValidationExecutor(self),
             DbAnalysisCheckpointExecutor(self),
@@ -548,14 +570,28 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
             DbMonitorResolveApprovalExecutor(self),
             DbMonitorLocalDeliveryExecutor(self),
         ]
-        if self.llm_capable:
+        if not self.slim_read:
+            from ...synthesis import DbAnswerSynthesisExecutor
+            from .query import (
+                DbPlanningContextExecutor,
+                DbQueryPlanValidationExecutor,
+            )
+
+            executors[:0] = [
+                DbPlanningContextExecutor(self),
+                DbQueryPlanValidationExecutor(self),
+                DbAnswerSynthesisExecutor(runtime=self),
+            ]
+        if self.llm_capable and not self.slim_read:
+            from ...llm_planner import DbLLMPlannerExecutor, DbLLMRepairExecutor
+
             executors.append(DbLLMPlannerExecutor(runtime=self))
             executors.append(DbLLMRepairExecutor(runtime=self))
         return tuple(executors)
 
     def declare_evidence_schemas(self) -> tuple[EvidenceSchema, ...]:
         object_schema = {"type": "object"}
-        return (
+        schemas = (
             EvidenceSchema(
                 kind="planning.context",
                 owner="db_runtime",
@@ -815,6 +851,13 @@ class DbRuntimePlanningPlugin(RuntimeExtensionPlugin):
                 description="Local runtime notification delivery result.",
             ),
         )
+        if self.slim_read:
+            return tuple(
+                schema
+                for schema in schemas
+                if schema.kind not in _SLIM_REMOVED_EVIDENCE
+            )
+        return schemas
 
     def get_workers(self) -> tuple[Worker, ...]:
         return (

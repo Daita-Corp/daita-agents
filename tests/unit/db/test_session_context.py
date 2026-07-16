@@ -27,6 +27,7 @@ from daita.db.session_context import (
     session_query_scope_evidence_for,
     session_scope_binding_evidence_for,
 )
+from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
 from daita.runtime import (
     AccessMode,
@@ -174,8 +175,7 @@ def _scope_read_facts(
 
 async def _seed_agent_schema(path):
     plugin = SQLitePlugin(path=str(path))
-    await plugin.execute_script(
-        """
+    await plugin.execute_script("""
         CREATE TABLE agent_profiles (
             id INTEGER PRIMARY KEY,
             agent_name TEXT NOT NULL
@@ -192,8 +192,7 @@ async def _seed_agent_schema(path):
         INSERT INTO agent_profiles (agent_name) VALUES ('alpha');
         INSERT INTO agent_runs (profile_id, status) VALUES (1, 'ok');
         INSERT INTO billing_events (amount_cents) VALUES (100);
-        """
-    )
+        """)
     await plugin.disconnect()
 
 
@@ -415,21 +414,26 @@ async def test_successful_db_run_persists_one_scope_and_follow_up_retrieves_it()
     )
     runtime = DbRuntime(
         source=sqlite,
-        config=DbRuntimeConfig(plugins=(sqlite,)),
+        config=DbRuntimeConfig(
+            plugins=(CatalogPlugin(auto_persist=False), sqlite),
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "session-scope:sqlite",
+                    "catalog_profile_key": "session-scope:sqlite",
+                    "source_options": {"include_sample_values": False},
+                }
+            },
+        ),
         db_llm_service=service,
     )
-    await runtime.setup(agent_id="db-session-scope-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL
         );
         INSERT INTO orders (id, status) VALUES (1, 'complete'), (2, 'pending');
-        """
-    )
-    await runtime.prepare_sqlite_slim_source()
-
+        """)
+    await runtime.setup(agent_id="db-session-scope-test")
     try:
         result = await runtime.run(
             DbRequest("Show complete orders", session_id="stateful-scope")
@@ -632,14 +636,23 @@ async def test_monitor_and_scheduler_operations_do_not_persist_session_scopes(
 
 async def test_direct_capability_execution_does_not_persist_session_scope():
     sqlite = SQLitePlugin(path=":memory:")
-    runtime = DbRuntime(config=DbRuntimeConfig(plugins=(sqlite,)))
+    runtime = DbRuntime(
+        config=DbRuntimeConfig(
+            plugins=(CatalogPlugin(auto_persist=False), sqlite),
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "direct-scope:sqlite",
+                    "catalog_profile_key": "direct-scope:sqlite",
+                    "source_options": {"include_sample_values": False},
+                }
+            },
+        )
+    )
     await runtime.setup(agent_id="db-direct-scope-test")
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT NOT NULL);
         INSERT INTO orders (id, status) VALUES (1, 'complete');
-        """
-    )
+        """)
 
     try:
         result_evidence = await runtime.execute_capability(

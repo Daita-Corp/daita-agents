@@ -20,8 +20,9 @@ from .inputs import executable_input_for_task
 from .models import DbTaskPlan, DbTaskSpec
 from .planning import (
     _validation_capability_for_sql_execute,
-    plan_sqlite_read_recipe,
+    plan_slim_operation,
     plan_task_specs,
+    plan_validated_slim_read,
 )
 from .readiness import task_readiness
 from .synthesis import execute_answer_synthesis
@@ -73,25 +74,56 @@ class DbTaskRuntime:
             contract=contract,
         )
 
-    async def plan_sqlite_read_recipe(
+    async def execute_slim_operation(
         self,
         operation: Operation,
         *,
-        sql: str,
-        params: Iterable[Any] = (),
-        param_specs: Iterable[Mapping[str, Any]] = (),
-        schema: Mapping[str, Any] | None = None,
+        operation_name: str,
+        arguments: Mapping[str, Any],
+        source_owner: str,
         attempt: int = 1,
-    ) -> DbTaskPlan:
-        return await plan_sqlite_read_recipe(
+    ) -> tuple[Evidence, ...]:
+        """Plan and execute one closed Phase 2 recipe through the kernel.
+
+        Query planning is intentionally sequential: validation is persisted and
+        executed before the dependent read task can exist.
+        """
+
+        plan = await plan_slim_operation(
             self.context,
             operation,
-            sql=sql,
-            params=params,
-            param_specs=param_specs,
-            schema=schema,
+            operation_name=operation_name,
+            arguments=arguments,
+            source_owner=source_owner,
             attempt=attempt,
         )
+        collected: list[Evidence] = []
+        for task in plan.tasks:
+            collected.extend(await self.execute_task(task, operation))
+        if operation_name != "query":
+            return tuple(collected)
+        validation = next(
+            (
+                item
+                for item in reversed(collected)
+                if item.accepted
+                and item.kind == "sql.validation"
+                and item.owner == source_owner
+                and item.operation_id == operation.id
+            ),
+            None,
+        )
+        if validation is None:
+            raise RuntimeError("query validation produced no accepted evidence")
+        read_plan = await plan_validated_slim_read(
+            self.context,
+            operation,
+            source_owner=source_owner,
+            validation=validation,
+        )
+        for task in read_plan.tasks:
+            collected.extend(await self.execute_task(task, operation))
+        return tuple(collected)
 
     async def task_readiness(
         self,

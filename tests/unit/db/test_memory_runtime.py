@@ -438,15 +438,13 @@ async def test_memory_executors_return_typed_evidence(tmp_path):
 async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
     db_path = tmp_path / "planning_memory.sqlite"
     sqlite = SQLitePlugin(path=str(db_path))
-    await sqlite.execute_script(
-        """
+    await sqlite.execute_script("""
         CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             total REAL NOT NULL
         );
         INSERT INTO orders (total) VALUES (10.0), (20.0);
-        """
-    )
+        """)
     source_identity = "sqlite:from_db:memory-test-source"
     memory = MemoryPlugin()
     backend = MagicMock()
@@ -486,10 +484,11 @@ async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
     runtime = DbRuntime(
         source=sqlite,
         config=DbRuntimeConfig(
-            plugins=(CatalogPlugin(auto_persist=False), sqlite, memory),
             metadata={
                 "from_db_options": {
                     "catalog_store_id": "from_db:memory-test-source",
+                    "catalog_profile_key": "memory-test-source",
+                    "source_options": {"include_sample_values": False},
                     "memory": {
                         "enabled": True,
                         "recall": "auto",
@@ -504,6 +503,12 @@ async def test_planning_time_db_memory_recall_adds_bounded_context(tmp_path):
             },
         ),
     )
+    # This is an isolated legacy planning-context contract test. Register its
+    # fixtures after construction so the production SQLite slim constructor
+    # remains covered by the closed Phase 2 registrations.
+    runtime.register_plugin(CatalogPlugin(auto_persist=False))
+    runtime.register_plugin(sqlite)
+    runtime.register_plugin(memory)
 
     try:
         await runtime.setup()
@@ -2095,8 +2100,7 @@ async def test_structured_db_memory_backfills_phase31_rows(tmp_path):
     db_path = tmp_path / "db_semantics.db"
     conn = sqlite3.connect(str(db_path))
     cursor = conn.cursor()
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE db_memory_records (
             record_id TEXT PRIMARY KEY,
             source_identity_key TEXT NOT NULL,
@@ -2118,8 +2122,7 @@ async def test_structured_db_memory_backfills_phase31_rows(tmp_path):
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
-        """
-    )
+        """)
     cursor.execute(
         """
         INSERT INTO db_memory_records VALUES (
@@ -2191,8 +2194,7 @@ async def test_local_backend_migrates_legacy_db_memory_chunks(tmp_path):
     vector_db = workspace_dir / "vectors.db"
     conn = sqlite3.connect(str(vector_db))
     cursor = conn.cursor()
-    cursor.execute(
-        """
+    cursor.execute("""
         CREATE TABLE chunks (
             chunk_id TEXT PRIMARY KEY,
             file_path TEXT NOT NULL,
@@ -2202,8 +2204,7 @@ async def test_local_backend_migrates_legacy_db_memory_chunks(tmp_path):
             metadata TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        """
-    )
+        """)
     cursor.execute(
         "CREATE TABLE embeddings (chunk_id TEXT PRIMARY KEY, embedding TEXT NOT NULL)"
     )

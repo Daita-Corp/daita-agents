@@ -5,11 +5,13 @@ Skeleton database runtime built on the extension registry.
 from __future__ import annotations
 
 import secrets
+from dataclasses import replace
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from daita.plugins import ExtensionRegistry, PluginContext, ServiceRegistry
+from daita.plugins.catalog import CatalogPlugin
 from daita.runtime import (
     AccessMode,
     Capability,
@@ -32,8 +34,6 @@ from daita.skills import SkillResolution, SkillResolver
 
 from ..evidence import evidence_in_task_plan_order
 from ..loop import DbAgentLoop, DbLoopResult
-from ..loop.legacy import DbLegacyAgentLoop
-from ..llm_agent_planner import DbLLMAgentPlanner
 from ..llm_service import DbLLMService
 from ..models import (
     DbIntent,
@@ -47,19 +47,15 @@ from ..models import (
 )
 from ..monitors import DbMonitorMutation, DbMonitorStore
 from ..planning import DbContractBuilder, build_safety_frame, classify_db_request
-from ..planner_protocol import DbAgentPlanner
 from ..session_context import (
     db_session_context_from_request,
     persist_session_query_scopes,
 )
-from ..synthesis import DbSynthesizer
 from ..verification import (
     DbVerifier,
     db_run_finalization_check,
-    db_sqlite_slim_readiness_check,
 )
 from .analysis import DbRuntimeAnalysisMixin
-from .cache import DbRuntimeCacheMixin
 from .extensions import DbRuntimePlanningPlugin
 from .governance import (
     DbRuntimeGovernanceMixin,
@@ -82,7 +78,6 @@ from .tasks.context import DbTaskContext
 from .tasks.models import DbTaskPlan, DbTaskSpec
 from .tasks.runtime import DbTaskRuntime
 from .types import (
-    _SourcePreparationSnapshot,
     _governance_blocked_answer,
     _governance_blocked_warning,
     DbRuntimeGovernanceBlocked,
@@ -91,7 +86,6 @@ from .types import (
 
 class DbRuntime(
     DbRuntimeAnalysisMixin,
-    DbRuntimeCacheMixin,
     DbRuntimeGovernanceMixin,
     DbRuntimeMonitorsMixin,
     DbRuntimeMemoryLearningMixin,
@@ -130,7 +124,7 @@ class DbRuntime(
         self.approval_channel = approval_channel or InMemoryApprovalChannel(self.store)
         self.runtime_id = runtime_id or f"db-runtime-{uuid4()}"
         self.verifier = DbVerifier()
-        self.synthesizer = DbSynthesizer()
+        self.synthesizer = None
         if db_llm_service is None:
             self.db_llm_service = DbLLMService(None)
             self._owns_db_llm_service = True
@@ -153,8 +147,6 @@ class DbRuntime(
         self._audit_fingerprint_key = audit_fingerprint_key
         self._setup_context: PluginContext | None = None
         self._is_setup = False
-        self._schema_profile_cache: dict[str, Any] | None = None
-        self._catalog_source_cache: _SourcePreparationSnapshot | None = None
         self._operation_results: list[DbOperationResult] = []
         self._audit_log: list[dict[str, Any]] = []
         self.kernel = RuntimeKernel(
@@ -174,11 +166,26 @@ class DbRuntime(
         )
         self.tasks = DbTaskRuntime(task_context)
 
-        self.registry.register(
-            DbRuntimePlanningPlugin(llm_capable=self.db_llm_service.available)
+        configured_plugins = (*tuple(self.config.plugins), *tuple(plugins))
+        configured_plugin_ids = {
+            str(getattr(getattr(plugin, "manifest", None), "id", ""))
+            for plugin in configured_plugins
+        }
+        slim_read = any(
+            owner in self.registry.plugin_ids or owner in configured_plugin_ids
+            for owner in ("sqlite", "postgresql")
         )
-        self.registry.register_many(self.config.plugins)
-        self.registry.register_many(tuple(plugins))
+        if not slim_read:
+            from ..synthesis import DbSynthesizer
+
+            self.synthesizer = DbSynthesizer()
+        self.registry.register(
+            DbRuntimePlanningPlugin(
+                llm_capable=self.db_llm_service.available,
+                slim_read=slim_read,
+            )
+        )
+        self.registry.register_many(configured_plugins)
 
     @property
     def is_setup(self) -> bool:
@@ -204,6 +211,25 @@ class DbRuntime(
         """Set up registered plugins with a typed runtime context."""
         if self._is_setup:
             return
+        slim_owners = [
+            owner
+            for owner in ("sqlite", "postgresql")
+            if owner in self.registry.plugin_ids
+        ]
+        if len(slim_owners) > 1:
+            raise RuntimeError("from_db requires exactly one SQL source connector")
+        catalog_plugin: CatalogPlugin | None = None
+        if slim_owners:
+            if "catalog" not in self.registry.plugin_ids:
+                raise RuntimeError(
+                    "SQLite/PostgreSQL Phase 2 setup requires one CatalogPlugin"
+                )
+            candidate = self.registry.get_plugin("catalog")
+            if not isinstance(candidate, CatalogPlugin):
+                raise RuntimeError(
+                    "SQLite/PostgreSQL Phase 2 setup requires CatalogPlugin ownership"
+                )
+            catalog_plugin = candidate
         services = ServiceRegistry(
             {
                 **self.host_services,
@@ -227,9 +253,56 @@ class DbRuntime(
                 }
             ),
         )
-        await self.registry.setup_all(context)
-        self._setup_context = context
-        self._is_setup = True
+        setup_complete = False
+        try:
+            await self.registry.setup_all(context)
+            self._setup_context = context
+            # Catalog maintenance executes declared tasks through this runtime;
+            # mark re-entrant setup complete only for the duration of readiness.
+            self._is_setup = True
+            if catalog_plugin is not None:
+                options = self.config.metadata.get("from_db_options") or {}
+                options = options if isinstance(options, Mapping) else {}
+                source_options = options.get("source_options") or {}
+                source_options = (
+                    source_options if isinstance(source_options, Mapping) else {}
+                )
+                store_id = str(options.get("catalog_store_id") or "")
+                profile_key = str(options.get("catalog_profile_key") or store_id)
+                if not store_id:
+                    raise RuntimeError(
+                        "Phase 2 catalog binding requires a configured store identity"
+                    )
+                state = await catalog_plugin.prepare_runtime_source(
+                    self,
+                    source_owner=slim_owners[0],
+                    store_id=store_id,
+                    profile_key=profile_key,
+                    catalog_keys=tuple(options.get("catalog_keys") or ()),
+                    cache_ttl=source_options.get("cache_ttl"),
+                    persist=bool(options.get("catalog_persist", False)),
+                    include_value_profiles=bool(
+                        source_options.get("include_sample_values", True)
+                    ),
+                )
+                binding = catalog_plugin.runtime_binding_facts()
+                if (
+                    state.get("status") != "ready"
+                    or binding.get("source_owner") != slim_owners[0]
+                    or binding.get("store_id") != store_id
+                ):
+                    raise RuntimeError(
+                        "Phase 2 catalog did not become ready for the configured source"
+                    )
+            setup_complete = True
+        finally:
+            if not setup_complete:
+                self._setup_context = None
+                self._is_setup = False
+                try:
+                    await self.registry.teardown_all()
+                except Exception:
+                    pass
 
     async def execute_task(
         self,
@@ -443,11 +516,12 @@ class DbRuntime(
             await self.setup()
         skill_resolution = self._resolve_skills(db_request)
         safety_frame = build_safety_frame(self.registry, self.config, db_request)
-        sqlite_slim = self._uses_sqlite_slim_read()
-        if sqlite_slim:
-            intent = _sqlite_slim_read_intent()
-            contract = _sqlite_slim_read_contract(
+        slim_owner = self._slim_read_owner()
+        if slim_owner is not None:
+            intent = _slim_read_intent(slim_owner)
+            contract = _slim_read_contract(
                 self.config,
+                source_owner=slim_owner,
                 request=db_request,
                 registry=self.registry,
                 safety_frame=safety_frame.to_dict(),
@@ -470,6 +544,7 @@ class DbRuntime(
                 "user_id": db_request.user_id,
                 "session_id": db_request.session_id,
                 "source_scope": list(db_request.source_scope),
+                "source_owner": slim_owner,
                 "mode": db_request.mode,
                 "requested_capabilities": list(db_request.requested_capabilities),
                 "constraints": db_request.constraints,
@@ -488,6 +563,7 @@ class DbRuntime(
                     "constraints": db_request.constraints,
                 },
                 "source_scope": list(db_request.source_scope),
+                "source_owner": slim_owner,
                 "mode": db_request.mode,
                 "requested_capabilities": list(db_request.requested_capabilities),
                 "constraints": db_request.constraints,
@@ -497,7 +573,9 @@ class DbRuntime(
                 "loop_state": {
                     "status": "bootstrap",
                     "implementation": (
-                        "sqlite_provider_native" if sqlite_slim else "legacy_planner"
+                        f"{slim_owner}_provider_native"
+                        if slim_owner is not None
+                        else "legacy_planner"
                     ),
                 },
                 "resume_context": {
@@ -528,9 +606,9 @@ class DbRuntime(
         if session_context is not None:
             base_diagnostics["session_context"] = session_context.to_diagnostic_dict()
 
-        planner = None if sqlite_slim else self._select_db_agent_planner()
-        if (sqlite_slim and not self.db_llm_service.available) or (
-            not sqlite_slim and planner is None
+        planner = None if slim_owner is not None else self._select_db_agent_planner()
+        if (slim_owner is not None and not self.db_llm_service.available) or (
+            slim_owner is None and planner is None
         ):
             return await self._record_operation_result(
                 DbOperationResult(
@@ -553,16 +631,19 @@ class DbRuntime(
             )
 
         try:
-            if sqlite_slim:
+            if slim_owner is not None:
                 loop_result = await DbAgentLoop(
                     self,
                     self.db_llm_service.provider,
+                    source_owner=slim_owner,
                 ).run(
                     operation,
                     safety_frame=safety_frame.to_dict(),
                 )
             else:
                 assert planner is not None
+                from ..loop.legacy import DbLegacyAgentLoop
+
                 loop_result = await DbLegacyAgentLoop(self, planner).run(
                     operation,
                     safety_frame=safety_frame.to_dict(),
@@ -603,14 +684,15 @@ class DbRuntime(
             )
 
         if loop_result.status == "finished":
-            if sqlite_slim:
-                return await self._finalize_sqlite_slim_run(
+            if slim_owner is not None:
+                return await self._finalize_slim_read_run(
                     operation_id=operation_id,
                     request=db_request,
                     intent=intent,
                     contract=contract,
                     loop_result=loop_result,
                     base_diagnostics=base_diagnostics,
+                    source_owner=slim_owner,
                 )
             return await self._finalize_run_operation(
                 operation_id=operation_id,
@@ -639,9 +721,9 @@ class DbRuntime(
                 warnings=tuple(loop_result.warnings),
                 diagnostics={
                     **base_diagnostics,
-                    ("loop" if sqlite_slim else "planner"): _planner_diagnostics(
-                        loop_result
-                    ),
+                    (
+                        "loop" if slim_owner is not None else "planner"
+                    ): _planner_diagnostics(loop_result),
                     **(
                         {"telemetry": loop_result.diagnostics["telemetry"]}
                         if isinstance(loop_result.diagnostics.get("telemetry"), dict)
@@ -657,12 +739,19 @@ class DbRuntime(
             operation=current_operation,
         )
 
-    def _uses_sqlite_slim_read(self) -> bool:
-        """Select the canonical implementation from the registered connector."""
+    def _slim_read_owner(self) -> str | None:
+        """Select the canonical slim implementation from the registered connector."""
 
-        return "sqlite" in self.registry.plugin_ids
+        owners = [
+            owner
+            for owner in ("sqlite", "postgresql")
+            if owner in self.registry.plugin_ids
+        ]
+        if len(owners) > 1:
+            raise RuntimeError("from_db requires exactly one SQL source connector")
+        return owners[0] if owners else None
 
-    async def _finalize_sqlite_slim_run(
+    async def _finalize_slim_read_run(
         self,
         *,
         operation_id: str,
@@ -671,6 +760,7 @@ class DbRuntime(
         contract: DbOperationContract,
         loop_result: DbLoopResult,
         base_diagnostics: dict[str, Any],
+        source_owner: str,
     ) -> DbOperationResult:
         operation = await self.store.load_operation(operation_id)
         if operation is None:
@@ -691,13 +781,9 @@ class DbRuntime(
             tasks,
         )
         answer = str(loop_result.diagnostics.get("final_answer") or "").strip()
-        readiness = db_sqlite_slim_readiness_check(
-            operation=operation,
-            evidence=evidence,
-            tasks=tasks,
-            answer=answer,
-        )
-        if not readiness.ready:
+        readiness = loop_result.diagnostics.get("readiness")
+        readiness = readiness if isinstance(readiness, Mapping) else {}
+        if readiness.get("ready") is not True:
             return await self._record_operation_result(
                 DbOperationResult(
                     operation_id=operation_id,
@@ -707,7 +793,9 @@ class DbRuntime(
                     status=OperationStatus.FAILED,
                     answer="DB operation could not be grounded in current query evidence.",
                     evidence=evidence,
-                    warnings=tuple((*loop_result.warnings, *readiness.reasons)),
+                    warnings=tuple(
+                        (*loop_result.warnings, *tuple(readiness.get("reasons") or ()))
+                    ),
                     diagnostics={
                         **base_diagnostics,
                         "loop": _planner_diagnostics(loop_result),
@@ -716,12 +804,64 @@ class DbRuntime(
                             tasks=tasks,
                             evidence=evidence,
                         ),
-                        "verification": readiness.to_dict(),
+                        "verification": dict(readiness),
                         "telemetry": loop_result.diagnostics.get("telemetry", {}),
                     },
                 ),
                 operation=operation,
             )
+        answer_kind = str(readiness.get("answer_kind") or "query")
+        evidence_ref_key = (
+            "catalog_evidence_ref" if answer_kind == "catalog" else "query_result_ref"
+        )
+        resolved_ref = readiness.get(evidence_ref_key)
+        resolved_ref = resolved_ref if isinstance(resolved_ref, Mapping) else {}
+        resolved_evidence = next(
+            (
+                item
+                for item in evidence
+                if item.id == resolved_ref.get("id")
+                and item.operation_id == operation.id
+                and item.accepted
+            ),
+            None,
+        )
+        if resolved_evidence is None:
+            return await self._record_operation_result(
+                DbOperationResult(
+                    operation_id=operation_id,
+                    request=request,
+                    intent=intent,
+                    contract=contract,
+                    status=OperationStatus.FAILED,
+                    answer="DB operation could not persist its resolved evidence target.",
+                    evidence=evidence,
+                    warnings=tuple(
+                        (*loop_result.warnings, "resolved_evidence_target_missing")
+                    ),
+                    diagnostics={
+                        **base_diagnostics,
+                        "loop": _planner_diagnostics(loop_result),
+                        "verification": dict(readiness),
+                    },
+                ),
+                operation=operation,
+            )
+        operation = replace(
+            operation,
+            required_evidence=frozenset({resolved_evidence.kind}),
+            metadata={
+                **operation.metadata,
+                "resolved_answer": {
+                    "kind": answer_kind,
+                    "evidence_id": resolved_evidence.id,
+                    "evidence_kind": resolved_evidence.kind,
+                    "evidence_owner": resolved_evidence.owner,
+                },
+            },
+        )
+        await self.store.save_operation(operation)
+        contract = replace(contract, required_evidence=(resolved_evidence.kind,))
         return await self._record_operation_result(
             DbOperationResult(
                 operation_id=operation_id,
@@ -731,7 +871,9 @@ class DbRuntime(
                 status=OperationStatus.SUCCEEDED,
                 answer=answer,
                 evidence=evidence,
-                warnings=tuple((*loop_result.warnings, *readiness.warnings)),
+                warnings=tuple(
+                    (*loop_result.warnings, *tuple(readiness.get("warnings") or ()))
+                ),
                 diagnostics={
                     **base_diagnostics,
                     "loop": _planner_diagnostics(loop_result),
@@ -740,14 +882,16 @@ class DbRuntime(
                         tasks=tasks,
                         evidence=evidence,
                     ),
-                    "verification": readiness.to_dict(),
+                    "verification": dict(readiness),
                     "telemetry": loop_result.diagnostics.get("telemetry", {}),
                 },
             ),
             operation=operation,
         )
 
-    def _select_db_agent_planner(self) -> DbAgentPlanner | None:
+    def _select_db_agent_planner(self) -> Any | None:
+        from ..llm_agent_planner import DbLLMAgentPlanner
+
         return (
             self.host_services.get("db_agent_planner")
             or self.host_services.get("db_planner")
@@ -1110,19 +1254,20 @@ def _neutral_run_intent() -> DbIntent:
     )
 
 
-def _sqlite_slim_read_intent() -> DbIntent:
+def _slim_read_intent(source_owner: str) -> DbIntent:
     return DbIntent(
         kind=DbIntentKind.DATA_QUERY,
         confidence=1.0,
         access=AccessMode.READ,
-        evidence_mode="sqlite_provider_native",
-        diagnostics={"source": "sqlite_slim_read_slice"},
+        evidence_mode=f"{source_owner}_provider_native",
+        diagnostics={"source": "slim_read_slice", "source_owner": source_owner},
     )
 
 
-def _sqlite_slim_read_contract(
+def _slim_read_contract(
     config: DbRuntimeConfig,
     *,
+    source_owner: str,
     request: DbRequest,
     registry: ExtensionRegistry,
     safety_frame: dict[str, Any],
@@ -1137,8 +1282,8 @@ def _sqlite_slim_read_contract(
     )
     return DbOperationContract(
         operation_type="data.query",
-        required_capabilities=("db.sql.validate", "db.sql.execute_read"),
-        required_evidence=("query.result",),
+        required_capabilities=(),
+        required_evidence=(),
         access=AccessMode.READ,
         limits=config.limits,
         policy_ids=base.policy_ids,
@@ -1147,9 +1292,11 @@ def _sqlite_slim_read_contract(
             "planned_operation": {
                 "operation_type": "data.query",
                 "access": AccessMode.READ.value,
-                "source": "sqlite_slim_read_slice",
+                "source": "slim_read_slice",
+                "source_owner": source_owner,
             },
-            "slim_sqlite": True,
+            "slim_read": True,
+            "source_owner": source_owner,
         },
     )
 
@@ -1295,7 +1442,9 @@ def _answer_from_loop_result(loop_result: DbLoopResult) -> str:
             "from_db model and provider to run this request."
         )
     if loop_result.status == "clarification_required":
-        question = loop_result.diagnostics.get("clarification_question")
+        question = loop_result.diagnostics.get(
+            "clarification_question"
+        ) or loop_result.diagnostics.get("final_answer")
         if question:
             return str(question)
         return "The DB planner needs clarification before it can continue."

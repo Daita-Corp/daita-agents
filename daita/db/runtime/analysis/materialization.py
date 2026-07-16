@@ -44,7 +44,6 @@ from ...models import (
     DbOperationResult,
     DbRequest,
 )
-from ..cache import _from_db_options
 from ..tasks.models import DbTaskSpec
 from ..types import (
     DbRuntimeGovernanceBlocked,
@@ -97,8 +96,6 @@ class DbRuntimeAnalysisMixin(
             *,
             operation: Operation | None = None,
         ) -> DbOperationResult: ...
-
-        def remember_schema_evidence(self, evidence: Evidence) -> None: ...
 
         async def plan_task_specs(
             self,
@@ -648,7 +645,6 @@ class DbRuntimeAnalysisMixin(
             await self.store.save_evidence(scoped)
             evidence_store.discard(schema_evidence.id)
             evidence_store.add(scoped)
-        self.remember_schema_evidence(scoped)
         return scoped
 
     async def _execute_analysis_planning_context_task(
@@ -1416,3 +1412,8 @@ def _analysis_max_concurrency(metadata: dict[str, Any]) -> int:
         return max(1, int(value))
     except (TypeError, ValueError):
         return 1
+
+
+def _from_db_options(metadata: dict[str, Any]) -> dict[str, Any]:
+    options = metadata.get("from_db_options")
+    return options if isinstance(options, dict) else {}

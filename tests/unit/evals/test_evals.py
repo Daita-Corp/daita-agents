@@ -148,6 +148,15 @@ def test_extracts_real_db_operation_result_dataclasses():
             ),
         ),
         diagnostics={
+            "telemetry": {
+                "total_tokens": 41,
+                "estimated_cost_usd": 0.0123,
+                "tokens": {
+                    "prompt_tokens": 30,
+                    "completion_tokens": 11,
+                    "total_tokens": 41,
+                },
+            },
             "execution": {
                 "task_count": 1,
                 "tasks": [
@@ -178,6 +187,8 @@ def test_extracts_real_db_operation_result_dataclasses():
     assert evidence.intent == "data.query"
     assert evidence.tasks[0].capability_id == "db.sql.execute_read"
     assert evidence.evidence[0].kind == "query.result"
+    assert evidence.metrics.tokens_total == 41
+    assert evidence.metrics.cost == 0.0123
 
 
 async def test_sql_assertions_fail_with_stable_codes():

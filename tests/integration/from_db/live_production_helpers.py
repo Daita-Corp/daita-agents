@@ -797,7 +797,39 @@ def assert_successful_prompt_run(result: Any, *, snapshot: Any | None = None) ->
 
 def assert_loop_evidence(result_or_snapshot: Any) -> None:
     """Assert the live LLM loop evidence contract for successful db.run prompts."""
-    missing = FULL_LOOP_EVIDENCE - evidence_kinds(result_or_snapshot)
+    kinds = evidence_kinds(result_or_snapshot)
+    operation = getattr(result_or_snapshot, "operation", None)
+    metadata = getattr(operation, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    loop_state = metadata.get("loop_state")
+    loop_state = loop_state if isinstance(loop_state, dict) else {}
+    diagnostics = getattr(result_or_snapshot, "diagnostics", None)
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    contract = diagnostics.get("contract")
+    contract = contract if isinstance(contract, dict) else {}
+    result_contract = getattr(result_or_snapshot, "contract", None)
+    result_contract = getattr(result_contract, "metadata", None)
+    result_contract = result_contract if isinstance(result_contract, dict) else {}
+    slim = (
+        bool(contract.get("slim_read"))
+        or str(loop_state.get("implementation") or "").endswith("_provider_native")
+        or bool(result_contract.get("slim_read"))
+    )
+    if slim:
+        missing = {"sql.validation", "query.result"} - kinds
+        forbidden = {
+            "answer.synthesis",
+            "planner.compilation",
+            "planner.decision",
+            "planning.context",
+            "query.plan.proposal",
+            "query.plan.repair",
+        } & kinds
+        assert (
+            not forbidden
+        ), f"Unexpected legacy slim-loop evidence: {sorted(forbidden)}"
+    else:
+        missing = FULL_LOOP_EVIDENCE - kinds
     assert not missing, f"Missing loop evidence: {sorted(missing)}"
 
 

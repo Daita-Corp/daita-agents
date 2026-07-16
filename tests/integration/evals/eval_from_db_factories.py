@@ -279,8 +279,7 @@ def wide_benchmark_postgres_sql(table_count: int = 48) -> str:
     statements = ["\n".join(decoys), RICH_BENCHMARK_POSTGRES_SQL]
     for index in range(1, table_count + 1):
         table = f"customer_activity_decoy_{index:02d}"
-        statements.append(
-            f"""
+        statements.append(f"""
 CREATE TABLE {table} (
     id INTEGER PRIMARY KEY,
     customer_id INTEGER,
@@ -293,8 +292,7 @@ CREATE TABLE {table} (
 INSERT INTO {table} (id, customer_id, customer_name, status, region, severity, total)
 VALUES
     (1, {index}, 'Decoy {index}', 'inactive', 'ZZ', 'low', 0.00);
-"""
-        )
+""")
     return "\n".join(statements)
 
 
@@ -313,7 +311,11 @@ class FromDbEvalTarget:
         self.agent = agent
         self.name = name
         self.agent_id = name
-        self.llm = getattr(agent, "llm", None)
+        self.llm = getattr(agent, "llm", None) or getattr(
+            getattr(getattr(agent, "runtime", None), "db_llm_service", None),
+            "provider",
+            None,
+        )
         self._cleanup = cleanup
         self._database_type = database_type or (
             "postgresql" if "postgres" in name.lower() else "sqlite"

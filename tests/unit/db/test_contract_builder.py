@@ -1,4 +1,4 @@
-from daita.db import DbIntentKind, DbRequest, DbRuntime
+from daita.db import DbIntentKind, DbRequest, DbRuntime, DbRuntimeConfig
 from daita.core.exceptions import SkillError
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
@@ -9,10 +9,19 @@ import pytest
 
 def _runtime() -> DbRuntime:
     return DbRuntime(
+        config=DbRuntimeConfig(
+            metadata={
+                "from_db_options": {
+                    "catalog_store_id": "contract-builder:sqlite",
+                    "catalog_profile_key": "contract-builder:sqlite",
+                    "source_options": {"include_sample_values": False},
+                }
+            }
+        ),
         plugins=(
             CatalogPlugin(auto_persist=False),
             SQLitePlugin(path=":memory:"),
-        )
+        ),
     )
 
 

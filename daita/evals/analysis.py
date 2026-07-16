@@ -171,23 +171,27 @@ def metric_delta_pct(
 
 def metric_snapshot(target: Any) -> dict[str, Any]:
     llm = getattr(target, "llm", target)
-    tokens = {}
+    snapshot: dict[str, Any] = {}
     if hasattr(llm, "get_accumulated_tokens"):
-        tokens = llm.get_accumulated_tokens()
-    cost = llm.get_accumulated_cost() if hasattr(llm, "get_accumulated_cost") else None
-    return {"tokens": tokens or {}, "cost": cost}
+        snapshot["tokens"] = llm.get_accumulated_tokens() or {}
+    if hasattr(llm, "get_accumulated_cost"):
+        snapshot["cost"] = llm.get_accumulated_cost()
+    return snapshot
 
 
 def metric_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
     if not before or not after:
         return {}
-    before_tokens = before.get("tokens") or {}
-    after_tokens = after.get("tokens") or {}
-    return {
-        "tokens_total": (after_tokens.get("total_tokens") or 0)
-        - (before_tokens.get("total_tokens") or 0),
-        "cost": (after.get("cost") or 0) - (before.get("cost") or 0),
-    }
+    result: dict[str, Any] = {}
+    before_tokens = _mapping(before.get("tokens"))
+    after_tokens = _mapping(after.get("tokens"))
+    if "total_tokens" in before_tokens and "total_tokens" in after_tokens:
+        result["tokens_total"] = int(after_tokens["total_tokens"] or 0) - int(
+            before_tokens["total_tokens"] or 0
+        )
+    if before.get("cost") is not None and after.get("cost") is not None:
+        result["cost"] = float(after["cost"]) - float(before["cost"])
+    return result
 
 
 def summarize_run_metrics(
@@ -195,15 +199,39 @@ def summarize_run_metrics(
     wrapper: Mapping[str, Any],
     execution: Mapping[str, Any],
 ) -> RunMetrics:
-    llm = _mapping(_mapping(result.get("diagnostics")).get("llm"))
-    tokens = _mapping(llm.get("tokens") or wrapper.get("tokens"))
+    diagnostics = _mapping(result.get("diagnostics"))
+    llm = _mapping(diagnostics.get("llm"))
+    telemetry = _mapping(diagnostics.get("telemetry"))
+    tokens = _mapping(
+        telemetry.get("tokens") or llm.get("tokens") or wrapper.get("tokens")
+    )
     deltas = _mapping(wrapper.get("_eval_metric_delta"))
+    tokens_total = (
+        deltas["tokens_total"]
+        if "tokens_total" in deltas
+        else (
+            tokens.get("total_tokens")
+            if tokens.get("total_tokens") is not None
+            else (
+                telemetry.get("total_tokens")
+                if telemetry.get("total_tokens") is not None
+                else wrapper.get("tokens_total")
+            )
+        )
+    )
+    cost = (
+        deltas["cost"]
+        if "cost" in deltas
+        else (
+            telemetry.get("estimated_cost_usd")
+            if telemetry.get("estimated_cost_usd") is not None
+            else llm.get("cost")
+        )
+    )
     return RunMetrics(
         latency_ms=_optional_float(wrapper.get("latency_ms")),
-        tokens_total=deltas.get("tokens_total")
-        or tokens.get("total_tokens")
-        or wrapper.get("tokens_total"),
-        cost=deltas.get("cost") if "cost" in deltas else llm.get("cost"),
+        tokens_total=tokens_total,
+        cost=cost,
         iterations=execution.get("task_count") or len(_list(execution.get("tasks"))),
     )
 

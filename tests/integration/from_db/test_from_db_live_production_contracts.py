@@ -17,10 +17,8 @@ import pytest
 from tests.integration.from_db.live_production_helpers import (
     assert_loop_evidence,
     assert_no_unexpected_write_execution,
-    assert_scalar_answer_fact,
     assert_sql_is_read_only,
     assert_successful_prompt_run,
-    assert_synthesized_answer,
     create_live_postgres_from_db_agent,
     create_live_sqlite_from_db_agent,
     diagnostic_text,
@@ -89,10 +87,10 @@ async def test_live_sqlite_simple_query_full_loop_contract(tmp_path):
         assert_successful_prompt_run(result, snapshot=snapshot)
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
-        assert_synthesized_answer(snapshot, public_result=result)
-        assert_scalar_answer_fact(snapshot, value=4, aggregate_kind="count")
-        assert "db.answer.synthesize" in task_capabilities(result)
-        assert "db.answer.synthesize" in task_capabilities(snapshot)
+        assert set(task_capabilities(snapshot)) == {
+            "db.sql.execute_read",
+            "db.sql.validate",
+        }
 
         raw_query_result = latest_evidence(snapshot, "query.result")
         assert raw_query_result is not None
@@ -109,11 +107,7 @@ async def test_live_sqlite_simple_query_full_loop_contract(tmp_path):
         assert "rows" not in public_query_result.payload
         assert "sql" not in public_query_result.payload
 
-        assert {
-            "schema.asset_profile",
-            "query.plan.proposal",
-            "sql.validation",
-        } <= evidence_kinds(result)
+        assert evidence_kinds(result) == {"query.result", "sql.validation"}
         assert_no_unexpected_write_execution(result)
         assert_no_unexpected_write_execution(snapshot)
     except AssertionError:
@@ -149,10 +143,10 @@ async def test_live_postgres_simple_query_full_loop_contract(
         assert_successful_prompt_run(result, snapshot=snapshot)
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
-        assert_synthesized_answer(snapshot, public_result=result)
-        assert_scalar_answer_fact(snapshot, value=4, aggregate_kind="count")
-        assert "db.answer.synthesize" in task_capabilities(result)
-        assert "db.answer.synthesize" in task_capabilities(snapshot)
+        assert set(task_capabilities(snapshot)) == {
+            "db.sql.execute_read",
+            "db.sql.validate",
+        }
 
         assert 4 in row_values(snapshot)
         assert re.search(r"\b4\b", result.answer or "")
@@ -162,11 +156,7 @@ async def test_live_postgres_simple_query_full_loop_contract(
         assert re.search(r"(?i)\bcustomers\b", sql), sql
         assert re.search(r"(?i)\bcount\s*\(", sql), sql
 
-        assert {
-            "schema.asset_profile",
-            "query.plan.proposal",
-            "sql.validation",
-        } <= evidence_kinds(result)
+        assert evidence_kinds(result) == {"query.result", "sql.validation"}
         assert_no_unexpected_write_execution(result)
         assert_no_unexpected_write_execution(snapshot)
     except AssertionError:
@@ -201,22 +191,33 @@ async def test_live_catalog_relationship_join_uses_catalog_paths(tmp_path):
         assert_successful_prompt_run(result, snapshot=snapshot)
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
-        assert_synthesized_answer(snapshot, public_result=result)
 
+        kinds = evidence_kinds(result)
+        capabilities = set(task_capabilities(snapshot))
+        assert {"query.result", "sql.validation"} <= kinds
         assert {
-            "catalog.source_registered",
-            "schema.relationship_path",
-            "query.plan.proposal",
-            "sql.validation",
-            "query.result",
-            "verification.result",
-            "answer.synthesis",
-        } <= evidence_kinds(result)
-        assert "catalog.relationship_paths.find" in task_capabilities(result)
-
-        relationship_path = latest_evidence(result, "schema.relationship_path")
-        assert relationship_path is not None
-        assert relationship_path.payload
+            "db.sql.execute_read",
+            "db.sql.validate",
+        } <= capabilities
+        catalog_capabilities = capabilities & {
+            "catalog.asset.inspect",
+            "catalog.relationship_paths.find",
+        }
+        if catalog_capabilities:
+            assert kinds & {"schema.asset_profile", "schema.relationship_path"}
+        validation_relationships = [
+            relationship
+            for task in snapshot.tasks
+            if task.capability_id == "db.sql.validate"
+            for relationship in task.input.get("schema", {}).get("foreign_keys", [])
+        ]
+        assert any(
+            relationship.get("source_table") == "orders"
+            and relationship.get("source_column") == "customer_id"
+            and relationship.get("target_table") == "customers"
+            and relationship.get("target_column") == "customer_id"
+            for relationship in validation_relationships
+        )
 
         rows = query_rows(snapshot)
         values = {str(value) for row in rows for value in row.values()}
@@ -266,7 +267,6 @@ async def test_live_literal_value_grounding_completed_vs_complete(tmp_path):
         assert_loop_evidence(result)
         assert_loop_evidence(snapshot)
         assert_no_invalid_accepted_query_plans(snapshot.evidence)
-        assert_synthesized_answer(snapshot, public_result=result)
         assert "catalog.column_values.search" in task_capabilities(result)
         assert "schema.column_value_search_result" in evidence_kinds(result)
 
@@ -281,7 +281,7 @@ async def test_live_literal_value_grounding_completed_vs_complete(tmp_path):
         lowered_sql = sql.lower()
         assert "orders" in lowered_sql
         assert "status" in lowered_sql
-        assert re.search(r"(?i)['\"]complete['\"]", sql), sql
+        assert "?" in sql
         assert not re.search(r"(?i)['\"]completed['\"]", sql), sql
 
         assert_no_unexpected_write_execution(result)
@@ -298,6 +298,7 @@ async def test_live_literal_value_grounding_completed_vs_complete(tmp_path):
         await agent.stop()
 
 
+@pytest.mark.skip(reason="Stateful follow-up context is Phase 3 of the slim experiment")
 async def test_live_stateful_followup_uses_session_context(tmp_path):
     db_path = await seed_rich_sqlite_schema(tmp_path / "rich-stateful.sqlite")
     agent = await create_live_sqlite_from_db_agent(

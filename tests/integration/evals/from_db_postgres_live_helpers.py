@@ -13,11 +13,8 @@ from daita.evals.reporters import render_pretty
 load_dotenv(Path.cwd() / ".env")
 
 POSTGRES_WARM_READ_SEQUENCE = [
-    "db.query.plan",
-    "db.query.plan.validate",
     "db.sql.validate",
     "db.sql.execute_read",
-    "db.answer.synthesize",
 ]
 
 WARM_FAST_PATH_MAX_PER_CAPABILITY = {
@@ -27,6 +24,8 @@ WARM_FAST_PATH_MAX_PER_CAPABILITY = {
     "db.column_values.profile": 0,
     "db.planning.context.build": 0,
     "db.query.plan": 0,
+    "db.query.plan.validate": 0,
+    "db.answer.synthesize": 0,
 }
 
 

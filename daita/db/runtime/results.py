@@ -69,6 +69,15 @@ class DbRuntimeResultsMixin:
             except Exception:
                 operation_for_trace = None
         if operation_for_trace is not None:
+            if result.status in {
+                OperationStatus.SUCCEEDED,
+                OperationStatus.FAILED,
+                OperationStatus.CANCELLED,
+            }:
+                await self.kernel.skip_nonterminal_tasks(
+                    result.operation_id,
+                    reason=f"operation_terminal:{result.status.value}",
+                )
             operation_for_trace = await self._persist_trace_correlation(
                 operation_for_trace,
                 intent_kind=result.intent.kind.value,

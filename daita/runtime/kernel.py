@@ -513,6 +513,37 @@ class RuntimeKernel:
             await self._append_event(event)
         return blocked
 
+    async def skip_nonterminal_tasks(
+        self,
+        operation_id: str,
+        *,
+        reason: str,
+    ) -> tuple[Task, ...]:
+        """Terminalize unfinished tasks before committing a terminal operation."""
+
+        skipped: list[Task] = []
+        for task in await self.store.list_tasks(operation_id):
+            if task.status in _TERMINAL_TASK_STATUSES:
+                continue
+            updated = replace(
+                task,
+                status=TaskStatus.SKIPPED,
+                metadata={
+                    **_metadata_without_active_lease(task.metadata),
+                    "skip_reason": str(reason),
+                },
+            )
+            await self.store.save_task(updated)
+            await self.append_event(
+                RuntimeEventType.TASK_SKIPPED,
+                operation_id=operation_id,
+                task=updated,
+                message=f"Task {task.id} skipped because {reason}.",
+                payload={"reason": str(reason)},
+            )
+            skipped.append(updated)
+        return tuple(skipped)
+
     async def apply_terminal_approval_state(
         self,
         operation_id: str,

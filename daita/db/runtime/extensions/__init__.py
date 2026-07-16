@@ -33,10 +33,6 @@ from .hosted_delivery import (
     HostedInAppMonitorDeliveryPlugin,
 )
 from .plugin import DbRuntimePlanningPlugin
-from .query import (
-    DbPlanningContextExecutor,
-    DbQueryPlanValidationExecutor,
-)
 
 __all__ = [
     "DbAnalysisCheckpointExecutor",
@@ -61,3 +57,19 @@ __all__ = [
     "HostedInAppMonitorDeliveryExecutor",
     "HostedInAppMonitorDeliveryPlugin",
 ]
+
+
+def __getattr__(name: str):
+    """Keep legacy query executors lazy for unsupported connector runtimes."""
+
+    if name in {"DbPlanningContextExecutor", "DbQueryPlanValidationExecutor"}:
+        from .query import (
+            DbPlanningContextExecutor,
+            DbQueryPlanValidationExecutor,
+        )
+
+        return {
+            "DbPlanningContextExecutor": DbPlanningContextExecutor,
+            "DbQueryPlanValidationExecutor": DbQueryPlanValidationExecutor,
+        }[name]
+    raise AttributeError(name)

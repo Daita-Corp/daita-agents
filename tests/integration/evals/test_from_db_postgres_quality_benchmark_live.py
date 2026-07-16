@@ -78,7 +78,7 @@ async def test_eval_live_from_db_postgres_rich_quality_benchmark(tmp_path):
                 "expectations": {
                     "answer": {"equals": "The count is 4."},
                     "capabilities": {
-                        "required_owners": ["db_runtime", "postgresql"],
+                        "required_owners": ["postgresql"],
                         "exact_sequence": POSTGRES_WARM_READ_SEQUENCE,
                         "max_per_capability": WARM_FAST_PATH_MAX_PER_CAPABILITY,
                     },
