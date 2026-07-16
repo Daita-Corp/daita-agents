@@ -394,9 +394,17 @@ def catalog_tool_views() -> tuple[ToolView, ...]:
                 "type": "string",
                 "description": "Asset name or reference to inspect.",
             },
-            "field_filter": {
+            "fields": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "maxItems": 200,
+                "description": "Exact field names to return.",
+            },
+            "field_glob": {
                 "type": "string",
-                "description": "Optional field name pattern to narrow returned fields.",
+                "minLength": 1,
+                "description": "One optional case-insensitive field-name glob.",
             },
             "offset": {
                 "type": "integer",

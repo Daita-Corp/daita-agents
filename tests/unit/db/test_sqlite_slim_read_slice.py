@@ -179,6 +179,16 @@ async def test_sqlite_slim_model_vocabulary_is_closed_and_bounded():
         views = DbAgentLoop(runtime, provider).model_tools()
         assert len(views) == 5
         assert tuple(view.name for view in views) == SLIM_READ_OPERATION_NAMES
+        inspect_parameters = next(
+            view.parameters for view in views if view.name == "inspect_asset"
+        )
+        assert inspect_parameters["properties"]["fields"]["type"] == "array"
+        assert inspect_parameters["properties"]["fields"]["items"] == {
+            "type": "string",
+            "minLength": 1,
+        }
+        assert inspect_parameters["properties"]["field_glob"]["type"] == "string"
+        assert "field_filter" not in inspect_parameters["properties"]
         for view in views:
             properties = view.parameters["properties"]
             assert not {
@@ -674,6 +684,85 @@ async def test_schema_search_answers_without_issuing_data_query():
         await runtime.teardown()
 
 
+async def test_sqlite_typed_asset_inspection_materializes_exact_fields():
+    runtime, _sqlite, provider = await _runtime_for(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "inspect-customers-fields",
+                        "name": "inspect_asset",
+                        "arguments": {
+                            "asset_ref": "customers",
+                            "fields": ["region", "name", "missing_field"],
+                            "limit": 10,
+                        },
+                    }
+                ]
+            },
+            "SCHEMA: The selected customer fields are name and region.",
+        ]
+    )
+    try:
+        result = await runtime.run("Describe selected customer fields")
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        payload = evidence[0].payload
+
+        assert result.status.value == "succeeded"
+        assert len(provider.calls) == 2
+        assert [task.capability_id for task in tasks] == ["catalog.asset.inspect"]
+        assert tasks[0].input["fields"] == ["region", "name", "missing_field"]
+        assert [field["name"] for field in payload["fields"]] == ["name", "region"]
+        assert payload["requested_fields"] == [
+            "region",
+            "name",
+            "missing_field",
+        ]
+        assert payload["matched_field_count"] == 2
+        assert payload["returned_field_count"] == 2
+        assert payload["missing_fields"] == ["missing_field"]
+        assert payload["missing_field_count"] == 1
+        assert payload["truncated"] is False
+    finally:
+        await runtime.teardown()
+
+
+async def test_sqlite_rejects_string_field_selection_before_catalog_work():
+    runtime, _sqlite, provider = await _runtime_for(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "inspect-malformed-fields",
+                        "name": "inspect_asset",
+                        "arguments": {
+                            "asset_ref": "customers",
+                            "fields": "name|region",
+                        },
+                    }
+                ]
+            },
+            "CLARIFY: Select fields using the typed field list.",
+        ]
+    )
+    try:
+        result = await runtime.run("Describe selected customer fields")
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        tool_content = next(
+            message["content"]
+            for message in provider.calls[1]["messages"]
+            if message.get("role") == "tool"
+        )
+
+        assert result.status.value == "blocked"
+        assert tasks == ()
+        assert evidence == ()
+        assert "catalog_operation_failed" in tool_content
+        assert "ValidationError" in tool_content
+    finally:
+        await runtime.teardown()
+
+
 async def test_data_request_cannot_finish_from_catalog_only_evidence():
     runtime, _sqlite, provider = await _runtime_for(
         [
@@ -900,6 +989,47 @@ async def test_catalog_context_and_observations_are_hard_bounded_and_runtime_bou
                     "source_registration_id",
                     "store_id",
                 } & set(properties)
+    finally:
+        await runtime.teardown()
+
+
+async def test_catalog_projection_is_retained_only_as_safe_observability():
+    runtime, _sqlite, provider = await _runtime_for(
+        [
+            _query_call("SELECT COUNT(*) AS customer_count FROM customers"),
+            "There are 3 customers.",
+        ]
+    )
+    try:
+        result = await runtime.run("How many customers are there?")
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        snapshot = await runtime.inspect_operation(result.operation_id)
+        catalog_context = next(
+            event.payload["slim_catalog_projection"]
+            for event in snapshot.events
+            if event.payload.get("slim_catalog_projection")
+        )
+        projection = catalog_context["projection"]
+        serialized = json.dumps(projection, sort_keys=True, separators=(",", ":"))
+
+        assert result.status.value == "succeeded"
+        assert len(provider.calls) == 2
+        assert [task.capability_id for task in tasks] == [
+            "db.sql.validate",
+            "db.sql.execute_read",
+        ]
+        assert [item.kind for item in evidence] == [
+            "sql.validation",
+            "query.result",
+        ]
+        assert catalog_context["freshness"] == "fresh"
+        assert projection["status"] == "ready"
+        assert projection["freshness"]["catalog_revision"]
+        assert projection["assets"][0]["name"] == "customers"
+        assert "query_terms" not in projection
+        assert "match_reasons" not in serialized
+        assert "store_id" not in serialized
+        assert len(serialized) <= 12_000
     finally:
         await runtime.teardown()
 

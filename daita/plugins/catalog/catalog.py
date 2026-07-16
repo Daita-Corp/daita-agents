@@ -913,7 +913,12 @@ class CatalogPlugin(DomainServicePlugin):
         return self.inspect_asset(
             _required_arg(args, "store_id"),
             _required_arg(args, "asset_ref"),
-            field_filter=args.get("field_filter"),
+            fields=(
+                _required_string_list_arg(args, "fields") if "fields" in args else None
+            ),
+            field_glob=(
+                _required_arg(args, "field_glob") if "field_glob" in args else None
+            ),
             offset=int(args.get("offset") or 0),
             limit=int(args.get("limit") or 100),
             include_fields=bool(args.get("include_fields", True)),
@@ -1362,6 +1367,8 @@ class CatalogPlugin(DomainServicePlugin):
         store_id: str,
         asset_ref: str,
         *,
+        fields: Optional[Iterable[str]] = None,
+        field_glob: Optional[str] = None,
         field_filter: Optional[str] = None,
         offset: int = 0,
         limit: int = 100,
@@ -1378,6 +1385,7 @@ class CatalogPlugin(DomainServicePlugin):
         schema = self._schema_dict_for_store(store_id)
         if schema is None:
             return self._missing_schema_response(store_id)
+        unscoped_table = _find_asset(schema, asset_ref)
         schema = _policy_scoped_schema(
             schema,
             allowed_tables=allowed_tables,
@@ -1405,10 +1413,63 @@ class CatalogPlugin(DomainServicePlugin):
                 "candidates": candidates,
             }
 
-        fields = table.get("columns", []) or []
-        filtered_fields = [
-            field for field in fields if _matches_field_pattern(field, field_filter)
-        ]
+        available_fields = table.get("columns", []) or []
+        exact_field_names: list[str] = []
+        exact_field_keys: set[str] = set()
+        field_items = (fields,) if isinstance(fields, str) else tuple(fields or ())
+        for item in field_items:
+            name = str(item).strip()
+            key = name.lower()
+            if not name or key in exact_field_keys:
+                continue
+            exact_field_names.append(name)
+            exact_field_keys.add(key)
+
+        unscoped_field_keys = {
+            str(field.get("name") or "").lower()
+            for field in ((unscoped_table or {}).get("columns", []) or [])
+            if isinstance(field, Mapping) and str(field.get("name") or "").strip()
+        }
+        available_by_key = {
+            str(field.get("name") or "").lower(): field
+            for field in available_fields
+            if isinstance(field, Mapping) and str(field.get("name") or "").strip()
+        }
+        requested_fields = []
+        missing_fields = []
+        policy_omitted_field_count = 0
+        for name in exact_field_names:
+            key = name.lower()
+            available = available_by_key.get(key)
+            if available is not None:
+                requested_fields.append(str(available.get("name") or name))
+            elif key in unscoped_field_keys:
+                policy_omitted_field_count += 1
+            else:
+                requested_fields.append(name)
+                missing_fields.append(name)
+
+        normalized_glob = str(field_glob or "").strip()
+        typed_selection = fields is not None or field_glob is not None
+        if typed_selection:
+            filtered_fields = [
+                field
+                for field in available_fields
+                if str(field.get("name") or "").lower() in exact_field_keys
+                or (
+                    normalized_glob
+                    and fnmatch.fnmatchcase(
+                        str(field.get("name") or "").lower(),
+                        normalized_glob.lower(),
+                    )
+                )
+            ]
+        else:
+            filtered_fields = [
+                field
+                for field in available_fields
+                if _matches_field_pattern(field, field_filter)
+            ]
         limit = _clamp_int(limit, default=100, minimum=1, maximum=MAX_ASSET_FIELD_LIMIT)
         offset = _clamp_int(
             offset, default=0, minimum=0, maximum=max(len(filtered_fields), 0)
@@ -1438,9 +1499,16 @@ class CatalogPlugin(DomainServicePlugin):
                         )
                         for field in page
                     ],
-                    "field_count": len(fields),
+                    "field_count": len(available_fields),
+                    "requested_fields": requested_fields,
+                    "requested_field_count": len(exact_field_names),
+                    "returned_field_count": len(page),
+                    "missing_fields": missing_fields,
+                    "missing_field_count": len(missing_fields),
+                    "policy_omitted_field_count": policy_omitted_field_count,
                     "matched_field_count": len(filtered_fields),
                     "field_filter": field_filter or None,
+                    "field_glob_applied": bool(normalized_glob),
                     "offset": offset,
                     "limit": limit,
                     "truncated": offset + len(page) < len(filtered_fields),

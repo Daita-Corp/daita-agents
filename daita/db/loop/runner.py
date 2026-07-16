@@ -85,7 +85,10 @@ class DbAgentLoop:
             prompt,
             frame,
         )
-        self._catalog_diagnostics = catalog_diagnostics
+        self._catalog_diagnostics = {
+            **catalog_diagnostics,
+            "projection": _catalog_diagnostic_projection(catalog_context),
+        }
         tools = self.model_tools()
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": _system_instruction(self.source_owner)},
@@ -595,11 +598,19 @@ class DbAgentLoop:
             "estimated_cost_usd": cost,
             "observation_chars_returned": 0,
         }
+        event_payload: dict[str, Any] = {
+            "turn": turn,
+            "slim_model_turn": diagnostic,
+        }
+        if turn == 1:
+            event_payload["slim_catalog_projection"] = dict(
+                getattr(self, "_catalog_diagnostics", {}) or {}
+            )
         await self.runtime.kernel.append_event(
             RuntimeEventType.LLM_COMPLETED,
             operation_id=operation.id,
             message=f"{self.source_owner} slim model turn {turn} completed.",
-            payload={"turn": turn, "slim_model_turn": diagnostic},
+            payload=event_payload,
         )
         return response, diagnostic
 
@@ -973,6 +984,99 @@ def _slim_source_owner(runtime: Any) -> str:
     if len(owners) != 1:
         raise RuntimeError("slim read loop requires exactly one supported SQL source")
     return owners[0]
+
+
+def _catalog_diagnostic_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain only the bounded catalog facts already safe for the model."""
+
+    freshness = value.get("freshness")
+    freshness = freshness if isinstance(freshness, Mapping) else {}
+    projection: dict[str, Any] = {
+        key: value.get(key)
+        for key in (
+            "status",
+            "dialect",
+            "total_matches",
+            "truncated",
+            "truncation",
+            "data_boundary",
+        )
+        if key in value
+    }
+    projection["freshness"] = {
+        key: freshness.get(key)
+        for key in (
+            "status",
+            "cache_behavior",
+            "source_revision",
+            "revision_status",
+            "revision_reason",
+            "catalog_revision",
+            "schema_fingerprint",
+            "last_checked_at",
+        )
+        if key in freshness
+    }
+    assets: list[dict[str, Any]] = []
+    for raw_asset in value.get("assets", ()) or ():
+        if not isinstance(raw_asset, Mapping):
+            continue
+        asset = {
+            key: raw_asset.get(key)
+            for key in (
+                "name",
+                "asset_ref",
+                "asset_type",
+                "field_count",
+                "column_count",
+                "score",
+            )
+            if key in raw_asset
+        }
+        matched_fields = []
+        for raw_field in raw_asset.get("matched_fields", ()) or ():
+            if isinstance(raw_field, Mapping):
+                matched_fields.append(
+                    {
+                        key: raw_field.get(key)
+                        for key in (
+                            "name",
+                            "type",
+                            "nullable",
+                            "is_primary_key",
+                        )
+                        if key in raw_field
+                    }
+                )
+            elif isinstance(raw_field, str):
+                matched_fields.append({"name": raw_field})
+        if matched_fields:
+            asset["matched_fields"] = matched_fields[:25]
+        relationships = []
+        for raw_relationship in raw_asset.get("relationships", ()) or ():
+            if not isinstance(raw_relationship, Mapping):
+                continue
+            relationships.append(
+                {
+                    key: raw_relationship.get(key)
+                    for key in (
+                        "direction",
+                        "relationship_type",
+                        "source_asset",
+                        "source_field",
+                        "target_asset",
+                        "target_field",
+                    )
+                    if key in raw_relationship
+                }
+            )
+        if relationships:
+            asset["relationships"] = relationships[:8]
+        assets.append(asset)
+    projection["assets"] = assets[:12]
+    serialized = _bounded_json(projection, 12_000)
+    parsed = json.loads(serialized)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _bounded_json(value: Any, max_chars: int) -> str:

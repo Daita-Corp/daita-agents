@@ -606,6 +606,7 @@ async def _postgres_agent_from_sql(
     name: str,
     cache_ttl: int | None,
     tag_prefix: str,
+    source_options: DbSourceOptions | None = None,
 ) -> FromDbEvalTarget:
     container = start_container(
         POSTGRES_IMAGE,
@@ -626,7 +627,11 @@ async def _postgres_agent_from_sql(
         agent = await Agent.from_db(
             url,
             name=name,
-            source_options=DbSourceOptions(cache_ttl=cache_ttl),
+            source_options=(
+                source_options
+                if source_options is not None
+                else DbSourceOptions(cache_ttl=cache_ttl)
+            ),
             **_openai_kwargs(),
         )
     except Exception:

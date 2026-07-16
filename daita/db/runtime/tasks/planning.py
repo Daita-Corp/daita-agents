@@ -506,6 +506,9 @@ def _matches_declared_schema(value: Any, schema: Mapping[str, Any]) -> bool:
     if isinstance(value, list) and isinstance(schema.get("items"), Mapping):
         if int(schema.get("minItems") or 0) > len(value):
             return False
+        maximum_items = schema.get("maxItems")
+        if maximum_items is not None and len(value) > int(maximum_items):
+            return False
         if not all(_matches_declared_schema(item, schema["items"]) for item in value):
             return False
     if isinstance(value, Mapping) and schema.get("type") == "object":

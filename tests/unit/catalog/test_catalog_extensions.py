@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -201,6 +202,15 @@ def test_catalog_tool_views_expose_strict_required_schemas():
     assert search["properties"]["limit"]["maximum"] == 50
     assert inspect["required"] == ["asset_ref"]
     assert inspect["additionalProperties"] is False
+    assert inspect["properties"]["fields"] == {
+        "type": "array",
+        "items": {"type": "string", "minLength": 1},
+        "minItems": 1,
+        "maxItems": 200,
+        "description": "Exact field names to return.",
+    }
+    assert inspect["properties"]["field_glob"]["type"] == "string"
+    assert "field_filter" not in inspect["properties"]
     assert paths["required"] == ["from_assets", "to_assets"]
     assert paths["additionalProperties"] is False
     assert values["required"] == ["query"]
@@ -297,7 +307,11 @@ async def test_catalog_inspect_relationship_and_profile_executors_return_evidenc
             operation_id=operation.id,
             capability_id="catalog.asset.inspect",
             executor_id="catalog.inspect_asset",
-            input={"store_id": "store:shop", "asset_ref": "customers"},
+            input={
+                "store_id": "store:shop",
+                "asset_ref": "customers",
+                "fields": ["email"],
+            },
         ),
         operation,
         {},
@@ -333,10 +347,110 @@ async def test_catalog_inspect_relationship_and_profile_executors_return_evidenc
 
     assert inspect_evidence[0].kind == "schema.asset_profile"
     assert inspect_evidence[0].payload["asset"]["name"] == "customers"
+    assert [field["name"] for field in inspect_evidence[0].payload["fields"]] == [
+        "email"
+    ]
     assert relationship_evidence[0].kind == "schema.relationship_path"
     assert relationship_evidence[0].payload["reachable"] is True
     assert profile_evidence[0].kind == "catalog.profile"
     assert profile_evidence[0].payload["table_count"] == 2
+
+
+async def test_catalog_inspect_asset_typed_fields_are_exact_safe_and_paginated():
+    catalog = CatalogPlugin(auto_persist=False)
+    await catalog.register_schema(
+        _reference_schema(),
+        store_type="sqlite",
+        store_id="store:typed-inspection",
+        persist=False,
+    )
+
+    exact = catalog.inspect_asset(
+        "store:typed-inspection",
+        "orders",
+        fields=["total", "id", "customer_id"],
+    )
+    mixed = catalog.inspect_asset(
+        "store:typed-inspection",
+        "orders",
+        fields=["total", "missing_field"],
+    )
+    paged = catalog.inspect_asset(
+        "store:typed-inspection",
+        "orders",
+        fields=["id", "customer_id", "total"],
+        offset=1,
+        limit=1,
+    )
+    globbed = catalog.inspect_asset(
+        "store:typed-inspection",
+        "orders",
+        field_glob="*_id",
+    )
+    pipe_literal = catalog.inspect_asset(
+        "store:typed-inspection",
+        "orders",
+        fields=["id|customer_id|total"],
+    )
+    blocked = catalog.inspect_asset(
+        "store:typed-inspection",
+        "orders",
+        fields=["total", "missing_field"],
+        blocked_columns=["orders.total"],
+    )
+    unfiltered = catalog.inspect_asset(
+        "store:typed-inspection",
+        "orders",
+    )
+
+    assert [field["name"] for field in exact["fields"]] == [
+        "id",
+        "customer_id",
+        "total",
+    ]
+    assert exact["matched_field_count"] == 3
+    assert exact["returned_field_count"] == 3
+    assert exact["missing_fields"] == []
+
+    assert [field["name"] for field in mixed["fields"]] == ["total"]
+    assert mixed["requested_fields"] == ["total", "missing_field"]
+    assert mixed["requested_field_count"] == 2
+    assert mixed["matched_field_count"] == 1
+    assert mixed["missing_fields"] == ["missing_field"]
+    assert mixed["missing_field_count"] == 1
+    assert mixed["truncated"] is False
+
+    assert [field["name"] for field in paged["fields"]] == ["customer_id"]
+    assert paged["field_count"] == 3
+    assert paged["matched_field_count"] == 3
+    assert paged["returned_field_count"] == 1
+    assert paged["offset"] == 1
+    assert paged["limit"] == 1
+    assert paged["truncated"] is True
+
+    assert [field["name"] for field in globbed["fields"]] == ["customer_id"]
+    assert globbed["field_glob_applied"] is True
+
+    assert pipe_literal["fields"] == []
+    assert pipe_literal["matched_field_count"] == 0
+    assert pipe_literal["missing_fields"] == ["id|customer_id|total"]
+
+    assert blocked["fields"] == []
+    assert blocked["missing_fields"] == ["missing_field"]
+    assert blocked["policy_omitted_field_count"] == 1
+    blocked_serialized = json.dumps(blocked, sort_keys=True)
+    assert "total" not in blocked_serialized
+
+    assert [field["name"] for field in unfiltered["fields"]] == [
+        "id",
+        "customer_id",
+        "total",
+    ]
+    assert unfiltered["matched_field_count"] == 3
+    assert unfiltered["returned_field_count"] == 3
+    assert unfiltered["requested_field_count"] == 0
+    assert unfiltered["missing_fields"] == []
+    assert unfiltered["truncated"] is False
 
 
 async def test_catalog_registers_searches_and_resolves_column_value_profiles():

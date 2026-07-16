@@ -222,6 +222,44 @@ async def test_postgresql_simple_read_uses_shared_two_turn_fixed_recipe():
         await runtime.teardown()
 
 
+async def test_postgresql_uses_shared_typed_asset_inspection_contract():
+    runtime, _catalog, _postgres, provider, executed = await _runtime_for(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "inspect-orders-fields",
+                        "name": "inspect_asset",
+                        "arguments": {
+                            "asset_ref": "orders",
+                            "fields": ["status", "total", "missing_field"],
+                            "limit": 10,
+                        },
+                    }
+                ]
+            },
+            "SCHEMA: The requested order fields are present in the asset schema.",
+        ]
+    )
+    try:
+        result = await runtime.run("Describe selected order fields")
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        payload = evidence[0].payload
+
+        assert result.status.value == "succeeded"
+        assert len(provider.calls) == 2
+        assert [task.capability_id for task in tasks] == ["catalog.asset.inspect"]
+        assert tasks[0].input["fields"] == ["status", "total", "missing_field"]
+        assert [field["name"] for field in payload["fields"]] == ["status", "total"]
+        assert payload["matched_field_count"] == 2
+        assert payload["returned_field_count"] == 2
+        assert payload["missing_fields"] == ["missing_field"]
+        assert payload["truncated"] is False
+        assert executed == []
+    finally:
+        await runtime.teardown()
+
+
 async def test_postgresql_filter_uses_dialect_placeholders_and_typed_params():
     runtime, _catalog, _postgres, _provider, executed = await _runtime_for(
         [
