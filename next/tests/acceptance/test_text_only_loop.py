@@ -12,11 +12,20 @@ from daita.llm.models import (
     ModelResponse,
     ModelUsage,
     TextBlock,
+    ToolCall,
+    ToolDefinition,
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.driver import AgentLoop
 from daita.loop.models import LoopExitKind, LoopPhase, Readiness, Turn
-from daita.operations.models import AgentTrigger, OperationStatus, TriggerKind
+from daita.operations.models import (
+    ActionProposal,
+    AgentTrigger,
+    Evidence,
+    Observation,
+    OperationStatus,
+    TriggerKind,
+)
 from daita.operations.runtime import (
     ModelCallStatus,
     OperationRuntime,
@@ -31,7 +40,9 @@ class StaticContextBuilder:
         self,
         operation: OperationSnapshot,
         turn: Turn,
+        tools: tuple[ToolDefinition, ...],
     ) -> ModelRequest:
+        assert tools == ()
         assert operation.operation.status is OperationStatus.RUNNING
         assert operation.loop_state.phase is LoopPhase.PREPARING_CONTEXT
         assert [event.type for event in operation.events] == [
@@ -57,7 +68,24 @@ class StaticContextBuilder:
         )
 
 
-class AllowTextReadiness:
+class AllowTextDomain:
+    def tool_views(
+        self,
+        operation: OperationSnapshot,
+    ) -> tuple[ToolDefinition, ...]:
+        assert operation.operation.status is OperationStatus.RUNNING
+        return ()
+
+    async def validate_action(
+        self,
+        call: ToolCall,
+        operation: OperationSnapshot,
+    ) -> ActionProposal:
+        raise AssertionError("text-only domain cannot validate tool calls")
+
+    async def project_observation(self, evidence: Evidence) -> Observation:
+        raise AssertionError("text-only domain cannot project observations")
+
     async def evaluate_final_answer(
         self,
         text: str,
@@ -101,7 +129,7 @@ async def test_text_only_response_completes_from_committed_runtime_state(
         runtime=runtime,
         model=provider,
         context_builder=StaticContextBuilder(),
-        readiness=AllowTextReadiness(),
+        domain=AllowTextDomain(),
     )
     trigger = AgentTrigger(
         id=f"trigger-{session_id or 'none'}",
@@ -154,7 +182,7 @@ async def test_model_failure_is_committed_once_without_whole_loop_retry() -> Non
         runtime=runtime,
         model=provider,
         context_builder=StaticContextBuilder(),
-        readiness=AllowTextReadiness(),
+        domain=AllowTextDomain(),
     )
     trigger = AgentTrigger(
         id="trigger-model-failure",

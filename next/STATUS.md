@@ -10,16 +10,15 @@ project. Update it before and after every material task.
   registry and the operation runtime's sole executor boundary
 - **Last completed task:** P1-02 — proved text-only completion and provider
   failure through committed in-memory operation/turn/model/readiness events
-- **Current checkpoint:** P1-01 commit
-  `6b3eea11505799513a85ce8f45542feab2793f73`
-  (`feat(v2): define canonical loop contracts`)
+- **Current checkpoint:** P1-02 commit
+  `48b0a1736100d49d4728a4403f5809b20a2d5028`
+  (`feat(v2): prove text-only loop lifecycle`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** commit the passing P1-02 checkpoint, then write the
-  failing fake-read lifecycle test that requires runtime-generated durable task
-  identity before executor entry, validated accepted evidence before a bounded
-  observation, a second model turn, readiness, and final completion
+- **Exact next action:** stage only the reviewed P1-03 paths under `next/`, run
+  the configured hooks, and create the passing checkpoint commit before
+  beginning P1-04
 
 ## Mandatory architecture re-read
 
@@ -94,9 +93,12 @@ The binding rationale and consequences are recorded in `next/decisions/`.
   `next/src/daita/operations/runtime.py`, and `next/src/daita/loop/driver.py`;
   static context/readiness doubles remain test-owned until another real
   implementation requires a production subsystem.
-- P1-03 planned owners: `next/src/daita/capabilities.py`, additions to
-  `next/src/daita/operations/models.py` and `runtime.py`, and the existing
-  generic driver. The fake controller and executor remain test-owned.
+- P1-03 implemented owners: immutable declarations and tool projections in
+  `next/src/daita/capabilities.py`, task/evidence records in
+  `next/src/daita/operations/models.py`, the sole executor invocation and
+  evidence-acceptance boundary in `runtime.py`, and sequential action
+  progression in the existing generic driver. The fake controller, context
+  builder, and executor remain test-owned.
 - Later Phase 1 owners are created only when their vertical slice becomes the
   active task; the target tree is not being scaffolded in advance.
 - Root `daita/`: **not being changed**
@@ -139,8 +141,15 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | Final P1-02 full isolated suite on CPython 3.11.15 and 3.12.7 | PASS — 56 passed in 0.20s on 3.11; 56 passed in 0.24s on 3.12 |
 | P1-02 Black, compile, mypy, pyright, architecture, and root-oracle checks | PASS — 27 Python files formatted; compile succeeded; mypy found no issues in 25 files; pyright 0 errors/warnings; architecture tests included in the full suite; root unchanged |
 | P1-02 clean-copy sdist/wheel build and content scan | PASS — build succeeded; 17-entry wheel included the mock provider, generic driver, and operation runtime with no tests or nested `next/` path |
+| Initial P1-03 focused run before the capability owner existed | EXPECTED RED — 2 collection errors for the intentionally absent `daita.capabilities` module |
+| Final P1-03 focused capability/runtime/text/fake-read suite | PASS — 30 passed in 0.07s; includes forged proposal/projection binding, dynamic tool visibility, executor identity drift, response-scoped call IDs, rejected evidence, sequential one/two-read trajectories, atomic checkpoints, and the sole `.execute()` call-site assertion |
+| Final P1-03 complete isolated v2 suite on CPython 3.11.15 and 3.12.7 | PASS — 81 passed in 0.23s on each interpreter |
+| P1-03 Black, compile, mypy, and pyright checks | PASS — 32 files formatted; compilation succeeded; mypy found no issues in 31 source files; pyright exited zero with no diagnostics (only npm's nonfatal `unsafe-perm` warning) |
+| P1-03 clean-copy sdist/wheel build and archive scan | PASS — built under `/private/tmp/daita-v2-p1-03.kp5giU`; 18-entry wheel contains the capability, generic loop, and operation-runtime modules and contains no tests or nested `next/` path |
+| P1-03 architecture/scoped review | PASS — independent final review found no blocker; exact committed/domain tool binding, sequential task/evidence/observation ordering, atomic injected-failure states, sole executor call site, no v1 import/symlink/root-oracle change, and `git diff --check` all passed |
 
-Phase 0 and P1-01 are complete. P1-02 has not yet added its production slice.
+Phase 0, P1-01, and P1-02 are complete. P1-03 is fully passing and awaits only
+its scoped checkpoint commit.
 
 ## Known failures and baselines
 
@@ -181,6 +190,21 @@ Phase 0 and P1-01 are complete. P1-02 has not yet added its production slice.
   rejected it as `bad object`. The checkpoint was read with `git rev-parse`,
   the ledger was corrected to `6b3eea11505799513a85ce8f45542feab2793f73`,
   and the root-oracle diff then passed.
+- P1-03 red/repair history: the initial focused run identified the intentionally
+  absent capability module. The first combined path run passed 18 tests and
+  failed the two-read case because the test executor incorrectly required the
+  whole operation to have no prior evidence; the assertion is now scoped to
+  the task entering I/O, and 19/19 focused tests pass. The first mypy pass then
+  found a tuple-cardinality inference in the test transcript builder; an
+  explicit canonical-message tuple annotation repaired it without a
+  production suppression.
+- The final P1-03 trust-boundary review found and repaired four issues before
+  checkpointing: same-name tool definitions now require exact registry
+  equality; per-turn domain visibility is bound exactly to the model request;
+  post-I/O executor identity drift terminalizes the task without evidence; and
+  provider call IDs are scoped to their turn rather than the whole operation.
+  Injected failures additionally prove task-start, evidence/task-success, and
+  observation commits never publish partial state.
 
 ## Credentials and external dependencies
 
@@ -212,15 +236,15 @@ Phase 0 and P1-01 are complete. P1-02 has not yet added its production slice.
 ## Remaining Phase 1 gate requirements
 
 - [x] Text-only response completes through the generic loop.
-- [ ] Fake read follows the durable task/execution/evidence/observation order.
+- [x] Fake read follows the durable task/execution/evidence/observation order.
 - [ ] Invalid action becomes a bounded observation and repair turn.
 - [ ] Repeated identical failure stops early with an inspectable reason.
 - [ ] Cancellation persists an inspectable state.
 - [ ] Turn, action, repair, time, token, observation, and cost budgets terminate
       honestly.
 - [ ] The loop contains no domain-specific or provider-specific branch.
-- [ ] A repository assertion proves only the operation runtime invokes the
+- [x] A repository assertion proves only the operation runtime invokes the
       executor.
-- [ ] Root v1 oracle paths remain unchanged.
+- [x] Root v1 oracle paths remain unchanged.
 - [ ] Passing Phase 1 evidence is committed as
       `chore(v2-phase-1): complete phase 1 gate`.

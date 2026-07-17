@@ -92,8 +92,8 @@ read-only Phase 0 scope.
 
 ## Phase 1 — loop laboratory
 
-Status: **P1-01 committed at `6b3eea1`; P1-02 complete; P1-03 active; no
-Phase 1 gate claimed.**
+Status: **P1-02 committed at `48b0a17`; P1-03 fully passing and awaiting its
+checkpoint commit; no Phase 1 gate claimed.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 0 commit and before
 the first Phase 1 production edit. Phase 1 evidence will be appended only for
@@ -142,6 +142,35 @@ commands actually run.
 - A root-oracle command used a mistyped long checkpoint hash and Git returned
   `bad object`. The exact hash was read from Git, corrected in `STATUS.md`, and
   the oracle-path diff passed.
+
+### Executed P1-03 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P1-Q11 | `next/` | Run the new capability unit and fake-read acceptance tests before adding the production capability owner | EXPECTED RED — 2 collection errors for the intentionally absent `daita.capabilities` module |
+| P1-Q12 | `next/` | Final isolated capability, adversarial execution-boundary, context-tool-boundary, runtime-commit, text-only, and fake-read tests | PASS — 30 passed in 0.07s |
+| P1-Q13 | `next/` | Complete isolated suite with `-S`, explicit v2 `PYTHONPATH`, and `-o addopts=''` on CPython 3.11.15 and 3.12.7 | PASS — 81 passed in 0.23s on each interpreter |
+| P1-Q14 | `next/` | Black check, byte compilation, full mypy, and pyright 1.1.411 across source, tests, and inventory script | PASS — Black reported 32 files unchanged; compilation succeeded; mypy found no issues in 31 source files; pyright exited zero with no diagnostics (npm emitted only its nonfatal `unsafe-perm` warning) |
+| P1-Q15 | repository root and `next/` | Independent final boundary review; sole `.execute()` AST/text checks; absolute/v1 import scan; symlink scan; root-oracle diff; `git diff --check`; scoped status review | PASS — no review blocker, prohibited reference, symlink, root change, diff error, or path outside `next/`; the sole executor call is in `operations/runtime.py` |
+| P1-Q16 | clean copy `/private/tmp/daita-v2-p1-03.kp5giU` | Build sdist/wheel without isolation and inspect the wheel for P1-03 modules and forbidden test/nested paths | PASS — build succeeded; 18-entry wheel contains `capabilities.py`, the generic driver, and operation runtime; no tests or nested `next/` path |
+
+### P1-03 red/repair evidence
+
+- The first combined path run passed 18 tests and failed only the two-read
+  trajectory because its test executor asserted that the entire operation had
+  no earlier evidence. The pre-I/O invariant is task-scoped; after correcting
+  that assertion, all 19 focused tests passed.
+- The first focused mypy pass found tuple-cardinality inference in the test
+  transcript builder. Its canonical-message tuple was annotated explicitly;
+  production code required no suppression.
+- Final adversarial review found that same-name tool definitions were compared
+  by name only, per-turn domain visibility was not rebound to the context
+  request, a mutable executor identity could strand a RUNNING task after I/O,
+  and provider call IDs were incorrectly operation-scoped. Exact declaration
+  and domain-set equality, a terminal identity-failure path, and turn-scoped
+  call identity repaired those contracts. Regression tests also inject
+  task-start, evidence-terminal, and observation-event failures to prove the
+  copy-on-write checkpoints publish no partial state.
 
 ## Phases 2 through 9
 

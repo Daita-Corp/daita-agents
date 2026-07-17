@@ -41,6 +41,13 @@ class TriggerKind(str, Enum):
     INTERNAL = "internal"
 
 
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 _TERMINAL_STATUSES = {
     OperationStatus.SUCCEEDED,
     OperationStatus.FAILED,
@@ -162,4 +169,110 @@ class Observation:
             raise ValueError("observation evidence_id requires task_id")
         if self.success and self.task_id is not None and self.evidence_id is None:
             raise ValueError("successful task observation requires evidence_id")
+        object.__setattr__(self, "payload", FrozenJsonObject.from_mapping(self.payload))
+
+
+@dataclass(frozen=True, slots=True)
+class Task:
+    id: str
+    operation_id: str
+    turn_id: str
+    call_id: str
+    capability_id: str
+    executor_id: str
+    status: TaskStatus
+    attempt: int
+    arguments: Mapping[str, object]
+    created_at: datetime
+    updated_at: datetime
+    evidence_ids: tuple[str, ...] = ()
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        _required_text(self.id, "task id")
+        _required_text(self.operation_id, "task operation_id")
+        _required_text(self.turn_id, "task turn_id")
+        _required_text(self.call_id, "task call_id")
+        _required_text(self.capability_id, "task capability_id")
+        _required_text(self.executor_id, "task executor_id")
+        if not isinstance(self.status, TaskStatus):
+            raise TypeError("task status must be a TaskStatus")
+        if (
+            not isinstance(self.attempt, int)
+            or isinstance(self.attempt, bool)
+            or self.attempt < 1
+        ):
+            raise ValueError("task attempt must be a positive integer")
+        _aware(self.created_at, "task created_at")
+        _aware(self.updated_at, "task updated_at")
+        if self.updated_at < self.created_at:
+            raise ValueError("task updated_at cannot precede created_at")
+        if self.error_code is not None:
+            _required_text(self.error_code, "task error_code")
+        if self.status is TaskStatus.FAILED and self.error_code is None:
+            raise ValueError("failed task requires error_code")
+        if self.status is not TaskStatus.FAILED and self.error_code is not None:
+            raise ValueError("only failed task may contain error_code")
+        evidence_ids = tuple(self.evidence_ids)
+        if any(
+            not isinstance(evidence_id, str) or not evidence_id.strip()
+            for evidence_id in evidence_ids
+        ):
+            raise ValueError("task evidence_ids must contain non-empty strings")
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("task evidence_ids must be unique")
+        if self.status is TaskStatus.SUCCEEDED and not evidence_ids:
+            raise ValueError("succeeded task requires accepted evidence")
+        if self.status is not TaskStatus.SUCCEEDED and evidence_ids:
+            raise ValueError("only succeeded tasks may link accepted evidence")
+        object.__setattr__(self, "evidence_ids", evidence_ids)
+        object.__setattr__(
+            self,
+            "arguments",
+            FrozenJsonObject.from_mapping(self.arguments),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Evidence:
+    id: str
+    operation_id: str
+    task_id: str
+    turn_id: str
+    capability_id: str
+    executor_id: str
+    kind: str
+    schema_version: int
+    attempt: int
+    accepted: bool
+    payload: Mapping[str, object]
+    content_hash: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        _required_text(self.id, "evidence id")
+        _required_text(self.operation_id, "evidence operation_id")
+        _required_text(self.task_id, "evidence task_id")
+        _required_text(self.turn_id, "evidence turn_id")
+        _required_text(self.capability_id, "evidence capability_id")
+        _required_text(self.executor_id, "evidence executor_id")
+        _required_text(self.kind, "evidence kind")
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version < 1
+        ):
+            raise ValueError("evidence schema_version must be a positive integer")
+        if (
+            not isinstance(self.attempt, int)
+            or isinstance(self.attempt, bool)
+            or self.attempt < 1
+        ):
+            raise ValueError("evidence attempt must be a positive integer")
+        if not isinstance(self.accepted, bool):
+            raise TypeError("evidence accepted must be a boolean")
+        _required_text(self.content_hash, "evidence content_hash")
+        if not self.content_hash.startswith("sha256:"):
+            raise ValueError("evidence content_hash must use sha256")
+        _aware(self.created_at, "evidence created_at")
         object.__setattr__(self, "payload", FrozenJsonObject.from_mapping(self.payload))

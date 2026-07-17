@@ -1,0 +1,399 @@
+"""Minimal immutable capability, executor, and model-tool contracts."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Protocol
+
+from ._json import FrozenJsonObject
+from .llm.models import ToolDefinition
+
+
+def _required_text(value: str, field_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+
+
+class AccessMode(str, Enum):
+    READ = "read"
+    WRITE = "write"
+
+
+class RiskLevel(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class CapabilityInputError(ValueError):
+    """Raised when proposed arguments violate a capability schema."""
+
+
+class CapabilityExecutionError(RuntimeError):
+    """Raised after a capability task records an execution failure."""
+
+
+class EvidenceValidationError(RuntimeError):
+    """Raised after executor output fails the declared evidence contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class Capability:
+    id: str
+    owner: str
+    description: str
+    input_schema: Mapping[str, object]
+    output_evidence_kind: str
+    output_schema_version: int
+    output_schema: Mapping[str, object]
+    executor_id: str
+    access_mode: AccessMode
+    risk: RiskLevel
+    side_effecting: bool
+    idempotent: bool
+    replay_safe: bool
+
+    def __post_init__(self) -> None:
+        _required_text(self.id, "capability id")
+        _required_text(self.owner, "capability owner")
+        _required_text(self.description, "capability description")
+        _required_text(self.output_evidence_kind, "output evidence kind")
+        _required_text(self.executor_id, "executor id")
+        if (
+            not isinstance(self.output_schema_version, int)
+            or isinstance(self.output_schema_version, bool)
+            or self.output_schema_version < 1
+        ):
+            raise ValueError("output_schema_version must be a positive integer")
+        if not isinstance(self.access_mode, AccessMode):
+            raise TypeError("capability access_mode must be an AccessMode")
+        if not isinstance(self.risk, RiskLevel):
+            raise TypeError("capability risk must be a RiskLevel")
+        for name, value in (
+            ("side_effecting", self.side_effecting),
+            ("idempotent", self.idempotent),
+            ("replay_safe", self.replay_safe),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"capability {name} must be a boolean")
+        if self.access_mode is AccessMode.READ and self.side_effecting:
+            raise ValueError("read capabilities cannot declare side effects")
+
+        input_schema = FrozenJsonObject.from_mapping(self.input_schema)
+        output_schema = FrozenJsonObject.from_mapping(self.output_schema)
+        _validate_supported_object_schema(input_schema, "input")
+        _validate_supported_object_schema(output_schema, "output")
+        object.__setattr__(self, "input_schema", input_schema)
+        object.__setattr__(self, "output_schema", output_schema)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolView:
+    """A bounded model-facing projection over one runtime capability."""
+
+    name: str
+    capability_id: str
+    description: str
+
+    def __post_init__(self) -> None:
+        _required_text(self.name, "tool view name")
+        _required_text(self.capability_id, "tool view capability_id")
+        _required_text(self.description, "tool view description")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRequest:
+    operation_id: str
+    task_id: str
+    turn_id: str
+    capability_id: str
+    attempt: int
+    arguments: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _required_text(self.operation_id, "execution operation_id")
+        _required_text(self.task_id, "execution task_id")
+        _required_text(self.turn_id, "execution turn_id")
+        _required_text(self.capability_id, "execution capability_id")
+        if (
+            not isinstance(self.attempt, int)
+            or isinstance(self.attempt, bool)
+            or self.attempt < 1
+        ):
+            raise ValueError("execution attempt must be a positive integer")
+        object.__setattr__(
+            self,
+            "arguments",
+            FrozenJsonObject.from_mapping(self.arguments),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceCandidate:
+    """Untrusted executor output; the runtime supplies all authoritative IDs."""
+
+    kind: str
+    schema_version: int
+    payload: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _required_text(self.kind, "evidence candidate kind")
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version < 1
+        ):
+            raise ValueError("evidence schema_version must be a positive integer")
+        object.__setattr__(
+            self,
+            "payload",
+            FrozenJsonObject.from_mapping(self.payload),
+        )
+
+
+class Executor(Protocol):
+    @property
+    def executor_id(self) -> str: ...
+
+    async def execute(self, request: ExecutionRequest) -> EvidenceCandidate: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _Registration:
+    capability: Capability
+    executor: Executor
+
+
+class CapabilityRegistry:
+    """An immutable declaration registry with bounded model projections."""
+
+    def __init__(
+        self,
+        *,
+        capabilities: Iterable[Capability] = (),
+        executors: Iterable[Executor] = (),
+        tool_views: Iterable[ToolView] = (),
+    ) -> None:
+        executor_by_id: dict[str, Executor] = {}
+        for executor in executors:
+            executor_id = getattr(executor, "executor_id", None)
+            if not isinstance(executor_id, str) or not executor_id.strip():
+                raise ValueError("executor id must be a non-empty string")
+            if not callable(getattr(executor, "execute", None)):
+                raise TypeError("executor must provide async execute(request)")
+            if executor_id in executor_by_id:
+                raise ValueError(f"executor already registered: {executor_id}")
+            executor_by_id[executor_id] = executor
+
+        registration_by_id: dict[str, _Registration] = {}
+        for capability in capabilities:
+            if not isinstance(capability, Capability):
+                raise TypeError("capabilities must contain Capability records")
+            if capability.id in registration_by_id:
+                raise ValueError(f"capability already registered: {capability.id}")
+            try:
+                executor = executor_by_id[capability.executor_id]
+            except KeyError as error:
+                raise ValueError(
+                    f"capability {capability.id} references missing executor "
+                    f"{capability.executor_id}"
+                ) from error
+            registration_by_id[capability.id] = _Registration(
+                capability=capability,
+                executor=executor,
+            )
+
+        view_by_name: dict[str, ToolView] = {}
+        for view in tool_views:
+            if not isinstance(view, ToolView):
+                raise TypeError("tool_views must contain ToolView records")
+            if view.name in view_by_name:
+                raise ValueError(f"tool view already registered: {view.name}")
+            if view.capability_id not in registration_by_id:
+                raise ValueError(
+                    f"tool view {view.name} references missing capability "
+                    f"{view.capability_id}"
+                )
+            view_by_name[view.name] = view
+
+        self._registrations = registration_by_id
+        self._executors = executor_by_id
+        self._tool_views = view_by_name
+
+    def capability(self, capability_id: str) -> Capability:
+        try:
+            return self._registrations[capability_id].capability
+        except KeyError as error:
+            raise KeyError(f"unknown capability: {capability_id}") from error
+
+    def resolve_tool(self, name: str) -> tuple[ToolView, Capability]:
+        try:
+            view = self._tool_views[name]
+        except KeyError as error:
+            raise KeyError(f"unknown tool view: {name}") from error
+        return view, self.capability(view.capability_id)
+
+    def tool_definitions(self) -> tuple[ToolDefinition, ...]:
+        return tuple(
+            self.tool_definition(view.name) for view in self._tool_views.values()
+        )
+
+    def tool_definition(self, name: str) -> ToolDefinition:
+        view, capability = self.resolve_tool(name)
+        return ToolDefinition(
+            name=view.name,
+            description=view.description,
+            input_schema=capability.input_schema,
+        )
+
+    def validate_arguments(
+        self,
+        capability_id: str,
+        arguments: Mapping[str, object],
+    ) -> FrozenJsonObject:
+        capability = self.capability(capability_id)
+        frozen = FrozenJsonObject.from_mapping(arguments)
+        _validate_object(capability.input_schema, frozen, CapabilityInputError)
+        return frozen
+
+    def validate_evidence(
+        self,
+        capability_id: str,
+        candidate: object,
+    ) -> EvidenceCandidate:
+        capability = self.capability(capability_id)
+        if not isinstance(candidate, EvidenceCandidate):
+            raise EvidenceValidationError("executor output is not EvidenceCandidate")
+        if candidate.kind != capability.output_evidence_kind:
+            raise EvidenceValidationError(
+                f"evidence kind {candidate.kind} does not match "
+                f"{capability.output_evidence_kind}"
+            )
+        if candidate.schema_version != capability.output_schema_version:
+            raise EvidenceValidationError(
+                f"evidence schema_version {candidate.schema_version} does not match "
+                f"{capability.output_schema_version}"
+            )
+        _validate_object(
+            capability.output_schema,
+            candidate.payload,
+            EvidenceValidationError,
+        )
+        return candidate
+
+    def resolve_execution(self, capability_id: str) -> tuple[Capability, Executor]:
+        try:
+            registration = self._registrations[capability_id]
+        except KeyError as error:
+            raise KeyError(f"unknown capability: {capability_id}") from error
+        actual_id = getattr(registration.executor, "executor_id", None)
+        if actual_id != registration.capability.executor_id:
+            raise ValueError(
+                f"executor identity changed for capability {capability_id}"
+            )
+        return registration.capability, registration.executor
+
+
+_SUPPORTED_PROPERTY_TYPES = {
+    "array",
+    "boolean",
+    "integer",
+    "number",
+    "object",
+    "string",
+}
+_ROOT_SCHEMA_KEYS = {"type", "properties", "required", "additionalProperties"}
+_PROPERTY_SCHEMA_KEYS = {"type"}
+
+
+def _validate_supported_object_schema(
+    schema: FrozenJsonObject,
+    direction: str,
+) -> None:
+    value = schema.to_dict()
+    unsupported = sorted(set(value) - _ROOT_SCHEMA_KEYS)
+    if unsupported:
+        raise ValueError(
+            f"unsupported {direction} schema keyword: {', '.join(unsupported)}"
+        )
+    if value.get("type") != "object":
+        raise ValueError(f"capability {direction} schema must have type object")
+    properties = value.get("properties", {})
+    if not isinstance(properties, dict):
+        raise ValueError(f"capability {direction} schema properties must be an object")
+    required = value.get("required", [])
+    if not isinstance(required, list) or any(
+        not isinstance(name, str) for name in required
+    ):
+        raise ValueError(
+            f"capability {direction} schema required must be a string array"
+        )
+    if len(required) != len(set(required)):
+        raise ValueError(f"capability {direction} schema has duplicate requirements")
+    if not set(required).issubset(properties):
+        raise ValueError(
+            f"capability {direction} schema requires an undeclared property"
+        )
+    additional = value.get("additionalProperties", True)
+    if not isinstance(additional, bool):
+        raise ValueError("additionalProperties must be a boolean")
+    for name, property_schema in properties.items():
+        if not isinstance(name, str) or not isinstance(property_schema, dict):
+            raise ValueError("capability property schemas must be objects")
+        unsupported_property = sorted(set(property_schema) - _PROPERTY_SCHEMA_KEYS)
+        if unsupported_property:
+            raise ValueError(
+                f"unsupported {direction} property schema keyword: "
+                f"{', '.join(unsupported_property)}"
+            )
+        property_type = property_schema.get("type")
+        if property_type not in _SUPPORTED_PROPERTY_TYPES:
+            raise ValueError(f"unsupported capability property type: {property_type}")
+
+
+def _validate_object(
+    schema: Mapping[str, object],
+    value: Mapping[str, object],
+    error_type: type[ValueError] | type[RuntimeError],
+) -> None:
+    schema_value = FrozenJsonObject.from_mapping(schema).to_dict()
+    object_value = FrozenJsonObject.from_mapping(value).to_dict()
+    properties = schema_value.get("properties", {})
+    required = schema_value.get("required", [])
+    additional = schema_value.get("additionalProperties", True)
+    assert isinstance(properties, dict)
+    assert isinstance(required, list)
+    assert isinstance(additional, bool)
+
+    missing = [name for name in required if name not in object_value]
+    if missing:
+        raise error_type(f"required field is missing: {', '.join(missing)}")
+    unexpected = sorted(set(object_value) - set(properties))
+    if unexpected and not additional:
+        raise error_type(f"unexpected field: {', '.join(unexpected)}")
+    for name, item in object_value.items():
+        property_schema = properties.get(name)
+        if property_schema is None:
+            continue
+        assert isinstance(property_schema, dict)
+        expected = property_schema["type"]
+        if not _matches_json_type(item, expected):
+            raise error_type(f"field {name} must be {expected}")
+
+
+def _matches_json_type(value: object, expected: object) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    return False

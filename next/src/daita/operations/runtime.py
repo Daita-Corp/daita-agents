@@ -7,9 +7,17 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
+import hashlib
 from uuid import uuid4
 
-from .._json import FrozenJsonObject
+from .._json import FrozenJsonObject, canonical_json
+from ..capabilities import (
+    CapabilityExecutionError,
+    CapabilityRegistry,
+    EvidenceCandidate,
+    EvidenceValidationError,
+    ExecutionRequest,
+)
 from ..llm.models import ModelRequest, ModelResponse
 from ..loop.models import (
     LoopExit,
@@ -20,10 +28,14 @@ from ..loop.models import (
     Turn,
 )
 from .models import (
+    ActionProposal,
     AgentTrigger,
+    Evidence,
     Observation,
     Operation,
     OperationStatus,
+    Task,
+    TaskStatus,
     TriggerKind,
 )
 
@@ -46,9 +58,24 @@ class RuntimeEvent:
     operation_id: str
     created_at: datetime
     turn_id: str | None = None
+    call_id: str | None = None
+    task_id: str | None = None
+    evidence_id: str | None = None
+    capability_id: str | None = None
+    executor_id: str | None = None
     payload: Mapping[str, object] = FrozenJsonObject(())
 
     def __post_init__(self) -> None:
+        for field_name, value in (
+            ("turn_id", self.turn_id),
+            ("call_id", self.call_id),
+            ("task_id", self.task_id),
+            ("evidence_id", self.evidence_id),
+            ("capability_id", self.capability_id),
+            ("executor_id", self.executor_id),
+        ):
+            if value is not None:
+                _required_text(value, f"event {field_name}")
         object.__setattr__(self, "payload", FrozenJsonObject.from_mapping(self.payload))
 
 
@@ -74,6 +101,8 @@ class OperationSnapshot:
     turns: tuple[Turn, ...]
     model_calls: tuple[ModelCall, ...]
     readiness: tuple[Readiness, ...]
+    tasks: tuple[Task, ...]
+    evidence: tuple[Evidence, ...]
     observations: tuple[Observation, ...]
     events: tuple[RuntimeEvent, ...]
 
@@ -86,6 +115,8 @@ class _OperationState:
     turns: list[Turn]
     model_calls: list[ModelCall]
     readiness: list[Readiness]
+    tasks: list[Task]
+    evidence: list[Evidence]
     observations: list[Observation]
     events: list[RuntimeEvent]
 
@@ -111,9 +142,11 @@ class OperationRuntime:
         *,
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[str], str] = _random_id,
+        capabilities: CapabilityRegistry | None = None,
     ) -> None:
         self._clock = clock
         self._id_factory = id_factory
+        self._capabilities = capabilities or CapabilityRegistry()
         self._lock = asyncio.Lock()
         self._states: dict[str, _OperationState] = {}
         self._operation_by_trigger: dict[str, str] = {}
@@ -147,6 +180,8 @@ class OperationRuntime:
                 turns=[],
                 model_calls=[],
                 readiness=[],
+                tasks=[],
+                evidence=[],
                 observations=[],
                 events=[],
             )
@@ -304,6 +339,33 @@ class OperationRuntime:
                 state.model_calls[-1].status is not ModelCallStatus.COMPLETED
             ):
                 raise OperationStateError("readiness requires a completed model call")
+            model_response = state.model_calls[-1].response
+            if (
+                model_response is None
+                or model_response.tool_calls
+                or model_response.text != final_text
+            ):
+                raise OperationStateError(
+                    "readiness text must match the committed final model response"
+                )
+            if any(
+                task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}
+                for task in state.tasks
+            ):
+                raise OperationStateError(
+                    "readiness requires every task to be terminal"
+                )
+            if any(
+                not any(
+                    observation.evidence_id == evidence.id
+                    for observation in state.observations
+                )
+                for evidence in state.evidence
+                if evidence.accepted
+            ):
+                raise OperationStateError(
+                    "readiness requires every accepted evidence item to be observed"
+                )
             now = self._clock()
             state.readiness.append(readiness)
             state.loop_state = replace(
@@ -317,6 +379,346 @@ class OperationRuntime:
                 "readiness.recorded",
                 turn_id=state.model_calls[-1].turn_id,
                 payload={"allowed": readiness.allowed, "code": readiness.code},
+            )
+            self._commit(state)
+
+    async def submit(self, proposal: ActionProposal) -> Evidence:
+        if not isinstance(proposal, ActionProposal):
+            raise TypeError("proposal must be an ActionProposal")
+
+        # Commit the unexecuted task first. The proposal is untrusted until it
+        # is bound to an exact tool call in a committed model response.
+        async with self._lock:
+            state = self._working_state(proposal.operation_id)
+            if not state.turns or state.turns[-1].id != proposal.turn_id:
+                raise OperationStateError(
+                    "proposal does not belong to the current turn"
+                )
+            if state.loop_state.phase not in {
+                LoopPhase.VALIDATING_ACTION,
+                LoopPhase.OBSERVING,
+            }:
+                raise OperationStateError(
+                    "operation is not accepting an action proposal"
+                )
+            model_call = self._completed_model_call_for_turn(
+                state,
+                proposal.turn_id,
+            )
+            assert model_call.response is not None
+            tool_call = next(
+                (
+                    call
+                    for call in model_call.response.tool_calls
+                    if call.id == proposal.call_id
+                ),
+                None,
+            )
+            if tool_call is None:
+                raise OperationStateError(
+                    f"proposal call_id is not in the committed response: "
+                    f"{proposal.call_id}"
+                )
+            call_position = model_call.response.tool_calls.index(tool_call)
+            for earlier_call in model_call.response.tool_calls[:call_position]:
+                earlier_task = next(
+                    (
+                        task
+                        for task in state.tasks
+                        if task.turn_id == proposal.turn_id
+                        and task.call_id == earlier_call.id
+                    ),
+                    None,
+                )
+                if (
+                    earlier_task is None
+                    or earlier_task.status is not TaskStatus.SUCCEEDED
+                    or not earlier_task.evidence_ids
+                    or any(
+                        not any(
+                            observation.evidence_id == evidence_id
+                            for observation in state.observations
+                        )
+                        for evidence_id in earlier_task.evidence_ids
+                    )
+                ):
+                    raise OperationStateError(
+                        "proposal tool call is out of committed sequential order"
+                    )
+            try:
+                view, capability = self._capabilities.resolve_tool(tool_call.name)
+            except KeyError as error:
+                raise OperationStateError(
+                    f"model selected an unknown tool view: {tool_call.name}"
+                ) from error
+            expected_definition = self._capabilities.tool_definition(view.name)
+            if expected_definition not in model_call.request.tools:
+                raise OperationStateError(
+                    f"model selected a tool without its declared projection: "
+                    f"{view.name}"
+                )
+            if proposal.capability_id != view.capability_id:
+                raise OperationStateError(
+                    "proposal capability does not match the committed tool view"
+                )
+            if proposal.arguments != tool_call.arguments:
+                raise OperationStateError(
+                    "proposal arguments do not match the committed tool call"
+                )
+            validated_arguments = self._capabilities.validate_arguments(
+                capability.id,
+                tool_call.arguments,
+            )
+            self._capabilities.resolve_execution(capability.id)
+            if any(
+                task.turn_id == proposal.turn_id and task.call_id == proposal.call_id
+                for task in state.tasks
+            ):
+                raise OperationStateError(
+                    f"tool call already materialized: {proposal.call_id}"
+                )
+            now = self._clock()
+            task = Task(
+                id=self._id_factory("task"),
+                operation_id=proposal.operation_id,
+                turn_id=proposal.turn_id,
+                call_id=proposal.call_id,
+                capability_id=capability.id,
+                executor_id=capability.executor_id,
+                status=TaskStatus.PENDING,
+                attempt=1,
+                arguments=validated_arguments,
+                created_at=now,
+                updated_at=now,
+            )
+            state.tasks.append(task)
+            state.loop_state = replace(
+                state.loop_state,
+                phase=LoopPhase.AWAITING_EXECUTION,
+                action_count=state.loop_state.action_count + 1,
+            )
+            state.operation = replace(state.operation, updated_at=now)
+            self._append_event(
+                state,
+                "task.created",
+                turn_id=task.turn_id,
+                call_id=task.call_id,
+                task_id=task.id,
+                capability_id=task.capability_id,
+                executor_id=task.executor_id,
+                payload={
+                    "task_id": task.id,
+                    "capability_id": task.capability_id,
+                    "executor_id": task.executor_id,
+                },
+            )
+            self._commit(state)
+
+        # A separate atomic transition makes RUNNING and executor.started
+        # durable before the only external execution call in production code.
+        async with self._lock:
+            state = self._working_state(task.operation_id)
+            task_index, committed_task = self._task(state, task.id)
+            if committed_task.status is not TaskStatus.PENDING:
+                raise OperationStateError("task is no longer pending")
+            capability, executor = self._capabilities.resolve_execution(
+                committed_task.capability_id
+            )
+            if capability.executor_id != committed_task.executor_id:
+                raise OperationStateError("task executor identity changed")
+            now = self._clock()
+            task = replace(
+                committed_task,
+                status=TaskStatus.RUNNING,
+                updated_at=now,
+            )
+            state.tasks[task_index] = task
+            state.operation = replace(state.operation, updated_at=now)
+            self._append_event(
+                state,
+                "executor.started",
+                turn_id=task.turn_id,
+                call_id=task.call_id,
+                task_id=task.id,
+                capability_id=task.capability_id,
+                executor_id=task.executor_id,
+                payload={"task_id": task.id, "executor_id": task.executor_id},
+            )
+            self._commit(state)
+
+        request = ExecutionRequest(
+            operation_id=task.operation_id,
+            task_id=task.id,
+            turn_id=task.turn_id,
+            capability_id=task.capability_id,
+            attempt=task.attempt,
+            arguments=task.arguments,
+        )
+        try:
+            candidate = await executor.execute(request)
+        except Exception as error:
+            await self._fail_task(task.id, "executor_failed")
+            raise CapabilityExecutionError(
+                f"executor failed for task {task.id}"
+            ) from error
+
+        execution_identity_error: Exception | None = None
+        accepted_candidate: EvidenceCandidate | None = None
+        validation_error: EvidenceValidationError | None = None
+        async with self._lock:
+            state = self._working_state(task.operation_id)
+            task_index, committed_task = self._task(state, task.id)
+            if committed_task.status is not TaskStatus.RUNNING:
+                raise OperationStateError("task is no longer running")
+            try:
+                current_capability, current_executor = (
+                    self._capabilities.resolve_execution(committed_task.capability_id)
+                )
+            except ValueError as error:
+                execution_identity_error = error
+            else:
+                if (
+                    current_capability.executor_id != committed_task.executor_id
+                    or current_executor is not executor
+                ):
+                    execution_identity_error = OperationStateError(
+                        "task execution identity changed"
+                    )
+
+            if execution_identity_error is None:
+                try:
+                    accepted_candidate = self._capabilities.validate_evidence(
+                        committed_task.capability_id,
+                        candidate,
+                    )
+                except EvidenceValidationError as error:
+                    # Failure publication needs its own copy-on-write transition.
+                    validation_error = error
+
+            if accepted_candidate is None:
+                # Do not commit this working copy. _fail_task publishes a
+                # terminal task with no evidence from the prior committed state.
+                pass
+            else:
+                now = self._clock()
+                payload_json = canonical_json(accepted_candidate.payload)
+                evidence = Evidence(
+                    id=self._id_factory("evidence"),
+                    operation_id=task.operation_id,
+                    task_id=task.id,
+                    turn_id=task.turn_id,
+                    capability_id=task.capability_id,
+                    executor_id=task.executor_id,
+                    kind=accepted_candidate.kind,
+                    schema_version=accepted_candidate.schema_version,
+                    attempt=task.attempt,
+                    accepted=True,
+                    payload=accepted_candidate.payload,
+                    content_hash=(
+                        "sha256:"
+                        + hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+                    ),
+                    created_at=now,
+                )
+                state.evidence.append(evidence)
+                state.tasks[task_index] = replace(
+                    committed_task,
+                    status=TaskStatus.SUCCEEDED,
+                    evidence_ids=(evidence.id,),
+                    updated_at=now,
+                )
+                state.loop_state = replace(
+                    state.loop_state,
+                    phase=LoopPhase.OBSERVING,
+                )
+                state.operation = replace(state.operation, updated_at=now)
+                self._append_event(
+                    state,
+                    "executor.completed",
+                    turn_id=task.turn_id,
+                    call_id=task.call_id,
+                    task_id=task.id,
+                    capability_id=task.capability_id,
+                    executor_id=task.executor_id,
+                    payload={"task_id": task.id, "executor_id": task.executor_id},
+                )
+                self._append_event(
+                    state,
+                    "evidence.accepted",
+                    turn_id=task.turn_id,
+                    call_id=task.call_id,
+                    task_id=task.id,
+                    evidence_id=evidence.id,
+                    capability_id=task.capability_id,
+                    executor_id=task.executor_id,
+                    payload={"task_id": task.id, "evidence_id": evidence.id},
+                )
+                self._append_event(
+                    state,
+                    "task.succeeded",
+                    turn_id=task.turn_id,
+                    call_id=task.call_id,
+                    task_id=task.id,
+                    evidence_id=evidence.id,
+                    capability_id=task.capability_id,
+                    executor_id=task.executor_id,
+                    payload={"task_id": task.id},
+                )
+                self._commit(state)
+                return evidence
+
+        if execution_identity_error is not None:
+            await self._fail_task(task.id, "execution_identity_changed")
+            raise CapabilityExecutionError(
+                f"executor identity changed for task {task.id}"
+            ) from execution_identity_error
+        await self._fail_task(task.id, "evidence_rejected")
+        assert validation_error is not None
+        raise validation_error
+
+    async def append_observation(self, observation: Observation) -> None:
+        if not isinstance(observation, Observation):
+            raise TypeError("observation must be an Observation")
+        async with self._lock:
+            state = self._working_state(observation.operation_id)
+            if observation.evidence_id is None or observation.task_id is None:
+                raise OperationStateError(
+                    "executor observation requires task and evidence identity"
+                )
+            _, task = self._task(state, observation.task_id)
+            evidence = self._accepted_evidence(state, observation.evidence_id)
+            if task.status is not TaskStatus.SUCCEEDED:
+                raise OperationStateError("observation task is not succeeded")
+            if evidence.id not in task.evidence_ids:
+                raise OperationStateError("observation evidence is not linked to task")
+            if evidence.task_id != task.id or evidence.turn_id != observation.turn_id:
+                raise OperationStateError(
+                    "observation linkage does not match accepted evidence"
+                )
+            if any(
+                item.evidence_id == observation.evidence_id
+                for item in state.observations
+            ):
+                raise OperationStateError("evidence already has an observation")
+            state.observations.append(observation)
+            now = self._clock()
+            state.loop_state = replace(state.loop_state, phase=LoopPhase.OBSERVING)
+            state.operation = replace(state.operation, updated_at=now)
+            self._append_event(
+                state,
+                "observation.recorded",
+                turn_id=observation.turn_id,
+                call_id=task.call_id,
+                task_id=task.id,
+                evidence_id=evidence.id,
+                capability_id=task.capability_id,
+                executor_id=task.executor_id,
+                payload={
+                    "task_id": task.id,
+                    "evidence_id": evidence.id,
+                    "code": observation.code,
+                    "truncated": observation.truncated,
+                },
             )
             self._commit(state)
 
@@ -428,6 +830,8 @@ class OperationRuntime:
             turns=list(committed.turns),
             model_calls=list(committed.model_calls),
             readiness=list(committed.readiness),
+            tasks=list(committed.tasks),
+            evidence=list(committed.evidence),
             observations=list(committed.observations),
             events=list(committed.events),
         )
@@ -451,12 +855,94 @@ class OperationRuntime:
                 return index, model_call
         raise OperationStateError(f"unknown model call: {model_call_id}")
 
+    def _completed_model_call_for_turn(
+        self,
+        state: _OperationState,
+        turn_id: str,
+    ) -> ModelCall:
+        self._turn(state, turn_id)
+        for model_call in state.model_calls:
+            if model_call.turn_id != turn_id:
+                continue
+            if (
+                model_call.status is ModelCallStatus.COMPLETED
+                and model_call.response is not None
+            ):
+                return model_call
+            raise OperationStateError("proposal requires a completed model response")
+        raise OperationStateError("proposal turn has no committed model response")
+
+    def _task(self, state: _OperationState, task_id: str) -> tuple[int, Task]:
+        for index, task in enumerate(state.tasks):
+            if task.id == task_id:
+                return index, task
+        raise OperationStateError(f"unknown task: {task_id}")
+
+    @staticmethod
+    def _accepted_evidence(state: _OperationState, evidence_id: str) -> Evidence:
+        for evidence in state.evidence:
+            if evidence.id == evidence_id and evidence.accepted:
+                return evidence
+        raise OperationStateError(f"unknown accepted evidence: {evidence_id}")
+
+    async def _fail_task(self, task_id: str, error_code: str) -> None:
+        async with self._lock:
+            operation_id = self._operation_for_task(task_id)
+            state = self._working_state(operation_id)
+            task_index, task = self._task(state, task_id)
+            if task.status is not TaskStatus.RUNNING:
+                raise OperationStateError("task is no longer running")
+            now = self._clock()
+            state.tasks[task_index] = replace(
+                task,
+                status=TaskStatus.FAILED,
+                updated_at=now,
+                error_code=error_code,
+            )
+            state.operation = replace(state.operation, updated_at=now)
+            self._append_event(
+                state,
+                "task.failed",
+                turn_id=task.turn_id,
+                call_id=task.call_id,
+                task_id=task.id,
+                capability_id=task.capability_id,
+                executor_id=task.executor_id,
+                payload={"task_id": task.id, "error_code": error_code},
+            )
+            self._append_event(
+                state,
+                "executor.failed",
+                turn_id=task.turn_id,
+                call_id=task.call_id,
+                task_id=task.id,
+                capability_id=task.capability_id,
+                executor_id=task.executor_id,
+                payload={
+                    "task_id": task.id,
+                    "executor_id": task.executor_id,
+                    "error_code": error_code,
+                },
+            )
+            self._commit(state)
+
+    def _operation_for_task(self, task_id: str) -> str:
+        for operation_id, state in self._states.items():
+            if any(task.id == task_id for task in state.tasks):
+                return operation_id
+        raise OperationStateError(f"unknown task: {task_id}")
+
     def _append_event(
         self,
         state: _OperationState,
         event_type: str,
         *,
         turn_id: str | None = None,
+        call_id: str | None = None,
+        task_id: str | None = None,
+        evidence_id: str | None = None,
+        capability_id: str | None = None,
+        executor_id: str | None = None,
         payload: Mapping[str, object] | None = None,
     ) -> None:
         state.events.append(
@@ -466,6 +952,11 @@ class OperationRuntime:
                 agent_id=state.operation.agent_id,
                 operation_id=state.operation.id,
                 turn_id=turn_id,
+                call_id=call_id,
+                task_id=task_id,
+                evidence_id=evidence_id,
+                capability_id=capability_id,
+                executor_id=executor_id,
                 payload=payload or {},
                 created_at=self._clock(),
             )
@@ -505,6 +996,8 @@ class OperationRuntime:
             turns=tuple(state.turns),
             model_calls=tuple(state.model_calls),
             readiness=tuple(state.readiness),
+            tasks=tuple(state.tasks),
+            evidence=tuple(state.evidence),
             observations=tuple(state.observations),
             events=tuple(state.events),
         )
