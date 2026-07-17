@@ -11,6 +11,7 @@ OPERATION_CHECKPOINTS = SOURCE_ROOT / "operations" / "checkpoints.py"
 OPERATION_STORE = SOURCE_ROOT / "operations" / "store.py"
 OPERATION_RUNTIME = SOURCE_ROOT / "operations" / "runtime.py"
 LOOP_DRIVER = SOURCE_ROOT / "loop" / "driver.py"
+SQLITE_ADAPTER = SOURCE_ROOT / "storage" / "sqlite.py"
 
 
 def _production_trees() -> tuple[tuple[Path, ast.Module], ...]:
@@ -215,6 +216,62 @@ def test_store_contract_does_not_import_runtime_execution_or_sql_owners() -> Non
         (lineno, module)
         for lineno, module in _imported_modules(tree)
         if any(_is_module_or_child(module, parent) for parent in forbidden_parents)
+    ]
+
+    assert violations == []
+
+
+def test_sqlite_adapter_imports_only_canonical_records_and_standard_library() -> None:
+    tree = _required_tree(SQLITE_ADAPTER)
+    imported_modules = {module for _, module in _imported_modules(tree)}
+
+    assert imported_modules == {
+        "__future__",
+        "_json",
+        "asyncio",
+        "collections.abc",
+        "dataclasses",
+        "datetime",
+        "decimal",
+        "events.models",
+        "hashlib",
+        "json",
+        "llm.models",
+        "loop.models",
+        "operations.checkpoints",
+        "operations.models",
+        "operations.store",
+        "pathlib",
+        "re",
+        "sqlite3",
+        "typing",
+    }
+
+
+def test_sqlite_adapter_has_no_opaque_snapshot_or_history_rewrite_sql() -> None:
+    tree = _required_tree(SQLITE_ADAPTER)
+    forbidden = re.compile(
+        r"\bsnapshot_json\b|\bdelete\s+from\b|\breplace\s+into\b|"
+        r"\binsert\s+or\s+(?:replace|ignore|abort|fail|rollback)\b|"
+        r"\bon\s+conflict\b|\bupsert\b",
+        re.IGNORECASE,
+    )
+    samples = (
+        "snapshot_json TEXT NOT NULL",
+        "DELETE FROM runtime_events",
+        "REPLACE INTO operations VALUES (?)",
+        "INSERT OR IGNORE INTO evidence VALUES (?)",
+        "ON CONFLICT(id) DO UPDATE SET revision = 2",
+        "UPSERT operation",
+    )
+    assert all(forbidden.search(sample) is not None for sample in samples)
+
+    violations = [
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and forbidden.search(node.value) is not None
     ]
 
     assert violations == []

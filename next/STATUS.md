@@ -16,9 +16,9 @@ project. Update it before and after every material task.
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** write expected-red SQLite marker, PRAGMA, ordered
-  checksummed migration, backup-before-migrate, compatibility, rollback, and
-  reopen contracts before adding the concrete `storage/sqlite.py` owner
+- **Exact next action:** finish the P2-03 scoped gate, run configured hooks,
+  and create the local SQLite persistence checkpoint without touching root
+  `daita/`
 
 ## Mandatory architecture re-read
 
@@ -113,11 +113,11 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 
 | ID | Status | Smallest output | Required proof before advancing |
 | --- | --- | --- | --- |
-| P2-03a | active | Test-only SQLite foundation contract | Expected-red marker/PRAGMA/version/checksum/backup/compatibility/rollback/reopen cases with no production SQLite owner |
-| P2-03b | pending | One concrete `SQLiteOperationStore` foundation in `storage/sqlite.py` | Foundation cases green; standard-library calls offloaded; no generic `StateStore`, loop import, or SQL leakage into runtime |
-| P2-03c | pending | Normalized lifecycle schema plus canonical codecs | Every trigger/operation/loop/turn/model/task/evidence/readiness/observation/event field round-trips independently; no opaque-snapshot-only persistence |
-| P2-03d | pending | Transactional optimistic operation repository | Reuse portable contract validation; create/load/by-trigger/CAS/conflict/rollback/reopen/shared-runtime conformance; failure leaves all tables/events unchanged |
-| P2-03e | pending | Final P2-03 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, independent review, scoped hooks, local commit |
+| P2-03a | complete | Test-only SQLite foundation contract | Expected-red marker/PRAGMA/version/checksum/backup/compatibility/rollback/reopen cases with no production SQLite owner |
+| P2-03b | complete | One concrete `SQLiteOperationStore` foundation in `storage/sqlite.py` | Foundation cases green; standard-library calls offloaded; no generic `StateStore`, loop import, or SQL leakage into runtime |
+| P2-03c | complete | Normalized lifecycle schema plus canonical codecs | Every trigger/operation/loop/turn/model/task/evidence/readiness/observation/event field round-trips independently; no opaque-snapshot-only persistence |
+| P2-03d | complete | Transactional optimistic operation repository | Reuse portable contract validation; create/load/by-trigger/CAS/conflict/rollback/reopen/shared-runtime conformance; failure leaves all tables/events unchanged |
+| P2-03e | active | Final P2-03 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, independent review, scoped hooks, local commit |
 
 ## Files/components being changed or planned
 
@@ -323,6 +323,24 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-02 final distribution gate | PASS — clean copy `/private/tmp/daita-v2-p2-02-gate.31k4au` built 22-entry wheel and 36-entry sdist; fresh isolated Python 3.11/3.12 installs import v2 canonical event/checkpoint/store modules from their own site-packages |
 | P2-02 independent final review | PASS — no architecture or cancellation blocker remains; store/runtime ownership, committed prefixes, exact event ancestry, cancellation precedence, interruption CAS convergence, and sole executor boundary verified |
 | P2-02 scoped checkpoint | PASS — exactly 19 paths under `next/`; cached diff and configured whitespace/EOF/conflict/large-file/Black hooks passed; commit `b13e66abc5d645b685f7bbf840d2e8d9ea903f2f` |
+| Initial P2-03 SQLite-foundation contract before its production owner existed | EXPECTED RED — collection stopped on exactly 1 `ModuleNotFoundError` for the intentionally absent `daita.storage` package; only the test file existed |
+| First P2-03b foundation implementation | PASS — 12 focused marker/PRAGMA/migration/backup/rollback/reopen tests on Python 3.11 and Python 3.12 |
+| P2-03b adversarial foundation review before repair | EXPECTED RED — 6 failures reproduced transient backup, pre-lock cancellation escape, bricked fresh migration retry, transaction-control escape, raw-constructor bypass, and non-resumable existing backup |
+| Repaired P2-03b foundation and cancellation suite | PASS — 23 tests on CPython 3.11.15 and 23 on CPython 3.12.7; migration/open/inspect/close workers finish before cancellation propagates |
+| P2-03b static and architecture checks | PASS — 31 focused architecture/foundation tests; mypy clean across 22 source/unit files; pyright 0 errors/warnings; compilation succeeded |
+| Initial P2-03c/d maximal normalized aggregate contract | EXPECTED RED — 2 tests fail only because `SQLiteOperationStore.create/load/load_by_trigger` do not yet exist; the valid fixture and raw-schema assertions already collect and run |
+| P2-03c maximal normalized aggregate and strict codec suite | PASS — every non-default lifecycle/model field, independent tuple order, duplicate readiness/observations, opposite task/global evidence order, UTC datetime, exact Decimal, tagged model content, and reopen lookups round-trip; raw schema has 11 lifecycle tables and no `snapshot_json` |
+| P2-03c schema/codec adversarial review before final repair | EXPECTED RED — 2 failures proved SQLite BLOB values were coerced to text and noncontiguous row positions changed collection semantics instead of failing loudly |
+| Repaired P2-03c focused/full/static evidence | PASS — 39 storage tests on Python 3.11 and 3.12; 257 complete tests on Python 3.11; exact public schema manifests reject missing, renamed, added, or index-drifted objects; mypy clean across 24 files and pyright 0 errors/warnings |
+| P2-03d cancellation and post-COMMIT acknowledgement contract before reconciliation | EXPECTED RED — 2 of 4 cases failed because a durable `COMMIT` followed by an injected SQLite error escaped as raw `OperationalError`; cancellation cases already waited for definitive transaction completion |
+| Repaired P2-03d write-cancellation and commit-outcome contract | PASS — 4 passed; cancelled create/commit awaits leave no background SQL and reopen exact state, while a post-COMMIT error is reconciled from authoritative rows or becomes typed outcome-unknown rather than a retry-safe false failure |
+| P2-03d optimistic transaction and rollback contract | PASS — 7 passed; exact event suffixes and legal mutable lifecycle transitions persist, missing/stale writes are typed, nine history rewrites leave raw rows unchanged, two connections produce one CAS winner, duplicate claims have typed losers, and injected event failures roll back all 11 lifecycle tables on create and commit |
+| P2-03d final focused persistence suite | PASS — 50 storage tests before the final migration-diagnostic regression; normalized create/load/by-trigger/commit, strict codecs, compatibility, migration, cancellation, reconciliation, concurrency, rollback, and reopen contracts pass together |
+| P2-03e final dual-interpreter complete suite | PASS — 271 passed in 2.25s on CPython 3.11.15 and 271 passed in 2.26s on CPython 3.12.7 |
+| P2-03e final static and architecture review | PASS — Black clean across 58 files; compilation succeeded; mypy clean across 57 files; pyright 1.1.411 reports 0 errors/warnings; all 36 architecture tests pass |
+| P2-03e root-oracle and distribution review | PASS — root safe suite remains 2,498 passed/221 deselected; disposition/v1 fixtures reproduce; root diff from `b87df318` is empty; clean v2 build `/private/tmp/daita-v2-p2-03.UIpzhE` produced 24/39-entry archives with fresh Python 3.11/3.12 imports; root build with the physical `next/` tree produced 401/442 entries at v1 `1.0.0` and excluded `next/` |
+| P2-03e migration-failure attribution before repair | EXPECTED RED — a three-migration fresh initialization failed in migration 3 but the typed diagnostic incorrectly named pending migration 1 |
+| P2-03e independent review | PASS after repair — transaction-design and final scope audits found no remaining in-contract blocker; the last review found and the new regression repaired exact failed-migration attribution, while its concurrent-first-open observation remains correctly owned by P2-08's required shared writer lock |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
@@ -348,6 +366,44 @@ re-read and an updated ordered ledger.
   and the read-only root package is unchanged.
 - P2-02 is complete; the earlier 204-test/static/build rows remain interim
   evidence and are superseded by the final 218-test and rebuilt-artifact rows.
+- P2-03 began test-first. Its initial focused collection stopped on the one
+  intentionally absent `daita.storage` owner. An independent design review
+  then narrowed arbitrary migration injection to a private test seam before
+  production work, so the operational store will always own its fixed ordered
+  schema rather than accepting caller-supplied SQL.
+- The representative P2-03b foundation was reviewed before standardization.
+  Its one concrete adapter, fixed migration plan, cancellation-resilient
+  offload boundary, fail-closed compatibility checks, and verified reusable
+  backup are sound to extend within the existing `OperationStore` seam. They
+  do not justify a generic database, serializer registry, or project-wide
+  storage framework. Six independent adversarial failures were locked as
+  regressions and repaired before P2-03c began; marker-only v0 state is also
+  rejected consistently because no released v2 schema can produce it.
+- P2-03c adds migration 2's normalized trigger, operation, loop, turn,
+  model-call, readiness, task/evidence-link/evidence, observation, and runtime
+  event tables. Every ordered collection has a checked zero-based persistence
+  envelope; readiness and observations retain their canonical value identity
+  without invented domain IDs. Model request/response JSON is explicitly
+  versioned/tagged, while lifecycle records remain independent rows. Public
+  open verifies the exact schema for both the already-applied prefix before
+  backup and the final version after migration. Strict storage-class, JSON,
+  enum, datetime, Decimal, boolean, and position decoders reject corruption
+  rather than coercing it. A deliberate external rewrite of an otherwise
+  complete valid database is outside this phase's tamper-evidence contract;
+  raw gaps/type/schema drift fail closed.
+- P2-03d reuses the portable operation-store validators inside one
+  `BEGIN IMMEDIATE` transaction, updates only the contract's legal mutable
+  fields, appends every historical suffix at an explicit position, and seals
+  the transaction with a revision CAS. It never deletes, replaces, upserts,
+  or retries an ambiguous commit. A post-COMMIT SQLite error is reconciled
+  only when an authoritative reload proves the exact candidate or a later
+  valid extension; otherwise the adapter raises typed outcome-unknown.
+- The SQLite adapter intentionally assumes the plan's one-active-writer
+  ownership for startup and migrations. P2-08 owns the shared per-agent
+  writer lock and its concurrent create/open/host-active tests; P2-03's
+  adversarial multi-connection coverage begins after one authoritative store
+  initialization and proves SQLite CAS independently of that future host
+  composition boundary.
 - P2-02 began test-first. Its combined event/checkpoint/store/architecture run
   stopped at collection on the intentionally absent canonical event and
   operation-store modules. This is expected-red evidence, not a gate failure;

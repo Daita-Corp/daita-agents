@@ -334,7 +334,7 @@ commands actually run.
 ## Phases 2 through 9
 
 Phase 2 status: **P2-02 canonical checkpoints and the authoritative in-memory
-operation-store seam are complete; P2-03 SQLite foundation is active. The
+operation-store seam are complete; P2-03 SQLite final checkpoint is active. The
 overall Phase 2 gate has not been run or claimed.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 1 gate and before
@@ -368,6 +368,30 @@ any Phase 2 production edit. Later phases remain unstarted.
 Rows P2-Q01f through P2-Q01h predate the adversarial repairs and remain useful
 interim evidence only. Rows P2-Q01p through P2-Q01s close the refreshed seam
 gate.
+
+### Executed P2-03 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P2-Q02a | `next/` | Run the test-only SQLite foundation contract before adding a production storage owner | EXPECTED RED — collection stopped on exactly one missing `daita.storage` module |
+| P2-Q02b | `next/` | First fixed-schema SQLite foundation on CPython 3.11/3.12 | PASS — 12 tests per interpreter; v2 marker, WAL, foreign keys, busy timeout, FULL synchronization, migrations, backup, rollback, compatibility, and reopen passed |
+| P2-Q02c | `next/` | Independent adversarial foundation/cancellation cases before repair | EXPECTED RED — 6 failures exposed transient backup acceptance, pre-lock cancellation escape, failed-fresh-init residue, transaction-control injection, raw-constructor bypass, and unusable existing-backup recovery |
+| P2-Q02d | `next/` | Repaired foundation and cancellation suite | PASS — 23 tests on each interpreter; offloaded migration/open/inspect/close work reaches a definitive state before cancellation propagates |
+| P2-Q02e | `next/` | Maximal normalized aggregate before repository reads/writes existed | EXPECTED RED — exactly 2 failures for absent `create`, `load`, and `load_by_trigger` methods |
+| P2-Q02f | `next/` | Maximal normalized lifecycle and strict codec contracts | PASS — all current trigger/operation/loop/turn/model/readiness/task/evidence/observation/event fields round-trip independently across 11 tables, explicit positions, UTC time, exact Decimal, and versioned/tagged provider-neutral JSON; no opaque snapshot row exists |
+| P2-Q02g | `next/` | Schema/codec adversarial review before repair | EXPECTED RED — 2 failures showed BLOB-to-text coercion and silent positional-gap reordering; strict storage-class and contiguous-position checks repaired both |
+| P2-Q02h | `next/` | Cancellation and post-COMMIT acknowledgement cases before reconciliation | EXPECTED RED — 2 of 4 failed because a real durable commit followed by an injected SQLite error escaped as raw `OperationalError` |
+| P2-Q02i | `next/` | Repaired write-cancellation and transaction contract | PASS — 11 cases; create/commit cannot outlive their public await, ambiguous commit acknowledgement is reconciled or typed unknown, legal mutable transitions append exact suffixes, stale/missing writes are typed, two connections have one CAS winner, duplicate claims serialize, and an event abort rolls back all 11 tables |
+| P2-Q02j | `next/` | Complete focused persistence suite after transaction repair | PASS — 50 storage tests covering foundation, migration, schema, codecs, normalized repository, cancellation, reconciliation, CAS, rollback, and reopen |
+| P2-Q02k | `next/` | Complete isolated suite on CPython 3.11.15 and 3.12.7 before final audit assertions | PASS — 268 passed in 1.30s on 3.11 and 268 passed in 1.40s on 3.12 |
+| P2-Q02l | repository root and `next/` | Black, compilation, mypy, pyright 1.1.411, architecture, disposition/v1 oracle, root-oracle, and root safe-suite checks | PASS — Black 58 files; compilation clean; mypy 57 files; pyright 0 errors/warnings; 34 architecture tests; fixture/inventory/root scans clean; root suite 2,498 passed and 221 deselected |
+| P2-Q02m | clean copies under `/private/tmp` | Build and inspect v2 plus root distributions; fresh isolated Python 3.11/3.12 v2 imports | PASS — v2 wheel/sdist 24/39 entries at `2.0.0a0` include `daita.storage.sqlite`; root wheel/sdist 401/442 at `1.0.0` exclude the physical `next/` tree; both fresh v2 imports resolve to their own site-packages |
+| P2-Q02n | current P2-03 diff | Independent transaction-design and final architecture/scope reviews | EXPECTED RED then PASS — final review found one incorrect later-migration diagnostic; a dedicated migration-3 regression failed with migration 1, then passed after tracking the active migration. No commit/CAS/schema/codec blocker remains; two requested architecture assertions permanently lock the adapter import allowlist and forbid opaque/delete/replace/ignore/upsert SQL shortcuts |
+| P2-Q02o | `next/` | Final post-review complete suites and static/architecture gate | PASS — 271 passed in 2.25s on CPython 3.11.15 and 271 passed in 2.26s on CPython 3.12.7; Black 58 files; compilation clean; mypy 57 files; pyright 0 errors/warnings; all 36 architecture tests pass |
+
+Rows P2-Q02k through P2-Q02m remain useful pre-review evidence; P2-Q02o is the
+refreshed code/test-tree gate. Only scoped hooks and the local checkpoint remain
+for P2-03e.
 
 ### Planned Phase 2 evidence sequence
 

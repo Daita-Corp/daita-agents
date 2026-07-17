@@ -130,7 +130,7 @@ class InMemoryOperationStore:
         self._operation_by_trigger: dict[str, str] = {}
 
     async def create(self, snapshot: OperationSnapshot) -> CommitResult:
-        _validate_checkpoint_structure(snapshot)
+        _validate_new_checkpoint(snapshot)
         operation_id = snapshot.operation.id
         trigger_id = snapshot.trigger.id
         async with self._lock:
@@ -170,7 +170,7 @@ class InMemoryOperationStore:
         *,
         expected_revision: int,
     ) -> CommitResult:
-        _validate_checkpoint_structure(snapshot)
+        _validate_new_checkpoint(snapshot)
         _require_revision(expected_revision)
         operation_id = snapshot.operation.id
         async with self._lock:
@@ -185,9 +185,10 @@ class InMemoryOperationStore:
                     actual_revision=current.revision,
                 )
 
-            _validate_stable_identity(current.snapshot, snapshot)
-            _validate_stable_history(current.snapshot, snapshot)
-            committed_events = _committed_event_suffix(current.snapshot, snapshot)
+            committed_events = _validate_commit_candidate(
+                current.snapshot,
+                snapshot,
+            )
             committed = VersionedOperation(
                 snapshot=snapshot,
                 revision=current.revision + 1,
@@ -207,6 +208,24 @@ def _require_identity(value: str, field_name: str) -> None:
 def _require_revision(revision: int) -> None:
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
         raise ValueError("expected_revision must be a non-negative integer")
+
+
+def _validate_new_checkpoint(snapshot: OperationSnapshot) -> None:
+    """Validate portable aggregate facts before any concrete adapter mutates."""
+
+    _validate_checkpoint_structure(snapshot)
+
+
+def _validate_commit_candidate(
+    current: OperationSnapshot,
+    candidate: OperationSnapshot,
+) -> tuple[RuntimeEvent, ...]:
+    """Validate a replacement checkpoint and return its exact event suffix."""
+
+    _validate_checkpoint_structure(candidate)
+    _validate_stable_identity(current, candidate)
+    _validate_stable_history(current, candidate)
+    return _committed_event_suffix(current, candidate)
 
 
 def _validate_checkpoint_structure(snapshot: OperationSnapshot) -> None:
