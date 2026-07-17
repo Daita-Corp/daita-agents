@@ -13,8 +13,9 @@ from daita.db.context_projection import policy_summary_from_source
 from daita.db.llm_service import DbLLMConfig, DbLLMService
 from daita.db.loop import DbAgentLoop, SLIM_READ_OPERATION_NAMES
 from daita.db.models import DbRuntimeConfig, DbSourceOptions
-from daita.db.query_sql_validation import sql_fingerprint
+from daita.db.query_sql_validation import grounding_coverage_result, sql_fingerprint
 from daita.db.runtime import DbRuntime
+from daita.db.sql_analysis import analyze_sql
 from daita.db.verification import db_slim_readiness_check
 from daita.plugins.catalog import CatalogPlugin
 from daita.plugins.sqlite import SQLitePlugin
@@ -72,6 +73,26 @@ def _query_call(sql, *, params=None, param_specs=None, call_id="query-1"):
             }
         ]
     }
+
+
+_TICKET_SQL = """
+    CREATE TABLE customers (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL
+    );
+    CREATE TABLE support_tickets (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL REFERENCES customers(id),
+        severity TEXT NOT NULL,
+        status TEXT NOT NULL,
+        opened_at TEXT NOT NULL
+    );
+    INSERT INTO customers (id, name) VALUES (1, 'Ada'), (2, 'Linus');
+    INSERT INTO support_tickets
+        (id, customer_id, severity, status, opened_at) VALUES
+        (1, 1, 'high', 'open', '2026-01-07'),
+        (2, 2, 'high', 'closed', '2026-01-08');
+"""
 
 
 async def _runtime_for(
@@ -289,6 +310,296 @@ async def test_filtered_read_uses_typed_bound_parameters():
             {"ref": "tier", "native_type": "string"},
         ]
         assert execute.input["validated_evidence_id"]
+    finally:
+        await runtime.teardown()
+
+
+@pytest.mark.parametrize(
+    ("where_sql", "params"),
+    (
+        ("t.severity = 'high' AND t.status = 'open'", []),
+        ("t.severity = ? AND t.status = ?", ["high", "open"]),
+    ),
+)
+async def test_sqlite_exact_grounding_literal_or_parameter_executes(
+    monkeypatch, where_sql, params
+):
+    sql = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        f"WHERE {where_sql} ORDER BY c.name"
+    )
+    runtime, sqlite, provider = await _runtime_for(
+        [_query_call(sql, params=params), "Ada has an open high-severity ticket."],
+        setup_sql=_TICKET_SQL,
+    )
+    executed = []
+    original_query = sqlite.query
+
+    async def query_spy(query_sql, query_params=None):
+        executed.append((query_sql, list(query_params or ())))
+        return await original_query(query_sql, query_params)
+
+    monkeypatch.setattr(sqlite, "query", query_spy)
+    try:
+        result = await runtime.run(
+            "customer names for open high-severity support tickets"
+        )
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        validation = next(item for item in evidence if item.kind == "sql.validation")
+        coverage = validation.payload["grounding_coverage"]
+
+        assert result.status.value == "succeeded"
+        assert len(provider.calls) == 2
+        assert len(executed) == 1
+        assert [task.capability_id for task in tasks] == [
+            "db.sql.validate",
+            "db.sql.execute_read",
+        ]
+        assert coverage["advisory"] == []
+        assert coverage["status"] == "covered", coverage
+        assert coverage["applicable_count"] == 2
+        assert {item["target"] for item in coverage["covered"]} == {
+            "support_tickets.severity",
+            "support_tickets.status",
+        }
+    finally:
+        await runtime.teardown()
+
+
+async def test_sqlite_missing_status_grounding_rejects_opened_at_before_io(monkeypatch):
+    sql = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        "WHERE t.severity = 'high' AND t.opened_at IS NOT NULL"
+    )
+    runtime, sqlite, provider = await _runtime_for(
+        [
+            _query_call(sql),
+            "CLARIFY: I could not safely represent the open-ticket constraint.",
+        ],
+        setup_sql=_TICKET_SQL,
+    )
+    executed = []
+    original_query = sqlite.query
+
+    async def query_spy(query_sql, query_params=None):
+        executed.append(query_sql)
+        return await original_query(query_sql, query_params)
+
+    monkeypatch.setattr(sqlite, "query", query_spy)
+    try:
+        result = await runtime.run(
+            "customer names for open high-severity support tickets"
+        )
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        validation = next(item for item in evidence if item.kind == "sql.validation")
+        coverage = validation.payload["grounding_coverage"]
+        tool_observation = next(
+            message["content"]
+            for message in provider.calls[1]["messages"]
+            if message.get("role") == "tool"
+        )
+
+        assert result.status.value == "blocked"
+        assert executed == []
+        assert [task.capability_id for task in tasks] == ["db.sql.validate"]
+        assert not any(item.kind == "query.result" for item in evidence)
+        assert coverage["status"] == "missing"
+        assert coverage["missing"] == [
+            {
+                "grounding_id": coverage["missing"][0]["grounding_id"],
+                "target": "support_tickets.status",
+                "value": "open",
+                "status": "missing",
+            }
+        ]
+        assert "support_tickets.status" in tool_observation
+        assert "opened_at" not in str(coverage["covered"])
+    finally:
+        await runtime.teardown()
+
+
+async def test_sqlite_conflicting_grounding_rejects_before_io(monkeypatch):
+    sql = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        "WHERE t.severity = 'high' AND t.status = 'closed'"
+    )
+    runtime, sqlite, provider = await _runtime_for(
+        [_query_call(sql), "CLARIFY: The requested ticket status conflicts."],
+        setup_sql=_TICKET_SQL,
+    )
+    executed = []
+    original_query = sqlite.query
+
+    async def query_spy(query_sql, query_params=None):
+        executed.append(query_sql)
+        return await original_query(query_sql, query_params)
+
+    monkeypatch.setattr(sqlite, "query", query_spy)
+    try:
+        result = await runtime.run(
+            "customer names for open high-severity support tickets"
+        )
+        _tasks, evidence = await _operation_state(runtime, result.operation_id)
+        coverage = next(
+            item.payload["grounding_coverage"]
+            for item in evidence
+            if item.kind == "sql.validation"
+        )
+
+        assert result.status.value == "blocked"
+        assert executed == []
+        assert coverage["status"] == "conflicting"
+        assert coverage["conflicting"][0]["target"] == "support_tickets.status"
+    finally:
+        await runtime.teardown()
+
+
+@pytest.mark.parametrize(
+    ("status_predicate", "expected_status"),
+    (
+        ("NOT t.status = 'open'", "conflicting"),
+        ("(t.status = 'open' OR t.opened_at IS NOT NULL)", "missing"),
+    ),
+)
+async def test_sqlite_weakened_grounding_predicate_rejects_before_io(
+    monkeypatch, status_predicate, expected_status
+):
+    sql = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        f"WHERE t.severity = 'high' AND {status_predicate}"
+    )
+    runtime, sqlite, _provider = await _runtime_for(
+        [_query_call(sql), "CLARIFY: The open-ticket constraint is not safe."],
+        setup_sql=_TICKET_SQL,
+    )
+    executed = []
+    original_query = sqlite.query
+
+    async def query_spy(query_sql, query_params=None):
+        executed.append(query_sql)
+        return await original_query(query_sql, query_params)
+
+    monkeypatch.setattr(sqlite, "query", query_spy)
+    try:
+        result = await runtime.run(
+            "customer names for open high-severity support tickets"
+        )
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        coverage = next(
+            item.payload["grounding_coverage"]
+            for item in evidence
+            if item.kind == "sql.validation"
+        )
+
+        assert result.status.value == "blocked"
+        assert executed == []
+        assert [task.capability_id for task in tasks] == ["db.sql.validate"]
+        assert coverage["status"] == expected_status
+        assert not any(item.kind == "query.result" for item in evidence)
+    finally:
+        await runtime.teardown()
+
+
+async def test_sqlite_grounding_repair_uses_existing_single_repair(monkeypatch):
+    missing = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        "WHERE t.severity = 'high' AND t.opened_at IS NOT NULL"
+    )
+    repaired = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        "WHERE t.severity = 'high' AND t.status = 'open'"
+    )
+    runtime, sqlite, provider = await _runtime_for(
+        [
+            _query_call(missing, call_id="missing-grounding"),
+            _query_call(repaired, call_id="repaired-grounding"),
+            "Ada has an open high-severity ticket.",
+        ],
+        setup_sql=_TICKET_SQL,
+    )
+    executed = []
+    original_query = sqlite.query
+
+    async def query_spy(query_sql, query_params=None):
+        executed.append(query_sql)
+        return await original_query(query_sql, query_params)
+
+    monkeypatch.setattr(sqlite, "query", query_spy)
+    try:
+        result = await runtime.run(
+            "customer names for open high-severity support tickets"
+        )
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        coverages = [
+            item.payload["grounding_coverage"]
+            for item in evidence
+            if item.kind == "sql.validation"
+        ]
+
+        assert result.status.value == "succeeded"
+        assert len(provider.calls) == 3
+        assert result.telemetry["llm_calls"] == 3
+        assert len(executed) == 1
+        assert [task.capability_id for task in tasks] == [
+            "db.sql.validate",
+            "db.sql.validate",
+            "db.sql.execute_read",
+        ]
+        assert [coverage["status"] for coverage in coverages] == [
+            "missing",
+            "covered",
+        ]
+    finally:
+        await runtime.teardown()
+
+
+async def test_sqlite_repeated_missing_grounding_stops_within_budget(monkeypatch):
+    first = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        "WHERE t.severity = 'high' AND t.opened_at IS NOT NULL"
+    )
+    second = f"{first} ORDER BY c.name"
+    runtime, sqlite, provider = await _runtime_for(
+        [
+            _query_call(first, call_id="missing-one"),
+            _query_call(second, call_id="missing-two"),
+        ],
+        setup_sql=_TICKET_SQL,
+    )
+    executed = []
+    original_query = sqlite.query
+
+    async def query_spy(query_sql, query_params=None):
+        executed.append(query_sql)
+        return await original_query(query_sql, query_params)
+
+    monkeypatch.setattr(sqlite, "query", query_spy)
+    try:
+        result = await runtime.run(
+            "customer names for open high-severity support tickets"
+        )
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+
+        assert result.status.value == "failed"
+        assert len(provider.calls) == 2
+        assert executed == []
+        assert [task.capability_id for task in tasks] == [
+            "db.sql.validate",
+            "db.sql.validate",
+        ]
+        assert [
+            item.payload["grounding_coverage"]["status"]
+            for item in evidence
+            if item.kind == "sql.validation"
+        ] == ["missing", "missing"]
+        assert not any(item.kind == "query.result" for item in evidence)
     finally:
         await runtime.teardown()
 
@@ -915,6 +1226,199 @@ async def test_relationship_and_literal_operations_are_single_catalog_tasks():
         } & {task.capability_id for task in tasks}
     finally:
         await runtime.teardown()
+
+
+async def test_competing_exact_catalog_mappings_remain_advisory():
+    runtime, _sqlite, provider = await _runtime_for(
+        [
+            _query_call("SELECT id FROM support_tickets ORDER BY id"),
+            "Ticket 1 is available.",
+        ],
+        setup_sql="""
+            CREATE TABLE support_tickets (
+                id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                lifecycle_stage TEXT NOT NULL
+            );
+            INSERT INTO support_tickets (id, status, lifecycle_stage)
+            VALUES (1, 'open', 'open');
+        """,
+    )
+    try:
+        result = await runtime.run("show open tickets")
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        validation = next(item for item in evidence if item.kind == "sql.validation")
+        coverage = validation.payload["grounding_coverage"]
+        snapshot = await runtime.inspect_operation(result.operation_id)
+        projected = next(
+            event.payload["slim_catalog_projection"]["projection"]
+            for event in snapshot.events
+            if event.payload.get("slim_catalog_projection")
+        )
+
+        assert result.status.value == "succeeded"
+        assert len(provider.calls) == 2
+        assert [task.capability_id for task in tasks] == [
+            "db.sql.validate",
+            "db.sql.execute_read",
+        ]
+        assert coverage["status"] == "advisory"
+        assert coverage["applicable_count"] == 0
+        assert {item["reason"] for item in coverage["advisory"]} == {"ambiguous"}
+        assert {item["status"] for item in projected.get("value_groundings", ())} == {
+            "advisory"
+        }
+    finally:
+        await runtime.teardown()
+
+
+async def test_competing_exact_values_for_same_column_remain_advisory():
+    runtime, _sqlite, provider = await _runtime_for(
+        [
+            _query_call("SELECT id, status FROM support_tickets ORDER BY id"),
+            "Tickets 1 and 2 are available.",
+        ],
+        setup_sql="""
+            CREATE TABLE support_tickets (
+                id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL
+            );
+            INSERT INTO support_tickets (id, status)
+            VALUES (1, 'open'), (2, 'closed');
+        """,
+    )
+    try:
+        result = await runtime.run("show open or closed tickets")
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        validation = next(item for item in evidence if item.kind == "sql.validation")
+        coverage = validation.payload["grounding_coverage"]
+
+        assert result.status.value == "succeeded"
+        assert len(provider.calls) == 2
+        assert [task.capability_id for task in tasks] == [
+            "db.sql.validate",
+            "db.sql.execute_read",
+        ]
+        assert coverage["status"] == "advisory"
+        assert coverage["applicable_count"] == 0
+        assert len(coverage["advisory"]) == 2
+        assert {item["reason"] for item in coverage["advisory"]} == {"ambiguous"}
+    finally:
+        await runtime.teardown()
+
+
+async def test_temporal_wording_does_not_require_lifecycle_predicate():
+    runtime, _sqlite, provider = await _runtime_for(
+        [
+            _query_call(
+                "SELECT id FROM support_tickets WHERE opened_at IS NOT NULL ORDER BY id"
+            ),
+            "Ticket 1 has an opening timestamp.",
+        ],
+        setup_sql="""
+            CREATE TABLE support_tickets (
+                id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL,
+                opened_at TEXT NOT NULL
+            );
+            INSERT INTO support_tickets (id, status, opened_at)
+            VALUES (1, 'open', '2026-01-07');
+        """,
+    )
+    try:
+        result = await runtime.run("show tickets opened recently")
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        coverage = next(
+            item.payload["grounding_coverage"]
+            for item in evidence
+            if item.kind == "sql.validation"
+        )
+
+        assert result.status.value == "succeeded"
+        assert len(provider.calls) == 2
+        assert [task.capability_id for task in tasks] == [
+            "db.sql.validate",
+            "db.sql.execute_read",
+        ]
+        assert coverage["status"] == "advisory"
+        assert coverage["applicable_count"] == 0
+        assert {item["reason"] for item in coverage["advisory"]} == {"not_exact"}
+    finally:
+        await runtime.teardown()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    (
+        ({"fresh": False}, "stale_or_unverified"),
+        ({"match_kind": "lexical_stem_match", "confidence": 0.82}, "not_exact"),
+        ({"sampled": True}, "ineligible_profile"),
+        ({"truncated": True}, "ineligible_profile"),
+        ({"redacted": True}, "ineligible_profile"),
+        ({"blocked": True}, "ineligible_profile"),
+        ({"policy_eligible": False}, "policy_ineligible"),
+        ({"source_owner": "other"}, "source_mismatch"),
+        ({"catalog_revision": "old"}, "revision_mismatch"),
+    ),
+)
+def test_ineligible_grounding_facts_are_advisory_and_do_not_leak(
+    mutation, expected_reason
+):
+    grounding = {
+        "grounding_id": "safe-grounding-id",
+        "status": "enforceable",
+        "reason": "enforceable",
+        "table": "blocked_table",
+        "column": "blocked_field",
+        "value": "blocked_value",
+        "match_kind": "exact_match",
+        "confidence": 1.0,
+        "fresh": True,
+        "policy_eligible": True,
+        "unambiguous": True,
+        "profile_status": "profiled",
+        "sampled": False,
+        "truncated": False,
+        "redacted": False,
+        "blocked": False,
+        "value_freshness": "fresh",
+        "source_fingerprint_status": "authoritative",
+        "source_owner": "sqlite",
+        "source_revision": "source-v1",
+        "catalog_revision": "catalog-v1",
+        "schema_fingerprint": "schema-v1",
+    }
+    grounding.update(mutation)
+    analysis = analyze_sql("SELECT id FROM visible_table", dialect="sqlite")
+    coverage = grounding_coverage_result(
+        analysis,
+        groundings=[grounding],
+        schema={
+            "tables": [],
+            "_catalog": {
+                "source_owner": "sqlite",
+                "freshness": "fresh",
+                "source_revision": "source-v1",
+                "revision_status": "authoritative",
+                "catalog_revision": "catalog-v1",
+                "schema_fingerprint": "schema-v1",
+            },
+        },
+        source_owner="sqlite",
+    )
+
+    assert coverage["status"] == "advisory"
+    assert coverage["valid"] is True
+    assert coverage["advisory"] == [
+        {
+            "grounding_id": "safe-grounding-id",
+            "status": "advisory",
+            "reason": expected_reason,
+        }
+    ]
+    assert "blocked_table" not in str(coverage)
+    assert "blocked_field" not in str(coverage)
+    assert "blocked_value" not in str(coverage)
 
 
 async def test_catalog_context_and_observations_are_hard_bounded_and_runtime_bound():

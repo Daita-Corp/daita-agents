@@ -5,7 +5,8 @@ from __future__ import annotations
 import difflib
 import hashlib
 import re
-from typing import Any
+from decimal import Decimal, InvalidOperation
+from typing import Any, Mapping
 
 from daita.db.query_metadata import (
     normalize_identifier,
@@ -27,6 +28,9 @@ def validate_sql_against_schema(
     *,
     dialect: str = "",
     analysis: SqlAnalysis | None = None,
+    params: list[Any] | tuple[Any, ...] = (),
+    groundings: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...] = (),
+    source_owner: str = "",
     validator_tool: str = DB_VALIDATE_SQL_TOOL_VIEW,
     catalog_search_tool: str = CATALOG_SEARCH_TOOL_VIEW,
     catalog_inspect_tool: str = CATALOG_INSPECT_TOOL_VIEW,
@@ -55,18 +59,36 @@ def validate_sql_against_schema(
             )
 
     table_columns = schema_table_columns(schema)
-    if not table_columns:
-        return {
-            "ok": True,
-            "sql_fingerprint": sql_fingerprint(sql),
-            "statement_facts": sql_statement_facts(sql, analysis),
-        }
-
-    unknown_tables = _unknown_tables(analysis, table_columns)
-    missing_columns = _missing_columns(analysis, table_columns)
+    unknown_tables = (
+        _unknown_tables(analysis, table_columns) if table_columns else set()
+    )
+    missing_columns = _missing_columns(analysis, table_columns) if table_columns else []
 
     if not unknown_tables and not missing_columns:
-        return _validation_ok(sql, analysis)
+        coverage = grounding_coverage_result(
+            analysis,
+            params=params,
+            groundings=groundings,
+            schema=schema,
+            source_owner=source_owner,
+        )
+        if coverage["valid"] is not True:
+            return {
+                "error": "SQL omits or conflicts with accepted catalog grounding.",
+                "error_type": "grounding_coverage_error",
+                "repair_required": True,
+                "preflight_failed": True,
+                "sql_fingerprint": sql_fingerprint(sql),
+                "statement_facts": sql_statement_facts(sql, analysis),
+                "grounding_coverage": coverage,
+                "suggested_next_tool": execution_tool,
+                "do_not_retry_same_sql": True,
+                "guidance": (
+                    "Revise the SQL so every enforceable grounding is represented "
+                    "by an exact predicate and literal or bound parameter."
+                ),
+            }
+        return _validation_ok(sql, analysis, grounding_coverage=coverage)
 
     inspect_tables = _tables_to_inspect(unknown_tables, missing_columns)
     return {
@@ -95,6 +117,102 @@ def validate_sql_against_schema(
             f"ambiguity, then call {validator_tool} or {execution_tool} with "
             "corrected SQL."
         ),
+    }
+
+
+def grounding_coverage_result(
+    analysis: SqlAnalysis,
+    *,
+    params: list[Any] | tuple[Any, ...] = (),
+    groundings: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...] = (),
+    schema: Mapping[str, Any] | None = None,
+    source_owner: str = "",
+) -> dict[str, Any]:
+    """Compare accepted catalog groundings with parsed SQL predicate values."""
+
+    schema = schema if isinstance(schema, Mapping) else {}
+    catalog_facts = schema.get("_catalog")
+    catalog_facts = catalog_facts if isinstance(catalog_facts, Mapping) else {}
+    predicates = _resolved_value_predicates(analysis, params)
+    covered: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    conflicting: list[dict[str, Any]] = []
+    advisory: list[dict[str, Any]] = []
+
+    for raw in list(groundings or ())[:12]:
+        grounding = dict(raw) if isinstance(raw, Mapping) else {}
+        reason = _grounding_advisory_reason(
+            grounding,
+            catalog_facts=catalog_facts,
+            source_owner=source_owner,
+        )
+        grounding_id = str(grounding.get("grounding_id") or "")[:80]
+        if reason:
+            advisory.append(
+                {
+                    "grounding_id": grounding_id,
+                    "status": "advisory",
+                    "reason": reason,
+                }
+            )
+            continue
+
+        table = str(grounding.get("table") or "")
+        column = str(grounding.get("column") or "")
+        expected = grounding.get("value")
+        applicable = [
+            predicate
+            for predicate in predicates
+            if _predicate_targets_grounding(
+                predicate,
+                table=table,
+                column=column,
+                analysis=analysis,
+                schema=schema,
+            )
+        ]
+        item = {
+            "grounding_id": grounding_id,
+            "target": f"{table}.{column}",
+            "value": expected,
+        }
+        exact_match = any(
+            _predicate_exactly_covers(predicate, expected) for predicate in applicable
+        )
+        conflicts = [
+            predicate
+            for predicate in applicable
+            if _predicate_conflicts(predicate, expected)
+        ]
+        if conflicts:
+            conflicting.append(
+                {
+                    **item,
+                    "status": "conflicting",
+                    "predicate_operators": sorted(
+                        {str(predicate["operator"]) for predicate in conflicts}
+                    )[:4],
+                }
+            )
+        elif exact_match:
+            covered.append({**item, "status": "covered"})
+        else:
+            missing.append({**item, "status": "missing"})
+
+    status = (
+        "conflicting"
+        if conflicting
+        else "missing" if missing else "covered" if covered else "advisory"
+    )
+    return {
+        "status": status,
+        "valid": not missing and not conflicting,
+        "applicable_count": len(covered) + len(missing) + len(conflicting),
+        "predicate_count": len(predicates),
+        "covered": covered,
+        "missing": missing,
+        "conflicting": conflicting,
+        "advisory": advisory,
     }
 
 
@@ -142,8 +260,13 @@ def sql_statement_facts(
     }
 
 
-def _validation_ok(sql: str, analysis: SqlAnalysis) -> dict[str, Any]:
-    return {
+def _validation_ok(
+    sql: str,
+    analysis: SqlAnalysis,
+    *,
+    grounding_coverage: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = {
         "ok": True,
         "sql_fingerprint": sql_fingerprint(sql),
         "statement_facts": sql_statement_facts(sql, analysis),
@@ -153,6 +276,201 @@ def _validation_ok(sql: str, analysis: SqlAnalysis) -> dict[str, Any]:
         "referenced_columns": sorted(analysis.referenced_column_names),
         "selected_columns": _selected_output_columns(analysis),
     }
+    if grounding_coverage is not None:
+        result["grounding_coverage"] = dict(grounding_coverage)
+    return result
+
+
+def _resolved_value_predicates(
+    analysis: SqlAnalysis,
+    params: list[Any] | tuple[Any, ...],
+) -> list[dict[str, Any]]:
+    predicates: list[dict[str, Any]] = []
+    for predicate in analysis.literal_predicates:
+        predicates.append(
+            {
+                "table": predicate.column.qualifier_key,
+                "column": predicate.column.key,
+                "operator": predicate.operator,
+                "values": [
+                    _typed_sql_literal(value, kind)
+                    for value, kind in zip(
+                        predicate.values,
+                        predicate.value_kinds,
+                    )
+                ],
+                "resolved": True,
+                "negated": predicate.negated,
+                "disjunctive": predicate.disjunctive,
+            }
+        )
+    for predicate in analysis.parameter_predicates:
+        values: list[Any] = [
+            _typed_sql_literal(value, kind)
+            for value, kind in zip(
+                predicate.literal_values,
+                predicate.literal_value_kinds,
+            )
+        ]
+        resolved = True
+        for index in predicate.parameter_indexes:
+            if index < 0 or index >= len(params):
+                resolved = False
+                continue
+            values.append(params[index])
+        predicates.append(
+            {
+                "table": predicate.column.qualifier_key,
+                "column": predicate.column.key,
+                "operator": predicate.operator,
+                "values": values,
+                "resolved": resolved,
+                "negated": predicate.negated,
+                "disjunctive": predicate.disjunctive,
+            }
+        )
+    return predicates
+
+
+def _typed_sql_literal(value: str, kind: str) -> Any:
+    if kind != "number":
+        return value
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation:
+        return value
+    if parsed == parsed.to_integral_value():
+        return int(parsed)
+    return float(parsed)
+
+
+def _grounding_advisory_reason(
+    grounding: Mapping[str, Any],
+    *,
+    catalog_facts: Mapping[str, Any],
+    source_owner: str,
+) -> str:
+    declared_reason = str(grounding.get("reason") or "")
+    if grounding.get("status") != "enforceable":
+        return declared_reason or "not_enforceable"
+    if grounding.get("policy_eligible") is not True:
+        return "policy_ineligible"
+    if grounding.get("unambiguous") is not True:
+        return "ambiguous"
+    if (
+        grounding.get("match_kind") != "exact_match"
+        or grounding.get("confidence") != 1.0
+    ):
+        return "not_exact"
+    if (
+        grounding.get("fresh") is not True
+        or grounding.get("value_freshness") != "fresh"
+        or grounding.get("profile_status") != "profiled"
+        or grounding.get("source_fingerprint_status")
+        not in {"authoritative", "best_effort"}
+    ):
+        return "stale_or_unverified"
+    if any(
+        bool(grounding.get(key))
+        for key in ("sampled", "truncated", "redacted", "blocked")
+    ):
+        return "ineligible_profile"
+    current_owner = str(source_owner or catalog_facts.get("source_owner") or "")
+    if not current_owner or grounding.get("source_owner") != current_owner:
+        return "source_mismatch"
+    if catalog_facts.get("freshness") != "fresh":
+        return "catalog_not_fresh"
+    if catalog_facts.get("revision_status") != "authoritative":
+        return "catalog_revision_unverified"
+    for key in ("source_revision", "catalog_revision", "schema_fingerprint"):
+        expected = catalog_facts.get(key)
+        actual = grounding.get(key)
+        if not expected or not actual or str(actual) != str(expected):
+            return "revision_mismatch"
+    value = grounding.get("value")
+    if isinstance(value, str) and (not value or len(value) > 128):
+        return "value_not_exactly_comparable"
+    if value is None or not isinstance(value, (str, int, float, bool)):
+        return "value_not_exactly_comparable"
+    if not str(grounding.get("table") or "") or not str(grounding.get("column") or ""):
+        return "target_unavailable"
+    return ""
+
+
+def _predicate_targets_grounding(
+    predicate: Mapping[str, Any],
+    *,
+    table: str,
+    column: str,
+    analysis: SqlAnalysis,
+    schema: Mapping[str, Any],
+) -> bool:
+    if str(predicate.get("column") or "").lower() != column.lower():
+        return False
+    predicate_table = str(predicate.get("table") or "").lower()
+    if predicate_table:
+        return _table_refs_match(predicate_table, table)
+
+    table_columns = schema_table_columns(dict(schema))
+    matching_tables = []
+    for table_ref in analysis.tables:
+        if table_ref.is_cte:
+            continue
+        known_key = _known_table_key(table_ref.key, table_columns)
+        if known_key and column.lower() in table_columns.get(known_key, set()):
+            matching_tables.append(table_ref.key)
+    return len(set(matching_tables)) == 1 and _table_refs_match(
+        matching_tables[0], table
+    )
+
+
+def _table_refs_match(left: str, right: str) -> bool:
+    left_key = normalize_identifier(left)
+    right_key = normalize_identifier(right)
+    return left_key == right_key or left_key.split(".")[-1] == right_key.split(".")[-1]
+
+
+def _predicate_exactly_covers(predicate: Mapping[str, Any], expected: Any) -> bool:
+    if (
+        predicate.get("resolved") is not True
+        or predicate.get("negated") is True
+        or predicate.get("disjunctive") is True
+    ):
+        return False
+    operator = str(predicate.get("operator") or "").lower()
+    values = list(predicate.get("values") or ())
+    return (
+        operator in {"=", "in"}
+        and len(values) == 1
+        and _values_equal(values[0], expected)
+    )
+
+
+def _predicate_conflicts(predicate: Mapping[str, Any], expected: Any) -> bool:
+    if predicate.get("resolved") is not True:
+        return False
+    operator = str(predicate.get("operator") or "").lower()
+    values = list(predicate.get("values") or ())
+    if predicate.get("negated") is True:
+        return operator in {"=", "in"} and any(
+            _values_equal(value, expected) for value in values
+        )
+    if operator in {"=", "in"} and values:
+        return len(values) != 1 or not _values_equal(values[0], expected)
+    if operator == "!=":
+        return any(_values_equal(value, expected) for value in values)
+    return False
+
+
+def _values_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        try:
+            return Decimal(str(left)) == Decimal(str(right))
+        except InvalidOperation:
+            return False
+    return type(left) is type(right) and left == right
 
 
 def _selected_output_columns(analysis: SqlAnalysis) -> list[str]:

@@ -75,7 +75,7 @@ async def _runtime_for(responses):
         return None
 
     async def tables():
-        return ["customers", "orders"]
+        return ["customers", "orders", "support_tickets"]
 
     async def describe(table):
         columns = {
@@ -89,6 +89,13 @@ async def _runtime_for(responses):
                 ("customer_id", "integer", False, False),
                 ("status", "text", False, False),
                 ("total", "numeric", False, False),
+            ],
+            "support_tickets": [
+                ("id", "integer", False, True),
+                ("customer_id", "integer", False, False),
+                ("severity", "text", False, False),
+                ("status", "text", False, False),
+                ("opened_at", "date", False, False),
             ],
         }
         return [
@@ -109,7 +116,13 @@ async def _runtime_for(responses):
                 "source_column": "customer_id",
                 "target_table": "customers",
                 "target_column": "id",
-            }
+            },
+            {
+                "source_table": "support_tickets",
+                "source_column": "customer_id",
+                "target_table": "customers",
+                "target_column": "id",
+            },
         ]
 
     async def source_revision():
@@ -124,6 +137,8 @@ async def _runtime_for(responses):
         normalized = " ".join(sql.lower().split())
         if "sum(o.total)" in normalized:
             return [{"name": "Ada", "total": 42}]
+        if "support_tickets" in normalized:
+            return [{"name": "Ada"}]
         if "where region = $1" in normalized:
             return [{"name": "Ada"}]
         if "count(*)" in normalized:
@@ -173,6 +188,52 @@ async def _runtime_for(responses):
     )
     await runtime.setup(agent_id="postgresql-slim-test")
     return runtime, catalog, postgres, provider, executed
+
+
+async def _register_ticket_groundings(catalog):
+    state = catalog.runtime_source_state()
+    await catalog.register_column_value_profiles(
+        "from_db:postgresql-slim-test",
+        [
+            {
+                "table": "support_tickets",
+                "column": "severity",
+                "distinct_count": 3,
+                "top_values": [
+                    {"value": "high", "count": 2},
+                    {"value": "medium", "count": 1},
+                    {"value": "low", "count": 1},
+                ],
+                "profile_status": "profiled",
+                "sampled": False,
+                "redacted": False,
+                "truncated": False,
+                "profiled_at": datetime.now(timezone.utc).isoformat(),
+                "source_fingerprint": "support-ticket-severity-v1",
+                "source_fingerprint_status": "authoritative",
+                "source_revision": state["source_revision"],
+                "policy": {"policy_owner": "postgresql"},
+            },
+            {
+                "table": "support_tickets",
+                "column": "status",
+                "distinct_count": 2,
+                "top_values": [
+                    {"value": "open", "count": 2},
+                    {"value": "closed", "count": 1},
+                ],
+                "profile_status": "profiled",
+                "sampled": False,
+                "redacted": False,
+                "truncated": False,
+                "profiled_at": datetime.now(timezone.utc).isoformat(),
+                "source_fingerprint": "support-ticket-status-v1",
+                "source_fingerprint_status": "authoritative",
+                "source_revision": state["source_revision"],
+                "policy": {"policy_owner": "postgresql"},
+            },
+        ],
+    )
 
 
 async def _operation_state(runtime, operation_id):
@@ -281,6 +342,112 @@ async def test_postgresql_filter_uses_dialect_placeholders_and_typed_params():
             {"ref": "region", "native_type": "string"}
         ]
         assert executed[0][1] == ["NA"]
+    finally:
+        await runtime.teardown()
+
+
+@pytest.mark.parametrize(
+    ("where_sql", "params"),
+    (
+        ("t.severity = 'high' AND t.status = 'open'", []),
+        ("t.severity = $1 AND t.status = $2", ["high", "open"]),
+    ),
+)
+async def test_postgresql_exact_grounding_literal_or_parameter_executes(
+    where_sql, params
+):
+    sql = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        f"WHERE {where_sql} ORDER BY c.name"
+    )
+    runtime, catalog, _postgres, provider, executed = await _runtime_for(
+        [_query_call(sql, params=params), "Ada has an open high-severity ticket."]
+    )
+    await _register_ticket_groundings(catalog)
+    try:
+        result = await runtime.run(
+            "customer names for open high-severity support tickets"
+        )
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        validation = next(item for item in evidence if item.kind == "sql.validation")
+        coverage = validation.payload["grounding_coverage"]
+
+        assert result.status.value == "succeeded"
+        assert len(provider.calls) == 2
+        assert len(executed) == 1
+        assert [task.capability_id for task in tasks] == [
+            "db.sql.validate",
+            "db.sql.execute_read",
+        ]
+        assert coverage["status"] == "covered"
+        assert coverage["applicable_count"] == 2
+        assert {item["target"] for item in coverage["covered"]} == {
+            "support_tickets.severity",
+            "support_tickets.status",
+        }
+    finally:
+        await runtime.teardown()
+
+
+async def test_postgresql_missing_status_rejects_opened_at_before_io():
+    sql = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        "WHERE t.severity = 'high' AND t.opened_at IS NOT NULL"
+    )
+    runtime, catalog, _postgres, provider, executed = await _runtime_for(
+        [
+            _query_call(sql),
+            "CLARIFY: I could not safely represent the open-ticket constraint.",
+        ]
+    )
+    await _register_ticket_groundings(catalog)
+    try:
+        result = await runtime.run(
+            "customer names for open high-severity support tickets"
+        )
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        validation = next(item for item in evidence if item.kind == "sql.validation")
+        coverage = validation.payload["grounding_coverage"]
+
+        assert result.status.value == "blocked"
+        assert len(provider.calls) == 2
+        assert executed == []
+        assert [task.capability_id for task in tasks] == ["db.sql.validate"]
+        assert coverage["status"] == "missing"
+        assert coverage["missing"][0]["target"] == "support_tickets.status"
+        assert not any(item.kind == "query.result" for item in evidence)
+    finally:
+        await runtime.teardown()
+
+
+async def test_postgresql_conflicting_grounding_rejects_before_io():
+    sql = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        "WHERE t.severity = 'high' AND t.status = 'closed'"
+    )
+    runtime, catalog, _postgres, _provider, executed = await _runtime_for(
+        [_query_call(sql), "CLARIFY: The requested status conflicts."]
+    )
+    await _register_ticket_groundings(catalog)
+    try:
+        result = await runtime.run(
+            "customer names for open high-severity support tickets"
+        )
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+        coverage = next(
+            item.payload["grounding_coverage"]
+            for item in evidence
+            if item.kind == "sql.validation"
+        )
+
+        assert result.status.value == "blocked"
+        assert executed == []
+        assert [task.capability_id for task in tasks] == ["db.sql.validate"]
+        assert coverage["status"] == "conflicting"
+        assert coverage["conflicting"][0]["target"] == "support_tickets.status"
     finally:
         await runtime.teardown()
 
@@ -482,6 +649,86 @@ async def test_postgresql_invalid_sql_repairs_once_before_connector_io():
             "db.sql.execute_read",
         ]
         assert [item.kind for item in evidence].count("query.result") == 1
+    finally:
+        await runtime.teardown()
+
+
+async def test_postgresql_grounding_repair_succeeds_once():
+    missing = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        "WHERE t.severity = 'high' AND t.opened_at IS NOT NULL"
+    )
+    repaired = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        "WHERE t.severity = 'high' AND t.status = 'open'"
+    )
+    runtime, catalog, _postgres, provider, executed = await _runtime_for(
+        [
+            _query_call(missing, call_id="missing-grounding"),
+            _query_call(repaired, call_id="repaired-grounding"),
+            "Ada has an open high-severity ticket.",
+        ]
+    )
+    await _register_ticket_groundings(catalog)
+    try:
+        result = await runtime.run(
+            "customer names for open high-severity support tickets"
+        )
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+
+        assert result.status.value == "succeeded"
+        assert len(provider.calls) == 3
+        assert result.telemetry["llm_calls"] == 3
+        assert len(executed) == 1
+        assert [task.capability_id for task in tasks] == [
+            "db.sql.validate",
+            "db.sql.validate",
+            "db.sql.execute_read",
+        ]
+        assert [
+            item.payload["grounding_coverage"]["status"]
+            for item in evidence
+            if item.kind == "sql.validation"
+        ] == ["missing", "covered"]
+    finally:
+        await runtime.teardown()
+
+
+async def test_postgresql_repeated_missing_grounding_stops_within_budget():
+    first = (
+        "SELECT c.name FROM support_tickets t "
+        "JOIN customers c ON c.id = t.customer_id "
+        "WHERE t.severity = 'high' AND t.opened_at IS NOT NULL"
+    )
+    second = f"{first} ORDER BY c.name"
+    runtime, catalog, _postgres, provider, executed = await _runtime_for(
+        [
+            _query_call(first, call_id="missing-one"),
+            _query_call(second, call_id="missing-two"),
+        ]
+    )
+    await _register_ticket_groundings(catalog)
+    try:
+        result = await runtime.run(
+            "customer names for open high-severity support tickets"
+        )
+        tasks, evidence = await _operation_state(runtime, result.operation_id)
+
+        assert result.status.value == "failed"
+        assert len(provider.calls) == 2
+        assert executed == []
+        assert [task.capability_id for task in tasks] == [
+            "db.sql.validate",
+            "db.sql.validate",
+        ]
+        assert [
+            item.payload["grounding_coverage"]["status"]
+            for item in evidence
+            if item.kind == "sql.validation"
+        ] == ["missing", "missing"]
+        assert not any(item.kind == "query.result" for item in evidence)
     finally:
         await runtime.teardown()
 

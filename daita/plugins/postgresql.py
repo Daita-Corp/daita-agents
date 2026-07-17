@@ -313,8 +313,27 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
                 schema,
                 dialect="postgresql",
                 analysis=analysis,
+                params=list(args.get("params") or ()),
+                groundings=list(args.get("groundings") or ()),
+                source_owner=str(args.get("source_owner") or "postgresql"),
             )
             if preflight.get("ok") is not True:
+                if preflight.get("error_type") == "grounding_coverage_error":
+                    return {
+                        "valid": False,
+                        "sql": sql,
+                        "sql_fingerprint": sql_fingerprint(sql),
+                        "operation": operation,
+                        "statement_type": analysis.statement_type,
+                        "is_read": analysis.is_read,
+                        "has_limit": analysis.has_limit,
+                        "tables": [table.short_key for table in analysis.tables],
+                        "columns": sorted(analysis.referenced_column_names),
+                        "statement_facts": sql_statement_facts(sql, analysis),
+                        "grounding_coverage": dict(
+                            preflight.get("grounding_coverage") or {}
+                        ),
+                    }
                 safe_keys = {
                     "available_columns",
                     "available_tables",
@@ -346,6 +365,12 @@ class PostgreSQLPlugin(BaseDatabasePlugin):
             "tables": [table.short_key for table in analysis.tables],
             "columns": sorted(analysis.referenced_column_names),
             "statement_facts": sql_statement_facts(sql, analysis),
+            "grounding_coverage": dict(
+                (preflight if isinstance(schema, dict) else {}).get(
+                    "grounding_coverage"
+                )
+                or {}
+            ),
         }
 
     async def _execute_sql_read(self, payload: Any) -> Dict[str, Any]:

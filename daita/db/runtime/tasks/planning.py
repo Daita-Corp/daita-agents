@@ -217,6 +217,7 @@ async def plan_slim_operation(
     arguments: Mapping[str, Any],
     source_owner: str,
     attempt: int = 1,
+    groundings: Iterable[Mapping[str, Any]] = (),
 ) -> DbTaskPlan:
     """Plan the first stage of one closed Phase 2 operation recipe.
 
@@ -285,6 +286,9 @@ async def plan_slim_operation(
     sql = str(model_input["sql"]).strip()
     params = list(model_input["params"])
     param_specs = [dict(item) for item in model_input.get("param_specs") or ()]
+    grounding_facts = [
+        dict(item) for item in list(groundings or ())[:12] if isinstance(item, Mapping)
+    ]
     fingerprint = sql_fingerprint(sql)
     validation = context.registry.get_capability("db.sql.validate", owner=owner)
     schema = _runtime_validation_schema(
@@ -296,12 +300,16 @@ async def plan_slim_operation(
         "sql": sql,
         "operation": "query",
         "schema": schema,
+        "params": params,
+        "groundings": grounding_facts,
+        "source_owner": owner,
     }
     recipe_identity = persisted_fingerprint(
         {
             "sql_fingerprint": fingerprint,
             "params": params,
             "param_specs": param_specs,
+            "groundings": grounding_facts,
             "attempt": recipe_attempt,
         }
     )

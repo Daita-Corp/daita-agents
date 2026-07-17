@@ -360,7 +360,9 @@ class CatalogPlugin(DomainServicePlugin):
                 "source_revision": revision,
                 "revision_status": revision_facts.get("status"),
                 "revision_reason": revision_facts.get("reason"),
-                "schema_fingerprint": _schema_structure_fingerprint(normalized),
+                "schema_fingerprint": _schema_structure_fingerprint(
+                    NormalizedSchema.from_dict(normalized).to_dict()
+                ),
                 "refreshed_at": _utc_now(),
                 "value_profile_count": len(profiles),
             }
@@ -431,6 +433,12 @@ class CatalogPlugin(DomainServicePlugin):
             limit=MAX_RUNTIME_CONTEXT_ASSETS,
             **scope,
         )
+        value_hints = self.resolve_column_value_hints(
+            store_id,
+            str(prompt or ""),
+            limit=MAX_COLUMN_VALUE_HINTS,
+            **scope,
+        )
         assets = [
             _without_internal_catalog_ids(item)
             for item in list(search.get("tables") or ())
@@ -452,6 +460,11 @@ class CatalogPlugin(DomainServicePlugin):
             "query_terms": list(search.get("tokens") or ()),
             "total_matches": int(search.get("total_matches") or 0),
             "assets": assets,
+            "value_groundings": _runtime_value_grounding_projections(
+                value_hints,
+                state=state,
+                binding=binding,
+            ),
             "truncated": bool(search.get("truncated", False)),
             "truncation": {
                 "asset_limit": MAX_RUNTIME_CONTEXT_ASSETS,
@@ -476,6 +489,7 @@ class CatalogPlugin(DomainServicePlugin):
         binding = self._runtime_source_binding
         if binding is None:
             return {}
+        state = dict(self._runtime_source_state or {})
         schema = self._schema_dict_for_store(str(binding["store_id"]))
         if schema is None:
             return {}
@@ -485,6 +499,14 @@ class CatalogPlugin(DomainServicePlugin):
             "schema": schema.get("schema"),
             "tables": list(schema.get("tables") or ()),
             "foreign_keys": list(schema.get("foreign_keys") or ()),
+            "_catalog": {
+                "source_owner": str(binding.get("source_owner") or ""),
+                "freshness": state.get("freshness"),
+                "source_revision": state.get("source_revision"),
+                "revision_status": state.get("revision_status"),
+                "catalog_revision": state.get("catalog_revision"),
+                "schema_fingerprint": state.get("schema_fingerprint"),
+            },
         }
 
     def runtime_source_state(self) -> Dict[str, Any]:
@@ -1786,6 +1808,8 @@ class CatalogPlugin(DomainServicePlugin):
                     "source_fingerprint_reason": profile.get(
                         "source_fingerprint_reason"
                     ),
+                    "source_revision": profile.get("source_revision"),
+                    "policy": dict(profile.get("policy") or {}),
                 }
             )
 
@@ -1812,6 +1836,10 @@ class CatalogPlugin(DomainServicePlugin):
         tables: Optional[Iterable[str]] = None,
         columns: Optional[Iterable[str]] = None,
         limit: int = MAX_COLUMN_VALUE_HINTS,
+        allowed_tables: Optional[Iterable[str]] = None,
+        allowed_tables_restricted: bool = False,
+        blocked_tables: Optional[Iterable[str]] = None,
+        blocked_columns: Optional[Iterable[str]] = None,
     ) -> Dict[str, Any]:
         """Resolve prompt-scoped value hints from canonical profiles."""
         result = self.search_column_value_profiles(
@@ -1820,6 +1848,10 @@ class CatalogPlugin(DomainServicePlugin):
             tables=tables,
             columns=columns,
             limit=limit,
+            allowed_tables=allowed_tables,
+            allowed_tables_restricted=allowed_tables_restricted,
+            blocked_tables=blocked_tables,
+            blocked_columns=blocked_columns,
         )
         if not result.get("success"):
             return result
@@ -1847,13 +1879,17 @@ class CatalogPlugin(DomainServicePlugin):
                 "redacted": bool(profile.get("redacted", False)),
                 "stale": bool(profile.get("stale", False)),
                 "stale_reason": profile.get("stale_reason"),
+                "value_freshness": profile.get("value_freshness"),
                 "source_fingerprint": profile.get("source_fingerprint"),
                 "source_fingerprint_status": profile.get("source_fingerprint_status"),
                 "source_fingerprint_reason": profile.get("source_fingerprint_reason"),
+                "source_revision": profile.get("source_revision"),
+                "policy": dict(profile.get("policy") or {}),
             }
-            mapping = _candidate_value_mapping(tokens, top_values)
-            if mapping:
-                hint["candidate_mapping"] = mapping
+            mappings = _candidate_value_mappings(tokens, top_values)
+            if mappings:
+                hint["candidate_mapping"] = mappings[0]
+                hint["candidate_mappings"] = mappings
             hints.append(hint)
         return {
             "success": True,
@@ -2629,6 +2665,7 @@ def _runtime_value_profile_targets(
         "currency",
         "kind",
         "region",
+        "severity",
         "stage",
         "state",
         "status",
@@ -3373,7 +3410,15 @@ def _score_column_value_profile(
 def _candidate_value_mapping(
     tokens: List[str], values: List[Dict[str, Any]]
 ) -> Optional[Dict[str, Any]]:
-    best: tuple[float, str, Any, str] | None = None
+    mappings = _candidate_value_mappings(tokens, values)
+    return mappings[0] if mappings else None
+
+
+def _candidate_value_mappings(
+    tokens: List[str], values: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
     for token in tokens:
         for item in values:
             observed = item.get("value")
@@ -3388,17 +3433,189 @@ def _candidate_value_mapping(
             elif _lexical_value_match(token, observed_text):
                 confidence = 0.82
                 reason = "lexical_stem_match"
-            if confidence and (best is None or confidence > best[0]):
-                best = (confidence, token, observed, reason)
-    if best is None:
-        return None
-    confidence, token, observed, reason = best
-    return {
-        "prompt_term": token,
-        "closest_value": observed,
-        "confidence": confidence,
-        "reason": reason,
-    }
+            identity = (
+                token,
+                json.dumps(observed, sort_keys=True, default=str),
+                reason,
+            )
+            if not confidence or identity in seen:
+                continue
+            seen.add(identity)
+            candidates.append(
+                {
+                    "prompt_term": token,
+                    "closest_value": observed,
+                    "confidence": confidence,
+                    "reason": reason,
+                }
+            )
+    candidates.sort(key=lambda item: -float(item["confidence"]))
+    return candidates[:8]
+
+
+def _runtime_value_grounding_projections(
+    value_hints: Mapping[str, Any],
+    *,
+    state: Mapping[str, Any],
+    binding: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    """Project bounded catalog facts for SQL coverage without rewriting SQL."""
+
+    candidates: List[Dict[str, Any]] = []
+    for raw_hint in value_hints.get("hints", ()) or ():
+        if not isinstance(raw_hint, Mapping):
+            continue
+        table = str(raw_hint.get("table") or "")
+        column = str(raw_hint.get("column") or "")
+        if not table or not column:
+            continue
+        policy = raw_hint.get("policy")
+        policy = policy if isinstance(policy, Mapping) else {}
+        raw_mappings = raw_hint.get("candidate_mappings")
+        mappings = (
+            list(raw_mappings)
+            if isinstance(raw_mappings, list)
+            else [raw_hint.get("candidate_mapping")]
+        )
+        for mapping in mappings:
+            if not isinstance(mapping, Mapping):
+                continue
+            prompt_term = str(mapping.get("prompt_term") or "")
+            value = mapping.get("closest_value")
+            if not prompt_term or value is None:
+                continue
+            candidates.append(
+                {
+                    "table": table,
+                    "column": column,
+                    "prompt_term": prompt_term,
+                    "value": value,
+                    "match_kind": str(mapping.get("reason") or ""),
+                    "confidence": mapping.get("confidence"),
+                    "profile_status": raw_hint.get("profile_status"),
+                    "sampled": bool(raw_hint.get("sampled", False)),
+                    "truncated": bool(raw_hint.get("truncated", False)),
+                    "redacted": bool(raw_hint.get("redacted", False)),
+                    "value_freshness": raw_hint.get("value_freshness"),
+                    "source_fingerprint_status": raw_hint.get(
+                        "source_fingerprint_status"
+                    ),
+                    "source_revision": raw_hint.get("source_revision"),
+                    "policy_owner": policy.get("policy_owner"),
+                    "profile_key": policy.get("profile_key"),
+                    "schema_fingerprint": policy.get("schema_fingerprint"),
+                }
+            )
+
+    exact_term_targets: Dict[str, set[tuple[str, str, str]]] = {}
+    exact_target_values: Dict[tuple[str, str], set[str]] = {}
+    for candidate in candidates:
+        if candidate["match_kind"] != "exact_match" or candidate["confidence"] != 1.0:
+            continue
+        term = candidate["prompt_term"].lower()
+        target = (candidate["table"].lower(), candidate["column"].lower())
+        exact_term_targets.setdefault(term, set()).add(
+            (*target, json.dumps(candidate["value"], sort_keys=True, default=str))
+        )
+        exact_target_values.setdefault(target, set()).add(
+            json.dumps(candidate["value"], sort_keys=True, default=str)
+        )
+
+    source_owner = str(binding.get("source_owner") or "")
+    source_revision = state.get("source_revision")
+    catalog_revision = state.get("catalog_revision")
+    schema_fingerprint = state.get("schema_fingerprint")
+    result: List[Dict[str, Any]] = []
+    for candidate in candidates[:MAX_COLUMN_VALUE_HINTS]:
+        term = candidate["prompt_term"].lower()
+        target = (candidate["table"].lower(), candidate["column"].lower())
+        unambiguous = (
+            len(exact_term_targets.get(term, ())) == 1
+            and len(exact_target_values.get(target, ())) == 1
+        )
+        policy_eligible = candidate.get("policy_owner") == source_owner
+        revision_compatible = bool(
+            source_revision
+            and catalog_revision
+            and schema_fingerprint
+            and candidate.get("schema_fingerprint") == schema_fingerprint
+        )
+        fresh = bool(
+            state.get("freshness") == "fresh"
+            and state.get("revision_status") == "authoritative"
+            and candidate.get("value_freshness") == "fresh"
+            and candidate.get("source_fingerprint_status")
+            in {"authoritative", "best_effort"}
+        )
+        exact = (
+            candidate.get("match_kind") == "exact_match"
+            and candidate.get("confidence") == 1.0
+        )
+        profile_eligible = bool(
+            candidate.get("profile_status") == "profiled"
+            and not candidate.get("sampled")
+            and not candidate.get("truncated")
+            and not candidate.get("redacted")
+        )
+        reason = "enforceable"
+        if not exact:
+            reason = "not_exact"
+        elif not unambiguous:
+            reason = "ambiguous"
+        elif not policy_eligible:
+            reason = "policy_ineligible"
+        elif not profile_eligible:
+            reason = "ineligible_profile"
+        elif not fresh:
+            reason = "stale_or_unverified"
+        elif not revision_compatible:
+            reason = "revision_mismatch"
+        status = "enforceable" if reason == "enforceable" else "advisory"
+        grounding_identity = {
+            "source_owner": source_owner,
+            "table": candidate["table"],
+            "column": candidate["column"],
+            "prompt_term": candidate["prompt_term"],
+            "value": candidate["value"],
+            "catalog_revision": catalog_revision,
+        }
+        grounding_id = hashlib.sha256(
+            json.dumps(
+                grounding_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        result.append(
+            {
+                "grounding_id": grounding_id,
+                "status": status,
+                "reason": reason,
+                "table": candidate["table"],
+                "column": candidate["column"],
+                "prompt_term": candidate["prompt_term"],
+                "value": candidate["value"],
+                "match_kind": candidate["match_kind"],
+                "confidence": candidate["confidence"],
+                "fresh": fresh,
+                "policy_eligible": policy_eligible,
+                "unambiguous": unambiguous,
+                "profile_status": candidate["profile_status"],
+                "sampled": candidate["sampled"],
+                "truncated": candidate["truncated"],
+                "redacted": candidate["redacted"],
+                "blocked": False,
+                "value_freshness": candidate["value_freshness"],
+                "source_fingerprint_status": candidate["source_fingerprint_status"],
+                "source_owner": source_owner,
+                "source_revision": source_revision,
+                "profile_source_revision": candidate["source_revision"],
+                "catalog_revision": catalog_revision,
+                "schema_fingerprint": candidate["schema_fingerprint"],
+            }
+        )
+    return result
 
 
 def _lexical_value_match(left: str, right: str) -> bool:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
+from daita.core.exceptions import ValidationError
 from daita.runtime import Capability, Evidence, Operation, Task, TaskDependency
 
 from ...models import DbIntent, DbOperationContract
@@ -82,6 +83,7 @@ class DbTaskRuntime:
         arguments: Mapping[str, Any],
         source_owner: str,
         attempt: int = 1,
+        groundings: Iterable[Mapping[str, Any]] = (),
     ) -> tuple[Evidence, ...]:
         """Plan and execute one closed Phase 2 recipe through the kernel.
 
@@ -96,6 +98,7 @@ class DbTaskRuntime:
             arguments=arguments,
             source_owner=source_owner,
             attempt=attempt,
+            groundings=groundings,
         )
         collected: list[Evidence] = []
         for task in plan.tasks:
@@ -115,6 +118,20 @@ class DbTaskRuntime:
         )
         if validation is None:
             raise RuntimeError("query validation produced no accepted evidence")
+        if validation.payload.get("valid") is not True:
+            coverage = validation.payload.get("grounding_coverage")
+            coverage = dict(coverage) if isinstance(coverage, Mapping) else {}
+            raise ValidationError(
+                "SQL grounding coverage validation failed.",
+                field="sql",
+                context={
+                    "error_type": "grounding_coverage_error",
+                    "repair_required": True,
+                    "do_not_retry_same_sql": True,
+                    "sql_fingerprint": validation.payload.get("sql_fingerprint"),
+                    "grounding_coverage": coverage,
+                },
+            )
         read_plan = await plan_validated_slim_read(
             self.context,
             operation,

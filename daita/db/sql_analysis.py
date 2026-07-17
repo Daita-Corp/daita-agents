@@ -64,6 +64,19 @@ class SqlLiteralPredicate:
     operator: str
     values: tuple[str, ...]
     value_kinds: tuple[str, ...] = field(default_factory=tuple)
+    negated: bool = False
+    disjunctive: bool = False
+
+
+@dataclass(frozen=True)
+class SqlParameterPredicate:
+    column: SqlColumnRef
+    operator: str
+    parameter_indexes: tuple[int, ...]
+    literal_values: tuple[str, ...] = field(default_factory=tuple)
+    literal_value_kinds: tuple[str, ...] = field(default_factory=tuple)
+    negated: bool = False
+    disjunctive: bool = False
 
 
 @dataclass(frozen=True)
@@ -85,6 +98,9 @@ class SqlAnalysis:
     columns: tuple[SqlColumnRef, ...]
     select_items: tuple[SqlSelectItem, ...]
     literal_predicates: tuple[SqlLiteralPredicate, ...] = field(default_factory=tuple)
+    parameter_predicates: tuple[SqlParameterPredicate, ...] = field(
+        default_factory=tuple
+    )
     column_predicates: tuple[SqlColumnPredicate, ...] = field(default_factory=tuple)
     mutating_statement_types: tuple[str, ...] = field(default_factory=tuple)
 
@@ -140,6 +156,7 @@ def analyze_sql(sql: str, *, dialect: str = "") -> SqlAnalysis:
             columns=inner.columns,
             select_items=inner.select_items,
             literal_predicates=inner.literal_predicates,
+            parameter_predicates=inner.parameter_predicates,
             column_predicates=inner.column_predicates,
             mutating_statement_types=inner.mutating_statement_types,
         )
@@ -164,6 +181,9 @@ def analyze_sql(sql: str, *, dialect: str = "") -> SqlAnalysis:
         select_items=select_items,
         literal_predicates=tuple(
             _literal_predicates(root, exp, alias_to_table, cte_names)
+        ),
+        parameter_predicates=tuple(
+            _parameter_predicates(root, exp, alias_to_table, cte_names)
         ),
         column_predicates=tuple(
             _column_predicates(root, exp, alias_to_table, cte_names)
@@ -397,12 +417,11 @@ def _literal_predicates(
             continue
         if isinstance(node, exp.In):
             column = _column_expression(node.this, exp)
-            literal_values = [
-                literal
-                for item in node.expressions
-                if (literal := _literal_value(item, exp)) is not None
-            ]
+            literal_values = [_literal_value(item, exp) for item in node.expressions]
             if column is not None and literal_values:
+                if any(literal is None for literal in literal_values):
+                    continue
+                negated, disjunctive = _predicate_boolean_context(node, exp)
                 predicates.append(
                     SqlLiteralPredicate(
                         column=_resolve_column_qualifiers(
@@ -411,8 +430,16 @@ def _literal_predicates(
                             cte_names,
                         )[0],
                         operator="in",
-                        values=tuple(value for value, _kind in literal_values),
-                        value_kinds=tuple(kind for _value, kind in literal_values),
+                        values=tuple(
+                            value
+                            for value, _kind in literal_values
+                            if value is not None
+                        ),
+                        value_kinds=tuple(
+                            kind for _value, kind in literal_values if kind is not None
+                        ),
+                        negated=negated,
+                        disjunctive=disjunctive,
                     )
                 )
             continue
@@ -435,6 +462,127 @@ def _literal_predicates(
             if predicate is not None:
                 predicates.append(predicate)
     return predicates
+
+
+def _parameter_predicates(
+    root: Any,
+    exp: Any,
+    alias_to_table: dict[str, SqlTableRef],
+    cte_names: set[str],
+) -> list[SqlParameterPredicate]:
+    predicates: list[SqlParameterPredicate] = []
+    parameter_indexes = _parameter_indexes(root, exp)
+    binary_operators = (
+        (exp.EQ, "=", "="),
+        (exp.NEQ, "!=", "!="),
+        (exp.GT, ">", "<"),
+        (exp.GTE, ">=", "<="),
+        (exp.LT, "<", ">"),
+        (exp.LTE, "<=", ">="),
+    )
+    for node in root.walk():
+        for klass, operator, reversed_operator in binary_operators:
+            if not isinstance(node, klass):
+                continue
+            left_column = _column_expression(node.this, exp)
+            right_column = _column_expression(node.expression, exp)
+            left_index = parameter_indexes.get(id(node.this))
+            right_index = parameter_indexes.get(id(node.expression))
+            if left_column is not None and right_index is not None:
+                column = left_column
+                indexes = (right_index,)
+            elif right_column is not None and left_index is not None:
+                column = right_column
+                indexes = (left_index,)
+                operator = reversed_operator
+            else:
+                break
+            negated, disjunctive = _predicate_boolean_context(node, exp)
+            predicates.append(
+                SqlParameterPredicate(
+                    column=_resolve_column_qualifiers(
+                        (_sql_column_ref(column),), alias_to_table, cte_names
+                    )[0],
+                    operator=operator,
+                    parameter_indexes=indexes,
+                    negated=negated,
+                    disjunctive=disjunctive,
+                )
+            )
+            break
+        if not isinstance(node, exp.In):
+            continue
+        column = _column_expression(node.this, exp)
+        if column is None:
+            continue
+        indexes = tuple(
+            parameter_indexes[id(item)]
+            for item in node.expressions
+            if id(item) in parameter_indexes
+        )
+        if not indexes:
+            continue
+        literals = tuple(
+            literal
+            for item in node.expressions
+            if (literal := _literal_value(item, exp)) is not None
+        )
+        negated, disjunctive = _predicate_boolean_context(node, exp)
+        predicates.append(
+            SqlParameterPredicate(
+                column=_resolve_column_qualifiers(
+                    (_sql_column_ref(column),), alias_to_table, cte_names
+                )[0],
+                operator="in",
+                parameter_indexes=indexes,
+                literal_values=tuple(value for value, _kind in literals),
+                literal_value_kinds=tuple(kind for _value, kind in literals),
+                negated=negated,
+                disjunctive=disjunctive,
+            )
+        )
+    return predicates
+
+
+def _predicate_boolean_context(node: Any, exp: Any) -> tuple[bool, bool]:
+    """Return conservative polarity facts for one predicate expression."""
+
+    negated = False
+    disjunctive = False
+    current = getattr(node, "parent", None)
+    while current is not None:
+        if isinstance(current, exp.Not):
+            negated = True
+        elif isinstance(current, exp.Or):
+            disjunctive = True
+        current = getattr(current, "parent", None)
+    return negated, disjunctive
+
+
+def _parameter_indexes(root: Any, exp: Any) -> dict[int, int]:
+    parameter_types = tuple(
+        cls
+        for cls in (getattr(exp, "Parameter", None), getattr(exp, "Placeholder", None))
+        if cls is not None
+    )
+    indexes: dict[int, int] = {}
+    next_index = 0
+    for node in root.walk():
+        if not isinstance(node, parameter_types):
+            continue
+        explicit_index: int | None = None
+        if isinstance(node, getattr(exp, "Parameter", ())):
+            raw = getattr(getattr(node, "this", None), "this", None)
+            try:
+                parsed = int(raw)
+            except (TypeError, ValueError):
+                parsed = 0
+            if parsed > 0:
+                explicit_index = parsed - 1
+        index = next_index if explicit_index is None else explicit_index
+        indexes[id(node)] = index
+        next_index = max(next_index + 1, index + 1)
+    return indexes
 
 
 def _column_predicates(
@@ -498,6 +646,7 @@ def _binary_literal_predicate(
         operator = reversed_operator or operator
     else:
         return None
+    negated, disjunctive = _predicate_boolean_context(node, exp)
     return SqlLiteralPredicate(
         column=_resolve_column_qualifiers(
             (_sql_column_ref(column),),
@@ -507,6 +656,8 @@ def _binary_literal_predicate(
         operator=operator,
         values=(value,),
         value_kinds=(value_kind,),
+        negated=negated,
+        disjunctive=disjunctive,
     )
 
 
