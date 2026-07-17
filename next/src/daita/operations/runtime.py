@@ -18,7 +18,7 @@ from ..capabilities import (
     EvidenceValidationError,
     ExecutionRequest,
 )
-from ..llm.models import ModelRequest, ModelResponse
+from ..llm.models import ModelRequest, ModelResponse, ToolCall
 from ..loop.models import (
     LoopExit,
     LoopExitKind,
@@ -29,6 +29,7 @@ from ..loop.models import (
 )
 from .models import (
     ActionProposal,
+    ActionRejection,
     AgentTrigger,
     Evidence,
     Observation,
@@ -329,7 +330,7 @@ class OperationRuntime:
         operation_id: str,
         final_text: str,
         readiness: Readiness,
-    ) -> None:
+    ) -> Observation | None:
         async with self._lock:
             _required_text(final_text, "final_text")
             if not isinstance(readiness, Readiness):
@@ -347,6 +348,15 @@ class OperationRuntime:
             ):
                 raise OperationStateError(
                     "readiness text must match the committed final model response"
+                )
+            readiness_turn_id = state.model_calls[-1].turn_id
+            if any(
+                event.type == "readiness.recorded"
+                and event.turn_id == readiness_turn_id
+                for event in state.events
+            ):
+                raise OperationStateError(
+                    "model response already has a readiness decision"
                 )
             if any(
                 task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}
@@ -368,10 +378,35 @@ class OperationRuntime:
                 )
             now = self._clock()
             state.readiness.append(readiness)
+            correction: Observation | None = None
+            if not readiness.allowed:
+                correction = Observation(
+                    operation_id=operation_id,
+                    turn_id=state.model_calls[-1].turn_id,
+                    code=readiness.code,
+                    message=readiness.message,
+                    payload={"missing_facts": readiness.missing_facts},
+                    success=False,
+                    created_at=now,
+                )
+                state.observations.append(correction)
             state.loop_state = replace(
                 state.loop_state,
-                phase=LoopPhase.SYNTHESIZING,
-                final_answer_candidate=final_text,
+                phase=(
+                    LoopPhase.SYNTHESIZING if readiness.allowed else LoopPhase.OBSERVING
+                ),
+                repair_count=(
+                    state.loop_state.repair_count + (0 if correction is None else 1)
+                ),
+                observation_characters=(
+                    state.loop_state.observation_characters
+                    + (
+                        0
+                        if correction is None
+                        else self._observation_characters(correction)
+                    )
+                ),
+                final_answer_candidate=(final_text if readiness.allowed else None),
             )
             state.operation = replace(state.operation, updated_at=now)
             self._append_event(
@@ -380,7 +415,182 @@ class OperationRuntime:
                 turn_id=state.model_calls[-1].turn_id,
                 payload={"allowed": readiness.allowed, "code": readiness.code},
             )
+            if correction is not None:
+                self._append_event(
+                    state,
+                    "observation.recorded",
+                    turn_id=correction.turn_id,
+                    payload={
+                        "code": correction.code,
+                        "repair": "readiness",
+                        "truncated": correction.truncated,
+                    },
+                )
             self._commit(state)
+            return correction
+
+    async def record_action_rejection(
+        self,
+        operation_id: str,
+        turn_id: str,
+        call: ToolCall,
+        rejection: ActionRejection,
+    ) -> Observation:
+        if not isinstance(call, ToolCall):
+            raise TypeError("call must be a ToolCall record")
+        if not isinstance(rejection, ActionRejection):
+            raise TypeError("rejection must be an ActionRejection record")
+
+        async with self._lock:
+            state = self._working_state(operation_id)
+            model_call, committed_call = self._committed_tool_call(
+                state,
+                turn_id,
+                call.id,
+            )
+            if committed_call != call:
+                raise OperationStateError(
+                    "rejected action does not match the committed tool call"
+                )
+            fingerprint = self._action_fingerprint(committed_call)
+            self._require_preceding_calls_observed(
+                state,
+                model_call,
+                committed_call,
+            )
+            assert model_call.response is not None
+            call_position = model_call.response.tool_calls.index(committed_call)
+            affected_calls = model_call.response.tool_calls[call_position:]
+            for affected_call in affected_calls:
+                if any(
+                    observation.turn_id == turn_id
+                    and observation.call_id == affected_call.id
+                    for observation in state.observations
+                ):
+                    raise OperationStateError("tool call already has an observation")
+                if any(
+                    task.turn_id == turn_id and task.call_id == affected_call.id
+                    for task in state.tasks
+                ):
+                    raise OperationStateError(
+                        "materialized task cannot be rejected or skipped"
+                    )
+
+            now = self._clock()
+            observation = Observation(
+                operation_id=operation_id,
+                turn_id=turn_id,
+                call_id=call.id,
+                code=rejection.code,
+                message=rejection.message,
+                payload=rejection.details,
+                success=False,
+                created_at=now,
+            )
+            skipped_observations = tuple(
+                Observation(
+                    operation_id=operation_id,
+                    turn_id=turn_id,
+                    call_id=skipped_call.id,
+                    code="action.skipped_after_rejection",
+                    message=(
+                        "Tool call was not run because an earlier call was rejected."
+                    ),
+                    payload={
+                        "blocked_by_call_id": call.id,
+                        "blocked_by_code": rejection.code,
+                    },
+                    success=False,
+                    created_at=now,
+                )
+                for skipped_call in affected_calls[1:]
+            )
+            last_fingerprint = (
+                state.loop_state.no_progress_fingerprints[-1]
+                if state.loop_state.no_progress_fingerprints
+                else None
+            )
+            identical_count = (
+                state.loop_state.identical_failure_count + 1
+                if last_fingerprint == fingerprint
+                else 1
+            )
+            state.observations.append(observation)
+            state.observations.extend(skipped_observations)
+            state.loop_state = replace(
+                state.loop_state,
+                phase=LoopPhase.OBSERVING,
+                repair_count=state.loop_state.repair_count + 1,
+                identical_failure_count=identical_count,
+                observation_characters=(
+                    state.loop_state.observation_characters
+                    + self._observation_characters(observation)
+                    + sum(
+                        self._observation_characters(skipped)
+                        for skipped in skipped_observations
+                    )
+                ),
+                no_progress_fingerprints=(
+                    state.loop_state.no_progress_fingerprints
+                    if last_fingerprint == fingerprint
+                    else (*state.loop_state.no_progress_fingerprints, fingerprint)
+                ),
+            )
+            state.operation = replace(state.operation, updated_at=now)
+            self._append_event(
+                state,
+                "action.rejected",
+                turn_id=turn_id,
+                call_id=call.id,
+                payload={
+                    "code": rejection.code,
+                    "fingerprint": fingerprint,
+                    "tool_name": call.name,
+                    "model_call_id": model_call.id,
+                },
+            )
+            self._append_event(
+                state,
+                "observation.recorded",
+                turn_id=turn_id,
+                call_id=call.id,
+                payload={
+                    "code": observation.code,
+                    "fingerprint": fingerprint,
+                    "repair": "action",
+                    "truncated": observation.truncated,
+                },
+            )
+            for skipped_call, skipped in zip(
+                affected_calls[1:],
+                skipped_observations,
+                strict=True,
+            ):
+                self._append_event(
+                    state,
+                    "action.skipped",
+                    turn_id=turn_id,
+                    call_id=skipped_call.id,
+                    payload={
+                        "blocked_by_call_id": call.id,
+                        "blocked_by_code": rejection.code,
+                        "model_call_id": model_call.id,
+                        "tool_name": skipped_call.name,
+                    },
+                )
+                self._append_event(
+                    state,
+                    "observation.recorded",
+                    turn_id=turn_id,
+                    call_id=skipped_call.id,
+                    payload={
+                        "code": skipped.code,
+                        "repair": "action_skip",
+                        "truncated": skipped.truncated,
+                    },
+                )
+            self._commit(state)
+            return observation
 
     async def submit(self, proposal: ActionProposal) -> Evidence:
         if not isinstance(proposal, ActionProposal):
@@ -390,61 +600,12 @@ class OperationRuntime:
         # is bound to an exact tool call in a committed model response.
         async with self._lock:
             state = self._working_state(proposal.operation_id)
-            if not state.turns or state.turns[-1].id != proposal.turn_id:
-                raise OperationStateError(
-                    "proposal does not belong to the current turn"
-                )
-            if state.loop_state.phase not in {
-                LoopPhase.VALIDATING_ACTION,
-                LoopPhase.OBSERVING,
-            }:
-                raise OperationStateError(
-                    "operation is not accepting an action proposal"
-                )
-            model_call = self._completed_model_call_for_turn(
+            model_call, tool_call = self._committed_tool_call(
                 state,
                 proposal.turn_id,
+                proposal.call_id,
             )
-            assert model_call.response is not None
-            tool_call = next(
-                (
-                    call
-                    for call in model_call.response.tool_calls
-                    if call.id == proposal.call_id
-                ),
-                None,
-            )
-            if tool_call is None:
-                raise OperationStateError(
-                    f"proposal call_id is not in the committed response: "
-                    f"{proposal.call_id}"
-                )
-            call_position = model_call.response.tool_calls.index(tool_call)
-            for earlier_call in model_call.response.tool_calls[:call_position]:
-                earlier_task = next(
-                    (
-                        task
-                        for task in state.tasks
-                        if task.turn_id == proposal.turn_id
-                        and task.call_id == earlier_call.id
-                    ),
-                    None,
-                )
-                if (
-                    earlier_task is None
-                    or earlier_task.status is not TaskStatus.SUCCEEDED
-                    or not earlier_task.evidence_ids
-                    or any(
-                        not any(
-                            observation.evidence_id == evidence_id
-                            for observation in state.observations
-                        )
-                        for evidence_id in earlier_task.evidence_ids
-                    )
-                ):
-                    raise OperationStateError(
-                        "proposal tool call is out of committed sequential order"
-                    )
+            self._require_preceding_calls_observed(state, model_call, tool_call)
             try:
                 view, capability = self._capabilities.resolve_tool(tool_call.name)
             except KeyError as error:
@@ -630,6 +791,8 @@ class OperationRuntime:
                 state.loop_state = replace(
                     state.loop_state,
                     phase=LoopPhase.OBSERVING,
+                    identical_failure_count=0,
+                    no_progress_fingerprints=(),
                 )
                 state.operation = replace(state.operation, updated_at=now)
                 self._append_event(
@@ -691,6 +854,8 @@ class OperationRuntime:
                 raise OperationStateError("observation task is not succeeded")
             if evidence.id not in task.evidence_ids:
                 raise OperationStateError("observation evidence is not linked to task")
+            if observation.call_id is not None and observation.call_id != task.call_id:
+                raise OperationStateError("observation call_id does not match its task")
             if evidence.task_id != task.id or evidence.turn_id != observation.turn_id:
                 raise OperationStateError(
                     "observation linkage does not match accepted evidence"
@@ -702,7 +867,14 @@ class OperationRuntime:
                 raise OperationStateError("evidence already has an observation")
             state.observations.append(observation)
             now = self._clock()
-            state.loop_state = replace(state.loop_state, phase=LoopPhase.OBSERVING)
+            state.loop_state = replace(
+                state.loop_state,
+                phase=LoopPhase.OBSERVING,
+                observation_characters=(
+                    state.loop_state.observation_characters
+                    + self._observation_characters(observation)
+                ),
+            )
             state.operation = replace(state.operation, updated_at=now)
             self._append_event(
                 state,
@@ -767,6 +939,72 @@ class OperationRuntime:
             _required_text(reason, "failure reason")
             state = self._working_state(operation_id)
             result = self._fail_locked(state, reason, final_text=final_text)
+            self._commit(state)
+            return result
+
+    async def fail_no_progress(
+        self,
+        operation_id: str,
+        call_id: str,
+    ) -> LoopExit:
+        _required_text(call_id, "no-progress call_id")
+        async with self._lock:
+            state = self._working_state(operation_id)
+            if not state.turns:
+                raise OperationStateError("no-progress failure requires a turn")
+            turn_id = state.turns[-1].id
+            _, committed_call = self._committed_tool_call(state, turn_id, call_id)
+            fingerprint = self._action_fingerprint(committed_call)
+            rejection_observation = next(
+                (
+                    observation
+                    for observation in state.observations
+                    if observation.turn_id == turn_id
+                    and observation.call_id == call_id
+                    and not observation.success
+                    and observation.task_id is None
+                    and observation.evidence_id is None
+                ),
+                None,
+            )
+            rejection_event = next(
+                (
+                    event
+                    for event in state.events
+                    if event.type == "action.rejected"
+                    and event.turn_id == turn_id
+                    and event.call_id == call_id
+                ),
+                None,
+            )
+            if rejection_observation is None or rejection_event is None:
+                raise OperationStateError(
+                    "no-progress failure requires a committed current rejection"
+                )
+            if rejection_event.payload.get("fingerprint") != fingerprint:
+                raise OperationStateError(
+                    "current rejection fingerprint does not match its tool call"
+                )
+            if (
+                not state.loop_state.no_progress_fingerprints
+                or state.loop_state.no_progress_fingerprints[-1] != fingerprint
+            ):
+                raise OperationStateError(
+                    "no-progress fingerprint does not match committed loop state"
+                )
+            reason = "no_progress_action_failure_limit"
+            self._append_event(
+                state,
+                "no_progress.detected",
+                turn_id=turn_id,
+                call_id=call_id,
+                payload={
+                    "count": state.loop_state.identical_failure_count,
+                    "fingerprint": fingerprint,
+                    "reason": reason,
+                },
+            )
+            result = self._fail_locked(state, reason)
             self._commit(state)
             return result
 
@@ -855,6 +1093,16 @@ class OperationRuntime:
                 return index, model_call
         raise OperationStateError(f"unknown model call: {model_call_id}")
 
+    @staticmethod
+    def _action_fingerprint(call: ToolCall) -> str:
+        normalized = canonical_json(
+            {
+                "arguments": call.arguments,
+                "tool_name": call.name,
+            }
+        )
+        return "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
     def _completed_model_call_for_turn(
         self,
         state: _OperationState,
@@ -871,6 +1119,69 @@ class OperationRuntime:
                 return model_call
             raise OperationStateError("proposal requires a completed model response")
         raise OperationStateError("proposal turn has no committed model response")
+
+    def _committed_tool_call(
+        self,
+        state: _OperationState,
+        turn_id: str,
+        call_id: str,
+    ) -> tuple[ModelCall, ToolCall]:
+        if not state.turns or state.turns[-1].id != turn_id:
+            raise OperationStateError("action does not belong to the current turn")
+        if state.loop_state.phase not in {
+            LoopPhase.VALIDATING_ACTION,
+            LoopPhase.OBSERVING,
+        }:
+            raise OperationStateError("operation is not accepting an action")
+        model_call = self._completed_model_call_for_turn(state, turn_id)
+        assert model_call.response is not None
+        tool_call = next(
+            (call for call in model_call.response.tool_calls if call.id == call_id),
+            None,
+        )
+        if tool_call is None:
+            raise OperationStateError(
+                f"action tool call is not in the committed response: {call_id}"
+            )
+        return model_call, tool_call
+
+    @staticmethod
+    def _require_preceding_calls_observed(
+        state: _OperationState,
+        model_call: ModelCall,
+        tool_call: ToolCall,
+    ) -> None:
+        assert model_call.response is not None
+        call_position = model_call.response.tool_calls.index(tool_call)
+        for earlier_call in model_call.response.tool_calls[:call_position]:
+            earlier_task = next(
+                (
+                    task
+                    for task in state.tasks
+                    if task.turn_id == model_call.turn_id
+                    and task.call_id == earlier_call.id
+                ),
+                None,
+            )
+            if (
+                earlier_task is None
+                or earlier_task.status is not TaskStatus.SUCCEEDED
+                or not earlier_task.evidence_ids
+                or any(
+                    not any(
+                        observation.evidence_id == evidence_id
+                        for observation in state.observations
+                    )
+                    for evidence_id in earlier_task.evidence_ids
+                )
+            ):
+                raise OperationStateError(
+                    "action tool call is out of committed sequential order"
+                )
+
+    @staticmethod
+    def _observation_characters(observation: Observation) -> int:
+        return len(observation.message) + len(canonical_json(observation.payload))
 
     def _task(self, state: _OperationState, task_id: str) -> tuple[int, Task]:
         for index, task in enumerate(state.tasks):

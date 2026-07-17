@@ -8,12 +8,13 @@ from ..llm.models import ModelRequest, ModelResponse, ToolCall, ToolDefinition
 from ..llm.protocols import ModelProvider
 from ..operations.models import (
     ActionProposal,
+    ActionRejection,
     AgentTrigger,
     Evidence,
     Observation,
 )
 from ..operations.runtime import OperationRuntime, OperationSnapshot
-from .models import LoopExit, LoopPhase, Readiness, Turn
+from .models import LoopBudgets, LoopExit, LoopPhase, Readiness, Turn
 
 
 class ContextBuilder(Protocol):
@@ -37,7 +38,7 @@ class DomainController(Protocol):
         self,
         call: ToolCall,
         operation: OperationSnapshot,
-    ) -> ActionProposal: ...
+    ) -> ActionProposal | ActionRejection: ...
 
     async def project_observation(self, evidence: Evidence) -> Observation: ...
 
@@ -58,11 +59,15 @@ class AgentLoop:
         model: ModelProvider,
         context_builder: ContextBuilder,
         domain: DomainController,
+        budgets: LoopBudgets = LoopBudgets(),
     ) -> None:
+        if not isinstance(budgets, LoopBudgets):
+            raise TypeError("budgets must be a LoopBudgets record")
         self._runtime = runtime
         self._model = model
         self._context_builder = context_builder
         self._domain = domain
+        self._budgets = budgets
 
     async def run(self, trigger: AgentTrigger) -> LoopExit:
         operation = await self._runtime.begin(trigger)
@@ -117,15 +122,12 @@ class AgentLoop:
             )
 
             if response.tool_calls:
-                completed = await self._process_actions(
+                terminal = await self._process_actions(
                     operation_id,
                     response.tool_calls,
                 )
-                if not completed:
-                    return await self._runtime.fail(
-                        operation_id,
-                        "action_processing_failed",
-                    )
+                if terminal is not None:
+                    return terminal
                 continue
 
             if response.text is None:
@@ -150,30 +152,77 @@ class AgentLoop:
                 readiness,
             )
             if not readiness.allowed:
-                return await self._runtime.fail(
-                    operation_id,
-                    "readiness_not_satisfied",
-                )
+                repaired = await self._runtime.inspect(operation_id)
+                if repaired.loop_state.repair_count > self._budgets.max_repairs:
+                    return await self._runtime.fail(
+                        operation_id,
+                        "repair_budget_exhausted",
+                    )
+                continue
             return await self._runtime.complete(operation_id, response.text)
 
     async def _process_actions(
         self,
         operation_id: str,
         calls: tuple[ToolCall, ...],
-    ) -> bool:
+    ) -> LoopExit | None:
         """Process one model response sequentially in declared call order."""
 
         for call in calls:
             try:
-                proposal = await self._domain.validate_action(
+                snapshot = await self._runtime.inspect(operation_id)
+                validation = await self._domain.validate_action(
                     call,
-                    await self._runtime.inspect(operation_id),
+                    snapshot,
                 )
-                evidence = await self._runtime.submit(proposal)
+            except Exception:
+                return await self._runtime.fail(
+                    operation_id,
+                    "action_processing_failed",
+                )
+
+            if isinstance(validation, ActionRejection):
+                try:
+                    await self._runtime.record_action_rejection(
+                        operation_id,
+                        snapshot.turns[-1].id,
+                        call,
+                        validation,
+                    )
+                except Exception:
+                    return await self._runtime.fail(
+                        operation_id,
+                        "action_processing_failed",
+                    )
+                repaired = await self._runtime.inspect(operation_id)
+                if (
+                    repaired.loop_state.identical_failure_count
+                    >= self._budgets.max_identical_failures
+                ):
+                    return await self._runtime.fail_no_progress(
+                        operation_id,
+                        call.id,
+                    )
+                if repaired.loop_state.repair_count > self._budgets.max_repairs:
+                    return await self._runtime.fail(
+                        operation_id,
+                        "repair_budget_exhausted",
+                    )
+                return None
+
+            if not isinstance(validation, ActionProposal):
+                return await self._runtime.fail(
+                    operation_id,
+                    "action_processing_failed",
+                )
+
+            try:
+                evidence = await self._runtime.submit(validation)
                 observation = await self._domain.project_observation(evidence)
                 await self._runtime.append_observation(observation)
             except Exception:
-                # Phase 1's next slice replaces this terminal path with bounded,
-                # structured repair observations. It must not retry here.
-                return False
-        return True
+                return await self._runtime.fail(
+                    operation_id,
+                    "action_processing_failed",
+                )
+        return None

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
-from .._json import FrozenJsonObject
+from .._json import FrozenJsonObject, canonical_json
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -139,6 +139,25 @@ class ActionProposal:
 
 
 @dataclass(frozen=True, slots=True)
+class ActionRejection:
+    """A bounded, provider-neutral semantic rejection returned to the loop."""
+
+    code: str
+    message: str
+    details: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _required_text(self.code, "action rejection code")
+        _required_text(self.message, "action rejection message")
+        if len(self.code) > 128 or len(self.message) > 512:
+            raise ValueError("action rejection text must be bounded")
+        details = FrozenJsonObject.from_mapping(self.details)
+        if len(canonical_json(details)) > 2048:
+            raise ValueError("action rejection details must be bounded")
+        object.__setattr__(self, "details", details)
+
+
+@dataclass(frozen=True, slots=True)
 class Observation:
     operation_id: str
     turn_id: str
@@ -147,6 +166,7 @@ class Observation:
     payload: Mapping[str, object]
     success: bool
     created_at: datetime
+    call_id: str | None = None
     task_id: str | None = None
     evidence_id: str | None = None
     truncated: bool = False
@@ -161,6 +181,8 @@ class Observation:
         if not isinstance(self.truncated, bool):
             raise TypeError("observation truncated must be a boolean")
         _aware(self.created_at, "observation created_at")
+        if self.call_id is not None:
+            _required_text(self.call_id, "observation call_id")
         if self.task_id is not None:
             _required_text(self.task_id, "observation task_id")
         if self.evidence_id is not None:

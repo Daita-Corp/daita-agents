@@ -7,6 +7,8 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 
+from .._json import canonical_json
+
 
 def _required_text(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
@@ -38,6 +40,26 @@ class LoopExitKind(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     INTERRUPTED = "interrupted"
+
+
+@dataclass(frozen=True, slots=True)
+class LoopBudgets:
+    """Limits introduced incrementally as each loop failure mode is proven.
+
+    ``max_identical_failures`` counts total consecutive failed attempts,
+    including the first failure; a value of two therefore permits one retry.
+    """
+
+    max_repairs: int = 3
+    max_identical_failures: int = 2
+
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("max_repairs", self.max_repairs),
+            ("max_identical_failures", self.max_identical_failures),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +141,8 @@ class Turn:
 
 @dataclass(frozen=True, slots=True)
 class Readiness:
+    """A bounded final-answer decision suitable for correction context."""
+
     allowed: bool
     code: str
     message: str
@@ -130,12 +154,20 @@ class Readiness:
             raise TypeError("readiness allowed must be a boolean")
         _required_text(self.code, "readiness code")
         _required_text(self.message, "readiness message")
+        if len(self.code) > 128 or len(self.message) > 512:
+            raise ValueError("readiness text must be bounded")
         _aware(self.evaluated_at, "readiness evaluated_at")
         if isinstance(self.missing_facts, str):
             raise TypeError("readiness missing facts must be a sequence of strings")
         missing_facts = tuple(self.missing_facts)
         for fact in missing_facts:
             _required_text(fact, "readiness missing fact")
+        if (
+            len(missing_facts) > 16
+            or any(len(fact) > 256 for fact in missing_facts)
+            or len(canonical_json({"missing_facts": missing_facts})) > 4096
+        ):
+            raise ValueError("readiness missing facts must be bounded")
         if self.allowed and missing_facts:
             raise ValueError("allowed readiness cannot contain missing facts")
         object.__setattr__(self, "missing_facts", missing_facts)

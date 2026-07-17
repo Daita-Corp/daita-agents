@@ -8,6 +8,7 @@ from daita._json import FrozenJsonObject
 from daita.loop.models import LoopPhase, LoopState
 from daita.operations.models import (
     ActionProposal,
+    ActionRejection,
     AgentTrigger,
     Observation,
     Operation,
@@ -145,6 +146,35 @@ def test_action_proposal_freezes_validated_arguments() -> None:
 
     assert isinstance(proposal.arguments, FrozenJsonObject)
     assert proposal.arguments.to_dict() == {"key": "alpha"}
+
+
+def test_action_rejection_is_structured_immutable_and_bounded() -> None:
+    details = {"field": "key", "expected": "string"}
+    rejection = ActionRejection(
+        code="invalid_arguments",
+        message="The key argument must be a string.",
+        details=details,
+    )
+    details["field"] = "mutated"
+
+    assert isinstance(rejection.details, FrozenJsonObject)
+    assert rejection.details.to_dict() == {
+        "expected": "string",
+        "field": "key",
+    }
+
+    with pytest.raises(ValueError, match="bounded"):
+        ActionRejection(
+            code="invalid_arguments",
+            message="x" * 513,
+        )
+
+    with pytest.raises(ValueError, match="bounded"):
+        ActionRejection(
+            code="invalid_arguments",
+            message="Invalid arguments.",
+            details={"value": "x" * 2048},
+        )
 
 
 def test_observation_links_evidence_to_task_and_preserves_bounded_facts() -> None:

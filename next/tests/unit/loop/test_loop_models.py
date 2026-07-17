@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from daita.loop.models import (
+    LoopBudgets,
     LoopExit,
     LoopExitKind,
     LoopPhase,
@@ -40,6 +41,19 @@ def test_loop_state_keeps_phase_and_budget_counters_separate() -> None:
 
     with pytest.raises(TypeError, match="sequence"):
         LoopState(no_progress_fingerprints="sha256:not-a-sequence")  # type: ignore[arg-type]
+
+
+def test_loop_budgets_bound_repairs_and_identical_failures() -> None:
+    budgets = LoopBudgets(max_repairs=3, max_identical_failures=2)
+
+    assert budgets.max_repairs == 3
+    assert budgets.max_identical_failures == 2
+
+    with pytest.raises(ValueError, match="positive"):
+        LoopBudgets(max_repairs=0)
+
+    with pytest.raises(ValueError, match="positive"):
+        LoopBudgets(max_identical_failures=0)
 
 
 def test_turn_requires_positive_number_and_stable_operation_linkage() -> None:
@@ -96,4 +110,33 @@ def test_readiness_and_exit_records_fail_closed() -> None:
             kind=LoopExitKind.COMPLETED,
             reason="completed",
             created_at=NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "missing_facts"),
+    [
+        ("x" * 129, "Missing evidence.", ()),
+        ("not_ready", "x" * 513, ()),
+        ("not_ready", "Missing evidence.", tuple("x" for _ in range(17))),
+        ("not_ready", "Missing evidence.", ("x" * 257,)),
+        (
+            "not_ready",
+            "Missing evidence.",
+            tuple("x" * 256 for _ in range(16)),
+        ),
+    ],
+)
+def test_readiness_correction_fields_are_bounded(
+    code: str,
+    message: str,
+    missing_facts: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError, match="bounded"):
+        Readiness(
+            allowed=False,
+            code=code,
+            message=message,
+            missing_facts=missing_facts,
+            evaluated_at=NOW,
         )

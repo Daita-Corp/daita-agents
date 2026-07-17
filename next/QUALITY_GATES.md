@@ -92,8 +92,9 @@ read-only Phase 0 scope.
 
 ## Phase 1 — loop laboratory
 
-Status: **P1-02 committed at `48b0a17`; P1-03 fully passing and awaiting its
-checkpoint commit; no Phase 1 gate claimed.**
+Status: **P1-03 committed at
+`e5258c0a0234e377b4581c744073609fe9e3d999`; P1-04 active; no Phase 1 gate
+claimed.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 0 commit and before
 the first Phase 1 production edit. Phase 1 evidence will be appended only for
@@ -153,6 +154,7 @@ commands actually run.
 | P1-Q14 | `next/` | Black check, byte compilation, full mypy, and pyright 1.1.411 across source, tests, and inventory script | PASS — Black reported 32 files unchanged; compilation succeeded; mypy found no issues in 31 source files; pyright exited zero with no diagnostics (npm emitted only its nonfatal `unsafe-perm` warning) |
 | P1-Q15 | repository root and `next/` | Independent final boundary review; sole `.execute()` AST/text checks; absolute/v1 import scan; symlink scan; root-oracle diff; `git diff --check`; scoped status review | PASS — no review blocker, prohibited reference, symlink, root change, diff error, or path outside `next/`; the sole executor call is in `operations/runtime.py` |
 | P1-Q16 | clean copy `/private/tmp/daita-v2-p1-03.kp5giU` | Build sdist/wheel without isolation and inspect the wheel for P1-03 modules and forbidden test/nested paths | PASS — build succeeded; 18-entry wheel contains `capabilities.py`, the generic driver, and operation runtime; no tests or nested `next/` path |
+| P1-Q17 | repository root | Stage the 11 reviewed P1-03 paths under `next/`; run `git diff --cached --check` and all configured hooks; create the scoped checkpoint | PASS — every staged path was under `next/`; trailing-whitespace, end-of-file, merge-conflict, large-file, and Black hooks passed; commit `e5258c0a0234e377b4581c744073609fe9e3d999` |
 
 ### P1-03 red/repair evidence
 
@@ -171,6 +173,52 @@ commands actually run.
   call identity repaired those contracts. Regression tests also inject
   task-start, evidence-terminal, and observation-event failures to prove the
   copy-on-write checkpoints publish no partial state.
+
+### Executed P1-04 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P1-Q18 | `next/` | Run new record tests before adding `ActionRejection` and `LoopBudgets` | EXPECTED RED — 2 collection errors for the intentionally absent records |
+| P1-Q19 | `next/` | Run new scripted action-repair trajectories before adding loop budgets/progression | EXPECTED RED — 2 failures because `AgentLoop.__init__` did not accept `budgets` |
+| P1-Q20 | `next/` | Final focused loop/operation record, runtime repair/readiness, and scripted acceptance modules | PASS — 42 passed in 0.08s; covers exact/canonical fingerprints, bounded corrections, evidence resets, thresholds, complete multi-call skip transcripts, and atomic failure injection |
+| P1-Q21 | `next/` | Complete isolated suite with `-S`, explicit v2 `PYTHONPATH`, and `-o addopts=''` on CPython 3.11.15 and 3.12.7 | PASS — 113 passed in 0.35s on 3.11; 113 passed in 0.37s on 3.12 |
+| P1-Q22 | `next/` | Black check, byte compilation, full mypy, and pyright 1.1.411 across source, tests, and inventory script | PASS — Black reported 34 files unchanged; compilation succeeded; mypy found no issues in 33 source files; pyright reported 0 errors and 0 warnings |
+| P1-Q23 | repository root and `next/` | Independent final boundary review; all architecture tests; sole `.execute()` scan; v1/symlink/root-oracle checks; `git diff --check`; scoped status review | PASS — no blocker, prohibited reference, symlink, root change, diff error, or path outside `next/`; 19 architecture tests; sole production executor invocation is `operations/runtime.py:719` |
+| P1-Q24 | clean copy `/private/tmp/daita-v2-p1-04-final.ySk4bb` | Build sdist/wheel without isolation and inspect both archives for required runtime modules and forbidden test/nested paths | PASS — build succeeded; 18-entry wheel and 31-entry sdist contain the generic loop/operation runtime and no tests or nested `next/` path |
+| P1-Q25 | repository root | Stage the 10 reviewed P1-04 paths under `next/`; run `git diff --cached --check` and all configured pre-commit hooks | PASS — every staged path is under `next/`; no diff-check error; trailing-whitespace, end-of-file, merge-conflict, large-file, and Black hooks passed |
+
+### P1-04 red/repair evidence
+
+- Parallel runtime tests first landed after their production surface and were
+  green; aligning the clarified minimal observation projection produced one
+  temporary fingerprint-history expectation failure. The resolved contract
+  treats fingerprints as a current no-progress epoch cleared by accepted
+  evidence, while events retain the operation's audit history.
+- The first complete regression run passed 95 tests and failed one P1-03
+  defensive assertion because a refactored error message omitted the words
+  "tool call." Restoring explicit boundary wording preserved the existing
+  contract; the subsequent complete suite passed.
+- Independent final review found that the first implementation accepted a
+  caller hash containing the rejection code, left later calls in a rejected
+  multi-call response without tool results, admitted unbounded readiness
+  correction facts, and could terminalize no-progress without the current
+  rejection commit. Runtime-owned canonical name/argument fingerprints,
+  atomic taskless skip observations, bounded readiness records, and exact
+  current-call event/observation grounding repaired those boundaries.
+- Boundary review also made threshold semantics explicit: the identical
+  failure limit counts the first failed attempt, no-progress wins when its
+  threshold and the aggregate repair limit cross together, and the neutral
+  `no_progress_action_failure_limit` reason remains truthful when the
+  configured limit is one.
+- The first amended mypy/pyright pass found two test-only payloads used as
+  `FrozenJsonObject` without explicit narrowing. Adding `isinstance` checks
+  repaired both diagnostics; production code had no type failure.
+- The first final clean-copy invocation and one search used cwd-relative paths
+  from the wrong directory. Both commands failed before changing tracked
+  state and passed immediately with corrected explicit paths.
+- The sandbox rejected the first scoped stage and pre-commit attempts because
+  Git could not create `index.lock`. Approved reruns used the same ten
+  `next/` paths and configured hooks; staging and all hooks then passed.
 
 ## Phases 2 through 9
 
