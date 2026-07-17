@@ -40,6 +40,7 @@ from .models import (
     Operation,
     OperationStatus,
     Task,
+    TaskExecutionFacts,
     TaskStatus,
     TriggerKind,
 )
@@ -715,8 +716,14 @@ class OperationRuntime:
                     f"tool call already materialized: {proposal.call_id}"
                 )
             now = self._clock()
+            task_id = self._id_factory("task")
+            idempotency_key = (
+                f"{proposal.operation_id}:{task_id}"
+                if capability.side_effecting and capability.idempotent
+                else None
+            )
             task = Task(
-                id=self._id_factory("task"),
+                id=task_id,
                 operation_id=proposal.operation_id,
                 turn_id=proposal.turn_id,
                 call_id=proposal.call_id,
@@ -727,6 +734,21 @@ class OperationRuntime:
                 arguments=validated_arguments,
                 created_at=now,
                 updated_at=now,
+                execution_facts=TaskExecutionFacts(
+                    capability_fingerprint=capability.contract_fingerprint,
+                    arguments_hash=(
+                        "sha256:"
+                        + hashlib.sha256(
+                            canonical_json(validated_arguments).encode("utf-8")
+                        ).hexdigest()
+                    ),
+                    access_mode=capability.access_mode,
+                    risk=capability.risk,
+                    side_effecting=capability.side_effecting,
+                    idempotent=capability.idempotent,
+                    replay_safe=capability.replay_safe,
+                    idempotency_key=idempotency_key,
+                ),
             )
             state.tasks.append(task)
             state.loop_state = replace(

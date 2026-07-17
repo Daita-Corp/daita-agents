@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+import hashlib
 from typing import Protocol
 
-from ._json import FrozenJsonObject
+from ._json import FrozenJsonObject, canonical_json
 from .llm.models import ToolDefinition
 
 
@@ -80,6 +81,8 @@ class Capability:
                 raise TypeError(f"capability {name} must be a boolean")
         if self.access_mode is AccessMode.READ and self.side_effecting:
             raise ValueError("read capabilities cannot declare side effects")
+        if self.replay_safe and not self.idempotent:
+            raise ValueError("replay-safe capabilities must be idempotent")
 
         input_schema = FrozenJsonObject.from_mapping(self.input_schema)
         output_schema = FrozenJsonObject.from_mapping(self.output_schema)
@@ -87,6 +90,28 @@ class Capability:
         _validate_supported_object_schema(output_schema, "output")
         object.__setattr__(self, "input_schema", input_schema)
         object.__setattr__(self, "output_schema", output_schema)
+
+    @property
+    def contract_fingerprint(self) -> str:
+        """Return the stable hash of this capability's execution contract."""
+
+        encoded = canonical_json(
+            {
+                "access_mode": self.access_mode.value,
+                "executor_id": self.executor_id,
+                "id": self.id,
+                "idempotent": self.idempotent,
+                "input_schema": self.input_schema,
+                "output_evidence_kind": self.output_evidence_kind,
+                "output_schema": self.output_schema,
+                "output_schema_version": self.output_schema_version,
+                "owner": self.owner,
+                "replay_safe": self.replay_safe,
+                "risk": self.risk.value,
+                "side_effecting": self.side_effecting,
+            }
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from ..events.models import RuntimeEvent
 from .checkpoints import OperationSnapshot
+from .leases import TaskClaimRequest, TaskLease, TaskLeaseGuard
+from .models import Task, TaskStatus
 
 
 class OperationStoreError(RuntimeError):
@@ -67,6 +70,116 @@ class InvalidOperationCheckpointError(OperationStoreError):
         super().__init__(f"invalid operation checkpoint {operation_id}: {reason}")
 
 
+class TaskNotFoundError(OperationStoreError):
+    """Raised when a task is absent from its operation checkpoint."""
+
+    def __init__(self, operation_id: str, task_id: str) -> None:
+        self.operation_id = operation_id
+        self.task_id = task_id
+        super().__init__(f"operation {operation_id} has no task {task_id}")
+
+
+class TaskDependenciesNotReadyError(OperationStoreError):
+    """Raised when a task has prerequisites that have not succeeded."""
+
+    def __init__(
+        self,
+        operation_id: str,
+        task_id: str,
+        dependency_ids: tuple[str, ...],
+    ) -> None:
+        self.operation_id = operation_id
+        self.task_id = task_id
+        self.dependency_ids = tuple(dependency_ids)
+        super().__init__(
+            f"operation {operation_id} task {task_id} has dependencies not ready: "
+            f"{', '.join(self.dependency_ids)}"
+        )
+
+
+class TaskClaimConflictError(OperationStoreError):
+    """Raised when another holder already owns the task's live lease."""
+
+    def __init__(
+        self,
+        operation_id: str,
+        task_id: str,
+        holder_id: str,
+        fencing_token: int,
+        expires_at: datetime,
+    ) -> None:
+        self.operation_id = operation_id
+        self.task_id = task_id
+        self.holder_id = holder_id
+        self.fencing_token = fencing_token
+        self.expires_at = expires_at
+        super().__init__(
+            f"operation {operation_id} task {task_id} is claimed by {holder_id} "
+            f"with fence {fencing_token} until {expires_at.isoformat()}"
+        )
+
+
+class TaskNotClaimableError(OperationStoreError):
+    """Raised when durable task state does not permit a claim."""
+
+    def __init__(
+        self,
+        operation_id: str,
+        task_id: str,
+        status: TaskStatus,
+    ) -> None:
+        self.operation_id = operation_id
+        self.task_id = task_id
+        self.status = status
+        super().__init__(
+            f"operation {operation_id} task {task_id} is not claimable from "
+            f"status {status.value}"
+        )
+
+
+class StaleTaskFenceError(OperationStoreError):
+    """Raised when a task mutation presents an obsolete fencing token."""
+
+    def __init__(
+        self,
+        operation_id: str,
+        task_id: str,
+        expected_fencing_token: int,
+        actual_fencing_token: int,
+    ) -> None:
+        self.operation_id = operation_id
+        self.task_id = task_id
+        self.expected_fencing_token = expected_fencing_token
+        self.actual_fencing_token = actual_fencing_token
+        super().__init__(
+            f"operation {operation_id} task {task_id} fence is stale: expected "
+            f"{expected_fencing_token}, found {actual_fencing_token}"
+        )
+
+
+class ExpiredTaskLeaseError(OperationStoreError):
+    """Raised when a holder checks or commits at or after lease expiry."""
+
+    def __init__(
+        self,
+        operation_id: str,
+        task_id: str,
+        fencing_token: int,
+        expires_at: datetime,
+        checked_at: datetime,
+    ) -> None:
+        self.operation_id = operation_id
+        self.task_id = task_id
+        self.fencing_token = fencing_token
+        self.expires_at = expires_at
+        self.checked_at = checked_at
+        super().__init__(
+            f"operation {operation_id} task {task_id} lease fence "
+            f"{fencing_token} expired at {expires_at.isoformat()} before check "
+            f"at {checked_at.isoformat()}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class VersionedOperation:
     """One immutable operation checkpoint paired with its optimistic revision."""
@@ -101,6 +214,34 @@ class CommitResult:
         object.__setattr__(self, "committed_events", events)
 
 
+@dataclass(frozen=True, slots=True)
+class TaskClaimResult:
+    """One atomic claim commit and its authoritative task/lease records."""
+
+    commit_result: CommitResult
+    task: Task
+    lease: TaskLease
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.commit_result, CommitResult):
+            raise TypeError("commit_result must be a CommitResult record")
+        if not isinstance(self.task, Task):
+            raise TypeError("task must be a Task record")
+        if not isinstance(self.lease, TaskLease):
+            raise TypeError("lease must be a TaskLease record")
+        if (
+            self.task.operation_id != self.lease.operation_id
+            or self.task.id != self.lease.task_id
+            or self.task.attempt != self.lease.attempt
+        ):
+            raise ValueError("claim task and lease execution identity must match")
+        snapshot = self.commit_result.operation.snapshot
+        if self.task not in snapshot.tasks or self.lease not in snapshot.task_leases:
+            raise ValueError(
+                "claim task and lease must be exact records from the committed snapshot"
+            )
+
+
 class OperationStore(Protocol):
     """Persist operation-owned lifecycle records with optimistic concurrency."""
 
@@ -118,6 +259,41 @@ class OperationStore(Protocol):
         snapshot: OperationSnapshot,
         *,
         expected_revision: int,
+    ) -> CommitResult: ...
+
+
+class TaskExecutionStore(OperationStore, Protocol):
+    """Atomic task-execution operations layered on operation persistence."""
+
+    async def claim_task(
+        self,
+        request: TaskClaimRequest,
+        *,
+        expected_revision: int,
+    ) -> TaskClaimResult: ...
+
+    async def renew_task_lease(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+        guard: TaskLeaseGuard,
+    ) -> CommitResult: ...
+
+    async def commit_fenced(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+        guard: TaskLeaseGuard,
+    ) -> CommitResult: ...
+
+    async def recover_expired_task(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+        guard: TaskLeaseGuard,
     ) -> CommitResult: ...
 
 
@@ -335,6 +511,9 @@ def _validate_stable_history(
     candidate: OperationSnapshot,
 ) -> None:
     operation_id = candidate.operation.id
+    actively_leased_task_ids = {
+        lease.task_id for lease in current.task_leases if lease.released_at is None
+    }
     _validate_record_id_prefix(current.turns, candidate.turns, operation_id, "turn")
     for before_turn, after_turn in zip(
         current.turns,
@@ -402,6 +581,14 @@ def _validate_stable_history(
         strict=False,
     ):
         if (
+            before_task.id in actively_leased_task_ids
+            and after_task.status is not before_task.status
+        ):
+            raise InvalidOperationCheckpointError(
+                operation_id,
+                f"actively leased task requires a fenced commit: {before_task.id}",
+            )
+        if (
             after_task.operation_id != before_task.operation_id
             or after_task.turn_id != before_task.turn_id
             or after_task.call_id != before_task.call_id
@@ -409,6 +596,7 @@ def _validate_stable_history(
             or after_task.executor_id != before_task.executor_id
             or after_task.attempt != before_task.attempt
             or after_task.arguments != before_task.arguments
+            or after_task.execution_facts != before_task.execution_facts
             or after_task.created_at != before_task.created_at
             or after_task.updated_at < before_task.updated_at
             or after_task.evidence_ids[: len(before_task.evidence_ids)]
@@ -420,6 +608,11 @@ def _validate_stable_history(
             or (
                 before_task.cancellation_requested
                 and not after_task.cancellation_requested
+            )
+            or (
+                before_task.manual_recovery_reason is not None
+                and after_task.manual_recovery_reason
+                != before_task.manual_recovery_reason
             )
         ):
             raise InvalidOperationCheckpointError(
@@ -433,6 +626,14 @@ def _validate_stable_history(
         operation_id,
         "evidence",
     )
+    if any(
+        evidence.task_id in actively_leased_task_ids
+        for evidence in candidate.evidence[len(current.evidence) :]
+    ):
+        raise InvalidOperationCheckpointError(
+            operation_id,
+            "actively leased task evidence requires a fenced commit",
+        )
     _validate_exact_history_prefix(
         current.readiness,
         candidate.readiness,
@@ -445,6 +646,37 @@ def _validate_stable_history(
         operation_id,
         "observation",
     )
+    _validate_exact_history_prefix(
+        current.task_dependencies,
+        candidate.task_dependencies,
+        operation_id,
+        "task dependency",
+    )
+    current_task_by_id = {task.id: task for task in current.tasks}
+    leased_task_ids = {lease.task_id for lease in current.task_leases}
+    for dependency in candidate.task_dependencies[len(current.task_dependencies) :]:
+        current_task = current_task_by_id.get(dependency.task_id)
+        candidate_task = next(
+            task for task in candidate.tasks if task.id == dependency.task_id
+        )
+        if (
+            candidate_task.status is not TaskStatus.PENDING
+            or dependency.task_id in leased_task_ids
+            or (
+                current_task is not None
+                and current_task.status is not TaskStatus.PENDING
+            )
+        ):
+            raise InvalidOperationCheckpointError(
+                operation_id,
+                f"task dependencies are immutable after readiness: "
+                f"{dependency.task_id}",
+            )
+    if candidate.task_leases != current.task_leases:
+        raise InvalidOperationCheckpointError(
+            operation_id,
+            "ordinary operation commit cannot mutate task lease history",
+        )
 
 
 def _validate_exact_history_prefix(

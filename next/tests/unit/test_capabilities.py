@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from daita._json import FrozenJsonObject
@@ -141,3 +143,20 @@ def test_registry_rejects_undeclared_or_ambiguous_runtime_identity() -> None:
                 ),
             )
         )
+
+
+def test_capability_contract_fingerprint_is_stable_and_execution_sensitive() -> None:
+    capability = _capability()
+
+    assert capability.contract_fingerprint.startswith("sha256:")
+    assert len(capability.contract_fingerprint) == 71
+    assert capability.contract_fingerprint == _capability().contract_fingerprint
+    assert (
+        replace(capability, executor_id="fake.read.executor.v2").contract_fingerprint
+        != capability.contract_fingerprint
+    )
+
+
+def test_replay_safe_capability_must_also_be_idempotent() -> None:
+    with pytest.raises(ValueError, match="replay-safe.*idempotent"):
+        replace(_capability(), idempotent=False)

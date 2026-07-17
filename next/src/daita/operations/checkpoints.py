@@ -14,7 +14,15 @@ from enum import Enum
 from ..events.models import RuntimeEvent
 from ..llm.models import ModelRequest, ModelResponse
 from ..loop.models import LoopBudgets, LoopState, Readiness, Turn
-from .models import AgentTrigger, Evidence, Observation, Operation, Task
+from .leases import TaskLease
+from .models import (
+    AgentTrigger,
+    Evidence,
+    Observation,
+    Operation,
+    Task,
+    TaskDependency,
+)
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -107,6 +115,8 @@ class OperationSnapshot:
     evidence: tuple[Evidence, ...]
     observations: tuple[Observation, ...]
     events: tuple[RuntimeEvent, ...]
+    task_dependencies: tuple[TaskDependency, ...] = ()
+    task_leases: tuple[TaskLease, ...] = ()
 
     def __post_init__(self) -> None:
         self._validate_root_records()
@@ -132,6 +142,8 @@ class OperationSnapshot:
             "model_calls",
             "readiness",
             "tasks",
+            "task_dependencies",
+            "task_leases",
             "evidence",
             "observations",
             "events",
@@ -153,6 +165,8 @@ class OperationSnapshot:
             (self.model_calls, ModelCall, "model_calls"),
             (self.readiness, Readiness, "readiness"),
             (self.tasks, Task, "tasks"),
+            (self.task_dependencies, TaskDependency, "task_dependencies"),
+            (self.task_leases, TaskLease, "task_leases"),
             (self.evidence, Evidence, "evidence"),
             (self.observations, Observation, "observations"),
             (self.events, RuntimeEvent, "events"),
@@ -253,6 +267,9 @@ class OperationSnapshot:
                 ):
                     raise ValueError("task evidence belongs to a different task")
 
+        self._validate_task_dependencies(task_by_id)
+        self._validate_task_leases(task_by_id)
+
         for evidence_record in self.evidence:
             if evidence_record.operation_id != operation_id:
                 raise ValueError("evidence operation does not match snapshot operation")
@@ -308,6 +325,104 @@ class OperationSnapshot:
                     raise ValueError("observation evidence does not match its task")
                 if linked_evidence.id not in linked_task.evidence_ids:
                     raise ValueError("observation evidence is not accepted by its task")
+
+    def _validate_task_dependencies(self, task_by_id: dict[str, Task]) -> None:
+        operation_id = self.operation.id
+        edges: set[tuple[str, str]] = set()
+        prerequisites_by_task: dict[str, set[str]] = {}
+        for dependency in self.task_dependencies:
+            if dependency.operation_id != operation_id:
+                raise ValueError(
+                    "task dependency operation does not match snapshot operation"
+                )
+            if dependency.task_id not in task_by_id:
+                raise ValueError("dependency task does not exist in snapshot")
+            if dependency.prerequisite_task_id not in task_by_id:
+                raise ValueError(
+                    "dependency prerequisite task does not exist in snapshot"
+                )
+            if dependency.task_id == dependency.prerequisite_task_id:
+                raise ValueError("task dependency cannot be a self-edge")
+
+            edge = (dependency.task_id, dependency.prerequisite_task_id)
+            if edge in edges:
+                raise ValueError("duplicate task dependency in operation snapshot")
+            edges.add(edge)
+            prerequisites_by_task.setdefault(dependency.task_id, set()).add(
+                dependency.prerequisite_task_id
+            )
+
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(task_id: str) -> None:
+            if task_id in visited:
+                return
+            if task_id in visiting:
+                raise ValueError("task dependency graph contains a cycle")
+            visiting.add(task_id)
+            for prerequisite_task_id in prerequisites_by_task.get(task_id, ()):
+                visit(prerequisite_task_id)
+            visiting.remove(task_id)
+            visited.add(task_id)
+
+        for task_id in prerequisites_by_task:
+            visit(task_id)
+
+    def _validate_task_leases(self, task_by_id: dict[str, Task]) -> None:
+        operation_id = self.operation.id
+        attempts_by_task: dict[str, set[int]] = {}
+        fences_by_task: dict[str, set[int]] = {}
+        last_attempt_by_task: dict[str, int] = {}
+        last_fence_by_task: dict[str, int] = {}
+        previous_lease_by_task: dict[str, TaskLease] = {}
+        unreleased_tasks: set[str] = set()
+
+        for lease in self.task_leases:
+            if lease.operation_id != operation_id:
+                raise ValueError(
+                    "task lease operation does not match snapshot operation"
+                )
+            if lease.task_id not in task_by_id:
+                raise ValueError("lease task does not exist in snapshot")
+
+            attempts = attempts_by_task.setdefault(lease.task_id, set())
+            if lease.attempt in attempts:
+                raise ValueError("task lease attempt must be unique per task")
+            attempts.add(lease.attempt)
+
+            fences = fences_by_task.setdefault(lease.task_id, set())
+            if lease.fencing_token in fences:
+                raise ValueError("task lease fencing token must be unique per task")
+            fences.add(lease.fencing_token)
+
+            previous_attempt = last_attempt_by_task.get(lease.task_id)
+            if previous_attempt is not None and lease.attempt <= previous_attempt:
+                raise ValueError("task lease attempt must strictly increase per task")
+            previous_fence = last_fence_by_task.get(lease.task_id)
+            if previous_fence is not None and lease.fencing_token <= previous_fence:
+                raise ValueError(
+                    "task lease fencing token must strictly increase per task"
+                )
+            last_attempt_by_task[lease.task_id] = lease.attempt
+            last_fence_by_task[lease.task_id] = lease.fencing_token
+
+            previous_lease = previous_lease_by_task.get(lease.task_id)
+            if previous_lease is not None:
+                if previous_lease.released_at is None:
+                    raise ValueError(
+                        "a later task lease requires the prior lease to be released"
+                    )
+                if lease.acquired_at < previous_lease.released_at:
+                    raise ValueError(
+                        "task lease acquisition cannot overlap the prior attempt"
+                    )
+            previous_lease_by_task[lease.task_id] = lease
+
+            if lease.released_at is None:
+                if lease.task_id in unreleased_tasks:
+                    raise ValueError("task may have at most one unreleased lease")
+                unreleased_tasks.add(lease.task_id)
 
     def _validate_events(self) -> None:
         self._require_unique_ids(self.events, "event")

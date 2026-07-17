@@ -6,8 +6,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import hashlib
+import re
 
 from .._json import FrozenJsonObject, canonical_json
+from ..capabilities import AccessMode, RiskLevel
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -43,9 +46,14 @@ class TriggerKind(str, Enum):
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
+    READY = "ready"
+    CLAIMED = "claimed"
     RUNNING = "running"
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+    MANUAL_RECOVERY_REQUIRED = "manual_recovery_required"
 
 
 _TERMINAL_STATUSES = {
@@ -194,6 +202,97 @@ class Observation:
         object.__setattr__(self, "payload", FrozenJsonObject.from_mapping(self.payload))
 
 
+_CANONICAL_SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_LEGACY_ZERO_HASH = "sha256:" + ("0" * 64)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskExecutionFacts:
+    """Immutable safety facts captured when a task is materialized."""
+
+    capability_fingerprint: str
+    arguments_hash: str
+    access_mode: AccessMode
+    risk: RiskLevel
+    side_effecting: bool
+    idempotent: bool
+    replay_safe: bool
+    idempotency_key: str | None = None
+
+    def __post_init__(self) -> None:
+        for hash_name, hash_value in (
+            ("capability_fingerprint", self.capability_fingerprint),
+            ("arguments_hash", self.arguments_hash),
+        ):
+            if (
+                not isinstance(hash_value, str)
+                or _CANONICAL_SHA256.fullmatch(hash_value) is None
+            ):
+                raise ValueError(
+                    f"{hash_name} must be a canonical lowercase sha256 hash"
+                )
+        if not isinstance(self.access_mode, AccessMode):
+            raise TypeError("access_mode must be an AccessMode")
+        if not isinstance(self.risk, RiskLevel):
+            raise TypeError("risk must be a RiskLevel")
+        for flag_name, flag_value in (
+            ("side_effecting", self.side_effecting),
+            ("idempotent", self.idempotent),
+            ("replay_safe", self.replay_safe),
+        ):
+            if not isinstance(flag_value, bool):
+                raise TypeError(f"{flag_name} must be a boolean")
+
+        if self.access_mode is AccessMode.READ and self.side_effecting:
+            raise ValueError("read execution facts cannot declare a side effect")
+        if self.replay_safe and not self.idempotent:
+            raise ValueError("replay_safe execution facts must be idempotent")
+
+        if self.idempotency_key is not None:
+            if (
+                not isinstance(self.idempotency_key, str)
+                or not self.idempotency_key.strip()
+            ):
+                raise ValueError("idempotency_key must be a non-empty string")
+            if not self.side_effecting or not self.idempotent:
+                raise ValueError(
+                    "idempotency_key is only valid for idempotent side effects"
+                )
+        if self.side_effecting and self.replay_safe and self.idempotency_key is None:
+            raise ValueError("replay-safe side effects require an idempotency_key")
+
+
+def _legacy_execution_facts() -> TaskExecutionFacts:
+    """Fail-closed defaults for records written before execution facts existed."""
+
+    return TaskExecutionFacts(
+        capability_fingerprint=_LEGACY_ZERO_HASH,
+        arguments_hash=_LEGACY_ZERO_HASH,
+        access_mode=AccessMode.WRITE,
+        risk=RiskLevel.HIGH,
+        side_effecting=True,
+        idempotent=False,
+        replay_safe=False,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskDependency:
+    operation_id: str
+    task_id: str
+    prerequisite_task_id: str
+
+    def __post_init__(self) -> None:
+        _required_text(self.operation_id, "dependency operation_id")
+        _required_text(self.task_id, "dependency task_id")
+        _required_text(
+            self.prerequisite_task_id,
+            "dependency prerequisite_task_id",
+        )
+        if self.task_id == self.prerequisite_task_id:
+            raise ValueError("task cannot depend on itself")
+
+
 @dataclass(frozen=True, slots=True)
 class Task:
     id: str
@@ -207,9 +306,11 @@ class Task:
     arguments: Mapping[str, object]
     created_at: datetime
     updated_at: datetime
+    execution_facts: TaskExecutionFacts = field(default_factory=_legacy_execution_facts)
     evidence_ids: tuple[str, ...] = ()
     error_code: str | None = None
     cancellation_requested: bool = False
+    manual_recovery_reason: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.id, "task id")
@@ -220,6 +321,18 @@ class Task:
         _required_text(self.executor_id, "task executor_id")
         if not isinstance(self.status, TaskStatus):
             raise TypeError("task status must be a TaskStatus")
+        if not isinstance(self.execution_facts, TaskExecutionFacts):
+            raise TypeError("task execution_facts must be a TaskExecutionFacts record")
+        arguments = FrozenJsonObject.from_mapping(self.arguments)
+        if self.execution_facts.arguments_hash != _LEGACY_ZERO_HASH:
+            actual_arguments_hash = (
+                "sha256:"
+                + hashlib.sha256(canonical_json(arguments).encode("utf-8")).hexdigest()
+            )
+            if self.execution_facts.arguments_hash != actual_arguments_hash:
+                raise ValueError(
+                    "task execution_facts arguments_hash does not match arguments"
+                )
         if (
             not isinstance(self.attempt, int)
             or isinstance(self.attempt, bool)
@@ -238,6 +351,18 @@ class Task:
             raise ValueError("failed task requires error_code")
         if self.status is not TaskStatus.FAILED and self.error_code is not None:
             raise ValueError("only failed task may contain error_code")
+        if self.status is TaskStatus.MANUAL_RECOVERY_REQUIRED:
+            if (
+                not isinstance(self.manual_recovery_reason, str)
+                or not self.manual_recovery_reason.strip()
+            ):
+                raise ValueError(
+                    "manual recovery task requires a manual recovery reason"
+                )
+        elif self.manual_recovery_reason is not None:
+            raise ValueError(
+                "only manual recovery tasks may contain a manual recovery reason"
+            )
         evidence_ids = tuple(self.evidence_ids)
         if any(
             not isinstance(evidence_id, str) or not evidence_id.strip()
@@ -254,7 +379,7 @@ class Task:
         object.__setattr__(
             self,
             "arguments",
-            FrozenJsonObject.from_mapping(self.arguments),
+            arguments,
         )
 
 

@@ -9,18 +9,17 @@ project. Update it before and after every material task.
 - **Active task:** P2-05 — define and implement persisted task execution,
   durable fenced leases, and fail-closed recovery facts at the sole executor
   boundary
-- **Last completed task:** P2-04 — content-addressed blob durability plus
-  committed event replay and wake-hint subscription
-- **Current checkpoint:** P2-04 committed-event checkpoint
-  `b04fcb11e2e6bbf38341648b9b171341ae1996e3`
-  (`feat(v2): add committed event replay`)
+- **Last completed task:** P2-05b — portable task execution-safety,
+  dependency, lease, fencing-guard, and repository contracts
+- **Current checkpoint:** P2-05 planning checkpoint `1eb4c18`
+  (`docs(v2): plan fenced task execution`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** author and run P2-05b's expected-red portable contract
-  tests for the complete task vocabulary, immutable execution-safety facts,
-  dependency linkage, lease chronology, store-owned monotonic fencing, and
-  typed claim/fenced-commit failures before editing production code
+- **Exact next action:** author and run P2-05c's expected-red Migration 4 and
+  SQLite projection tests for conservative v3 task backfill, normalized
+  dependency/lease rows, strict codecs, transactional fenced operations, and
+  rollback/reopen behavior before editing the concrete adapter
 
 ## Mandatory architecture re-read
 
@@ -139,8 +138,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | ID | Status | Smallest output | Required proof before advancing |
 | --- | --- | --- | --- |
 | P2-05a | complete | Read-only task/execution/lease ownership inventory and locked test-first sequence | Existing aggregate, SQLite, runtime, capability replay facts, v1 behavioral oracles, exact deferrals, and no second executor/runtime/recovery owner are recorded before production edits |
-| P2-05b | active | Canonical task execution-safety, dependency, attempt, and fenced-lease records plus narrow repository contracts | Full task vocabulary and legal transitions; immutable capability/executor/input/idempotency facts; positive fencing tokens; lease chronology; typed claim/stale/terminal outcomes; no database types in portable records |
-| P2-05c | pending | Migration 4 and SQLite task/dependency/lease projection | Existing tasks backfill coherently; dependencies and leases normalize; materialize/claim/renew/release/terminal commits are transactional; migration rollback/reopen/strict-codec tests pass |
+| P2-05b | complete | Canonical task execution-safety, dependency, attempt, and fenced-lease records plus narrow repository contracts | Full task vocabulary and legal transitions; immutable capability/executor/input/idempotency facts; positive fencing tokens; lease chronology; typed claim/stale/terminal outcomes; no database types in portable records |
+| P2-05c | active | Migration 4 and SQLite task/dependency/lease projection | Existing tasks backfill coherently; dependencies and leases normalize; materialize/claim/renew/release/terminal commits are transactional; migration rollback/reopen/strict-codec tests pass |
 | P2-05d | pending | Durable materialize/readiness and fenced claim lifecycle | Task persists before claim; dependencies reuse terminal success; two claimers have one winner; expiry permits only declared replay-safe reclaim; terminal/cancelled/manual-recovery tasks never claim |
 | P2-05e | pending | Split operation-runtime materialize → claim → execute → validate → commit path | The sole existing runtime invokes the executor only with a live fence; stale holders commit no evidence/task/event; task/evidence/event success is atomic; timeouts/cancellation retain truthful durable intent |
 | P2-05f | pending | Fail-closed execution recovery and blob-backed evidence linkage | Replay-safe reads may resume after expiry; side-effecting unknown outcomes become manual recovery unless persisted idempotency proves safe; durable blob references precede evidence acceptance; terminal work is skipped |
@@ -336,7 +335,11 @@ actively leased task, mutate lease history, or accept its evidence. Fenced
 start and outcome commits verify exact holder/fence/attempt identity and strict
 `checked_at < expires_at` chronology inside the same atomic boundary. Equality
 with expiry is expired; renewal cannot resurrect an expired lease and must
-strictly extend it. A stale or expired holder changes no task, evidence, lease,
+strictly extend it. P2-05d's concrete stores must capture their injected clock
+while holding the store lock/SQLite transaction, require request/guard audit
+times to match that authoritative instant, bound claim duration, and construct
+the committed claim event from the allocated attempt/fence rather than trusting
+a prebuilt payload. A stale or expired holder changes no task, evidence, lease,
 event, or operation revision. The executor request receives the committed
 attempt, fence, and stable idempotency key, and `operations/runtime.py` remains
 the sole production `executor.execute(...)` caller.
@@ -481,6 +484,10 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-04h distribution gate | PASS — clean-copy v2 wheel/sdist contain 26/41 entries at `2.0.0a0`; physical-`next/` root wheel/sdist remain 401/442 entries at v1 `1.0.0`; archive boundaries are clean and fresh Python 3.11/3.12 installs import blob/event/SQLite v2 owners from their own site-packages |
 | P2-04h scoped checkpoint | PASS — exactly 11 reviewed paths, all under `next/`; cached diff and configured whitespace/EOF/conflict/large-file/Black hooks passed; commit `b04fcb11e2e6bbf38341648b9b171341ae1996e3` |
 | P2-05a task/lease ownership inventory | PASS — read-only plan, current-v2, and root-v1 oracle inspection plus two independent design audits keep the existing operation runtime/store/SQLite transaction as the only owners; exact records, narrow repository operations, fail-closed recovery rules, highest-value tests, and P2-06/P2-07/P2-08 deferrals are locked before production edits |
+| Initial P2-05b portable execution contract | EXPECTED RED — the dynamic model slice reported 56 missing-contract failures without collection errors; the combined store/checkpoint run stopped on exactly 2 collection errors for the intentionally absent `operations.leases` owner |
+| P2-05b portable task/lease/store contract | PASS — 91 focused cases and all 463 v2 tests pass; exact task vocabulary, canonical-argument-bound materialization facts and capability fingerprints, dependency DAG integrity, nonoverlapping lease chronology, correlated claim results, portable claim/guard/error shapes, and the sole existing runtime owner are covered |
+| P2-05b independent safety audit | PASS after repair — two reviewers found generic commit could still advance an actively leased task, lease attempts could overlap, argument hashes were not bound to task arguments, claim results lacked aggregate correlation, and dependencies could be added after readiness; regressions now close each bypass, while authoritative store time/event construction remains explicitly owned by P2-05d |
+| P2-05b static and architecture gate | PASS — Black clean across 71 files; byte compilation succeeds; mypy is clean across 70 source files; pyright 1.1.411 reports 0 errors/warnings; the complete suite includes all architecture tests |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
