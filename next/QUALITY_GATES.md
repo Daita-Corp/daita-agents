@@ -92,9 +92,9 @@ read-only Phase 0 scope.
 
 ## Phase 1 — loop laboratory
 
-Status: **P1-03 committed at
-`e5258c0a0234e377b4581c744073609fe9e3d999`; P1-04 active; no Phase 1 gate
-claimed.**
+Status: **P1-04 committed at
+`91d73764af34a3e04938b9c5cdde4a457d2af7e9`; P1-05 implementation and
+verification complete with checkpoint pending; no Phase 1 gate claimed.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 0 commit and before
 the first Phase 1 production edit. Phase 1 evidence will be appended only for
@@ -185,7 +185,7 @@ commands actually run.
 | P1-Q22 | `next/` | Black check, byte compilation, full mypy, and pyright 1.1.411 across source, tests, and inventory script | PASS — Black reported 34 files unchanged; compilation succeeded; mypy found no issues in 33 source files; pyright reported 0 errors and 0 warnings |
 | P1-Q23 | repository root and `next/` | Independent final boundary review; all architecture tests; sole `.execute()` scan; v1/symlink/root-oracle checks; `git diff --check`; scoped status review | PASS — no blocker, prohibited reference, symlink, root change, diff error, or path outside `next/`; 19 architecture tests; sole production executor invocation is `operations/runtime.py:719` |
 | P1-Q24 | clean copy `/private/tmp/daita-v2-p1-04-final.ySk4bb` | Build sdist/wheel without isolation and inspect both archives for required runtime modules and forbidden test/nested paths | PASS — build succeeded; 18-entry wheel and 31-entry sdist contain the generic loop/operation runtime and no tests or nested `next/` path |
-| P1-Q25 | repository root | Stage the 10 reviewed P1-04 paths under `next/`; run `git diff --cached --check` and all configured pre-commit hooks | PASS — every staged path is under `next/`; no diff-check error; trailing-whitespace, end-of-file, merge-conflict, large-file, and Black hooks passed |
+| P1-Q25 | repository root | Stage the 10 reviewed P1-04 paths under `next/`; run `git diff --cached --check` and all configured pre-commit hooks; create the scoped checkpoint | PASS — every staged path was under `next/`; no diff-check error; all configured hooks passed; commit `91d73764af34a3e04938b9c5cdde4a457d2af7e9` |
 
 ### P1-04 red/repair evidence
 
@@ -219,6 +219,56 @@ commands actually run.
 - The sandbox rejected the first scoped stage and pre-commit attempts because
   Git could not create `index.lock`. Approved reruns used the same ten
   `next/` paths and configured hooks; staging and all hooks then passed.
+
+### Executed P1-05 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P1-Q26 | `next/` | Run expanded `LoopBudgets` model tests before adding comprehensive fields | EXPECTED RED — 10 failed and 8 passed; missing turn/action/observation/token/time/task/cost fields were identified |
+| P1-Q27 | `next/` | Focused loop-model, budget acceptance, and runtime-budget tests after the first implementation | PASS — 33 passed; operation-bound limits, exact N/N+1 behavior, response usage, observation overrun, wall/model timeout, task timeout, executor-owned `TimeoutError`, budget facts, and atomic rollback are covered |
+| P1-Q28 | `next/` | Focused cancellation acceptance and runtime-interruption tests | PASS — 7 passed; model/executor/post-evidence cancellation, repeated cancellation, wall-terminal-commit race, typed interruption, and atomic event failure are covered |
+| P1-Q29 | `next/` | Run cancellation-suppressing provider/executor and task-persistence deadline regressions before repairing deadline ownership | EXPECTED RED — exactly 3 failures: late provider response completed, late executor result became evidence, and executor I/O ran after the wall deadline |
+| P1-Q30 | `next/` | Run external caller-cancellation suppression regressions before adding explicit cancellation checks | EXPECTED RED — 2 failures because provider/executor adapters swallowed `CancelledError` and returned normally |
+| P1-Q31 | `next/` | Final focused loop-model, budget, adversarial-deadline, cancellation, and runtime modules | PASS — 46 passed, including 28 deadline/budget/cancellation/runtime cases; independent re-review found no blocker |
+| P1-Q32 | `next/` | Complete isolated suite with `-S` and explicit v2 `PYTHONPATH` on CPython 3.11.15 and 3.12.7 | PASS — 150 passed on each interpreter |
+| P1-Q33 | repository root and `next/` | Black check, byte compilation, full mypy, and pyright 1.1.411 across source, tests, and inventory script | PASS — Black reported 39 files unchanged; compilation succeeded; mypy found no issues in 38 source files; pyright reported 0 errors and 0 warnings |
+| P1-Q34 | repository root and `next/` | Independent final deadline review; architecture tests; sole `.execute()` scan; v1/symlink/root-oracle checks; `git diff --check`; scoped status review | PASS — no blocker, prohibited reference, symlink, root change, or diff error; 19 architecture tests; sole production executor invocation is `operations/runtime.py:830` |
+| P1-Q35 | clean copy `/private/tmp/daita-v2-p1-05.ZIaT8S` | Build sdist/wheel without isolation and inspect both archives for required runtime modules and forbidden test/nested paths | PASS — build succeeded; 18-entry wheel and 31-entry sdist contain the generic loop/operation runtime and no tests or nested `next/` path |
+| P1-Q36 | repository root | Stage the 12 reviewed P1-05 paths under `next/`; run `git diff --cached --check` and all configured pre-commit hooks | PASS — every staged path is under `next/`; cached diff check is clean; trailing-whitespace, end-of-file, merge-conflict, large-file, and Black hooks passed |
+
+### P1-05 red/repair evidence
+
+- The expanded budget-record run first failed ten cases on the intentionally
+  absent fields. The first parallel budget acceptance run met concurrent
+  production and exposed eight naming/payload expectation mismatches rather
+  than semantic gaps; aligning the tests to the locked inspectable facts made
+  all 33 model/budget cases pass.
+- Initial raw-cancellation tests landed after their production surface and
+  were already green. Follow-up races prove cancellation-resistant terminal
+  commits, active-child intent, atomic rollback, and preservation of accepted
+  evidence without falsely claiming an observation.
+- Independent adversarial review found three root deadline defects. Both
+  provider and executor adapters could suppress timeout cancellation and
+  return usable late results, while task-persistence work could exhaust wall
+  time before the runtime's sole executor call. Post-context expiry checks and
+  a runtime-owned authoritative pre-I/O deadline recomputation now reject late
+  results, omit false executor-start events, and preserve distinct wall/task
+  terminal facts.
+- Two additional expected-red cases showed an adapter could suppress the
+  caller's raw `CancelledError`. Pending task-cancellation checks at both model
+  and executor await boundaries restore cancellation precedence and durable
+  interruption. The nested wall-failure handler also ensures cancellation
+  during a terminal budget commit cannot strand a running operation.
+- The first full mypy pass found two narrow production typing errors; explicit
+  integer/duration loop variables and a narrowed final-text binding repaired
+  them without suppressions. The first pyright command omitted the venv
+  `--pythonpath` and reported only unresolved pytest imports; the established
+  command passed with zero diagnostics. An initial collection-count path and
+  archive filename guess likewise failed without changing tracked state and
+  passed immediately when corrected.
+- The sandbox rejected the first scoped stage and pre-commit invocations at
+  Git's `index.lock`. Approved reruns used the same 12 `next/` paths; cached
+  diff review and all configured hooks passed.
 
 ## Phases 2 through 9
 

@@ -44,16 +44,68 @@ def test_loop_state_keeps_phase_and_budget_counters_separate() -> None:
 
 
 def test_loop_budgets_bound_repairs_and_identical_failures() -> None:
-    budgets = LoopBudgets(max_repairs=3, max_identical_failures=2)
+    budgets = LoopBudgets(
+        max_turns=6,
+        max_actions=8,
+        max_repairs=3,
+        max_identical_failures=2,
+        max_observation_characters=4096,
+        max_total_tokens=2048,
+        max_wall_time_seconds=30.0,
+        task_timeout_seconds=5.0,
+        max_estimated_cost_usd=Decimal("0.25"),
+    )
 
+    assert budgets.max_turns == 6
+    assert budgets.max_actions == 8
     assert budgets.max_repairs == 3
     assert budgets.max_identical_failures == 2
+    assert budgets.max_observation_characters == 4096
+    assert budgets.max_total_tokens == 2048
+    assert budgets.max_wall_time_seconds == 30.0
+    assert budgets.task_timeout_seconds == 5.0
+    assert budgets.max_estimated_cost_usd == Decimal("0.25")
 
     with pytest.raises(ValueError, match="positive"):
         LoopBudgets(max_repairs=0)
 
     with pytest.raises(ValueError, match="positive"):
         LoopBudgets(max_identical_failures=0)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("max_turns", 0),
+        ("max_actions", False),
+        ("max_observation_characters", -1),
+        ("max_total_tokens", 0),
+        ("max_wall_time_seconds", 0.0),
+        ("max_wall_time_seconds", float("inf")),
+        ("task_timeout_seconds", -1.0),
+        ("task_timeout_seconds", float("nan")),
+    ],
+)
+def test_loop_budget_limits_must_be_finite_and_positive(
+    field_name: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="positive|finite"):
+        LoopBudgets(**{field_name: value})  # type: ignore[arg-type]
+
+
+def test_optional_cost_budget_requires_a_finite_non_negative_decimal() -> None:
+    assert LoopBudgets(max_estimated_cost_usd=None).max_estimated_cost_usd is None
+    assert LoopBudgets(max_estimated_cost_usd=Decimal("0")).max_estimated_cost_usd == 0
+
+    with pytest.raises(TypeError, match="Decimal"):
+        LoopBudgets(max_estimated_cost_usd=0.1)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="finite|non-negative"):
+        LoopBudgets(max_estimated_cost_usd=Decimal("NaN"))
+
+    with pytest.raises(ValueError, match="finite|non-negative"):
+        LoopBudgets(max_estimated_cost_usd=Decimal("-0.01"))
 
 
 def test_turn_requires_positive_number_and_stable_operation_linkage() -> None:

@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
+import math
 from uuid import uuid4
 
 from .._json import FrozenJsonObject, canonical_json
@@ -20,6 +21,7 @@ from ..capabilities import (
 )
 from ..llm.models import ModelRequest, ModelResponse, ToolCall
 from ..loop.models import (
+    LoopBudgets,
     LoopExit,
     LoopExitKind,
     LoopPhase,
@@ -43,6 +45,25 @@ from .models import (
 
 class OperationStateError(RuntimeError):
     """Raised when a runtime transition conflicts with committed state."""
+
+
+class TaskExecutionTimeout(CapabilityExecutionError):
+    """Raised after a runtime-owned executor deadline is durably recorded."""
+
+    def __init__(self, task_id: str, timeout_seconds: float) -> None:
+        self.task_id = task_id
+        self.timeout_seconds = timeout_seconds
+        super().__init__(f"task {task_id} exceeded {timeout_seconds:g} seconds")
+
+
+class OperationWallTimeExceeded(CapabilityExecutionError):
+    """Raised when the operation deadline prevents or bounds executor I/O."""
+
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+        super().__init__(
+            f"operation wall-time limit expired before task {task_id} completed"
+        )
 
 
 class ModelCallStatus(str, Enum):
@@ -92,6 +113,7 @@ class ModelCall:
     updated_at: datetime
     response: ModelResponse | None = None
     error_code: str | None = None
+    cancellation_requested: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +121,7 @@ class OperationSnapshot:
     trigger: AgentTrigger
     operation: Operation
     loop_state: LoopState
+    budgets: LoopBudgets
     turns: tuple[Turn, ...]
     model_calls: tuple[ModelCall, ...]
     readiness: tuple[Readiness, ...]
@@ -113,6 +136,7 @@ class _OperationState:
     trigger: AgentTrigger
     operation: Operation
     loop_state: LoopState
+    budgets: LoopBudgets
     turns: list[Turn]
     model_calls: list[ModelCall]
     readiness: list[Readiness]
@@ -152,8 +176,15 @@ class OperationRuntime:
         self._states: dict[str, _OperationState] = {}
         self._operation_by_trigger: dict[str, str] = {}
 
-    async def begin(self, trigger: AgentTrigger) -> OperationSnapshot:
+    async def begin(
+        self,
+        trigger: AgentTrigger,
+        *,
+        budgets: LoopBudgets = LoopBudgets(),
+    ) -> OperationSnapshot:
         async with self._lock:
+            if not isinstance(budgets, LoopBudgets):
+                raise TypeError("budgets must be a LoopBudgets record")
             existing_id = self._operation_by_trigger.get(trigger.id)
             if existing_id is not None:
                 raise OperationStateError(
@@ -178,6 +209,7 @@ class OperationRuntime:
                 trigger=trigger,
                 operation=operation,
                 loop_state=LoopState(phase=LoopPhase.PREPARING_CONTEXT),
+                budgets=budgets,
                 turns=[],
                 model_calls=[],
                 readiness=[],
@@ -592,9 +624,24 @@ class OperationRuntime:
             self._commit(state)
             return observation
 
-    async def submit(self, proposal: ActionProposal) -> Evidence:
+    async def submit(
+        self,
+        proposal: ActionProposal,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Evidence:
         if not isinstance(proposal, ActionProposal):
             raise TypeError("proposal must be an ActionProposal")
+        if timeout_seconds is not None and (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be finite and positive")
+        requested_timeout_seconds = (
+            None if timeout_seconds is None else float(timeout_seconds)
+        )
 
         # Commit the unexecuted task first. The proposal is untrusted until it
         # is bound to an exact tool call in a committed model response.
@@ -677,6 +724,9 @@ class OperationRuntime:
 
         # A separate atomic transition makes RUNNING and executor.started
         # durable before the only external execution call in production code.
+        wall_deadline_error: OperationWallTimeExceeded | None = None
+        execution_timeout_seconds = 0.0
+        timeout_is_wall = False
         async with self._lock:
             state = self._working_state(task.operation_id)
             task_index, committed_task = self._task(state, task.id)
@@ -705,7 +755,65 @@ class OperationRuntime:
                 executor_id=task.executor_id,
                 payload={"task_id": task.id, "executor_id": task.executor_id},
             )
-            self._commit(state)
+            deadline_now = self._clock()
+            if deadline_now.tzinfo is None or deadline_now.utcoffset() is None:
+                raise ValueError("runtime clock must return a timezone-aware datetime")
+            elapsed_seconds = max(
+                0.0,
+                (deadline_now - state.operation.created_at).total_seconds(),
+            )
+            remaining_wall_time = state.budgets.max_wall_time_seconds - elapsed_seconds
+            if remaining_wall_time <= 0:
+                # Discard the uncommitted RUNNING/executor.started projection.
+                # The persisted task proves that execution was blocked before
+                # the executor invocation boundary.
+                state = self._working_state(task.operation_id)
+                task_index, pending_task = self._task(state, task.id)
+                state.tasks[task_index] = replace(
+                    pending_task,
+                    status=TaskStatus.FAILED,
+                    updated_at=deadline_now,
+                    error_code="task_timeout",
+                )
+                state.operation = replace(
+                    state.operation,
+                    updated_at=deadline_now,
+                )
+                self._append_event(
+                    state,
+                    "task.failed",
+                    turn_id=pending_task.turn_id,
+                    call_id=pending_task.call_id,
+                    task_id=pending_task.id,
+                    capability_id=pending_task.capability_id,
+                    executor_id=pending_task.executor_id,
+                    payload={
+                        "task_id": pending_task.id,
+                        "error_code": "task_timeout",
+                    },
+                )
+                self._commit(state)
+                wall_deadline_error = OperationWallTimeExceeded(task.id)
+            else:
+                timeout_candidates = [
+                    state.budgets.task_timeout_seconds,
+                    remaining_wall_time,
+                ]
+                if requested_timeout_seconds is not None:
+                    timeout_candidates.append(requested_timeout_seconds)
+                execution_timeout_seconds = min(timeout_candidates)
+                timeout_is_wall = remaining_wall_time <= min(
+                    state.budgets.task_timeout_seconds,
+                    (
+                        requested_timeout_seconds
+                        if requested_timeout_seconds is not None
+                        else math.inf
+                    ),
+                )
+                self._commit(state)
+
+        if wall_deadline_error is not None:
+            raise wall_deadline_error
 
         request = ExecutionRequest(
             operation_id=task.operation_id,
@@ -715,13 +823,44 @@ class OperationRuntime:
             attempt=task.attempt,
             arguments=task.arguments,
         )
+        timeout = asyncio.timeout(execution_timeout_seconds)
+        deadline_cause: Exception | None = None
         try:
-            candidate = await executor.execute(request)
+            async with timeout:
+                candidate = await executor.execute(request)
+        except asyncio.CancelledError:
+            raise
         except Exception as error:
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                raise asyncio.CancelledError from error
+            if timeout.expired():
+                deadline_cause = error
+            else:
+                await self._fail_task(task.id, "executor_failed")
+                raise CapabilityExecutionError(
+                    f"executor failed for task {task.id}"
+                ) from error
+
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling():
+            raise asyncio.CancelledError
+        if timeout.expired():
+            await self._fail_task(task.id, "task_timeout")
+            if timeout_is_wall:
+                raise OperationWallTimeExceeded(task.id) from deadline_cause
+            raise TaskExecutionTimeout(
+                task.id,
+                execution_timeout_seconds,
+            ) from deadline_cause
+
+        if deadline_cause is not None:
+            # ``timeout.expired()`` is stable once the context has exited, so
+            # this branch is defensive against an invalid timeout lifecycle.
             await self._fail_task(task.id, "executor_failed")
             raise CapabilityExecutionError(
                 f"executor failed for task {task.id}"
-            ) from error
+            ) from deadline_cause
 
         execution_identity_error: Exception | None = None
         accepted_candidate: EvidenceCandidate | None = None
@@ -1008,6 +1147,137 @@ class OperationRuntime:
             self._commit(state)
             return result
 
+    async def fail_budget(
+        self,
+        operation_id: str,
+        reason: str,
+        *,
+        budget: str,
+        limit: int | float | str,
+        used: int | float | str,
+        turn_id: str | None = None,
+        call_id: str | None = None,
+        task_id: str | None = None,
+    ) -> LoopExit:
+        """Atomically persist one loop-owned budget decision and failure."""
+
+        _required_text(reason, "budget failure reason")
+        _required_text(budget, "budget kind")
+        async with self._lock:
+            state = self._working_state(operation_id)
+            if state.model_calls and (
+                state.model_calls[-1].status is ModelCallStatus.STARTED
+            ):
+                model_call = state.model_calls[-1]
+                state.model_calls[-1] = replace(
+                    model_call,
+                    status=ModelCallStatus.FAILED,
+                    error_code=reason,
+                    updated_at=self._clock(),
+                )
+                self._append_event(
+                    state,
+                    "model_call.failed",
+                    turn_id=model_call.turn_id,
+                    payload={
+                        "error_code": reason,
+                        "model_call_id": model_call.id,
+                    },
+                )
+            self._append_event(
+                state,
+                "budget.exhausted",
+                turn_id=turn_id,
+                call_id=call_id,
+                task_id=task_id,
+                payload={
+                    "budget": budget,
+                    "limit": limit,
+                    "reason": reason,
+                    "used": used,
+                },
+            )
+            result = self._fail_locked(state, reason)
+            self._commit(state)
+            return result
+
+    async def interrupt(
+        self,
+        operation_id: str,
+        reason: str = "run_cancelled",
+    ) -> LoopExit:
+        """Persist interruption and active-child cancellation intent atomically."""
+
+        _required_text(reason, "interruption reason")
+        async with self._lock:
+            state = self._working_state(operation_id)
+            now = self._clock()
+            active_task_index = next(
+                (
+                    index
+                    for index in range(len(state.tasks) - 1, -1, -1)
+                    if state.tasks[index].status
+                    in {TaskStatus.PENDING, TaskStatus.RUNNING}
+                ),
+                None,
+            )
+            if active_task_index is not None:
+                task = state.tasks[active_task_index]
+                state.tasks[active_task_index] = replace(
+                    task,
+                    cancellation_requested=True,
+                    updated_at=now,
+                )
+                self._append_event(
+                    state,
+                    "task.cancellation_requested",
+                    turn_id=task.turn_id,
+                    call_id=task.call_id,
+                    task_id=task.id,
+                    capability_id=task.capability_id,
+                    executor_id=task.executor_id,
+                    payload={"reason": reason, "status": task.status.value},
+                )
+            elif state.model_calls and (
+                state.model_calls[-1].status is ModelCallStatus.STARTED
+            ):
+                model_call = state.model_calls[-1]
+                state.model_calls[-1] = replace(
+                    model_call,
+                    cancellation_requested=True,
+                    updated_at=now,
+                )
+                self._append_event(
+                    state,
+                    "model_call.cancellation_requested",
+                    turn_id=model_call.turn_id,
+                    payload={"model_call_id": model_call.id, "reason": reason},
+                )
+            state.operation = replace(
+                state.operation,
+                status=OperationStatus.INTERRUPTED,
+                updated_at=now,
+                terminal_reason=reason,
+            )
+            state.loop_state = replace(
+                state.loop_state,
+                phase=LoopPhase.TERMINAL,
+                interruption_reason=reason,
+            )
+            self._append_event(
+                state,
+                "operation.interrupted",
+                payload={"reason": reason},
+            )
+            result = LoopExit(
+                operation_id=operation_id,
+                kind=LoopExitKind.INTERRUPTED,
+                reason=reason,
+                created_at=now,
+            )
+            self._commit(state)
+            return result
+
     async def record_model_failure(
         self,
         operation_id: str,
@@ -1045,6 +1315,19 @@ class OperationRuntime:
                 raise KeyError(f"Unknown operation: {operation_id}") from error
             return self._snapshot(state)
 
+    async def elapsed_seconds(self, operation_id: str) -> float:
+        """Return authoritative elapsed wall time from the runtime clock."""
+
+        async with self._lock:
+            try:
+                state = self._states[operation_id]
+            except KeyError as error:
+                raise KeyError(f"Unknown operation: {operation_id}") from error
+            now = self._clock()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("runtime clock must return a timezone-aware datetime")
+            return max(0.0, (now - state.operation.created_at).total_seconds())
+
     def _active_state(self, operation_id: str) -> _OperationState:
         try:
             state = self._states[operation_id]
@@ -1065,6 +1348,7 @@ class OperationRuntime:
             trigger=committed.trigger,
             operation=committed.operation,
             loop_state=committed.loop_state,
+            budgets=committed.budgets,
             turns=list(committed.turns),
             model_calls=list(committed.model_calls),
             readiness=list(committed.readiness),
@@ -1304,6 +1588,7 @@ class OperationRuntime:
             trigger=state.trigger,
             operation=state.operation,
             loop_state=state.loop_state,
+            budgets=state.budgets,
             turns=tuple(state.turns),
             model_calls=tuple(state.model_calls),
             readiness=tuple(state.readiness),

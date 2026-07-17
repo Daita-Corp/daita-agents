@@ -6,18 +6,19 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 1 — loop laboratory
-- **Active task:** P1-04 checkpoint — its bounded correction/no-progress
-  implementation and final verification are complete
-- **Last completed task:** P1-04 implementation — invalid actions and denied
-  readiness now become bounded, inspectable repair turns
-- **Current checkpoint:** P1-03 commit
-  `e5258c0a0234e377b4581c744073609fe9e3d999`
-  (`feat(v2): prove fake-read execution boundary`)
+- **Active task:** P1-05 checkpoint — implementation, adversarial review, and
+  final verification are complete
+- **Last completed task:** P1-05 implementation — operation-bound budgets,
+  runtime-owned execution deadlines, and cancellation-resistant interruption
+  are inspectable and provider neutral
+- **Current checkpoint:** P1-04 commit
+  `91d73764af34a3e04938b9c5cdde4a457d2af7e9`
+  (`feat(v2): add bounded repair progression`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** stage only the reviewed P1-04 paths under `next/`, run
-  the configured hooks, create its passing checkpoint, and advance to P1-05
+- **Exact next action:** stage only the reviewed P1-05 paths under `next/`, run
+  the configured hooks, create the passing checkpoint, and advance to P1-06
 
 ## Mandatory architecture re-read
 
@@ -71,8 +72,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P1-01 | complete | Re-read Sections 6 and 15; Phase 1 work/gate; ADRs 0002–0005 and 0008; v1 neutral fixtures | Minimal immutable canonical loop/model records and `ModelProvider` protocol, with no provider wire format or executor reference | 25 focused tests; strict JSON mutation isolation; provider-neutral message/tool records; trigger/operation/turn/action/observation/readiness/exit invariants; exact Decimal usage; mypy/pyright clean | Phase 0 gate |
 | P1-02 | complete | P1-01 records | Text-only vertical slice with deterministic scripted mock model, static context, copy-on-write in-memory operation/turn/event state, direct generic loop, and readiness commit | 7 focused tests; exact success event order; optional session; model call committed before I/O; stable provider failure with no whole-loop retry; injected commit failure publishes no partial state | P1-01 |
 | P1-03 | complete | P1-02 loop; fake capability contract | Minimal capability registry/tool projection, fake read executor, in-memory task/evidence state, and operation runtime submission path | 30 focused tests; exact proposal/projection binding; durable PENDING/RUNNING/success checkpoints; accepted evidence before observation; one/two sequential reads; injected atomic failures; sole executor call site; commit `e5258c0` | P1-02 |
-| P1-04 | active — checkpoint pending | P1-03 action path | Structured invalid-action observations, bounded repair turns, normalized failure fingerprints, and no-progress termination | 42 focused and 113 complete tests; invalid/readiness repair, multi-call skip ordering, normalized early stop, changed-action progress, atomic failures | P1-03 |
-| P1-05 | pending | P1-02 through P1-04 | Cancellation checks plus turn, action, repair, identical-retry, wall-time, task-timeout, token, observation, and estimated-cost budgets | Every budget exits honestly with inspectable state/events; cancellation persists interruption state | P1-04 |
+| P1-04 | complete | P1-03 action path | Structured invalid-action observations, bounded repair turns, normalized failure fingerprints, and no-progress termination | 42 focused and 113 complete tests; atomic ordered repair/skip boundaries; commit `91d7376` | P1-03 |
+| P1-05 | active — checkpoint pending | P1-02 through P1-04 | Cancellation checks plus turn, action, repair, identical-retry, wall-time, task-timeout, token, observation, and estimated-cost budgets | 46 focused and 150 complete tests; adversarial deadline/cancellation suppression; atomic interruption/budget commits; Python 3.11/3.12, static, architecture, and build gates pass | P1-04 |
 | P1-06 | pending | Complete loop laboratory | Deterministic scripted acceptance trajectories and architecture assertions covering every Phase 1 gate | No domain/provider branch; only operation runtime contains executor invocation; full suites on Python 3.11/3.12; static/build scans | P1-05 |
 | P1-07 | pending | Passing P1-06 results | Final Phase 1 ledger/evidence and coherent gate commit | scoped diff; root oracle unchanged; pre-commit; `chore(v2-phase-1): complete phase 1 gate` | P1-06 |
 
@@ -103,6 +104,12 @@ The binding rationale and consequences are recorded in `next/decisions/`.
   the generic driver owns repair progression; and the operation runtime owns
   exact-call binding, normalized fingerprints, taskless observations, atomic
   multi-call skips, no-progress facts, and terminal commits.
+- P1-05 extends the same immutable budget, generic-driver, and operation-runtime
+  owners. Budgets bind to the operation snapshot; the loop alone decides
+  progression and terminal meaning; the runtime rechecks the authoritative
+  wall deadline immediately before its sole executor call, rejects late
+  timeout-suppressed results, and atomically records active-child cancellation
+  intent before interruption becomes terminal.
 - Later Phase 1 owners are created only when their vertical slice becomes the
   active task; the target tree is not being scaffolded in advance.
 - Root `daita/`: **not being changed**
@@ -158,8 +165,16 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P1-04 Black, compile, mypy, and pyright checks | PASS — Black reported 34 files unchanged; compilation succeeded; mypy found no issues in 33 source files; pyright reported 0 errors/warnings |
 | P1-04 independent review, architecture/root/scoped scans, and clean-copy build | PASS — no blocker or root/v1/symlink leak; 19 architecture tests; sole production executor call remains in `operations/runtime.py`; 18-entry wheel and 31-entry sdist exclude tests/nested `next/` paths |
 | P1-04 scoped stage and configured pre-commit hooks | PASS — exactly 10 reviewed paths, all under `next/`; cached diff check clean; trailing-whitespace, end-of-file, merge-conflict, large-file, and Black hooks passed |
+| Initial P1-05 loop-budget model run | EXPECTED RED — 10 failures and 8 passes identified the absent comprehensive budget fields and validation |
+| Final P1-05 focused budget/cancellation/runtime suite | PASS — 46 passed; covers exact N/N+1 limits, response-usage commits, observation overrun, wall/task deadline precedence, cancellation at model/executor/post-evidence boundaries, repeated cancellation, atomic failures, and suppression-resistant deadlines |
+| P1-05 adversarial deadline run before root-cause repair | EXPECTED RED — exactly 3 failures proved late provider/executor results were accepted and task-persistence time could cross the wall deadline before I/O |
+| P1-05 external-cancellation suppression run before repair | EXPECTED RED — 2 failures proved provider/executor adapters could swallow the caller's cancellation |
+| Final P1-05 complete isolated v2 suites on CPython 3.11.15 and 3.12.7 | PASS — 150 passed on each interpreter |
+| P1-05 Black, compile, mypy, and pyright checks | PASS — Black reported 39 files unchanged; compilation succeeded; mypy found no issues in 38 source files; pyright 1.1.411 reported 0 errors/warnings |
+| P1-05 independent review, architecture/root/scoped scans, and clean-copy build | PASS — no blocker or root/v1/symlink leak; 19 architecture tests; sole production executor call is `operations/runtime.py:830`; root oracle unchanged; 18-entry wheel and 31-entry sdist exclude tests/nested `next/` paths |
+| P1-05 scoped stage and configured pre-commit hooks | PASS — exactly 12 reviewed paths, all under `next/`; cached diff check clean; trailing-whitespace, end-of-file, merge-conflict, large-file, and Black hooks passed |
 
-Phase 0 and P1-01 through P1-03 are checkpointed. P1-04 implementation and
+Phase 0 and P1-01 through P1-04 are checkpointed. P1-05 implementation and
 verification are complete; only its scoped checkpoint remains.
 
 ## Known failures and baselines
@@ -235,6 +250,31 @@ verification are complete; only its scoped checkpoint remains.
 - The first amended static pass found two test-only `.to_dict()` calls lacking
   explicit `FrozenJsonObject` narrowing. Adding the runtime type assertions
   made both mypy and pyright clean without production suppressions.
+- P1-05 red/repair history: the initial loop-record run exposed the absent
+  budget fields. Parallel budget tests first met concurrent production and
+  reported eight API-label expectation mismatches; aligning them to the locked
+  inspectable budget facts produced 33/33 passing model/budget tests. The first
+  cancellation tests likewise landed after their production surface and were
+  green, so later adversarial tests supplied the independent red evidence.
+- Independent P1-05 review reproduced three root deadline failures: a provider
+  and executor could suppress timeout cancellation and return a late result,
+  and task persistence could consume the wall budget before executor I/O. The
+  loop/runtime now reject post-timeout results, recompute operation remaining
+  time immediately before execution, discard false executor-start state, and
+  keep wall versus task terminal reasons distinct. A second red pair proved
+  caller cancellation could also be swallowed; explicit pending-cancellation
+  checks now preserve interruption precedence.
+- The first P1-05 mypy pass exposed two production narrowing issues in reused
+  budget loop variables and a nullable final-text closure; distinct variable
+  names and an explicitly narrowed final-text binding repaired both without
+  ignores. The first pyright invocation omitted the configured venv
+  `--pythonpath` and therefore could not resolve pytest; the established
+  command immediately passed with zero diagnostics. One collection count and
+  the first archive-inspection command also used incorrect paths, failed before
+  changing tracked state, and passed after correction.
+- The sandbox rejected the first P1-05 stage and pre-commit invocations because
+  Git could not create `index.lock`. Approved reruns preserved the exact 12-file
+  `next/` scope; staging, cached diff review, and every configured hook passed.
 - Two verification invocations used incorrect cwd-relative paths (the first
   clean-copy source and one `rg` scan). Both failed before changing tracked
   state and were immediately rerun with explicit correct paths.
@@ -275,8 +315,8 @@ verification are complete; only its scoped checkpoint remains.
 - [x] Fake read follows the durable task/execution/evidence/observation order.
 - [x] Invalid action becomes a bounded observation and repair turn.
 - [x] Repeated identical failure stops early with an inspectable reason.
-- [ ] Cancellation persists an inspectable state.
-- [ ] Turn, action, repair, time, token, observation, and cost budgets terminate
+- [x] Cancellation persists an inspectable state.
+- [x] Turn, action, repair, time, token, observation, and cost budgets terminate
       honestly.
 - [x] The loop contains no domain-specific or provider-specific branch.
 - [x] A repository assertion proves only the operation runtime invokes the

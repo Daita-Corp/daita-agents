@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+import math
 
 from .._json import canonical_json
 
@@ -50,16 +51,53 @@ class LoopBudgets:
     including the first failure; a value of two therefore permits one retry.
     """
 
+    max_turns: int = 8
+    max_actions: int = 16
     max_repairs: int = 3
     max_identical_failures: int = 2
+    max_observation_characters: int = 100_000
+    max_total_tokens: int = 100_000
+    max_wall_time_seconds: float = 300.0
+    task_timeout_seconds: float = 30.0
+    max_estimated_cost_usd: Decimal | None = None
 
     def __post_init__(self) -> None:
-        for field_name, value in (
+        for field_name, integer_value in (
+            ("max_turns", self.max_turns),
+            ("max_actions", self.max_actions),
             ("max_repairs", self.max_repairs),
             ("max_identical_failures", self.max_identical_failures),
+            ("max_observation_characters", self.max_observation_characters),
+            ("max_total_tokens", self.max_total_tokens),
         ):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            if (
+                not isinstance(integer_value, int)
+                or isinstance(integer_value, bool)
+                or integer_value < 1
+            ):
                 raise ValueError(f"{field_name} must be a positive integer")
+        for field_name, duration_value in (
+            ("max_wall_time_seconds", self.max_wall_time_seconds),
+            ("task_timeout_seconds", self.task_timeout_seconds),
+        ):
+            if (
+                not isinstance(duration_value, (int, float))
+                or isinstance(duration_value, bool)
+                or not math.isfinite(duration_value)
+                or duration_value <= 0
+            ):
+                raise ValueError(f"{field_name} must be finite and positive")
+            object.__setattr__(self, field_name, float(duration_value))
+        if self.max_estimated_cost_usd is not None:
+            if not isinstance(self.max_estimated_cost_usd, Decimal):
+                raise TypeError("max_estimated_cost_usd must be a Decimal or None")
+            if (
+                not self.max_estimated_cost_usd.is_finite()
+                or self.max_estimated_cost_usd < 0
+            ):
+                raise ValueError(
+                    "max_estimated_cost_usd must be finite and non-negative"
+                )
 
 
 @dataclass(frozen=True, slots=True)

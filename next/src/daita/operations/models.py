@@ -209,6 +209,7 @@ class Task:
     updated_at: datetime
     evidence_ids: tuple[str, ...] = ()
     error_code: str | None = None
+    cancellation_requested: bool = False
 
     def __post_init__(self) -> None:
         _required_text(self.id, "task id")
@@ -229,6 +230,8 @@ class Task:
         _aware(self.updated_at, "task updated_at")
         if self.updated_at < self.created_at:
             raise ValueError("task updated_at cannot precede created_at")
+        if not isinstance(self.cancellation_requested, bool):
+            raise TypeError("task cancellation_requested must be a boolean")
         if self.error_code is not None:
             _required_text(self.error_code, "task error_code")
         if self.status is TaskStatus.FAILED and self.error_code is None:
