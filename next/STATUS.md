@@ -6,19 +6,19 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-03 — build the SQLite foundation and normalized operation
-  lifecycle repository against the proven optimistic contract
-- **Last completed task:** P2-02 — canonical checkpoints and authoritative
-  async in-memory operation-store seam
-- **Current checkpoint:** P2-02 store-seam commit
-  `b13e66abc5d645b685f7bbf840d2e8d9ea903f2f`
-  (`refactor(v2): add authoritative operation store`)
+- **Active task:** P2-04 — add content-addressed blob durability and committed
+  event replay/subscription without weakening the SQLite transaction boundary
+- **Last completed task:** P2-03 — normalized SQLite operation repository,
+  migrations, strict codecs, optimistic transactions, and reconciliation
+- **Current checkpoint:** P2-03 SQLite persistence commit
+  `ee6763bb6e0b55b1f95ec4d9fcc1f40505fbe4d5`
+  (`feat(v2): add normalized sqlite operation store`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** finish the P2-03 scoped gate, run configured hooks,
-  and create the local SQLite persistence checkpoint without touching root
-  `daita/`
+- **Exact next action:** add test-only canonical blob/reader/store contracts,
+  capture their missing-owner expected red, and implement no filesystem I/O
+  until that portable shape is reviewed green
 
 ## Mandatory architecture re-read
 
@@ -99,8 +99,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | --- | --- | --- | --- | --- | --- |
 | P2-01 | complete | Re-read Sections 6 and 15; Phase 2 work/gate; Sections 8.1–8.8, 9.1–9.10, and 11.1–11.8; Phase 1 owners | Persistence, recovery, hosting, session, event, approval, and provider ownership inventory plus this ordered test-first plan | Read-only source/plan inventory; no production edit; smallest representative persistence seam selected | Phase 1 gate |
 | P2-02 | complete | In-memory operation runtime commit seam; canonical operation/loop/model records | Narrow async optimistic `OperationStore` contract, in-memory implementation, canonical event/model-call/snapshot records, and one representative trigger/operation checkpoint migrated without changing loop semantics | 218 tests on each Python version; canonical linkage/history/cancellation/CAS adversarial regressions; architecture/static/isolation/build gates and independent review pass | P2-01 |
-| P2-03 | active | Proven P2-02 seam; Section 11.2 lifecycle inventory | SQLite engine with v2 marker, WAL, foreign keys, busy timeout, correctness-first synchronous mode, checksummed ordered migrations, SQLite-API backup-before-migrate, compatibility rejection, normalized lifecycle tables, and transactional optimistic operation repository | Fresh/reopen/concurrent-CAS/rollback/migration/interruption/future-or-unknown-schema tests; every runtime lifecycle record round-trips independently | P2-02 |
-| P2-04 | pending | SQLite transaction boundary; Section 8.4/11.5 contracts | Content-addressed blob store and durable committed-event log/subscription with per-agent monotonic cursors; event notification remains a post-commit wake hint | Temp/flush/hash/atomic-rename/orphan tests; rollback emits nothing; commit/publish gap replays; reconnect, slow subscriber, and cross-agent isolation tests | P2-03 |
+| P2-03 | complete | Proven P2-02 seam; Section 11.2 lifecycle inventory | SQLite engine with v2 marker, WAL, foreign keys, busy timeout, correctness-first synchronous mode, checksummed ordered migrations, SQLite-API backup-before-migrate, compatibility rejection, normalized lifecycle tables, and transactional optimistic operation repository | Fresh/reopen/concurrent-CAS/rollback/migration/interruption/future-or-unknown-schema tests; every runtime lifecycle record round-trips independently | P2-02 |
+| P2-04 | active | SQLite transaction boundary; Section 8.4/11.5 contracts | Content-addressed blob store and durable committed-event log/subscription with per-agent monotonic cursors; event notification remains a post-commit wake hint | Temp/flush/hash/atomic-rename/orphan tests; rollback emits nothing; commit/publish gap replays; reconnect, slow subscriber, and cross-agent isolation tests | P2-03 |
 | P2-05 | pending | Persisted tasks/evidence/events; Section 8.5 recovery rules | Ready/claimed/running/approval-waiting/cancelled/manual-recovery task states, persisted execution-safety and idempotency facts, durable fenced leases, and a split materialize/claim/execute/commit path preserving the sole executor boundary | Claim race, lease expiry/reclaim, stale-fence rejection with no evidence/event, terminal skip, unknown side-effect outcome, and task/evidence/event atomicity tests | P2-04 |
 | P2-06 | pending | Durable checkpoints, tasks, evidence, observations, readiness, and leases | One loop with new-trigger and checkpoint-aware same-operation resume paths, plus startup recovery that reuses completed work and never rebuilds the plan from the original trigger | Crash/cancel injection at all seven Phase 2 boundaries; at-least-once started model call; terminal task skip; recovered response/evidence/observation/readiness paths do not repeat avoidable I/O | P2-05 |
 | P2-07 | pending | Recovery runtime and persisted governance facts | Immutable risk/policy/task fingerprints, CAS approval records, and one test-owned durable fake side-effect marker with wait, decision-only approval mutation, wake, denial, same-operation resume, and exact-once idempotency | Pre-approval no-I/O, approval mutation no-I/O, exact-fingerprint resume, denial no-I/O, cancellation race with one winner, repeated/concurrent resume marker unchanged, stale holder blocked | P2-06 |
@@ -117,7 +117,20 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-03b | complete | One concrete `SQLiteOperationStore` foundation in `storage/sqlite.py` | Foundation cases green; standard-library calls offloaded; no generic `StateStore`, loop import, or SQL leakage into runtime |
 | P2-03c | complete | Normalized lifecycle schema plus canonical codecs | Every trigger/operation/loop/turn/model/task/evidence/readiness/observation/event field round-trips independently; no opaque-snapshot-only persistence |
 | P2-03d | complete | Transactional optimistic operation repository | Reuse portable contract validation; create/load/by-trigger/CAS/conflict/rollback/reopen/shared-runtime conformance; failure leaves all tables/events unchanged |
-| P2-03e | active | Final P2-03 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, independent review, scoped hooks, local commit |
+| P2-03e | complete | Final P2-03 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, independent review, scoped hooks, local commit `ee6763bb6e0b55b1f95ec4d9fcc1f40505fbe4d5` |
+
+### Ordered P2-04 internal tasks
+
+| ID | Status | Smallest output | Required proof before advancing |
+| --- | --- | --- | --- |
+| P2-04a | complete | Read-only blob/event ownership inventory and locked test-first sequence | Existing owners, transaction boundaries, dependency direction, explicit deferrals, and no generic `StateStore` or free-standing event append API |
+| P2-04b | active | Canonical blob identity/metadata/reader records plus narrow `BlobStore` protocol | Strict digest/ID/time/version/provenance/tombstone validation and protocol shape fail before the owner exists, then pass without filesystem or SQLite leakage into runtime |
+| P2-04c | pending | Local content-addressed filesystem blob adapter | Temp/write/flush/fsync/re-read/hash/atomic-rename/directory-fsync/reopen; idempotent same-ID retry, same-content races, corruption/symlink rejection, cancellation completion, and explicit grace-based orphan cleanup |
+| P2-04d | pending | Representative blob review before broader persistence work | One complete put/open/metadata/tombstone/delete path is independently reviewed; metadata/content ownership is coherent and does not justify a generic storage framework |
+| P2-04e | pending | Canonical committed-event cursor/envelope and narrow read/subscription contract | Positive agent-bound cursors, strict envelope linkage, bounded reads, cross-agent cursor rejection, and no public event append method |
+| P2-04f | pending | Migration 3 plus SQLite committed-event projection | Existing `runtime_events` gain per-agent monotonic sequence and append-only enforcement; v2 backfill, state/event/cursor atomicity, rollback, CAS loser, cross-operation order, pagination, and reopen pass |
+| P2-04g | pending | Post-commit wake-hint subscription over durable replay | No pre-commit delivery; missed/failed wake, commit-before-notify gap, reconnect, cross-store polling, slow subscriber, bounded batches, and cancellation all recover from durable cursors |
+| P2-04h | pending | Final P2-04 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, independent review, scoped hooks, and local commit |
 
 ## Files/components being changed or planned
 
@@ -233,6 +246,28 @@ partial migrations, event/state partial writes, and reopen drift. Repository
 tests then reuse the existing optimistic conformance cases and add independent
 normalized-row round-trips. This creates no unbounded `StateStore` and imports
 no SQLite code into the generic loop or operation runtime.
+
+P2-04 begins from two deliberately different owners. No blob owner exists, so
+the plan-named `storage/blobs.py` will own one narrow `BlobStore`, immutable
+content objects, logical provenance/retention records, and the local filesystem
+adapter. Physical identity is `(sha256, digest)` while caller-supplied blob IDs
+own retry identity and metadata, allowing two producers to share bytes without
+silently sharing provenance. The first implementation remains local and
+standard-library-only; evidence gains an explicit blob reference only in
+P2-05, agent-home wiring and the shared writer lock remain P2-08 work, and
+encryption/automated retention/cloud streaming stay with their later owners.
+
+Canonical `RuntimeEvent` already belongs to `events/models.py`, operation
+checkpoints already commit it with state, and `storage/sqlite.py` already owns
+the only SQL insertion path. The current pain is delivery: operation-local
+positions and ephemeral `CommitResult` suffixes cannot support replay across
+operations or close the commit-before-publish crash gap. The smallest repair
+is an agent-bound durable cursor envelope and a read/subscription contract under
+`events/`, plus migration 3 assigning a positive per-agent sequence directly
+to `runtime_events`. The operation transaction remains the only event writer;
+there will be no public `append(event)` or duplicate outbox table. Subscribers
+read bounded durable suffixes and use notifications only as post-commit wake
+hints, so missed hints, failure, reconnect, and slow consumers remain correct.
 
 ## Tests last run
 

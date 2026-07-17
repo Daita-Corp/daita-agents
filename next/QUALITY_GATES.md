@@ -334,7 +334,8 @@ commands actually run.
 ## Phases 2 through 9
 
 Phase 2 status: **P2-02 canonical checkpoints and the authoritative in-memory
-operation-store seam are complete; P2-03 SQLite final checkpoint is active. The
+operation-store seam and P2-03 normalized SQLite repository are complete;
+P2-04 blob/event persistence is active. The
 overall Phase 2 gate has not been run or claimed.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 1 gate and before
@@ -388,10 +389,10 @@ gate.
 | P2-Q02m | clean copies under `/private/tmp` | Build and inspect v2 plus root distributions; fresh isolated Python 3.11/3.12 v2 imports | PASS — v2 wheel/sdist 24/39 entries at `2.0.0a0` include `daita.storage.sqlite`; root wheel/sdist 401/442 at `1.0.0` exclude the physical `next/` tree; both fresh v2 imports resolve to their own site-packages |
 | P2-Q02n | current P2-03 diff | Independent transaction-design and final architecture/scope reviews | EXPECTED RED then PASS — final review found one incorrect later-migration diagnostic; a dedicated migration-3 regression failed with migration 1, then passed after tracking the active migration. No commit/CAS/schema/codec blocker remains; two requested architecture assertions permanently lock the adapter import allowlist and forbid opaque/delete/replace/ignore/upsert SQL shortcuts |
 | P2-Q02o | `next/` | Final post-review complete suites and static/architecture gate | PASS — 271 passed in 2.25s on CPython 3.11.15 and 271 passed in 2.26s on CPython 3.12.7; Black 58 files; compilation clean; mypy 57 files; pyright 0 errors/warnings; all 36 architecture tests pass |
+| P2-Q02p | repository root | Stage exactly 12 reviewed P2-03 paths; cached diff; configured hooks; local checkpoint | PASS — every path was under `next/`; cached diff and whitespace/EOF/merge-conflict/large-file/Black hooks passed; commit `ee6763bb6e0b55b1f95ec4d9fcc1f40505fbe4d5` |
 
 Rows P2-Q02k through P2-Q02m remain useful pre-review evidence; P2-Q02o is the
-refreshed code/test-tree gate. Only scoped hooks and the local checkpoint remain
-for P2-03e.
+refreshed code/test-tree gate and P2-Q02p closes P2-03.
 
 ### Planned Phase 2 evidence sequence
 
@@ -401,7 +402,7 @@ after its command and evidence actually exist.
 | ID | Scope | Required evidence before PASS |
 | --- | --- | --- |
 | P2-Q01 | Representative persistence seam | PASS — test-first canonical/store seam, optimistic conflict/rollback/history/cancellation proofs, 218 cross-version tests, and refreshed static/architecture/isolation/build reviews |
-| P2-Q02 | SQLite and migrations | WAL/foreign-key/busy-timeout assertions; ordered versioning; backup; reopen; incompatible future schema rejection; normalized lifecycle round-trips; atomic CAS |
+| P2-Q02 | SQLite and migrations | PASS — marker/PRAGMA/migration/backup/compatibility gates, normalized lifecycle round-trips, strict corruption rejection, optimistic CAS/rollback, cancellation, reconciliation, dual-Python/static/build proof, and checkpoint `ee6763b` |
 | P2-Q03 | Blobs and events | Durable put-by-content; hash/rename/orphan behavior; state/event same transaction; post-commit subscription, cursor replay, and commit/publish crash-gap coverage |
 | P2-Q04 | Tasks, leases, and recovery | Claim races; fencing; expiry; replay-safe reclaim; terminal skip; manual recovery for unknown side effects; all seven crash/cancel checkpoints |
 | P2-Q05 | Governance and fake side effect | Risk facts and decision-only approval mutation; no executor before approval or after denial; same-operation wake/resume; repeated resume changes the marker once |
