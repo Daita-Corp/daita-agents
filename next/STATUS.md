@@ -6,20 +6,20 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 1 — loop laboratory
-- **Active task:** P1-02 — prove text-only completion with a deterministic mock,
-  static context, in-memory committed state/events, and the generic loop
-- **Last completed task:** P1-01 — implemented and verified strict immutable
-  canonical operation, loop, and provider-neutral model records
-- **Current checkpoint:** Phase 0 gate commit
-  `720adc8ac8c80f450fd9924349aa675f2c40cfe9`
-  (`chore(v2-phase-0): complete phase 0 gate`)
+- **Active task:** P1-03 — prove the fake-read path through a minimal capability
+  registry and the operation runtime's sole executor boundary
+- **Last completed task:** P1-02 — proved text-only completion and provider
+  failure through committed in-memory operation/turn/model/readiness events
+- **Current checkpoint:** P1-01 commit
+  `6b3eea11505799513a85ce8f45542feab2793f73`
+  (`feat(v2): define canonical loop contracts`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** commit the passing P1-01 checkpoint, then write one
-  failing text-only trajectory proving the trigger/operation is committed
-  before the model call, one turn and readiness decision precede terminal
-  success, the exact final text is preserved, and no task/evidence exists
+- **Exact next action:** commit the passing P1-02 checkpoint, then write the
+  failing fake-read lifecycle test that requires runtime-generated durable task
+  identity before executor entry, validated accepted evidence before a bounded
+  observation, a second model turn, readiness, and final completion
 
 ## Mandatory architecture re-read
 
@@ -71,8 +71,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
 | --- | --- | --- | --- | --- | --- |
 | P1-01 | complete | Re-read Sections 6 and 15; Phase 1 work/gate; ADRs 0002–0005 and 0008; v1 neutral fixtures | Minimal immutable canonical loop/model records and `ModelProvider` protocol, with no provider wire format or executor reference | 25 focused tests; strict JSON mutation isolation; provider-neutral message/tool records; trigger/operation/turn/action/observation/readiness/exit invariants; exact Decimal usage; mypy/pyright clean | Phase 0 gate |
-| P1-02 | active | P1-01 records | Text-only vertical slice with deterministic scripted mock model, static context, in-memory operation/turn/event state, direct generic loop, and readiness commit | Text-only completion trajectory; operation/turn/model-response/readiness/terminal event order; optional session | P1-01 |
-| P1-03 | pending | P1-02 loop; fake capability contract | Minimal capability registry/tool projection, fake read executor, in-memory task/evidence state, and operation runtime submission path | Proposal → persisted task → sole executor boundary → accepted evidence → durable observation → next turn → final answer | P1-02 |
+| P1-02 | complete | P1-01 records | Text-only vertical slice with deterministic scripted mock model, static context, copy-on-write in-memory operation/turn/event state, direct generic loop, and readiness commit | 7 focused tests; exact success event order; optional session; model call committed before I/O; stable provider failure with no whole-loop retry; injected commit failure publishes no partial state | P1-01 |
+| P1-03 | active | P1-02 loop; fake capability contract | Minimal capability registry/tool projection, fake read executor, in-memory task/evidence state, and operation runtime submission path | Proposal → persisted task → sole executor boundary → accepted evidence → durable observation → next turn → final answer | P1-02 |
 | P1-04 | pending | P1-03 action path | Structured invalid-action observations, bounded repair turns, normalized failure fingerprints, and no-progress termination | Invalid proposal repairs once; repeated identical failure stops early; changed action may progress | P1-03 |
 | P1-05 | pending | P1-02 through P1-04 | Cancellation checks plus turn, action, repair, identical-retry, wall-time, task-timeout, token, observation, and estimated-cost budgets | Every budget exits honestly with inspectable state/events; cancellation persists interruption state | P1-04 |
 | P1-06 | pending | Complete loop laboratory | Deterministic scripted acceptance trajectories and architecture assertions covering every Phase 1 gate | No domain/provider branch; only operation runtime contains executor invocation; full suites on Python 3.11/3.12; static/build scans | P1-05 |
@@ -90,10 +90,13 @@ The binding rationale and consequences are recorded in `next/decisions/`.
   for strict, recursively immutable canonical JSON values. The shared utility
   already has more than three record consumers and avoids parallel mutable
   payload rules.
-- P1-02 planned owners: `next/src/daita/llm/providers/mock.py`,
+- P1-02 completed owners: `next/src/daita/llm/providers/mock.py`,
   `next/src/daita/operations/runtime.py`, and `next/src/daita/loop/driver.py`;
   static context/readiness doubles remain test-owned until another real
   implementation requires a production subsystem.
+- P1-03 planned owners: `next/src/daita/capabilities.py`, additions to
+  `next/src/daita/operations/models.py` and `runtime.py`, and the existing
+  generic driver. The fake controller and executor remain test-owned.
 - Later Phase 1 owners are created only when their vertical slice becomes the
   active task; the target tree is not being scaffolded in advance.
 - Root `daita/`: **not being changed**
@@ -131,6 +134,11 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | Final P1-01 full isolated suite on CPython 3.11.15 and 3.12.7 | PASS — 49 passed in 0.19s on 3.11; 49 passed in 0.15s on 3.12 |
 | P1-01 Black, compile, mypy, pyright, architecture, dependency-direction, and root-oracle checks | PASS — 20 Python files formatted; compile succeeded; mypy found no issues in 13 files; pyright 0 errors/warnings; 19 architecture tests; no operations→loop import; root unchanged |
 | P1-01 clean-copy sdist/wheel build and content scan | PASS — build succeeded; wheel contained 13 entries including all 5 required contract modules and no tests or nested `next/` path |
+| Initial P1-02 focused test run before the mock/runtime/driver modules existed | EXPECTED RED — 2 collection errors for the absent provider package and loop/runtime owners |
+| Final P1-02 focused mock/runtime/text-loop tests | PASS — 7 passed in 0.03s |
+| Final P1-02 full isolated suite on CPython 3.11.15 and 3.12.7 | PASS — 56 passed in 0.20s on 3.11; 56 passed in 0.24s on 3.12 |
+| P1-02 Black, compile, mypy, pyright, architecture, and root-oracle checks | PASS — 27 Python files formatted; compile succeeded; mypy found no issues in 25 files; pyright 0 errors/warnings; architecture tests included in the full suite; root unchanged |
+| P1-02 clean-copy sdist/wheel build and content scan | PASS — build succeeded; 17-entry wheel included the mock provider, generic driver, and operation runtime with no tests or nested `next/` path |
 
 Phase 0 and P1-01 are complete. P1-02 has not yet added its production slice.
 
@@ -163,6 +171,16 @@ Phase 0 and P1-01 are complete. P1-02 has not yet added its production slice.
   checkpoint types. Trigger, operation, proposal, and observation ownership was
   consolidated under operations; loop phase/state/turn/readiness/exit remained
   under loop; their atomic pairing is deferred to the P1-02 runtime owner.
+- P1-02 red/repair history: the first focused run identified the intentionally
+  absent modules; the first implementation imported `Observation` from its old
+  loop location and failed collection, then imported it from the operations
+  owner. The runtime was changed to copy-on-write commits after reviewing
+  mid-transition failure atomicity, and an injected event failure now proves
+  no partial state/event publication.
+- One root-oracle check used a mistyped long form of the P1-01 hash and Git
+  rejected it as `bad object`. The checkpoint was read with `git rev-parse`,
+  the ledger was corrected to `6b3eea11505799513a85ce8f45542feab2793f73`,
+  and the root-oracle diff then passed.
 
 ## Credentials and external dependencies
 
@@ -193,7 +211,7 @@ Phase 0 and P1-01 are complete. P1-02 has not yet added its production slice.
 
 ## Remaining Phase 1 gate requirements
 
-- [ ] Text-only response completes through the generic loop.
+- [x] Text-only response completes through the generic loop.
 - [ ] Fake read follows the durable task/execution/evidence/observation order.
 - [ ] Invalid action becomes a bounded observation and repair turn.
 - [ ] Repeated identical failure stops early with an inspectable reason.

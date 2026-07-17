@@ -92,7 +92,8 @@ read-only Phase 0 scope.
 
 ## Phase 1 — loop laboratory
 
-Status: **P1-01 complete; P1-02 active; no Phase 1 gate claimed.**
+Status: **P1-01 committed at `6b3eea1`; P1-02 complete; P1-03 active; no
+Phase 1 gate claimed.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 0 commit and before
 the first Phase 1 production edit. Phase 1 evidence will be appended only for
@@ -118,6 +119,29 @@ commands actually run.
 - A dependency review rejected an operations→loop model import. Operation
   boundary records now belong to operations, loop progression records belong
   to loop, and P1-02 will pair them transactionally in the runtime owner.
+
+### Executed P1-02 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P1-Q06 | `next/` | Run the new mock-provider and text-only acceptance tests before adding their production owners | EXPECTED RED — 2 collection errors for the absent provider package and loop/runtime modules |
+| P1-Q07 | `next/` | Isolated focused mock, runtime-commit, and text-only acceptance tests | PASS — 7 passed in 0.03s |
+| P1-Q08 | `next/` | Complete isolated suite on CPython 3.11.15 and 3.12.7 | PASS — 56 passed in 0.20s on 3.11; 56 passed in 0.24s on 3.12 |
+| P1-Q09 | `next/` | Black check, byte compilation, mypy, pyright 1.1.411, architecture tests, and corrected root-oracle diff | PASS — 27 files formatted; compile succeeded; mypy clean across 25 files; pyright 0 errors/warnings; full suite included architecture tests; root unchanged |
+| P1-Q10 | clean copy `/private/tmp/daita-v2-p1-02.19EFBE` | Build sdist/wheel without isolation; inspect wheel for the mock provider, driver, runtime, and forbidden test/nested paths | PASS — 17-entry wheel contained all 3 new runtime modules; no tests or nested `next/` path |
+
+### P1-02 red/repair evidence
+
+- The first implementation kept `Observation` at its pre-review import path;
+  the focused collection error was repaired by importing the canonical record
+  from its operations owner.
+- The runtime initially mutated its private state object directly under a
+  lock. It now applies every transition to a private working copy and publishes
+  only after the state and corresponding events are complete; an injected
+  event-commit failure leaves the committed snapshot exactly unchanged.
+- A root-oracle command used a mistyped long checkpoint hash and Git returned
+  `bad object`. The exact hash was read from Git, corrected in `STATUS.md`, and
+  the oracle-path diff passed.
 
 ## Phases 2 through 9
 
