@@ -320,6 +320,26 @@ async def test_fake_reads_follow_the_only_durable_executor_path_in_order(
         "readiness.recorded",
         "operation.succeeded",
     ]
+    model_call_by_turn = {
+        model_call.turn_id: model_call.id for model_call in final.model_calls
+    }
+    correlated_event_types = {
+        "context.built",
+        "model_call.started",
+        "model_response.recorded",
+        "task.created",
+        "executor.started",
+        "executor.completed",
+        "evidence.accepted",
+        "task.succeeded",
+        "observation.recorded",
+        "readiness.recorded",
+    }
+    for event in final.events:
+        if event.type not in correlated_event_types:
+            continue
+        assert event.turn_id is not None
+        assert event.model_call_id == model_call_by_turn[event.turn_id]
     second_request = provider.requests[1]
     assert [message.role for message in second_request.messages] == [
         MessageRole.USER,

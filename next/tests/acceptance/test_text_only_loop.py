@@ -179,6 +179,10 @@ async def test_text_only_response_completes_from_committed_runtime_state(
         "readiness.recorded",
         "operation.succeeded",
     ]
+    model_call = final.model_calls[0]
+    for event in final.events[3:7]:
+        assert event.turn_id == model_call.turn_id
+        assert event.model_call_id == model_call.id
     assert not any(
         event.type.startswith(("task.", "evidence.")) for event in final.events
     )

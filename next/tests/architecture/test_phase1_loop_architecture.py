@@ -89,7 +89,7 @@ def test_operation_runtime_is_the_only_executor_invocation_boundary() -> None:
             if not (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "execute"
+                and _attribute_parts(node.func) == ("executor", "execute")
             ):
                 continue
             callers.append(
@@ -142,7 +142,10 @@ def test_operations_import_checkpoint_contracts_not_loop_implementation() -> Non
             if module is not None and (module == "loop" or module.startswith("loop.")):
                 loop_imports.append((relative_path.as_posix(), module))
 
-    assert loop_imports == [("operations/runtime.py", "loop.models")]
+    assert loop_imports == [
+        ("operations/checkpoints.py", "loop.models"),
+        ("operations/runtime.py", "loop.models"),
+    ]
 
 
 def test_loop_checkpoint_contracts_are_an_implementation_free_leaf() -> None:
@@ -182,6 +185,7 @@ def test_generic_loop_imports_contracts_not_domain_or_provider_implementations()
         "llm.models",
         "llm.protocols",
         "models",
+        "operations.checkpoints",
         "operations.models",
         "operations.runtime",
         "typing",

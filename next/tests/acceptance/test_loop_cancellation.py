@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -16,6 +17,7 @@ from daita.capabilities import (
     RiskLevel,
     ToolView,
 )
+from daita.events.models import RuntimeEvent
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -43,7 +45,9 @@ from daita.operations.runtime import (
     ModelCallStatus,
     OperationRuntime,
     OperationSnapshot,
+    OperationStateError,
 )
+from daita.operations.store import CommitResult, InMemoryOperationStore
 
 NOW = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
 
@@ -576,6 +580,134 @@ async def test_repeated_cancel_cannot_abort_the_interruption_commit() -> None:
         "model_call.cancellation_requested",
         "operation.interrupted",
     ]
+
+
+class FailingInterruptRuntime(OperationRuntime):
+    async def interrupt(
+        self,
+        operation_id: str,
+        reason: str = "run_cancelled",
+    ) -> LoopExit:
+        raise OperationStateError(f"forced interrupt conflict: {operation_id}")
+
+
+def _cleanup_loop(runtime: OperationRuntime) -> AgentLoop:
+    return AgentLoop(
+        runtime=runtime,
+        model=BlockingProvider(),
+        context_builder=SingleTurnContextBuilder(),
+        domain=TextOnlyDomain(),
+    )
+
+
+async def test_interruption_cleanup_accepts_only_an_authoritative_terminal_race() -> (
+    None
+):
+    runtime = FailingInterruptRuntime(clock=lambda: NOW)
+    started = await runtime.begin(_trigger("terminal-cleanup-race"))
+    await runtime.fail(started.operation.id, "external_terminal_winner")
+
+    await _cleanup_loop(runtime)._persist_interruption(started.operation.id)
+
+    snapshot = await runtime.inspect(started.operation.id)
+    assert snapshot.operation.status is OperationStatus.FAILED
+    assert snapshot.operation.terminal_reason == "external_terminal_winner"
+
+
+async def test_interruption_cleanup_surfaces_a_nonterminal_persistence_failure() -> (
+    None
+):
+    runtime = FailingInterruptRuntime(clock=lambda: NOW)
+    started = await runtime.begin(_trigger("nonterminal-cleanup-failure"))
+
+    with pytest.raises(OperationStateError, match="forced interrupt conflict"):
+        await _cleanup_loop(runtime)._persist_interruption(started.operation.id)
+
+    snapshot = await runtime.inspect(started.operation.id)
+    assert snapshot.operation.status is OperationStatus.RUNNING
+
+
+class CancelThenConflictStore(InMemoryOperationStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.transition_blocked = asyncio.Event()
+        self.release_transition = asyncio.Event()
+        self.block_next_commit = True
+
+    async def commit(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+    ) -> CommitResult:
+        if self.block_next_commit:
+            self.block_next_commit = False
+            self.transition_blocked.set()
+            await self.release_transition.wait()
+        return await super().commit(
+            snapshot,
+            expected_revision=expected_revision,
+        )
+
+    async def commit_external(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+    ) -> CommitResult:
+        return await InMemoryOperationStore.commit(
+            self,
+            snapshot,
+            expected_revision=expected_revision,
+        )
+
+
+async def test_cancellation_wins_when_a_blocked_transition_later_loses_cas() -> None:
+    store = CancelThenConflictStore()
+    runtime = OperationRuntime(store=store, clock=lambda: NOW)
+    provider = BlockingProvider()
+    loop = AgentLoop(
+        runtime=runtime,
+        model=provider,
+        context_builder=SingleTurnContextBuilder(),
+        domain=TextOnlyDomain(),
+    )
+    trigger = _trigger("cancel-before-transition-conflict")
+    running = asyncio.create_task(loop.run(trigger))
+
+    await store.transition_blocked.wait()
+    current = await store.load_by_trigger(trigger.id)
+    assert current is not None
+    external_event = RuntimeEvent(
+        id="event-external-transition-race",
+        type="checkpoint.external",
+        agent_id=current.snapshot.operation.agent_id,
+        operation_id=current.snapshot.operation.id,
+        session_id=current.snapshot.operation.session_id,
+        payload={},
+        created_at=NOW,
+    )
+    external = replace(
+        current.snapshot,
+        events=(*current.snapshot.events, external_event),
+    )
+    external_result = await store.commit_external(
+        external,
+        expected_revision=current.revision,
+    )
+
+    running.cancel()
+    await asyncio.sleep(0)
+    store.release_transition.set()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    committed = await store.load(current.snapshot.operation.id)
+    assert committed.revision == external_result.operation.revision + 1
+    assert committed.snapshot.events[: len(external.events)] == external.events
+    assert committed.snapshot.operation.status is OperationStatus.INTERRUPTED
+    assert committed.snapshot.events[-1].type == "operation.interrupted"
+    assert provider.requests == []
 
 
 class MutableClock:

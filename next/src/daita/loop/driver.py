@@ -8,17 +8,18 @@ from typing import Protocol, TypeVar
 
 from ..llm.models import ModelRequest, ModelResponse, ToolCall, ToolDefinition
 from ..llm.protocols import ModelProvider
+from ..operations.checkpoints import OperationSnapshot
 from ..operations.models import (
     ActionProposal,
     ActionRejection,
     AgentTrigger,
     Evidence,
     Observation,
+    OperationStatus,
 )
 from ..operations.runtime import (
     OperationWallTimeExceeded,
     OperationRuntime,
-    OperationSnapshot,
     OperationStateError,
     TaskExecutionTimeout,
 )
@@ -561,14 +562,25 @@ class AgentLoop:
         )
 
     async def _persist_interruption(self, operation_id: str) -> None:
-        commit = asyncio.create_task(self._runtime.interrupt(operation_id))
+        async def persist_or_accept_terminal_race() -> None:
+            try:
+                await self._runtime.interrupt(operation_id)
+            except OperationStateError:
+                snapshot = await self._runtime.inspect(operation_id)
+                if snapshot.operation.status not in {
+                    OperationStatus.SUCCEEDED,
+                    OperationStatus.FAILED,
+                    OperationStatus.CANCELLED,
+                    OperationStatus.INTERRUPTED,
+                }:
+                    raise
+
+        commit = asyncio.create_task(persist_or_accept_terminal_race())
         while not commit.done():
             try:
                 await asyncio.shield(commit)
             except asyncio.CancelledError:
                 continue
-        try:
-            commit.result()
-        except OperationStateError:
-            # A terminal commit racing cancellation remains authoritative.
-            return
+            except Exception:
+                break
+        commit.result()

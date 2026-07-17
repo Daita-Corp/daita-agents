@@ -93,7 +93,7 @@ read-only Phase 0 scope.
 ## Phase 1 — loop laboratory
 
 Status: **Phase 1 gate complete in the exact gate commit containing this
-ledger; Phases 2–9 have not started.**
+ledger; Phase 2 is active and Phases 3–9 have not started.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 0 commit and before
 the first Phase 1 production edit. Phase 1 evidence will be appended only for
@@ -333,12 +333,40 @@ commands actually run.
 
 ## Phases 2 through 9
 
-Phase 2 status: **P2-01 read-only architecture and persistence inventory is
-complete; P2-02 is active. No Phase 2 production edit or gate has been run or
-claimed.**
+Phase 2 status: **P2-02 canonical checkpoints and the authoritative in-memory
+operation-store seam are complete; P2-03 SQLite foundation is active. The
+overall Phase 2 gate has not been run or claimed.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 1 gate and before
 any Phase 2 production edit. Later phases remain unstarted.
+
+### Executed P2-02 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P2-Q01a | `next/` | Isolated combined canonical event/checkpoint, in-memory operation-store contract, and Phase 2 persistence architecture tests before adding production modules | EXPECTED RED — collection stopped on exactly 3 `ModuleNotFoundError` results for the intentionally absent `daita.events` and `daita.operations.store` owners |
+| P2-Q01b | `next/` | Focused runtime-store seam tests after the standalone canonical-record/store contract passed 28 tests | EXPECTED RED — 6 failures because the existing runtime did not accept `store=`; tests lock atomic create/CAS failure, conflict visibility, cross-runtime authority, and trigger uniqueness |
+| P2-Q01c | `next/` | Structured typed-store-error attributes after the optimistic contract was otherwise green | EXPECTED RED — 4 failures identified absent stable operation/trigger/reason attributes; typed constructors repaired the contract and all 9 store tests then passed |
+| P2-Q01d | `next/` | Standalone canonical event/checkpoint and optimistic in-memory store tests, excluding only compatibility re-exports before runtime extraction | PASS — 28 passed; this was the representative green slice reviewed before standardizing the runtime seam |
+| P2-Q01e | `next/` | Focused canonical/store/runtime-commit and Phase 1/2 architecture integration after removing both runtime state maps | PASS — 53 passed; no split authority, hidden CAS retry, partial failed commit, duplicate trigger claim, duplicate record owner, SQL leakage, or executor-boundary drift |
+| P2-Q01f | `next/` | Complete isolated suite on CPython 3.11.15 and 3.12.7 | PASS — 204 passed in 1.00s on 3.11 and 204 passed in 1.07s on 3.12 |
+| P2-Q01g | repository root and `next/` | Black, byte compilation, mypy, pyright 1.1.411, all architecture tests, v1 fixture/disposition reproduction, v1-import/symlink/root-oracle scans | PASS — 49 files Black-clean; compile succeeded; mypy 48 files; pyright 0 errors/warnings; 34 architecture tests; every isolation/oracle scan clean |
+| P2-Q01h | clean copy `/private/tmp/daita-v2-p2-02.zm30hd` | Build sdist/wheel; inspect archive content; install wheel without dependencies into fresh Python 3.11/3.12 environments; import canonical event/store modules | PASS — wheel/sdist 22/36 entries at `2.0.0a0`; no tests or nested `next/`; both fresh imports resolved to their own site-packages |
+| P2-Q01i | `next/` | Adversarial snapshot-linkage and committed-lifecycle-history contracts before repair | EXPECTED RED — 6 failed and 17 passed; same-turn pointers, response-owned call IDs, symmetric task/evidence linkage, and immutable non-event history were not fully enforced |
+| P2-Q01j | `next/` | Focused canonical checkpoint and optimistic-store contracts after structural repair | PASS — 23 passed; invalid linkage and prior-record rewrite/removal are rejected without publishing candidate state |
+| P2-Q01k | `next/` | Cancellation after durable create and interruption lost-CAS convergence before repair | EXPECTED RED — 2 failed; one running orphan and one surfaced revision conflict reproduced the reviewer findings |
+| P2-Q01l | `next/` | Focused cancellation-store contracts after central atomic-write/interruption repair on CPython 3.11.15/3.12.7 | PASS — 2 passed on each interpreter; durable create cannot remain running and interruption preserves a concurrently committed event while converging |
+| P2-Q01m | `next/` | Downstream canonical model-call correlation and terminal-race cleanup contracts before repair | EXPECTED RED — 9 acceptance trajectories and 1 terminal-race case failed; canonical fields were absent and the driver's post-shield handler was unreachable |
+| P2-Q01n | `next/` | Canonical aggregate ownership and event-ancestry regressions before repair | EXPECTED RED — focused cases accepted an erased event call correlation, an unowned model call, and child IDs without one explicit consistent turn/model/task ancestry |
+| P2-Q01o | `next/` | Cancellation delivered before a blocked ordinary transition later lost CAS | EXPECTED RED — 1 integration failure surfaced `OperationStateError`, skipped loop interruption cleanup, and left the externally advanced operation running |
+| P2-Q01p | `next/` | Final complete isolated suite on CPython 3.11.15 and 3.12.7 | PASS — 218 passed in 1.24s on 3.11 and 218 passed in 1.26s on 3.12 |
+| P2-Q01q | repository root and `next/` | Final Black, compilation, mypy, pyright 1.1.411, architecture, disposition/v1-oracle, root-oracle, import, symlink, SQL-leakage, and diff gates | PASS — Black 50 files; compile clean; mypy 49 files; pyright 0 errors/warnings; 34 architecture tests; every isolation/oracle scan clean |
+| P2-Q01r | clean copy `/private/tmp/daita-v2-p2-02-gate.31k4au` | Rebuild final sdist/wheel; inspect content; fresh isolated Python 3.11/3.12 installs and canonical-module imports | PASS — wheel/sdist 22/36 entries at `2.0.0a0`; no tests or nested `next/`; both imports resolved to their own site-packages |
+| P2-Q01s | current P2-02 diff | Two independent final adversarial reviews after all repairs | PASS — no remaining architecture/cancellation blocker; exact ancestry, committed history, authoritative store state, cancellation precedence, deliberate interruption retry, and sole executor boundary verified |
+
+Rows P2-Q01f through P2-Q01h predate the adversarial repairs and remain useful
+interim evidence only. Rows P2-Q01p through P2-Q01s close the refreshed seam
+gate.
 
 ### Planned Phase 2 evidence sequence
 
@@ -347,7 +375,7 @@ after its command and evidence actually exist.
 
 | ID | Scope | Required evidence before PASS |
 | --- | --- | --- |
-| P2-Q01 | Representative persistence seam | Expected-red store/record tests; optimistic conflict and rollback; first durable checkpoint; all 160 Phase 1 tests remain green before broader standardization |
+| P2-Q01 | Representative persistence seam | PASS — test-first canonical/store seam, optimistic conflict/rollback/history/cancellation proofs, 218 cross-version tests, and refreshed static/architecture/isolation/build reviews |
 | P2-Q02 | SQLite and migrations | WAL/foreign-key/busy-timeout assertions; ordered versioning; backup; reopen; incompatible future schema rejection; normalized lifecycle round-trips; atomic CAS |
 | P2-Q03 | Blobs and events | Durable put-by-content; hash/rename/orphan behavior; state/event same transaction; post-commit subscription, cursor replay, and commit/publish crash-gap coverage |
 | P2-Q04 | Tasks, leases, and recovery | Claim races; fencing; expiry; replay-safe reclaim; terminal skip; manual recovery for unknown side effects; all seven crash/cancel checkpoints |

@@ -6,20 +6,19 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-02 — add the narrow async operation-store seam and prove
-  one representative durable checkpoint before standardizing all transitions
-- **Last completed task:** P2-01 — persistence/recovery ownership and ordered
-  SQLite vertical-slice plan
-- **Current checkpoint:** Phase 1 gate commit
-  `c8c70e37bbbda981db4a490a2ac6bd75cfd29d55`
-  (`chore(v2-phase-1): complete phase 1 gate`)
+- **Active task:** P2-03 — build the SQLite foundation and normalized operation
+  lifecycle repository against the proven optimistic contract
+- **Last completed task:** P2-02 — canonical checkpoints and authoritative
+  async in-memory operation-store seam
+- **Current pre-task checkpoint:** P2-01 planning commit
+  `fece6673ebd1799df35feefa53e462f23b682691`
+  (`docs(v2): plan phase 2 persistent loop`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** write expected-red contract tests for the async
-  operation repository, optimistic revision conflict, canonical committed
-  events, and the first operation/trigger checkpoint; then adapt only that
-  representative runtime transition and rerun the complete Phase 1 suite
+- **Exact next action:** create the scoped P2-02 checkpoint, record its hash,
+  then write expected-red SQLite marker/PRAGMA/migration/backup/rollback/reopen
+  contracts before adding any SQLite production owner
 
 ## Mandatory architecture re-read
 
@@ -99,8 +98,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
 | --- | --- | --- | --- | --- | --- |
 | P2-01 | complete | Re-read Sections 6 and 15; Phase 2 work/gate; Sections 8.1–8.8, 9.1–9.10, and 11.1–11.8; Phase 1 owners | Persistence, recovery, hosting, session, event, approval, and provider ownership inventory plus this ordered test-first plan | Read-only source/plan inventory; no production edit; smallest representative persistence seam selected | Phase 1 gate |
-| P2-02 | active | In-memory operation runtime commit seam; canonical operation/loop/model records | Narrow async optimistic `OperationStore` contract, in-memory implementation, canonical event/model-call/snapshot records, and one representative trigger/operation checkpoint migrated without changing loop semantics | Expected-red contract/atomicity/conflict tests; complete Phase 1 suite stays green; review before applying the pattern to later transitions | P2-01 |
-| P2-03 | pending | Proven P2-02 seam; Section 11.2 lifecycle inventory | SQLite engine with v2 marker, WAL, foreign keys, busy timeout, correctness-first synchronous mode, checksummed ordered migrations, SQLite-API backup-before-migrate, compatibility rejection, normalized lifecycle tables, and transactional optimistic operation repository | Fresh/reopen/concurrent-CAS/rollback/migration/interruption/future-or-unknown-schema tests; every runtime lifecycle record round-trips independently | P2-02 |
+| P2-02 | complete | In-memory operation runtime commit seam; canonical operation/loop/model records | Narrow async optimistic `OperationStore` contract, in-memory implementation, canonical event/model-call/snapshot records, and one representative trigger/operation checkpoint migrated without changing loop semantics | 218 tests on each Python version; canonical linkage/history/cancellation/CAS adversarial regressions; architecture/static/isolation/build gates and independent review pass | P2-01 |
+| P2-03 | active | Proven P2-02 seam; Section 11.2 lifecycle inventory | SQLite engine with v2 marker, WAL, foreign keys, busy timeout, correctness-first synchronous mode, checksummed ordered migrations, SQLite-API backup-before-migrate, compatibility rejection, normalized lifecycle tables, and transactional optimistic operation repository | Fresh/reopen/concurrent-CAS/rollback/migration/interruption/future-or-unknown-schema tests; every runtime lifecycle record round-trips independently | P2-02 |
 | P2-04 | pending | SQLite transaction boundary; Section 8.4/11.5 contracts | Content-addressed blob store and durable committed-event log/subscription with per-agent monotonic cursors; event notification remains a post-commit wake hint | Temp/flush/hash/atomic-rename/orphan tests; rollback emits nothing; commit/publish gap replays; reconnect, slow subscriber, and cross-agent isolation tests | P2-03 |
 | P2-05 | pending | Persisted tasks/evidence/events; Section 8.5 recovery rules | Ready/claimed/running/approval-waiting/cancelled/manual-recovery task states, persisted execution-safety and idempotency facts, durable fenced leases, and a split materialize/claim/execute/commit path preserving the sole executor boundary | Claim race, lease expiry/reclaim, stale-fence rejection with no evidence/event, terminal skip, unknown side-effect outcome, and task/evidence/event atomicity tests | P2-04 |
 | P2-06 | pending | Durable checkpoints, tasks, evidence, observations, readiness, and leases | One loop with new-trigger and checkpoint-aware same-operation resume paths, plus startup recovery that reuses completed work and never rebuilds the plan from the original trigger | Crash/cancel injection at all seven Phase 2 boundaries; at-least-once started model call; terminal task skip; recovered response/evidence/observation/readiness paths do not repeat avoidable I/O | P2-05 |
@@ -169,6 +168,31 @@ The binding rationale and consequences are recorded in `next/decisions/`.
   records, sole executor invocation, and generic-loop dependency direction.
   The representative slice is reviewed green before the same seam is applied
   to all lifecycle transitions, as required by the refactoring discipline.
+- P2-02 completed its representative review before standardization: 28
+  canonical-record/store tests passed first, then the same load/copy/CAS seam
+  replaced both runtime-owned state maps across all 17 transition commits.
+  standalone tests proved the seam before all 17 transition commits migrated.
+  `next/src/daita/events/models.py` owns canonical runtime events;
+  `next/src/daita/operations/checkpoints.py` owns model-call and immutable
+  operation aggregate records; and `next/src/daita/operations/store.py` owns
+  the narrow protocol plus its lock-protected in-memory reference adapter.
+- `OperationRuntime` remains the only lifecycle/executor owner. It now injects
+  `OperationStore`, performs no retry after a revision loss, and translates a
+  lost CAS into an inspectable operation-state conflict. Two runtime instances
+  sharing one store see the same checkpoint and cannot claim one trigger twice.
+  Commit results expose only the exact newly committed event suffix, but no
+  subscriber is introduced before the P2-04 durable event-log call site.
+- Canonical `RuntimeEvent.operation_id` is nullable because Section 8.4 also
+  names operationless agent lifecycle events. An `OperationSnapshot` requires
+  every contained event to match its operation and session exactly, binds turn
+  pointers to model calls from the same turn, scopes task/observation/event tool
+  calls to that turn's committed response, and enforces symmetric task,
+  evidence, and evidence-backed-observation ownership. The in-memory store also
+  preserves every committed lifecycle-record prefix, not only the event log.
+  Readiness still lacks independent operation/turn identity and observations
+  lack stable row IDs; P2-03 must add persistence envelopes/codecs before
+  claiming their normalized SQLite round-trip rather than weakening semantic
+  records now.
 - Phase 2 persistence uses normalized lifecycle tables with explicit JSON
   record payloads where useful; it never stores one opaque operation snapshot
   as the only durable truth. Standard-library `sqlite3` is offloaded from the
@@ -255,6 +279,25 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P1-07 architecture/oracle/range gate | PASS — 26 architecture tests; disposition and v1 fixtures reproduce; all committed Phase 1 paths are under `next/`; root oracle and symlink scans clean |
 | P1-07 committed-tree distribution gate | PASS — v2 build `/private/tmp/daita-v2-p1-gate.Y9lKPa` produced 18/31-entry archives at `2.0.0a0`; root build `/private/tmp/daita-root-p1-gate.Bbhplk` produced 401/442-entry archives at `1.0.0`; neither crossed the isolation boundary |
 | P1-07 scoped ledger stage and configured hooks | PASS — exactly `next/STATUS.md` and `next/QUALITY_GATES.md`; cached diff and all configured hooks passed before the exact gate commit |
+| Initial P2-02 canonical-record/store/architecture run before production owners existed | EXPECTED RED — collection stopped on exactly 3 missing-module errors for `daita.events` and `daita.operations.store`; no production module existed or was edited |
+| Initial P2-02 runtime-store seam run after the standalone store contract passed | EXPECTED RED — 6 tests failed because `OperationRuntime` did not yet accept an injected store; this locks the authoritative shared-store transition before the runtime refactor |
+| P2-02 standalone canonical-record and optimistic-store contract | PASS — 28 passed after the initial missing-owner red; immutable records, atomic identity claims, exact event suffixes, stale/concurrent CAS, append-only event history, and rollback behavior are covered |
+| P2-02 focused canonical/store/runtime/architecture integration | PASS — 53 passed; injected create and revision commits, failed-commit rollback, conflict visibility, shared-store authority, trigger uniqueness, canonical re-exports, sole runtime/executor ownership, and no SQL leakage are covered |
+| P2-02 complete isolated suite on CPython 3.11.15 and 3.12.7 | PASS — 204 passed in 1.00s on 3.11 and 204 passed in 1.07s on 3.12 |
+| P2-02 formatting, compilation, mypy, and pyright | PASS — Black clean across 49 files; compilation succeeded; mypy clean across 48 files after one test annotation repair; pyright 1.1.411 reported 0 errors/warnings |
+| P2-02 architecture/oracle/isolation review | PASS — 34 architecture tests; disposition and v1 fixtures reproduce; no v1 import, root-oracle change, v2 symlink, or SQL/storage leakage in loop/runtime |
+| P2-02 clean-copy build and fresh-install smoke | PASS — `/private/tmp/daita-v2-p2-02.zm30hd`; 22-entry wheel and 36-entry sdist contain canonical event/checkpoint/store modules and no tests/nested `next/`; fresh Python 3.11/3.12 installs import v2 `2.0.0a0` from their own site-packages |
+| P2-02 adversarial structural/history contracts before repair | EXPECTED RED — 6 failed and 17 passed; cross-turn model pointers, response-owned call linkage, symmetric task/evidence ownership, and immutable committed lifecycle history were not yet enforced |
+| P2-02 repaired structural/history contracts | PASS — 23 passed; invalid linkage and committed-record rewrite/removal are rejected without changing authoritative state or events |
+| P2-02 cancellation-after-create and interruption-CAS contracts before repair | EXPECTED RED — 2 failed; cancellation could leave a durably created operation running and an interruption lost one revision race |
+| P2-02 repaired focused cancellation-store contracts on CPython 3.11/3.12 | PASS — 2 passed on each interpreter; a durable create converges to interruption and interruption alone deliberately reloads after a lost CAS |
+| P2-02 downstream model-call and terminal-cleanup contracts before repair | EXPECTED RED — 9 correlation trajectories and 1 terminal-race cleanup case failed; downstream readiness/action/task/evidence/observation events lacked canonical call IDs and the driver's conflict handler was unreachable |
+| P2-02 aggregate model/event ancestry contracts before repair | EXPECTED RED — focused cases accepted an erased event call ID, an unowned model call, and child event IDs with missing or contradictory turn/model/task ancestry |
+| P2-02 cancellation-versus-delayed-CAS contract before repair | EXPECTED RED — 1 integration case raised `OperationStateError` and left the externally advanced operation running instead of preserving cancellation and committing interruption |
+| P2-02 final complete isolated suites | PASS — 218 passed in 1.24s on CPython 3.11.15 and 218 passed in 1.26s on CPython 3.12.7 |
+| P2-02 final static/architecture/oracle gate | PASS — Black clean across 50 files; compilation succeeded; mypy clean across 49 files; pyright 0 errors/warnings; 34 architecture tests; disposition/v1 fixtures reproduce; root-oracle, import, symlink, SQL-leakage, and diff scans clean |
+| P2-02 final distribution gate | PASS — clean copy `/private/tmp/daita-v2-p2-02-gate.31k4au` built 22-entry wheel and 36-entry sdist; fresh isolated Python 3.11/3.12 installs import v2 canonical event/checkpoint/store modules from their own site-packages |
+| P2-02 independent final review | PASS — no architecture or cancellation blocker remains; store/runtime ownership, committed prefixes, exact event ancestry, cancellation precedence, interruption CAS convergence, and sole executor boundary verified |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
@@ -278,8 +321,26 @@ re-read and an updated ordered ledger.
 - The root distribution build emitted pre-existing setuptools deprecation
   warnings for its license metadata and classifier. Both archives were valid,
   and the read-only root package is unchanged.
-- No current test, static-analysis, isolation, install, or build failure is
-  outstanding.
+- P2-02 is complete; the earlier 204-test/static/build rows remain interim
+  evidence and are superseded by the final 218-test and rebuilt-artifact rows.
+- P2-02 began test-first. Its combined event/checkpoint/store/architecture run
+  stopped at collection on the intentionally absent canonical event and
+  operation-store modules. This is expected-red evidence, not a gate failure;
+  the repair must implement the narrow owners without weakening the tests.
+- The first structured store-error attribute run was expected red: 4 tests
+  found that typed not-found, duplicate, trigger-claim, and invalid-checkpoint
+  exceptions lacked stable identity/reason attributes. Constructors now retain
+  those facts, and all 9 store contracts pass.
+- The first P2-02 static gate found one missing annotation in the architecture
+  test's class-location accumulator. Adding the precise `dict[str, list[str]]`
+  annotation repaired mypy; production code required no ignore or suppression.
+- The adversarial history repair initially reused loop variable names across
+  heterogeneous record collections; mypy reported 26 inference errors. Precise
+  record-specific bindings and one three-call-site prefix helper repaired the
+  type gate without a suppression or behavior change.
+- Two fresh-install smoke commands were first launched with a repository or
+  wrong relative-tool cwd, so they loaded v1 or could not locate the venv.
+  Isolated absolute-path reruns imported v2 from both fresh site-packages.
 - P1-01 red/repair history: the initial test-first collection failed on the
   intentionally absent modules; duplicate `test_models.py` basenames then
   caused a pytest import collision and were renamed; the first static pass

@@ -765,6 +765,18 @@ async def test_success_then_rejection_skips_rest_in_stable_transcript_order() ->
         "readiness.recorded",
         "operation.succeeded",
     ]
+    model_call_by_turn = {
+        model_call.turn_id: model_call.id for model_call in final.model_calls
+    }
+    for event in final.events:
+        if event.type not in {
+            "action.rejected",
+            "action.skipped",
+            "observation.recorded",
+        }:
+            continue
+        assert event.turn_id is not None
+        assert event.model_call_id == model_call_by_turn[event.turn_id]
     provider.assert_consumed()
 
 
@@ -874,6 +886,11 @@ async def test_repeated_normalized_failure_stops_before_more_model_or_io() -> No
         event for event in final.events if event.type == "no_progress.detected"
     )
     assert no_progress.call_id == "provider-call-b"
+    assert no_progress.turn_id is not None
+    model_call_by_turn = {
+        model_call.turn_id: model_call.id for model_call in final.model_calls
+    }
+    assert no_progress.model_call_id == model_call_by_turn[no_progress.turn_id]
     assert isinstance(no_progress.payload, FrozenJsonObject)
     assert no_progress.payload.to_dict() == {
         "count": 2,

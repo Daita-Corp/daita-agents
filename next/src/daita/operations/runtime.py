@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from enum import Enum
 import hashlib
 import math
+from typing import TypeVar
 from uuid import uuid4
 
-from .._json import FrozenJsonObject, canonical_json
+from .._json import canonical_json
 from ..capabilities import (
     CapabilityExecutionError,
     CapabilityRegistry,
@@ -19,6 +19,7 @@ from ..capabilities import (
     EvidenceValidationError,
     ExecutionRequest,
 )
+from ..events.models import RuntimeEvent
 from ..llm.models import ModelRequest, ModelResponse, ToolCall
 from ..loop.models import (
     LoopBudgets,
@@ -29,6 +30,7 @@ from ..loop.models import (
     Readiness,
     Turn,
 )
+from .checkpoints import ModelCall, ModelCallStatus, OperationSnapshot
 from .models import (
     ActionProposal,
     ActionRejection,
@@ -41,6 +43,17 @@ from .models import (
     TaskStatus,
     TriggerKind,
 )
+from .store import (
+    InMemoryOperationStore,
+    InvalidOperationCheckpointError,
+    OperationAlreadyExistsError,
+    OperationNotFoundError,
+    OperationRevisionConflict,
+    OperationStore,
+    TriggerAlreadyClaimedError,
+)
+
+_T = TypeVar("_T")
 
 
 class OperationStateError(RuntimeError):
@@ -66,73 +79,9 @@ class OperationWallTimeExceeded(CapabilityExecutionError):
         )
 
 
-class ModelCallStatus(str, Enum):
-    STARTED = "started"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-@dataclass(frozen=True, slots=True)
-class RuntimeEvent:
-    id: str
-    type: str
-    agent_id: str
-    operation_id: str
-    created_at: datetime
-    turn_id: str | None = None
-    call_id: str | None = None
-    task_id: str | None = None
-    evidence_id: str | None = None
-    capability_id: str | None = None
-    executor_id: str | None = None
-    payload: Mapping[str, object] = FrozenJsonObject(())
-
-    def __post_init__(self) -> None:
-        for field_name, value in (
-            ("turn_id", self.turn_id),
-            ("call_id", self.call_id),
-            ("task_id", self.task_id),
-            ("evidence_id", self.evidence_id),
-            ("capability_id", self.capability_id),
-            ("executor_id", self.executor_id),
-        ):
-            if value is not None:
-                _required_text(value, f"event {field_name}")
-        object.__setattr__(self, "payload", FrozenJsonObject.from_mapping(self.payload))
-
-
-@dataclass(frozen=True, slots=True)
-class ModelCall:
-    id: str
-    operation_id: str
-    turn_id: str
-    provider_id: str
-    request: ModelRequest
-    status: ModelCallStatus
-    created_at: datetime
-    updated_at: datetime
-    response: ModelResponse | None = None
-    error_code: str | None = None
-    cancellation_requested: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class OperationSnapshot:
-    trigger: AgentTrigger
-    operation: Operation
-    loop_state: LoopState
-    budgets: LoopBudgets
-    turns: tuple[Turn, ...]
-    model_calls: tuple[ModelCall, ...]
-    readiness: tuple[Readiness, ...]
-    tasks: tuple[Task, ...]
-    evidence: tuple[Evidence, ...]
-    observations: tuple[Observation, ...]
-    events: tuple[RuntimeEvent, ...]
-
-
 @dataclass(slots=True)
 class _OperationState:
+    revision: int
     trigger: AgentTrigger
     operation: Operation
     loop_state: LoopState
@@ -159,8 +108,43 @@ def _required_text(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a non-empty string")
 
 
+async def _await_store_write(awaitable: Awaitable[_T]) -> tuple[_T, bool]:
+    """Resolve one atomic store write before propagating caller cancellation."""
+
+    write = asyncio.ensure_future(awaitable)
+    cancellation_requested = False
+    while not write.done():
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            cancellation_requested = True
+            continue
+        except BaseException:
+            # Resolve the completed write below so a caller cancellation that
+            # arrived first retains precedence without losing the write error.
+            break
+    try:
+        result = write.result()
+    except BaseException as error:
+        if cancellation_requested and not isinstance(error, asyncio.CancelledError):
+            raise asyncio.CancelledError from error
+        raise
+    return result, cancellation_requested
+
+
+async def _await_resistant_task(task: asyncio.Task[_T]) -> _T:
+    """Wait for required cleanup even when cancellation is requested again."""
+
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
 class OperationRuntime:
-    """Commit inspectable operation/loop transitions under one in-memory lock."""
+    """Commit inspectable operation/loop transitions through one repository."""
 
     def __init__(
         self,
@@ -168,13 +152,13 @@ class OperationRuntime:
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[str], str] = _random_id,
         capabilities: CapabilityRegistry | None = None,
+        store: OperationStore | None = None,
     ) -> None:
         self._clock = clock
         self._id_factory = id_factory
         self._capabilities = capabilities or CapabilityRegistry()
         self._lock = asyncio.Lock()
-        self._states: dict[str, _OperationState] = {}
-        self._operation_by_trigger: dict[str, str] = {}
+        self._store = store if store is not None else InMemoryOperationStore()
 
     async def begin(
         self,
@@ -182,15 +166,10 @@ class OperationRuntime:
         *,
         budgets: LoopBudgets = LoopBudgets(),
     ) -> OperationSnapshot:
+        cancellation_requested = False
         async with self._lock:
             if not isinstance(budgets, LoopBudgets):
                 raise TypeError("budgets must be a LoopBudgets record")
-            existing_id = self._operation_by_trigger.get(trigger.id)
-            if existing_id is not None:
-                raise OperationStateError(
-                    f"trigger already owns operation: {existing_id}; "
-                    "resume is introduced with persistent recovery in Phase 2"
-                )
             if trigger.kind is TriggerKind.EVENT:
                 raise ValueError("event triggers are reserved for a later phase")
 
@@ -206,6 +185,7 @@ class OperationRuntime:
                 updated_at=now,
             )
             state = _OperationState(
+                revision=0,
                 trigger=trigger,
                 operation=operation,
                 loop_state=LoopState(phase=LoopPhase.PREPARING_CONTEXT),
@@ -220,13 +200,48 @@ class OperationRuntime:
             )
             self._append_event(state, "trigger.received")
             self._append_event(state, "operation.created")
-            self._states[operation_id] = state
-            self._operation_by_trigger[trigger.id] = operation_id
-            return self._snapshot(state)
+            try:
+                committed, cancellation_requested = await _await_store_write(
+                    self._store.create(self._snapshot(state))
+                )
+            except TriggerAlreadyClaimedError as error:
+                existing = await self._store.load_by_trigger(trigger.id)
+                existing_id = (
+                    "unknown" if existing is None else existing.snapshot.operation.id
+                )
+                raise OperationStateError(
+                    f"trigger already owns operation: {existing_id}; "
+                    "resume is introduced with persistent recovery in Phase 2"
+                ) from error
+            except OperationAlreadyExistsError as error:
+                raise OperationStateError(
+                    f"operation already exists: {operation_id}"
+                ) from error
+            snapshot = committed.operation.snapshot
+
+        if cancellation_requested:
+
+            async def interrupt_or_accept_terminal_race() -> None:
+                try:
+                    await self.interrupt(operation_id)
+                except OperationStateError:
+                    snapshot = await self.inspect(operation_id)
+                    if snapshot.operation.status not in {
+                        OperationStatus.SUCCEEDED,
+                        OperationStatus.FAILED,
+                        OperationStatus.CANCELLED,
+                        OperationStatus.INTERRUPTED,
+                    }:
+                        raise
+
+            interruption = asyncio.create_task(interrupt_or_accept_terminal_race())
+            await _await_resistant_task(interruption)
+            raise asyncio.CancelledError
+        return snapshot
 
     async def begin_turn(self, operation_id: str) -> Turn:
         async with self._lock:
-            state = self._working_state(operation_id)
+            state = await self._working_state(operation_id)
             now = self._clock()
             turn = Turn(
                 id=self._id_factory("turn"),
@@ -242,7 +257,7 @@ class OperationRuntime:
             )
             state.operation = replace(state.operation, updated_at=now)
             self._append_event(state, "turn.created", turn_id=turn.id)
-            self._commit(state)
+            await self._commit(state)
             return turn
 
     async def begin_model_call(
@@ -256,7 +271,7 @@ class OperationRuntime:
             _required_text(provider_id, "provider_id")
             if not isinstance(request, ModelRequest):
                 raise TypeError("request must be a ModelRequest")
-            state = self._working_state(operation_id)
+            state = await self._working_state(operation_id)
             turn_index, turn = self._turn(state, turn_id)
             if request.operation_id != operation_id or request.turn_id != turn_id:
                 raise OperationStateError(
@@ -293,14 +308,20 @@ class OperationRuntime:
                 phase=LoopPhase.AWAITING_MODEL,
             )
             state.operation = replace(state.operation, updated_at=now)
-            self._append_event(state, "context.built", turn_id=turn_id)
+            self._append_event(
+                state,
+                "context.built",
+                turn_id=turn_id,
+                model_call_id=model_call.id,
+            )
             self._append_event(
                 state,
                 "model_call.started",
                 turn_id=turn_id,
+                model_call_id=model_call.id,
                 payload={"model_call_id": model_call.id, "provider_id": provider_id},
             )
-            self._commit(state)
+            await self._commit(state)
             return model_call
 
     async def record_model_response(
@@ -314,7 +335,7 @@ class OperationRuntime:
         async with self._lock:
             if not isinstance(response, ModelResponse):
                 raise TypeError("response must be a ModelResponse")
-            state = self._working_state(operation_id)
+            state = await self._working_state(operation_id)
             call_index, model_call = self._model_call(state, model_call_id)
             if model_call.status is not ModelCallStatus.STARTED:
                 raise OperationStateError("model call is already terminal")
@@ -348,6 +369,7 @@ class OperationRuntime:
                 state,
                 "model_response.recorded",
                 turn_id=model_call.turn_id,
+                model_call_id=model_call.id,
                 payload={
                     "finish_reason": response.finish_reason.value,
                     "model_call_id": model_call.id,
@@ -355,7 +377,7 @@ class OperationRuntime:
                     "estimated_cost_usd": str(response.usage.estimated_cost_usd),
                 },
             )
-            self._commit(state)
+            await self._commit(state)
 
     async def record_readiness(
         self,
@@ -367,12 +389,13 @@ class OperationRuntime:
             _required_text(final_text, "final_text")
             if not isinstance(readiness, Readiness):
                 raise TypeError("readiness must be a Readiness record")
-            state = self._working_state(operation_id)
+            state = await self._working_state(operation_id)
             if not state.model_calls or (
                 state.model_calls[-1].status is not ModelCallStatus.COMPLETED
             ):
                 raise OperationStateError("readiness requires a completed model call")
-            model_response = state.model_calls[-1].response
+            model_call = state.model_calls[-1]
+            model_response = model_call.response
             if (
                 model_response is None
                 or model_response.tool_calls
@@ -381,7 +404,7 @@ class OperationRuntime:
                 raise OperationStateError(
                     "readiness text must match the committed final model response"
                 )
-            readiness_turn_id = state.model_calls[-1].turn_id
+            readiness_turn_id = model_call.turn_id
             if any(
                 event.type == "readiness.recorded"
                 and event.turn_id == readiness_turn_id
@@ -414,7 +437,7 @@ class OperationRuntime:
             if not readiness.allowed:
                 correction = Observation(
                     operation_id=operation_id,
-                    turn_id=state.model_calls[-1].turn_id,
+                    turn_id=model_call.turn_id,
                     code=readiness.code,
                     message=readiness.message,
                     payload={"missing_facts": readiness.missing_facts},
@@ -444,7 +467,8 @@ class OperationRuntime:
             self._append_event(
                 state,
                 "readiness.recorded",
-                turn_id=state.model_calls[-1].turn_id,
+                turn_id=model_call.turn_id,
+                model_call_id=model_call.id,
                 payload={"allowed": readiness.allowed, "code": readiness.code},
             )
             if correction is not None:
@@ -452,13 +476,14 @@ class OperationRuntime:
                     state,
                     "observation.recorded",
                     turn_id=correction.turn_id,
+                    model_call_id=model_call.id,
                     payload={
                         "code": correction.code,
                         "repair": "readiness",
                         "truncated": correction.truncated,
                     },
                 )
-            self._commit(state)
+            await self._commit(state)
             return correction
 
     async def record_action_rejection(
@@ -474,7 +499,7 @@ class OperationRuntime:
             raise TypeError("rejection must be an ActionRejection record")
 
         async with self._lock:
-            state = self._working_state(operation_id)
+            state = await self._working_state(operation_id)
             model_call, committed_call = self._committed_tool_call(
                 state,
                 turn_id,
@@ -573,6 +598,7 @@ class OperationRuntime:
                 state,
                 "action.rejected",
                 turn_id=turn_id,
+                model_call_id=model_call.id,
                 call_id=call.id,
                 payload={
                     "code": rejection.code,
@@ -585,6 +611,7 @@ class OperationRuntime:
                 state,
                 "observation.recorded",
                 turn_id=turn_id,
+                model_call_id=model_call.id,
                 call_id=call.id,
                 payload={
                     "code": observation.code,
@@ -602,6 +629,7 @@ class OperationRuntime:
                     state,
                     "action.skipped",
                     turn_id=turn_id,
+                    model_call_id=model_call.id,
                     call_id=skipped_call.id,
                     payload={
                         "blocked_by_call_id": call.id,
@@ -614,6 +642,7 @@ class OperationRuntime:
                     state,
                     "observation.recorded",
                     turn_id=turn_id,
+                    model_call_id=model_call.id,
                     call_id=skipped_call.id,
                     payload={
                         "code": skipped.code,
@@ -621,7 +650,7 @@ class OperationRuntime:
                         "truncated": skipped.truncated,
                     },
                 )
-            self._commit(state)
+            await self._commit(state)
             return observation
 
     async def submit(
@@ -646,7 +675,7 @@ class OperationRuntime:
         # Commit the unexecuted task first. The proposal is untrusted until it
         # is bound to an exact tool call in a committed model response.
         async with self._lock:
-            state = self._working_state(proposal.operation_id)
+            state = await self._working_state(proposal.operation_id)
             model_call, tool_call = self._committed_tool_call(
                 state,
                 proposal.turn_id,
@@ -710,6 +739,7 @@ class OperationRuntime:
                 state,
                 "task.created",
                 turn_id=task.turn_id,
+                model_call_id=model_call.id,
                 call_id=task.call_id,
                 task_id=task.id,
                 capability_id=task.capability_id,
@@ -720,7 +750,7 @@ class OperationRuntime:
                     "executor_id": task.executor_id,
                 },
             )
-            self._commit(state)
+            await self._commit(state)
 
         # A separate atomic transition makes RUNNING and executor.started
         # durable before the only external execution call in production code.
@@ -728,8 +758,9 @@ class OperationRuntime:
         execution_timeout_seconds = 0.0
         timeout_is_wall = False
         async with self._lock:
-            state = self._working_state(task.operation_id)
+            state = await self._working_state(task.operation_id)
             task_index, committed_task = self._task(state, task.id)
+            model_call = self._completed_model_call_for_turn(state, task.turn_id)
             if committed_task.status is not TaskStatus.PENDING:
                 raise OperationStateError("task is no longer pending")
             capability, executor = self._capabilities.resolve_execution(
@@ -749,6 +780,7 @@ class OperationRuntime:
                 state,
                 "executor.started",
                 turn_id=task.turn_id,
+                model_call_id=model_call.id,
                 call_id=task.call_id,
                 task_id=task.id,
                 capability_id=task.capability_id,
@@ -767,8 +799,12 @@ class OperationRuntime:
                 # Discard the uncommitted RUNNING/executor.started projection.
                 # The persisted task proves that execution was blocked before
                 # the executor invocation boundary.
-                state = self._working_state(task.operation_id)
+                state = await self._working_state(task.operation_id)
                 task_index, pending_task = self._task(state, task.id)
+                model_call = self._completed_model_call_for_turn(
+                    state,
+                    pending_task.turn_id,
+                )
                 state.tasks[task_index] = replace(
                     pending_task,
                     status=TaskStatus.FAILED,
@@ -783,6 +819,7 @@ class OperationRuntime:
                     state,
                     "task.failed",
                     turn_id=pending_task.turn_id,
+                    model_call_id=model_call.id,
                     call_id=pending_task.call_id,
                     task_id=pending_task.id,
                     capability_id=pending_task.capability_id,
@@ -792,7 +829,7 @@ class OperationRuntime:
                         "error_code": "task_timeout",
                     },
                 )
-                self._commit(state)
+                await self._commit(state)
                 wall_deadline_error = OperationWallTimeExceeded(task.id)
             else:
                 timeout_candidates = [
@@ -810,7 +847,7 @@ class OperationRuntime:
                         else math.inf
                     ),
                 )
-                self._commit(state)
+                await self._commit(state)
 
         if wall_deadline_error is not None:
             raise wall_deadline_error
@@ -837,7 +874,11 @@ class OperationRuntime:
             if timeout.expired():
                 deadline_cause = error
             else:
-                await self._fail_task(task.id, "executor_failed")
+                await self._fail_task(
+                    task.operation_id,
+                    task.id,
+                    "executor_failed",
+                )
                 raise CapabilityExecutionError(
                     f"executor failed for task {task.id}"
                 ) from error
@@ -846,7 +887,7 @@ class OperationRuntime:
         if current_task is not None and current_task.cancelling():
             raise asyncio.CancelledError
         if timeout.expired():
-            await self._fail_task(task.id, "task_timeout")
+            await self._fail_task(task.operation_id, task.id, "task_timeout")
             if timeout_is_wall:
                 raise OperationWallTimeExceeded(task.id) from deadline_cause
             raise TaskExecutionTimeout(
@@ -857,7 +898,7 @@ class OperationRuntime:
         if deadline_cause is not None:
             # ``timeout.expired()`` is stable once the context has exited, so
             # this branch is defensive against an invalid timeout lifecycle.
-            await self._fail_task(task.id, "executor_failed")
+            await self._fail_task(task.operation_id, task.id, "executor_failed")
             raise CapabilityExecutionError(
                 f"executor failed for task {task.id}"
             ) from deadline_cause
@@ -866,8 +907,9 @@ class OperationRuntime:
         accepted_candidate: EvidenceCandidate | None = None
         validation_error: EvidenceValidationError | None = None
         async with self._lock:
-            state = self._working_state(task.operation_id)
+            state = await self._working_state(task.operation_id)
             task_index, committed_task = self._task(state, task.id)
+            model_call = self._completed_model_call_for_turn(state, task.turn_id)
             if committed_task.status is not TaskStatus.RUNNING:
                 raise OperationStateError("task is no longer running")
             try:
@@ -938,6 +980,7 @@ class OperationRuntime:
                     state,
                     "executor.completed",
                     turn_id=task.turn_id,
+                    model_call_id=model_call.id,
                     call_id=task.call_id,
                     task_id=task.id,
                     capability_id=task.capability_id,
@@ -948,6 +991,7 @@ class OperationRuntime:
                     state,
                     "evidence.accepted",
                     turn_id=task.turn_id,
+                    model_call_id=model_call.id,
                     call_id=task.call_id,
                     task_id=task.id,
                     evidence_id=evidence.id,
@@ -959,6 +1003,7 @@ class OperationRuntime:
                     state,
                     "task.succeeded",
                     turn_id=task.turn_id,
+                    model_call_id=model_call.id,
                     call_id=task.call_id,
                     task_id=task.id,
                     evidence_id=evidence.id,
@@ -966,15 +1011,19 @@ class OperationRuntime:
                     executor_id=task.executor_id,
                     payload={"task_id": task.id},
                 )
-                self._commit(state)
+                await self._commit(state)
                 return evidence
 
         if execution_identity_error is not None:
-            await self._fail_task(task.id, "execution_identity_changed")
+            await self._fail_task(
+                task.operation_id,
+                task.id,
+                "execution_identity_changed",
+            )
             raise CapabilityExecutionError(
                 f"executor identity changed for task {task.id}"
             ) from execution_identity_error
-        await self._fail_task(task.id, "evidence_rejected")
+        await self._fail_task(task.operation_id, task.id, "evidence_rejected")
         assert validation_error is not None
         raise validation_error
 
@@ -982,12 +1031,16 @@ class OperationRuntime:
         if not isinstance(observation, Observation):
             raise TypeError("observation must be an Observation")
         async with self._lock:
-            state = self._working_state(observation.operation_id)
+            state = await self._working_state(observation.operation_id)
             if observation.evidence_id is None or observation.task_id is None:
                 raise OperationStateError(
                     "executor observation requires task and evidence identity"
                 )
             _, task = self._task(state, observation.task_id)
+            model_call = self._completed_model_call_for_turn(
+                state,
+                observation.turn_id,
+            )
             evidence = self._accepted_evidence(state, observation.evidence_id)
             if task.status is not TaskStatus.SUCCEEDED:
                 raise OperationStateError("observation task is not succeeded")
@@ -1019,6 +1072,7 @@ class OperationRuntime:
                 state,
                 "observation.recorded",
                 turn_id=observation.turn_id,
+                model_call_id=model_call.id,
                 call_id=task.call_id,
                 task_id=task.id,
                 evidence_id=evidence.id,
@@ -1031,12 +1085,12 @@ class OperationRuntime:
                     "truncated": observation.truncated,
                 },
             )
-            self._commit(state)
+            await self._commit(state)
 
     async def complete(self, operation_id: str, final_text: str) -> LoopExit:
         async with self._lock:
             _required_text(final_text, "final_text")
-            state = self._working_state(operation_id)
+            state = await self._working_state(operation_id)
             if not state.readiness or not state.readiness[-1].allowed:
                 raise OperationStateError("completion requires allowed readiness")
             if state.loop_state.final_answer_candidate != final_text:
@@ -1064,7 +1118,7 @@ class OperationRuntime:
                 final_text=final_text,
                 created_at=now,
             )
-            self._commit(state)
+            await self._commit(state)
             return result
 
     async def fail(
@@ -1076,9 +1130,9 @@ class OperationRuntime:
     ) -> LoopExit:
         async with self._lock:
             _required_text(reason, "failure reason")
-            state = self._working_state(operation_id)
+            state = await self._working_state(operation_id)
             result = self._fail_locked(state, reason, final_text=final_text)
-            self._commit(state)
+            await self._commit(state)
             return result
 
     async def fail_no_progress(
@@ -1088,11 +1142,15 @@ class OperationRuntime:
     ) -> LoopExit:
         _required_text(call_id, "no-progress call_id")
         async with self._lock:
-            state = self._working_state(operation_id)
+            state = await self._working_state(operation_id)
             if not state.turns:
                 raise OperationStateError("no-progress failure requires a turn")
             turn_id = state.turns[-1].id
-            _, committed_call = self._committed_tool_call(state, turn_id, call_id)
+            model_call, committed_call = self._committed_tool_call(
+                state,
+                turn_id,
+                call_id,
+            )
             fingerprint = self._action_fingerprint(committed_call)
             rejection_observation = next(
                 (
@@ -1136,6 +1194,7 @@ class OperationRuntime:
                 state,
                 "no_progress.detected",
                 turn_id=turn_id,
+                model_call_id=model_call.id,
                 call_id=call_id,
                 payload={
                     "count": state.loop_state.identical_failure_count,
@@ -1144,7 +1203,7 @@ class OperationRuntime:
                 },
             )
             result = self._fail_locked(state, reason)
-            self._commit(state)
+            await self._commit(state)
             return result
 
     async def fail_budget(
@@ -1164,7 +1223,7 @@ class OperationRuntime:
         _required_text(reason, "budget failure reason")
         _required_text(budget, "budget kind")
         async with self._lock:
-            state = self._working_state(operation_id)
+            state = await self._working_state(operation_id)
             if state.model_calls and (
                 state.model_calls[-1].status is ModelCallStatus.STARTED
             ):
@@ -1179,6 +1238,7 @@ class OperationRuntime:
                     state,
                     "model_call.failed",
                     turn_id=model_call.turn_id,
+                    model_call_id=model_call.id,
                     payload={
                         "error_code": reason,
                         "model_call_id": model_call.id,
@@ -1188,6 +1248,14 @@ class OperationRuntime:
                 state,
                 "budget.exhausted",
                 turn_id=turn_id,
+                model_call_id=next(
+                    (
+                        model_call.id
+                        for model_call in reversed(state.model_calls)
+                        if model_call.turn_id == turn_id
+                    ),
+                    None,
+                ),
                 call_id=call_id,
                 task_id=task_id,
                 payload={
@@ -1198,7 +1266,7 @@ class OperationRuntime:
                 },
             )
             result = self._fail_locked(state, reason)
-            self._commit(state)
+            await self._commit(state)
             return result
 
     async def interrupt(
@@ -1210,73 +1278,16 @@ class OperationRuntime:
 
         _required_text(reason, "interruption reason")
         async with self._lock:
-            state = self._working_state(operation_id)
-            now = self._clock()
-            active_task_index = next(
-                (
-                    index
-                    for index in range(len(state.tasks) - 1, -1, -1)
-                    if state.tasks[index].status
-                    in {TaskStatus.PENDING, TaskStatus.RUNNING}
-                ),
-                None,
-            )
-            if active_task_index is not None:
-                task = state.tasks[active_task_index]
-                state.tasks[active_task_index] = replace(
-                    task,
-                    cancellation_requested=True,
-                    updated_at=now,
-                )
-                self._append_event(
-                    state,
-                    "task.cancellation_requested",
-                    turn_id=task.turn_id,
-                    call_id=task.call_id,
-                    task_id=task.id,
-                    capability_id=task.capability_id,
-                    executor_id=task.executor_id,
-                    payload={"reason": reason, "status": task.status.value},
-                )
-            elif state.model_calls and (
-                state.model_calls[-1].status is ModelCallStatus.STARTED
-            ):
-                model_call = state.model_calls[-1]
-                state.model_calls[-1] = replace(
-                    model_call,
-                    cancellation_requested=True,
-                    updated_at=now,
-                )
-                self._append_event(
-                    state,
-                    "model_call.cancellation_requested",
-                    turn_id=model_call.turn_id,
-                    payload={"model_call_id": model_call.id, "reason": reason},
-                )
-            state.operation = replace(
-                state.operation,
-                status=OperationStatus.INTERRUPTED,
-                updated_at=now,
-                terminal_reason=reason,
-            )
-            state.loop_state = replace(
-                state.loop_state,
-                phase=LoopPhase.TERMINAL,
-                interruption_reason=reason,
-            )
-            self._append_event(
-                state,
-                "operation.interrupted",
-                payload={"reason": reason},
-            )
-            result = LoopExit(
-                operation_id=operation_id,
-                kind=LoopExitKind.INTERRUPTED,
-                reason=reason,
-                created_at=now,
-            )
-            self._commit(state)
-            return result
+            while True:
+                state = await self._working_state(operation_id)
+                result = self._interrupt_locked(state, reason)
+                try:
+                    await self._commit(state)
+                except OperationStateError as error:
+                    if isinstance(error.__cause__, OperationRevisionConflict):
+                        continue
+                    raise
+                return result
 
     async def record_model_failure(
         self,
@@ -1286,7 +1297,7 @@ class OperationRuntime:
     ) -> LoopExit:
         async with self._lock:
             _required_text(error_code, "model error_code")
-            state = self._working_state(operation_id)
+            state = await self._working_state(operation_id)
             call_index, model_call = self._model_call(state, model_call_id)
             if model_call.status is not ModelCallStatus.STARTED:
                 raise OperationStateError("model call is already terminal")
@@ -1301,65 +1312,86 @@ class OperationRuntime:
                 state,
                 "model_call.failed",
                 turn_id=model_call.turn_id,
+                model_call_id=model_call.id,
                 payload={"error_code": error_code, "model_call_id": model_call.id},
             )
             result = self._fail_locked(state, error_code)
-            self._commit(state)
+            await self._commit(state)
             return result
 
     async def inspect(self, operation_id: str) -> OperationSnapshot:
         async with self._lock:
             try:
-                state = self._states[operation_id]
-            except KeyError as error:
+                committed = await self._store.load(operation_id)
+            except OperationNotFoundError as error:
                 raise KeyError(f"Unknown operation: {operation_id}") from error
-            return self._snapshot(state)
+            return committed.snapshot
 
     async def elapsed_seconds(self, operation_id: str) -> float:
         """Return authoritative elapsed wall time from the runtime clock."""
 
         async with self._lock:
             try:
-                state = self._states[operation_id]
-            except KeyError as error:
+                committed = await self._store.load(operation_id)
+            except OperationNotFoundError as error:
                 raise KeyError(f"Unknown operation: {operation_id}") from error
             now = self._clock()
             if now.tzinfo is None or now.utcoffset() is None:
                 raise ValueError("runtime clock must return a timezone-aware datetime")
-            return max(0.0, (now - state.operation.created_at).total_seconds())
+            return max(
+                0.0,
+                (now - committed.snapshot.operation.created_at).total_seconds(),
+            )
 
-    def _active_state(self, operation_id: str) -> _OperationState:
+    async def _working_state(self, operation_id: str) -> _OperationState:
         try:
-            state = self._states[operation_id]
-        except KeyError as error:
+            committed = await self._store.load(operation_id)
+        except OperationNotFoundError as error:
             raise KeyError(f"Unknown operation: {operation_id}") from error
-        if state.operation.status in {
+        snapshot = committed.snapshot
+        if snapshot.operation.status in {
             OperationStatus.SUCCEEDED,
             OperationStatus.FAILED,
             OperationStatus.CANCELLED,
             OperationStatus.INTERRUPTED,
         }:
             raise OperationStateError("operation is already terminal")
-        return state
-
-    def _working_state(self, operation_id: str) -> _OperationState:
-        committed = self._active_state(operation_id)
         return _OperationState(
-            trigger=committed.trigger,
-            operation=committed.operation,
-            loop_state=committed.loop_state,
-            budgets=committed.budgets,
-            turns=list(committed.turns),
-            model_calls=list(committed.model_calls),
-            readiness=list(committed.readiness),
-            tasks=list(committed.tasks),
-            evidence=list(committed.evidence),
-            observations=list(committed.observations),
-            events=list(committed.events),
+            revision=committed.revision,
+            trigger=snapshot.trigger,
+            operation=snapshot.operation,
+            loop_state=snapshot.loop_state,
+            budgets=snapshot.budgets,
+            turns=list(snapshot.turns),
+            model_calls=list(snapshot.model_calls),
+            readiness=list(snapshot.readiness),
+            tasks=list(snapshot.tasks),
+            evidence=list(snapshot.evidence),
+            observations=list(snapshot.observations),
+            events=list(snapshot.events),
         )
 
-    def _commit(self, state: _OperationState) -> None:
-        self._states[state.operation.id] = state
+    async def _commit(self, state: _OperationState) -> None:
+        try:
+            committed, cancellation_requested = await _await_store_write(
+                self._store.commit(
+                    self._snapshot(state),
+                    expected_revision=state.revision,
+                )
+            )
+        except OperationNotFoundError as error:
+            raise KeyError(f"Unknown operation: {state.operation.id}") from error
+        except OperationRevisionConflict as error:
+            raise OperationStateError(
+                f"operation changed concurrently: {state.operation.id}"
+            ) from error
+        except InvalidOperationCheckpointError as error:
+            raise OperationStateError(
+                f"operation checkpoint rejected: {state.operation.id}"
+            ) from error
+        state.revision = committed.operation.revision
+        if cancellation_requested:
+            raise asyncio.CancelledError
 
     def _turn(self, state: _OperationState, turn_id: str) -> tuple[int, Turn]:
         for index, turn in enumerate(state.turns):
@@ -1480,11 +1512,16 @@ class OperationRuntime:
                 return evidence
         raise OperationStateError(f"unknown accepted evidence: {evidence_id}")
 
-    async def _fail_task(self, task_id: str, error_code: str) -> None:
+    async def _fail_task(
+        self,
+        operation_id: str,
+        task_id: str,
+        error_code: str,
+    ) -> None:
         async with self._lock:
-            operation_id = self._operation_for_task(task_id)
-            state = self._working_state(operation_id)
+            state = await self._working_state(operation_id)
             task_index, task = self._task(state, task_id)
+            model_call = self._completed_model_call_for_turn(state, task.turn_id)
             if task.status is not TaskStatus.RUNNING:
                 raise OperationStateError("task is no longer running")
             now = self._clock()
@@ -1499,6 +1536,7 @@ class OperationRuntime:
                 state,
                 "task.failed",
                 turn_id=task.turn_id,
+                model_call_id=model_call.id,
                 call_id=task.call_id,
                 task_id=task.id,
                 capability_id=task.capability_id,
@@ -1509,6 +1547,7 @@ class OperationRuntime:
                 state,
                 "executor.failed",
                 turn_id=task.turn_id,
+                model_call_id=model_call.id,
                 call_id=task.call_id,
                 task_id=task.id,
                 capability_id=task.capability_id,
@@ -1519,13 +1558,7 @@ class OperationRuntime:
                     "error_code": error_code,
                 },
             )
-            self._commit(state)
-
-    def _operation_for_task(self, task_id: str) -> str:
-        for operation_id, state in self._states.items():
-            if any(task.id == task_id for task in state.tasks):
-                return operation_id
-        raise OperationStateError(f"unknown task: {task_id}")
+            await self._commit(state)
 
     def _append_event(
         self,
@@ -1533,6 +1566,7 @@ class OperationRuntime:
         event_type: str,
         *,
         turn_id: str | None = None,
+        model_call_id: str | None = None,
         call_id: str | None = None,
         task_id: str | None = None,
         evidence_id: str | None = None,
@@ -1546,7 +1580,9 @@ class OperationRuntime:
                 type=event_type,
                 agent_id=state.operation.agent_id,
                 operation_id=state.operation.id,
+                session_id=state.operation.session_id,
                 turn_id=turn_id,
+                model_call_id=model_call_id,
                 call_id=call_id,
                 task_id=task_id,
                 evidence_id=evidence_id,
@@ -1579,6 +1615,78 @@ class OperationRuntime:
             kind=LoopExitKind.FAILED,
             reason=reason,
             final_text=final_text,
+            created_at=now,
+        )
+
+    def _interrupt_locked(
+        self,
+        state: _OperationState,
+        reason: str,
+    ) -> LoopExit:
+        now = self._clock()
+        active_task_index = next(
+            (
+                index
+                for index in range(len(state.tasks) - 1, -1, -1)
+                if state.tasks[index].status in {TaskStatus.PENDING, TaskStatus.RUNNING}
+            ),
+            None,
+        )
+        if active_task_index is not None:
+            task = state.tasks[active_task_index]
+            state.tasks[active_task_index] = replace(
+                task,
+                cancellation_requested=True,
+                updated_at=now,
+            )
+            model_call = self._completed_model_call_for_turn(state, task.turn_id)
+            self._append_event(
+                state,
+                "task.cancellation_requested",
+                turn_id=task.turn_id,
+                model_call_id=model_call.id,
+                call_id=task.call_id,
+                task_id=task.id,
+                capability_id=task.capability_id,
+                executor_id=task.executor_id,
+                payload={"reason": reason, "status": task.status.value},
+            )
+        elif state.model_calls and (
+            state.model_calls[-1].status is ModelCallStatus.STARTED
+        ):
+            model_call = state.model_calls[-1]
+            state.model_calls[-1] = replace(
+                model_call,
+                cancellation_requested=True,
+                updated_at=now,
+            )
+            self._append_event(
+                state,
+                "model_call.cancellation_requested",
+                turn_id=model_call.turn_id,
+                model_call_id=model_call.id,
+                payload={"model_call_id": model_call.id, "reason": reason},
+            )
+        state.operation = replace(
+            state.operation,
+            status=OperationStatus.INTERRUPTED,
+            updated_at=now,
+            terminal_reason=reason,
+        )
+        state.loop_state = replace(
+            state.loop_state,
+            phase=LoopPhase.TERMINAL,
+            interruption_reason=reason,
+        )
+        self._append_event(
+            state,
+            "operation.interrupted",
+            payload={"reason": reason},
+        )
+        return LoopExit(
+            operation_id=state.operation.id,
+            kind=LoopExitKind.INTERRUPTED,
+            reason=reason,
             created_at=now,
         )
 
