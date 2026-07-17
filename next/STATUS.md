@@ -10,15 +10,14 @@ project. Update it before and after every material task.
   event replay/subscription without weakening the SQLite transaction boundary
 - **Last completed task:** P2-03 — normalized SQLite operation repository,
   migrations, strict codecs, optimistic transactions, and reconciliation
-- **Current checkpoint:** P2-03 SQLite persistence commit
-  `ee6763bb6e0b55b1f95ec4d9fcc1f40505fbe4d5`
-  (`feat(v2): add normalized sqlite operation store`)
+- **Current checkpoint:** P2-04 local blob durability commit
+  `320a9e0` (`feat(v2): add durable local blob store`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** add test-only committed-event cursor/envelope/read
-  contracts, capture the absent projection expected red, then extend the
-  existing SQLite transaction owner without adding a public event writer
+- **Exact next action:** complete independent subscription review, repair any
+  blocker, then run the complete P2-04 dual-interpreter/static/architecture/
+  oracle/build gate before the scoped checkpoint
 
 ## Mandatory architecture re-read
 
@@ -127,10 +126,10 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-04b | complete | Canonical blob identity/metadata/reader records plus narrow `BlobStore` protocol | Strict digest/ID/time/version/provenance/tombstone validation and protocol shape fail before the owner exists, then pass without filesystem or SQLite leakage into runtime |
 | P2-04c | complete | Local content-addressed filesystem blob adapter | Temp/write/flush/fsync/re-read/hash/atomic-rename/directory-fsync/reopen; idempotent same-ID retry, same-content races, corruption/symlink rejection, cancellation completion, and explicit grace-based orphan cleanup |
 | P2-04d | complete | Representative blob review before broader persistence work | One complete put/open/metadata/tombstone/delete path is independently reviewed; metadata/content ownership is coherent and does not justify a generic storage framework |
-| P2-04e | active | Canonical committed-event cursor/envelope and narrow read/subscription contract | Positive agent-bound cursors, strict envelope linkage, bounded reads, cross-agent cursor rejection, and no public event append method |
-| P2-04f | pending | Migration 3 plus SQLite committed-event projection | Existing `runtime_events` gain per-agent monotonic sequence and append-only enforcement; v2 backfill, state/event/cursor atomicity, rollback, CAS loser, cross-operation order, pagination, and reopen pass |
-| P2-04g | pending | Post-commit wake-hint subscription over durable replay | No pre-commit delivery; missed/failed wake, commit-before-notify gap, reconnect, cross-store polling, slow subscriber, bounded batches, and cancellation all recover from durable cursors |
-| P2-04h | pending | Final P2-04 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, independent review, scoped hooks, and local commit |
+| P2-04e | complete | Canonical committed-event cursor/envelope and narrow read/subscription contract | Positive agent-bound cursors, strict envelope linkage, bounded reads, cross-agent cursor rejection, and no public event append method |
+| P2-04f | complete | Migration 3 plus SQLite committed-event projection | Existing `runtime_events` gain per-agent monotonic sequence and append-only enforcement; v2 backfill, state/event/cursor atomicity, rollback, CAS loser, cross-operation order, pagination, and reopen pass |
+| P2-04g | complete | Post-commit wake-hint subscription over durable replay | No pre-commit delivery; missed/failed wake, commit-before-notify gap, reconnect, cross-store polling, slow subscriber, bounded batches, and cancellation all recover from durable cursors |
+| P2-04h | active | Final P2-04 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, independent review, scoped hooks, and local commit |
 
 ## Files/components being changed or planned
 
@@ -407,6 +406,18 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-04c independent durability review before repair | REVIEW FINDINGS — directory creation was not durable in its parent; retries did not re-fsync visible rename results; malformed recursive JSON, hard links, oversized orphan verification, reader cancellation advancement, and impossible lifecycle versions needed stronger fail-closed behavior |
 | Repaired P2-04c/P2-04d focused and complete gates | PASS — 71 focused blob cases and 344 complete v2 tests pass on CPython 3.11.15 and 3.12.7; new regressions prove parent-directory fsync, content/manifest retry stabilization, typed recursive-codec failure, cancellation-poisoned readers, strict lifecycle revisions, same-ID races, short/zero writes, tamper checksums, and no resurrection; Black/compile/mypy/pyright and 38 architecture tests are clean |
 | P2-04d ownership review | PASS after repair — content precedes the manifest commit point; shared bytes remain reference-safe across logical records; terminal metadata survives physical deletion; cleanup fails closed before deleting; no blob behavior leaked into SQLite, runtime, loop, capability, or provider owners; no generic storage framework is justified |
+| Initial P2-04e committed-event contract | EXPECTED RED — focused collection stopped on exactly one import error because canonical `CommittedEvent` and `EventCursor` records did not yet exist |
+| P2-04e portable event contract | PASS — 6 focused cases prove immutable positive agent-bound cursors, exact canonical-event linkage, a read-only bounded replay/subscription protocol, typed cross-agent and unknown-cursor facts, and no public append method; focused mypy and pyright are clean |
+| Initial P2-04f SQLite projection | EXPECTED RED — 7 focused failures identified the absent Migration 3 sequence column, migration history, and concrete bounded `read_after` implementation |
+| P2-04f projection/replay implementation | PASS — 42 focused event, migration, codec-corruption, and architecture cases prove rowid-order legacy backfill, positive unique append-only per-agent sequences, atomic create/commit projection, rollback and CAS-loser gaplessness, bounded pagination, cursor errors, reopen, corruption normalization, and no new dependency leak |
+| P2-04f independent review and migration-failure hardening | PASS — review found no design blocker and independently passed 29 cases plus mypy; its high-value follow-up now proves a failed legacy-row copy rolls the complete Migration 3 rebuild back to exact version-2 history/schema/data with no partial table or triggers |
+| Initial P2-04g subscription contract | EXPECTED RED — exactly 9 focused failures identified the absent concrete `subscribe`, polling/batch constants, and local wake seam before production subscription code existed |
+| P2-04g wake-hint subscription | PASS — all 10 subscription cases and 52 combined event/storage/architecture cases pass; notification occurs only after another connection observes durable rows, rollback emits nothing, wake failure and cross-store delivery recover by polling, a double read closes commit-before-wait, reconnect is cursor-exact, multiple/slow subscribers use independent hints and bounded pages without duplicates, cancellation leaves no worker, and agent isolation holds; focused Black/mypy/pyright are clean |
+| P2-04g independent review | PASS after the static repair — review found the subscription semantics and ownership coherent, identified only test-typing failures, and verified those failures are repaired; it confirmed post-commit publication, polling authority, race closure, per-subscriber hints, cursor advancement, cleanup, scope validation, and absence of a public append path or background worker |
+| P2-04h final dual-interpreter v2 suite | PASS — 370 tests and 0 failures/errors on each of CPython 3.11.15 and 3.12.7; JUnit totals record 1.992s and 2.056s respectively |
+| P2-04h final static and architecture gate | PASS — Black clean across 67 files; byte compilation succeeded; mypy clean across 66 files; pyright 1.1.411 reports 0 errors/warnings; all 38 architecture tests pass |
+| P2-04h root preservation gate | PASS — root v1 collected 2,719 tests and passed all 2,498 safe selections with 221 deselected in 10.38s; disposition/v1 fixtures reproduce; root diff from `b87df318`, symlink scan, and diff check are clean |
+| P2-04h distribution gate | PASS — clean-copy v2 wheel/sdist contain 26/41 entries at `2.0.0a0`; physical-`next/` root wheel/sdist remain 401/442 entries at v1 `1.0.0`; archive boundaries are clean and fresh Python 3.11/3.12 installs import blob/event/SQLite v2 owners from their own site-packages |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
@@ -480,6 +491,23 @@ re-read and an updated ordered ledger.
   final-component no-follow guarantee; P2-08 owns the private Agent Home and
   shared cross-process writer boundary rather than duplicating a host/security
   framework here.
+- P2-04e/f keep event creation inside the existing operation transaction and
+  expose only portable replay/follow contracts. Migration 3 rebuilds the
+  legacy table in insertion order, assigns one contiguous sequence per agent,
+  removes cascading operation deletion, and rejects raw updates/deletes. The
+  sole writer allocates `MAX(sequence) + 1` only while holding SQLite's
+  existing `BEGIN IMMEDIATE` write lock; rolled-back writes reserve nothing.
+  Replay validates a supplied cursor and reads its bounded page in one
+  transaction through the canonical event decoder. No counter table, outbox,
+  generic event store, or public append API was added. P2-04g notifications
+  remain non-authoritative post-commit wake hints, with polling/replay required
+  to close missed-notification and cross-process gaps.
+- Each concrete subscription owns one in-process `asyncio.Event` wake hint and
+  advances only from yielded durable envelopes. Clear-then-reread closes the
+  same-process wait race; a 250 ms poll bounds missed, failed, cross-store, and
+  future cross-process hints. Closing an idle store is observed on the next
+  bounded poll; the current portable contract intentionally does not invent a
+  separate subscription-close signal or background dispatcher.
 - P2-02 began test-first. Its combined event/checkpoint/store/architecture run
   stopped at collection on the intentionally absent canonical event and
   operation-store modules. This is expected-red evidence, not a gate failure;

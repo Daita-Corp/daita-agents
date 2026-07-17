@@ -59,3 +59,36 @@ class RuntimeEvent:
             if value is not None:
                 _required_text(value, f"event {field_name}")
         object.__setattr__(self, "payload", FrozenJsonObject.from_mapping(self.payload))
+
+
+@dataclass(frozen=True, slots=True)
+class EventCursor:
+    """One durable position in an agent-scoped committed-event sequence."""
+
+    agent_id: str
+    sequence: int
+
+    def __post_init__(self) -> None:
+        _required_text(self.agent_id, "event cursor agent_id")
+        if (
+            not isinstance(self.sequence, int)
+            or isinstance(self.sequence, bool)
+            or self.sequence < 1
+        ):
+            raise ValueError("event cursor sequence must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedEvent:
+    """A canonical runtime event after its durable cursor is assigned."""
+
+    cursor: EventCursor
+    event: RuntimeEvent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cursor, EventCursor):
+            raise TypeError("committed event cursor must be an EventCursor")
+        if not isinstance(self.event, RuntimeEvent):
+            raise TypeError("committed event event must be a RuntimeEvent")
+        if self.cursor.agent_id != self.event.agent_id:
+            raise ValueError("committed event cursor agent does not match event agent")

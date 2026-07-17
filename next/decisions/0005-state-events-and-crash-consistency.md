@@ -22,3 +22,20 @@
 
 Repository contracts remain lifecycle-specific rather than becoming one
 unbounded `StateStore`. Failure-injection tests are required at each checkpoint.
+
+## Phase 2 implementation binding
+
+- SQLite assigns each committed runtime event a positive, contiguous sequence
+  scoped to its agent inside the same `BEGIN IMMEDIATE` transaction that
+  persists lifecycle state. The existing operation transaction remains the
+  sole writer; consumers receive no append API or duplicate outbox.
+- Migration backfill uses legacy insertion (`rowid`) order, not timestamps,
+  and the resulting log rejects update and delete operations. Durable cursors
+  are agent-bound and readers reject cross-agent or nonexistent positions.
+- In-process subscription signals are post-commit wake hints only. Bounded
+  replay is authoritative, with a clear-then-reread wait boundary and polling
+  to recover from missed, failed, cross-store, and future cross-process hints.
+- Local blobs separate immutable content identity from logical provenance.
+  Fsynced content becomes visible before a checksummed, fsynced logical
+  manifest is atomically published as the commit point; retries stabilize an
+  already-visible result before reporting success.

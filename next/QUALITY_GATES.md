@@ -394,6 +394,28 @@ gate.
 Rows P2-Q02k through P2-Q02m remain useful pre-review evidence; P2-Q02o is the
 refreshed code/test-tree gate and P2-Q02p closes P2-03.
 
+### Executed P2-04 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P2-Q03a | `next/` | Isolated canonical blob contract and architecture tests before a blob owner existed | EXPECTED RED — collection stopped on the absent `daita.storage.blobs`; the architecture run had exactly 2 missing-owner failures |
+| P2-Q03b | `next/` | Local content-addressed adapter durability/cancellation contracts before `LocalBlobStore` existed | EXPECTED RED — both adapter suites stopped at collection on the intentionally absent concrete owner |
+| P2-Q03c | `next/` | Focused blob contract, durability, cancellation, corruption, race, cleanup, and architecture suites after independent repair | PASS — 71 focused cases prove parent-directory fsync, partial-write handling, visible-result retry stabilization, strict recursive codecs, cancellation-poisoned readers, content sharing, lifecycle CAS, corruption/link rejection, bounded verification, grace cleanup, and no ownership leak |
+| P2-Q03d | `next/` | `PYTHONPATH=src:... python -S -m pytest tests/ -q` on CPython 3.11.15/3.12.7 plus full Black/compile/mypy/pyright and architecture checks at the blob checkpoint | PASS — 344 tests per interpreter; Black/compile clean; mypy clean; pyright 0 errors/warnings; all 38 architecture tests pass; independent review found no remaining blob blocker; commit `320a9e0` |
+| P2-Q03e | `next/` | Canonical committed-event record/protocol tests before the records existed | EXPECTED RED — collection stopped on exactly 1 import error for absent `CommittedEvent` and `EventCursor` |
+| P2-Q03f | `next/` | Migration 3 and SQLite replay contracts before the projection/reader existed | EXPECTED RED — exactly 7 failures identified the absent per-agent sequence, migration history, and `read_after` implementation |
+| P2-Q03g | `next/` | Focused event record, Migration 3, bounded replay, codec-corruption, and architecture tests after independent review | PASS — 42 cases prove rowid-order backfill, atomic migration rollback, positive unique append-only sequences, state/event/cursor atomicity, rollback/CAS gaplessness, pagination, typed cursor errors, reopen, and strict corruption normalization; independent review found no blocker |
+| P2-Q03h | `next/` | `PYTHONPATH=src:... python -S -m pytest tests/contract/storage/test_sqlite_event_subscription.py -q` before subscription production code | EXPECTED RED — exactly 9 failures identified absent `subscribe`, polling/batch constants, and local wake seam |
+| P2-Q03i | `next/` | Focused 10-case subscription suite plus combined event/storage/architecture tests, Black, mypy, pyright, and independent lifecycle review | PASS — 10 subscription and 52 combined cases; durable post-commit notification, rollback invisibility, failed/missed/cross-store wake recovery, double-read race closure, exact reconnect, multiple/slow subscribers, bounded paging, cleanup, and agent isolation pass; static checks are clean and review found no remaining blocker |
+| P2-Q03j | `next/` | `PYTHONPATH=src:../.venv/lib/python3.11/site-packages ../.venv/bin/python -S -m pytest tests/ -q -p no:cacheprovider --junitxml=/private/tmp/daita-v2-p2-04-py311-final.xml`; equivalent CPython 3.12 command with the miniforge site-packages path | PASS — 370 tests, 0 failures/errors in 1.992s on CPython 3.11.15; 370 tests, 0 failures/errors in 2.056s on CPython 3.12.7 |
+| P2-Q03k | `next/` | `black --check src tests scripts`; `compileall -q src tests scripts`; full mypy; pyright 1.1.411; isolated `pytest tests/architecture -q -p no:cacheprovider` | PASS — Black 67 files; compilation clean; mypy 66 files; pyright 0 errors/warnings; 38 architecture tests |
+| P2-Q03l | repository root and `next/` | Root safe suite with `-m "not requires_llm and not requires_db"`; disposition/v1-oracle checks; root diff from `b87df318`; symlink and `git diff --check` scans | PASS — root collected 2,719 and passed all 2,498 selected with 221 deselected in 10.38s; inventories/fixtures reproduce; no root change, v2 symlink, or diff error |
+| P2-Q03m | clean copy `/private/tmp/daita-v2-p2-04-final.ckXW37` | Build v2 and root distributions without isolation; inspect cross-inclusion; install the v2 wheel without dependencies into fresh CPython 3.11/3.12 environments; isolated imports of blob/event/SQLite owners | PASS — v2 wheel/sdist contain 26/41 entries at `2.0.0a0`; root wheel/sdist contain 401/442 entries at `1.0.0`; no tests/nested `next/` crossed archives; both fresh imports resolve to their own site-packages |
+
+P2-Q03j through P2-Q03m are the refreshed P2-04 code/test-tree gate. The
+scoped hook and local checkpoint row is added only after that operation
+succeeds.
+
 ### Planned Phase 2 evidence sequence
 
 These rows are prospective gates, not passing claims. Each is updated only

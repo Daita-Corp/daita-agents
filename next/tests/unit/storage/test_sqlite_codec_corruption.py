@@ -315,7 +315,7 @@ async def test_load_rejects_noncontiguous_collection_positions(tmp_path: Path) -
     await _create_valid_database(path)
     _execute(
         path,
-        "UPDATE runtime_events SET position = 10 WHERE operation_id = ?",
+        "UPDATE turns SET position = 10 WHERE operation_id = ?",
         (OPERATION_ID,),
     )
 
@@ -343,7 +343,7 @@ async def test_public_open_rejects_lifecycle_schema_drift_with_valid_history(
     try:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,)]
+        ).fetchall() == [(1,), (2,), (3,)]
     finally:
         connection.close()
 

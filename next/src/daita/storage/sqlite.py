@@ -8,7 +8,7 @@ and backup-before-migrate behavior for the concrete adapter.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -20,7 +20,11 @@ import sqlite3
 from typing import TypeVar
 
 from .._json import canonical_json
-from ..events.models import RuntimeEvent
+from ..events.models import CommittedEvent, EventCursor, RuntimeEvent
+from ..events.protocols import (
+    EventCursorMismatchError,
+    EventCursorNotFoundError,
+)
 from ..llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -62,6 +66,9 @@ from ..operations.store import (
 )
 
 DAITA_V2_APPLICATION_ID = 0x44414932  # ASCII ``DAI2``.
+_MAX_COMMITTED_EVENT_READ_LIMIT = 1_000
+_COMMITTED_EVENT_SUBSCRIPTION_BATCH_SIZE = 100
+_COMMITTED_EVENT_POLL_INTERVAL_SECONDS = 0.25
 
 _SCHEMA_HISTORY_SQL = """
 CREATE TABLE schema_migrations (
@@ -396,8 +403,78 @@ _LIFECYCLE_SCHEMA_SQL = (
 )
 
 
+_COMMITTED_EVENT_SCHEMA_SQL = (
+    """
+    CREATE TABLE runtime_events_v3 (
+        id TEXT PRIMARY KEY,
+        operation_id TEXT,
+        position INTEGER,
+        type TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        agent_sequence INTEGER NOT NULL CHECK (agent_sequence >= 1),
+        created_at TEXT NOT NULL,
+        session_id TEXT,
+        turn_id TEXT,
+        model_call_id TEXT,
+        call_id TEXT,
+        task_id TEXT,
+        evidence_id TEXT,
+        capability_id TEXT,
+        executor_id TEXT,
+        payload_json TEXT NOT NULL,
+        CHECK (
+            (operation_id IS NULL AND position IS NULL)
+            OR (operation_id IS NOT NULL AND position >= 0)
+        ),
+        UNIQUE (operation_id, position),
+        UNIQUE (agent_id, agent_sequence),
+        FOREIGN KEY (operation_id) REFERENCES operations(id),
+        FOREIGN KEY (operation_id, turn_id)
+            REFERENCES turns(operation_id, id) DEFERRABLE INITIALLY DEFERRED,
+        FOREIGN KEY (operation_id, model_call_id)
+            REFERENCES model_calls(operation_id, id) DEFERRABLE INITIALLY DEFERRED,
+        FOREIGN KEY (operation_id, task_id)
+            REFERENCES tasks(operation_id, id) DEFERRABLE INITIALLY DEFERRED,
+        FOREIGN KEY (operation_id, evidence_id)
+            REFERENCES evidence(operation_id, id) DEFERRABLE INITIALLY DEFERRED
+    )
+    """.strip(),
+    """
+    INSERT INTO runtime_events_v3(
+        id, operation_id, position, type, agent_id, agent_sequence, created_at,
+        session_id, turn_id, model_call_id, call_id, task_id, evidence_id,
+        capability_id, executor_id, payload_json
+    )
+    SELECT
+        id, operation_id, position, type, agent_id,
+        ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY rowid),
+        created_at, session_id, turn_id, model_call_id, call_id, task_id,
+        evidence_id, capability_id, executor_id, payload_json
+    FROM runtime_events
+    ORDER BY rowid
+    """.strip(),
+    "DROP TABLE runtime_events",
+    "ALTER TABLE runtime_events_v3 RENAME TO runtime_events",
+    """
+    CREATE TRIGGER runtime_events_reject_update
+    BEFORE UPDATE ON runtime_events
+    BEGIN
+        SELECT RAISE(ABORT, 'runtime_events are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER runtime_events_reject_delete
+    BEFORE DELETE ON runtime_events
+    BEGIN
+        SELECT RAISE(ABORT, 'runtime_events are append-only');
+    END
+    """.strip(),
+)
+
+
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
+# Migration 3 assigns one append-only committed-event sequence per agent.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -408,6 +485,11 @@ _MIGRATIONS = (
         version=2,
         name="normalize_operation_lifecycle",
         statements=_LIFECYCLE_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=3,
+        name="project_committed_event_cursors",
+        statements=_COMMITTED_EVENT_SCHEMA_SQL,
     ),
 )
 
@@ -442,6 +524,7 @@ class SQLiteOperationStore:
         self._connection = connection
         self._busy_timeout_ms = busy_timeout_ms
         self._lock = asyncio.Lock()
+        self._event_wake_hints: dict[str, set[asyncio.Event]] = {}
         self._closed = False
 
     @classmethod
@@ -484,9 +567,11 @@ class SQLiteOperationStore:
         """Atomically claim an operation/trigger and persist every lifecycle row."""
 
         _validate_new_checkpoint(snapshot)
-        return await self._run_connection(
+        result = await self._run_connection(
             lambda connection: _create_operation(connection, snapshot)
         )
+        self._publish_committed_event_wake_hints(result.committed_events)
+        return result
 
     async def load(self, operation_id: str) -> VersionedOperation:
         """Load one self-consistent normalized operation snapshot."""
@@ -507,6 +592,46 @@ class SQLiteOperationStore:
             lambda connection: _load_versioned_by_trigger(connection, trigger_id)
         )
 
+    async def read_after(
+        self,
+        agent_id: str,
+        cursor: EventCursor | None,
+        *,
+        limit: int,
+    ) -> tuple[CommittedEvent, ...]:
+        """Read one bounded page from an agent's committed event history."""
+
+        _validate_committed_event_scope(agent_id, cursor)
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit < 1
+            or limit > _MAX_COMMITTED_EVENT_READ_LIMIT
+        ):
+            raise ValueError(
+                "committed event read limit must be an integer from 1 through "
+                f"{_MAX_COMMITTED_EVENT_READ_LIMIT}"
+            )
+        return await self._run_connection(
+            lambda connection: _read_committed_events(
+                connection,
+                agent_id,
+                cursor=cursor,
+                limit=limit,
+            )
+        )
+
+    def subscribe(
+        self,
+        agent_id: str,
+        cursor: EventCursor | None,
+    ) -> AsyncGenerator[CommittedEvent, None]:
+        """Follow one agent's durable event sequence from an exact cursor."""
+
+        _validate_committed_event_scope(agent_id, cursor)
+        self._require_open()
+        return self._subscribe_committed_events(agent_id, cursor)
+
     async def commit(
         self,
         snapshot: OperationSnapshot,
@@ -517,13 +642,15 @@ class SQLiteOperationStore:
 
         _validate_new_checkpoint(snapshot)
         _require_revision(expected_revision)
-        return await self._run_connection(
+        result = await self._run_connection(
             lambda connection: _commit_operation(
                 connection,
                 snapshot,
                 expected_revision=expected_revision,
             )
         )
+        self._publish_committed_event_wake_hints(result.committed_events)
+        return result
 
     async def close(self) -> None:
         """Close the SQLite connection before returning, even under cancellation."""
@@ -544,6 +671,66 @@ class SQLiteOperationStore:
     def _require_open(self) -> None:
         if self._closed:
             raise SQLiteStoreError(f"SQLite operation store is closed: {self._path}")
+
+    def _publish_committed_event_wake_hints(
+        self,
+        events: tuple[RuntimeEvent, ...],
+    ) -> None:
+        try:
+            self._notify_committed_events(events)
+        except Exception:
+            # Durable replay is authoritative. A failed in-process wake hint
+            # must never turn a successful transaction into a reported failure.
+            return
+
+    def _notify_committed_events(self, events: tuple[RuntimeEvent, ...]) -> None:
+        notified_agents: set[str] = set()
+        for event in events:
+            if event.agent_id in notified_agents:
+                continue
+            notified_agents.add(event.agent_id)
+            for wake_hint in tuple(self._event_wake_hints.get(event.agent_id, ())):
+                wake_hint.set()
+
+    async def _subscribe_committed_events(
+        self,
+        agent_id: str,
+        cursor: EventCursor | None,
+    ) -> AsyncGenerator[CommittedEvent, None]:
+        wake_hint = asyncio.Event()
+        subscribers = self._event_wake_hints.setdefault(agent_id, set())
+        subscribers.add(wake_hint)
+        current_cursor = cursor
+        try:
+            while True:
+                page = await self.read_after(
+                    agent_id,
+                    current_cursor,
+                    limit=_COMMITTED_EVENT_SUBSCRIPTION_BATCH_SIZE,
+                )
+                if not page:
+                    wake_hint.clear()
+                    page = await self.read_after(
+                        agent_id,
+                        current_cursor,
+                        limit=_COMMITTED_EVENT_SUBSCRIPTION_BATCH_SIZE,
+                    )
+                    if not page:
+                        try:
+                            await asyncio.wait_for(
+                                wake_hint.wait(),
+                                timeout=_COMMITTED_EVENT_POLL_INTERVAL_SECONDS,
+                            )
+                        except TimeoutError:
+                            pass
+                        continue
+                for committed_event in page:
+                    current_cursor = committed_event.cursor
+                    yield committed_event
+        finally:
+            subscribers.discard(wake_hint)
+            if not subscribers:
+                self._event_wake_hints.pop(agent_id, None)
 
     async def _run_connection(
         self,
@@ -1736,15 +1923,19 @@ def _insert_runtime_event(
 ) -> None:
     connection.execute(
         "INSERT INTO runtime_events("
-        "id, operation_id, position, type, agent_id, created_at, session_id, "
-        "turn_id, model_call_id, call_id, task_id, evidence_id, capability_id, "
-        "executor_id, payload_json"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "id, operation_id, position, type, agent_id, agent_sequence, created_at, "
+        "session_id, turn_id, model_call_id, call_id, task_id, evidence_id, "
+        "capability_id, executor_id, payload_json"
+        ") VALUES (?, ?, ?, ?, ?, ("
+        "SELECT COALESCE(MAX(agent_sequence), 0) + 1 FROM runtime_events "
+        "WHERE agent_id = ?"
+        "), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             event.id,
             operation_id,
             position,
             event.type,
+            event.agent_id,
             event.agent_id,
             _encode_datetime(event.created_at),
             event.session_id,
@@ -1757,6 +1948,87 @@ def _insert_runtime_event(
             event.executor_id,
             canonical_json(event.payload),
         ),
+    )
+
+
+def _read_committed_events(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    cursor: EventCursor | None,
+    limit: int,
+) -> tuple[CommittedEvent, ...]:
+    after_sequence = 0 if cursor is None else cursor.sequence
+    connection.execute("BEGIN")
+    try:
+        if cursor is not None:
+            cursor_row = connection.execute(
+                "SELECT 1 FROM runtime_events "
+                "WHERE agent_id = ? AND agent_sequence = ?",
+                (agent_id, cursor.sequence),
+            ).fetchone()
+            if cursor_row is None:
+                raise EventCursorNotFoundError(cursor)
+        rows = connection.execute(
+            "SELECT * FROM runtime_events "
+            "WHERE agent_id = ? AND agent_sequence > ? "
+            "ORDER BY agent_sequence LIMIT ?",
+            (agent_id, after_sequence, limit),
+        ).fetchall()
+        committed: list[CommittedEvent] = []
+        expected_sequence = after_sequence + 1
+        for row in rows:
+            try:
+                sequence = _sqlite_int(
+                    row["agent_sequence"],
+                    "event agent sequence",
+                )
+                if sequence != expected_sequence:
+                    raise SQLiteCorruptionError(
+                        f"committed event sequence for {agent_id} must be "
+                        f"contiguous; expected {expected_sequence}, found {sequence}"
+                    )
+                event = _decode_runtime_event_row(row)
+                committed.append(
+                    CommittedEvent(
+                        cursor=EventCursor(agent_id=agent_id, sequence=sequence),
+                        event=event,
+                    )
+                )
+            except SQLiteCorruptionError:
+                raise
+            except (KeyError, IndexError, TypeError, ValueError) as error:
+                raise SQLiteCorruptionError(
+                    f"cannot reconstruct committed event {agent_id}:"
+                    f"{expected_sequence}"
+                ) from error
+            expected_sequence += 1
+        connection.execute("COMMIT")
+        return tuple(committed)
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _decode_runtime_event_row(row: sqlite3.Row) -> RuntimeEvent:
+    return RuntimeEvent(
+        id=_sqlite_text(row["id"], "event id"),
+        type=_sqlite_text(row["type"], "event type"),
+        agent_id=_sqlite_text(row["agent_id"], "event agent id"),
+        operation_id=_optional_text(row["operation_id"]),
+        created_at=_decode_datetime(
+            _sqlite_text(row["created_at"], "event created_at")
+        ),
+        session_id=_optional_text(row["session_id"]),
+        turn_id=_optional_text(row["turn_id"]),
+        model_call_id=_optional_text(row["model_call_id"]),
+        call_id=_optional_text(row["call_id"]),
+        task_id=_optional_text(row["task_id"]),
+        evidence_id=_optional_text(row["evidence_id"]),
+        capability_id=_optional_text(row["capability_id"]),
+        executor_id=_optional_text(row["executor_id"]),
+        payload=_decode_json_object(_sqlite_text(row["payload_json"], "event payload")),
     )
 
 
@@ -2062,29 +2334,7 @@ def _decode_snapshot(
         )
         for row in observation_rows
     )
-    events = tuple(
-        RuntimeEvent(
-            id=_sqlite_text(row["id"], "event id"),
-            type=_sqlite_text(row["type"], "event type"),
-            agent_id=_sqlite_text(row["agent_id"], "event agent id"),
-            operation_id=_optional_text(row["operation_id"]),
-            created_at=_decode_datetime(
-                _sqlite_text(row["created_at"], "event created_at")
-            ),
-            session_id=_optional_text(row["session_id"]),
-            turn_id=_optional_text(row["turn_id"]),
-            model_call_id=_optional_text(row["model_call_id"]),
-            call_id=_optional_text(row["call_id"]),
-            task_id=_optional_text(row["task_id"]),
-            evidence_id=_optional_text(row["evidence_id"]),
-            capability_id=_optional_text(row["capability_id"]),
-            executor_id=_optional_text(row["executor_id"]),
-            payload=_decode_json_object(
-                _sqlite_text(row["payload_json"], "event payload")
-            ),
-        )
-        for row in event_rows
-    )
+    events = tuple(_decode_runtime_event_row(row) for row in event_rows)
     return OperationSnapshot(
         trigger=trigger,
         operation=operation,
@@ -2154,6 +2404,20 @@ def _validate_contiguous_positions(
 def _require_identity(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
+
+
+def _validate_committed_event_scope(
+    agent_id: str,
+    cursor: EventCursor | None,
+) -> None:
+    _require_identity(agent_id, "event agent_id")
+    if cursor is not None and not isinstance(cursor, EventCursor):
+        raise TypeError("committed event cursor must be an EventCursor or None")
+    if cursor is not None and cursor.agent_id != agent_id:
+        raise EventCursorMismatchError(
+            requested_agent_id=agent_id,
+            cursor=cursor,
+        )
 
 
 def _sqlite_text(value: object, label: str) -> str:
