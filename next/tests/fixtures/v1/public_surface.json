@@ -1,0 +1,544 @@
+{
+  "_meta": {
+    "architecture_plan_sha256": "403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935",
+    "capture_script": "next/scripts/capture_v1_oracles.py",
+    "schema_version": 1,
+    "source_refs": [
+      "daita/__init__.py",
+      "daita/db/__init__.py",
+      "daita/llm/__init__.py",
+      "tests/unit/db/test_public_api.py"
+    ],
+    "v1_baseline_commit": "b87df31873d33fffbf50498f5dc4d8892115e8f8"
+  },
+  "distribution": {
+    "module_version": "1.0.0",
+    "name": "daita-agents",
+    "requires_python": ">=3.11",
+    "version": "1.0.0"
+  },
+  "exports": {
+    "daita": [
+      "Agent",
+      "BaseAgent",
+      "ConversationHistory",
+      "tool",
+      "configure_tracing",
+      "get_trace_manager",
+      "set_trace_context",
+      "postgresql",
+      "mysql",
+      "mongodb",
+      "sqlite",
+      "rest",
+      "s3",
+      "slack",
+      "elasticsearch",
+      "redis_messaging",
+      "BasePlugin",
+      "ConnectorPlugin",
+      "DomainServicePlugin",
+      "EmptySecretProvider",
+      "ObservabilityPlugin",
+      "PluginContext",
+      "PluginKind",
+      "PluginManifest",
+      "RuntimeExtensionPlugin",
+      "SecretProvider",
+      "ServiceRegistry",
+      "SkillPlugin",
+      "WorkerProviderPlugin",
+      "ExtensionRegistry",
+      "RegistryDiagnostic",
+      "BaseSkill",
+      "Skill",
+      "SkillActivation",
+      "SkillActivationRules",
+      "SkillDiscovery",
+      "SkillResolver",
+      "SkillResolution",
+      "SkillRuntimeEffects",
+      "AgentConfig",
+      "RetryPolicy",
+      "RetryStrategy",
+      "apply_focus",
+      "DaitaError",
+      "AgentError",
+      "LLMError",
+      "ConfigError",
+      "PluginError",
+      "SkillError",
+      "TransientError",
+      "RetryableError",
+      "PermanentError",
+      "RateLimitError",
+      "AuthenticationError",
+      "ValidationError",
+      "FocusDSLError",
+      "DataQualityError",
+      "ItemAssertion",
+      "create_llm_provider",
+      "BaseEmbeddingProvider",
+      "__version__"
+    ],
+    "daita.db": [
+      "DbAgent",
+      "DbIntent",
+      "DbIntentKind",
+      "DbLimits",
+      "DbOperationContract",
+      "DbOperationResult",
+      "DbRequest",
+      "DbRuntime",
+      "DbRuntimeConfig",
+      "DbRuntimeInspection",
+      "DbSourceOptions",
+      "DbLLMConfig",
+      "DbMemoryConfig",
+      "DbExecutionConfig",
+      "DbRuntimeOptions",
+      "DbMonitor",
+      "DbMonitorInspection",
+      "DbMonitorMutation",
+      "DbMonitorRun",
+      "DbMonitorState",
+      "DbMonitorStore",
+      "HostedInAppMonitorDeliveryPlugin",
+      "from_db"
+    ],
+    "daita.llm": [
+      "create_llm_provider",
+      "register_llm_provider",
+      "list_available_providers",
+      "BaseLLMProvider",
+      "CostEstimate",
+      "ModelPricing",
+      "TokenUsage",
+      "estimate_llm_cost",
+      "OpenAIProvider",
+      "AnthropicProvider",
+      "GrokProvider",
+      "GeminiProvider",
+      "MockLLMProvider"
+    ]
+  },
+  "llm_export_count": 13,
+  "optional_extras": [
+    "all",
+    "anthropic",
+    "api-server",
+    "aws",
+    "azure",
+    "bigquery",
+    "chromadb",
+    "cli",
+    "cloud",
+    "complete",
+    "data",
+    "data-quality",
+    "databases",
+    "dev",
+    "elasticsearch",
+    "exa",
+    "gcp",
+    "github",
+    "google",
+    "google-drive",
+    "lineage",
+    "llm-all",
+    "mcp",
+    "memory",
+    "mongodb",
+    "mysql",
+    "neo4j",
+    "opensearch",
+    "otlp",
+    "pinecone",
+    "postgresql",
+    "production",
+    "qdrant",
+    "recommended",
+    "redis",
+    "sentence-transformers",
+    "slack",
+    "snowflake",
+    "sqlite",
+    "transformers",
+    "vectordb",
+    "voyage",
+    "web",
+    "websearch"
+  ],
+  "providers": [
+    "openai",
+    "anthropic",
+    "grok",
+    "gemini",
+    "ollama",
+    "mock"
+  ],
+  "signatures": {
+    "Agent.__init__": [
+      {
+        "default_repr": null,
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "self",
+        "required": true
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "name",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "llm_provider",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "model",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "api_key",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "config",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "agent_id",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "prompt",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "focus",
+        "required": false
+      },
+      {
+        "default_repr": "False",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "display_reasoning",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "plugins",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "extension_registry",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "skills",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "tools",
+        "required": false
+      },
+      {
+        "default_repr": "False",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "enable_reliability",
+        "required": false
+      },
+      {
+        "default_repr": "10",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "max_concurrent_tasks",
+        "required": false
+      },
+      {
+        "default_repr": "100",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "max_queue_size",
+        "required": false
+      },
+      {
+        "default_repr": "False",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "enable_retry",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "retry_policy",
+        "required": false
+      },
+      {
+        "default_repr": null,
+        "kind": "VAR_KEYWORD",
+        "name": "kwargs",
+        "required": true
+      }
+    ],
+    "Agent.from_db": [
+      {
+        "default_repr": null,
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "source",
+        "required": true
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "name",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "mode",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "config",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "source_options",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "llm",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "runtime",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "memory",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "catalog",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "lineage",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "quality",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "history",
+        "required": false
+      },
+      {
+        "default_repr": "False",
+        "kind": "KEYWORD_ONLY",
+        "name": "stateful",
+        "required": false
+      },
+      {
+        "default_repr": "()",
+        "kind": "KEYWORD_ONLY",
+        "name": "plugins",
+        "required": false
+      },
+      {
+        "default_repr": "()",
+        "kind": "KEYWORD_ONLY",
+        "name": "skills",
+        "required": false
+      }
+    ],
+    "Agent.run": [
+      {
+        "default_repr": null,
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "self",
+        "required": true
+      },
+      {
+        "default_repr": null,
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "prompt",
+        "required": true
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "tools",
+        "required": false
+      },
+      {
+        "default_repr": "20",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "max_iterations",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "timeout_seconds",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "on_event",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "history",
+        "required": false
+      },
+      {
+        "default_repr": "False",
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "detailed",
+        "required": false
+      },
+      {
+        "default_repr": null,
+        "kind": "VAR_KEYWORD",
+        "name": "kwargs",
+        "required": true
+      }
+    ],
+    "daita.db.from_db": [
+      {
+        "default_repr": null,
+        "kind": "POSITIONAL_OR_KEYWORD",
+        "name": "source",
+        "required": true
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "name",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "mode",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "config",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "source_options",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "llm",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "runtime",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "memory",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "catalog",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "lineage",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "quality",
+        "required": false
+      },
+      {
+        "default_repr": "None",
+        "kind": "KEYWORD_ONLY",
+        "name": "history",
+        "required": false
+      },
+      {
+        "default_repr": "False",
+        "kind": "KEYWORD_ONLY",
+        "name": "stateful",
+        "required": false
+      },
+      {
+        "default_repr": "()",
+        "kind": "KEYWORD_ONLY",
+        "name": "plugins",
+        "required": false
+      },
+      {
+        "default_repr": "()",
+        "kind": "KEYWORD_ONLY",
+        "name": "skills",
+        "required": false
+      }
+    ]
+  }
+}

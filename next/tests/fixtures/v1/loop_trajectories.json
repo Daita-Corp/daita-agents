@@ -1,0 +1,82 @@
+{
+  "_meta": {
+    "architecture_plan_sha256": "403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935",
+    "capture_script": "next/scripts/capture_v1_oracles.py",
+    "schema_version": 1,
+    "source_refs": [
+      "daita/agents/chat/runtime.py",
+      "tests/unit/agents/test_chat_runtime.py",
+      "tests/unit/db/test_agent_loop_completion_targets.py",
+      "tests/unit/db/test_agent_loop_phase2.py"
+    ],
+    "v1_baseline_commit": "b87df31873d33fffbf50498f5dc4d8892115e8f8"
+  },
+  "trajectories": [
+    {
+      "id": "text_only_completion",
+      "steps": [
+        "operation.persisted",
+        "model.response.persisted",
+        "readiness.allowed",
+        "operation.succeeded"
+      ],
+      "task_count": 0,
+      "terminal_reason": "completed"
+    },
+    {
+      "id": "tool_evidence_completion",
+      "steps": [
+        "model.tool_call.persisted",
+        "task.persisted",
+        "executor.invoked",
+        "evidence.accepted",
+        "observation.persisted",
+        "model.final_answer.persisted",
+        "readiness.allowed",
+        "operation.succeeded"
+      ],
+      "task_count": 1,
+      "terminal_reason": "completed"
+    },
+    {
+      "id": "validation_repair",
+      "steps": [
+        "model.invalid_action.persisted",
+        "validation.failure_observed",
+        "model.repaired_action.persisted",
+        "task.persisted",
+        "evidence.accepted",
+        "readiness.allowed",
+        "operation.succeeded"
+      ],
+      "task_count": 1,
+      "terminal_reason": "completed_after_repair"
+    },
+    {
+      "id": "identical_failure_no_progress",
+      "steps": [
+        "validation.failure_observed",
+        "identical_action.repeated",
+        "no_progress_budget.exhausted",
+        "operation.failed"
+      ],
+      "task_count": 0,
+      "terminal_reason": "no_progress"
+    },
+    {
+      "id": "approval_resume",
+      "steps": [
+        "task.persisted",
+        "approval.persisted",
+        "operation.waiting_for_approval",
+        "approval.approved",
+        "same_operation.resumed",
+        "completed_tasks.skipped",
+        "executor.invoked_once",
+        "evidence.accepted"
+      ],
+      "task_count": 1,
+      "terminal_reason": "resumed_once"
+    }
+  ]
+}
