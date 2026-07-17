@@ -411,10 +411,11 @@ refreshed code/test-tree gate and P2-Q02p closes P2-03.
 | P2-Q03k | `next/` | `black --check src tests scripts`; `compileall -q src tests scripts`; full mypy; pyright 1.1.411; isolated `pytest tests/architecture -q -p no:cacheprovider` | PASS — Black 67 files; compilation clean; mypy 66 files; pyright 0 errors/warnings; 38 architecture tests |
 | P2-Q03l | repository root and `next/` | Root safe suite with `-m "not requires_llm and not requires_db"`; disposition/v1-oracle checks; root diff from `b87df318`; symlink and `git diff --check` scans | PASS — root collected 2,719 and passed all 2,498 selected with 221 deselected in 10.38s; inventories/fixtures reproduce; no root change, v2 symlink, or diff error |
 | P2-Q03m | clean copy `/private/tmp/daita-v2-p2-04-final.ckXW37` | Build v2 and root distributions without isolation; inspect cross-inclusion; install the v2 wheel without dependencies into fresh CPython 3.11/3.12 environments; isolated imports of blob/event/SQLite owners | PASS — v2 wheel/sdist contain 26/41 entries at `2.0.0a0`; root wheel/sdist contain 401/442 entries at `1.0.0`; no tests/nested `next/` crossed archives; both fresh imports resolve to their own site-packages |
+| P2-Q03n | repository root | Stage exactly the 11 reviewed P2-04 event/checkpoint paths; run cached diff and `.venv/bin/pre-commit run`; create the authorized local checkpoint | PASS — every path was under `next/`; diff and whitespace/EOF/conflict/large-file/Black hooks passed; commit `b04fcb11e2e6bbf38341648b9b171341ae1996e3` |
+| P2-Q04a | plan, current v2, and root v1 oracle (read-only) | Inventory task models/checkpoints/store/SQLite/runtime/capability facts; inspect v1 kernel/store/governance/worker tests; run two independent v2 lease-boundary design audits | PASS — the existing operation runtime/store/SQLite transaction remain the only owners; exact records, narrow repository operations, fail-closed recovery rules, highest-value tests, and later-phase deferrals are locked before production edits |
 
-P2-Q03j through P2-Q03m are the refreshed P2-04 code/test-tree gate. The
-scoped hook and local checkpoint row is added only after that operation
-succeeds.
+P2-Q03j through P2-Q03n close the refreshed P2-04 code/test-tree, preservation,
+distribution, review, and checkpoint gate.
 
 ### Planned Phase 2 evidence sequence
 

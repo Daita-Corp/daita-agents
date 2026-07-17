@@ -6,18 +6,21 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-04 — add content-addressed blob durability and committed
-  event replay/subscription without weakening the SQLite transaction boundary
-- **Last completed task:** P2-03 — normalized SQLite operation repository,
-  migrations, strict codecs, optimistic transactions, and reconciliation
-- **Current checkpoint:** P2-04 local blob durability commit
-  `320a9e0` (`feat(v2): add durable local blob store`)
+- **Active task:** P2-05 — define and implement persisted task execution,
+  durable fenced leases, and fail-closed recovery facts at the sole executor
+  boundary
+- **Last completed task:** P2-04 — content-addressed blob durability plus
+  committed event replay and wake-hint subscription
+- **Current checkpoint:** P2-04 committed-event checkpoint
+  `b04fcb11e2e6bbf38341648b9b171341ae1996e3`
+  (`feat(v2): add committed event replay`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** complete independent subscription review, repair any
-  blocker, then run the complete P2-04 dual-interpreter/static/architecture/
-  oracle/build gate before the scoped checkpoint
+- **Exact next action:** author and run P2-05b's expected-red portable contract
+  tests for the complete task vocabulary, immutable execution-safety facts,
+  dependency linkage, lease chronology, store-owned monotonic fencing, and
+  typed claim/fenced-commit failures before editing production code
 
 ## Mandatory architecture re-read
 
@@ -99,8 +102,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-01 | complete | Re-read Sections 6 and 15; Phase 2 work/gate; Sections 8.1–8.8, 9.1–9.10, and 11.1–11.8; Phase 1 owners | Persistence, recovery, hosting, session, event, approval, and provider ownership inventory plus this ordered test-first plan | Read-only source/plan inventory; no production edit; smallest representative persistence seam selected | Phase 1 gate |
 | P2-02 | complete | In-memory operation runtime commit seam; canonical operation/loop/model records | Narrow async optimistic `OperationStore` contract, in-memory implementation, canonical event/model-call/snapshot records, and one representative trigger/operation checkpoint migrated without changing loop semantics | 218 tests on each Python version; canonical linkage/history/cancellation/CAS adversarial regressions; architecture/static/isolation/build gates and independent review pass | P2-01 |
 | P2-03 | complete | Proven P2-02 seam; Section 11.2 lifecycle inventory | SQLite engine with v2 marker, WAL, foreign keys, busy timeout, correctness-first synchronous mode, checksummed ordered migrations, SQLite-API backup-before-migrate, compatibility rejection, normalized lifecycle tables, and transactional optimistic operation repository | Fresh/reopen/concurrent-CAS/rollback/migration/interruption/future-or-unknown-schema tests; every runtime lifecycle record round-trips independently | P2-02 |
-| P2-04 | active | SQLite transaction boundary; Section 8.4/11.5 contracts | Content-addressed blob store and durable committed-event log/subscription with per-agent monotonic cursors; event notification remains a post-commit wake hint | Temp/flush/hash/atomic-rename/orphan tests; rollback emits nothing; commit/publish gap replays; reconnect, slow subscriber, and cross-agent isolation tests | P2-03 |
-| P2-05 | pending | Persisted tasks/evidence/events; Section 8.5 recovery rules | Ready/claimed/running/approval-waiting/cancelled/manual-recovery task states, persisted execution-safety and idempotency facts, durable fenced leases, and a split materialize/claim/execute/commit path preserving the sole executor boundary | Claim race, lease expiry/reclaim, stale-fence rejection with no evidence/event, terminal skip, unknown side-effect outcome, and task/evidence/event atomicity tests | P2-04 |
+| P2-04 | complete | SQLite transaction boundary; Section 8.4/11.5 contracts | Content-addressed blob store and durable committed-event log/subscription with per-agent monotonic cursors; event notification remains a post-commit wake hint | Temp/flush/hash/atomic-rename/orphan tests; rollback emits nothing; commit/publish gap replays; reconnect, slow subscriber, and cross-agent isolation tests | P2-03 |
+| P2-05 | active | Persisted tasks/evidence/events; Section 8.5 recovery rules | Ready/claimed/running/approval-waiting/cancelled/manual-recovery task states, persisted execution-safety and idempotency facts, durable fenced leases, and a split materialize/claim/execute/commit path preserving the sole executor boundary | Claim race, lease expiry/reclaim, stale-fence rejection with no evidence/event, terminal skip, unknown side-effect outcome, and task/evidence/event atomicity tests | P2-04 |
 | P2-06 | pending | Durable checkpoints, tasks, evidence, observations, readiness, and leases | One loop with new-trigger and checkpoint-aware same-operation resume paths, plus startup recovery that reuses completed work and never rebuilds the plan from the original trigger | Crash/cancel injection at all seven Phase 2 boundaries; at-least-once started model call; terminal task skip; recovered response/evidence/observation/readiness paths do not repeat avoidable I/O | P2-05 |
 | P2-07 | pending | Recovery runtime and persisted governance facts | Immutable risk/policy/task fingerprints, CAS approval records, and one test-owned durable fake side-effect marker with wait, decision-only approval mutation, wake, denial, same-operation resume, and exact-once idempotency | Pre-approval no-I/O, approval mutation no-I/O, exact-fingerprint resume, denial no-I/O, cancellation race with one winner, repeated/concurrent resume marker unchanged, stale holder blocked | P2-06 |
 | P2-08 | pending | SQLite composition, recovery, approvals, committed events | Strict isolated agent home and bootstrap identity manifest, authoritative DB identity, durable sessions/transcripts, shared per-agent writer lock, thin `Agent.create/open/run/inspect/resume`, and embedded composition only | Create/reopen/path/mismatch/concurrency/lock/session isolation/restart tests; default never touches v1 state; facade contains no loop/executor/provider behavior | P2-07 |
@@ -129,7 +132,20 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-04e | complete | Canonical committed-event cursor/envelope and narrow read/subscription contract | Positive agent-bound cursors, strict envelope linkage, bounded reads, cross-agent cursor rejection, and no public event append method |
 | P2-04f | complete | Migration 3 plus SQLite committed-event projection | Existing `runtime_events` gain per-agent monotonic sequence and append-only enforcement; v2 backfill, state/event/cursor atomicity, rollback, CAS loser, cross-operation order, pagination, and reopen pass |
 | P2-04g | complete | Post-commit wake-hint subscription over durable replay | No pre-commit delivery; missed/failed wake, commit-before-notify gap, reconnect, cross-store polling, slow subscriber, bounded batches, and cancellation all recover from durable cursors |
-| P2-04h | active | Final P2-04 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, independent review, scoped hooks, and local commit |
+| P2-04h | complete | Final P2-04 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, independent review, scoped hooks, and local commit `b04fcb11e2e6bbf38341648b9b171341ae1996e3` |
+
+### Ordered P2-05 internal tasks
+
+| ID | Status | Smallest output | Required proof before advancing |
+| --- | --- | --- | --- |
+| P2-05a | complete | Read-only task/execution/lease ownership inventory and locked test-first sequence | Existing aggregate, SQLite, runtime, capability replay facts, v1 behavioral oracles, exact deferrals, and no second executor/runtime/recovery owner are recorded before production edits |
+| P2-05b | active | Canonical task execution-safety, dependency, attempt, and fenced-lease records plus narrow repository contracts | Full task vocabulary and legal transitions; immutable capability/executor/input/idempotency facts; positive fencing tokens; lease chronology; typed claim/stale/terminal outcomes; no database types in portable records |
+| P2-05c | pending | Migration 4 and SQLite task/dependency/lease projection | Existing tasks backfill coherently; dependencies and leases normalize; materialize/claim/renew/release/terminal commits are transactional; migration rollback/reopen/strict-codec tests pass |
+| P2-05d | pending | Durable materialize/readiness and fenced claim lifecycle | Task persists before claim; dependencies reuse terminal success; two claimers have one winner; expiry permits only declared replay-safe reclaim; terminal/cancelled/manual-recovery tasks never claim |
+| P2-05e | pending | Split operation-runtime materialize → claim → execute → validate → commit path | The sole existing runtime invokes the executor only with a live fence; stale holders commit no evidence/task/event; task/evidence/event success is atomic; timeouts/cancellation retain truthful durable intent |
+| P2-05f | pending | Fail-closed execution recovery and blob-backed evidence linkage | Replay-safe reads may resume after expiry; side-effecting unknown outcomes become manual recovery unless persisted idempotency proves safe; durable blob references precede evidence acceptance; terminal work is skipped |
+| P2-05g | pending | Representative review before broader restart wiring | One read and one test-owned side-effect classification are independently reviewed; P2-06 retains startup/loop resume, and P2-07 retains real approval decision/wake behavior |
+| P2-05h | pending | Final P2-05 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local commit |
 
 ## Files/components being changed or planned
 
@@ -292,6 +308,51 @@ there will be no public `append(event)` or duplicate outbox table. Subscribers
 read bounded durable suffixes and use notifications only as post-commit wake
 hints, so missed hints, failure, reconnect, and slow consumers remain correct.
 
+P2-05 extends the existing `OperationRuntime`, `OperationSnapshot`, and
+`OperationStore`; it does not introduce a second kernel, recovery service,
+lease database, or generic state store. The current pain is that a task jumps
+from `pending` to `running`, its mutable registry declaration is the only
+source of replay safety, its attempt cannot advance, and its returned evidence
+can commit without proving live execution ownership. SQLite already owns the
+required `BEGIN IMMEDIATE` transaction and normalized task/evidence/event
+projection, so the smallest correction is a task-specific extension of that
+same repository boundary.
+
+The locked portable design adds the full task-state vocabulary, immutable
+materialization-time capability/executor/input/safety/idempotency facts, a
+normalized dependency relation, and append-preserving `TaskLease` attempt
+records inside the operation checkpoint. Each claim allocates its positive
+monotonic fence from authoritative lease history while the existing in-memory
+store lock or SQLite write transaction is held; the runtime never reserves a
+fence or manufactures an attempt outside that boundary. A claim atomically
+commits `ready -> claimed`, its lease, operation revision, and `task.claimed`
+event. The same repository exposes narrow renew, fenced-checkpoint, and
+expired-attempt recovery operations; it does not expose a free-standing event
+append path.
+
+Ordinary optimistic commits may materialize tasks, evaluate dependencies, or
+set monotonic cancellation intent, but they may not start or terminalize an
+actively leased task, mutate lease history, or accept its evidence. Fenced
+start and outcome commits verify exact holder/fence/attempt identity and strict
+`checked_at < expires_at` chronology inside the same atomic boundary. Equality
+with expiry is expired; renewal cannot resurrect an expired lease and must
+strictly extend it. A stale or expired holder changes no task, evidence, lease,
+event, or operation revision. The executor request receives the committed
+attempt, fence, and stable idempotency key, and `operations/runtime.py` remains
+the sole production `executor.execute(...)` caller.
+
+Expired `claimed` work that never crossed the durable `running` checkpoint may
+return to `ready` regardless of side-effect declaration. Expired `running`
+work is reclaimable only from persisted facts proving a replay-safe idempotent
+read, or an adapter-declared replay-safe idempotent side effect carrying the
+same stable idempotency key on every attempt. Every other post-I/O exception,
+timeout, cancellation, lost fence, or crash is an unknown side-effect outcome
+and transitions to `manual_recovery_required`; mutable registry state cannot
+weaken that decision. Terminal, cancelled, approval-waiting, and manual-
+recovery tasks are structurally nonclaimable. P2-06 retains startup scanning
+and whole-loop same-operation resume, P2-07 retains real approval decisions and
+wake behavior, and P2-08 retains the cross-process Agent Home writer lock.
+
 ## Tests last run
 
 Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
@@ -418,6 +479,8 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-04h final static and architecture gate | PASS — Black clean across 67 files; byte compilation succeeded; mypy clean across 66 files; pyright 1.1.411 reports 0 errors/warnings; all 38 architecture tests pass |
 | P2-04h root preservation gate | PASS — root v1 collected 2,719 tests and passed all 2,498 safe selections with 221 deselected in 10.38s; disposition/v1 fixtures reproduce; root diff from `b87df318`, symlink scan, and diff check are clean |
 | P2-04h distribution gate | PASS — clean-copy v2 wheel/sdist contain 26/41 entries at `2.0.0a0`; physical-`next/` root wheel/sdist remain 401/442 entries at v1 `1.0.0`; archive boundaries are clean and fresh Python 3.11/3.12 installs import blob/event/SQLite v2 owners from their own site-packages |
+| P2-04h scoped checkpoint | PASS — exactly 11 reviewed paths, all under `next/`; cached diff and configured whitespace/EOF/conflict/large-file/Black hooks passed; commit `b04fcb11e2e6bbf38341648b9b171341ae1996e3` |
+| P2-05a task/lease ownership inventory | PASS — read-only plan, current-v2, and root-v1 oracle inspection plus two independent design audits keep the existing operation runtime/store/SQLite transaction as the only owners; exact records, narrow repository operations, fail-closed recovery rules, highest-value tests, and P2-06/P2-07/P2-08 deferrals are locked before production edits |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
@@ -610,6 +673,10 @@ re-read and an updated ordered ledger.
 - The first staging and pre-commit invocations could not create Git's
   `index.lock` inside the workspace sandbox. The same explicitly scoped
   `git add` and configured hook run were approved, then completed successfully.
+- P2-04's first explicitly scoped stage and hook commands encountered the same
+  workspace `index.lock` restriction. Approved reruns staged only the 11
+  reviewed `next/` paths and passed every configured hook; this was an
+  environment permission boundary, not a code/test failure.
 - P1-06 gate review found no production behavior gap. It strengthened the
   existing deterministic trajectory owners and moved the sole-executor scan
   to the architecture suite rather than creating a duplicate acceptance
