@@ -5,20 +5,21 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 1 complete — Phase 2 not started
-- **Active task:** P1-07 complete — this ledger is part of the exact Phase 1
-  gate commit
-- **Last completed task:** P1-07 — final Phase 1 evidence, committed-tree
-  isolation, scoped diff, and hooks are reconciled and passing
-- **Current checkpoint:** Phase 1 gate commit containing this ledger, with the
-  exact message `chore(v2-phase-1): complete phase 1 gate`; its hash must be
-  recorded before the first Phase 2 implementation task
+- **Active phase:** Phase 2 — persistent local loop
+- **Active task:** P2-02 — add the narrow async operation-store seam and prove
+  one representative durable checkpoint before standardizing all transitions
+- **Last completed task:** P2-01 — persistence/recovery ownership and ordered
+  SQLite vertical-slice plan
+- **Current checkpoint:** Phase 1 gate commit
+  `c8c70e37bbbda981db4a490a2ac6bd75cfd29d55`
+  (`chore(v2-phase-1): complete phase 1 gate`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** after the Phase 1 gate commit exists, record its hash,
-  re-read plan Sections 6 and 15 in full, and inventory Phase 2 persistence and
-  recovery work before the first Phase 2 production edit
+- **Exact next action:** write expected-red contract tests for the async
+  operation repository, optimistic revision conflict, canonical committed
+  events, and the first operation/trigger checkpoint; then adapt only that
+  representative runtime transition and rerun the complete Phase 1 suite
 
 ## Mandatory architecture re-read
 
@@ -33,6 +34,22 @@ sequence below therefore starts from these renewed constraints:
 - canonical records are provider-neutral and independently resumable; and
 - no real catalog, memory, monitor, production provider, or broad extension
   SDK belongs in Phase 1.
+
+After the Phase 1 gate commit and before any Phase 2 production edit, Sections
+6 and 15 were re-read in full again on 2026-07-16 together with Phase 2 and the
+supporting persistence/hosting/provider sections. Phase 2 therefore begins
+with these renewed constraints:
+
+- persist current state and its lifecycle event atomically before publishing;
+- keep one operation runtime as the executor, lease, approval, evidence, and
+  recovery authority;
+- resume the same operation from durable checkpoints without re-planning or
+  rerunning terminal tasks;
+- reject stale lease commits and fail unknown side-effect outcomes closed;
+- keep SQLite/blob/hosting/provider implementations outside the generic loop;
+- preserve the isolated v2 state root and lazy optional-provider imports; and
+- do not pull catalog, memory, monitor, or later-phase domain work into the
+  persistent-loop slice.
 
 ## Current architectural decisions
 
@@ -76,6 +93,22 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P1-05 | complete | P1-02 through P1-04 | Cancellation checks plus turn, action, repair, identical-retry, wall-time, task-timeout, token, observation, and estimated-cost budgets | 46 focused and 150 complete tests; adversarial deadline/cancellation suppression; atomic interruption/budget commits; commit `5c87494` | P1-04 |
 | P1-06 | complete | Complete loop laboratory | Deterministic scripted acceptance trajectories and architecture assertions covering every Phase 1 gate | 160 tests on Python 3.11/3.12; 26 architecture tests; static/isolation/build gates pass; commit `eb57f9d` | P1-05 |
 | P1-07 | complete | Passing P1-06 results | Final Phase 1 ledger/evidence and coherent gate commit | 160 tests per interpreter; 26 architecture tests; committed-tree root/v2 builds isolated; exact gate commit contains this ledger | P1-06 |
+
+## Ordered Phase 2 tasks
+
+| ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
+| --- | --- | --- | --- | --- | --- |
+| P2-01 | complete | Re-read Sections 6 and 15; Phase 2 work/gate; Sections 8.1–8.8, 9.1–9.10, and 11.1–11.8; Phase 1 owners | Persistence, recovery, hosting, session, event, approval, and provider ownership inventory plus this ordered test-first plan | Read-only source/plan inventory; no production edit; smallest representative persistence seam selected | Phase 1 gate |
+| P2-02 | active | In-memory operation runtime commit seam; canonical operation/loop/model records | Narrow async optimistic `OperationStore` contract, in-memory implementation, canonical event/model-call/snapshot records, and one representative trigger/operation checkpoint migrated without changing loop semantics | Expected-red contract/atomicity/conflict tests; complete Phase 1 suite stays green; review before applying the pattern to later transitions | P2-01 |
+| P2-03 | pending | Proven P2-02 seam; Section 11.2 lifecycle inventory | SQLite engine with v2 marker, WAL, foreign keys, busy timeout, correctness-first synchronous mode, checksummed ordered migrations, SQLite-API backup-before-migrate, compatibility rejection, normalized lifecycle tables, and transactional optimistic operation repository | Fresh/reopen/concurrent-CAS/rollback/migration/interruption/future-or-unknown-schema tests; every runtime lifecycle record round-trips independently | P2-02 |
+| P2-04 | pending | SQLite transaction boundary; Section 8.4/11.5 contracts | Content-addressed blob store and durable committed-event log/subscription with per-agent monotonic cursors; event notification remains a post-commit wake hint | Temp/flush/hash/atomic-rename/orphan tests; rollback emits nothing; commit/publish gap replays; reconnect, slow subscriber, and cross-agent isolation tests | P2-03 |
+| P2-05 | pending | Persisted tasks/evidence/events; Section 8.5 recovery rules | Ready/claimed/running/approval-waiting/cancelled/manual-recovery task states, persisted execution-safety and idempotency facts, durable fenced leases, and a split materialize/claim/execute/commit path preserving the sole executor boundary | Claim race, lease expiry/reclaim, stale-fence rejection with no evidence/event, terminal skip, unknown side-effect outcome, and task/evidence/event atomicity tests | P2-04 |
+| P2-06 | pending | Durable checkpoints, tasks, evidence, observations, readiness, and leases | One loop with new-trigger and checkpoint-aware same-operation resume paths, plus startup recovery that reuses completed work and never rebuilds the plan from the original trigger | Crash/cancel injection at all seven Phase 2 boundaries; at-least-once started model call; terminal task skip; recovered response/evidence/observation/readiness paths do not repeat avoidable I/O | P2-05 |
+| P2-07 | pending | Recovery runtime and persisted governance facts | Immutable risk/policy/task fingerprints, CAS approval records, and one test-owned durable fake side-effect marker with wait, decision-only approval mutation, wake, denial, same-operation resume, and exact-once idempotency | Pre-approval no-I/O, approval mutation no-I/O, exact-fingerprint resume, denial no-I/O, cancellation race with one winner, repeated/concurrent resume marker unchanged, stale holder blocked | P2-06 |
+| P2-08 | pending | SQLite composition, recovery, approvals, committed events | Strict isolated agent home and bootstrap identity manifest, authoritative DB identity, durable sessions/transcripts, shared per-agent writer lock, thin `Agent.create/open/run/inspect/resume`, and embedded composition only | Create/reopen/path/mismatch/concurrency/lock/session isolation/restart tests; default never touches v1 state; facade contains no loop/executor/provider behavior | P2-07 |
+| P2-09 | pending | Persisted embedded fake-capability loop; provider-neutral model contract | Separate canonical/provider call identity, normalized provider errors, lazy optional OpenAI Responses adapter, fake-client contract tests, and one live persisted fake-capability loop | Missing-extra/import isolation; response/tool continuation/error tests; architecture scan forbids provider execution; explicit credential/model live gate | P2-08 |
+| P2-10 | pending | Complete Phase 2 vertical slice | Consolidated restart, failure-injection, approval, event, import, architecture, static, cross-version, root-oracle, and clean-build evidence with parity/quality/ADR review | Complete Phase 2 gate suite on Python 3.11/3.12 plus live production-provider evidence; no mock substitutes for live evidence | P2-09 |
+| P2-11 | pending | Passing P2-10 results | Final Phase 2 ledger/evidence and coherent exact gate commit | Scoped diff/hooks; all paths under `next/`; exact `chore(v2-phase-2): complete phase 2 gate` commit | P2-10 |
 
 ## Files/components being changed or planned
 
@@ -122,8 +155,35 @@ The binding rationale and consequences are recorded in `next/decisions/`.
   tests now permit only that record import, forbid every operations-to-driver
   edge, and keep `loop.models` implementation-free. Lifecycle decisions remain
   loop-owned; durable commits remain operation-runtime-owned.
-- Later Phase 1 owners are created only when their vertical slice becomes the
-  active task; the target tree is not being scaffolded in advance.
+- P2-01 keeps `OperationRuntime` as the sole execution, approval, evidence,
+  lease, recovery, and lifecycle-transition authority. Its current 1,600-line
+  in-memory `_states` map and synchronous publication step are painful because
+  they make restart correctness and transactional event pairing impossible.
+  The smallest correction is a narrow optimistic operation repository at the
+  existing copy-on-write commit seam, first proven on one checkpoint. This is
+  not a parallel runtime or unbounded `StateStore`; SQLite remains an adapter,
+  and later session/blob/event contracts stay narrow and lifecycle-owned.
+- P2-02 first extracts only canonical records that a repository must consume
+  without importing the concrete runtime implementation. Tests must catch
+  behavior drift in Phase 1 event order, atomic rollback, provider-neutral
+  records, sole executor invocation, and generic-loop dependency direction.
+  The representative slice is reviewed green before the same seam is applied
+  to all lifecycle transitions, as required by the refactoring discipline.
+- Phase 2 persistence uses normalized lifecycle tables with explicit JSON
+  record payloads where useful; it never stores one opaque operation snapshot
+  as the only durable truth. Standard-library `sqlite3` is offloaded from the
+  event loop, so minimal v2 gains no mandatory SQLite SDK dependency.
+- Durable event consumers read from the committed log after a cursor. An
+  in-process notification can reduce latency but is only a wake hint, which
+  closes the commit-before-publish crash gap and preserves post-commit-only
+  delivery.
+- Phase 2 implements embedded single-writer execution only. `AgentHost`, local
+  socket/API routing, inbox/scheduler/daemon/CLI lifecycle, background
+  autonomy, session summaries, provider-token streaming, full routing and
+  fallback policy, additional providers, and independent-operation concurrency
+  are explicitly deferred to their owning later phases.
+- Later owners are created only when their vertical slice becomes active; the
+  target tree is not being scaffolded in advance.
 - Root `daita/`: **not being changed**
 
 ## Tests last run

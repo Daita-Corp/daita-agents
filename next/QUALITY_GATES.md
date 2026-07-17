@@ -333,7 +333,32 @@ commands actually run.
 
 ## Phases 2 through 9
 
-No later-phase gate has been run or claimed.
+Phase 2 status: **P2-01 read-only architecture and persistence inventory is
+complete; P2-02 is active. No Phase 2 production edit or gate has been run or
+claimed.**
+
+Plan Sections 6 and 15 were re-read in full after the Phase 1 gate and before
+any Phase 2 production edit. Later phases remain unstarted.
+
+### Planned Phase 2 evidence sequence
+
+These rows are prospective gates, not passing claims. Each is updated only
+after its command and evidence actually exist.
+
+| ID | Scope | Required evidence before PASS |
+| --- | --- | --- |
+| P2-Q01 | Representative persistence seam | Expected-red store/record tests; optimistic conflict and rollback; first durable checkpoint; all 160 Phase 1 tests remain green before broader standardization |
+| P2-Q02 | SQLite and migrations | WAL/foreign-key/busy-timeout assertions; ordered versioning; backup; reopen; incompatible future schema rejection; normalized lifecycle round-trips; atomic CAS |
+| P2-Q03 | Blobs and events | Durable put-by-content; hash/rename/orphan behavior; state/event same transaction; post-commit subscription, cursor replay, and commit/publish crash-gap coverage |
+| P2-Q04 | Tasks, leases, and recovery | Claim races; fencing; expiry; replay-safe reclaim; terminal skip; manual recovery for unknown side effects; all seven crash/cancel checkpoints |
+| P2-Q05 | Governance and fake side effect | Risk facts and decision-only approval mutation; no executor before approval or after denial; same-operation wake/resume; repeated resume changes the marker once |
+| P2-Q06 | Agent, sessions, and embedded mode | Isolated create/open identity; authoritative DB/manifest match; shared writer lock; restart-safe transcripts; transient/sessionless isolation; thin-facade architecture |
+| P2-Q07 | OpenAI adapter and live loop | Lazy optional import; fake Responses client contracts; provider call-ID continuation; normalized errors; provider cannot execute; explicit live model completes persisted fake loop |
+| P2-Q08 | Phase gate | Full Python 3.11/3.12 suite; static/architecture/import/root-oracle/build scans; parity/ADR/ledger review; scoped hooks and exact Phase 2 gate commit |
+
+The production-provider row remains NOT RUN until an actual API key and an
+explicit test model are available. A skip or mock trajectory cannot close the
+Phase 2 gate.
 
 ## Live and external gates
 
