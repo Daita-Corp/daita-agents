@@ -6,19 +6,20 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 1 — loop laboratory
-- **Active task:** P1-05 checkpoint — implementation, adversarial review, and
-  final verification are complete
+- **Active task:** P1-06 checkpoint — complete deterministic Phase 1 gate
+  trajectories and repository architecture assertions are verified
 - **Last completed task:** P1-05 implementation — operation-bound budgets,
   runtime-owned execution deadlines, and cancellation-resistant interruption
   are inspectable and provider neutral
-- **Current checkpoint:** P1-04 commit
-  `91d73764af34a3e04938b9c5cdde4a457d2af7e9`
-  (`feat(v2): add bounded repair progression`)
+- **Current checkpoint:** P1-05 commit
+  `5c87494af5c905b7254cd1ce67196daa9869f3f6`
+  (`feat(v2): enforce budgets and interruption`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** stage only the reviewed P1-05 paths under `next/`, run
-  the configured hooks, create the passing checkpoint, and advance to P1-06
+- **Exact next action:** stage only the reviewed P1-06 paths under `next/`, run
+  cached-diff and configured-hook checks, create the scoped P1-06 checkpoint,
+  then advance the ledger to the P1-07 Phase 1 gate review
 
 ## Mandatory architecture re-read
 
@@ -73,8 +74,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P1-02 | complete | P1-01 records | Text-only vertical slice with deterministic scripted mock model, static context, copy-on-write in-memory operation/turn/event state, direct generic loop, and readiness commit | 7 focused tests; exact success event order; optional session; model call committed before I/O; stable provider failure with no whole-loop retry; injected commit failure publishes no partial state | P1-01 |
 | P1-03 | complete | P1-02 loop; fake capability contract | Minimal capability registry/tool projection, fake read executor, in-memory task/evidence state, and operation runtime submission path | 30 focused tests; exact proposal/projection binding; durable PENDING/RUNNING/success checkpoints; accepted evidence before observation; one/two sequential reads; injected atomic failures; sole executor call site; commit `e5258c0` | P1-02 |
 | P1-04 | complete | P1-03 action path | Structured invalid-action observations, bounded repair turns, normalized failure fingerprints, and no-progress termination | 42 focused and 113 complete tests; atomic ordered repair/skip boundaries; commit `91d7376` | P1-03 |
-| P1-05 | active — checkpoint pending | P1-02 through P1-04 | Cancellation checks plus turn, action, repair, identical-retry, wall-time, task-timeout, token, observation, and estimated-cost budgets | 46 focused and 150 complete tests; adversarial deadline/cancellation suppression; atomic interruption/budget commits; Python 3.11/3.12, static, architecture, and build gates pass | P1-04 |
-| P1-06 | pending | Complete loop laboratory | Deterministic scripted acceptance trajectories and architecture assertions covering every Phase 1 gate | No domain/provider branch; only operation runtime contains executor invocation; full suites on Python 3.11/3.12; static/build scans | P1-05 |
+| P1-05 | complete | P1-02 through P1-04 | Cancellation checks plus turn, action, repair, identical-retry, wall-time, task-timeout, token, observation, and estimated-cost budgets | 46 focused and 150 complete tests; adversarial deadline/cancellation suppression; atomic interruption/budget commits; commit `5c87494` | P1-04 |
+| P1-06 | complete — checkpoint pending | Complete loop laboratory | Deterministic scripted acceptance trajectories and architecture assertions covering every Phase 1 gate | 160 tests on Python 3.11/3.12; 26 architecture tests; static/isolation/build gates pass | P1-05 |
 | P1-07 | pending | Passing P1-06 results | Final Phase 1 ledger/evidence and coherent gate commit | scoped diff; root oracle unchanged; pre-commit; `chore(v2-phase-1): complete phase 1 gate` | P1-06 |
 
 ## Files/components being changed or planned
@@ -110,6 +111,18 @@ The binding rationale and consequences are recorded in `next/decisions/`.
   wall deadline immediately before its sole executor call, rejects late
   timeout-suppressed results, and atomically records active-child cancellation
   intent before interruption becomes terminal.
+- P1-06 dependency review resolved an ambiguity without ownership churn.
+  Section 7 places checkpoint/progression contracts in `loop.models`; Sections
+  6.3–6.4 and ADR 0005 require the operation runtime to commit those records;
+  and the P1-01 ledger explicitly deferred their atomic pairing to that runtime
+  owner. Section 15's ban on operations importing the agent loop therefore
+  means the executable driver/orchestration protocols, not the immutable
+  canonical checkpoint records. P1-Q04's broad “no operations→loop import” was
+  a point-in-time P1-01 result for the rejected `operations.models` edge, not a
+  permanent ban on `operations.runtime` consuming `loop.models`. Architecture
+  tests now permit only that record import, forbid every operations-to-driver
+  edge, and keep `loop.models` implementation-free. Lifecycle decisions remain
+  loop-owned; durable commits remain operation-runtime-owned.
 - Later Phase 1 owners are created only when their vertical slice becomes the
   active task; the target tree is not being scaffolded in advance.
 - Root `daita/`: **not being changed**
@@ -173,8 +186,13 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P1-05 Black, compile, mypy, and pyright checks | PASS — Black reported 39 files unchanged; compilation succeeded; mypy found no issues in 38 source files; pyright 1.1.411 reported 0 errors/warnings |
 | P1-05 independent review, architecture/root/scoped scans, and clean-copy build | PASS — no blocker or root/v1/symlink leak; 19 architecture tests; sole production executor call is `operations/runtime.py:830`; root oracle unchanged; 18-entry wheel and 31-entry sdist exclude tests/nested `next/` paths |
 | P1-05 scoped stage and configured pre-commit hooks | PASS — exactly 12 reviewed paths, all under `next/`; cached diff check clean; trailing-whitespace, end-of-file, merge-conflict, large-file, and Black hooks passed |
+| P1-06 focused gate-consolidation modules | PASS — 46 passed; complete repaired-action events/correlations, all accepted MVP triggers, reserved-event atomicity, dynamic import firewall, one loop, driver import allowlist, dependency leaf, branchlessness, and sole executor boundary |
+| Final P1-06 complete isolated v2 suites on CPython 3.11.15 and 3.12.7 | PASS — final checkpoint-tree rerun: 160 passed in 0.57s on 3.11; 160 passed in 0.52s on 3.12 |
+| P1-06 Black, compile, mypy, and pyright checks | PASS — Black reported 40 files unchanged; compilation succeeded; mypy found no issues in 39 source files; pyright 1.1.411 reported 0 errors/warnings |
+| P1-06 architecture/root/isolation scans | PASS — 26 architecture tests; generated disposition and v1 fixtures reproduce; no root-oracle change, v2 symlink, or diff error |
+| P1-06 clean-copy build and fresh-install smoke | PASS — `/private/tmp/daita-v2-p1-06.VGBQWx`; 18-entry wheel and 31-entry sdist exclude forbidden paths; fresh Python 3.11/3.12 installs import v2 `2.0.0a0` from their own `site-packages` |
 
-Phase 0 and P1-01 through P1-04 are checkpointed. P1-05 implementation and
+Phase 0 and P1-01 through P1-05 are checkpointed. P1-06 implementation and
 verification are complete; only its scoped checkpoint remains.
 
 ## Known failures and baselines
@@ -281,6 +299,22 @@ verification are complete; only its scoped checkpoint remains.
 - The first staging and pre-commit invocations could not create Git's
   `index.lock` inside the workspace sandbox. The same explicitly scoped
   `git add` and configured hook run were approved, then completed successfully.
+- P1-06 gate review found no production behavior gap. It strengthened the
+  existing deterministic trajectory owners and moved the sole-executor scan
+  to the architecture suite rather than creating a duplicate acceptance
+  harness. The first focused Black check rejected the new architecture file's
+  formatting; Black reformatted it, and every focused/full/static gate passed.
+- P1-06 also resolved the apparent operations-to-loop wording conflict from
+  Section 15 without moving canonical records away from the plan's target
+  ownership map. Only `operations.runtime` may consume the implementation-free
+  `loop.models` checkpoint contracts; every operation import of the executable
+  driver remains forbidden and regression-tested.
+- Independent P1-06 checkpoint review caught and repaired a receiver-name
+  loophole in the moved sole-executor scan, underinclusive/overbroad identity
+  branch detection, and an 8-versus-14 event-count ledger typo. The first
+  allowed-contract scanner regression was expected red, then passed after
+  direct identity checks became context-sensitive. Final full/static gates were
+  rerun on the repaired tree.
 
 ## Credentials and external dependencies
 

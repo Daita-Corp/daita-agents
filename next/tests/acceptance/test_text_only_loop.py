@@ -102,8 +102,18 @@ class AllowTextDomain:
         )
 
 
-@pytest.mark.parametrize("session_id", [None, "session-1"])
+@pytest.mark.parametrize(
+    ("trigger_kind", "session_id"),
+    [
+        pytest.param(TriggerKind.USER, None, id="user-sessionless"),
+        pytest.param(TriggerKind.USER, "session-1", id="user-session"),
+        pytest.param(TriggerKind.SCHEDULE, None, id="schedule"),
+        pytest.param(TriggerKind.MONITOR, None, id="monitor"),
+        pytest.param(TriggerKind.INTERNAL, None, id="internal"),
+    ],
+)
 async def test_text_only_response_completes_from_committed_runtime_state(
+    trigger_kind: TriggerKind,
     session_id: str | None,
 ) -> None:
     runtime = OperationRuntime(clock=lambda: NOW)
@@ -132,10 +142,10 @@ async def test_text_only_response_completes_from_committed_runtime_state(
         domain=AllowTextDomain(),
     )
     trigger = AgentTrigger(
-        id=f"trigger-{session_id or 'none'}",
+        id=f"trigger-{trigger_kind.value}-{session_id or 'none'}",
         agent_id="agent-1",
-        kind=TriggerKind.USER,
-        source_id="user-1",
+        kind=trigger_kind,
+        source_id=f"{trigger_kind.value}-1",
         session_id=session_id,
         payload={"message": "Say hello without using a tool."},
         created_at=NOW,
@@ -150,6 +160,7 @@ async def test_text_only_response_completes_from_committed_runtime_state(
     assert final.operation.status is OperationStatus.SUCCEEDED
     assert final.operation.final_text == result.final_text
     assert final.operation.session_id == session_id
+    assert final.trigger.kind is trigger_kind
     assert final.loop_state.phase is LoopPhase.TERMINAL
     assert final.loop_state.turn_count == 1
     assert final.loop_state.input_tokens == 7

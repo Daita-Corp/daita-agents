@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import ast
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 
@@ -786,19 +784,3 @@ async def test_invalid_evidence_fails_task_without_accepting_evidence(
     assert "executor.failed" in event_types
     assert "evidence.accepted" not in event_types
     assert "task.succeeded" not in event_types
-
-
-def test_only_operation_runtime_invokes_executor_execute() -> None:
-    source_root = Path(__file__).parents[3] / "src" / "daita"
-    callers: set[str] = set()
-    for path in source_root.rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        if any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "execute"
-            for node in ast.walk(tree)
-        ):
-            callers.add(path.relative_to(source_root).as_posix())
-
-    assert callers == {"operations/runtime.py"}

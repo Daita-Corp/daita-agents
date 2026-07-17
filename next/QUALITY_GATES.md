@@ -92,9 +92,9 @@ read-only Phase 0 scope.
 
 ## Phase 1 — loop laboratory
 
-Status: **P1-04 committed at
-`91d73764af34a3e04938b9c5cdde4a457d2af7e9`; P1-05 implementation and
-verification complete with checkpoint pending; no Phase 1 gate claimed.**
+Status: **P1-05 committed at
+`5c87494af5c905b7254cd1ce67196daa9869f3f6`; P1-06 active; no Phase 1 gate
+claimed.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 0 commit and before
 the first Phase 1 production edit. Phase 1 evidence will be appended only for
@@ -234,7 +234,7 @@ commands actually run.
 | P1-Q33 | repository root and `next/` | Black check, byte compilation, full mypy, and pyright 1.1.411 across source, tests, and inventory script | PASS — Black reported 39 files unchanged; compilation succeeded; mypy found no issues in 38 source files; pyright reported 0 errors and 0 warnings |
 | P1-Q34 | repository root and `next/` | Independent final deadline review; architecture tests; sole `.execute()` scan; v1/symlink/root-oracle checks; `git diff --check`; scoped status review | PASS — no blocker, prohibited reference, symlink, root change, or diff error; 19 architecture tests; sole production executor invocation is `operations/runtime.py:830` |
 | P1-Q35 | clean copy `/private/tmp/daita-v2-p1-05.ZIaT8S` | Build sdist/wheel without isolation and inspect both archives for required runtime modules and forbidden test/nested paths | PASS — build succeeded; 18-entry wheel and 31-entry sdist contain the generic loop/operation runtime and no tests or nested `next/` path |
-| P1-Q36 | repository root | Stage the 12 reviewed P1-05 paths under `next/`; run `git diff --cached --check` and all configured pre-commit hooks | PASS — every staged path is under `next/`; cached diff check is clean; trailing-whitespace, end-of-file, merge-conflict, large-file, and Black hooks passed |
+| P1-Q36 | repository root | Stage the 12 reviewed P1-05 paths under `next/`; run `git diff --cached --check` and all configured pre-commit hooks; create the scoped checkpoint | PASS — every staged path was under `next/`; cached diff and all configured hooks passed; commit `5c87494af5c905b7254cd1ce67196daa9869f3f6` |
 
 ### P1-05 red/repair evidence
 
@@ -269,6 +269,58 @@ commands actually run.
 - The sandbox rejected the first scoped stage and pre-commit invocations at
   Git's `index.lock`. Approved reruns used the same 12 `next/` paths; cached
   diff review and all configured hooks passed.
+
+### P1-06 Phase 1 gate coverage
+
+| Gate behavior | Deterministic proof |
+| --- | --- |
+| One loop handles sessionless/session user, schedule, monitor, and internal triggers | Parameterized `test_text_only_response_completes_from_committed_runtime_state`; reserved event rejection proves no partial state or trigger-ID reservation |
+| Normal text completion uses committed state | Exact 8-event text-only transcript, committed model response/readiness, terminal operation, usage, and provider-neutral request assertions |
+| Model-selected action follows task → executor → evidence → observation ordering | `test_fake_reads_follow_the_only_durable_executor_path_in_order` plus the complete repaired-action 24-event transcript and correlation assertions |
+| Invalid action becomes a bounded observation and a changed action can repair | `test_invalid_action_is_observed_then_changed_action_repairs` and stable multi-call skip transcript cases |
+| Repeated normalized failure stops without more model or executor I/O | `test_repeated_normalized_failure_stops_before_more_model_or_io` and exact threshold cases |
+| Cancellation is inspectable at model, executor, post-evidence, repeated-cancel, and terminal-budget boundaries | All seven `test_loop_cancellation.py` trajectories, including cancellation-suppressing adapters |
+| Turn/action/observation/token/cost/wall/task limits have truthful terminal facts | Eleven `test_loop_budgets.py` trajectories plus three adversarial timeout-suppression/deadline cases |
+| One generic provider/domain-neutral loop and one executor invocation boundary | Six repository AST assertions in `test_phase1_loop_architecture.py`; import firewall also rejects literal dynamic v1/self imports |
+
+### Executed P1-06 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P1-Q37 | `next/` | Focused new/changed architecture, text-only, repaired-action, runtime-commit, and execution-boundary modules with isolated v2 import path | PASS — 46 passed in 0.16s; complete event/correlation, all MVP triggers, reserved-event atomicity, dynamic import, one-loop, dependency-leaf, branchlessness, and sole-executor assertions pass |
+| P1-Q38 | `next/` | Complete isolated suite with `-S`, explicit v2 `PYTHONPATH`, and disabled repository addopts on CPython 3.11.15 and 3.12.7 | PASS — final checkpoint-tree rerun: 160 passed in 0.57s on 3.11 and 160 passed in 0.52s on 3.12 |
+| P1-Q39 | `next/` | Black check; byte compilation; full mypy with `MYPYPATH=src`; pyright 1.1.411 with repository venv | PASS — Black reported 40 files unchanged; compilation succeeded; mypy found no issues in 39 source files; pyright reported 0 errors/warnings |
+| P1-Q40 | repository root and `next/` | Generated disposition and v1-oracle checks; isolated architecture suite; root-oracle diff from `b87df318`; symlink and `git diff --check` scans | PASS — 26 architecture tests; inventories/fixtures reproduce; no root change, v2 symlink, or diff error |
+| P1-Q41 | clean copy `/private/tmp/daita-v2-p1-06.VGBQWx` | Build sdist/wheel without isolation; inspect required and forbidden archive paths; install wheel into fresh CPython 3.11/3.12 venvs and verify version/origin | PASS — 18-entry wheel and 31-entry sdist exclude tests/scripts/decisions/nested `next/`; both fresh installs import v2 `2.0.0a0` from their own `site-packages` |
+
+### P1-06 review/repair evidence
+
+- Gate inventory found no missing production behavior and therefore added no
+  second acceptance harness. Existing deterministic trajectories remain the
+  behavioral owners; only their missing trigger/event/correlation assertions
+  were strengthened.
+- The sole executor-invocation repository scan moved from an operation unit
+  module into the architecture suite, which now also proves exactly one
+  `AgentLoop`, an implementation-free checkpoint-record leaf, no operation
+  dependency on the driver, an explicit driver import allowlist, and no
+  provider/domain identity branching.
+- Section 15's operations-to-loop wording was reconciled with Sections 6–7,
+  ADRs 0002/0003/0005, and the P1-01 ledger: the operation runtime consumes
+  canonical checkpoint records to commit them but cannot import the executable
+  driver or orchestration protocols. The source module documentation and
+  architecture assertions make that distinction inspectable.
+- The first focused Black check correctly rejected the newly added architecture
+  module's formatting. Black reformatted that file, after which the focused
+  check, complete static gate, and both interpreter suites passed.
+- Independent checkpoint review caught that the first moved executor scan
+  filtered by receiver name, the first identity-branch scan both missed type
+  checks and overmatched generic `name` fields, and the ledger misstated the
+  text-only transcript as 14 events. The executor and model-generation scans
+  now conservatively cover every production call, the identity detector has
+  synthetic forbidden/allowed regressions, and the corrected text count is 8.
+  Its first allowed-contract regression was expected red because the detector
+  still matched the inner `self._domain` expression; context-sensitive direct
+  identity handling repaired that overreach before the final green reruns.
 
 ## Phases 2 through 9
 

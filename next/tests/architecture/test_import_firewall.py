@@ -31,6 +31,34 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
     return True
 
 
+def _is_daita_module_name(name: str) -> bool:
+    return name == "daita" or name.startswith("daita.")
+
+
+def _literal_dynamic_import(node: ast.Call) -> tuple[str, str] | None:
+    """Return the mechanism and literal module used by a dynamic import call."""
+
+    if not node.args:
+        return None
+    module_argument = node.args[0]
+    if not isinstance(module_argument, ast.Constant) or not isinstance(
+        module_argument.value,
+        str,
+    ):
+        return None
+
+    if isinstance(node.func, ast.Name) and node.func.id == "__import__":
+        return "__import__", module_argument.value
+    if (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "import_module"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "importlib"
+    ):
+        return "importlib.import_module", module_argument.value
+    return None
+
+
 def _loaded_daita_module_paths() -> dict[str, Path]:
     paths: dict[str, Path] = {}
     for name, module in tuple(sys.modules.items()):
@@ -123,7 +151,7 @@ def test_v2_production_uses_no_absolute_self_or_known_v1_imports() -> None:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name == "daita" or alias.name.startswith("daita."):
+                    if _is_daita_module_name(alias.name):
                         violations.append(
                             f"{relative_path}:{node.lineno}: absolute import {alias.name}"
                         )
@@ -131,17 +159,44 @@ def test_v2_production_uses_no_absolute_self_or_known_v1_imports() -> None:
                 isinstance(node, ast.ImportFrom)
                 and node.level == 0
                 and node.module is not None
-                and (node.module == "daita" or node.module.startswith("daita."))
+                and _is_daita_module_name(node.module)
             ):
                 violations.append(
                     f"{relative_path}:{node.lineno}: absolute import {node.module}"
                 )
+            elif isinstance(node, ast.Call):
+                dynamic_import = _literal_dynamic_import(node)
+                if dynamic_import is not None:
+                    mechanism, module_name = dynamic_import
+                    if _is_daita_module_name(module_name):
+                        violations.append(
+                            f"{relative_path}:{node.lineno}: dynamic import "
+                            f"{module_name} via {mechanism}"
+                        )
 
         for fragment in known_v1_fragments:
             if fragment in source:
                 violations.append(f"{relative_path}: known v1 reference {fragment}")
 
     assert violations == []
+
+
+def test_literal_dynamic_import_detector_covers_supported_python_mechanisms() -> None:
+    sources = (
+        '__import__("daita.db.runtime")',
+        'importlib.import_module("daita.plugins.registry")',
+    )
+
+    detected = []
+    for source in sources:
+        expression = ast.parse(source, mode="eval").body
+        assert isinstance(expression, ast.Call)
+        detected.append(_literal_dynamic_import(expression))
+
+    assert detected == [
+        ("__import__", "daita.db.runtime"),
+        ("importlib.import_module", "daita.plugins.registry"),
+    ]
 
 
 def test_root_distribution_configuration_does_not_include_next() -> None:

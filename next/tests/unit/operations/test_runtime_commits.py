@@ -13,10 +13,59 @@ from daita.llm.models import (
     TextBlock,
 )
 from daita.loop.models import LoopPhase
-from daita.operations.models import AgentTrigger, TriggerKind
+from daita.operations.models import AgentTrigger, OperationStatus, TriggerKind
 from daita.operations.runtime import ModelCallStatus, OperationRuntime
 
 NOW = datetime(2026, 7, 16, 13, 0, tzinfo=timezone.utc)
+
+
+async def test_rejected_event_trigger_leaves_no_reservation_or_partial_state() -> None:
+    issued_ids: list[str] = []
+
+    def recording_id_factory(prefix: str) -> str:
+        identifier = f"{prefix}-{len(issued_ids) + 1}"
+        issued_ids.append(identifier)
+        return identifier
+
+    runtime = OperationRuntime(
+        clock=lambda: NOW,
+        id_factory=recording_id_factory,
+    )
+    rejected = AgentTrigger(
+        id="trigger-reusable",
+        agent_id="agent-1",
+        kind=TriggerKind.EVENT,
+        source_id="event-source-1",
+        payload={"message": "reserved for a later phase"},
+        created_at=NOW,
+    )
+
+    with pytest.raises(ValueError, match="event triggers.*later phase"):
+        await runtime.begin(rejected)
+
+    assert issued_ids == []
+    accepted = AgentTrigger(
+        id=rejected.id,
+        agent_id=rejected.agent_id,
+        kind=TriggerKind.USER,
+        source_id="user-1",
+        payload={"message": "the trigger id remains available"},
+        created_at=NOW,
+    )
+    started = await runtime.begin(accepted)
+    snapshot = await runtime.inspect(started.operation.id)
+
+    assert snapshot.trigger == accepted
+    assert snapshot.operation.status is OperationStatus.RUNNING
+    assert snapshot.turns == ()
+    assert snapshot.model_calls == ()
+    assert snapshot.tasks == ()
+    assert snapshot.evidence == ()
+    assert snapshot.observations == ()
+    assert [event.type for event in snapshot.events] == [
+        "trigger.received",
+        "operation.created",
+    ]
 
 
 async def test_duplicate_trigger_is_rejected_until_phase2_resume_exists() -> None:

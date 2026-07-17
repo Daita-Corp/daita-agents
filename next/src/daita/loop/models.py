@@ -1,4 +1,8 @@
-"""Canonical records owned by the generic agent loop."""
+"""Canonical loop checkpoint records shared with the operation runtime.
+
+The generic loop owns progression decisions. The operation runtime consumes
+these implementation-free records only to commit the resulting durable state.
+"""
 
 from __future__ import annotations
 

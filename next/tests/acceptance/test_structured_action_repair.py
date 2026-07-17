@@ -484,10 +484,18 @@ async def test_invalid_action_is_observed_then_changed_action_repairs() -> None:
         "details": REJECTION_DETAILS,
         "message": REJECTION_MESSAGE,
     }
-    assert _important_events(final) == [
+    assert [event.type for event in final.events] == [
+        "trigger.received",
+        "operation.created",
+        "turn.created",
+        "context.built",
+        "model_call.started",
         "model_response.recorded",
         "action.rejected",
         "observation.recorded",
+        "turn.created",
+        "context.built",
+        "model_call.started",
         "model_response.recorded",
         "task.created",
         "executor.started",
@@ -495,10 +503,81 @@ async def test_invalid_action_is_observed_then_changed_action_repairs() -> None:
         "evidence.accepted",
         "task.succeeded",
         "observation.recorded",
+        "turn.created",
+        "context.built",
+        "model_call.started",
         "model_response.recorded",
         "readiness.recorded",
         "operation.succeeded",
     ]
+
+    task = final.tasks[0]
+    evidence = final.evidence[0]
+    successful_observation = final.observations[1]
+    assert task.call_id == "repaired-call"
+    assert task.turn_id == final.turns[1].id
+    assert task.evidence_ids == (evidence.id,)
+    assert evidence.operation_id == final.operation.id
+    assert evidence.task_id == task.id
+    assert evidence.turn_id == task.turn_id
+    assert evidence.capability_id == task.capability_id
+    assert evidence.executor_id == task.executor_id
+    assert successful_observation.operation_id == final.operation.id
+    assert successful_observation.turn_id == task.turn_id
+    assert successful_observation.task_id == task.id
+    assert successful_observation.evidence_id == evidence.id
+
+    rejected_event = next(
+        event for event in final.events if event.type == "action.rejected"
+    )
+    rejected_observation_event = next(
+        event
+        for event in final.events
+        if event.type == "observation.recorded" and event.call_id == "invalid-call"
+    )
+    assert rejected_event.turn_id == final.turns[0].id
+    assert rejected_event.call_id == rejection.call_id
+    assert rejected_event.task_id is None
+    assert rejected_event.evidence_id is None
+    assert rejected_observation_event.turn_id == final.turns[0].id
+    assert rejected_observation_event.task_id is None
+    assert rejected_observation_event.evidence_id is None
+
+    task_events = [
+        event
+        for event in final.events
+        if event.type
+        in {
+            "task.created",
+            "executor.started",
+            "executor.completed",
+            "evidence.accepted",
+            "task.succeeded",
+        }
+    ]
+    assert len(task_events) == 5
+    for event in task_events:
+        assert event.turn_id == task.turn_id
+        assert event.call_id == task.call_id
+        assert event.task_id == task.id
+        assert event.capability_id == task.capability_id
+        assert event.executor_id == task.executor_id
+    evidence_events = [
+        event
+        for event in task_events
+        if event.type in {"evidence.accepted", "task.succeeded"}
+    ]
+    assert all(event.evidence_id == evidence.id for event in evidence_events)
+    successful_observation_event = next(
+        event
+        for event in final.events
+        if event.type == "observation.recorded" and event.evidence_id == evidence.id
+    )
+    assert successful_observation_event.turn_id == task.turn_id
+    assert successful_observation_event.call_id == task.call_id
+    assert successful_observation_event.task_id == task.id
+    assert successful_observation_event.capability_id == task.capability_id
+    assert successful_observation_event.executor_id == task.executor_id
     failure_facts = canonical_json(
         {
             "code": rejection.code,
