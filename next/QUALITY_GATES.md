@@ -363,6 +363,7 @@ any Phase 2 production edit. Later phases remain unstarted.
 | P2-Q01q | repository root and `next/` | Final Black, compilation, mypy, pyright 1.1.411, architecture, disposition/v1-oracle, root-oracle, import, symlink, SQL-leakage, and diff gates | PASS — Black 50 files; compile clean; mypy 49 files; pyright 0 errors/warnings; 34 architecture tests; every isolation/oracle scan clean |
 | P2-Q01r | clean copy `/private/tmp/daita-v2-p2-02-gate.31k4au` | Rebuild final sdist/wheel; inspect content; fresh isolated Python 3.11/3.12 installs and canonical-module imports | PASS — wheel/sdist 22/36 entries at `2.0.0a0`; no tests or nested `next/`; both imports resolved to their own site-packages |
 | P2-Q01s | current P2-02 diff | Two independent final adversarial reviews after all repairs | PASS — no remaining architecture/cancellation blocker; exact ancestry, committed history, authoritative store state, cancellation precedence, deliberate interruption retry, and sole executor boundary verified |
+| P2-Q01t | repository root | Stage only the 19 reviewed P2-02 paths under `next/`; cached diff; configured hooks; local checkpoint commit | PASS — every staged path was under `next/`; diff and all hooks passed; commit `b13e66abc5d645b685f7bbf840d2e8d9ea903f2f` |
 
 Rows P2-Q01f through P2-Q01h predate the adversarial repairs and remain useful
 interim evidence only. Rows P2-Q01p through P2-Q01s close the refreshed seam

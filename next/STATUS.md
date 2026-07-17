@@ -10,15 +10,15 @@ project. Update it before and after every material task.
   lifecycle repository against the proven optimistic contract
 - **Last completed task:** P2-02 — canonical checkpoints and authoritative
   async in-memory operation-store seam
-- **Current pre-task checkpoint:** P2-01 planning commit
-  `fece6673ebd1799df35feefa53e462f23b682691`
-  (`docs(v2): plan phase 2 persistent loop`)
+- **Current checkpoint:** P2-02 store-seam commit
+  `b13e66abc5d645b685f7bbf840d2e8d9ea903f2f`
+  (`refactor(v2): add authoritative operation store`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** create the scoped P2-02 checkpoint, record its hash,
-  then write expected-red SQLite marker/PRAGMA/migration/backup/rollback/reopen
-  contracts before adding any SQLite production owner
+- **Exact next action:** write expected-red SQLite marker, PRAGMA, ordered
+  checksummed migration, backup-before-migrate, compatibility, rollback, and
+  reopen contracts before adding the concrete `storage/sqlite.py` owner
 
 ## Mandatory architecture re-read
 
@@ -108,6 +108,16 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-09 | pending | Persisted embedded fake-capability loop; provider-neutral model contract | Separate canonical/provider call identity, normalized provider errors, lazy optional OpenAI Responses adapter, fake-client contract tests, and one live persisted fake-capability loop | Missing-extra/import isolation; response/tool continuation/error tests; architecture scan forbids provider execution; explicit credential/model live gate | P2-08 |
 | P2-10 | pending | Complete Phase 2 vertical slice | Consolidated restart, failure-injection, approval, event, import, architecture, static, cross-version, root-oracle, and clean-build evidence with parity/quality/ADR review | Complete Phase 2 gate suite on Python 3.11/3.12 plus live production-provider evidence; no mock substitutes for live evidence | P2-09 |
 | P2-11 | pending | Passing P2-10 results | Final Phase 2 ledger/evidence and coherent exact gate commit | Scoped diff/hooks; all paths under `next/`; exact `chore(v2-phase-2): complete phase 2 gate` commit | P2-10 |
+
+### Ordered P2-03 internal tasks
+
+| ID | Status | Smallest output | Required proof before advancing |
+| --- | --- | --- | --- |
+| P2-03a | active | Test-only SQLite foundation contract | Expected-red marker/PRAGMA/version/checksum/backup/compatibility/rollback/reopen cases with no production SQLite owner |
+| P2-03b | pending | One concrete `SQLiteOperationStore` foundation in `storage/sqlite.py` | Foundation cases green; standard-library calls offloaded; no generic `StateStore`, loop import, or SQL leakage into runtime |
+| P2-03c | pending | Normalized lifecycle schema plus canonical codecs | Every trigger/operation/loop/turn/model/task/evidence/readiness/observation/event field round-trips independently; no opaque-snapshot-only persistence |
+| P2-03d | pending | Transactional optimistic operation repository | Reuse portable contract validation; create/load/by-trigger/CAS/conflict/rollback/reopen/shared-runtime conformance; failure leaves all tables/events unchanged |
+| P2-03e | pending | Final P2-03 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, independent review, scoped hooks, local commit |
 
 ## Files/components being changed or planned
 
@@ -210,6 +220,20 @@ The binding rationale and consequences are recorded in `next/decisions/`.
   target tree is not being scaffolded in advance.
 - Root `daita/`: **not being changed**
 
+P2-03 extends the existing `OperationStore` contract owner rather than adding
+another persistence facade. The current pain is that its proven in-memory
+adapter cannot survive restart or atomically normalize lifecycle records. The
+smallest correction is one concrete standard-library SQLite adapter in the
+plan-owned `storage/sqlite.py`, beginning with its connection/migration
+boundary before adding codecs or repository writes. Portable checkpoint
+validation remains owned by `operations/store.py`; the adapter may consume it
+but may not duplicate runtime transition legality. Foundation tests catch
+wrong databases, unsafe PRAGMAs, drifted or future schemas, missing backups,
+partial migrations, event/state partial writes, and reopen drift. Repository
+tests then reuse the existing optimistic conformance cases and add independent
+normalized-row round-trips. This creates no unbounded `StateStore` and imports
+no SQLite code into the generic loop or operation runtime.
+
 ## Tests last run
 
 Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
@@ -298,6 +322,7 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-02 final static/architecture/oracle gate | PASS — Black clean across 50 files; compilation succeeded; mypy clean across 49 files; pyright 0 errors/warnings; 34 architecture tests; disposition/v1 fixtures reproduce; root-oracle, import, symlink, SQL-leakage, and diff scans clean |
 | P2-02 final distribution gate | PASS — clean copy `/private/tmp/daita-v2-p2-02-gate.31k4au` built 22-entry wheel and 36-entry sdist; fresh isolated Python 3.11/3.12 installs import v2 canonical event/checkpoint/store modules from their own site-packages |
 | P2-02 independent final review | PASS — no architecture or cancellation blocker remains; store/runtime ownership, committed prefixes, exact event ancestry, cancellation precedence, interruption CAS convergence, and sole executor boundary verified |
+| P2-02 scoped checkpoint | PASS — exactly 19 paths under `next/`; cached diff and configured whitespace/EOF/conflict/large-file/Black hooks passed; commit `b13e66abc5d645b685f7bbf840d2e8d9ea903f2f` |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
