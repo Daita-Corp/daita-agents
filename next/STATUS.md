@@ -5,21 +5,20 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 1 — loop laboratory
-- **Active task:** P1-06 checkpoint — complete deterministic Phase 1 gate
-  trajectories and repository architecture assertions are verified
-- **Last completed task:** P1-05 implementation — operation-bound budgets,
-  runtime-owned execution deadlines, and cancellation-resistant interruption
-  are inspectable and provider neutral
-- **Current checkpoint:** P1-05 commit
-  `5c87494af5c905b7254cd1ce67196daa9869f3f6`
-  (`feat(v2): enforce budgets and interruption`)
+- **Active phase:** Phase 1 complete — Phase 2 not started
+- **Active task:** P1-07 complete — this ledger is part of the exact Phase 1
+  gate commit
+- **Last completed task:** P1-07 — final Phase 1 evidence, committed-tree
+  isolation, scoped diff, and hooks are reconciled and passing
+- **Current checkpoint:** Phase 1 gate commit containing this ledger, with the
+  exact message `chore(v2-phase-1): complete phase 1 gate`; its hash must be
+  recorded before the first Phase 2 implementation task
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** stage only the reviewed P1-06 paths under `next/`, run
-  cached-diff and configured-hook checks, create the scoped P1-06 checkpoint,
-  then advance the ledger to the P1-07 Phase 1 gate review
+- **Exact next action:** after the Phase 1 gate commit exists, record its hash,
+  re-read plan Sections 6 and 15 in full, and inventory Phase 2 persistence and
+  recovery work before the first Phase 2 production edit
 
 ## Mandatory architecture re-read
 
@@ -75,8 +74,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P1-03 | complete | P1-02 loop; fake capability contract | Minimal capability registry/tool projection, fake read executor, in-memory task/evidence state, and operation runtime submission path | 30 focused tests; exact proposal/projection binding; durable PENDING/RUNNING/success checkpoints; accepted evidence before observation; one/two sequential reads; injected atomic failures; sole executor call site; commit `e5258c0` | P1-02 |
 | P1-04 | complete | P1-03 action path | Structured invalid-action observations, bounded repair turns, normalized failure fingerprints, and no-progress termination | 42 focused and 113 complete tests; atomic ordered repair/skip boundaries; commit `91d7376` | P1-03 |
 | P1-05 | complete | P1-02 through P1-04 | Cancellation checks plus turn, action, repair, identical-retry, wall-time, task-timeout, token, observation, and estimated-cost budgets | 46 focused and 150 complete tests; adversarial deadline/cancellation suppression; atomic interruption/budget commits; commit `5c87494` | P1-04 |
-| P1-06 | complete — checkpoint pending | Complete loop laboratory | Deterministic scripted acceptance trajectories and architecture assertions covering every Phase 1 gate | 160 tests on Python 3.11/3.12; 26 architecture tests; static/isolation/build gates pass | P1-05 |
-| P1-07 | pending | Passing P1-06 results | Final Phase 1 ledger/evidence and coherent gate commit | scoped diff; root oracle unchanged; pre-commit; `chore(v2-phase-1): complete phase 1 gate` | P1-06 |
+| P1-06 | complete | Complete loop laboratory | Deterministic scripted acceptance trajectories and architecture assertions covering every Phase 1 gate | 160 tests on Python 3.11/3.12; 26 architecture tests; static/isolation/build gates pass; commit `eb57f9d` | P1-05 |
+| P1-07 | complete | Passing P1-06 results | Final Phase 1 ledger/evidence and coherent gate commit | 160 tests per interpreter; 26 architecture tests; committed-tree root/v2 builds isolated; exact gate commit contains this ledger | P1-06 |
 
 ## Files/components being changed or planned
 
@@ -191,9 +190,15 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P1-06 Black, compile, mypy, and pyright checks | PASS — Black reported 40 files unchanged; compilation succeeded; mypy found no issues in 39 source files; pyright 1.1.411 reported 0 errors/warnings |
 | P1-06 architecture/root/isolation scans | PASS — 26 architecture tests; generated disposition and v1 fixtures reproduce; no root-oracle change, v2 symlink, or diff error |
 | P1-06 clean-copy build and fresh-install smoke | PASS — `/private/tmp/daita-v2-p1-06.VGBQWx`; 18-entry wheel and 31-entry sdist exclude forbidden paths; fresh Python 3.11/3.12 installs import v2 `2.0.0a0` from their own `site-packages` |
+| P1-06 scoped stage, hooks, and checkpoint | PASS — exactly 9 reviewed paths, all under `next/`; cached diff and configured hooks passed; commit `eb57f9d76dc33c840410529672f5381f33b4423b` |
+| P1-07 final complete suites and static gate | PASS — 160 tests in 0.52s on Python 3.11 and 160 in 0.48s on Python 3.12; Black 40 files; mypy 39 files; pyright 0 errors/warnings |
+| P1-07 architecture/oracle/range gate | PASS — 26 architecture tests; disposition and v1 fixtures reproduce; all committed Phase 1 paths are under `next/`; root oracle and symlink scans clean |
+| P1-07 committed-tree distribution gate | PASS — v2 build `/private/tmp/daita-v2-p1-gate.Y9lKPa` produced 18/31-entry archives at `2.0.0a0`; root build `/private/tmp/daita-root-p1-gate.Bbhplk` produced 401/442-entry archives at `1.0.0`; neither crossed the isolation boundary |
+| P1-07 scoped ledger stage and configured hooks | PASS — exactly `next/STATUS.md` and `next/QUALITY_GATES.md`; cached diff and all configured hooks passed before the exact gate commit |
 
-Phase 0 and P1-01 through P1-05 are checkpointed. P1-06 implementation and
-verification are complete; only its scoped checkpoint remains.
+Phase 0 and every Phase 1 task are complete. This ledger is committed by the
+exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
+re-read and an updated ordered ledger.
 
 ## Known failures and baselines
 
@@ -343,7 +348,7 @@ verification are complete; only its scoped checkpoint remains.
 - [x] Passing Phase 0 evidence is committed as `720adc8`
       (`chore(v2-phase-0): complete phase 0 gate`).
 
-## Remaining Phase 1 gate requirements
+## Phase 1 gate record
 
 - [x] Text-only response completes through the generic loop.
 - [x] Fake read follows the durable task/execution/evidence/observation order.
@@ -356,5 +361,5 @@ verification are complete; only its scoped checkpoint remains.
 - [x] A repository assertion proves only the operation runtime invokes the
       executor.
 - [x] Root v1 oracle paths remain unchanged.
-- [ ] Passing Phase 1 evidence is committed as
-      `chore(v2-phase-1): complete phase 1 gate`.
+- [x] Passing Phase 1 evidence is committed by the gate commit containing this
+      ledger with exact message `chore(v2-phase-1): complete phase 1 gate`.

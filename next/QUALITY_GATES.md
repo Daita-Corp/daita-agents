@@ -92,9 +92,8 @@ read-only Phase 0 scope.
 
 ## Phase 1 — loop laboratory
 
-Status: **P1-05 committed at
-`5c87494af5c905b7254cd1ce67196daa9869f3f6`; P1-06 active; no Phase 1 gate
-claimed.**
+Status: **Phase 1 gate complete in the exact gate commit containing this
+ledger; Phases 2–9 have not started.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 0 commit and before
 the first Phase 1 production edit. Phase 1 evidence will be appended only for
@@ -292,6 +291,7 @@ commands actually run.
 | P1-Q39 | `next/` | Black check; byte compilation; full mypy with `MYPYPATH=src`; pyright 1.1.411 with repository venv | PASS — Black reported 40 files unchanged; compilation succeeded; mypy found no issues in 39 source files; pyright reported 0 errors/warnings |
 | P1-Q40 | repository root and `next/` | Generated disposition and v1-oracle checks; isolated architecture suite; root-oracle diff from `b87df318`; symlink and `git diff --check` scans | PASS — 26 architecture tests; inventories/fixtures reproduce; no root change, v2 symlink, or diff error |
 | P1-Q41 | clean copy `/private/tmp/daita-v2-p1-06.VGBQWx` | Build sdist/wheel without isolation; inspect required and forbidden archive paths; install wheel into fresh CPython 3.11/3.12 venvs and verify version/origin | PASS — 18-entry wheel and 31-entry sdist exclude tests/scripts/decisions/nested `next/`; both fresh installs import v2 `2.0.0a0` from their own `site-packages` |
+| P1-Q42 | repository root | Stage the 9 reviewed P1-06 paths under `next/`; run cached diff and configured pre-commit hooks; create the scoped checkpoint | PASS — every path was under `next/`; cached diff and hooks passed; commit `eb57f9d76dc33c840410529672f5381f33b4423b` |
 
 ### P1-06 review/repair evidence
 
@@ -321,6 +321,15 @@ commands actually run.
   Its first allowed-contract regression was expected red because the detector
   still matched the inner `self._domain` expression; context-sensitive direct
   identity handling repaired that overreach before the final green reruns.
+
+### Executed P1-07 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P1-Q43 | `next/` | Final complete isolated suite on CPython 3.11.15/3.12.7; Black; compilation; mypy; pyright 1.1.411 | PASS — 160 tests in 0.52s on 3.11 and 160 in 0.48s on 3.12; Black 40 files; mypy 39 files; pyright 0 errors/warnings |
+| P1-Q44 | repository root and `next/` | Isolated architecture suite; disposition/v1-oracle reproduction; root-oracle diff; Phase 1 commit-range scope/diff scan; v2 symlink scan | PASS — 26 architecture tests; every committed Phase 1 path is under `next/`; no root change, fixture drift, symlink, or diff error |
+| P1-Q45 | committed P1-06 archives under `/private/tmp/daita-v2-p1-gate.Y9lKPa` and `/private/tmp/daita-root-p1-gate.Bbhplk` | Build v2 from `HEAD:next` and root from `HEAD`; inspect archive counts, versions, and cross-inclusion | PASS — v2 wheel/sdist 18/31 at `2.0.0a0`; root wheel/sdist 401/442 at `1.0.0`; neither archive family contains the other tree |
+| P1-Q46 | repository root | Stage only the final `STATUS.md` and `QUALITY_GATES.md`; run cached diff and every configured hook before the exact gate commit | PASS — exactly 2 paths, both under `next/`; cached diff, whitespace, EOF, merge-conflict, large-file, and applicable Black checks passed |
 
 ## Phases 2 through 9
 
