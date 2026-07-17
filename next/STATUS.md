@@ -16,9 +16,9 @@ project. Update it before and after every material task.
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** add test-only canonical blob/reader/store contracts,
-  capture their missing-owner expected red, and implement no filesystem I/O
-  until that portable shape is reviewed green
+- **Exact next action:** add test-only committed-event cursor/envelope/read
+  contracts, capture the absent projection expected red, then extend the
+  existing SQLite transaction owner without adding a public event writer
 
 ## Mandatory architecture re-read
 
@@ -124,10 +124,10 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | ID | Status | Smallest output | Required proof before advancing |
 | --- | --- | --- | --- |
 | P2-04a | complete | Read-only blob/event ownership inventory and locked test-first sequence | Existing owners, transaction boundaries, dependency direction, explicit deferrals, and no generic `StateStore` or free-standing event append API |
-| P2-04b | active | Canonical blob identity/metadata/reader records plus narrow `BlobStore` protocol | Strict digest/ID/time/version/provenance/tombstone validation and protocol shape fail before the owner exists, then pass without filesystem or SQLite leakage into runtime |
-| P2-04c | pending | Local content-addressed filesystem blob adapter | Temp/write/flush/fsync/re-read/hash/atomic-rename/directory-fsync/reopen; idempotent same-ID retry, same-content races, corruption/symlink rejection, cancellation completion, and explicit grace-based orphan cleanup |
-| P2-04d | pending | Representative blob review before broader persistence work | One complete put/open/metadata/tombstone/delete path is independently reviewed; metadata/content ownership is coherent and does not justify a generic storage framework |
-| P2-04e | pending | Canonical committed-event cursor/envelope and narrow read/subscription contract | Positive agent-bound cursors, strict envelope linkage, bounded reads, cross-agent cursor rejection, and no public event append method |
+| P2-04b | complete | Canonical blob identity/metadata/reader records plus narrow `BlobStore` protocol | Strict digest/ID/time/version/provenance/tombstone validation and protocol shape fail before the owner exists, then pass without filesystem or SQLite leakage into runtime |
+| P2-04c | complete | Local content-addressed filesystem blob adapter | Temp/write/flush/fsync/re-read/hash/atomic-rename/directory-fsync/reopen; idempotent same-ID retry, same-content races, corruption/symlink rejection, cancellation completion, and explicit grace-based orphan cleanup |
+| P2-04d | complete | Representative blob review before broader persistence work | One complete put/open/metadata/tombstone/delete path is independently reviewed; metadata/content ownership is coherent and does not justify a generic storage framework |
+| P2-04e | active | Canonical committed-event cursor/envelope and narrow read/subscription contract | Positive agent-bound cursors, strict envelope linkage, bounded reads, cross-agent cursor rejection, and no public event append method |
 | P2-04f | pending | Migration 3 plus SQLite committed-event projection | Existing `runtime_events` gain per-agent monotonic sequence and append-only enforcement; v2 backfill, state/event/cursor atomicity, rollback, CAS loser, cross-operation order, pagination, and reopen pass |
 | P2-04g | pending | Post-commit wake-hint subscription over durable replay | No pre-commit delivery; missed/failed wake, commit-before-notify gap, reconnect, cross-store polling, slow subscriber, bounded batches, and cancellation all recover from durable cursors |
 | P2-04h | pending | Final P2-04 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, independent review, scoped hooks, and local commit |
@@ -257,6 +257,30 @@ standard-library-only; evidence gains an explicit blob reference only in
 P2-05, agent-home wiring and the shared writer lock remain P2-08 work, and
 encryption/automated retention/cloud streaming stay with their later owners.
 
+The completed local adapter uses the logical manifest as its commit point.
+Content is written by a partial-write loop to a private `0600` same-filesystem
+temporary file, fsynced, reopened without following the final path, rehashed,
+atomically renamed to `sha256/<prefix>/<digest>`, and directory-fsynced before
+the checksummed versioned logical manifest is published the same way. Each
+new root/layout/shard directory is made durable in its parent. An identical
+retry re-fsyncs both a visible object and manifest, closing rename-success /
+directory-fsync-failure ambiguity before it can claim success. Blob IDs are
+hashed only for private manifest paths and verified inside the record; two IDs
+may share one physical digest without sharing provenance.
+
+`LocalBlobStore` serializes complete filesystem transactions with one
+process-shared lock per canonical root, including cleanup, while every async
+mutation waits for its offloaded worker to reach a definitive result before
+cancellation escapes. This is adapter-local same-process CAS, not the shared
+cross-process/per-agent host lease that remains P2-08's owner. Final-component
+symlinks, hard links, corrupt/checksum-drifted manifests, noncanonical values,
+and corrupt objects fail closed. The path-based adapter assumes its enclosing
+Agent Home is a trusted private directory; P2-08 must establish and lock that
+home before multiple processes can reach it. Streaming input, encryption
+enforcement, automated retention, and cloud storage remain later-owner work.
+Concrete grace-based orphan cleanup is intentionally not added to the portable
+`BlobStore` protocol.
+
 Canonical `RuntimeEvent` already belongs to `events/models.py`, operation
 checkpoints already commit it with state, and `storage/sqlite.py` already owns
 the only SQL insertion path. The current pain is delivery: operation-local
@@ -376,6 +400,13 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-03e root-oracle and distribution review | PASS — root safe suite remains 2,498 passed/221 deselected; disposition/v1 fixtures reproduce; root diff from `b87df318` is empty; clean v2 build `/private/tmp/daita-v2-p2-03.UIpzhE` produced 24/39-entry archives with fresh Python 3.11/3.12 imports; root build with the physical `next/` tree produced 401/442 entries at v1 `1.0.0` and excluded `next/` |
 | P2-03e migration-failure attribution before repair | EXPECTED RED — a three-migration fresh initialization failed in migration 3 but the typed diagnostic incorrectly named pending migration 1 |
 | P2-03e independent review | PASS after repair — transaction-design and final scope audits found no remaining in-contract blocker; the last review found and the new regression repaired exact failed-migration attribution, while its concurrent-first-open observation remains correctly owned by P2-08's required shared writer lock |
+| Initial P2-04b canonical blob contract | EXPECTED RED — collection stopped on the absent `daita.storage.blobs` owner; the separate architecture run had exactly 2 failures for the missing sole `BlobStore` definition/module |
+| P2-04b portable blob records and protocols | PASS — 39 focused contract/architecture tests; strict SHA-256, immutable metadata, provenance nesting, lifecycle chronology, typed errors, bounded async-reader shape, sole owner, no generic `StateStore`, and dependency firewalls pass; focused mypy and pyright are clean |
+| Initial P2-04c local adapter contracts | EXPECTED RED — the core and durability/cancellation suites each stopped at collection only because `LocalBlobStore` was absent; no production filesystem owner existed |
+| First P2-04c content-addressed adapter | PASS — 61 focused blob/architecture cases covered exact layout, reopen, bounded reads, idempotency, distinct logical provenance over shared content, CAS lifecycle, corruption/symlinks, cancellation completion, injected write/fsync/hash/rename/manifest failures, and grace cleanup |
+| P2-04c independent durability review before repair | REVIEW FINDINGS — directory creation was not durable in its parent; retries did not re-fsync visible rename results; malformed recursive JSON, hard links, oversized orphan verification, reader cancellation advancement, and impossible lifecycle versions needed stronger fail-closed behavior |
+| Repaired P2-04c/P2-04d focused and complete gates | PASS — 71 focused blob cases and 344 complete v2 tests pass on CPython 3.11.15 and 3.12.7; new regressions prove parent-directory fsync, content/manifest retry stabilization, typed recursive-codec failure, cancellation-poisoned readers, strict lifecycle revisions, same-ID races, short/zero writes, tamper checksums, and no resurrection; Black/compile/mypy/pyright and 38 architecture tests are clean |
+| P2-04d ownership review | PASS after repair — content precedes the manifest commit point; shared bytes remain reference-safe across logical records; terminal metadata survives physical deletion; cleanup fails closed before deleting; no blob behavior leaked into SQLite, runtime, loop, capability, or provider owners; no generic storage framework is justified |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
@@ -439,6 +470,16 @@ re-read and an updated ordered ledger.
   adversarial multi-connection coverage begins after one authoritative store
   initialization and proves SQLite CAS independently of that future host
   composition boundary.
+- P2-04c began test-first: both local-adapter suites stopped on the absent
+  concrete owner. Its first complete implementation passed all authored tests,
+  then independent review found crash-durability and retry-reconciliation gaps
+  not covered by that first suite. Parent-directory fsync and explicit retry
+  stabilization now close those gaps, and the review's codec, bounded-I/O,
+  cancellation, link, and lifecycle findings are locked as regressions. The
+  remaining parent-directory swap threat is outside a path-only adapter's
+  final-component no-follow guarantee; P2-08 owns the private Agent Home and
+  shared cross-process writer boundary rather than duplicating a host/security
+  framework here.
 - P2-02 began test-first. Its combined event/checkpoint/store/architecture run
   stopped at collection on the intentionally absent canonical event and
   operation-store modules. This is expected-red evidence, not a gate failure;

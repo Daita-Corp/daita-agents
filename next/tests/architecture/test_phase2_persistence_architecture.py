@@ -12,6 +12,7 @@ OPERATION_STORE = SOURCE_ROOT / "operations" / "store.py"
 OPERATION_RUNTIME = SOURCE_ROOT / "operations" / "runtime.py"
 LOOP_DRIVER = SOURCE_ROOT / "loop" / "driver.py"
 SQLITE_ADAPTER = SOURCE_ROOT / "storage" / "sqlite.py"
+BLOB_STORE = SOURCE_ROOT / "storage" / "blobs.py"
 
 
 def _production_trees() -> tuple[tuple[Path, ast.Module], ...]:
@@ -246,6 +247,44 @@ def test_sqlite_adapter_imports_only_canonical_records_and_standard_library() ->
         "sqlite3",
         "typing",
     }
+
+
+def test_blob_store_has_one_canonical_owner_and_no_generic_state_store() -> None:
+    assert _class_locations("BlobStore", "StateStore") == {
+        "BlobStore": ["storage/blobs.py"],
+        "StateStore": [],
+    }
+
+
+def test_blob_store_does_not_import_runtime_execution_sql_or_provider_owners() -> None:
+    tree = _required_tree(BLOB_STORE)
+    forbidden_parents = {
+        "aiosqlite",
+        "anthropic",
+        "asyncpg",
+        "boto3",
+        "botocore",
+        "capabilities",
+        "daita",
+        "google.genai",
+        "groq",
+        "loop.driver",
+        "openai",
+        "operations.runtime",
+        "psycopg",
+        "psycopg2",
+        "sqlalchemy",
+        "sqlite3",
+        "storage.sqlite",
+        "xai",
+    }
+    violations = [
+        (lineno, module)
+        for lineno, module in _imported_modules(tree)
+        if any(_is_module_or_child(module, parent) for parent in forbidden_parents)
+    ]
+
+    assert violations == []
 
 
 def test_sqlite_adapter_has_no_opaque_snapshot_or_history_rewrite_sql() -> None:
