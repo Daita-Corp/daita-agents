@@ -28,7 +28,8 @@ Recorded 2026-07-16 in `America/Chicago`:
 
 ## Phase 0 — architecture constitution and v1 oracle
 
-Status: **P0-06 verification complete; P0-07 final scoped review in progress.**
+Status: **COMPLETE at gate commit
+`720adc8ac8c80f450fd9924349aa675f2c40cfe9`.**
 
 ### Executed passing evidence
 
@@ -87,13 +88,40 @@ read-only Phase 0 scope.
       all Phase 0 artifacts are final.
 - [x] Root wheel build/content scan proving `next/` is excluded.
 - [x] Final architecture/reference scans and clean scoped diff.
-- [ ] Phase 0 gate commit with final ledger evidence.
+- [x] Phase 0 gate commit with final ledger evidence (`720adc8`).
 
-## Phases 1 through 9
+## Phase 1 — loop laboratory
 
-No later-phase gate has been run or claimed. Each phase receives its own
-command/result section only after Phase 0 passes and Sections 6 and 15 are
-re-read.
+Status: **P1-01 complete; P1-02 active; no Phase 1 gate claimed.**
+
+Plan Sections 6 and 15 were re-read in full after the Phase 0 commit and before
+the first Phase 1 production edit. Phase 1 evidence will be appended only for
+commands actually run.
+
+### Executed P1-01 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P1-Q01 | `next/` | Run the new P1-01 unit tests before adding production modules | EXPECTED RED — 4 collection errors identified the absent `_json`, `llm`, `loop`, and `operations` owners |
+| P1-Q02 | `next/` | Isolated focused `pytest -o addopts='' tests/unit -q` after contract and ownership review | PASS — 25 passed in 0.04s |
+| P1-Q03 | `next/` | Complete isolated suite on CPython 3.11.15 and 3.12.7 | PASS — 49 passed in 0.19s on 3.11; 49 passed in 0.15s on 3.12 |
+| P1-Q04 | `next/` | Black check, byte compilation, mypy, pyright 1.1.411, all architecture tests, operations dependency scan, and root-oracle diff | PASS — 20 files formatted; compile succeeded; mypy clean across 13 files; pyright 0 errors/warnings; 19 architecture tests; no operations→loop import; root unchanged |
+| P1-Q05 | clean copy `/private/tmp/daita-v2-p1-01.VXrIhE` | Build sdist/wheel without isolation; inspect wheel for required modules and forbidden test/nested paths | PASS — 13-entry wheel contained all 5 required contract modules; no tests or nested `next/` path |
+
+### P1-01 red/repair evidence
+
+- Duplicate `test_models.py` leaf names initially collided under pytest's
+  import mode; each test module now has a responsibility-specific unique name.
+- The first static pass required Black formatting and exposed overly broad
+  mapping annotations in the JSON boundary; the boundary and tests were typed
+  precisely, then mypy and pyright passed without a production suppression.
+- A dependency review rejected an operations→loop model import. Operation
+  boundary records now belong to operations, loop progression records belong
+  to loop, and P1-02 will pair them transactionally in the runtime owner.
+
+## Phases 2 through 9
+
+No later-phase gate has been run or claimed.
 
 ## Live and external gates
 

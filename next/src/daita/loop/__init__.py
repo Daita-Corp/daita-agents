@@ -1,0 +1,1 @@
+"""Generic agent-loop contracts."""
