@@ -6,20 +6,19 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-06e — add the narrow agent-scoped nonterminal query to both
-  existing stores and iterate it through the same loop resume path at startup
-- **Last completed task:** P2-06d — the existing driver dispatches every durable
-  turn/model/task/evidence/observation/readiness/terminal checkpoint; exact
-  trigger redelivery and all three independent reviews pass
-- **Current checkpoint:** P2-06d green dispatcher is recorded by local commit
-  `e28bd26`; nine P2-06e focused cases now fail only at the intentionally
-  absent store/runtime/loop recovery seams
+- **Active task:** P2-06f — prove all seven Phase 2 crash/restart trajectories
+  against the existing dispatcher, stores, leases, blobs, and readiness owners
+- **Last completed task:** P2-06e — both stores expose one exact agent-scoped
+  nonterminal snapshot and startup recovery sequentially reuses public `resume()`;
+  all ordering/corruption/race reviews pass
+- **Current checkpoint:** P2-06e expected-red contract is `d395b68`; the green
+  query/startup implementation is recorded by the commit containing this ledger
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** checkpoint the P2-06e expected-red contract, then add
-  `load_nonterminal` to the existing protocol/adapters, project it read-only
-  through `OperationRuntime`, and iterate the same `AgentLoop.resume()` path
+- **Exact next action:** add the P2-06f expected-red crash-injection matrix for
+  all seven durable boundaries, exact identity/event/counter deltas, safe replay
+  versus manual recovery, blob orphaning, and terminal delivery before any fix
 
 ## Mandatory architecture re-read
 
@@ -163,8 +162,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-06b | complete | One expected-red SQLite-reopen trajectory after model-response persistence but before task materialization | Same operation/turn/response survives reopen; initial context/model I/O does not repeat; one task/evidence/observation and only the necessary follow-up model call are expected |
 | P2-06c | complete | Representative checkpoint-aware continuation in the existing generic loop | `resume(operation_id)` enters the existing driver; no new loop/recovery runtime/module; a completed response is consumed without rebuilding context or repeating its model call; focused review passes before broader cases |
 | P2-06d | complete | Complete checkpoint dispatcher over requestless turn, started/completed model call, ordered tool calls, task/evidence/observation, readiness, terminal state, and exact trigger redelivery | Persisted records, not coarse phase alone, select progression; STARTED inference is at-least-once; existing tasks use `resume_task()`; avoidable validation/executor/projection/readiness/model I/O is skipped; exact trigger redelivery enters the same driver |
-| P2-06e | active | Portable agent-scoped nonterminal inspection plus startup recovery over both existing stores | Deterministic scoped query, SQLite single-transaction reopen, terminal exclusion, live-lease deferral, and startup iteration reuse the same loop; P2-08 retains Agent Home, host admission, and writer-lock composition |
-| P2-06f | pending | All seven Phase 2 crash/restart trajectories and independent representative review | Abrupt process-exit injection at every required durable boundary; exact identity/event/counter assertions; safe replay versus manual recovery; blob orphan; terminal delivery replay; no second owner |
+| P2-06e | complete | Portable agent-scoped nonterminal inspection plus startup recovery over both existing stores | Deterministic scoped query, SQLite single-transaction reopen, terminal exclusion, live-lease deferral, and startup iteration reuse the same loop; P2-08 retains Agent Home, host admission, and writer-lock composition |
+| P2-06f | active | All seven Phase 2 crash/restart trajectories and independent representative review | Abrupt process-exit injection at every required durable boundary; exact identity/event/counter assertions; safe replay versus manual recovery; blob orphan; terminal delivery replay; no second owner |
 | P2-06g | pending | Final P2-06 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local checkpoint |
 
 ## Files/components being changed or planned

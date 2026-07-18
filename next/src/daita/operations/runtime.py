@@ -1812,6 +1812,16 @@ class OperationRuntime:
                 raise KeyError(f"Unknown operation: {operation_id}") from error
             return committed.snapshot
 
+    async def inspect_nonterminal(
+        self,
+        agent_id: str,
+    ) -> tuple[OperationSnapshot, ...]:
+        """Inspect one agent's resumable operations without exposing revisions."""
+
+        async with self._lock:
+            committed = await self._store.load_nonterminal(agent_id)
+            return tuple(item.snapshot for item in committed)
+
     async def elapsed_seconds(self, operation_id: str) -> float:
         """Return authoritative elapsed wall time from the runtime clock."""
 

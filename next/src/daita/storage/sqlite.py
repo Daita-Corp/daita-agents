@@ -65,6 +65,8 @@ from ..operations.store import (
     TaskClaimResult,
     TriggerAlreadyClaimedError,
     VersionedOperation,
+    _NONTERMINAL_OPERATION_STATUSES,
+    _TERMINAL_OPERATION_STATUSES,
     _authoritative_time,
     _committed_event_suffix,
     _prepare_expired_task_recovery,
@@ -898,6 +900,17 @@ class SQLiteOperationStore:
         _require_identity(operation_id, "operation_id")
         return await self._run_connection(
             lambda connection: _load_versioned_operation(connection, operation_id)
+        )
+
+    async def load_nonterminal(
+        self,
+        agent_id: str,
+    ) -> tuple[VersionedOperation, ...]:
+        """Load one agent's exact resumable checkpoints in stable order."""
+
+        _require_identity(agent_id, "agent_id")
+        return await self._run_connection(
+            lambda connection: _load_nonterminal_operations(connection, agent_id)
         )
 
     async def load_by_trigger(
@@ -2809,6 +2822,48 @@ def _load_versioned_by_trigger(
         )
         connection.execute("COMMIT")
         return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_nonterminal_operations(
+    connection: sqlite3.Connection,
+    agent_id: str,
+) -> tuple[VersionedOperation, ...]:
+    connection.execute("BEGIN")
+    try:
+        rows = connection.execute(
+            "SELECT id, status FROM operations "
+            "WHERE agent_id = ? "
+            "ORDER BY updated_at ASC, id ASC",
+            (agent_id,),
+        ).fetchall()
+        result: list[VersionedOperation] = []
+        for row in rows:
+            try:
+                operation_id = _sqlite_text(row[0], "operation id")
+                raw_status = _sqlite_text(row[1], "operation status")
+                status = OperationStatus(raw_status)
+            except (TypeError, ValueError) as error:
+                raise SQLiteCorruptionError(
+                    "cannot classify agent-scoped operation status"
+                ) from error
+            if status in _NONTERMINAL_OPERATION_STATUSES:
+                result.append(
+                    _load_versioned_operation_in_transaction(
+                        connection,
+                        operation_id,
+                    )
+                )
+                continue
+            if status not in _TERMINAL_OPERATION_STATUSES:
+                raise SQLiteCorruptionError(
+                    f"unclassified operation {operation_id} status: {raw_status!r}"
+                )
+        connection.execute("COMMIT")
+        return tuple(result)
     except BaseException:
         if connection.in_transaction:
             connection.execute("ROLLBACK")

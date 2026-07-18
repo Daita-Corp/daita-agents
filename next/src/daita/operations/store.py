@@ -13,7 +13,7 @@ from typing import Literal, Protocol
 from ..events.models import RuntimeEvent
 from .checkpoints import OperationSnapshot
 from .leases import TaskClaimRequest, TaskLease, TaskLeaseGuard
-from .models import Task, TaskStatus
+from .models import OperationStatus, Task, TaskStatus
 
 
 class OperationStoreError(RuntimeError):
@@ -252,6 +252,11 @@ class OperationStore(Protocol):
 
     async def load(self, operation_id: str) -> VersionedOperation: ...
 
+    async def load_nonterminal(
+        self,
+        agent_id: str,
+    ) -> tuple[VersionedOperation, ...]: ...
+
     async def load_by_trigger(
         self,
         trigger_id: str,
@@ -301,6 +306,20 @@ class TaskExecutionStore(OperationStore, Protocol):
     ) -> CommitResult: ...
 
 
+_NONTERMINAL_OPERATION_STATUSES = (
+    OperationStatus.PENDING,
+    OperationStatus.RUNNING,
+    OperationStatus.WAITING_FOR_APPROVAL,
+    OperationStatus.WAITING_FOR_INPUT,
+)
+_TERMINAL_OPERATION_STATUSES = (
+    OperationStatus.SUCCEEDED,
+    OperationStatus.FAILED,
+    OperationStatus.CANCELLED,
+    OperationStatus.INTERRUPTED,
+)
+
+
 class InMemoryOperationStore:
     """Lock-protected reference adapter for the portable operation contract."""
 
@@ -347,6 +366,37 @@ class InMemoryOperationStore:
                 return self._operations[operation_id]
             except KeyError as error:
                 raise OperationNotFoundError(operation_id) from error
+
+    async def load_nonterminal(
+        self,
+        agent_id: str,
+    ) -> tuple[VersionedOperation, ...]:
+        """Load one agent's exact resumable checkpoints in stable order."""
+
+        _require_identity(agent_id, "agent_id")
+        async with self._lock:
+            selected: list[VersionedOperation] = []
+            for item in self._operations.values():
+                operation = item.snapshot.operation
+                if operation.agent_id != agent_id:
+                    continue
+                if operation.status in _NONTERMINAL_OPERATION_STATUSES:
+                    selected.append(item)
+                    continue
+                if operation.status not in _TERMINAL_OPERATION_STATUSES:
+                    raise InvalidOperationCheckpointError(
+                        operation.id,
+                        f"unclassified operation status: {operation.status!r}",
+                    )
+            return tuple(
+                sorted(
+                    selected,
+                    key=lambda item: (
+                        item.snapshot.operation.updated_at.astimezone(timezone.utc),
+                        item.snapshot.operation.id,
+                    ),
+                )
+            )
 
     async def load_by_trigger(self, trigger_id: str) -> VersionedOperation | None:
         _require_identity(trigger_id, "trigger_id")

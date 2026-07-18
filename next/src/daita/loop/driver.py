@@ -94,6 +94,15 @@ class AgentLoop:
 
         return await self._continue_operation(operation_id)
 
+    async def recover_startup(self, agent_id: str) -> tuple[LoopExit, ...]:
+        """Resume one ordered snapshot of an agent's nonterminal operations."""
+
+        snapshots = await self._runtime.inspect_nonterminal(agent_id)
+        results: list[LoopExit] = []
+        for snapshot in snapshots:
+            results.append(await self.resume(snapshot.operation.id))
+        return tuple(results)
+
     async def _continue_operation(self, operation_id: str) -> LoopExit:
         try:
             try:
