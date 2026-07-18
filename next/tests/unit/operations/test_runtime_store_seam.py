@@ -13,6 +13,7 @@ from daita.operations.store import (
     CommitResult,
     InMemoryOperationStore,
     OperationRevisionConflict,
+    VersionedOperation,
 )
 
 NOW = datetime(2026, 7, 17, 16, 0, tzinfo=timezone.utc)
@@ -35,6 +36,7 @@ class RecordingStore(InMemoryOperationStore):
         super().__init__()
         self.created: list[OperationSnapshot] = []
         self.commits: list[tuple[OperationSnapshot, int]] = []
+        self.nonterminal_loads: list[str] = []
         self.commit_error: Exception | None = None
 
     async def create(self, snapshot: OperationSnapshot) -> CommitResult:
@@ -54,6 +56,13 @@ class RecordingStore(InMemoryOperationStore):
             snapshot,
             expected_revision=expected_revision,
         )
+
+    async def load_nonterminal(
+        self,
+        agent_id: str,
+    ) -> tuple[VersionedOperation, ...]:
+        self.nonterminal_loads.append(agent_id)
+        return await super().load_nonterminal(agent_id)
 
 
 async def test_runtime_begin_commits_one_complete_checkpoint_through_store() -> None:
@@ -136,6 +145,20 @@ async def test_shared_store_is_authoritative_across_runtime_instances() -> None:
 
     assert observed.turns == (turn,)
     assert observed.events[-1].type == "turn.created"
+
+
+async def test_runtime_nonterminal_inspection_projects_exact_store_snapshots() -> None:
+    store = RecordingStore()
+    runtime = OperationRuntime(store=store, clock=lambda: NOW)
+    started = await runtime.begin(_trigger())
+    before = await store.load(started.operation.id)
+
+    snapshots = await runtime.inspect_nonterminal("agent-1")
+
+    after = await store.load(started.operation.id)
+    assert store.nonterminal_loads == ["agent-1"]
+    assert snapshots == (before.snapshot,)
+    assert after == before
 
 
 async def test_two_runtimes_redeliver_the_same_exact_trigger_operation() -> None:

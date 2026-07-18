@@ -11,14 +11,15 @@ project. Update it before and after every material task.
 - **Last completed task:** P2-06d — the existing driver dispatches every durable
   turn/model/task/evidence/observation/readiness/terminal checkpoint; exact
   trigger redelivery and all three independent reviews pass
-- **Current checkpoint:** P2-06d green dispatcher is recorded by the commit
-  containing this ledger; expected-red checkpoint is `2d4bc92`
+- **Current checkpoint:** P2-06d green dispatcher is recorded by local commit
+  `e28bd26`; nine P2-06e focused cases now fail only at the intentionally
+  absent store/runtime/loop recovery seams
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** add expected-red portable query/startup-iteration tests
-  for deterministic agent scope, terminal exclusion, SQLite reopen/transaction
-  consistency, and reuse of `resume(operation_id)` before editing store owners
+- **Exact next action:** checkpoint the P2-06e expected-red contract, then add
+  `load_nonterminal` to the existing protocol/adapters, project it read-only
+  through `OperationRuntime`, and iterate the same `AgentLoop.resume()` path
 
 ## Mandatory architecture re-read
 

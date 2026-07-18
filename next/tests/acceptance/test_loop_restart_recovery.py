@@ -30,7 +30,14 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.driver import AgentLoop
-from daita.loop.models import LoopBudgets, LoopExitKind, LoopPhase, Readiness, Turn
+from daita.loop.models import (
+    LoopBudgets,
+    LoopExit,
+    LoopExitKind,
+    LoopPhase,
+    Readiness,
+    Turn,
+)
 from daita.operations.checkpoints import OperationSnapshot
 from daita.operations.models import (
     ActionProposal,
@@ -410,8 +417,12 @@ async def _seed_model_call(
     response: ModelResponse | None,
     *,
     budgets: LoopBudgets = LoopBudgets(),
+    trigger: AgentTrigger | None = None,
 ) -> tuple[OperationSnapshot, Turn, ModelRequest, str]:
-    started = await runtime.begin(_trigger(), budgets=budgets)
+    started = await runtime.begin(
+        _trigger() if trigger is None else trigger,
+        budgets=budgets,
+    )
     turn = await runtime.begin_turn(started.operation.id)
     snapshot = await runtime.inspect(started.operation.id)
     request = await CountingContextBuilder().build(
@@ -1528,3 +1539,192 @@ async def test_resume_committed_readiness_and_terminal_redelivery_are_zero_io(
     assert domain.readiness_calls == 0
     assert provider.requests == ()
     assert executor.requests == []
+
+
+async def test_startup_recovery_uses_ordered_resume_and_continues_after_waiting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "startup-recovery.db"
+    clock = MutableClock(NOW)
+    id_counts: dict[str, int] = {}
+
+    def startup_id(prefix: str) -> str:
+        id_counts[prefix] = id_counts.get(prefix, 0) + 1
+        return f"{prefix}-startup-{id_counts[prefix]}"
+
+    store = await SQLiteOperationStore.open(database_path, clock=clock)
+    executor = RecordingExecutor()
+    registry = _registry(executor)
+    runtime = OperationRuntime(
+        capabilities=registry,
+        store=store,
+        clock=clock,
+        id_factory=startup_id,
+    )
+    try:
+        first = await runtime.begin(
+            replace(
+                _trigger(),
+                id="trigger-startup-a",
+                payload={"key": "alpha"},
+            )
+        )
+        clock.current = NOW + timedelta(seconds=1)
+        second = await runtime.begin(
+            replace(
+                _trigger(),
+                id="trigger-startup-b",
+                payload={"key": "beta"},
+            )
+        )
+        loop = AgentLoop(
+            runtime=runtime,
+            model=MockModelProvider(()),
+            context_builder=CountingContextBuilder(),
+            domain=TextDomain(registry),
+        )
+        resumed_ids: list[str] = []
+
+        async def record_resume(operation_id: str) -> LoopExit:
+            resumed_ids.append(operation_id)
+            return LoopExit(
+                operation_id=operation_id,
+                kind=(
+                    LoopExitKind.WAITING
+                    if operation_id == first.operation.id
+                    else LoopExitKind.COMPLETED
+                ),
+                reason=(
+                    "waiting_for_approval"
+                    if operation_id == first.operation.id
+                    else "ready"
+                ),
+                final_text=(
+                    None if operation_id == first.operation.id else "Recovered."
+                ),
+                created_at=clock.current,
+            )
+
+        async def reject_begin(*args: object, **kwargs: object) -> OperationSnapshot:
+            del args, kwargs
+            raise AssertionError("startup recovery must not reconstruct a trigger")
+
+        monkeypatch.setattr(loop, "resume", record_resume)
+        monkeypatch.setattr(runtime, "begin", reject_begin)
+
+        exits = await loop.recover_startup("agent-restart")
+    finally:
+        await store.close()
+
+    assert resumed_ids == [first.operation.id, second.operation.id]
+    assert tuple(exit.kind for exit in exits) == (
+        LoopExitKind.WAITING,
+        LoopExitKind.COMPLETED,
+    )
+
+
+async def test_startup_recovery_defers_live_lease_and_drops_new_terminal(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "startup-live-lease.db"
+    clock = MutableClock(NOW)
+    id_counts: dict[str, int] = {}
+
+    def startup_id(prefix: str) -> str:
+        id_counts[prefix] = id_counts.get(prefix, 0) + 1
+        return f"{prefix}-startup-live-{id_counts[prefix]}"
+
+    first_executor = ProcessExitExecutor()
+    first_registry = _registry(first_executor)
+    first_store = await SQLiteOperationStore.open(database_path, clock=clock)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=first_registry,
+            store=first_store,
+            clock=clock,
+            id_factory=startup_id,
+        )
+        live, live_turn, _, _ = await _seed_model_call(
+            first_runtime,
+            first_registry,
+            _tool_response(),
+        )
+        with pytest.raises(AbruptProcessExit):
+            await first_runtime.submit(_proposal(live.operation.id, live_turn.id))
+        live_before = await first_store.load(live.operation.id)
+        assert live_before.snapshot.tasks[0].status is TaskStatus.RUNNING
+
+        clock.current = NOW + timedelta(seconds=1)
+        completing_trigger = replace(
+            _trigger(),
+            id="trigger-startup-completing",
+            payload={"key": "completed"},
+            created_at=clock.current,
+        )
+        completing, _, _, _ = await _seed_model_call(
+            first_runtime,
+            first_registry,
+            _final_response(),
+            trigger=completing_trigger,
+        )
+        await first_runtime.record_readiness(
+            completing.operation.id,
+            "Recovered answer.",
+            Readiness(
+                allowed=True,
+                code="ready.before_startup_recovery",
+                message="The committed answer is ready.",
+                evaluated_at=clock.current,
+            ),
+        )
+    finally:
+        await first_store.close()
+
+    resumed_executor = RecordingExecutor()
+    resumed_registry = _registry(resumed_executor)
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=clock)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            clock=clock,
+        )
+        context = CountingContextBuilder()
+        domain = CountingDomain(resumed_registry)
+        provider = MockModelProvider(())
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=provider,
+            context_builder=context,
+            domain=domain,
+        )
+
+        first_exits = await loop.recover_startup("agent-restart")
+        live_after_first = await resumed_store.load(live.operation.id)
+        completed = await resumed_store.load(completing.operation.id)
+        second_exits = await loop.recover_startup("agent-restart")
+        live_after_second = await resumed_store.load(live.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert tuple(exit.operation_id for exit in first_exits) == (
+        live.operation.id,
+        completing.operation.id,
+    )
+    assert tuple(exit.kind for exit in first_exits) == (
+        LoopExitKind.WAITING,
+        LoopExitKind.COMPLETED,
+    )
+    assert first_exits[0].reason == "task_lease_active"
+    assert tuple(exit.operation_id for exit in second_exits) == (live.operation.id,)
+    assert second_exits[0].kind is LoopExitKind.WAITING
+    assert live_after_first == live_before
+    assert live_after_second == live_before
+    assert completed.snapshot.operation.status is OperationStatus.SUCCEEDED
+    assert context.calls == 0
+    assert domain.validation_calls == 0
+    assert domain.projection_calls == 0
+    assert domain.readiness_calls == 0
+    assert provider.requests == ()
+    assert resumed_executor.requests == []

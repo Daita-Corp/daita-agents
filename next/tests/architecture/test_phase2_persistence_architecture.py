@@ -171,15 +171,35 @@ def test_operation_store_is_a_narrow_async_optimistic_contract() -> None:
     assert set(public_methods) == {
         "create",
         "load",
+        "load_nonterminal",
         "load_by_trigger",
         "commit",
     }
     assert all(
         isinstance(method, ast.AsyncFunctionDef) for method in public_methods.values()
     )
+    nonterminal = public_methods["load_nonterminal"]
+    assert isinstance(nonterminal, ast.AsyncFunctionDef)
+    assert "agent_id" in {
+        argument.arg
+        for argument in (*nonterminal.args.args, *nonterminal.args.kwonlyargs)
+    }
     commit = public_methods["commit"]
     assert isinstance(commit, ast.AsyncFunctionDef)
     assert "expected_revision" in {argument.arg for argument in commit.args.kwonlyargs}
+
+    for path, class_name in (
+        (OPERATION_STORE, "InMemoryOperationStore"),
+        (SQLITE_ADAPTER, "SQLiteOperationStore"),
+    ):
+        concrete = _class_definition(_required_tree(path), class_name)
+        methods = {
+            node.name: node
+            for node in concrete.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not node.name.startswith("_")
+        }
+        assert isinstance(methods.get("load_nonterminal"), ast.AsyncFunctionDef)
 
     assert _class_locations(
         "OperationStore",
@@ -512,4 +532,4 @@ def test_runtime_uses_the_injected_store_as_authoritative_state() -> None:
             store_calls.add(node.func.attr)
 
     assert forbidden_state_attributes == []
-    assert {"create", "load", "commit"} <= store_calls
+    assert {"create", "load", "load_nonterminal", "commit"} <= store_calls

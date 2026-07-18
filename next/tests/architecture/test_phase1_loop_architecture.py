@@ -129,6 +129,33 @@ def test_production_contains_one_generic_agent_loop() -> None:
     assert model_generation_callers == [("loop/driver.py", "self._model.generate")]
 
 
+def test_startup_recovery_reuses_the_public_same_operation_resume_path() -> None:
+    tree = ast.parse(
+        LOOP_DRIVER.read_text(encoding="utf-8"),
+        filename=str(LOOP_DRIVER),
+    )
+    agent_loop = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "AgentLoop"
+    )
+    methods = [
+        node
+        for node in agent_loop.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "recover_startup"
+    ]
+    assert len(methods) == 1
+    calls = {
+        _attribute_parts(node.func)
+        for node in ast.walk(methods[0])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert ("self", "_runtime", "inspect_nonterminal") in calls
+    assert ("self", "resume") in calls
+    assert ("self", "run") not in calls
+    assert ("self", "_runtime", "begin") not in calls
+
+
 def test_operations_import_checkpoint_contracts_not_loop_implementation() -> None:
     loop_imports: list[tuple[str, str]] = []
     for path, tree in _production_trees():
