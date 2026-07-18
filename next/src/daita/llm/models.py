@@ -43,10 +43,13 @@ class ToolCall:
     id: str
     name: str
     arguments: Mapping[str, object] = field(default_factory=dict)
+    provider_call_id: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.id, "tool-call id")
         _required_text(self.name, "tool-call name")
+        if self.provider_call_id is not None:
+            _required_text(self.provider_call_id, "tool-call provider_call_id")
         object.__setattr__(
             self, "arguments", FrozenJsonObject.from_mapping(self.arguments)
         )
@@ -91,6 +94,7 @@ class CanonicalMessage:
     turn_id: str | None = None
     session_id: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
+    provider_metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _required_text(self.agent_id, "message agent_id")
@@ -114,6 +118,9 @@ class CanonicalMessage:
             raise TypeError("message tool_calls must contain ToolCall records")
         if tool_calls and self.role is not MessageRole.ASSISTANT:
             raise ValueError("only an assistant message may contain tool calls")
+        provider_metadata = FrozenJsonObject.from_mapping(self.provider_metadata)
+        if provider_metadata and self.role is not MessageRole.ASSISTANT:
+            raise ValueError("only an assistant message may contain provider metadata")
 
         has_tool_result = any(isinstance(block, ToolResultBlock) for block in content)
         if self.role is MessageRole.TOOL:
@@ -127,9 +134,17 @@ class CanonicalMessage:
         call_ids = [call.id for call in tool_calls]
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("Duplicate tool-call IDs in one message")
+        provider_call_ids = [
+            call.provider_call_id
+            for call in tool_calls
+            if call.provider_call_id is not None
+        ]
+        if len(provider_call_ids) != len(set(provider_call_ids)):
+            raise ValueError("Duplicate provider tool-call IDs in one message")
 
         object.__setattr__(self, "content", content)
         object.__setattr__(self, "tool_calls", tool_calls)
+        object.__setattr__(self, "provider_metadata", provider_metadata)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +232,13 @@ class ModelResponse:
         call_ids = [call.id for call in tool_calls]
         if len(call_ids) != len(set(call_ids)):
             raise ValueError("Duplicate tool-call IDs in one model response")
+        provider_call_ids = [
+            call.provider_call_id
+            for call in tool_calls
+            if call.provider_call_id is not None
+        ]
+        if len(provider_call_ids) != len(set(provider_call_ids)):
+            raise ValueError("Duplicate provider tool-call IDs in one model response")
         if tool_calls and self.finish_reason is not FinishReason.TOOL_CALLS:
             raise ValueError("tool calls require the tool_calls finish reason")
         if not tool_calls and self.finish_reason is FinishReason.TOOL_CALLS:

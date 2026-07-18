@@ -20,6 +20,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+openai = ["openai>=1.77.0"]
 dev = [
     "black>=26.1.0",
     "build>=1.2.2",

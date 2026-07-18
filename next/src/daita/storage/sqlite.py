@@ -2211,6 +2211,7 @@ def _load_session_transcript(
                         role=MessageRole.ASSISTANT,
                         content=content,
                         tool_calls=response.tool_calls,
+                        provider_metadata=response.provider_metadata,
                     )
                 )
                 for observation in snapshot.observations:
@@ -4254,19 +4255,25 @@ def _expect_int(value: object, label: str) -> int:
 
 
 def _tool_call_to_data(call: ToolCall) -> dict[str, object]:
-    return {
+    data: dict[str, object] = {
         "arguments": call.arguments,
         "id": call.id,
         "name": call.name,
     }
+    if call.provider_call_id is not None:
+        data["provider_call_id"] = call.provider_call_id
+    return data
 
 
 def _tool_call_from_data(value: object) -> ToolCall:
-    data = _expect_object(
-        value,
-        keys={"arguments", "id", "name"},
-        label="tool call",
-    )
+    if not isinstance(value, dict):
+        raise ValueError("tool call must be a JSON object")
+    keys = frozenset(value)
+    legacy_keys = frozenset({"arguments", "id", "name"})
+    current_keys = legacy_keys | {"provider_call_id"}
+    if keys not in (legacy_keys, current_keys):
+        raise ValueError("tool call has unknown or missing fields")
+    data = value
     arguments = data["arguments"]
     if not isinstance(arguments, dict):
         raise ValueError("tool-call arguments must be a JSON object")
@@ -4274,6 +4281,10 @@ def _tool_call_from_data(value: object) -> ToolCall:
         id=_expect_text(data["id"], "tool-call id"),
         name=_expect_text(data["name"], "tool-call name"),
         arguments=arguments,
+        provider_call_id=_expect_optional_text(
+            data.get("provider_call_id"),
+            "tool-call provider_call_id",
+        ),
     )
 
 
@@ -4345,7 +4356,7 @@ def _content_block_from_data(value: object) -> TextBlock | ToolResultBlock:
 
 
 def _message_to_data(message: CanonicalMessage) -> dict[str, object]:
-    return {
+    data: dict[str, object] = {
         "agent_id": message.agent_id,
         "content": [_content_block_to_data(block) for block in message.content],
         "operation_id": message.operation_id,
@@ -4354,12 +4365,16 @@ def _message_to_data(message: CanonicalMessage) -> dict[str, object]:
         "tool_calls": [_tool_call_to_data(call) for call in message.tool_calls],
         "turn_id": message.turn_id,
     }
+    if message.provider_metadata:
+        data["provider_metadata"] = message.provider_metadata
+    return data
 
 
 def _message_from_data(value: object) -> CanonicalMessage:
-    data = _expect_object(
-        value,
-        keys={
+    if not isinstance(value, dict):
+        raise ValueError("canonical message must be a JSON object")
+    legacy_keys = frozenset(
+        {
             "agent_id",
             "content",
             "operation_id",
@@ -4367,9 +4382,14 @@ def _message_from_data(value: object) -> CanonicalMessage:
             "session_id",
             "tool_calls",
             "turn_id",
-        },
-        label="canonical message",
+        }
     )
+    if frozenset(value) not in (legacy_keys, legacy_keys | {"provider_metadata"}):
+        raise ValueError("canonical message has unknown or missing fields")
+    data = value
+    provider_metadata = data.get("provider_metadata", {})
+    if not isinstance(provider_metadata, dict):
+        raise ValueError("message provider_metadata must be a JSON object")
     return CanonicalMessage(
         agent_id=_expect_text(data["agent_id"], "message agent_id"),
         operation_id=_expect_text(data["operation_id"], "message operation_id"),
@@ -4384,6 +4404,7 @@ def _message_from_data(value: object) -> CanonicalMessage:
             _tool_call_from_data(item)
             for item in _expect_list(data["tool_calls"], "message tool calls")
         ),
+        provider_metadata=provider_metadata,
     )
 
 

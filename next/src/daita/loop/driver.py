@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Protocol, TypeVar
 
+from ..llm.errors import ModelProviderError
 from ..llm.models import ModelRequest, ModelResponse, ToolCall, ToolDefinition
 from ..llm.protocols import ModelProvider
 from ..operations.checkpoints import ModelCall, ModelCallStatus, OperationSnapshot
@@ -219,6 +220,12 @@ class AgentLoop:
             )
         except _WallTimeExhausted:
             raise
+        except ModelProviderError as error:
+            return await self._runtime.record_model_failure(
+                operation_id,
+                model_call.id,
+                error.code.value,
+            )
         except Exception:
             return await self._runtime.record_model_failure(
                 operation_id,

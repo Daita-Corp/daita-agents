@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
 from pathlib import Path
 import sqlite3
 
 import pytest
 
 from daita.events.models import RuntimeEvent
+from daita.identity import AgentIdentity
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -37,6 +39,7 @@ from daita.operations.models import (
     TaskStatus,
     TriggerKind,
 )
+from daita.sessions import Session
 from daita.storage.sqlite import SQLiteCorruptionError, SQLiteOperationStore
 
 OFFSET = timezone(timedelta(hours=5, minutes=30))
@@ -144,8 +147,18 @@ def _maximal_snapshot() -> OperationSnapshot:
                         id="prior-call",
                         name="fake.prior",
                         arguments=_rich_json("prior-call"),
+                        provider_call_id="provider-prior-call",
                     ),
                 ),
+                provider_metadata={
+                    "openai_replay_items": [
+                        {
+                            "encrypted_content": "encrypted-reasoning-state",
+                            "id": "reasoning-roundtrip",
+                            "type": "reasoning",
+                        }
+                    ]
+                },
             ),
             CanonicalMessage(
                 agent_id=agent_id,
@@ -188,6 +201,7 @@ def _maximal_snapshot() -> OperationSnapshot:
                 id="call-z",
                 name="fake.read",
                 arguments={"key": "z", "options": _rich_json("call-z")},
+                provider_call_id="provider-call-z",
             ),
             ToolCall(
                 id="call-a",
@@ -442,6 +456,24 @@ async def test_maximal_snapshot_round_trips_through_lookups_and_reopen(
 
     store = await SQLiteOperationStore.open(path)
     try:
+        session_id = snapshot.operation.session_id
+        assert session_id is not None
+        await store.initialize_identity(
+            AgentIdentity(
+                id=snapshot.operation.agent_id,
+                display_name="Round-trip agent",
+                created_at=EARLY,
+            )
+        )
+        await store.create_session(
+            Session(
+                id=session_id,
+                agent_id=snapshot.operation.agent_id,
+                title="Round-trip session",
+                created_at=EARLY,
+                updated_at=EARLY,
+            )
+        )
         created = await store.create(snapshot)
 
         assert created.operation.revision == 1
@@ -449,8 +481,42 @@ async def test_maximal_snapshot_round_trips_through_lookups_and_reopen(
         assert created.committed_events == snapshot.events
         assert await store.load(snapshot.operation.id) == created.operation
         assert await store.load_by_trigger(snapshot.trigger.id) == created.operation
+        transcript = await store.load_session(snapshot.operation.agent_id, session_id)
+        assert transcript is not None
+        assistant = next(
+            message
+            for message in transcript.messages
+            if message.role is MessageRole.ASSISTANT and message.provider_metadata
+        )
+        response = snapshot.model_calls[0].response
+        assert response is not None
+        assert assistant.provider_metadata == response.provider_metadata
     finally:
         await store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT request_json, response_json FROM model_calls "
+            "WHERE operation_id = ? AND id = ?",
+            (snapshot.operation.id, "model-call-z"),
+        ).fetchone()
+        assert row is not None
+        request_data = json.loads(str(row[0]))
+        response_data = json.loads(str(row[1]))
+        request_calls = request_data["messages"][2]["tool_calls"]
+        request_metadata = request_data["messages"][2]["provider_metadata"]
+        response_calls = response_data["tool_calls"]
+        assert request_calls[0]["provider_call_id"] == "provider-prior-call"
+        assert request_metadata["openai_replay_items"][0] == {
+            "encrypted_content": "encrypted-reasoning-state",
+            "id": "reasoning-roundtrip",
+            "type": "reasoning",
+        }
+        assert response_calls[0]["provider_call_id"] == "provider-call-z"
+        assert "provider_call_id" not in response_calls[1]
+    finally:
+        connection.close()
 
     reopened = await SQLiteOperationStore.open(path)
     try:

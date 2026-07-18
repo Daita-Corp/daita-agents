@@ -5,6 +5,7 @@ from decimal import Decimal
 import pytest
 
 from daita._json import FrozenJsonObject, thaw_json
+from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -30,7 +31,12 @@ def test_tool_call_and_definition_are_provider_neutral_and_mutation_isolated() -
         "required": required,
     }
 
-    call = ToolCall(id="call-1", name="fake.read", arguments=arguments)
+    call = ToolCall(
+        id="call-1",
+        name="fake.read",
+        arguments=arguments,
+        provider_call_id="provider-call-91",
+    )
     definition = ToolDefinition(
         name="fake.read",
         description="Read a deterministic value.",
@@ -44,12 +50,48 @@ def test_tool_call_and_definition_are_provider_neutral_and_mutation_isolated() -
         "key": "alpha",
         "options": {"limit": 1},
     }
+    assert call.id == "call-1"
+    assert call.provider_call_id == "provider-call-91"
     assert isinstance(definition.input_schema, FrozenJsonObject)
     assert definition.input_schema.to_dict() == {
         "properties": {"key": {"type": "string"}},
         "required": ["key"],
         "type": "object",
     }
+
+    with pytest.raises(ValueError, match="provider_call_id"):
+        ToolCall(
+            id="call-2",
+            name="fake.read",
+            provider_call_id="   ",
+        )
+
+
+def test_provider_error_taxonomy_is_stable_and_typed() -> None:
+    assert {code.value for code in ProviderErrorCode} == {
+        "authentication_error",
+        "rate_limit_error",
+        "provider_unavailable",
+        "model_not_found",
+        "context_overflow",
+        "invalid_request",
+        "content_blocked",
+        "timeout",
+        "cancelled",
+        "malformed_response",
+    }
+
+    error = ModelProviderError(
+        ProviderErrorCode.RATE_LIMIT_ERROR,
+        "The provider asked the adapter to slow down.",
+    )
+    assert error.code is ProviderErrorCode.RATE_LIMIT_ERROR
+    assert str(error) == "The provider asked the adapter to slow down."
+
+    with pytest.raises(TypeError, match="ProviderErrorCode"):
+        ModelProviderError("rate_limit_error")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="non-empty"):
+        ModelProviderError(ProviderErrorCode.TIMEOUT, " ")
 
 
 def test_canonical_tool_exchange_keeps_operation_and_call_linkage() -> None:
@@ -78,6 +120,44 @@ def test_canonical_tool_exchange_keeps_operation_and_call_linkage() -> None:
     assert result.output.to_dict() == {"value": 42}
 
 
+def test_assistant_provider_metadata_is_immutable_and_role_scoped() -> None:
+    replay_items: list[dict[str, object]] = [
+        {
+            "id": "reasoning-1",
+            "type": "reasoning",
+            "encrypted_content": "encrypted-state",
+        }
+    ]
+    assistant = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="op-1",
+        role=MessageRole.ASSISTANT,
+        content=(TextBlock("Continuing after a tool call."),),
+        provider_metadata={"openai_replay_items": replay_items},
+    )
+    replay_items[0]["encrypted_content"] = "mutated"
+
+    assert isinstance(assistant.provider_metadata, FrozenJsonObject)
+    assert thaw_json(assistant.provider_metadata) == {
+        "openai_replay_items": [
+            {
+                "encrypted_content": "encrypted-state",
+                "id": "reasoning-1",
+                "type": "reasoning",
+            }
+        ]
+    }
+
+    with pytest.raises(ValueError, match="assistant"):
+        CanonicalMessage(
+            agent_id="agent-1",
+            operation_id="op-1",
+            role=MessageRole.USER,
+            content=(TextBlock("hello"),),
+            provider_metadata={"provider": "state"},
+        )
+
+
 def test_message_role_shape_is_strict() -> None:
     call = ToolCall(id="call-1", name="fake.read", arguments={})
 
@@ -103,6 +183,25 @@ def test_message_role_shape_is_strict() -> None:
             agent_id="agent-1",
             operation_id="op-1",
             role=MessageRole.SYSTEM,
+        )
+
+    with pytest.raises(ValueError, match="Duplicate provider tool-call"):
+        CanonicalMessage(
+            agent_id="agent-1",
+            operation_id="op-1",
+            role=MessageRole.ASSISTANT,
+            tool_calls=(
+                ToolCall(
+                    id="call-1",
+                    name="fake.read",
+                    provider_call_id="provider-call-1",
+                ),
+                ToolCall(
+                    id="call-2",
+                    name="fake.read",
+                    provider_call_id="provider-call-1",
+                ),
+            ),
         )
 
 
@@ -168,6 +267,23 @@ def test_response_is_strict_and_preserves_mixed_text_and_ordered_calls() -> None
 
     with pytest.raises(ValueError, match="finish reason"):
         ModelResponse(tool_calls=(first,), finish_reason=FinishReason.STOP)
+
+    with pytest.raises(ValueError, match="Duplicate provider tool-call"):
+        ModelResponse(
+            tool_calls=(
+                ToolCall(
+                    id="call-3",
+                    name="fake.read",
+                    provider_call_id="provider-call-1",
+                ),
+                ToolCall(
+                    id="call-4",
+                    name="fake.read",
+                    provider_call_id="provider-call-1",
+                ),
+            ),
+            finish_reason=FinishReason.TOOL_CALLS,
+        )
 
 
 def test_usage_accounts_exact_decimal_cost_without_float_drift() -> None:

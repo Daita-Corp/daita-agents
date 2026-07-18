@@ -6,16 +6,18 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** stopped after completing P2-08; P2-09 has not started
-- **Last completed task:** P2-08 — isolated agent home, durable sessions, shared
-  writer admission, and the thin embedded `Agent` facade
-- **Current checkpoint:** P2-08 is complete in the local checkpoint containing
-  this ledger; P2-07 remains closed by `bf4bb87`
+- **Active task:** P2-10 — consolidated Phase 2 gate; P2-09 implementation is
+  complete and Phase 3 has not started
+- **Last completed task:** P2-09 — canonical/provider call identity, normalized
+  model errors, and the lazy OpenAI Responses adapter
+- **Current checkpoint:** P2-09 is complete in the local checkpoint containing
+  this ledger; P2-08 remains closed by `f766134`
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** stop per user direction; on a future continuation,
-  begin P2-09 with the provider-call identity and OpenAI adapter inventory
+- **Exact next action:** run the single consolidated P2-10 deterministic,
+  cross-version, static, architecture, root-oracle, and distribution gate;
+  create the exact P2-11 gate commit and pause before Phase 3
 
 ## Development cadence
 
@@ -124,7 +126,7 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-06 | complete | Durable checkpoints, tasks, evidence, observations, readiness, and leases | One loop with new-trigger and checkpoint-aware same-operation resume paths, plus startup recovery that reuses completed work and never rebuilds the plan from the original trigger | Crash/cancel injection at all seven Phase 2 boundaries; at-least-once started model call; terminal task skip; recovered response/evidence/observation/readiness paths do not repeat avoidable I/O | P2-05 |
 | P2-07 | complete | Recovery runtime and persisted governance facts | Immutable risk/policy/task fingerprints, CAS approval records, and one test-owned durable fake side-effect marker with wait, decision-only approval mutation, wake, denial, same-operation resume, and exact-once idempotency | Pre-approval no-I/O, approval mutation no-I/O, exact-fingerprint resume, denial no-I/O, cancellation race with one winner, repeated/concurrent resume marker unchanged, stale holder blocked | P2-06 |
 | P2-08 | complete | SQLite composition, recovery, approvals, committed events | Strict isolated agent home and bootstrap identity manifest, authoritative DB identity, durable sessions/transcripts, shared per-agent writer lock, thin `Agent.create/open/run/inspect/resume`, and embedded composition only | 132 focused public-agent, storage, and architecture cases pass; create/reopen/path/mismatch/concurrency/lock/session isolation/restart and facade boundaries are covered | P2-07 |
-| P2-09 | pending | Persisted embedded fake-capability loop; provider-neutral model contract | Separate canonical/provider call identity, normalized provider errors, lazy optional OpenAI Responses adapter, fake-client contract tests, and one live persisted fake-capability loop | Missing-extra/import isolation; response/tool continuation/error tests; architecture scan forbids provider execution; explicit credential/model live gate | P2-08 |
+| P2-09 | complete | Persisted embedded fake-capability loop; provider-neutral model contract | Separate canonical/provider call identity, normalized provider errors, lazy optional OpenAI Responses adapter, fake-client contract tests, and one live persisted fake-capability loop | Final 44-case provider/model/SQLite/architecture selection and the credential-gated SQLite-backed live loop pass with explicit `gpt-4.1-mini`; encrypted reasoning continuation survives persistence and the provider remains translation-only | P2-08 |
 | P2-10 | pending | Complete Phase 2 vertical slice | Consolidated restart, failure-injection, approval, event, import, architecture, static, cross-version, root-oracle, and clean-build evidence with parity/quality/ADR review | Complete Phase 2 gate suite on Python 3.11/3.12 plus live production-provider evidence; no mock substitutes for live evidence | P2-09 |
 | P2-11 | pending | Passing P2-10 results | Final Phase 2 ledger/evidence and coherent exact gate commit | Scoped diff/hooks; all paths under `next/`; exact `chore(v2-phase-2): complete phase 2 gate` commit | P2-10 |
 
@@ -891,13 +893,40 @@ re-read and an updated ordered ledger.
       the facade contains no model-loop, provider, policy, or executor behavior.
 - [x] The final focused acceptance, affected storage, and architecture selection
       passes 132 cases; broad Phase 2 gates remain deferred to P2-10.
-- [x] P2-09 is deliberately not started.
+- [x] P2-09 was deliberately not started inside the P2-08 checkpoint.
+
+## P2-09 checkpoint record
+
+- [x] `ToolCall.id` remains Daita-owned while an optional persisted
+      `provider_call_id` preserves provider continuation identity without
+      making the canonical loop depend on provider state.
+- [x] Stable provider errors are normalized before the loop boundary; the loop
+      persists only canonical codes and adds no provider-specific retry,
+      fallback, or string parsing.
+- [x] `OpenAIResponsesProvider` lazily imports the optional SDK, sets
+      `store=False`, rebuilds the full canonical transcript, and translates
+      flattened function calls/results without receiving or invoking runtime
+      executors.
+- [x] Provider-owned encrypted reasoning items are requested, frozen as
+      assistant metadata, encoded by the backward-compatible SQLite message
+      codec, restored in session transcripts, and replayed before matching
+      function calls/results after reopen.
+- [x] Fake-client text, tool, multi-call, continuation, usage, malformed,
+      error, cancellation, and actual `generate()` missing-extra cases pass;
+      strict SQLite codecs accept both legacy and current message/call shapes.
+- [x] The actual OpenAI Responses API completed the public embedded
+      SQLite-backed fake-read loop with explicit `gpt-4.1-mini`; close/reopen
+      preserved model calls, task, evidence, observation, events, and the
+      terminal answer.
+- [x] P2-10/P2-11 retain the only broad Phase 2 gate. Phase 3 has not started.
 
 ## Credentials and external dependencies
 
-- Live LLM and external database credentials have not been assumed or tested.
-- PostgreSQL and production-provider live gates are later-phase requirements;
-  unavailable credentials will be recorded without substituting mock results.
+- The P2-09 OpenAI live gate passed on 2026-07-18 using a repository-configured
+  key and explicit `gpt-4.1-mini`; no credential value was logged or persisted.
+- PostgreSQL and other external database/provider gates remain later-phase
+  requirements; unavailable credentials will be recorded without substituting
+  mock results.
 - Phase 0 is designed to complete with deterministic local tests only.
 - The architecture plan is intentionally local and ignored by the root
   `.gitignore`; its fingerprint above anchors the governing version.

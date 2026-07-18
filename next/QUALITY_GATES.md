@@ -441,6 +441,9 @@ refreshed code/test-tree gate and P2-Q02p closes P2-03.
 | P2-Q05i | checkpoint `110596b`, repository root, and clean copies under `/private/tmp` | Final P2-06 dual-interpreter, static, architecture, root-oracle, distribution, and fresh-install gate | PASS — 644 v2 tests in 6.700s/7.178s on CPython 3.11.15/3.12.7; 53 architecture tests; Black 81 files; compilation, focused mypy, and scoped pyright clean; 2,498 root safe tests with 221 deselected; four v1 fixtures reproduce; root diff/symlinks clean; v2/root wheel/sdist counts remain 27/42 and 401/442; fresh Python 3.11/3.12 installs import v2 `2.0.0a0` loop/runtime/SQLite/blob owners from their own site-packages |
 | P2-Q05j | final P2-06 ledger diff | Independent recovery/scope reviews, configured hooks, and local checkpoint | PASS — both closing reviews report GO; exactly `next/STATUS.md` and `next/QUALITY_GATES.md` comprise the final diff; whitespace, EOF, conflict, large-file, and applicable Black hooks pass; the containing local checkpoint closes P2-06 and advances only the ledger to P2-07 |
 | P2-Q05k | `next/` P2-07 approval/governance vertical slice | Focused governance, operation/store, SQLite migration/projection, acceptance, and sole-executor architecture tests plus one targeted safety review | PASS after repair — 573 affected-scope tests pass in 5.36s; the review-found pre-governance crash bypass is closed by an atomic PENDING-to-READY governance commit, PENDING recovery re-enters governance, and a SQLite crash/reopen test proves zero pre-approval I/O; post-fix review GO |
+| P2-Q06a | `next/` P2-08 embedded lifecycle slice | Public Agent acceptance, affected SQLite migration/store, and all architecture tests plus one targeted durability review | PASS after repair — 132 focused cases; cancellation-safe writer admission/bootstrap, v1/symlink/alias rejection, authoritative identity/session linkage, monotonic restart-safe transcripts, and the thin facade pass; review-found lock/bootstrap/session gaps are closed |
+| P2-Q07a | `next/` P2-09 provider-neutral/OpenAI slice | Canonical provider-call identity, strict legacy/current SQLite codecs, normalized error persistence, fake Responses client, optional-import, and provider-ownership tests | PASS after repair — the final 44-case provider/model/SQLite/architecture selection passes; review-required encrypted reasoning-item persistence/replay and actual `generate()` missing-extra behavior are covered, and the generic-loop allowlist remains provider-neutral |
+| P2-Q07b | `next/` | `set -a; source ../.env; set +a; DAITA_OPENAI_MODEL=gpt-4.1-mini ../.venv/bin/python -m pytest tests/acceptance/test_openai_live_persisted_loop.py -m requires_llm -q -s` | PASS — 1 live case, reconfirmed after encrypted reasoning replay was added; the actual Responses API completes the public SQLite-backed fake-read loop and close/reopen preserves canonical/provider call identity, model calls, task, evidence, observation, events, and terminal answer; no mock substituted for this row |
 
 P2-Q03j through P2-Q03n close the refreshed P2-04 code/test-tree, preservation,
 distribution, review, and checkpoint gate.
@@ -458,17 +461,17 @@ after its command and evidence actually exist.
 | P2-Q04 | Tasks, leases, and recovery | Claim races; fencing; expiry; replay-safe reclaim; terminal skip; manual recovery for unknown side effects; all seven crash/cancel checkpoints |
 | P2-Q05 | Governance and fake side effect | Risk facts and decision-only approval mutation; no executor before approval or after denial; same-operation wake/resume; repeated resume changes the marker once |
 | P2-Q06 | Agent, sessions, and embedded mode | PASS — 132 focused public-agent, affected storage, and architecture cases cover isolated create/open identity, cancellation-safe shared writer admission/bootstrap, no-alias/no-follow paths, authoritative DB/manifest/session linkage, monotonic restart-safe transcripts, sessionless/session isolation, and the thin-facade boundary |
-| P2-Q07 | OpenAI adapter and live loop | Lazy optional import; fake Responses client contracts; provider call-ID continuation; normalized errors; provider cannot execute; explicit live model completes persisted fake loop |
+| P2-Q07 | OpenAI adapter and live loop | PASS — lazy optional import, fake Responses client contracts, provider call-ID and encrypted-reasoning continuation, normalized errors, execution-ownership scan, and explicit live `gpt-4.1-mini` persisted fake loop all pass |
 | P2-Q08 | Phase gate | Full Python 3.11/3.12 suite; static/architecture/import/root-oracle/build scans; parity/ADR/ledger review; scoped hooks and exact Phase 2 gate commit |
 
-The production-provider row remains NOT RUN until an actual API key and an
-explicit test model are available. A skip or mock trajectory cannot close the
-Phase 2 gate.
+The production-provider row is satisfied by P2-Q07b. The consolidated P2-Q08
+gate remains pending until its full deterministic, cross-version, static,
+architecture, root-oracle, distribution, and ledger checks run.
 
 ## Live and external gates
 
 - Phase 0 requires no live provider or external database.
-- Production-model, PostgreSQL, and other live checks are **NOT RUN** and will
-  be recorded in their owning later phases.
-- No credential presence is inferred from local environment files, and no
-  mock result will satisfy a live gate.
+- The Phase 2 production-model gate passed with an explicit model and actual
+  OpenAI API call; the credential value was neither printed nor persisted.
+- PostgreSQL and other later-phase live checks remain **NOT RUN** until their
+  owning phases. No mock result will satisfy those gates.

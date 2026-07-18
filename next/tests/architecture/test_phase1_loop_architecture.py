@@ -209,6 +209,7 @@ def test_generic_loop_imports_contracts_not_domain_or_provider_implementations()
         "__future__",
         "asyncio",
         "collections.abc",
+        "llm.errors",
         "llm.models",
         "llm.protocols",
         "models",
