@@ -187,7 +187,11 @@ async def test_migration_three_backfills_agent_sequences_in_rowid_order(
     finally:
         connection.close()
 
-    upgraded = await SQLiteOperationStore.open(path)
+    upgraded = await sqlite_owner._open_with_migrations(
+        path,
+        migrations=sqlite_owner._MIGRATIONS[:3],
+        verify_owned_schema=True,
+    )
     await upgraded.close()
 
     backup_path = path.with_name(f"{path.name}.before-v2.bak")

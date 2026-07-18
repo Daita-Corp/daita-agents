@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 
+from daita.storage import sqlite as sqlite_owner
 from daita.events.models import RuntimeEvent
 from daita.llm.models import (
     CanonicalMessage,
@@ -343,7 +344,7 @@ async def test_public_open_rejects_lifecycle_schema_drift_with_valid_history(
     try:
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,)]
+        ).fetchall() == [(migration.version,) for migration in sqlite_owner._MIGRATIONS]
     finally:
         connection.close()
 

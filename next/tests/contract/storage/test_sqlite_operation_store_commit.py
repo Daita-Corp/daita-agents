@@ -60,6 +60,8 @@ NORMALIZED_TABLES = (
     "model_calls",
     "readiness",
     "tasks",
+    "task_dependencies",
+    "task_leases",
     "evidence",
     "task_evidence",
     "observations",

@@ -20,6 +20,7 @@ import sqlite3
 from typing import TypeVar
 
 from .._json import canonical_json
+from ..capabilities import AccessMode, RiskLevel
 from ..events.models import CommittedEvent, EventCursor, RuntimeEvent
 from ..events.protocols import (
     EventCursorMismatchError,
@@ -43,6 +44,7 @@ from ..operations.checkpoints import (
     ModelCallStatus,
     OperationSnapshot,
 )
+from ..operations.leases import TaskLease
 from ..operations.models import (
     AgentTrigger,
     Evidence,
@@ -50,6 +52,8 @@ from ..operations.models import (
     Operation,
     OperationStatus,
     Task,
+    TaskDependency,
+    TaskExecutionFacts,
     TaskStatus,
     TriggerKind,
 )
@@ -472,9 +476,282 @@ _COMMITTED_EVENT_SCHEMA_SQL = (
 )
 
 
+_FENCED_TASK_EXECUTION_SCHEMA_SQL = (
+    """
+    ALTER TABLE tasks ADD COLUMN capability_fingerprint TEXT NOT NULL
+        DEFAULT 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
+        CHECK (
+            length(capability_fingerprint) = 71
+            AND substr(capability_fingerprint, 1, 7) = 'sha256:'
+            AND substr(capability_fingerprint, 8) NOT GLOB '*[^0-9a-f]*'
+        )
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN arguments_hash TEXT NOT NULL
+        DEFAULT 'sha256:0000000000000000000000000000000000000000000000000000000000000000'
+        CHECK (
+            length(arguments_hash) = 71
+            AND substr(arguments_hash, 1, 7) = 'sha256:'
+            AND substr(arguments_hash, 8) NOT GLOB '*[^0-9a-f]*'
+        )
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'write'
+        CHECK (access_mode IN ('read', 'write'))
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN risk TEXT NOT NULL DEFAULT 'high'
+        CHECK (risk IN ('low', 'medium', 'high'))
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN side_effecting INTEGER NOT NULL DEFAULT 1
+        CHECK (side_effecting IN (0, 1))
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN idempotent INTEGER NOT NULL DEFAULT 0
+        CHECK (idempotent IN (0, 1))
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN replay_safe INTEGER NOT NULL DEFAULT 0
+        CHECK (replay_safe IN (0, 1))
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN idempotency_key TEXT
+        CHECK (
+            (idempotency_key IS NULL OR length(trim(idempotency_key)) > 0)
+            AND (access_mode != 'read' OR side_effecting = 0)
+            AND (replay_safe = 0 OR idempotent = 1)
+            AND (
+                idempotency_key IS NULL
+                OR (side_effecting = 1 AND idempotent = 1)
+            )
+            AND (
+                side_effecting = 0
+                OR replay_safe = 0
+                OR idempotency_key IS NOT NULL
+            )
+        )
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN manual_recovery_reason TEXT
+        CHECK (
+            (
+                status = 'manual_recovery_required'
+                AND manual_recovery_reason IS NOT NULL
+                AND length(trim(manual_recovery_reason)) > 0
+            )
+            OR (
+                status != 'manual_recovery_required'
+                AND manual_recovery_reason IS NULL
+            )
+        )
+    """.strip(),
+    """
+    CREATE TABLE task_dependencies (
+        operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        task_id TEXT NOT NULL,
+        prerequisite_task_id TEXT NOT NULL,
+        PRIMARY KEY (operation_id, position),
+        UNIQUE (operation_id, task_id, prerequisite_task_id),
+        CHECK (task_id != prerequisite_task_id),
+        FOREIGN KEY (operation_id, task_id)
+            REFERENCES tasks(operation_id, id) ON DELETE CASCADE,
+        FOREIGN KEY (operation_id, prerequisite_task_id)
+            REFERENCES tasks(operation_id, id) ON DELETE CASCADE
+    )
+    """.strip(),
+    """
+    CREATE INDEX task_dependencies_task_idx
+        ON task_dependencies(operation_id, task_id, position)
+    """.strip(),
+    """
+    CREATE INDEX task_dependencies_prerequisite_idx
+        ON task_dependencies(operation_id, prerequisite_task_id, position)
+    """.strip(),
+    """
+    CREATE TRIGGER task_dependencies_reject_update
+    BEFORE UPDATE ON task_dependencies
+    BEGIN
+        SELECT RAISE(ABORT, 'task dependencies are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER task_dependencies_reject_delete
+    BEFORE DELETE ON task_dependencies
+    BEGIN
+        SELECT RAISE(ABORT, 'task dependencies are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TABLE task_leases (
+        operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        task_id TEXT NOT NULL,
+        attempt INTEGER NOT NULL CHECK (attempt >= 1),
+        fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+        holder_id TEXT NOT NULL CHECK (length(trim(holder_id)) > 0),
+        acquired_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        started_at TEXT,
+        renewed_at TEXT,
+        released_at TEXT,
+        release_reason TEXT,
+        PRIMARY KEY (operation_id, position),
+        UNIQUE (operation_id, task_id, attempt),
+        CHECK (expires_at > acquired_at),
+        CHECK (
+            started_at IS NULL
+            OR (started_at >= acquired_at AND started_at < expires_at)
+        ),
+        CHECK (
+            renewed_at IS NULL
+            OR (renewed_at >= acquired_at AND renewed_at < expires_at)
+        ),
+        CHECK (
+            (released_at IS NULL AND release_reason IS NULL)
+            OR (
+                released_at IS NOT NULL
+                AND release_reason IS NOT NULL
+                AND length(trim(release_reason)) > 0
+                AND released_at >= acquired_at
+                AND (started_at IS NULL OR released_at >= started_at)
+                AND (renewed_at IS NULL OR released_at >= renewed_at)
+            )
+        ),
+        FOREIGN KEY (operation_id, task_id)
+            REFERENCES tasks(operation_id, id) ON DELETE CASCADE
+    )
+    """.strip(),
+    """
+    CREATE UNIQUE INDEX task_leases_task_fence_idx
+        ON task_leases(operation_id, task_id, fencing_token)
+    """.strip(),
+    """
+    CREATE UNIQUE INDEX task_leases_one_unreleased_idx
+        ON task_leases(operation_id, task_id)
+        WHERE released_at IS NULL
+    """.strip(),
+    """
+    CREATE TRIGGER task_leases_reject_identity_update
+    BEFORE UPDATE ON task_leases
+    WHEN NEW.operation_id != OLD.operation_id
+        OR NEW.position != OLD.position
+        OR NEW.task_id != OLD.task_id
+        OR NEW.attempt != OLD.attempt
+        OR NEW.fencing_token != OLD.fencing_token
+        OR NEW.holder_id != OLD.holder_id
+        OR NEW.acquired_at != OLD.acquired_at
+    BEGIN
+        SELECT RAISE(ABORT, 'task lease identity is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER task_leases_reject_released_update
+    BEFORE UPDATE ON task_leases
+    WHEN OLD.released_at IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'released task lease is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER task_leases_reject_delete
+    BEFORE DELETE ON task_leases
+    BEGIN
+        SELECT RAISE(ABORT, 'task lease history is append-only');
+    END
+    """.strip(),
+    """
+    INSERT INTO runtime_events(
+        id, operation_id, position, type, agent_id, agent_sequence, created_at,
+        session_id, turn_id, model_call_id, call_id, task_id, evidence_id,
+        capability_id, executor_id, payload_json
+    )
+    WITH legacy_running AS (
+        SELECT
+            task.id AS task_id,
+            task.operation_id,
+            task.position AS task_position,
+            task.turn_id,
+            task.call_id,
+            task.capability_id,
+            task.executor_id,
+            task.updated_at,
+            operation.agent_id,
+            operation.session_id,
+            turn.model_response_id,
+            COALESCE((
+                SELECT MAX(existing.position) + 1
+                FROM runtime_events AS existing
+                WHERE existing.operation_id = task.operation_id
+            ), 0) AS operation_event_base,
+            COALESCE((
+                SELECT MAX(existing.agent_sequence)
+                FROM runtime_events AS existing
+                WHERE existing.agent_id = operation.agent_id
+            ), 0) AS agent_event_base,
+            ROW_NUMBER() OVER (
+                PARTITION BY task.operation_id ORDER BY task.position
+            ) - 1 AS operation_event_offset,
+            ROW_NUMBER() OVER (
+                PARTITION BY operation.agent_id
+                ORDER BY task.operation_id, task.position
+            ) AS agent_event_offset
+        FROM tasks AS task
+        JOIN operations AS operation ON operation.id = task.operation_id
+        JOIN turns AS turn
+            ON turn.operation_id = task.operation_id
+            AND turn.id = task.turn_id
+        WHERE task.status = 'running'
+    )
+    SELECT
+        'daita:v2:migration:4:manual-recovery:'
+            || lower(hex(CAST(operation_id AS BLOB)))
+            || ':'
+            || lower(hex(CAST(task_id AS BLOB))),
+        operation_id,
+        operation_event_base + operation_event_offset,
+        'task.manual_recovery_required',
+        agent_id,
+        agent_event_base + agent_event_offset,
+        updated_at,
+        session_id,
+        turn_id,
+        model_response_id,
+        call_id,
+        task_id,
+        NULL,
+        capability_id,
+        executor_id,
+        '{"from_status":"running","reason":"legacy_running_task_missing_lease","to_status":"manual_recovery_required"}'
+    FROM legacy_running
+    ORDER BY agent_id, agent_event_offset
+    """.strip(),
+    """
+    UPDATE operations
+    SET revision = revision + 1
+    WHERE EXISTS (
+        SELECT 1
+        FROM tasks AS task
+        WHERE task.operation_id = operations.id
+            AND task.status = 'running'
+    )
+    """.strip(),
+    """
+    UPDATE tasks
+    SET
+        status = 'manual_recovery_required',
+        manual_recovery_reason = 'legacy_running_task_missing_lease'
+    WHERE status = 'running'
+    """.strip(),
+)
+
+
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
 # Migration 3 assigns one append-only committed-event sequence per agent.
+# Migration 4 persists immutable execution-safety facts, dependency edges, and
+# fenced lease history. Legacy in-flight work is failed closed during upgrade.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -490,6 +767,11 @@ _MIGRATIONS = (
         version=3,
         name="project_committed_event_cursors",
         statements=_COMMITTED_EVENT_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=4,
+        name="normalize_fenced_task_execution",
+        statements=_FENCED_TASK_EXECUTION_SCHEMA_SQL,
     ),
 )
 
@@ -1531,13 +1813,14 @@ def _apply_commit_delta(
     ):
         task_update = connection.execute(
             "UPDATE tasks SET status = ?, updated_at = ?, error_code = ?, "
-            "cancellation_requested = ? WHERE operation_id = ? AND position = ? "
-            "AND id = ?",
+            "cancellation_requested = ?, manual_recovery_reason = ? "
+            "WHERE operation_id = ? AND position = ? AND id = ?",
             (
                 task_after.status.value,
                 _encode_datetime(task_after.updated_at),
                 task_after.error_code,
                 int(task_after.cancellation_requested),
+                task_after.manual_recovery_reason,
                 operation_id,
                 position,
                 task_before.id,
@@ -1546,6 +1829,17 @@ def _apply_commit_delta(
         _require_one_row(task_update.rowcount, "task", task_before.id)
     for position in range(len(current.tasks), len(candidate.tasks)):
         _insert_task(connection, operation_id, position, candidate.tasks[position])
+
+    for position in range(
+        len(current.task_dependencies),
+        len(candidate.task_dependencies),
+    ):
+        _insert_task_dependency(
+            connection,
+            operation_id,
+            position,
+            candidate.task_dependencies[position],
+        )
 
     for position in range(len(current.evidence), len(candidate.evidence)):
         _insert_evidence(
@@ -1714,6 +2008,20 @@ def _insert_snapshot(
         _insert_readiness(connection, operation.id, position, readiness)
     for position, task in enumerate(snapshot.tasks):
         _insert_task(connection, operation.id, position, task)
+    for position, dependency in enumerate(snapshot.task_dependencies):
+        _insert_task_dependency(
+            connection,
+            operation.id,
+            position,
+            dependency,
+        )
+    for position, lease in enumerate(snapshot.task_leases):
+        _insert_task_lease(
+            connection,
+            operation.id,
+            position,
+            lease,
+        )
     for position, evidence in enumerate(snapshot.evidence):
         _insert_evidence(connection, operation.id, position, evidence)
     for task in snapshot.tasks:
@@ -1820,8 +2128,11 @@ def _insert_task(
         "INSERT INTO tasks("
         "operation_id, position, id, turn_id, call_id, capability_id, "
         "executor_id, status, attempt, arguments_json, created_at, updated_at, "
-        "error_code, cancellation_requested"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "error_code, cancellation_requested, capability_fingerprint, "
+        "arguments_hash, access_mode, risk, side_effecting, idempotent, "
+        "replay_safe, idempotency_key, manual_recovery_reason"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "?, ?, ?, ?)",
         (
             operation_id,
             position,
@@ -1837,6 +2148,63 @@ def _insert_task(
             _encode_datetime(task.updated_at),
             task.error_code,
             int(task.cancellation_requested),
+            task.execution_facts.capability_fingerprint,
+            task.execution_facts.arguments_hash,
+            task.execution_facts.access_mode.value,
+            task.execution_facts.risk.value,
+            int(task.execution_facts.side_effecting),
+            int(task.execution_facts.idempotent),
+            int(task.execution_facts.replay_safe),
+            task.execution_facts.idempotency_key,
+            task.manual_recovery_reason,
+        ),
+    )
+
+
+def _insert_task_dependency(
+    connection: sqlite3.Connection,
+    operation_id: str,
+    position: int,
+    dependency: TaskDependency,
+) -> None:
+    connection.execute(
+        "INSERT INTO task_dependencies("
+        "operation_id, position, task_id, prerequisite_task_id"
+        ") VALUES (?, ?, ?, ?)",
+        (
+            operation_id,
+            position,
+            dependency.task_id,
+            dependency.prerequisite_task_id,
+        ),
+    )
+
+
+def _insert_task_lease(
+    connection: sqlite3.Connection,
+    operation_id: str,
+    position: int,
+    lease: TaskLease,
+) -> None:
+    connection.execute(
+        "INSERT INTO task_leases("
+        "operation_id, position, task_id, attempt, fencing_token, holder_id, "
+        "acquired_at, expires_at, started_at, renewed_at, released_at, "
+        "release_reason"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            operation_id,
+            position,
+            lease.task_id,
+            lease.attempt,
+            lease.fencing_token,
+            lease.holder_id,
+            _encode_datetime(lease.acquired_at),
+            _encode_datetime(lease.expires_at),
+            _encode_optional_datetime(lease.started_at),
+            _encode_optional_datetime(lease.renewed_at),
+            _encode_optional_datetime(lease.released_at),
+            lease.release_reason,
         ),
     )
 
@@ -2202,6 +2570,12 @@ def _decode_snapshot(
     model_call_rows = _operation_rows(connection, "model_calls", operation_id)
     readiness_rows = _operation_rows(connection, "readiness", operation_id)
     task_rows = _operation_rows(connection, "tasks", operation_id)
+    task_dependency_rows = _operation_rows(
+        connection,
+        "task_dependencies",
+        operation_id,
+    )
+    task_lease_rows = _operation_rows(connection, "task_leases", operation_id)
     evidence_rows = _operation_rows(connection, "evidence", operation_id)
     observation_rows = _operation_rows(connection, "observations", operation_id)
     event_rows = _operation_rows(connection, "runtime_events", operation_id)
@@ -2280,6 +2654,24 @@ def _decode_snapshot(
             updated_at=_decode_datetime(
                 _sqlite_text(row["updated_at"], "task updated_at")
             ),
+            execution_facts=TaskExecutionFacts(
+                capability_fingerprint=_sqlite_text(
+                    row["capability_fingerprint"],
+                    "task capability fingerprint",
+                ),
+                arguments_hash=_sqlite_text(
+                    row["arguments_hash"],
+                    "task arguments hash",
+                ),
+                access_mode=AccessMode(
+                    _sqlite_text(row["access_mode"], "task access mode")
+                ),
+                risk=RiskLevel(_sqlite_text(row["risk"], "task risk")),
+                side_effecting=_decode_bool(row["side_effecting"]),
+                idempotent=_decode_bool(row["idempotent"]),
+                replay_safe=_decode_bool(row["replay_safe"]),
+                idempotency_key=_optional_text(row["idempotency_key"]),
+            ),
             evidence_ids=_load_task_evidence_ids(
                 connection,
                 operation_id,
@@ -2287,8 +2679,52 @@ def _decode_snapshot(
             ),
             error_code=_optional_text(row["error_code"]),
             cancellation_requested=_decode_bool(row["cancellation_requested"]),
+            manual_recovery_reason=_optional_text(row["manual_recovery_reason"]),
         )
         for row in task_rows
+    )
+    task_dependencies = tuple(
+        TaskDependency(
+            operation_id=operation_id,
+            task_id=_sqlite_text(row["task_id"], "task dependency task id"),
+            prerequisite_task_id=_sqlite_text(
+                row["prerequisite_task_id"],
+                "task dependency prerequisite id",
+            ),
+        )
+        for row in task_dependency_rows
+    )
+    task_leases = tuple(
+        TaskLease(
+            operation_id=operation_id,
+            task_id=_sqlite_text(row["task_id"], "task lease task id"),
+            attempt=_sqlite_int(row["attempt"], "task lease attempt"),
+            fencing_token=_sqlite_int(
+                row["fencing_token"],
+                "task lease fencing token",
+            ),
+            holder_id=_sqlite_text(row["holder_id"], "task lease holder id"),
+            acquired_at=_decode_datetime(
+                _sqlite_text(row["acquired_at"], "task lease acquired_at")
+            ),
+            expires_at=_decode_datetime(
+                _sqlite_text(row["expires_at"], "task lease expires_at")
+            ),
+            started_at=_decode_optional_datetime(
+                row["started_at"],
+                "task lease started_at",
+            ),
+            renewed_at=_decode_optional_datetime(
+                row["renewed_at"],
+                "task lease renewed_at",
+            ),
+            released_at=_decode_optional_datetime(
+                row["released_at"],
+                "task lease released_at",
+            ),
+            release_reason=_optional_text(row["release_reason"]),
+        )
+        for row in task_lease_rows
     )
     evidence = tuple(
         Evidence(
@@ -2344,6 +2780,8 @@ def _decode_snapshot(
         model_calls=model_calls,
         readiness=readiness,
         tasks=tasks,
+        task_dependencies=task_dependencies,
+        task_leases=task_leases,
         evidence=evidence,
         observations=observations,
         events=events,
@@ -2360,6 +2798,8 @@ def _operation_rows(
         "model_calls",
         "readiness",
         "tasks",
+        "task_dependencies",
+        "task_leases",
         "evidence",
         "observations",
         "runtime_events",
@@ -2450,6 +2890,10 @@ def _encode_datetime(value: datetime) -> str:
     )
 
 
+def _encode_optional_datetime(value: datetime | None) -> str | None:
+    return None if value is None else _encode_datetime(value)
+
+
 def _decode_datetime(value: str) -> datetime:
     if not isinstance(value, str):
         raise TypeError("persisted datetime must be text")
@@ -2459,6 +2903,12 @@ def _decode_datetime(value: str) -> datetime:
     if _encode_datetime(decoded) != value:
         raise ValueError("persisted datetime is not in canonical UTC form")
     return decoded
+
+
+def _decode_optional_datetime(value: object, label: str) -> datetime | None:
+    if value is None:
+        return None
+    return _decode_datetime(_sqlite_text(value, label))
 
 
 def _encode_decimal(value: Decimal) -> str:

@@ -49,6 +49,8 @@ NORMALIZED_LIFECYCLE_TABLES = {
     "model_calls",
     "readiness",
     "tasks",
+    "task_dependencies",
+    "task_leases",
     "task_evidence",
     "evidence",
     "observations",

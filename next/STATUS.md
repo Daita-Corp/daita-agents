@@ -9,17 +9,17 @@ project. Update it before and after every material task.
 - **Active task:** P2-05 — define and implement persisted task execution,
   durable fenced leases, and fail-closed recovery facts at the sole executor
   boundary
-- **Last completed task:** P2-05b — portable task execution-safety,
-  dependency, lease, fencing-guard, and repository contracts
-- **Current checkpoint:** P2-05 planning checkpoint `1eb4c18`
-  (`docs(v2): plan fenced task execution`)
+- **Last completed task:** P2-05c — Migration 4 plus exact SQLite task,
+  dependency, and fenced-lease projection
+- **Current checkpoint:** P2-05b portable-contract checkpoint `27586c9`
+  (`feat(v2): define fenced task contracts`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** author and run P2-05c's expected-red Migration 4 and
-  SQLite projection tests for conservative v3 task backfill, normalized
-  dependency/lease rows, strict codecs, transactional fenced operations, and
-  rollback/reopen behavior before editing the concrete adapter
+- **Exact next action:** author and run P2-05d's expected-red authoritative
+  store-clock, bounded lease, readiness, one-winner claim, renewal, expiry,
+  replay-safe reclaim, and terminal/nonclaimable tests before adding the
+  concrete `TaskExecutionStore` methods to the existing SQLite adapter
 
 ## Mandatory architecture re-read
 
@@ -139,8 +139,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | --- | --- | --- | --- |
 | P2-05a | complete | Read-only task/execution/lease ownership inventory and locked test-first sequence | Existing aggregate, SQLite, runtime, capability replay facts, v1 behavioral oracles, exact deferrals, and no second executor/runtime/recovery owner are recorded before production edits |
 | P2-05b | complete | Canonical task execution-safety, dependency, attempt, and fenced-lease records plus narrow repository contracts | Full task vocabulary and legal transitions; immutable capability/executor/input/idempotency facts; positive fencing tokens; lease chronology; typed claim/stale/terminal outcomes; no database types in portable records |
-| P2-05c | active | Migration 4 and SQLite task/dependency/lease projection | Existing tasks backfill coherently; dependencies and leases normalize; materialize/claim/renew/release/terminal commits are transactional; migration rollback/reopen/strict-codec tests pass |
-| P2-05d | pending | Durable materialize/readiness and fenced claim lifecycle | Task persists before claim; dependencies reuse terminal success; two claimers have one winner; expiry permits only declared replay-safe reclaim; terminal/cancelled/manual-recovery tasks never claim |
+| P2-05c | complete | Migration 4 and SQLite task/dependency/lease projection | Existing tasks backfill coherently; dependencies and leases normalize; exact create/commit/reopen projection, fail-closed legacy recovery, migration rollback, strict codecs, and schema-integrity tests pass |
+| P2-05d | active | Durable materialize/readiness and fenced claim lifecycle | Task persists before claim; dependencies reuse terminal success; two claimers have one winner; expiry permits only declared replay-safe reclaim; terminal/cancelled/manual-recovery tasks never claim |
 | P2-05e | pending | Split operation-runtime materialize → claim → execute → validate → commit path | The sole existing runtime invokes the executor only with a live fence; stale holders commit no evidence/task/event; task/evidence/event success is atomic; timeouts/cancellation retain truthful durable intent |
 | P2-05f | pending | Fail-closed execution recovery and blob-backed evidence linkage | Replay-safe reads may resume after expiry; side-effecting unknown outcomes become manual recovery unless persisted idempotency proves safe; durable blob references precede evidence acceptance; terminal work is skipped |
 | P2-05g | pending | Representative review before broader restart wiring | One read and one test-owned side-effect classification are independently reviewed; P2-06 retains startup/loop resume, and P2-07 retains real approval decision/wake behavior |
@@ -329,6 +329,19 @@ event. The same repository exposes narrow renew, fenced-checkpoint, and
 expired-attempt recovery operations; it does not expose a free-standing event
 append path.
 
+Migration 4 now extends that single SQLite owner with explicit execution-fact
+columns plus normalized, operation-scoped dependency and lease rows. Global
+tuple order is persisted by contiguous positions; composite foreign keys,
+unique attempts/fences, one unreleased lease, append-only history, immutable
+lease identity, and released-lease immutability are enforced at the database
+boundary and revalidated by canonical reconstruction. A v3 `running` task has
+an unknowable external outcome, so upgrade atomically applies conservative
+zero-hash/WRITE/HIGH/nonreplayable facts, transitions it to manual recovery,
+appends a fully correlated event with operation/agent positions allocated from
+durable maxima, and increments each affected operation once. P2-05c adds no
+claim/renew/recovery DML method; authoritative time and one-winner lifecycle
+semantics remain P2-05d work at this same transaction boundary.
+
 Ordinary optimistic commits may materialize tasks, evaluate dependencies, or
 set monotonic cancellation intent, but they may not start or terminalize an
 actively leased task, mutate lease history, or accept its evidence. Fenced
@@ -488,6 +501,10 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-05b portable task/lease/store contract | PASS — 91 focused cases and all 463 v2 tests pass; exact task vocabulary, canonical-argument-bound materialization facts and capability fingerprints, dependency DAG integrity, nonoverlapping lease chronology, correlated claim results, portable claim/guard/error shapes, and the sole existing runtime owner are covered |
 | P2-05b independent safety audit | PASS after repair — two reviewers found generic commit could still advance an actively leased task, lease attempts could overlap, argument hashes were not bound to task arguments, claim results lacked aggregate correlation, and dependencies could be added after readiness; regressions now close each bypass, while authoritative store time/event construction remains explicitly owned by P2-05d |
 | P2-05b static and architecture gate | PASS — Black clean across 71 files; byte compilation succeeds; mypy is clean across 70 source files; pyright 1.1.411 reports 0 errors/warnings; the complete suite includes all architecture tests |
+| Initial P2-05c Migration 4/projection contract | EXPECTED RED — the architecture slice passed 6/7 with only Migration 4 absent, the migration slice failed 3/3 at the missing fixed version/name/upgrade boundary, and the projection slice passed 1/19 with the other 18 failures confined to absent task facts, dependency/lease tables, and codecs; there were no collection errors |
+| P2-05c Migration 4 and exact projection | PASS — 5 migration, 34 projection, and 7 ownership checks pass; v3 tasks backfill to zero-hash/WRITE/HIGH/side-effecting/nonreplayable facts, legacy RUNNING work becomes correlated manual recovery with one revision bump, and exact v3 backup/rollback/reopen plus shared-agent multi-operation allocation behavior is proven |
+| P2-05c adversarial persistence review | PASS after test-harness and integrity hardening — independent reviewers preserved composite operation/task foreign keys, the unique one-active-lease index, immutable acquisition identity, and released-lease immutability instead of weakening SQLite to inject corruption; added regressions cover interleaved global lease order, multiple prerequisites, dependency/task suffixes, unique attempt/fence, cross-operation rows, history rewrites, lifecycle updates, cycle/gap/overlap corruption, and nontrivial recovery event/revision allocation |
+| P2-05c complete dual-interpreter and static gate | PASS — all 509 v2 tests pass on CPython 3.11.15 and 3.12.7; all 45 architecture tests pass; Black is clean across 72 files, byte compilation succeeds, mypy is clean across 72 files, pyright 1.1.411 reports 0 errors/warnings, `git diff --check` is clean, and root `daita/` has no diff |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
