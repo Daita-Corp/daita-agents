@@ -26,6 +26,7 @@ from ..events.protocols import (
     EventCursorMismatchError,
     EventCursorNotFoundError,
 )
+from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -80,6 +81,11 @@ from ..operations.store import (
     _require_revision,
     _validate_commit_candidate,
     _validate_new_checkpoint,
+)
+from ..sessions import (
+    Session,
+    SessionAlreadyExistsError,
+    SessionTranscript,
 )
 
 DAITA_V2_APPLICATION_ID = 0x44414932  # ASCII ``DAI2``.
@@ -967,6 +973,42 @@ _APPROVAL_SCHEMA_SQL = (
     """.strip(),
 )
 
+_AGENT_SESSION_SCHEMA_SQL = (
+    """
+    CREATE TABLE agents (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        id TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        state_schema_generation INTEGER NOT NULL CHECK (
+            state_schema_generation = 2
+        )
+    )
+    """.strip(),
+    """
+    CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (agent_id) REFERENCES agents(id)
+    )
+    """.strip(),
+    """
+    CREATE TABLE session_operations (
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        position INTEGER NOT NULL CHECK (position >= 0),
+        operation_id TEXT NOT NULL UNIQUE REFERENCES operations(id),
+        PRIMARY KEY (session_id, position)
+    )
+    """.strip(),
+    """
+    CREATE INDEX operations_agent_session_created_idx
+        ON operations(agent_id, session_id, created_at, id)
+    """.strip(),
+)
+
 
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
@@ -978,6 +1020,9 @@ _APPROVAL_SCHEMA_SQL = (
 # Migration 6 normalizes exact approval decisions and correlates their events.
 # Legacy approval-waiting tasks have no exact fingerprints, so upgrade fails
 # them closed into manual recovery rather than synthesizing authority.
+# Migration 7 adds the authoritative per-home agent identity and durable session
+# directory. Canonical transcript content remains operation-owned and is read
+# from the already-normalized trigger/model/observation rows.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -1008,6 +1053,11 @@ _MIGRATIONS = (
         version=6,
         name="normalize_approval_lifecycle",
         statements=_APPROVAL_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=7,
+        name="add_agent_identity_and_sessions",
+        statements=_AGENT_SESSION_SCHEMA_SQL,
     ),
 )
 
@@ -1094,6 +1144,46 @@ class SQLiteOperationStore:
         if cancellation_requested:
             raise asyncio.CancelledError
         return foundation
+
+    async def initialize_identity(self, identity: AgentIdentity) -> AgentIdentity:
+        """Create or verify the one authoritative identity for this database."""
+
+        if not isinstance(identity, AgentIdentity):
+            raise TypeError("identity must be an AgentIdentity record")
+        return await self._run_connection(
+            lambda connection: _initialize_agent_identity(connection, identity)
+        )
+
+    async def load_identity(self) -> AgentIdentity | None:
+        """Load the authoritative database identity, if initialized."""
+
+        return await self._run_connection(_load_agent_identity)
+
+    async def create_session(self, session: Session) -> Session:
+        """Persist one stable session identity before its first operation."""
+
+        if not isinstance(session, Session):
+            raise TypeError("session must be a Session record")
+        return await self._run_connection(
+            lambda connection: _create_session(connection, session)
+        )
+
+    async def load_session(
+        self,
+        agent_id: str,
+        session_id: str,
+    ) -> SessionTranscript | None:
+        """Load one restart-safe provider-neutral session transcript."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(session_id, "session_id")
+        return await self._run_connection(
+            lambda connection: _load_session_transcript(
+                connection,
+                agent_id,
+                session_id,
+            )
+        )
 
     async def create(self, snapshot: OperationSnapshot) -> CommitResult:
         """Atomically claim an operation/trigger and persist every lifecycle row."""
@@ -1958,6 +2048,218 @@ def _user_tables(connection: sqlite3.Connection) -> set[str]:
     return {_sqlite_text(row[0], "schema table name") for row in rows}
 
 
+def _initialize_agent_identity(
+    connection: sqlite3.Connection,
+    identity: AgentIdentity,
+) -> AgentIdentity:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        current = _load_agent_identity(connection)
+        if current is None:
+            connection.execute(
+                "INSERT INTO agents(singleton, id, display_name, created_at, "
+                "state_schema_generation) VALUES (1, ?, ?, ?, ?)",
+                (
+                    identity.id,
+                    identity.display_name,
+                    _encode_datetime(identity.created_at),
+                    identity.state_schema_generation,
+                ),
+            )
+            current = identity
+        elif current != identity:
+            raise AgentIdentityConflictError(
+                "SQLite database already belongs to a different agent identity"
+            )
+        connection.execute("COMMIT")
+        return current
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_agent_identity(connection: sqlite3.Connection) -> AgentIdentity | None:
+    rows = connection.execute(
+        "SELECT id, display_name, created_at, state_schema_generation "
+        "FROM agents ORDER BY singleton"
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise SQLiteCorruptionError("agent database must contain exactly one identity")
+    row = rows[0]
+    try:
+        return AgentIdentity(
+            id=_sqlite_text(row["id"], "agent id"),
+            display_name=_sqlite_text(row["display_name"], "agent display name"),
+            created_at=_decode_datetime(
+                _sqlite_text(row["created_at"], "agent created_at")
+            ),
+            state_schema_generation=_sqlite_int(
+                row["state_schema_generation"],
+                "agent state schema generation",
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise SQLiteCorruptionError(
+            "cannot reconstruct authoritative agent identity"
+        ) from error
+
+
+def _create_session(connection: sqlite3.Connection, session: Session) -> Session:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != session.agent_id:
+            raise AgentIdentityConflictError(
+                "session agent does not match the authoritative database identity"
+            )
+        try:
+            connection.execute(
+                "INSERT INTO sessions(id, agent_id, title, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    session.id,
+                    session.agent_id,
+                    session.title,
+                    _encode_datetime(session.created_at),
+                    _encode_datetime(session.updated_at),
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise SessionAlreadyExistsError(
+                f"session already exists: {session.id}"
+            ) from error
+        connection.execute("COMMIT")
+        return session
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_session_transcript(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    session_id: str,
+) -> SessionTranscript | None:
+    connection.execute("BEGIN")
+    try:
+        row = connection.execute(
+            "SELECT id, agent_id, title, created_at, updated_at FROM sessions "
+            "WHERE id = ? AND agent_id = ?",
+            (session_id, agent_id),
+        ).fetchone()
+        if row is None:
+            connection.execute("COMMIT")
+            return None
+        session = Session(
+            id=_sqlite_text(row["id"], "session id"),
+            agent_id=_sqlite_text(row["agent_id"], "session agent id"),
+            title=_sqlite_text(row["title"], "session title"),
+            created_at=_decode_datetime(
+                _sqlite_text(row["created_at"], "session created_at")
+            ),
+            updated_at=_decode_datetime(
+                _sqlite_text(row["updated_at"], "session updated_at")
+            ),
+        )
+        operation_rows = connection.execute(
+            "SELECT operation.id FROM session_operations AS link "
+            "JOIN operations AS operation ON operation.id = link.operation_id "
+            "WHERE operation.agent_id = ? AND link.session_id = ? "
+            "ORDER BY link.position",
+            (agent_id, session_id),
+        ).fetchall()
+        snapshots = tuple(
+            _load_versioned_operation_in_transaction(
+                connection,
+                _sqlite_text(operation_row[0], "session operation id"),
+            ).snapshot
+            for operation_row in operation_rows
+        )
+        operation_ids = tuple(snapshot.operation.id for snapshot in snapshots)
+        messages: list[CanonicalMessage] = []
+        updated_at = session.updated_at
+        for snapshot in snapshots:
+            updated_at = max(updated_at, snapshot.operation.updated_at)
+            first_turn_id = snapshot.turns[0].id if snapshot.turns else None
+            user_text = snapshot.trigger.payload.get("message")
+            if isinstance(user_text, str) and user_text.strip():
+                messages.append(
+                    CanonicalMessage(
+                        agent_id=agent_id,
+                        operation_id=snapshot.operation.id,
+                        session_id=session_id,
+                        turn_id=first_turn_id,
+                        role=MessageRole.USER,
+                        content=(TextBlock(user_text),),
+                    )
+                )
+            for model_call in snapshot.model_calls:
+                response = model_call.response
+                if response is None:
+                    continue
+                content = () if response.text is None else (TextBlock(response.text),)
+                messages.append(
+                    CanonicalMessage(
+                        agent_id=agent_id,
+                        operation_id=snapshot.operation.id,
+                        session_id=session_id,
+                        turn_id=model_call.turn_id,
+                        role=MessageRole.ASSISTANT,
+                        content=content,
+                        tool_calls=response.tool_calls,
+                    )
+                )
+                for observation in snapshot.observations:
+                    if (
+                        observation.turn_id != model_call.turn_id
+                        or observation.call_id is None
+                    ):
+                        continue
+                    messages.append(
+                        CanonicalMessage(
+                            agent_id=agent_id,
+                            operation_id=snapshot.operation.id,
+                            session_id=session_id,
+                            turn_id=observation.turn_id,
+                            role=MessageRole.TOOL,
+                            content=(
+                                ToolResultBlock(
+                                    call_id=observation.call_id,
+                                    output={
+                                        "code": observation.code,
+                                        "message": observation.message,
+                                        "payload": observation.payload,
+                                    },
+                                    is_error=not observation.success,
+                                ),
+                            ),
+                        )
+                    )
+        if updated_at != session.updated_at:
+            session = Session(
+                id=session.id,
+                agent_id=session.agent_id,
+                title=session.title,
+                created_at=session.created_at,
+                updated_at=updated_at,
+            )
+        result = SessionTranscript(
+            session=session,
+            operation_ids=operation_ids,
+            messages=tuple(messages),
+        )
+        connection.execute("COMMIT")
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _create_operation(
     connection: sqlite3.Connection,
     snapshot: OperationSnapshot,
@@ -2490,6 +2792,7 @@ def _apply_commit_delta(
                 "operation revision",
             ),
         )
+    _touch_session(connection, candidate)
 
 
 def _apply_task_lease_delta(
@@ -2723,6 +3026,77 @@ def _insert_snapshot(
         _insert_observation(connection, operation.id, position, observation)
     for position, event in enumerate(snapshot.events):
         _insert_runtime_event(connection, operation.id, position, event)
+    _link_session_operation(connection, snapshot)
+    _touch_session(connection, snapshot)
+
+
+def _link_session_operation(
+    connection: sqlite3.Connection,
+    snapshot: OperationSnapshot,
+) -> None:
+    if _pragma_int(connection, "user_version") < 7:
+        return
+    identity = _load_agent_identity(connection)
+    if identity is None:
+        # A raw pre-Agent-Home operation store remains a supported migration
+        # and contract-test state. Once identity is initialized, it is binding.
+        return
+    if identity.id != snapshot.operation.agent_id:
+        raise InvalidOperationCheckpointError(
+            snapshot.operation.id,
+            "operation agent does not match authoritative database identity",
+        )
+    session_id = snapshot.operation.session_id
+    if session_id is None:
+        return
+    session_row = connection.execute(
+        "SELECT 1 FROM sessions WHERE id = ? AND agent_id = ?",
+        (session_id, snapshot.operation.agent_id),
+    ).fetchone()
+    if session_row is None:
+        raise InvalidOperationCheckpointError(
+            snapshot.operation.id,
+            "session-scoped operation requires a persisted session",
+        )
+    connection.execute(
+        "INSERT INTO session_operations(session_id, position, operation_id) "
+        "VALUES (?, (SELECT COALESCE(MAX(position), -1) + 1 "
+        "FROM session_operations WHERE session_id = ?), ?)",
+        (session_id, session_id, snapshot.operation.id),
+    )
+
+
+def _touch_session(
+    connection: sqlite3.Connection,
+    snapshot: OperationSnapshot,
+) -> None:
+    if _pragma_int(connection, "user_version") < 7:
+        return
+    identity = _load_agent_identity(connection)
+    if identity is None:
+        return
+    session_id = snapshot.operation.session_id
+    if session_id is None:
+        return
+    row = connection.execute(
+        "SELECT updated_at FROM sessions WHERE id = ? AND agent_id = ?",
+        (session_id, snapshot.operation.agent_id),
+    ).fetchone()
+    if row is None:
+        raise InvalidOperationCheckpointError(
+            snapshot.operation.id,
+            "session-scoped operation requires a persisted session",
+        )
+    current_updated_at = _decode_datetime(_sqlite_text(row[0], "session updated_at"))
+    updated_at = max(current_updated_at, snapshot.operation.updated_at)
+    connection.execute(
+        "UPDATE sessions SET updated_at = ? WHERE id = ? AND agent_id = ?",
+        (
+            _encode_datetime(updated_at),
+            session_id,
+            snapshot.operation.agent_id,
+        ),
+    )
 
 
 def _insert_turn(

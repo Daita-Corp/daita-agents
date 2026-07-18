@@ -6,16 +6,16 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** stopped after completing P2-07; P2-08 has not started
-- **Last completed task:** P2-07 — durable approval wait/decision/resume and the
-  test-owned idempotent side-effect marker
-- **Current checkpoint:** P2-07 is complete in the local checkpoint containing
-  this ledger; P2-06 remains closed by `9ae878b`
+- **Active task:** stopped after completing P2-08; P2-09 has not started
+- **Last completed task:** P2-08 — isolated agent home, durable sessions, shared
+  writer admission, and the thin embedded `Agent` facade
+- **Current checkpoint:** P2-08 is complete in the local checkpoint containing
+  this ledger; P2-07 remains closed by `bf4bb87`
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
 - **Exact next action:** stop per user direction; on a future continuation,
-  begin P2-08 with the isolated agent-home and identity ownership inventory
+  begin P2-09 with the provider-call identity and OpenAI adapter inventory
 
 ## Development cadence
 
@@ -123,7 +123,7 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-05 | complete | Persisted tasks/evidence/events; Section 8.5 recovery rules | Ready/claimed/running/approval-waiting/cancelled/manual-recovery task states, persisted execution-safety and idempotency facts, durable fenced leases, and a split materialize/claim/execute/commit path preserving the sole executor boundary | Claim race, lease expiry/reclaim, stale-fence rejection with no evidence/event, terminal skip, unknown side-effect outcome, and task/evidence/event atomicity tests | P2-04 |
 | P2-06 | complete | Durable checkpoints, tasks, evidence, observations, readiness, and leases | One loop with new-trigger and checkpoint-aware same-operation resume paths, plus startup recovery that reuses completed work and never rebuilds the plan from the original trigger | Crash/cancel injection at all seven Phase 2 boundaries; at-least-once started model call; terminal task skip; recovered response/evidence/observation/readiness paths do not repeat avoidable I/O | P2-05 |
 | P2-07 | complete | Recovery runtime and persisted governance facts | Immutable risk/policy/task fingerprints, CAS approval records, and one test-owned durable fake side-effect marker with wait, decision-only approval mutation, wake, denial, same-operation resume, and exact-once idempotency | Pre-approval no-I/O, approval mutation no-I/O, exact-fingerprint resume, denial no-I/O, cancellation race with one winner, repeated/concurrent resume marker unchanged, stale holder blocked | P2-06 |
-| P2-08 | pending | SQLite composition, recovery, approvals, committed events | Strict isolated agent home and bootstrap identity manifest, authoritative DB identity, durable sessions/transcripts, shared per-agent writer lock, thin `Agent.create/open/run/inspect/resume`, and embedded composition only | Create/reopen/path/mismatch/concurrency/lock/session isolation/restart tests; default never touches v1 state; facade contains no loop/executor/provider behavior | P2-07 |
+| P2-08 | complete | SQLite composition, recovery, approvals, committed events | Strict isolated agent home and bootstrap identity manifest, authoritative DB identity, durable sessions/transcripts, shared per-agent writer lock, thin `Agent.create/open/run/inspect/resume`, and embedded composition only | 132 focused public-agent, storage, and architecture cases pass; create/reopen/path/mismatch/concurrency/lock/session isolation/restart and facade boundaries are covered | P2-07 |
 | P2-09 | pending | Persisted embedded fake-capability loop; provider-neutral model contract | Separate canonical/provider call identity, normalized provider errors, lazy optional OpenAI Responses adapter, fake-client contract tests, and one live persisted fake-capability loop | Missing-extra/import isolation; response/tool continuation/error tests; architecture scan forbids provider execution; explicit credential/model live gate | P2-08 |
 | P2-10 | pending | Complete Phase 2 vertical slice | Consolidated restart, failure-injection, approval, event, import, architecture, static, cross-version, root-oracle, and clean-build evidence with parity/quality/ADR review | Complete Phase 2 gate suite on Python 3.11/3.12 plus live production-provider evidence; no mock substitutes for live evidence | P2-09 |
 | P2-11 | pending | Passing P2-10 results | Final Phase 2 ledger/evidence and coherent exact gate commit | Scoped diff/hooks; all paths under `next/`; exact `chore(v2-phase-2): complete phase 2 gate` commit | P2-10 |
@@ -874,6 +874,24 @@ re-read and an updated ordered ledger.
       573 tests; root oracle paths remain unchanged.
 - [x] P2-08 is deliberately not started. Broad cross-version, static,
       distribution, and root-suite gates remain deferred to P2-10.
+
+## P2-08 checkpoint record
+
+- [x] V2 creates and reopens a strict per-agent home under `~/.daita-next/` by
+      default; the bootstrap manifest must match authoritative SQLite identity.
+- [x] Embedded callers hold one cross-process per-agent writer lock and fail
+      clearly with `host_active` rather than opening a competing writer.
+- [x] Admission and manifest workers finish before cancellation propagates;
+      failed bootstrap cleans its own files, while published bootstrap reopens.
+- [x] Symlink/alias and v1-descendant homes fail closed, manifest/state opens use
+      no-follow checks, and authoritative session linkage cannot be omitted.
+- [x] Durable sessions project ordered provider-neutral transcripts from the
+      canonical operation checkpoints and remain isolated across restart.
+- [x] `Agent.create/open/run/inspect/resume` delegates to embedded composition;
+      the facade contains no model-loop, provider, policy, or executor behavior.
+- [x] The final focused acceptance, affected storage, and architecture selection
+      passes 132 cases; broad Phase 2 gates remain deferred to P2-10.
+- [x] P2-09 is deliberately not started.
 
 ## Credentials and external dependencies
 

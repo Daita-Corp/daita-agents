@@ -457,7 +457,7 @@ after its command and evidence actually exist.
 | P2-Q03 | Blobs and events | Durable put-by-content; hash/rename/orphan behavior; state/event same transaction; post-commit subscription, cursor replay, and commit/publish crash-gap coverage |
 | P2-Q04 | Tasks, leases, and recovery | Claim races; fencing; expiry; replay-safe reclaim; terminal skip; manual recovery for unknown side effects; all seven crash/cancel checkpoints |
 | P2-Q05 | Governance and fake side effect | Risk facts and decision-only approval mutation; no executor before approval or after denial; same-operation wake/resume; repeated resume changes the marker once |
-| P2-Q06 | Agent, sessions, and embedded mode | Isolated create/open identity; authoritative DB/manifest match; shared writer lock; restart-safe transcripts; transient/sessionless isolation; thin-facade architecture |
+| P2-Q06 | Agent, sessions, and embedded mode | PASS — 132 focused public-agent, affected storage, and architecture cases cover isolated create/open identity, cancellation-safe shared writer admission/bootstrap, no-alias/no-follow paths, authoritative DB/manifest/session linkage, monotonic restart-safe transcripts, sessionless/session isolation, and the thin-facade boundary |
 | P2-Q07 | OpenAI adapter and live loop | Lazy optional import; fake Responses client contracts; provider call-ID continuation; normalized errors; provider cannot execute; explicit live model completes persisted fake loop |
 | P2-Q08 | Phase gate | Full Python 3.11/3.12 suite; static/architecture/import/root-oracle/build scans; parity/ADR/ledger review; scoped hooks and exact Phase 2 gate commit |
 

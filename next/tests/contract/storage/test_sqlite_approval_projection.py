@@ -264,7 +264,7 @@ async def test_migration_six_normalizes_approvals_and_event_correlation(
 
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (7,)
         approval_columns = tuple(
             row[1] for row in connection.execute("PRAGMA table_info(approvals)")
         )

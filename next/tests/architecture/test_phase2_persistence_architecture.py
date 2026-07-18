@@ -173,6 +173,7 @@ def test_operation_store_is_a_narrow_async_optimistic_contract() -> None:
         "load",
         "load_nonterminal",
         "load_by_trigger",
+        "load_by_approval",
         "commit",
     }
     assert all(
@@ -260,15 +261,18 @@ def test_sqlite_adapter_imports_only_canonical_records_and_standard_library() ->
         "events.models",
         "events.protocols",
         "hashlib",
+        "identity",
         "json",
         "llm.models",
         "loop.models",
         "operations.checkpoints",
+        "operations.governance",
         "operations.leases",
         "operations.models",
         "operations.store",
         "pathlib",
         "re",
+        "sessions",
         "sqlite3",
         "typing",
     }
