@@ -334,9 +334,10 @@ commands actually run.
 ## Phases 2 through 9
 
 Phase 2 status: **P2-02 canonical checkpoints and the authoritative in-memory
-operation-store seam and P2-03 normalized SQLite repository are complete;
-P2-04 blob/event persistence is active. The
-overall Phase 2 gate has not been run or claimed.**
+operation-store seam, P2-03 normalized SQLite repository, P2-04 blob/event
+persistence, and P2-05d's cross-adapter fenced lifecycle are complete;
+P2-05e's sole-runtime execution migration is active. The overall Phase 2 gate
+has not been run or claimed.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 1 gate and before
 any Phase 2 production edit. Later phases remain unstarted.
@@ -415,6 +416,9 @@ refreshed code/test-tree gate and P2-Q02p closes P2-03.
 | P2-Q04a | plan, current v2, and root v1 oracle (read-only) | Inventory task models/checkpoints/store/SQLite/runtime/capability facts; inspect v1 kernel/store/governance/worker tests; run two independent v2 lease-boundary design audits | PASS — the existing operation runtime/store/SQLite transaction remain the only owners; exact records, narrow repository operations, fail-closed recovery rules, highest-value tests, and later-phase deferrals are locked before production edits |
 | P2-Q04b | `next/` | Run the portable task/safety/lease/store/checkpoint contracts before their production records exist | EXPECTED RED — the model slice reported 56 failures with no collection error; the combined run stopped on exactly 2 missing-lease-module collection errors |
 | P2-Q04c | `next/` | Focused P2-05b contract; independent bypass/chronology/correlation audit; complete isolated v2 suite; Black, compile, mypy, pyright, and architecture checks | PASS after repair — 91 focused and 463 complete tests; Black 71 files; compilation clean; mypy 70 files; pyright 0 errors/warnings; generic commit cannot advance active leases or accept their evidence, lease attempts cannot overlap, dependencies freeze at readiness, and immutable safety/dependency/lease/fence contracts remain backend-neutral |
+| P2-Q04d | `next/` | Migration 4 plus exact task/dependency/lease projection, corruption, migration rollback, and reopen contracts | PASS after repair — 5 migration, 34 projection, and 7 ownership cases pass; all 509 v2 tests pass on CPython 3.11.15/3.12.7; all 45 architecture tests and static gates are clean; checkpoint `94584a5` |
+| P2-Q04e | `next/` | Representative authoritative-clock lifecycle tests before concrete adapter methods, plus ambiguous-commit event-prefix reconciliation before its repair | EXPECTED RED — lifecycle behavior was absent from both adapters, and the focused reconciliation regression proved a later event prefix was not exact commit acknowledgement |
+| P2-Q04f | `next/` | Final P2-05d dual-interpreter suite, architecture/static/preservation gates, and two independent release audits | PASS — 549 tests with 0 failures/errors in 4.333s/4.338s on CPython 3.11.15/3.12.7; 50 architecture tests; Black 76 files; compilation clean; mypy 23 production files; pyright 0 errors/warnings; diff/root scopes clean; both audits GO |
 
 P2-Q03j through P2-Q03n close the refreshed P2-04 code/test-tree, preservation,
 distribution, review, and checkpoint gate.

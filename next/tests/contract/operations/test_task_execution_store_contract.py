@@ -28,6 +28,7 @@ from daita.operations.store import (
 
 NOW = datetime(2026, 7, 17, 18, 0, tzinfo=timezone.utc)
 EXPIRES_AT = NOW + timedelta(seconds=30)
+LEASE_DURATION_SECONDS = 30.0
 _replace: object = replace
 
 
@@ -60,8 +61,7 @@ def _claim_request() -> TaskClaimRequest:
         operation_id="operation-1",
         task_id="task-1",
         holder_id="worker-1",
-        acquired_at=NOW,
-        expires_at=EXPIRES_AT,
+        lease_duration_seconds=LEASE_DURATION_SECONDS,
         event=_claim_event(),
     )
 
@@ -73,7 +73,6 @@ def _lease_guard() -> TaskLeaseGuard:
         holder_id="worker-1",
         attempt=2,
         fencing_token=7,
-        checked_at=NOW + timedelta(seconds=1),
     )
 
 
@@ -85,21 +84,19 @@ def test_claim_request_is_an_immutable_portable_atomic_claim_candidate() -> None
         "operation_id",
         "task_id",
         "holder_id",
-        "acquired_at",
-        "expires_at",
+        "lease_duration_seconds",
         "event",
     )
     assert request.operation_id == "operation-1"
     assert request.task_id == "task-1"
     assert request.holder_id == "worker-1"
-    assert request.acquired_at == NOW
-    assert request.expires_at == EXPIRES_AT
+    assert request.lease_duration_seconds == LEASE_DURATION_SECONDS
     assert request.event == _claim_event()
     with pytest.raises(FrozenInstanceError):
         setattr(request, "holder_id", "worker-2")
 
 
-def test_claim_request_rejects_ambiguous_identity_and_chronology() -> None:
+def test_claim_request_rejects_ambiguous_identity_and_duration() -> None:
     request = _claim_request()
 
     for field_name in ("operation_id", "task_id", "holder_id"):
@@ -109,13 +106,23 @@ def test_claim_request_rejects_ambiguous_identity_and_chronology() -> None:
         with pytest.raises((TypeError, ValueError), match=field_name):
             _dynamic_replace(request, **{field_name: cast(str, object())})
 
-    for field_name in ("acquired_at", "expires_at"):
-        with pytest.raises(ValueError, match=f"{field_name}.*timezone-aware"):
-            _dynamic_replace(request, **{field_name: NOW.replace(tzinfo=None)})
-
-    for invalid_expiry in (NOW, NOW - timedelta(microseconds=1)):
-        with pytest.raises(ValueError, match="expires_at.*after.*acquired_at"):
-            _dynamic_replace(request, expires_at=invalid_expiry)
+    for invalid_duration in (0, -1, True, float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(
+            (TypeError, ValueError),
+            match="lease_duration_seconds.*positive.*finite|positive.*finite.*lease_duration_seconds",
+        ):
+            _dynamic_replace(
+                request,
+                lease_duration_seconds=invalid_duration,
+            )
+    with pytest.raises(
+        (TypeError, ValueError),
+        match="lease_duration_seconds",
+    ):
+        _dynamic_replace(
+            request,
+            lease_duration_seconds=cast(float, object()),
+        )
 
 
 def test_claim_request_requires_an_event_bound_to_the_exact_task() -> None:
@@ -139,19 +146,17 @@ def test_lease_guard_is_an_immutable_strict_fencing_proof() -> None:
         "holder_id",
         "attempt",
         "fencing_token",
-        "checked_at",
     )
     assert guard.operation_id == "operation-1"
     assert guard.task_id == "task-1"
     assert guard.holder_id == "worker-1"
     assert guard.attempt == 2
     assert guard.fencing_token == 7
-    assert guard.checked_at == NOW + timedelta(seconds=1)
     with pytest.raises(FrozenInstanceError):
         setattr(guard, "fencing_token", 8)
 
 
-def test_lease_guard_rejects_ambiguous_identity_time_attempt_and_fence() -> None:
+def test_lease_guard_rejects_ambiguous_identity_attempt_and_fence() -> None:
     guard = _lease_guard()
 
     for field_name in ("operation_id", "task_id", "holder_id"):
@@ -160,9 +165,6 @@ def test_lease_guard_rejects_ambiguous_identity_time_attempt_and_fence() -> None
                 _dynamic_replace(guard, **{field_name: invalid_identity})
         with pytest.raises((TypeError, ValueError), match=field_name):
             _dynamic_replace(guard, **{field_name: cast(str, object())})
-
-    with pytest.raises(ValueError, match="checked_at.*timezone-aware"):
-        _dynamic_replace(guard, checked_at=guard.checked_at.replace(tzinfo=None))
 
     for field_name in ("attempt", "fencing_token"):
         for invalid_number in (0, -1, True):
@@ -214,7 +216,13 @@ def test_task_execution_store_extends_only_the_portable_operation_contract() -> 
 
     expected_parameters = {
         "claim_task": ("self", "request", "expected_revision"),
-        "renew_task_lease": ("self", "snapshot", "expected_revision", "guard"),
+        "renew_task_lease": (
+            "self",
+            "snapshot",
+            "expected_revision",
+            "guard",
+            "lease_duration_seconds",
+        ),
         "commit_fenced": ("self", "snapshot", "expected_revision", "guard"),
         "recover_expired_task": (
             "self",
@@ -235,6 +243,14 @@ def test_task_execution_store_extends_only_the_portable_operation_contract() -> 
             parameter = signature.parameters[parameter_name]
             assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
             assert parameter.default is inspect.Parameter.empty
+
+
+def test_renewal_duration_is_required_to_be_positive_and_finite() -> None:
+    signature = inspect.signature(TaskExecutionStore.renew_task_lease)
+    duration = signature.parameters["lease_duration_seconds"]
+
+    assert duration.kind is inspect.Parameter.KEYWORD_ONLY
+    assert duration.default is inspect.Parameter.empty
 
 
 def test_portable_task_execution_contract_has_no_sqlite_dependency() -> None:

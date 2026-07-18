@@ -133,6 +133,7 @@ def _initial_snapshot(
     *,
     operation_id: str = "operation-commit",
     trigger_id: str = "trigger-commit",
+    mutable_task_status: TaskStatus = TaskStatus.PENDING,
 ) -> OperationSnapshot:
     model_turn_id = f"{operation_id}:turn:model"
     task_turn_id = f"{operation_id}:turn:task"
@@ -248,7 +249,7 @@ def _initial_snapshot(
         call_id=mutable_tool_call_id,
         capability_id="fake.read",
         executor_id="fake.executor",
-        status=TaskStatus.PENDING,
+        status=mutable_task_status,
         attempt=1,
         arguments={"key": "mutable"},
         created_at=NOW,
@@ -501,7 +502,7 @@ async def test_commit_persists_legal_mutations_and_exact_event_suffixes(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "state.db"
-    initial = _initial_snapshot()
+    initial = _initial_snapshot(mutable_task_status=TaskStatus.RUNNING)
     store = await SQLiteOperationStore.open(path)
     try:
         created = await store.create(initial)
@@ -825,7 +826,7 @@ async def test_runtime_event_abort_rolls_back_commit_to_exact_prior_snapshot(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "state.db"
-    initial = _initial_snapshot()
+    initial = _initial_snapshot(mutable_task_status=TaskStatus.RUNNING)
     candidate = _with_completed_task(
         _with_completed_model(initial),
         final_event_type="test.force_abort",

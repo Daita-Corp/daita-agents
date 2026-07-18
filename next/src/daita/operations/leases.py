@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 
 from ..events.models import RuntimeEvent
 
@@ -28,6 +29,17 @@ def _positive_integer(value: object, field_name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"{field_name} must be a positive integer")
     return value
+
+
+def _positive_finite_number(value: object, field_name: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{field_name} must be a positive finite number")
+    return float(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,18 +114,22 @@ class TaskClaimRequest:
     operation_id: str
     task_id: str
     holder_id: str
-    acquired_at: datetime
-    expires_at: datetime
+    lease_duration_seconds: float
     event: RuntimeEvent
 
     def __post_init__(self) -> None:
         _required_text(self.operation_id, "operation_id")
         _required_text(self.task_id, "task_id")
         _required_text(self.holder_id, "holder_id")
-        acquired_at = _aware_datetime(self.acquired_at, "acquired_at")
-        expires_at = _aware_datetime(self.expires_at, "expires_at")
-        if expires_at <= acquired_at:
-            raise ValueError("expires_at must be after acquired_at")
+        lease_duration_seconds = _positive_finite_number(
+            self.lease_duration_seconds,
+            "lease_duration_seconds",
+        )
+        object.__setattr__(
+            self,
+            "lease_duration_seconds",
+            lease_duration_seconds,
+        )
 
         if not isinstance(self.event, RuntimeEvent):
             raise TypeError("event must be a RuntimeEvent")
@@ -134,7 +150,6 @@ class TaskLeaseGuard:
     holder_id: str
     attempt: int
     fencing_token: int
-    checked_at: datetime
 
     def __post_init__(self) -> None:
         _required_text(self.operation_id, "operation_id")
@@ -142,4 +157,3 @@ class TaskLeaseGuard:
         _required_text(self.holder_id, "holder_id")
         _positive_integer(self.attempt, "attempt")
         _positive_integer(self.fencing_token, "fencing_token")
-        _aware_datetime(self.checked_at, "checked_at")

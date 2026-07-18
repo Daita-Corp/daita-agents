@@ -19,7 +19,7 @@ from daita.operations.models import (
     OperationStatus,
     TriggerKind,
 )
-from daita.operations.store import CommitResult
+from daita.operations.store import CommitResult, VersionedOperation
 from daita.storage import sqlite as sqlite_owner
 from daita.storage.sqlite import SQLiteOperationStore, SQLiteStoreError
 
@@ -110,6 +110,31 @@ async def _invoke_write(
     if write_kind == "create":
         return await store.create(snapshot)
     return await store.commit(snapshot, expected_revision=1)
+
+
+def test_later_event_prefix_is_not_proof_of_an_ambiguous_commit() -> None:
+    initial = _initial_snapshot()
+    candidate_snapshot = _advanced_snapshot(initial)
+    candidate = VersionedOperation(snapshot=candidate_snapshot, revision=2)
+    successor_time = LATER + timedelta(seconds=1)
+    successor_snapshot = replace(
+        candidate_snapshot,
+        operation=replace(
+            candidate_snapshot.operation,
+            updated_at=successor_time,
+        ),
+        events=(
+            *candidate_snapshot.events,
+            _event(
+                "event-write-cancellation-3",
+                "checkpoint.updated",
+                created_at=successor_time,
+            ),
+        ),
+    )
+    observed = VersionedOperation(snapshot=successor_snapshot, revision=3)
+
+    assert sqlite_owner._observed_commit_proves_result(observed, candidate) is False
 
 
 @pytest.mark.parametrize("write_kind", ("create", "commit"))

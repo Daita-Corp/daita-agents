@@ -44,7 +44,7 @@ from ..operations.checkpoints import (
     ModelCallStatus,
     OperationSnapshot,
 )
-from ..operations.leases import TaskLease
+from ..operations.leases import TaskClaimRequest, TaskLease, TaskLeaseGuard
 from ..operations.models import (
     AgentTrigger,
     Evidence,
@@ -62,8 +62,17 @@ from ..operations.store import (
     OperationAlreadyExistsError,
     OperationNotFoundError,
     OperationRevisionConflict,
+    TaskClaimResult,
     TriggerAlreadyClaimedError,
     VersionedOperation,
+    _authoritative_time,
+    _committed_event_suffix,
+    _prepare_expired_task_recovery,
+    _prepare_fenced_task_commit,
+    _prepare_task_claim,
+    _prepare_task_lease_renewal,
+    _require_bounded_lease_duration,
+    _require_lease_duration,
     _require_revision,
     _validate_commit_candidate,
     _validate_new_checkpoint,
@@ -73,6 +82,11 @@ DAITA_V2_APPLICATION_ID = 0x44414932  # ASCII ``DAI2``.
 _MAX_COMMITTED_EVENT_READ_LIMIT = 1_000
 _COMMITTED_EVENT_SUBSCRIPTION_BATCH_SIZE = 100
 _COMMITTED_EVENT_POLL_INTERVAL_SECONDS = 0.25
+
+
+def _sqlite_utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
 
 _SCHEMA_HISTORY_SQL = """
 CREATE TABLE schema_migrations (
@@ -796,6 +810,8 @@ class SQLiteOperationStore:
         connection: sqlite3.Connection,
         *,
         busy_timeout_ms: int,
+        clock: Callable[[], datetime] | None = None,
+        max_lease_duration_seconds: float = 300.0,
         _construction_token: object | None = None,
     ) -> None:
         if _construction_token is not _STORE_CONSTRUCTION_TOKEN:
@@ -805,6 +821,14 @@ class SQLiteOperationStore:
         self._path = path
         self._connection = connection
         self._busy_timeout_ms = busy_timeout_ms
+        resolved_clock = _sqlite_utc_now if clock is None else clock
+        if not callable(resolved_clock):
+            raise TypeError("clock must be callable")
+        self._clock = resolved_clock
+        self._max_lease_duration_seconds = _require_lease_duration(
+            max_lease_duration_seconds,
+            "max_lease_duration_seconds",
+        )
         self._lock = asyncio.Lock()
         self._event_wake_hints: dict[str, set[asyncio.Event]] = {}
         self._closed = False
@@ -816,6 +840,8 @@ class SQLiteOperationStore:
         *,
         busy_timeout_ms: int = 5_000,
         backup_path: str | Path | None = None,
+        clock: Callable[[], datetime] | None = None,
+        max_lease_duration_seconds: float = 300.0,
     ) -> SQLiteOperationStore:
         """Open the fixed package-owned schema for one v2 SQLite database."""
 
@@ -825,6 +851,8 @@ class SQLiteOperationStore:
             busy_timeout_ms=busy_timeout_ms,
             backup_path=backup_path,
             verify_owned_schema=True,
+            clock=clock,
+            max_lease_duration_seconds=max_lease_duration_seconds,
         )
 
     @property
@@ -934,6 +962,118 @@ class SQLiteOperationStore:
         self._publish_committed_event_wake_hints(result.committed_events)
         return result
 
+    async def claim_task(
+        self,
+        request: TaskClaimRequest,
+        *,
+        expected_revision: int,
+    ) -> TaskClaimResult:
+        """Atomically claim one ready task with an authoritative fenced lease."""
+
+        if not isinstance(request, TaskClaimRequest):
+            raise TypeError("request must be a TaskClaimRequest record")
+        _require_revision(expected_revision)
+        _require_bounded_lease_duration(
+            request.lease_duration_seconds,
+            maximum=self._max_lease_duration_seconds,
+        )
+        result = await self._run_connection(
+            lambda connection: _claim_task_execution(
+                connection,
+                request,
+                expected_revision=expected_revision,
+                clock=self._clock,
+                max_lease_duration_seconds=self._max_lease_duration_seconds,
+            )
+        )
+        self._publish_committed_event_wake_hints(result.commit_result.committed_events)
+        return result
+
+    async def renew_task_lease(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+        guard: TaskLeaseGuard,
+        lease_duration_seconds: float,
+    ) -> CommitResult:
+        """Extend one exact live fence without allowing lease resurrection."""
+
+        if not isinstance(snapshot, OperationSnapshot):
+            raise TypeError("snapshot must be an OperationSnapshot record")
+        if not isinstance(guard, TaskLeaseGuard):
+            raise TypeError("guard must be a TaskLeaseGuard record")
+        _require_revision(expected_revision)
+        _require_bounded_lease_duration(
+            lease_duration_seconds,
+            maximum=self._max_lease_duration_seconds,
+        )
+        result = await self._run_connection(
+            lambda connection: _renew_task_execution_lease(
+                connection,
+                snapshot,
+                expected_revision=expected_revision,
+                guard=guard,
+                lease_duration_seconds=lease_duration_seconds,
+                clock=self._clock,
+                max_lease_duration_seconds=self._max_lease_duration_seconds,
+            )
+        )
+        self._publish_committed_event_wake_hints(result.committed_events)
+        return result
+
+    async def commit_fenced(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+        guard: TaskLeaseGuard,
+    ) -> CommitResult:
+        """Commit one task transition only while its exact fence remains live."""
+
+        if not isinstance(snapshot, OperationSnapshot):
+            raise TypeError("snapshot must be an OperationSnapshot record")
+        if not isinstance(guard, TaskLeaseGuard):
+            raise TypeError("guard must be a TaskLeaseGuard record")
+        _require_revision(expected_revision)
+        result = await self._run_connection(
+            lambda connection: _commit_fenced_task_execution(
+                connection,
+                snapshot,
+                expected_revision=expected_revision,
+                guard=guard,
+                clock=self._clock,
+            )
+        )
+        self._publish_committed_event_wake_hints(result.committed_events)
+        return result
+
+    async def recover_expired_task(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+        guard: TaskLeaseGuard,
+    ) -> CommitResult:
+        """Release an expired fence through the portable fail-closed matrix."""
+
+        if not isinstance(snapshot, OperationSnapshot):
+            raise TypeError("snapshot must be an OperationSnapshot record")
+        if not isinstance(guard, TaskLeaseGuard):
+            raise TypeError("guard must be a TaskLeaseGuard record")
+        _require_revision(expected_revision)
+        result = await self._run_connection(
+            lambda connection: _recover_expired_task_execution(
+                connection,
+                snapshot,
+                expected_revision=expected_revision,
+                guard=guard,
+                clock=self._clock,
+            )
+        )
+        self._publish_committed_event_wake_hints(result.committed_events)
+        return result
+
     async def close(self) -> None:
         """Close the SQLite connection before returning, even under cancellation."""
 
@@ -1035,12 +1175,21 @@ async def _open_with_migrations(
     busy_timeout_ms: int = 5_000,
     backup_path: str | Path | None = None,
     verify_owned_schema: bool = False,
+    clock: Callable[[], datetime] | None = None,
+    max_lease_duration_seconds: float = 300.0,
 ) -> SQLiteOperationStore:
     """Private migration harness used by the adapter and foundation tests."""
 
     database_path = _validate_database_path(path)
     migration_plan = _validate_migration_plan(migrations)
     timeout = _validate_busy_timeout(busy_timeout_ms)
+    resolved_clock = _sqlite_utc_now if clock is None else clock
+    if not callable(resolved_clock):
+        raise TypeError("clock must be callable")
+    lease_duration_limit = _require_lease_duration(
+        max_lease_duration_seconds,
+        "max_lease_duration_seconds",
+    )
     resolved_backup_path = (
         None
         if backup_path is None
@@ -1096,6 +1245,8 @@ async def _open_with_migrations(
         database_path,
         connection,
         busy_timeout_ms=timeout,
+        clock=resolved_clock,
+        max_lease_duration_seconds=lease_duration_limit,
         _construction_token=_STORE_CONSTRUCTION_TOKEN,
     )
 
@@ -1655,6 +1806,172 @@ def _commit_operation(
     return result
 
 
+def _commit_task_execution_mutation(
+    connection: sqlite3.Connection,
+    operation_id: str,
+    *,
+    expected_revision: int,
+    clock: Callable[[], datetime],
+    prepare: Callable[[OperationSnapshot, datetime], OperationSnapshot],
+) -> CommitResult:
+    """Apply one portable task transition inside the SQLite write boundary."""
+
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        revision_row = connection.execute(
+            "SELECT revision FROM operations WHERE id = ?",
+            (operation_id,),
+        ).fetchone()
+        if revision_row is None:
+            raise OperationNotFoundError(operation_id)
+        actual_revision = _sqlite_int(
+            revision_row[0],
+            "operation revision",
+        )
+        if actual_revision != expected_revision:
+            raise OperationRevisionConflict(
+                operation_id,
+                expected_revision=expected_revision,
+                actual_revision=actual_revision,
+            )
+
+        current = _load_versioned_operation_in_transaction(connection, operation_id)
+        now = _authoritative_time(clock)
+        candidate = prepare(current.snapshot, now)
+        committed_events = _committed_event_suffix(current.snapshot, candidate)
+        candidate_revision = actual_revision + 1
+        _apply_commit_delta(
+            connection,
+            current.snapshot,
+            candidate,
+            expected_revision=actual_revision,
+            candidate_revision=candidate_revision,
+        )
+        committed = VersionedOperation(
+            snapshot=candidate,
+            revision=candidate_revision,
+        )
+        observed = _load_versioned_operation_in_transaction(connection, operation_id)
+        if observed != committed:
+            raise SQLiteCorruptionError(
+                f"task transition projection diverged for operation {operation_id}"
+            )
+        result = CommitResult(
+            operation=committed,
+            committed_events=committed_events,
+        )
+        _commit_with_reconciliation(connection, result)
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    return result
+
+
+def _claim_task_execution(
+    connection: sqlite3.Connection,
+    request: TaskClaimRequest,
+    *,
+    expected_revision: int,
+    clock: Callable[[], datetime],
+    max_lease_duration_seconds: float,
+) -> TaskClaimResult:
+    commit_result = _commit_task_execution_mutation(
+        connection,
+        request.operation_id,
+        expected_revision=expected_revision,
+        clock=clock,
+        prepare=lambda current, now: _prepare_task_claim(
+            current,
+            request,
+            now=now,
+            max_lease_duration_seconds=max_lease_duration_seconds,
+        )[0],
+    )
+    snapshot = commit_result.operation.snapshot
+    task = next(task for task in snapshot.tasks if task.id == request.task_id)
+    lease = next(
+        lease
+        for lease in reversed(snapshot.task_leases)
+        if lease.task_id == request.task_id and lease.released_at is None
+    )
+    return TaskClaimResult(
+        commit_result=commit_result,
+        task=task,
+        lease=lease,
+    )
+
+
+def _renew_task_execution_lease(
+    connection: sqlite3.Connection,
+    snapshot: OperationSnapshot,
+    *,
+    expected_revision: int,
+    guard: TaskLeaseGuard,
+    lease_duration_seconds: float,
+    clock: Callable[[], datetime],
+    max_lease_duration_seconds: float,
+) -> CommitResult:
+    return _commit_task_execution_mutation(
+        connection,
+        guard.operation_id,
+        expected_revision=expected_revision,
+        clock=clock,
+        prepare=lambda current, now: _prepare_task_lease_renewal(
+            current,
+            snapshot,
+            guard,
+            now=now,
+            lease_duration_seconds=lease_duration_seconds,
+            max_lease_duration_seconds=max_lease_duration_seconds,
+        ),
+    )
+
+
+def _commit_fenced_task_execution(
+    connection: sqlite3.Connection,
+    snapshot: OperationSnapshot,
+    *,
+    expected_revision: int,
+    guard: TaskLeaseGuard,
+    clock: Callable[[], datetime],
+) -> CommitResult:
+    return _commit_task_execution_mutation(
+        connection,
+        guard.operation_id,
+        expected_revision=expected_revision,
+        clock=clock,
+        prepare=lambda current, now: _prepare_fenced_task_commit(
+            current,
+            snapshot,
+            guard,
+            now=now,
+        ),
+    )
+
+
+def _recover_expired_task_execution(
+    connection: sqlite3.Connection,
+    snapshot: OperationSnapshot,
+    *,
+    expected_revision: int,
+    guard: TaskLeaseGuard,
+    clock: Callable[[], datetime],
+) -> CommitResult:
+    return _commit_task_execution_mutation(
+        connection,
+        guard.operation_id,
+        expected_revision=expected_revision,
+        clock=clock,
+        prepare=lambda current, now: _prepare_expired_task_recovery(
+            current,
+            snapshot,
+            guard,
+            now=now,
+        ),
+    )
+
+
 def _commit_with_reconciliation(
     connection: sqlite3.Connection,
     result: CommitResult,
@@ -1699,15 +2016,10 @@ def _observed_commit_proves_result(
     observed: VersionedOperation,
     candidate: VersionedOperation,
 ) -> bool:
-    if observed == candidate:
-        return True
-    if observed.revision <= candidate.revision:
-        return False
-    try:
-        _validate_commit_candidate(candidate.snapshot, observed.snapshot)
-    except BaseException:
-        return False
-    return True
+    # A successor can reuse the same caller-supplied event record after this
+    # writer failed, so an append-only event prefix alone cannot prove which
+    # transaction committed. Only an exact read-back removes the ambiguity.
+    return observed == candidate
 
 
 def _apply_commit_delta(
@@ -1812,11 +2124,12 @@ def _apply_commit_delta(
         zip(current.tasks, candidate.tasks, strict=False)
     ):
         task_update = connection.execute(
-            "UPDATE tasks SET status = ?, updated_at = ?, error_code = ?, "
+            "UPDATE tasks SET status = ?, attempt = ?, updated_at = ?, error_code = ?, "
             "cancellation_requested = ?, manual_recovery_reason = ? "
             "WHERE operation_id = ? AND position = ? AND id = ?",
             (
                 task_after.status.value,
+                task_after.attempt,
                 _encode_datetime(task_after.updated_at),
                 task_after.error_code,
                 int(task_after.cancellation_requested),
@@ -1840,6 +2153,8 @@ def _apply_commit_delta(
             position,
             candidate.task_dependencies[position],
         )
+
+    _apply_task_lease_delta(connection, current, candidate)
 
     for position in range(len(current.evidence), len(candidate.evidence)):
         _insert_evidence(
@@ -1904,6 +2219,55 @@ def _apply_commit_delta(
                 revision_row[0],
                 "operation revision",
             ),
+        )
+
+
+def _apply_task_lease_delta(
+    connection: sqlite3.Connection,
+    current: OperationSnapshot,
+    candidate: OperationSnapshot,
+) -> None:
+    operation_id = candidate.operation.id
+    for position, (before, after) in enumerate(
+        zip(current.task_leases, candidate.task_leases, strict=False)
+    ):
+        if after == before:
+            continue
+        lease_update = connection.execute(
+            "UPDATE task_leases SET expires_at = ?, started_at = ?, "
+            "renewed_at = ?, released_at = ?, release_reason = ? "
+            "WHERE operation_id = ? AND position = ? AND task_id = ? "
+            "AND attempt = ? AND fencing_token = ? AND holder_id = ? "
+            "AND acquired_at = ? AND expires_at = ? "
+            "AND started_at IS ? AND renewed_at IS ? "
+            "AND released_at IS ? AND release_reason IS ?",
+            (
+                _encode_datetime(after.expires_at),
+                _encode_optional_datetime(after.started_at),
+                _encode_optional_datetime(after.renewed_at),
+                _encode_optional_datetime(after.released_at),
+                after.release_reason,
+                operation_id,
+                position,
+                before.task_id,
+                before.attempt,
+                before.fencing_token,
+                before.holder_id,
+                _encode_datetime(before.acquired_at),
+                _encode_datetime(before.expires_at),
+                _encode_optional_datetime(before.started_at),
+                _encode_optional_datetime(before.renewed_at),
+                _encode_optional_datetime(before.released_at),
+                before.release_reason,
+            ),
+        )
+        _require_one_row(lease_update.rowcount, "task lease", before.task_id)
+    for position in range(len(current.task_leases), len(candidate.task_leases)):
+        _insert_task_lease(
+            connection,
+            operation_id,
+            position,
+            candidate.task_leases[position],
         )
 
 
