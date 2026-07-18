@@ -6,20 +6,21 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-06g — run the final Phase 2-06 preservation,
-  distribution, static, review, and scoped-checkpoint gate
-- **Last completed task:** P2-06f — all seven crash/restart trajectories and
-  their request/claim/blob/delivery subfrontiers are proven against the existing
-  owners; three independent reviews report GO
-- **Current checkpoint:** the P2-06f proof-only crash matrix passes 644 tests on
-  both interpreters, 31 restart cases, and 53 architecture cases with no
-  production change; its scoped local checkpoint is next
+- **Active task:** P2-07 — re-read governance/approval constraints and inventory
+  existing risk, policy, task-fingerprint, decision, wake, and side-effect owners
+  before any production edit
+- **Last completed task:** P2-06g — the final dual-interpreter, static,
+  architecture, root-oracle, clean-build/install, and independent review gates
+  pass and the containing local checkpoint closes whole-loop recovery
+- **Current checkpoint:** P2-06 is complete; proof checkpoint `110596b` covers
+  every crash frontier, and the containing ledger checkpoint records the final
+  644-test cross-version and preservation gate
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** create the scoped P2-06f test checkpoint, then run the
-  P2-06g root-oracle, isolated-build/install, import, static, and final review
-  gates before closing Phase 2-06
+- **Exact next action:** stage only the two closing ledgers, re-run cached
+  diff/configured hooks, create the local Phase 2-06 checkpoint, then re-read
+  the binding governance sections and write the ordered test-first P2-07 plan
 
 ## Mandatory architecture re-read
 
@@ -112,8 +113,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-03 | complete | Proven P2-02 seam; Section 11.2 lifecycle inventory | SQLite engine with v2 marker, WAL, foreign keys, busy timeout, correctness-first synchronous mode, checksummed ordered migrations, SQLite-API backup-before-migrate, compatibility rejection, normalized lifecycle tables, and transactional optimistic operation repository | Fresh/reopen/concurrent-CAS/rollback/migration/interruption/future-or-unknown-schema tests; every runtime lifecycle record round-trips independently | P2-02 |
 | P2-04 | complete | SQLite transaction boundary; Section 8.4/11.5 contracts | Content-addressed blob store and durable committed-event log/subscription with per-agent monotonic cursors; event notification remains a post-commit wake hint | Temp/flush/hash/atomic-rename/orphan tests; rollback emits nothing; commit/publish gap replays; reconnect, slow subscriber, and cross-agent isolation tests | P2-03 |
 | P2-05 | complete | Persisted tasks/evidence/events; Section 8.5 recovery rules | Ready/claimed/running/approval-waiting/cancelled/manual-recovery task states, persisted execution-safety and idempotency facts, durable fenced leases, and a split materialize/claim/execute/commit path preserving the sole executor boundary | Claim race, lease expiry/reclaim, stale-fence rejection with no evidence/event, terminal skip, unknown side-effect outcome, and task/evidence/event atomicity tests | P2-04 |
-| P2-06 | active | Durable checkpoints, tasks, evidence, observations, readiness, and leases | One loop with new-trigger and checkpoint-aware same-operation resume paths, plus startup recovery that reuses completed work and never rebuilds the plan from the original trigger | Crash/cancel injection at all seven Phase 2 boundaries; at-least-once started model call; terminal task skip; recovered response/evidence/observation/readiness paths do not repeat avoidable I/O | P2-05 |
-| P2-07 | pending | Recovery runtime and persisted governance facts | Immutable risk/policy/task fingerprints, CAS approval records, and one test-owned durable fake side-effect marker with wait, decision-only approval mutation, wake, denial, same-operation resume, and exact-once idempotency | Pre-approval no-I/O, approval mutation no-I/O, exact-fingerprint resume, denial no-I/O, cancellation race with one winner, repeated/concurrent resume marker unchanged, stale holder blocked | P2-06 |
+| P2-06 | complete | Durable checkpoints, tasks, evidence, observations, readiness, and leases | One loop with new-trigger and checkpoint-aware same-operation resume paths, plus startup recovery that reuses completed work and never rebuilds the plan from the original trigger | Crash/cancel injection at all seven Phase 2 boundaries; at-least-once started model call; terminal task skip; recovered response/evidence/observation/readiness paths do not repeat avoidable I/O | P2-05 |
+| P2-07 | active | Recovery runtime and persisted governance facts | Immutable risk/policy/task fingerprints, CAS approval records, and one test-owned durable fake side-effect marker with wait, decision-only approval mutation, wake, denial, same-operation resume, and exact-once idempotency | Pre-approval no-I/O, approval mutation no-I/O, exact-fingerprint resume, denial no-I/O, cancellation race with one winner, repeated/concurrent resume marker unchanged, stale holder blocked | P2-06 |
 | P2-08 | pending | SQLite composition, recovery, approvals, committed events | Strict isolated agent home and bootstrap identity manifest, authoritative DB identity, durable sessions/transcripts, shared per-agent writer lock, thin `Agent.create/open/run/inspect/resume`, and embedded composition only | Create/reopen/path/mismatch/concurrency/lock/session isolation/restart tests; default never touches v1 state; facade contains no loop/executor/provider behavior | P2-07 |
 | P2-09 | pending | Persisted embedded fake-capability loop; provider-neutral model contract | Separate canonical/provider call identity, normalized provider errors, lazy optional OpenAI Responses adapter, fake-client contract tests, and one live persisted fake-capability loop | Missing-extra/import isolation; response/tool continuation/error tests; architecture scan forbids provider execution; explicit credential/model live gate | P2-08 |
 | P2-10 | pending | Complete Phase 2 vertical slice | Consolidated restart, failure-injection, approval, event, import, architecture, static, cross-version, root-oracle, and clean-build evidence with parity/quality/ADR review | Complete Phase 2 gate suite on Python 3.11/3.12 plus live production-provider evidence; no mock substitutes for live evidence | P2-09 |
@@ -165,7 +166,7 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-06d | complete | Complete checkpoint dispatcher over requestless turn, started/completed model call, ordered tool calls, task/evidence/observation, readiness, terminal state, and exact trigger redelivery | Persisted records, not coarse phase alone, select progression; STARTED inference is at-least-once; existing tasks use `resume_task()`; avoidable validation/executor/projection/readiness/model I/O is skipped; exact trigger redelivery enters the same driver |
 | P2-06e | complete | Portable agent-scoped nonterminal inspection plus startup recovery over both existing stores | Deterministic scoped query, SQLite single-transaction reopen, terminal exclusion, live-lease deferral, and startup iteration reuse the same loop; P2-08 retains Agent Home, host admission, and writer-lock composition |
 | P2-06f | complete | All seven Phase 2 crash/restart trajectories and independent representative review | Abrupt process-exit injection at every required durable boundary; exact identity/event/counter assertions; safe replay versus manual recovery; blob orphan; terminal delivery replay; no second owner |
-| P2-06g | active | Final P2-06 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local checkpoint |
+| P2-06g | complete | Final P2-06 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local checkpoint |
 
 ## Files/components being changed or planned
 
@@ -613,6 +614,11 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | Initial P2-06f crash-boundary proof | PASS ON ARRIVAL — the first 9-case and expanded 11-case selections passed against unchanged `5d76647` production, so no artificial expected-red failure or unjustified production patch was created |
 | P2-06f complete crash/restart matrix | PASS — 13 new abrupt-loss cases cover turn/request, unknown provider outcome, response, task, live and expired claim, executor start and actual executor loss, blob-before-evidence orphaning, evidence, observation with exact durable tool-result context, readiness, and committed-result delivery; the 31-case restart module passes; all 644 v2 tests pass with 0 failures/errors in 6.493s/6.948s on CPython 3.11.15/3.12.7; all 53 architecture tests pass; Black is clean across 81 files; compilation, focused mypy over 24 files, scoped pyright 1.1.411, and diff checks are clean |
 | P2-06f independent reviews | PASS after assertion hardening — semantic, coverage, and scope reviewers all report GO after live `CLAIMED` recovery gained exact zero-delta/zero-I/O proof and the resumed request gained an exact durable `ToolResultBlock` assertion; root `daita/` and v2 production are untouched, and no P2-07/P2-08 ownership leaked into the proof |
+| P2-06g committed-tree v2/static gate | PASS — checkpoint `110596b` passes all 644 v2 tests with 0 failures/errors in 6.700s/7.178s on CPython 3.11.15/3.12.7 and all 53 architecture tests; Black is clean across 81 files, byte compilation succeeds, focused mypy is clean across 24 files, and scoped pyright 1.1.411 reports 0 errors/warnings |
+| P2-06g root preservation gate | PASS — the root safe suite passes all 2,498 selected tests with 221 deselected in 10.70s; all four v1 oracle fixtures reproduce byte-for-byte; the recorded root baseline, root/oracle diff scopes, and symlink scan are clean |
+| P2-06g clean distribution gate | PASS — clean committed-tree builds produce v2 wheel/sdist archives with 27/42 entries at `2.0.0a0` and root archives with 401/442 entries at `1.0.0`; neither contains tests or a nested replacement/root tree; fresh CPython 3.11/3.12 environments install the v2 wheel without dependencies and import loop, runtime, SQLite, and blob owners only from their own site-packages |
+| P2-06g final independent reviews | PASS — separate architecture/recovery and root/scope ledger reviews find the two-file closing diff honest and internally consistent; the existing loop/runtime/store/SQLite owners remain authoritative, the sole executor call site is unchanged, root and v2 production/test/package scopes are clean, and no P2-07/P2-08 behavior leaked into Phase 2-06 |
+| P2-06g scoped checkpoint | PASS — the final diff contains only `next/STATUS.md` and `next/QUALITY_GATES.md`; whitespace/EOF/conflict/large-file and applicable Black hooks pass, and the containing local checkpoint closes P2-06 without touching root or v2 production |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
