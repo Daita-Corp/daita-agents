@@ -333,11 +333,8 @@ commands actually run.
 
 ## Phases 2 through 9
 
-Phase 2 status: **P2-02 canonical checkpoints and the authoritative in-memory
-operation-store seam, P2-03 normalized SQLite repository, P2-04 blob/event
-persistence, and all P2-05 fenced execution, recovery, and blob-evidence work
-are complete. P2-06 checkpoint-aware same-operation resume and startup
-recovery is active. The overall Phase 2 gate has not been run or claimed.**
+Phase 2 status: **P2-02 through P2-09 are complete. P2-10's consolidated gate
+and P2-11's evidence/checkpoint close Phase 2. Phase 3 has not started.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 1 gate and before
 any Phase 2 production edit. Later phases remain unstarted.
@@ -444,29 +441,41 @@ refreshed code/test-tree gate and P2-Q02p closes P2-03.
 | P2-Q06a | `next/` P2-08 embedded lifecycle slice | Public Agent acceptance, affected SQLite migration/store, and all architecture tests plus one targeted durability review | PASS after repair — 132 focused cases; cancellation-safe writer admission/bootstrap, v1/symlink/alias rejection, authoritative identity/session linkage, monotonic restart-safe transcripts, and the thin facade pass; review-found lock/bootstrap/session gaps are closed |
 | P2-Q07a | `next/` P2-09 provider-neutral/OpenAI slice | Canonical provider-call identity, strict legacy/current SQLite codecs, normalized error persistence, fake Responses client, optional-import, and provider-ownership tests | PASS after repair — the final 44-case provider/model/SQLite/architecture selection passes; review-required encrypted reasoning-item persistence/replay and actual `generate()` missing-extra behavior are covered, and the generic-loop allowlist remains provider-neutral |
 | P2-Q07b | `next/` | `set -a; source ../.env; set +a; DAITA_OPENAI_MODEL=gpt-4.1-mini ../.venv/bin/python -m pytest tests/acceptance/test_openai_live_persisted_loop.py -m requires_llm -q -s` | PASS — 1 live case, reconfirmed after encrypted reasoning replay was added; the actual Responses API completes the public SQLite-backed fake-read loop and close/reopen preserves canonical/provider call identity, model calls, task, evidence, observation, events, and terminal answer; no mock substituted for this row |
+| P2-Q08a | `next/` | `PYTHONPATH=src:/Users/jendala/daita/daita-agents/.venv/lib/python3.11/site-packages /Users/jendala/daita/daita-agents/.venv/bin/python -S -m pytest -o addopts='' tests/ -m 'not requires_llm and not requires_db' -q -p no:cacheprovider --junitxml=/private/tmp/daita-v2-p2-gate-final-py311.xml`; `PYTHONPATH=src:/opt/homebrew/Caskroom/miniforge/base/lib/python3.12/site-packages python3.12 -S -m pytest -o addopts='' tests/ -m 'not requires_llm and not requires_db' -q -p no:cacheprovider --junitxml=/private/tmp/daita-v2-p2-gate-final-py312.xml` | PASS — 727 selected and 1 deselected in 7.58s/8.33s on CPython 3.11.15/3.12.7; the final confirmation includes the repaired static-boundary regression |
+| P2-Q08b | `next/` | `/Users/jendala/daita/daita-agents/.venv/bin/black --check src tests scripts`; `/Users/jendala/daita/daita-agents/.venv/bin/python -m compileall -q src tests scripts`; `MYPYPATH=src /Users/jendala/daita/daita-agents/.venv/bin/python -m mypy src/daita tests scripts/build_test_disposition.py`; `npx --yes pyright@1.1.411 --pythonpath /Users/jendala/daita/daita-agents/.venv/bin/python` | PASS after contract repair — the first consolidated mypy/pyright runs exposed 70/65 genuine diagnostics, including malformed provider status/schema/metadata handling and test protocol narrowing; the focused repair passed 176 affected tests, focused mypy/pyright, then final Black (98 files), compilation, mypy (97 files), and pyright (0 errors/warnings) |
+| P2-Q08c | repository root and `next/` | `PYTHONPATH=src:/Users/jendala/daita/daita-agents/.venv/lib/python3.11/site-packages /Users/jendala/daita/daita-agents/.venv/bin/python -S -m pytest -o addopts='' tests/architecture -q -p no:cacheprovider --junitxml=/private/tmp/daita-v2-p2-gate-final-architecture.xml`; `/Users/jendala/daita/daita-agents/.venv/bin/python next/scripts/build_test_disposition.py --check`; `git diff --quiet b87df31873d33fffbf50498f5dc4d8892115e8f8 -- daita tests pyproject.toml`; `git diff --name-only b87df31873d33fffbf50498f5dc4d8892115e8f8`; `find next -type l -print`; ADR-status/plan-parity review; `git diff --check` | PASS — 59 architecture tests in 1.96s; root `daita/`, root tests, and root packaging are unchanged from `b87df318`; every Phase 2 path is under `next/`; v2 has no root import or symlink; all 14 numbered ADRs are Accepted; plan fingerprint is `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935` |
+| P2-Q08d | repository root | `/Users/jendala/daita/daita-agents/.venv/bin/python -m pytest tests/ -m 'not requires_llm and not requires_db' -q -p no:cacheprovider`; `PYTHONPATH=.:/Users/jendala/daita/daita-agents/.venv/lib/python3.11/site-packages /Users/jendala/daita/daita-agents/.venv/bin/python -S next/scripts/capture_v1_oracles.py --check` | PASS — root collected 2,719 and passed all 2,498 selected with 221 deselected; all established v1 fixtures reproduce from the delegated tree |
+| P2-Q08e | clean-copy `project/` directories under `/private/tmp/daita-v2-p2-gate.lDr8Gf` and `/private/tmp/daita-root-p2-gate.eNvGUj` | `/Users/jendala/daita/daita-agents/.venv/bin/python -m build --no-isolation` in each project; archive version/content/cross-inclusion scan; fresh `python -m venv`, `python -m pip install --no-deps .../daita_agents-2.0.0a0-py3-none-any.whl`, and import smoke with CPython 3.11/3.12 | PASS — v2 wheel/sdist contain 35/51 entries at `2.0.0a0`; root wheel/sdist contain 401/442 at `1.0.0`; neither distribution crosses package trees; both v2 installs import from their own site-packages, including the OpenAI adapter without the optional SDK |
+| P2-Q08f | final Phase 2 diff | Review plan parity, ledgers, ADRs, P2-Q07b, root-oracle dispositions, scope, cached diff, and configured hooks; create exactly `chore(v2-phase-2): complete phase 2 gate` | PASS — P2-Q07b's actual `gpt-4.1-mini` result is internally consistent and was preserved without a second paid run; exactly 13 changed paths are under `next/`; hooks pass; the containing detached-worktree commit is the sole P2-10/P2-11 checkpoint |
+
+P2-Q08 has no root-oracle failure. An initial v1-fixture precheck inherited the
+main checkout's editable `daita` and therefore reported that checkout's
+`daita/__init__.py` instead of the delegated worktree; the isolated P2-Q08d
+command corrected module origin and passed without changing an oracle. The
+root distribution emitted only its pre-existing setuptools license/classifier
+deprecation warnings. Pip disabled its unwritable user cache, and npm reported
+its nonfatal `unsafe-perm` configuration warning; all commands still exited 0.
 
 P2-Q03j through P2-Q03n close the refreshed P2-04 code/test-tree, preservation,
 distribution, review, and checkpoint gate.
 
-### Planned Phase 2 evidence sequence
+### Phase 2 evidence accounting
 
-These rows are prospective gates, not passing claims. Each is updated only
-after its command and evidence actually exist.
+Every row is backed by the executed evidence above.
 
 | ID | Scope | Required evidence before PASS |
 | --- | --- | --- |
 | P2-Q01 | Representative persistence seam | PASS — test-first canonical/store seam, optimistic conflict/rollback/history/cancellation proofs, 218 cross-version tests, and refreshed static/architecture/isolation/build reviews |
 | P2-Q02 | SQLite and migrations | PASS — marker/PRAGMA/migration/backup/compatibility gates, normalized lifecycle round-trips, strict corruption rejection, optimistic CAS/rollback, cancellation, reconciliation, dual-Python/static/build proof, and checkpoint `ee6763b` |
-| P2-Q03 | Blobs and events | Durable put-by-content; hash/rename/orphan behavior; state/event same transaction; post-commit subscription, cursor replay, and commit/publish crash-gap coverage |
-| P2-Q04 | Tasks, leases, and recovery | Claim races; fencing; expiry; replay-safe reclaim; terminal skip; manual recovery for unknown side effects; all seven crash/cancel checkpoints |
-| P2-Q05 | Governance and fake side effect | Risk facts and decision-only approval mutation; no executor before approval or after denial; same-operation wake/resume; repeated resume changes the marker once |
+| P2-Q03 | Blobs and events | PASS — P2-Q03a through P2-Q03n prove durable content-addressed blobs, orphan/corruption/cancellation behavior, transactional event state, monotonic cursors, reconnect/subscription, commit-gap replay, cross-version/static/root/distribution gates, and checkpoint scope |
+| P2-Q04 | Tasks, leases, and recovery | PASS — P2-Q04a through P2-Q04q and P2-Q05h prove claim races, immutable fences, expiry, replay-safe reclaim, terminal skip, unsafe manual recovery, blob linkage, all seven crash boundaries, dual-interpreter/static/root/distribution gates, and reviewed checkpoint scope |
+| P2-Q05 | Governance and fake side effect | PASS — P2-Q05k proves persisted risk/fingerprint governance, decision-only approval mutation, zero executor I/O before approval/after denial, same-operation resume, exact-once fake side effect, crash/reopen safety, and post-repair review GO |
 | P2-Q06 | Agent, sessions, and embedded mode | PASS — 132 focused public-agent, affected storage, and architecture cases cover isolated create/open identity, cancellation-safe shared writer admission/bootstrap, no-alias/no-follow paths, authoritative DB/manifest/session linkage, monotonic restart-safe transcripts, sessionless/session isolation, and the thin-facade boundary |
 | P2-Q07 | OpenAI adapter and live loop | PASS — lazy optional import, fake Responses client contracts, provider call-ID and encrypted-reasoning continuation, normalized errors, execution-ownership scan, and explicit live `gpt-4.1-mini` persisted fake loop all pass |
-| P2-Q08 | Phase gate | Full Python 3.11/3.12 suite; static/architecture/import/root-oracle/build scans; parity/ADR/ledger review; scoped hooks and exact Phase 2 gate commit |
+| P2-Q08 | Phase gate | PASS — P2-Q08a through P2-Q08f complete the Python 3.11/3.12, static, architecture/import, root-oracle, distribution/fresh-install, parity/ADR/ledger, hook, scope, and exact-commit gate |
 
-The production-provider row is satisfied by P2-Q07b. The consolidated P2-Q08
-gate remains pending until its full deterministic, cross-version, static,
-architecture, root-oracle, distribution, and ledger checks run.
+The production-provider row is satisfied by P2-Q07b; its live evidence was
+audited for internal consistency and not rerun at additional paid cost.
 
 ## Live and external gates
 

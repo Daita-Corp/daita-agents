@@ -411,6 +411,7 @@ async def test_valid_artifact_uses_runtime_owned_ids_and_exact_blob_provenance(
     case = await _runtime_case(candidate, blob_store=blob_store)
 
     evidence = await case.runtime.submit(_proposal(case))
+    assert evidence is not None
 
     snapshot = await case.runtime.inspect(case.operation_id)
     task = snapshot.tasks[0]
@@ -475,6 +476,7 @@ async def test_blob_is_durable_before_fenced_evidence_acceptance(
         blob_store.release_put.set()
 
     evidence = await submission
+    assert evidence is not None
     accepted = await operation_store.load(case.operation_id)
     assert accepted.snapshot.evidence == (evidence,)
     assert evidence.blob_id == request.blob_id

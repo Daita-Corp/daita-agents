@@ -495,6 +495,7 @@ async def test_accepted_evidence_resets_the_consecutive_failure_count() -> None:
             proposed_at=NOW,
         )
     )
+    assert evidence is not None
     await runtime.append_observation(
         Observation(
             operation_id=operation_id,
@@ -535,6 +536,7 @@ async def test_success_observation_call_id_must_match_its_task() -> None:
             proposed_at=NOW,
         )
     )
+    assert evidence is not None
     before = await runtime.inspect(operation_id)
 
     with pytest.raises(OperationStateError, match="call_id.*task"):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -188,7 +189,7 @@ def _snapshot(
     cancellation_requested: bool = False,
     prerequisite_status: TaskStatus | None = None,
 ) -> OperationSnapshot:
-    target_arguments = {"key": "target"}
+    target_arguments: dict[str, object] = {"key": "target"}
     if target_facts is None:
         target_facts = _safe_read_facts(target_arguments)
     target = _task(
@@ -203,7 +204,7 @@ def _snapshot(
     tasks: list[Task] = []
     dependencies: tuple[TaskDependency, ...] = ()
     if prerequisite_status is not None:
-        prerequisite_arguments = {"key": "prerequisite"}
+        prerequisite_arguments: dict[str, object] = {"key": "prerequisite"}
         prerequisite = _task(
             task_id=PREREQUISITE_TASK_ID,
             call_id=PREREQUISITE_CALL_ID,
@@ -1103,7 +1104,7 @@ async def test_fenced_terminal_state_requires_its_canonical_outcome_event() -> N
 
 
 async def test_expired_unsafe_running_cancellation_fails_closed_to_manual() -> None:
-    arguments = {"key": "target"}
+    arguments: dict[str, object] = {"key": "target"}
     clock = ProbeClock(NOW)
     snapshot = _snapshot(target_facts=_unsafe_side_effect_facts(arguments))
     store, created = await _create(snapshot, clock)
@@ -1199,14 +1200,13 @@ async def test_expired_unsafe_running_cancellation_fails_closed_to_manual() -> N
 )
 async def test_expired_task_recovery_uses_the_explicit_safety_matrix(
     case: str,
-    facts_factory: object,
+    facts_factory: Callable[[dict[str, object]], TaskExecutionFacts],
     started: bool,
     expected_status: TaskStatus,
     release_reason: str,
 ) -> None:
     del case
-    arguments = {"key": "target"}
-    assert callable(facts_factory)
+    arguments: dict[str, object] = {"key": "target"}
     facts = facts_factory(arguments)
     clock = ProbeClock(NOW)
     snapshot = _snapshot(target_facts=facts)
@@ -1488,7 +1488,7 @@ async def test_sqlite_expired_recovery_reclaims_with_monotonic_fence(
 async def test_sqlite_unsafe_started_expiry_persists_manual_recovery(
     tmp_path: Path,
 ) -> None:
-    arguments = {"key": "target"}
+    arguments: dict[str, object] = {"key": "target"}
     clock = ProbeClock(NOW)
     snapshot = _snapshot(target_facts=_unsafe_side_effect_facts(arguments))
     store = await SQLiteOperationStore.open(tmp_path / "manual.db", clock=clock)

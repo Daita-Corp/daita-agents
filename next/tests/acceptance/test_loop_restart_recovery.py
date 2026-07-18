@@ -183,6 +183,12 @@ class CrashAfterCommittedEventStore:
     ) -> VersionedOperation | None:
         return await self.delegate.load_by_trigger(trigger_id)
 
+    async def load_by_approval(
+        self,
+        approval_id: str,
+    ) -> VersionedOperation | None:
+        return await self.delegate.load_by_approval(approval_id)
+
     async def commit(
         self,
         snapshot: OperationSnapshot,
@@ -938,6 +944,7 @@ async def test_resume_mixed_multi_call_checkpoints_in_committed_order(
         first_evidence = await first_runtime.submit(
             _proposal(started.operation.id, turn.id)
         )
+        assert first_evidence is not None
         first_observation = await CountingDomain(first_registry).project_observation(
             first_evidence
         )
@@ -1020,6 +1027,7 @@ async def test_resume_projects_existing_evidence_without_executor_replay(
             _tool_response(),
         )
         evidence = await first_runtime.submit(_proposal(started.operation.id, turn.id))
+        assert evidence is not None
         before_restart = await first_runtime.inspect(started.operation.id)
         assert before_restart.observations == ()
     finally:
@@ -1074,6 +1082,7 @@ async def test_resume_projects_only_missing_item_from_plural_task_evidence(
     first_evidence = await source_runtime.submit(
         _proposal(started.operation.id, turn.id)
     )
+    assert first_evidence is not None
     first_observation = await CountingDomain(source_registry).project_observation(
         first_evidence
     )
@@ -1371,6 +1380,7 @@ async def test_resume_attributes_aggregate_observation_budget_to_durable_frontie
         first_evidence = await first_runtime.submit(
             _proposal(started.operation.id, turn.id)
         )
+        assert first_evidence is not None
         await first_runtime.append_observation(
             await domain.project_observation(first_evidence)
         )
@@ -1385,6 +1395,7 @@ async def test_resume_attributes_aggregate_observation_budget_to_durable_frontie
                 key="beta",
             )
         )
+        assert second_evidence is not None
         await first_runtime.append_observation(
             await domain.project_observation(second_evidence)
         )
@@ -1449,6 +1460,7 @@ async def test_resume_replays_post_observation_budget_check_without_projection(
             budgets=LoopBudgets(max_observation_characters=1),
         )
         evidence = await first_runtime.submit(_proposal(started.operation.id, turn.id))
+        assert evidence is not None
         observation = await CountingDomain(first_registry).project_observation(evidence)
         await first_runtime.append_observation(observation)
         before_restart = await first_runtime.inspect(started.operation.id)

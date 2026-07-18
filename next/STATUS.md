@@ -5,19 +5,15 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-10 — consolidated Phase 2 gate; P2-09 implementation is
-  complete and Phase 3 has not started
-- **Last completed task:** P2-09 — canonical/provider call identity, normalized
-  model errors, and the lazy OpenAI Responses adapter
-- **Current checkpoint:** P2-09 is complete in the local checkpoint containing
-  this ledger; P2-08 remains closed by `f766134`
+- **Active phase:** Phase 2 complete; Phase 3 has not started
+- **Active task:** paused after P2-11 — consolidated Phase 2 completion gate
+- **Last completed task:** P2-11 — final Phase 2 evidence and exact gate commit
+- **Current checkpoint:** P2-09 baseline `da79c88`; the local commit containing
+  this ledger is the sole P2-10/P2-11 completion checkpoint
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** run the single consolidated P2-10 deterministic,
-  cross-version, static, architecture, root-oracle, and distribution gate;
-  create the exact P2-11 gate commit and pause before Phase 3
+- **Exact next action:** stop and await explicit Phase 3 authorization
 
 ## Development cadence
 
@@ -127,8 +123,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-07 | complete | Recovery runtime and persisted governance facts | Immutable risk/policy/task fingerprints, CAS approval records, and one test-owned durable fake side-effect marker with wait, decision-only approval mutation, wake, denial, same-operation resume, and exact-once idempotency | Pre-approval no-I/O, approval mutation no-I/O, exact-fingerprint resume, denial no-I/O, cancellation race with one winner, repeated/concurrent resume marker unchanged, stale holder blocked | P2-06 |
 | P2-08 | complete | SQLite composition, recovery, approvals, committed events | Strict isolated agent home and bootstrap identity manifest, authoritative DB identity, durable sessions/transcripts, shared per-agent writer lock, thin `Agent.create/open/run/inspect/resume`, and embedded composition only | 132 focused public-agent, storage, and architecture cases pass; create/reopen/path/mismatch/concurrency/lock/session isolation/restart and facade boundaries are covered | P2-07 |
 | P2-09 | complete | Persisted embedded fake-capability loop; provider-neutral model contract | Separate canonical/provider call identity, normalized provider errors, lazy optional OpenAI Responses adapter, fake-client contract tests, and one live persisted fake-capability loop | Final 44-case provider/model/SQLite/architecture selection and the credential-gated SQLite-backed live loop pass with explicit `gpt-4.1-mini`; encrypted reasoning continuation survives persistence and the provider remains translation-only | P2-08 |
-| P2-10 | pending | Complete Phase 2 vertical slice | Consolidated restart, failure-injection, approval, event, import, architecture, static, cross-version, root-oracle, and clean-build evidence with parity/quality/ADR review | Complete Phase 2 gate suite on Python 3.11/3.12 plus live production-provider evidence; no mock substitutes for live evidence | P2-09 |
-| P2-11 | pending | Passing P2-10 results | Final Phase 2 ledger/evidence and coherent exact gate commit | Scoped diff/hooks; all paths under `next/`; exact `chore(v2-phase-2): complete phase 2 gate` commit | P2-10 |
+| P2-10 | complete | Complete Phase 2 vertical slice | Consolidated restart, failure-injection, approval, event, import, architecture, static, cross-version, root-oracle, and clean-build evidence with parity/quality/ADR review | 727 selected deterministic tests pass on Python 3.11/3.12; 59 architecture tests, static checks, root oracle, distributions, fresh imports, and audited live-provider evidence pass | P2-09 |
+| P2-11 | complete | Passing P2-10 results | Final Phase 2 ledger/evidence and coherent exact gate commit | Exactly 13 paths under `next/`; scoped diff/hooks pass; containing commit uses `chore(v2-phase-2): complete phase 2 gate` | P2-10 |
 
 ### Ordered P2-03 internal tasks
 
@@ -919,6 +915,33 @@ re-read and an updated ordered ledger.
       preserved model calls, task, evidence, observation, events, and the
       terminal answer.
 - [x] P2-10/P2-11 retain the only broad Phase 2 gate. Phase 3 has not started.
+
+## P2-10/P2-11 completion gate record
+
+- [x] The deterministic suite with `not requires_llm and not requires_db`
+      passes 727 selected cases with 1 deselected on CPython 3.11.15 and 3.12.7.
+- [x] The first consolidated mypy/pyright runs found 70/65 genuine static
+      diagnostics. The OpenAI translation boundary now freezes/thaws schemas
+      and metadata explicitly, validates replay-item shapes, and rejects
+      malformed status codes safely; test doubles and optional records use
+      exact protocol/narrowing contracts. The affected 176-case slice and both
+      focused type checks pass before the final complete confirmation.
+- [x] Black checks all 98 files, byte compilation succeeds, mypy checks all 97
+      files, pyright 1.1.411 reports 0 errors/warnings, and all 59 architecture
+      tests pass. V2 imports no root `daita`, contains no symlink, and all 14
+      numbered ADRs are Accepted.
+- [x] The root safe suite passes all 2,498 selected cases with 221 deselected;
+      disposition and v1 fixtures reproduce; root `daita/`, tests, and package
+      metadata remain unchanged from `b87df318`.
+- [x] Clean v2/root builds contain 35/51 and 401/442 wheel/sdist entries at
+      `2.0.0a0` and `1.0.0`, with no cross-inclusion. Fresh CPython 3.11/3.12
+      v2 installs import their own agent/runtime/storage/OpenAI modules.
+- [x] The recorded P2-Q07b actual `gpt-4.1-mini` live pass is internally
+      consistent after encrypted-reasoning replay and was not rerun.
+- [x] Exactly 13 final paths are under `next/`; scoped diff and configured hooks
+      pass; the containing detached-worktree commit uses the exact subject
+      `chore(v2-phase-2): complete phase 2 gate`.
+- [x] Phase 3 was not started.
 
 ## Credentials and external dependencies
 

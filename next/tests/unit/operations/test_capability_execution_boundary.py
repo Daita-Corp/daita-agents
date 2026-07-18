@@ -469,6 +469,7 @@ async def test_submit_executes_only_after_fenced_start_and_forwards_identity() -
     )
 
     evidence = await runtime.submit(_proposal(operation_id, turn_id))
+    assert evidence is not None
 
     assert len(executor.snapshots_at_entry) == 1
     at_entry = executor.snapshots_at_entry[0]
@@ -789,6 +790,7 @@ async def test_runtime_fenced_lifecycle_round_trips_through_sqlite(
         )
 
         evidence = await runtime.submit(_proposal(operation_id, turn_id))
+        assert evidence is not None
         final = await runtime.inspect(operation_id)
 
         assert final.tasks[0].status is TaskStatus.SUCCEEDED
@@ -1174,6 +1176,7 @@ async def test_call_id_may_be_reused_by_a_later_model_response() -> None:
         await _runtime_with_committed_tool_call(candidate)
     )
     first_evidence = await runtime.submit(_proposal(operation_id, first_turn_id))
+    assert first_evidence is not None
     await runtime.append_observation(
         Observation(
             operation_id=operation_id,
@@ -1233,6 +1236,7 @@ async def test_call_id_may_be_reused_by_a_later_model_response() -> None:
             arguments={"key": "beta"},
         )
     )
+    assert second_evidence is not None
 
     final = await runtime.inspect(operation_id)
     assert len(executor.requests) == 2
@@ -1386,6 +1390,7 @@ async def test_observation_event_failure_preserves_succeeded_task_and_evidence()
         id_factory=fail_observation_event,
     )
     evidence = await runtime.submit(_proposal(operation_id, turn_id))
+    assert evidence is not None
     before = await runtime.inspect(operation_id)
     observation = Observation(
         operation_id=operation_id,

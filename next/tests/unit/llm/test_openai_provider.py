@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +44,10 @@ class SimpleNamespaceError(Exception):
         self.status_code = status_code
         self.code = code
         super().__init__(f"status {status_code}")
+
+
+class MalformedStatusError(Exception):
+    status_code = "503"
 
 
 def _message(role: MessageRole, text: str) -> CanonicalMessage:
@@ -309,6 +314,7 @@ async def test_reasoning_items_are_persistable_and_replayed_before_tool_outputs(
         ),
         (SimpleNamespaceError(400), ProviderErrorCode.INVALID_REQUEST),
         (SimpleNamespaceError(503), ProviderErrorCode.PROVIDER_UNAVAILABLE),
+        (MalformedStatusError(), ProviderErrorCode.PROVIDER_UNAVAILABLE),
         (TimeoutError(), ProviderErrorCode.TIMEOUT),
     ],
 )
@@ -372,10 +378,16 @@ def test_missing_sdk_uses_the_repository_install_hint(
 ) -> None:
     original_import = builtins.__import__
 
-    def blocked_import(name: str, *args: object, **kwargs: object) -> object:
+    def blocked_import(
+        name: str,
+        globals: Mapping[str, object] | None = None,
+        locals: Mapping[str, object] | None = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> object:
         if name == "openai" or name.startswith("openai."):
             raise ImportError("blocked for test")
-        return original_import(name, *args, **kwargs)
+        return original_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", blocked_import)
     provider = OpenAIResponsesProvider("gpt-test")
@@ -389,10 +401,16 @@ async def test_generate_preserves_the_missing_sdk_install_hint(
 ) -> None:
     original_import = builtins.__import__
 
-    def blocked_import(name: str, *args: object, **kwargs: object) -> object:
+    def blocked_import(
+        name: str,
+        globals: Mapping[str, object] | None = None,
+        locals: Mapping[str, object] | None = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> object:
         if name == "openai" or name.startswith("openai."):
             raise ImportError("blocked for test")
-        return original_import(name, *args, **kwargs)
+        return original_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", blocked_import)
     provider = OpenAIResponsesProvider("gpt-test")

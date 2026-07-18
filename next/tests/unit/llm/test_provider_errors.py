@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from daita._json import FrozenJsonObject
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     CanonicalMessage,
@@ -114,7 +115,9 @@ async def test_loop_persists_only_normalized_provider_error_code() -> None:
     assert (
         snapshot.model_calls[-1].error_code == ProviderErrorCode.RATE_LIMIT_ERROR.value
     )
-    assert snapshot.events[-2].payload.to_dict() == {
+    error_payload = snapshot.events[-2].payload
+    assert isinstance(error_payload, FrozenJsonObject)
+    assert error_payload.to_dict() == {
         "error_code": ProviderErrorCode.RATE_LIMIT_ERROR.value,
         "model_call_id": snapshot.model_calls[-1].id,
     }

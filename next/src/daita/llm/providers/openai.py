@@ -91,7 +91,9 @@ class OpenAIResponsesProvider:
                     "type": "function",
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": tool.input_schema.to_dict(),
+                    "parameters": FrozenJsonObject.from_mapping(
+                        tool.input_schema
+                    ).to_dict(),
                     "strict": False,
                 }
                 for tool in request.tools
@@ -209,17 +211,24 @@ def _response_input(messages: tuple[CanonicalMessage, ...]) -> list[dict[str, ob
     items: list[dict[str, object]] = []
     provider_call_ids: dict[str, str] = {}
     for message in messages:
-        replay_value = message.provider_metadata.get("openai_replay_items")
+        metadata = FrozenJsonObject.from_mapping(message.provider_metadata)
+        replay_value = metadata.get("openai_replay_items")
         if replay_value is not None:
             replay_items = thaw_json(replay_value)
-            if not isinstance(replay_items, list) or any(
-                not isinstance(item, dict) for item in replay_items
-            ):
+            if not isinstance(replay_items, list):
                 raise ModelProviderError(
                     ProviderErrorCode.INVALID_REQUEST,
                     "OpenAI replay metadata must contain JSON objects",
                 )
-            items.extend(replay_items)
+            decoded_replay_items: list[dict[str, object]] = []
+            for replay_item in replay_items:
+                if not isinstance(replay_item, dict):
+                    raise ModelProviderError(
+                        ProviderErrorCode.INVALID_REQUEST,
+                        "OpenAI replay metadata must contain JSON objects",
+                    )
+                decoded_replay_items.append(replay_item)
+            items.extend(decoded_replay_items)
         text = "\n".join(
             block.text for block in message.content if isinstance(block, TextBlock)
         ).strip()
@@ -265,17 +274,17 @@ def _plain_provider_item(item: object) -> dict[str, object]:
         return FrozenJsonObject.from_mapping(item).to_dict()
     model_dump = getattr(item, "model_dump", None)
     if callable(model_dump):
-        value = model_dump(mode="json", exclude_none=True)
-        if isinstance(value, Mapping):
-            return FrozenJsonObject.from_mapping(value).to_dict()
-    value: dict[str, object] = {}
+        dumped_value = model_dump(mode="json", exclude_none=True)
+        if isinstance(dumped_value, Mapping):
+            return FrozenJsonObject.from_mapping(dumped_value).to_dict()
+    provider_item: dict[str, object] = {}
     for name in ("id", "type", "summary", "status", "encrypted_content"):
         field = getattr(item, name, _MISSING)
         if field is not _MISSING and field is not None:
-            value[name] = field
-    if value.get("type") != "reasoning":
+            provider_item[name] = field
+    if provider_item.get("type") != "reasoning":
         raise ValueError("reasoning replay item is malformed")
-    return FrozenJsonObject.from_mapping(value).to_dict()
+    return FrozenJsonObject.from_mapping(provider_item).to_dict()
 
 
 def _message_text(item: object) -> list[str]:
@@ -316,7 +325,12 @@ def _decode_usage(value: object) -> ModelUsage:
 
 
 def _normalize_error(error: Exception) -> ModelProviderError:
-    status = _field(error, "status_code", None)
+    status_value = _field(error, "status_code", None)
+    status = (
+        status_value
+        if isinstance(status_value, int) and not isinstance(status_value, bool)
+        else None
+    )
     code = _optional_text(_field(error, "code", None), "provider error code")
     name = type(error).__name__.lower()
     if isinstance(error, (asyncio.TimeoutError, TimeoutError)) or "timeout" in name:

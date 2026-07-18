@@ -392,13 +392,19 @@ async def test_run_inspect_resume_and_session_transcripts_survive_reopen(
         MessageRole.ASSISTANT,
     ]
     assert [
-        block.text for message in transcript_a.messages for block in message.content
+        block.text
+        for message in transcript_a.messages
+        for block in message.content
+        if isinstance(block, TextBlock)
     ] == [
         "first question",
         "first answer",
     ]
     assert [
-        block.text for message in transcript_b.messages for block in message.content
+        block.text
+        for message in transcript_b.messages
+        for block in message.content
+        if isinstance(block, TextBlock)
     ] == [
         "isolated question",
         "isolated answer",
@@ -413,7 +419,10 @@ async def test_run_inspect_resume_and_session_transcripts_survive_reopen(
     assert len(transcript_a.operation_ids) == 2
     assert len(transcript_a.messages) == 4
     assert [
-        block.text for message in transcript_a.messages for block in message.content
+        block.text
+        for message in transcript_a.messages
+        for block in message.content
+        if isinstance(block, TextBlock)
     ] == [
         "first question",
         "first answer",

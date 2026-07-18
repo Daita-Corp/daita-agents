@@ -7,7 +7,7 @@ import hashlib
 
 import pytest
 
-from daita._json import canonical_json
+from daita._json import FrozenJsonObject, canonical_json
 from daita.capabilities import (
     AccessMode,
     Capability,
@@ -407,6 +407,7 @@ async def test_resume_reclaims_expired_replay_safe_running_task_with_same_identi
     assert request.task_id == TASK_ID
     assert request.capability_id == capability.id
     assert request.executor_id == capability.executor_id
+    assert isinstance(request.arguments, FrozenJsonObject)
     assert request.arguments.to_dict() == {"key": "alpha"}
     assert request.idempotency_key == expected_idempotency_key
     assert request.attempt == 2
@@ -466,6 +467,7 @@ async def test_resume_returns_existing_success_without_reexecuting() -> None:
 
     assert evidence is not None
     assert evidence.id == "evidence-existing"
+    assert isinstance(evidence.payload, FrozenJsonObject)
     assert evidence.payload.to_dict() == {"key": "alpha", "value": "EXISTING"}
     assert executor.requests == []
     final = await runtime.inspect(OPERATION_ID)

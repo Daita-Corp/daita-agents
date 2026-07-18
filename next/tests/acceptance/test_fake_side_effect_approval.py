@@ -233,7 +233,7 @@ class MarkerContextBuilder:
         tools: tuple[ToolDefinition, ...],
     ) -> ModelRequest:
         if not operation.model_calls:
-            messages = (
+            messages: tuple[CanonicalMessage, ...] = (
                 CanonicalMessage(
                     agent_id=operation.operation.agent_id,
                     operation_id=operation.operation.id,
