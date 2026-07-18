@@ -336,66 +336,30 @@ def _with_completed_model(snapshot: OperationSnapshot) -> OperationSnapshot:
     )
 
 
-def _with_completed_task(
+def _with_task_cancellation(
     snapshot: OperationSnapshot,
     *,
-    final_event_type: str = "readiness.recorded",
+    event_type: str = "task.cancellation_requested",
 ) -> OperationSnapshot:
     task_turn = snapshot.turns[1]
     tools_call = snapshot.model_calls[1]
-    pending_task = snapshot.tasks[1]
-    evidence = Evidence(
-        id=f"{snapshot.operation.id}:evidence:mutable",
-        operation_id=snapshot.operation.id,
-        task_id=pending_task.id,
-        turn_id=pending_task.turn_id,
-        capability_id=pending_task.capability_id,
-        executor_id=pending_task.executor_id,
-        kind="fake.record",
-        schema_version=1,
-        attempt=pending_task.attempt,
-        accepted=True,
-        payload={"value": "mutable"},
-        content_hash="sha256:" + "2" * 64,
-        created_at=TASK_COMPLETED_AT,
-    )
-    completed_task = replace(
-        pending_task,
-        status=TaskStatus.SUCCEEDED,
-        evidence_ids=(evidence.id,),
+    mutable_task = snapshot.tasks[1]
+    cancelled_task = replace(
+        mutable_task,
         cancellation_requested=True,
         updated_at=TASK_COMPLETED_AT,
     )
-    observation = Observation(
-        operation_id=snapshot.operation.id,
-        turn_id=completed_task.turn_id,
-        call_id=completed_task.call_id,
-        task_id=completed_task.id,
-        evidence_id=evidence.id,
-        code="fake.read.succeeded",
-        message="Mutable evidence was accepted.",
-        payload={"value": "mutable"},
-        success=True,
-        created_at=TASK_COMPLETED_AT,
-    )
-    task_event = _event(
+    event = _event(
         snapshot.operation.id,
-        f"{snapshot.operation.id}:event:task-completed",
-        "task.succeeded",
+        f"{snapshot.operation.id}:event:task-cancellation",
+        event_type,
         TASK_COMPLETED_AT,
         turn_id=task_turn.id,
         model_call_id=tools_call.id,
-        call_id=completed_task.call_id,
-        task_id=completed_task.id,
-        evidence_id=evidence.id,
-        capability_id=completed_task.capability_id,
-        executor_id=completed_task.executor_id,
-    )
-    final_event = _event(
-        snapshot.operation.id,
-        f"{snapshot.operation.id}:event:final-checkpoint",
-        final_event_type,
-        TASK_COMPLETED_AT,
+        call_id=cancelled_task.call_id,
+        task_id=cancelled_task.id,
+        capability_id=cancelled_task.capability_id,
+        executor_id=cancelled_task.executor_id,
     )
     return replace(
         snapshot,
@@ -403,24 +367,8 @@ def _with_completed_task(
             snapshot.operation,
             updated_at=TASK_COMPLETED_AT,
         ),
-        loop_state=replace(
-            snapshot.loop_state,
-            phase=LoopPhase.OBSERVING,
-            observation_characters=128,
-        ),
-        readiness=(
-            *snapshot.readiness,
-            Readiness(
-                allowed=True,
-                code="ready",
-                message="Both facts are supported.",
-                evaluated_at=TASK_COMPLETED_AT,
-            ),
-        ),
-        tasks=(snapshot.tasks[0], completed_task),
-        evidence=(*snapshot.evidence, evidence),
-        observations=(*snapshot.observations, observation),
-        events=(*snapshot.events, task_event, final_event),
+        tasks=(snapshot.tasks[0], cancelled_task),
+        events=(*snapshot.events, event),
     )
 
 
@@ -518,14 +466,14 @@ async def test_commit_persists_legal_mutations_and_exact_event_suffixes(
         )
         assert model_completed.model_calls[0].status is ModelCallStatus.COMPLETED
 
-        task_completed = _with_completed_task(model_completed)
-        third = await store.commit(task_completed, expected_revision=2)
+        cancellation_committed = _with_task_cancellation(model_completed)
+        third = await store.commit(cancellation_committed, expected_revision=2)
 
         assert third.operation.revision == 3
-        assert third.operation.snapshot == task_completed
-        assert third.committed_events == task_completed.events[-2:]
-        assert task_completed.tasks[1].status is TaskStatus.SUCCEEDED
-        assert task_completed.tasks[1].cancellation_requested is True
+        assert third.operation.snapshot == cancellation_committed
+        assert third.committed_events == (cancellation_committed.events[-1],)
+        assert cancellation_committed.tasks[1].status is TaskStatus.RUNNING
+        assert cancellation_committed.tasks[1].cancellation_requested is True
         assert await store.load(initial.operation.id) == third.operation
         assert await store.load_by_trigger(initial.trigger.id) == third.operation
         assert created.operation.revision == 1
@@ -827,9 +775,9 @@ async def test_runtime_event_abort_rolls_back_commit_to_exact_prior_snapshot(
 ) -> None:
     path = tmp_path / "state.db"
     initial = _initial_snapshot(mutable_task_status=TaskStatus.RUNNING)
-    candidate = _with_completed_task(
+    candidate = _with_task_cancellation(
         _with_completed_model(initial),
-        final_event_type="test.force_abort",
+        event_type="test.force_abort",
     )
     store = await SQLiteOperationStore.open(path)
     try:

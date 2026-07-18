@@ -334,6 +334,7 @@ def _task_event(
     event_id: str,
     event_type: str,
     created_at: datetime,
+    evidence_id: str | None = None,
     payload: dict[str, object] | None = None,
 ) -> RuntimeEvent:
     task = _target(snapshot)
@@ -347,6 +348,7 @@ def _task_event(
         model_call_id="model-call-1",
         call_id=task.call_id,
         task_id=task.id,
+        evidence_id=evidence_id,
         capability_id=task.capability_id,
         executor_id=task.executor_id,
         payload={} if payload is None else payload,
@@ -443,6 +445,114 @@ def _start_candidate(claim: TaskClaimResult, at: datetime) -> OperationSnapshot:
         tasks=_replace_target(snapshot, task),
         task_leases=_replace_lease(snapshot, claim.lease, lease),
         events=(*snapshot.events, event),
+    )
+
+
+def _terminal_candidate(
+    started: VersionedOperation,
+    *,
+    at: datetime,
+    outcome: str,
+) -> tuple[OperationSnapshot, TaskLeaseGuard]:
+    snapshot = started.snapshot
+    running = _target(snapshot)
+    active = next(
+        lease
+        for lease in reversed(snapshot.task_leases)
+        if lease.task_id == running.id and lease.released_at is None
+    )
+    guard = _guard(active)
+    events: tuple[RuntimeEvent, ...]
+    evidence_suffix: tuple[Evidence, ...]
+    if outcome == "success":
+        evidence = Evidence(
+            id="evidence-terminal",
+            operation_id=running.operation_id,
+            task_id=running.id,
+            turn_id=running.turn_id,
+            capability_id=running.capability_id,
+            executor_id=running.executor_id,
+            kind="fake.result",
+            schema_version=1,
+            attempt=running.attempt,
+            accepted=True,
+            payload={"value": "accepted"},
+            content_hash=_content_hash({"value": "accepted"}),
+            created_at=at,
+        )
+        terminal = replace(
+            running,
+            status=TaskStatus.SUCCEEDED,
+            evidence_ids=(evidence.id,),
+            updated_at=at,
+        )
+        released = replace(
+            active,
+            released_at=at,
+            release_reason="completed",
+        )
+        events = (
+            _task_event(
+                snapshot,
+                event_id="event-executor-completed",
+                event_type="executor.completed",
+                created_at=at,
+            ),
+            _task_event(
+                snapshot,
+                event_id="event-evidence-accepted",
+                event_type="evidence.accepted",
+                created_at=at,
+                evidence_id=evidence.id,
+            ),
+            _task_event(
+                snapshot,
+                event_id="event-task-succeeded",
+                event_type="task.succeeded",
+                created_at=at,
+                evidence_id=evidence.id,
+            ),
+        )
+        evidence_suffix = (evidence,)
+    elif outcome == "failure":
+        terminal = replace(
+            running,
+            status=TaskStatus.FAILED,
+            error_code="executor_failed",
+            updated_at=at,
+        )
+        released = replace(
+            active,
+            released_at=at,
+            release_reason="executor_failed",
+        )
+        events = (
+            _task_event(
+                snapshot,
+                event_id="event-task-failed",
+                event_type="task.failed",
+                created_at=at,
+            ),
+            _task_event(
+                snapshot,
+                event_id="event-executor-failed",
+                event_type="executor.failed",
+                created_at=at,
+            ),
+        )
+        evidence_suffix = ()
+    else:
+        raise AssertionError(f"unknown terminal outcome: {outcome}")
+    return (
+        replace(
+            snapshot,
+            operation=replace(snapshot.operation, updated_at=at),
+            tasks=_replace_target(snapshot, terminal),
+            task_leases=_replace_lease(snapshot, active, released),
+            evidence=(*snapshot.evidence, *evidence_suffix),
+            events=(*snapshot.events, *events),
+        ),
+        guard,
     )
 
 
@@ -1475,6 +1585,88 @@ async def test_sqlite_claim_event_failure_rolls_back_the_whole_transition(
                 "SELECT COUNT(*) FROM task_leases WHERE operation_id = ?",
                 (snapshot.operation.id,),
             ).fetchone() == (0,)
+        finally:
+            inspection.close()
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "abort_event_type"),
+    (
+        ("success", "evidence.accepted"),
+        ("failure", "executor.failed"),
+    ),
+)
+async def test_sqlite_terminal_event_failure_rolls_back_task_lease_and_evidence(
+    tmp_path: Path,
+    outcome: str,
+    abort_event_type: str,
+) -> None:
+    path = tmp_path / f"terminal-{outcome}-rollback.db"
+    clock = ProbeClock(NOW)
+    snapshot = _snapshot()
+    store = await SQLiteOperationStore.open(path, clock=clock)
+    try:
+        created = await store.create(snapshot)
+        claim = await store.claim_task(
+            _claim_request(snapshot),
+            expected_revision=created.operation.revision,
+        )
+        clock.set(NOW + timedelta(seconds=1))
+        started = await store.commit_fenced(
+            _start_candidate(claim, clock.now),
+            expected_revision=claim.commit_result.operation.revision,
+            guard=_guard(claim.lease),
+        )
+        before = started.operation
+        candidate, guard = _terminal_candidate(
+            before,
+            at=NOW + timedelta(seconds=2),
+            outcome=outcome,
+        )
+        trigger_connection = sqlite3.connect(path)
+        try:
+            trigger_connection.execute(f"""
+                CREATE TRIGGER abort_terminal_event
+                BEFORE INSERT ON runtime_events
+                WHEN NEW.type = '{abort_event_type}'
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced terminal event failure');
+                END
+                """)
+            trigger_connection.commit()
+        finally:
+            trigger_connection.close()
+        clock.set(NOW + timedelta(seconds=2))
+
+        with pytest.raises(sqlite3.IntegrityError, match="forced terminal event"):
+            await store.commit_fenced(
+                candidate,
+                expected_revision=before.revision,
+                guard=guard,
+            )
+
+        assert await store.load(snapshot.operation.id) == before
+        inspection = sqlite3.connect(path)
+        try:
+            assert inspection.execute(
+                "SELECT revision FROM operations WHERE id = ?",
+                (snapshot.operation.id,),
+            ).fetchone() == (before.revision,)
+            assert inspection.execute(
+                "SELECT status FROM tasks WHERE operation_id = ? AND id = ?",
+                (snapshot.operation.id, TARGET_TASK_ID),
+            ).fetchone() == (TaskStatus.RUNNING.value,)
+            assert inspection.execute(
+                "SELECT released_at, release_reason FROM task_leases "
+                "WHERE operation_id = ? AND task_id = ?",
+                (snapshot.operation.id, TARGET_TASK_ID),
+            ).fetchone() == (None, None)
+            assert inspection.execute(
+                "SELECT COUNT(*) FROM evidence WHERE operation_id = ?",
+                (snapshot.operation.id,),
+            ).fetchone() == (len(before.snapshot.evidence),)
         finally:
             inspection.close()
     finally:

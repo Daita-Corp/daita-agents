@@ -619,6 +619,69 @@ async def test_ordinary_commit_cannot_advance_an_actively_leased_task() -> None:
         )
 
 
+async def test_ordinary_commit_cannot_start_an_unleased_pending_task() -> None:
+    initial = _snapshot()
+    store = InMemoryOperationStore()
+    created = await store.create(initial)
+    pending = initial.tasks[0]
+    candidate = _with_event(
+        replace(
+            initial,
+            tasks=(
+                replace(
+                    pending,
+                    status=TaskStatus.RUNNING,
+                    updated_at=NOW + timedelta(seconds=1),
+                ),
+                *initial.tasks[1:],
+            ),
+        ),
+        "event-unleased-task-start",
+    )
+
+    with pytest.raises(InvalidOperationCheckpointError, match="claim|fenc|lease"):
+        await store.commit(
+            candidate,
+            expected_revision=created.operation.revision,
+        )
+
+
+async def test_ordinary_commit_cannot_terminalize_an_unleased_running_task() -> None:
+    pending = _snapshot()
+    running_task = replace(
+        pending.tasks[0],
+        status=TaskStatus.RUNNING,
+        updated_at=NOW + timedelta(seconds=1),
+    )
+    initial = replace(
+        pending,
+        tasks=(running_task, *pending.tasks[1:]),
+    )
+    store = InMemoryOperationStore()
+    created = await store.create(initial)
+    candidate = _with_event(
+        replace(
+            initial,
+            tasks=(
+                replace(
+                    running_task,
+                    status=TaskStatus.FAILED,
+                    error_code="executor_failed",
+                    updated_at=NOW + timedelta(seconds=2),
+                ),
+                *initial.tasks[1:],
+            ),
+        ),
+        "event-unleased-task-failure",
+    )
+
+    with pytest.raises(InvalidOperationCheckpointError, match="fenc|lease"):
+        await store.commit(
+            candidate,
+            expected_revision=created.operation.revision,
+        )
+
+
 async def test_task_claim_result_binds_task_and_lease_execution_identity() -> None:
     lease = _lease()
     snapshot = _snapshot(task_leases=(lease,))

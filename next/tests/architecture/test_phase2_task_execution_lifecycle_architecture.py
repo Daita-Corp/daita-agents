@@ -6,6 +6,7 @@ import re
 
 NEXT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = NEXT_ROOT / "src" / "daita"
+CAPABILITIES = SOURCE_ROOT / "capabilities.py"
 OPERATION_STORE = SOURCE_ROOT / "operations" / "store.py"
 OPERATION_RUNTIME = SOURCE_ROOT / "operations" / "runtime.py"
 OPERATION_LEASES = SOURCE_ROOT / "operations" / "leases.py"
@@ -272,3 +273,61 @@ def test_operation_runtime_remains_the_sole_executor_invocation_boundary() -> No
                 callers.append((_relative_path(path), ast.unparse(node.func)))
 
     assert callers == [("operations/runtime.py", "executor.execute")]
+
+
+def test_operation_runtime_consumes_the_existing_fenced_store_contract() -> None:
+    runtime_tree = _required_tree(OPERATION_RUNTIME)
+    runtime = _class_definition(runtime_tree, "OperationRuntime")
+    state = _class_definition(runtime_tree, "_OperationState")
+    request = _class_definition(_required_tree(CAPABILITIES), "ExecutionRequest")
+
+    state_fields = {
+        node.target.id
+        for node in state.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert {"task_dependencies", "task_leases"} <= state_fields
+
+    request_fields = {
+        node.target.id
+        for node in request.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert {
+        "executor_id",
+        "attempt",
+        "fencing_token",
+        "idempotency_key",
+    } <= request_fields
+
+    constructors = [
+        node
+        for node in runtime.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    ]
+    assert len(constructors) == 1
+    store_argument = next(
+        argument
+        for argument in constructors[0].args.kwonlyargs
+        if argument.arg == "store"
+    )
+    assert store_argument.annotation is not None
+    assert "TaskExecutionStore" in ast.unparse(store_argument.annotation)
+
+    submit = next(
+        node
+        for node in runtime.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "submit"
+    )
+    store_calls = {
+        _attribute_parts(node.func)
+        for node in ast.walk(submit)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert ("self", "_store", "claim_task") in store_calls
+    runtime_calls = {
+        _attribute_parts(node.func)
+        for node in ast.walk(runtime)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert ("self", "_store", "commit_fenced") in runtime_calls

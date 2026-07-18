@@ -430,8 +430,13 @@ async def test_cancellation_during_executor_io_preserves_running_task_intent() -
     assert task.error_code is None
     assert snapshot.evidence == ()
     assert snapshot.observations == ()
-    assert [event.type for event in snapshot.events][-4:] == [
+    assert len(snapshot.task_leases) == 1
+    assert snapshot.task_leases[0].started_at is not None
+    assert snapshot.task_leases[0].released_at is None
+    assert [event.type for event in snapshot.events][-6:] == [
         "task.created",
+        "task.ready",
+        "task.claimed",
         "executor.started",
         "task.cancellation_requested",
         "operation.interrupted",
@@ -473,6 +478,9 @@ async def test_executor_cannot_suppress_caller_cancellation() -> None:
     assert snapshot.operation.status is OperationStatus.INTERRUPTED
     assert snapshot.tasks[-1].status is TaskStatus.RUNNING
     assert snapshot.tasks[-1].cancellation_requested is True
+    assert len(snapshot.task_leases) == 1
+    assert snapshot.task_leases[0].started_at is not None
+    assert snapshot.task_leases[0].released_at is None
     assert snapshot.evidence == ()
     assert snapshot.observations == ()
     assert not any(event.type == "evidence.accepted" for event in snapshot.events)

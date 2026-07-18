@@ -86,8 +86,25 @@ class RecordingReadExecutor:
         at_entry = await self.runtime.inspect(request.operation_id)
         task = next(task for task in at_entry.tasks if task.id == request.task_id)
         assert task.status is TaskStatus.RUNNING
-        assert at_entry.events[-2].type == "task.created"
-        assert at_entry.events[-1].type == "executor.started"
+        task_events = [
+            event.type for event in at_entry.events if event.task_id == request.task_id
+        ]
+        assert task_events == [
+            "task.created",
+            "task.ready",
+            "task.claimed",
+            "executor.started",
+        ]
+        lease = next(
+            lease
+            for lease in at_entry.task_leases
+            if lease.task_id == request.task_id and lease.released_at is None
+        )
+        assert lease.started_at is not None
+        assert request.attempt == task.attempt == lease.attempt
+        assert request.fencing_token == lease.fencing_token
+        assert request.executor_id == task.executor_id
+        assert request.idempotency_key == task.execution_facts.idempotency_key
         assert not any(
             evidence.task_id == request.task_id for evidence in at_entry.evidence
         )
@@ -299,6 +316,8 @@ async def test_fake_reads_follow_the_only_durable_executor_path_in_order(
 
     action_events = [
         "task.created",
+        "task.ready",
+        "task.claimed",
         "executor.started",
         "executor.completed",
         "evidence.accepted",
@@ -328,6 +347,8 @@ async def test_fake_reads_follow_the_only_durable_executor_path_in_order(
         "model_call.started",
         "model_response.recorded",
         "task.created",
+        "task.ready",
+        "task.claimed",
         "executor.started",
         "executor.completed",
         "evidence.accepted",

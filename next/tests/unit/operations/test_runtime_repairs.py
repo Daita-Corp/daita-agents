@@ -485,7 +485,7 @@ async def test_accepted_evidence_resets_the_consecutive_failure_count() -> None:
         operation_id,
         successful_call,
     )
-    await runtime.submit(
+    evidence = await runtime.submit(
         ActionProposal(
             operation_id=operation_id,
             turn_id=successful_turn_id,
@@ -495,6 +495,20 @@ async def test_accepted_evidence_resets_the_consecutive_failure_count() -> None:
             proposed_at=NOW,
         )
     )
+    await runtime.append_observation(
+        Observation(
+            operation_id=operation_id,
+            turn_id=successful_turn_id,
+            call_id=successful_call.id,
+            code="fake.read.succeeded",
+            message="Fake read completed.",
+            payload=evidence.payload,
+            success=True,
+            task_id=evidence.task_id,
+            evidence_id=evidence.id,
+            created_at=NOW,
+        )
+    )
 
     snapshot = await runtime.inspect(operation_id)
     assert snapshot.loop_state.repair_count == 1
@@ -502,6 +516,7 @@ async def test_accepted_evidence_resets_the_consecutive_failure_count() -> None:
     assert snapshot.loop_state.no_progress_fingerprints == ()
     assert len(snapshot.evidence) == 1
     assert snapshot.evidence[0].accepted is True
+    assert len(snapshot.observations) == 2
     assert len(executor.requests) == 1
 
 

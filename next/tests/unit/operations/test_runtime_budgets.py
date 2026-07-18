@@ -194,6 +194,10 @@ async def test_operation_bound_timeout_fails_task_without_accepting_evidence() -
     assert snapshot.tasks[0].status is TaskStatus.FAILED
     assert snapshot.tasks[0].error_code == "task_timeout"
     assert snapshot.tasks[0].evidence_ids == ()
+    assert len(snapshot.task_leases) == 1
+    assert snapshot.task_leases[0].started_at is not None
+    assert snapshot.task_leases[0].released_at is not None
+    assert snapshot.task_leases[0].release_reason == "task_timeout"
     assert snapshot.evidence == ()
     task_failure_events = [
         event
@@ -232,6 +236,10 @@ async def test_executor_raised_timeout_remains_an_executor_failure() -> None:
     assert len(snapshot.tasks) == 1
     assert snapshot.tasks[0].status is TaskStatus.FAILED
     assert snapshot.tasks[0].error_code == "executor_failed"
+    assert len(snapshot.task_leases) == 1
+    assert snapshot.task_leases[0].started_at is not None
+    assert snapshot.task_leases[0].released_at is not None
+    assert snapshot.task_leases[0].release_reason == "executor_failed"
     assert snapshot.evidence == ()
     assert not any(
         event.type == "budget.exhausted"

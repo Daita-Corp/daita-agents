@@ -13,11 +13,13 @@ from uuid import uuid4
 
 from .._json import canonical_json
 from ..capabilities import (
+    Capability,
     CapabilityExecutionError,
     CapabilityRegistry,
     EvidenceCandidate,
     EvidenceValidationError,
     ExecutionRequest,
+    Executor,
 )
 from ..events.models import RuntimeEvent
 from ..llm.models import ModelRequest, ModelResponse, ToolCall
@@ -40,18 +42,23 @@ from .models import (
     Operation,
     OperationStatus,
     Task,
+    TaskDependency,
     TaskExecutionFacts,
     TaskStatus,
     TriggerKind,
 )
+from .leases import TaskClaimRequest, TaskLease, TaskLeaseGuard
 from .store import (
+    ExpiredTaskLeaseError,
     InMemoryOperationStore,
     InvalidOperationCheckpointError,
     OperationAlreadyExistsError,
     OperationNotFoundError,
     OperationRevisionConflict,
-    OperationStore,
+    OperationStoreError,
+    StaleTaskFenceError,
     TriggerAlreadyClaimedError,
+    TaskExecutionStore,
 )
 
 _T = TypeVar("_T")
@@ -91,6 +98,8 @@ class _OperationState:
     model_calls: list[ModelCall]
     readiness: list[Readiness]
     tasks: list[Task]
+    task_dependencies: list[TaskDependency]
+    task_leases: list[TaskLease]
     evidence: list[Evidence]
     observations: list[Observation]
     events: list[RuntimeEvent]
@@ -153,13 +162,28 @@ class OperationRuntime:
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[str], str] = _random_id,
         capabilities: CapabilityRegistry | None = None,
-        store: OperationStore | None = None,
+        store: TaskExecutionStore | None = None,
+        lease_holder_id: str | None = None,
+        lease_duration_seconds: float = 60.0,
     ) -> None:
+        if lease_holder_id is not None:
+            _required_text(lease_holder_id, "lease_holder_id")
+        if (
+            not isinstance(lease_duration_seconds, (int, float))
+            or isinstance(lease_duration_seconds, bool)
+            or not math.isfinite(lease_duration_seconds)
+            or lease_duration_seconds <= 0
+        ):
+            raise ValueError("lease_duration_seconds must be finite and positive")
         self._clock = clock
         self._id_factory = id_factory
         self._capabilities = capabilities or CapabilityRegistry()
         self._lock = asyncio.Lock()
-        self._store = store if store is not None else InMemoryOperationStore()
+        self._store = (
+            store if store is not None else InMemoryOperationStore(clock=clock)
+        )
+        self._lease_holder_id = lease_holder_id or _random_id("runtime-holder")
+        self._lease_duration_seconds = float(lease_duration_seconds)
 
     async def begin(
         self,
@@ -195,6 +219,8 @@ class OperationRuntime:
                 model_calls=[],
                 readiness=[],
                 tasks=[],
+                task_dependencies=[],
+                task_leases=[],
                 evidence=[],
                 observations=[],
                 events=[],
@@ -415,7 +441,14 @@ class OperationRuntime:
                     "model response already has a readiness decision"
                 )
             if any(
-                task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}
+                task.status
+                in {
+                    TaskStatus.PENDING,
+                    TaskStatus.READY,
+                    TaskStatus.CLAIMED,
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_FOR_APPROVAL,
+                }
                 for task in state.tasks
             ):
                 raise OperationStateError(
@@ -774,41 +807,22 @@ class OperationRuntime:
             )
             await self._commit(state)
 
-        # A separate atomic transition makes RUNNING and executor.started
-        # durable before the only external execution call in production code.
+        # Persist readiness, claim a fenced lease, and durably cross the
+        # executor-start boundary before the only external execution call.
         wall_deadline_error: OperationWallTimeExceeded | None = None
+        post_start_wall_deadline_error: OperationWallTimeExceeded | None = None
+        lease_expired_before_io = False
         execution_timeout_seconds = 0.0
         timeout_is_wall = False
+        executor: Executor | None = None
+        guard: TaskLeaseGuard | None = None
         async with self._lock:
             state = await self._working_state(task.operation_id)
             task_index, committed_task = self._task(state, task.id)
             model_call = self._completed_model_call_for_turn(state, task.turn_id)
             if committed_task.status is not TaskStatus.PENDING:
                 raise OperationStateError("task is no longer pending")
-            capability, executor = self._capabilities.resolve_execution(
-                committed_task.capability_id
-            )
-            if capability.executor_id != committed_task.executor_id:
-                raise OperationStateError("task executor identity changed")
-            now = self._clock()
-            task = replace(
-                committed_task,
-                status=TaskStatus.RUNNING,
-                updated_at=now,
-            )
-            state.tasks[task_index] = task
-            state.operation = replace(state.operation, updated_at=now)
-            self._append_event(
-                state,
-                "executor.started",
-                turn_id=task.turn_id,
-                model_call_id=model_call.id,
-                call_id=task.call_id,
-                task_id=task.id,
-                capability_id=task.capability_id,
-                executor_id=task.executor_id,
-                payload={"task_id": task.id, "executor_id": task.executor_id},
-            )
+            self._resolve_task_execution(committed_task)
             deadline_now = self._clock()
             if deadline_now.tzinfo is None or deadline_now.utcoffset() is None:
                 raise ValueError("runtime clock must return a timezone-aware datetime")
@@ -818,17 +832,8 @@ class OperationRuntime:
             )
             remaining_wall_time = state.budgets.max_wall_time_seconds - elapsed_seconds
             if remaining_wall_time <= 0:
-                # Discard the uncommitted RUNNING/executor.started projection.
-                # The persisted task proves that execution was blocked before
-                # the executor invocation boundary.
-                state = await self._working_state(task.operation_id)
-                task_index, pending_task = self._task(state, task.id)
-                model_call = self._completed_model_call_for_turn(
-                    state,
-                    pending_task.turn_id,
-                )
                 state.tasks[task_index] = replace(
-                    pending_task,
+                    committed_task,
                     status=TaskStatus.FAILED,
                     updated_at=deadline_now,
                     error_code="task_timeout",
@@ -840,46 +845,200 @@ class OperationRuntime:
                 self._append_event(
                     state,
                     "task.failed",
-                    turn_id=pending_task.turn_id,
+                    turn_id=committed_task.turn_id,
                     model_call_id=model_call.id,
-                    call_id=pending_task.call_id,
-                    task_id=pending_task.id,
-                    capability_id=pending_task.capability_id,
-                    executor_id=pending_task.executor_id,
+                    call_id=committed_task.call_id,
+                    task_id=committed_task.id,
+                    capability_id=committed_task.capability_id,
+                    executor_id=committed_task.executor_id,
                     payload={
-                        "task_id": pending_task.id,
+                        "task_id": committed_task.id,
                         "error_code": "task_timeout",
                     },
                 )
                 await self._commit(state)
-                wall_deadline_error = OperationWallTimeExceeded(task.id)
+                wall_deadline_error = OperationWallTimeExceeded(committed_task.id)
             else:
-                timeout_candidates = [
-                    state.budgets.task_timeout_seconds,
-                    remaining_wall_time,
-                ]
-                if requested_timeout_seconds is not None:
-                    timeout_candidates.append(requested_timeout_seconds)
-                execution_timeout_seconds = min(timeout_candidates)
-                timeout_is_wall = remaining_wall_time <= min(
-                    state.budgets.task_timeout_seconds,
-                    (
-                        requested_timeout_seconds
-                        if requested_timeout_seconds is not None
-                        else math.inf
-                    ),
+                ready_at = self._clock()
+                ready_task = replace(
+                    committed_task,
+                    status=TaskStatus.READY,
+                    updated_at=ready_at,
+                )
+                state.tasks[task_index] = ready_task
+                state.operation = replace(state.operation, updated_at=ready_at)
+                self._append_event(
+                    state,
+                    "task.ready",
+                    turn_id=ready_task.turn_id,
+                    model_call_id=model_call.id,
+                    call_id=ready_task.call_id,
+                    task_id=ready_task.id,
+                    capability_id=ready_task.capability_id,
+                    executor_id=ready_task.executor_id,
+                    payload={"task_id": ready_task.id},
                 )
                 await self._commit(state)
+                self._resolve_task_execution(ready_task)
+
+                claim_event = RuntimeEvent(
+                    id=self._id_factory("event"),
+                    type="task.claimed",
+                    agent_id=state.operation.agent_id,
+                    operation_id=state.operation.id,
+                    session_id=state.operation.session_id,
+                    turn_id=ready_task.turn_id,
+                    model_call_id=model_call.id,
+                    call_id=ready_task.call_id,
+                    task_id=ready_task.id,
+                    capability_id=ready_task.capability_id,
+                    executor_id=ready_task.executor_id,
+                    payload={},
+                    created_at=self._clock(),
+                )
+                try:
+                    claim, cancellation_requested = await _await_store_write(
+                        self._store.claim_task(
+                            TaskClaimRequest(
+                                operation_id=ready_task.operation_id,
+                                task_id=ready_task.id,
+                                holder_id=self._lease_holder_id,
+                                lease_duration_seconds=self._lease_duration_seconds,
+                                event=claim_event,
+                            ),
+                            expected_revision=state.revision,
+                        )
+                    )
+                except OperationStoreError as error:
+                    raise OperationStateError(
+                        f"task claim rejected: {ready_task.id}"
+                    ) from error
+                if cancellation_requested:
+                    raise asyncio.CancelledError
+
+                state = self._state_from_snapshot(
+                    claim.commit_result.operation.snapshot,
+                    revision=claim.commit_result.operation.revision,
+                )
+                task_index, claimed_task = self._task(state, ready_task.id)
+                _, executor = self._resolve_task_execution(claimed_task)
+                guard = TaskLeaseGuard(
+                    operation_id=claimed_task.operation_id,
+                    task_id=claimed_task.id,
+                    holder_id=claim.lease.holder_id,
+                    attempt=claim.lease.attempt,
+                    fencing_token=claim.lease.fencing_token,
+                )
+                lease_index, claimed_lease = self._lease(state, guard)
+                state.tasks[task_index] = replace(
+                    claimed_task,
+                    status=TaskStatus.RUNNING,
+                    updated_at=claimed_task.updated_at,
+                )
+                state.task_leases[lease_index] = replace(
+                    claimed_lease,
+                    started_at=claimed_lease.acquired_at,
+                )
+                self._append_event(
+                    state,
+                    "executor.started",
+                    turn_id=claimed_task.turn_id,
+                    model_call_id=model_call.id,
+                    call_id=claimed_task.call_id,
+                    task_id=claimed_task.id,
+                    capability_id=claimed_task.capability_id,
+                    executor_id=claimed_task.executor_id,
+                    payload={
+                        "task_id": claimed_task.id,
+                        "executor_id": claimed_task.executor_id,
+                    },
+                )
+                fenced_start_monotonic = asyncio.get_running_loop().time()
+                state = await self._commit_fenced(state, guard)
+                fenced_start_round_trip = max(
+                    0.0,
+                    asyncio.get_running_loop().time() - fenced_start_monotonic,
+                )
+                _, task = self._task(state, claimed_task.id)
+                _, started_lease = self._lease(state, guard)
+                _, executor = self._resolve_task_execution(task)
+                if started_lease.started_at is None:
+                    raise OperationStateError("executor start lease was not committed")
+
+                # Readiness, claim, and fenced start are durable writes and may
+                # consume the remaining operation budget. Recompute both the
+                # wall and lease bounds from the committed start immediately
+                # before allowing executor I/O.
+                execution_now = self._clock()
+                if execution_now.tzinfo is None or execution_now.utcoffset() is None:
+                    raise ValueError(
+                        "runtime clock must return a timezone-aware datetime"
+                    )
+                elapsed_seconds = max(
+                    0.0,
+                    (execution_now - state.operation.created_at).total_seconds(),
+                )
+                remaining_wall_time = (
+                    state.budgets.max_wall_time_seconds - elapsed_seconds
+                )
+                # Lease timestamps belong to the store's authoritative clock;
+                # never compare them with the independently injectable runtime
+                # clock. The fenced start supplies the exact remaining store
+                # interval at that commit boundary.
+                remaining_lease_time = (
+                    started_lease.expires_at - started_lease.started_at
+                ).total_seconds() - fenced_start_round_trip
+                if remaining_wall_time <= 0:
+                    post_start_wall_deadline_error = OperationWallTimeExceeded(task.id)
+                elif remaining_lease_time <= 0:
+                    lease_expired_before_io = True
+                else:
+                    # Reserve half of the live interval for cancellation and a
+                    # fenced outcome. Until P2-05f adds renewal, the other half
+                    # is the strict executor-timeout ceiling.
+                    lease_safe_timeout = remaining_lease_time / 2.0
+                    non_wall_timeout = min(
+                        state.budgets.task_timeout_seconds,
+                        (
+                            requested_timeout_seconds
+                            if requested_timeout_seconds is not None
+                            else math.inf
+                        ),
+                        lease_safe_timeout,
+                    )
+                    execution_timeout_seconds = min(
+                        remaining_wall_time,
+                        non_wall_timeout,
+                    )
+                    timeout_is_wall = remaining_wall_time <= non_wall_timeout
 
         if wall_deadline_error is not None:
             raise wall_deadline_error
+        assert executor is not None
+        assert guard is not None
+        if post_start_wall_deadline_error is not None:
+            await self._fail_task(
+                task.operation_id,
+                task.id,
+                guard,
+                "task_timeout",
+            )
+            raise post_start_wall_deadline_error
+        if lease_expired_before_io:
+            raise OperationStateError(
+                f"task lease expired before executor invocation: {task.id}"
+            )
+        assert execution_timeout_seconds > 0
 
         request = ExecutionRequest(
             operation_id=task.operation_id,
             task_id=task.id,
             turn_id=task.turn_id,
             capability_id=task.capability_id,
+            executor_id=task.executor_id,
             attempt=task.attempt,
+            fencing_token=guard.fencing_token,
+            idempotency_key=task.execution_facts.idempotency_key,
             arguments=task.arguments,
         )
         timeout = asyncio.timeout(execution_timeout_seconds)
@@ -896,9 +1055,10 @@ class OperationRuntime:
             if timeout.expired():
                 deadline_cause = error
             else:
-                await self._fail_task(
+                await self._record_execution_failure(
                     task.operation_id,
                     task.id,
+                    guard,
                     "executor_failed",
                 )
                 raise CapabilityExecutionError(
@@ -909,7 +1069,12 @@ class OperationRuntime:
         if current_task is not None and current_task.cancelling():
             raise asyncio.CancelledError
         if timeout.expired():
-            await self._fail_task(task.operation_id, task.id, "task_timeout")
+            await self._record_execution_failure(
+                task.operation_id,
+                task.id,
+                guard,
+                "task_timeout",
+            )
             if timeout_is_wall:
                 raise OperationWallTimeExceeded(task.id) from deadline_cause
             raise TaskExecutionTimeout(
@@ -920,7 +1085,12 @@ class OperationRuntime:
         if deadline_cause is not None:
             # ``timeout.expired()`` is stable once the context has exited, so
             # this branch is defensive against an invalid timeout lifecycle.
-            await self._fail_task(task.operation_id, task.id, "executor_failed")
+            await self._record_execution_failure(
+                task.operation_id,
+                task.id,
+                guard,
+                "executor_failed",
+            )
             raise CapabilityExecutionError(
                 f"executor failed for task {task.id}"
             ) from deadline_cause
@@ -935,16 +1105,11 @@ class OperationRuntime:
             if committed_task.status is not TaskStatus.RUNNING:
                 raise OperationStateError("task is no longer running")
             try:
-                current_capability, current_executor = (
-                    self._capabilities.resolve_execution(committed_task.capability_id)
-                )
-            except ValueError as error:
+                _, current_executor = self._resolve_task_execution(committed_task)
+            except OperationStateError as error:
                 execution_identity_error = error
             else:
-                if (
-                    current_capability.executor_id != committed_task.executor_id
-                    or current_executor is not executor
-                ):
+                if current_executor is not executor:
                     execution_identity_error = OperationStateError(
                         "task execution identity changed"
                     )
@@ -960,11 +1125,11 @@ class OperationRuntime:
                     validation_error = error
 
             if accepted_candidate is None:
-                # Do not commit this working copy. _fail_task publishes a
-                # terminal task with no evidence from the prior committed state.
+                # Do not commit this working copy. The failure path reloads the
+                # prior checkpoint and preserves side-effect uncertainty.
                 pass
             else:
-                now = self._clock()
+                placeholder_time = committed_task.updated_at
                 payload_json = canonical_json(accepted_candidate.payload)
                 evidence = Evidence(
                     id=self._id_factory("evidence"),
@@ -975,29 +1140,37 @@ class OperationRuntime:
                     executor_id=task.executor_id,
                     kind=accepted_candidate.kind,
                     schema_version=accepted_candidate.schema_version,
-                    attempt=task.attempt,
+                    attempt=committed_task.attempt,
                     accepted=True,
                     payload=accepted_candidate.payload,
                     content_hash=(
                         "sha256:"
                         + hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
                     ),
-                    created_at=now,
+                    created_at=placeholder_time,
                 )
                 state.evidence.append(evidence)
                 state.tasks[task_index] = replace(
                     committed_task,
                     status=TaskStatus.SUCCEEDED,
                     evidence_ids=(evidence.id,),
-                    updated_at=now,
+                    updated_at=placeholder_time,
                 )
-                state.loop_state = replace(
-                    state.loop_state,
-                    phase=LoopPhase.OBSERVING,
-                    identical_failure_count=0,
-                    no_progress_fingerprints=(),
+                lease_index, active_lease = self._lease(state, guard)
+                release_placeholder = max(
+                    timestamp
+                    for timestamp in (
+                        active_lease.acquired_at,
+                        active_lease.started_at,
+                        active_lease.renewed_at,
+                    )
+                    if timestamp is not None
                 )
-                state.operation = replace(state.operation, updated_at=now)
+                state.task_leases[lease_index] = replace(
+                    active_lease,
+                    released_at=release_placeholder,
+                    release_reason="completed",
+                )
                 self._append_event(
                     state,
                     "executor.completed",
@@ -1033,19 +1206,25 @@ class OperationRuntime:
                     executor_id=task.executor_id,
                     payload={"task_id": task.id},
                 )
-                await self._commit(state)
-                return evidence
+                committed_state = await self._commit_fenced(state, guard)
+                return self._accepted_evidence(committed_state, evidence.id)
 
         if execution_identity_error is not None:
-            await self._fail_task(
+            await self._record_execution_failure(
                 task.operation_id,
                 task.id,
+                guard,
                 "execution_identity_changed",
             )
             raise CapabilityExecutionError(
                 f"executor identity changed for task {task.id}"
             ) from execution_identity_error
-        await self._fail_task(task.operation_id, task.id, "evidence_rejected")
+        await self._record_execution_failure(
+            task.operation_id,
+            task.id,
+            guard,
+            "evidence_rejected",
+        )
         assert validation_error is not None
         raise validation_error
 
@@ -1084,6 +1263,8 @@ class OperationRuntime:
             state.loop_state = replace(
                 state.loop_state,
                 phase=LoopPhase.OBSERVING,
+                identical_failure_count=0,
+                no_progress_fingerprints=(),
                 observation_characters=(
                     state.loop_state.observation_characters
                     + self._observation_characters(observation)
@@ -1378,8 +1559,16 @@ class OperationRuntime:
             OperationStatus.INTERRUPTED,
         }:
             raise OperationStateError("operation is already terminal")
+        return self._state_from_snapshot(snapshot, revision=committed.revision)
+
+    @staticmethod
+    def _state_from_snapshot(
+        snapshot: OperationSnapshot,
+        *,
+        revision: int,
+    ) -> _OperationState:
         return _OperationState(
-            revision=committed.revision,
+            revision=revision,
             trigger=snapshot.trigger,
             operation=snapshot.operation,
             loop_state=snapshot.loop_state,
@@ -1388,6 +1577,8 @@ class OperationRuntime:
             model_calls=list(snapshot.model_calls),
             readiness=list(snapshot.readiness),
             tasks=list(snapshot.tasks),
+            task_dependencies=list(snapshot.task_dependencies),
+            task_leases=list(snapshot.task_leases),
             evidence=list(snapshot.evidence),
             observations=list(snapshot.observations),
             events=list(snapshot.events),
@@ -1414,6 +1605,33 @@ class OperationRuntime:
         state.revision = committed.operation.revision
         if cancellation_requested:
             raise asyncio.CancelledError
+
+    async def _commit_fenced(
+        self,
+        state: _OperationState,
+        guard: TaskLeaseGuard,
+    ) -> _OperationState:
+        try:
+            committed, cancellation_requested = await _await_store_write(
+                self._store.commit_fenced(
+                    self._snapshot(state),
+                    expected_revision=state.revision,
+                    guard=guard,
+                )
+            )
+        except OperationNotFoundError as error:
+            raise KeyError(f"Unknown operation: {state.operation.id}") from error
+        except OperationStoreError as error:
+            raise OperationStateError(
+                f"fenced task checkpoint rejected: {guard.task_id}"
+            ) from error
+        committed_state = self._state_from_snapshot(
+            committed.operation.snapshot,
+            revision=committed.operation.revision,
+        )
+        if cancellation_requested:
+            raise asyncio.CancelledError
+        return committed_state
 
     def _turn(self, state: _OperationState, turn_id: str) -> tuple[int, Turn]:
         for index, turn in enumerate(state.turns):
@@ -1528,16 +1746,140 @@ class OperationRuntime:
         raise OperationStateError(f"unknown task: {task_id}")
 
     @staticmethod
+    def _lease(
+        state: _OperationState,
+        guard: TaskLeaseGuard,
+    ) -> tuple[int, TaskLease]:
+        for index, lease in enumerate(state.task_leases):
+            if (
+                lease.operation_id == guard.operation_id
+                and lease.task_id == guard.task_id
+                and lease.holder_id == guard.holder_id
+                and lease.attempt == guard.attempt
+                and lease.fencing_token == guard.fencing_token
+            ):
+                return index, lease
+        raise OperationStateError(f"unknown task lease: {guard.task_id}")
+
+    def _resolve_task_execution(self, task: Task) -> tuple[Capability, Executor]:
+        try:
+            capability, executor = self._capabilities.resolve_execution(
+                task.capability_id
+            )
+        except (KeyError, ValueError) as error:
+            raise OperationStateError(
+                f"task execution identity changed: {task.id}"
+            ) from error
+        expected_idempotency_key = (
+            f"{task.operation_id}:{task.id}"
+            if capability.side_effecting and capability.idempotent
+            else None
+        )
+        expected_facts = TaskExecutionFacts(
+            capability_fingerprint=capability.contract_fingerprint,
+            arguments_hash=(
+                "sha256:"
+                + hashlib.sha256(
+                    canonical_json(task.arguments).encode("utf-8")
+                ).hexdigest()
+            ),
+            access_mode=capability.access_mode,
+            risk=capability.risk,
+            side_effecting=capability.side_effecting,
+            idempotent=capability.idempotent,
+            replay_safe=capability.replay_safe,
+            idempotency_key=expected_idempotency_key,
+        )
+        if (
+            task.executor_id != capability.executor_id
+            or task.execution_facts != expected_facts
+        ):
+            raise OperationStateError(
+                f"task persisted execution facts changed: {task.id}"
+            )
+        return capability, executor
+
+    @staticmethod
     def _accepted_evidence(state: _OperationState, evidence_id: str) -> Evidence:
         for evidence in state.evidence:
             if evidence.id == evidence_id and evidence.accepted:
                 return evidence
         raise OperationStateError(f"unknown accepted evidence: {evidence_id}")
 
+    async def _record_execution_failure(
+        self,
+        operation_id: str,
+        task_id: str,
+        guard: TaskLeaseGuard,
+        error_code: str,
+    ) -> None:
+        """Fail safe I/O, but retain side-effect uncertainty for recovery."""
+
+        fail_known_safe = False
+        async with self._lock:
+            state = await self._working_state(operation_id)
+            task_index, task = self._task(state, task_id)
+            if task.status is not TaskStatus.RUNNING:
+                raise OperationStateError("task is no longer running")
+            _, active_lease = self._lease(state, guard)
+            if active_lease.released_at is not None or task.attempt != guard.attempt:
+                raise OperationStateError("task execution lease is no longer active")
+            if not task.execution_facts.side_effecting:
+                fail_known_safe = True
+            elif task.cancellation_requested:
+                return
+            else:
+                fail_known_safe = False
+                now = self._clock()
+                if now.tzinfo is None or now.utcoffset() is None:
+                    raise ValueError(
+                        "runtime clock must return a timezone-aware datetime"
+                    )
+                now = max(now, task.updated_at, state.operation.updated_at)
+                state.tasks[task_index] = replace(
+                    task,
+                    updated_at=now,
+                )
+                state.operation = replace(state.operation, updated_at=now)
+                model_call = self._completed_model_call_for_turn(
+                    state,
+                    task.turn_id,
+                )
+                self._append_event(
+                    state,
+                    "task.outcome_unknown",
+                    turn_id=task.turn_id,
+                    model_call_id=model_call.id,
+                    call_id=task.call_id,
+                    task_id=task.id,
+                    capability_id=task.capability_id,
+                    executor_id=task.executor_id,
+                    payload={
+                        "reason": error_code,
+                        "status": task.status.value,
+                        "attempt": guard.attempt,
+                        "fencing_token": guard.fencing_token,
+                    },
+                )
+                try:
+                    await self._commit_fenced(state, guard)
+                except OperationStateError as error:
+                    if isinstance(
+                        error.__cause__,
+                        (ExpiredTaskLeaseError, StaleTaskFenceError),
+                    ):
+                        # The durable start already proves an uncertain external
+                        # outcome. A stale holder must not annotate it.
+                        return
+                    raise
+        if fail_known_safe:
+            await self._fail_task(operation_id, task_id, guard, error_code)
+
     async def _fail_task(
         self,
         operation_id: str,
         task_id: str,
+        guard: TaskLeaseGuard,
         error_code: str,
     ) -> None:
         async with self._lock:
@@ -1546,14 +1888,28 @@ class OperationRuntime:
             model_call = self._completed_model_call_for_turn(state, task.turn_id)
             if task.status is not TaskStatus.RUNNING:
                 raise OperationStateError("task is no longer running")
-            now = self._clock()
+            placeholder_time = task.updated_at
             state.tasks[task_index] = replace(
                 task,
                 status=TaskStatus.FAILED,
-                updated_at=now,
+                updated_at=placeholder_time,
                 error_code=error_code,
             )
-            state.operation = replace(state.operation, updated_at=now)
+            lease_index, active_lease = self._lease(state, guard)
+            release_placeholder = max(
+                timestamp
+                for timestamp in (
+                    active_lease.acquired_at,
+                    active_lease.started_at,
+                    active_lease.renewed_at,
+                )
+                if timestamp is not None
+            )
+            state.task_leases[lease_index] = replace(
+                active_lease,
+                released_at=release_placeholder,
+                release_reason=error_code,
+            )
             self._append_event(
                 state,
                 "task.failed",
@@ -1580,7 +1936,7 @@ class OperationRuntime:
                     "error_code": error_code,
                 },
             )
-            await self._commit(state)
+            await self._commit_fenced(state, guard)
 
     def _append_event(
         self,
@@ -1650,7 +2006,14 @@ class OperationRuntime:
             (
                 index
                 for index in range(len(state.tasks) - 1, -1, -1)
-                if state.tasks[index].status in {TaskStatus.PENDING, TaskStatus.RUNNING}
+                if state.tasks[index].status
+                in {
+                    TaskStatus.PENDING,
+                    TaskStatus.READY,
+                    TaskStatus.CLAIMED,
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_FOR_APPROVAL,
+                }
             ),
             None,
         )
@@ -1723,6 +2086,8 @@ class OperationRuntime:
             model_calls=tuple(state.model_calls),
             readiness=tuple(state.readiness),
             tasks=tuple(state.tasks),
+            task_dependencies=tuple(state.task_dependencies),
+            task_leases=tuple(state.task_leases),
             evidence=tuple(state.evidence),
             observations=tuple(state.observations),
             events=tuple(state.events),

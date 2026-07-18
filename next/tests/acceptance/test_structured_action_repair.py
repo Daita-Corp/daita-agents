@@ -416,7 +416,9 @@ def _important_events(snapshot: OperationSnapshot) -> list[str]:
         "operation.failed",
         "operation.succeeded",
         "readiness.recorded",
+        "task.claimed",
         "task.created",
+        "task.ready",
         "task.succeeded",
     }
     return [event.type for event in snapshot.events if event.type in important]
@@ -498,6 +500,8 @@ async def test_invalid_action_is_observed_then_changed_action_repairs() -> None:
         "model_call.started",
         "model_response.recorded",
         "task.created",
+        "task.ready",
+        "task.claimed",
         "executor.started",
         "executor.completed",
         "evidence.accepted",
@@ -548,14 +552,16 @@ async def test_invalid_action_is_observed_then_changed_action_repairs() -> None:
         for event in final.events
         if event.type
         in {
+            "task.claimed",
             "task.created",
+            "task.ready",
             "executor.started",
             "executor.completed",
             "evidence.accepted",
             "task.succeeded",
         }
     ]
-    assert len(task_events) == 5
+    assert len(task_events) == 7
     for event in task_events:
         assert event.turn_id == task.turn_id
         assert event.call_id == task.call_id
@@ -752,6 +758,8 @@ async def test_success_then_rejection_skips_rest_in_stable_transcript_order() ->
     assert _important_events(final) == [
         "model_response.recorded",
         "task.created",
+        "task.ready",
+        "task.claimed",
         "executor.started",
         "executor.completed",
         "evidence.accepted",

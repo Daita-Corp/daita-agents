@@ -134,7 +134,10 @@ class ExecutionRequest:
     task_id: str
     turn_id: str
     capability_id: str
+    executor_id: str
     attempt: int
+    fencing_token: int
+    idempotency_key: str | None = None
     arguments: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -142,12 +145,21 @@ class ExecutionRequest:
         _required_text(self.task_id, "execution task_id")
         _required_text(self.turn_id, "execution turn_id")
         _required_text(self.capability_id, "execution capability_id")
+        _required_text(self.executor_id, "execution executor_id")
         if (
             not isinstance(self.attempt, int)
             or isinstance(self.attempt, bool)
             or self.attempt < 1
         ):
             raise ValueError("execution attempt must be a positive integer")
+        if (
+            not isinstance(self.fencing_token, int)
+            or isinstance(self.fencing_token, bool)
+            or self.fencing_token < 1
+        ):
+            raise ValueError("execution fencing_token must be a positive integer")
+        if self.idempotency_key is not None:
+            _required_text(self.idempotency_key, "execution idempotency_key")
         object.__setattr__(
             self,
             "arguments",

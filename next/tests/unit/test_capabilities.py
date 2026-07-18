@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
@@ -155,6 +156,52 @@ def test_capability_contract_fingerprint_is_stable_and_execution_sensitive() -> 
         replace(capability, executor_id="fake.read.executor.v2").contract_fingerprint
         != capability.contract_fingerprint
     )
+
+
+def _execution_request(
+    *,
+    executor_id: str = "fake.read.executor",
+    fencing_token: int = 7,
+    idempotency_key: str | None = "operation-1:task-1",
+) -> ExecutionRequest:
+    return ExecutionRequest(
+        operation_id="operation-1",
+        task_id="task-1",
+        turn_id="turn-1",
+        capability_id="fake.read",
+        executor_id=executor_id,
+        attempt=2,
+        fencing_token=fencing_token,
+        idempotency_key=idempotency_key,
+        arguments={"key": "alpha"},
+    )
+
+
+def test_execution_request_carries_committed_fence_and_executor_identity() -> None:
+    request = _execution_request()
+
+    assert request.executor_id == "fake.read.executor"
+    assert request.attempt == 2
+    assert request.fencing_token == 7
+    assert request.idempotency_key == "operation-1:task-1"
+    assert isinstance(request.arguments, FrozenJsonObject)
+
+
+@pytest.mark.parametrize(
+    ("factory", "match"),
+    (
+        (lambda: _execution_request(executor_id=""), "executor"),
+        (lambda: _execution_request(fencing_token=0), "fencing"),
+        (lambda: _execution_request(fencing_token=True), "fencing"),
+        (lambda: _execution_request(idempotency_key=""), "idempotency"),
+    ),
+)
+def test_execution_request_rejects_invalid_committed_identity(
+    factory: Callable[[], ExecutionRequest],
+    match: str,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=match):
+        factory()
 
 
 def test_replay_safe_capability_must_also_be_idempotent() -> None:

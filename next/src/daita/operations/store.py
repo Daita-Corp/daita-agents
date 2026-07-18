@@ -924,7 +924,13 @@ def _validate_task_execution_candidate(
             )
             if before != after
         )
-        if len(changed) != 1 or changed[0][0].task_id != task_id:
+        if mutation == "fenced":
+            if len(changed) > 1 or (changed and changed[0][0].task_id != task_id):
+                raise InvalidOperationCheckpointError(
+                    current.operation.id,
+                    "fenced task lifecycle may mutate only the guarded lease",
+                )
+        elif len(changed) != 1 or changed[0][0].task_id != task_id:
             raise InvalidOperationCheckpointError(
                 current.operation.id,
                 "task lifecycle commit must mutate exactly the guarded lease",
@@ -1165,6 +1171,42 @@ def _prepare_fenced_task_commit(
                 "fenced start cannot append evidence",
             )
         committed_lease = replace(active, started_at=now)
+    elif (
+        before_task.status is TaskStatus.RUNNING
+        and after_task.status is TaskStatus.RUNNING
+    ):
+        if active.started_at is None:
+            raise InvalidOperationCheckpointError(
+                current.operation.id,
+                "running task requires a durable lease start checkpoint",
+            )
+        if proposed_lease != active:
+            raise InvalidOperationCheckpointError(
+                current.operation.id,
+                "fenced outcome annotation cannot mutate its live lease",
+            )
+        if after_task.cancellation_requested != before_task.cancellation_requested:
+            raise InvalidOperationCheckpointError(
+                current.operation.id,
+                "fenced outcome annotation cannot manufacture cancellation intent",
+            )
+        if new_evidence:
+            raise InvalidOperationCheckpointError(
+                current.operation.id,
+                "fenced outcome annotation cannot append evidence",
+            )
+        if len(suffix) != 1 or suffix[0].type != "task.outcome_unknown":
+            raise InvalidOperationCheckpointError(
+                current.operation.id,
+                "running task annotation requires one task.outcome_unknown event",
+            )
+        reason = suffix[0].payload.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise InvalidOperationCheckpointError(
+                current.operation.id,
+                "task.outcome_unknown requires a non-empty reason",
+            )
+        committed_lease = active
     elif before_task.status is TaskStatus.RUNNING:
         if active.started_at is None:
             raise InvalidOperationCheckpointError(
@@ -1311,6 +1353,15 @@ def _prepare_fenced_task_commit(
             }
         if event.type == "task.succeeded":
             return {"task_id": committed_task.id}
+        if event.type == "task.outcome_unknown":
+            return {
+                "task_id": committed_task.id,
+                "executor_id": committed_task.executor_id,
+                "reason": event.payload["reason"],
+                "status": committed_task.status.value,
+                "attempt": committed_lease.attempt,
+                "fencing_token": committed_lease.fencing_token,
+            }
         if event.type in {"task.failed", "executor.failed"}:
             payload: dict[str, object] = {
                 "task_id": committed_task.id,
@@ -1692,7 +1743,6 @@ def _validate_stable_history(
             TaskStatus.PENDING: {
                 TaskStatus.PENDING,
                 TaskStatus.READY,
-                TaskStatus.RUNNING,
                 TaskStatus.WAITING_FOR_APPROVAL,
                 TaskStatus.FAILED,
                 TaskStatus.CANCELLED,
@@ -1700,12 +1750,7 @@ def _validate_stable_history(
             },
             TaskStatus.READY: {TaskStatus.READY},
             TaskStatus.CLAIMED: {TaskStatus.CLAIMED},
-            TaskStatus.RUNNING: {
-                TaskStatus.RUNNING,
-                TaskStatus.SUCCEEDED,
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
-            },
+            TaskStatus.RUNNING: {TaskStatus.RUNNING},
             TaskStatus.WAITING_FOR_APPROVAL: {
                 TaskStatus.WAITING_FOR_APPROVAL,
             },
