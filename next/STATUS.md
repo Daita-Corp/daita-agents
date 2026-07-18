@@ -11,14 +11,14 @@ project. Update it before and after every material task.
 - **Last completed task:** P2-06c — `AgentLoop.resume(operation_id)` consumes a
   committed tool response after SQLite reopen without repeating its context or
   model call; focused dual-interpreter/static checks and independent reviews pass
-- **Current checkpoint:** representative green continuation is recorded by the
-  commit containing this ledger; expected-red parent is `cb8f562`
+- **Current checkpoint:** representative green continuation `4cfefaa`; the
+  broader P2-06d expected-red contract is recorded by the next test checkpoint
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** add expected-red checkpoint-dispatch trajectories for
-  requestless/started/completed model work, existing task and observation work,
-  committed readiness, and terminal replay, then implement them in the same driver
+- **Exact next action:** implement the six expected-red checkpoint states in the
+  same driver/runtime owners, preserving at-least-once STARTED inference and
+  zero-I/O reuse of persisted tasks, evidence, readiness, and terminal state
 
 ## Mandatory architecture re-read
 
@@ -606,6 +606,7 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-06a checkpoint/restart ownership inventory | PASS — direct plan/ADR/current-v2/v1-oracle inspection plus three independent read-only audits agree that the canonical snapshot already holds every semantic resume fact; the existing loop/runtime/store remain the only owners; one representative SQLite-reopen test precedes broader continuation and startup-query work |
 | Initial P2-06b SQLite-reopen loop continuation | EXPECTED RED — exactly 1 failure and no collection/setup error; the committed response reopened intact, and execution stopped only because the existing `AgentLoop` has no `resume(operation_id)` entry |
 | P2-06c representative checkpoint continuation | PASS — 16 focused restart/fake-read/text/repair cases pass on CPython 3.11.15 and 3.12.7; the complete 605-test Python 3.11 suite and all 52 architecture tests pass; Black, compilation, and focused mypy are clean; independent code and test reviews report GO after both SQLite stores gained `finally` cleanup |
+| Initial P2-06d checkpoint-dispatch contract | EXPECTED RED — the representative response-before-task case still passes and exactly 6 new SQLite-reopen cases fail at the absent requestless-turn reuse, STARTED-call resend, persisted-task/evidence reuse, live-lease wait, and readiness/terminal/trigger-redelivery behavior; no collection, migration, or fixture error |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
