@@ -6,18 +6,16 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-06a — inventory the existing loop, operation-runtime,
-  checkpoint, and startup-recovery seams before any restart production edit
-- **Last completed task:** P2-05h — final persisted-task execution, recovery,
-  blob-linkage, preservation, distribution, and independent release gate
-- **Current checkpoint:** P2-05 recovery/blob checkpoint `cf43e11` plus the
-  cancellation-precedence repair `4cc8492`
+- **Active task:** P2-06b — lock the first expected-red SQLite-reopen trajectory
+  for a committed model response whose task has not yet been materialized
+- **Last completed task:** P2-06a — read-only loop/runtime/store ownership and
+  crash-boundary inventory, including the renewed architecture re-read
+- **Current checkpoint:** completed P2-05 gate `a30496d`
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** complete P2-06a's read-only ownership inventory and
-  lock the expected-red seven-boundary crash/cancellation sequence before any
-  production edit
+- **Exact next action:** add and run the single representative expected-red
+  SQLite-reopen resume test before changing the existing loop/runtime owners
 
 ## Mandatory architecture re-read
 
@@ -48,6 +46,15 @@ with these renewed constraints:
 - preserve the isolated v2 state root and lazy optional-provider imports; and
 - do not pull catalog, memory, monitor, or later-phase domain work into the
   persistent-loop slice.
+
+Before P2-06 production edits, Sections 6 and 15 were re-read in full again on
+2026-07-16 together with Sections 8.5–8.7, the Phase 2 work/gate, the runtime
+and resume behavior-preservation inventory, and the crash-consistency risk
+entry. The renewed constraints are that the generic loop must reconcile
+canonical checkpoints rather than replay the original trigger semantically;
+model inference remains at-least-once; terminal tasks, observations, and
+readiness are reused; and the operation runtime/store remain the only
+execution and durable-state authorities.
 
 ## Current architectural decisions
 
@@ -143,6 +150,18 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-05f | complete | Fail-closed execution recovery and blob-backed evidence linkage | Replay-safe reads may resume after expiry; side-effecting unknown outcomes become manual recovery unless persisted idempotency proves safe; durable blob references precede evidence acceptance; terminal work is skipped |
 | P2-05g | complete | Representative review before broader restart wiring | One read and one test-owned side-effect classification are independently reviewed; P2-06 retains startup/loop resume, and P2-07 retains real approval decision/wake behavior |
 | P2-05h | complete | Final P2-05 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local checkpoint; all independent audits GO after the cancellation-precedence repair |
+
+### Ordered P2-06 internal tasks
+
+| ID | Status | Smallest output | Required proof before advancing |
+| --- | --- | --- | --- |
+| P2-06a | complete | Read-only checkpoint/restart ownership inventory and renewed Sections 6/8.5–8.7/15 re-read | Existing `AgentLoop`, `OperationRuntime`, `OperationStore`, and canonical snapshot remain the only owners; exact replayable versus necessarily repeated work, seven crash boundaries, and P2-07/P2-08 deferrals are locked before production edits |
+| P2-06b | active | One expected-red SQLite-reopen trajectory after model-response persistence but before task materialization | Same operation/turn/response survives reopen; initial context/model I/O does not repeat; one task/evidence/observation and only the necessary follow-up model call are expected |
+| P2-06c | pending | Representative checkpoint-aware continuation in the existing generic loop | `resume(operation_id)` and exact trigger redelivery enter the same driver; no new loop/recovery runtime/module; completed response is consumed without rebuilding context or the original trigger plan; focused review passes before broader cases |
+| P2-06d | pending | Complete checkpoint dispatcher over requestless turn, started/completed model call, ordered tool calls, task/evidence/observation, readiness, and terminal state | Persisted records, not coarse phase alone, select progression; STARTED inference is at-least-once; existing tasks use `resume_task()`; avoidable validation/executor/projection/readiness/model I/O is skipped |
+| P2-06e | pending | Portable agent-scoped nonterminal inspection plus startup recovery over both existing stores | Deterministic scoped query, SQLite single-transaction reopen, terminal exclusion, live-lease deferral, and startup iteration reuse the same loop; P2-08 retains Agent Home, host admission, and writer-lock composition |
+| P2-06f | pending | All seven Phase 2 crash/restart trajectories and independent representative review | Abrupt process-exit injection at every required durable boundary; exact identity/event/counter assertions; safe replay versus manual recovery; blob orphan; terminal delivery replay; no second owner |
+| P2-06g | pending | Final P2-06 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local checkpoint |
 
 ## Files/components being changed or planned
 
@@ -403,6 +422,31 @@ unlinked blob for explicit orphan maintenance rather than claiming a
 distributed transaction. Migration 5 adds only nullable `evidence.blob_id`;
 blob content and manifest ownership stay out of SQLite and the generic loop.
 
+P2-06 keeps the existing ownership split. `AgentLoop` already owns semantic
+progression, `OperationRuntime` already owns every durable transition and the
+sole executor call, and `OperationStore` already owns exact aggregate reads and
+CAS. The current pain is that the driver consumes durable records through
+ephemeral locals, unconditionally creates a new turn, and cannot enumerate the
+nonterminal aggregate set needed by startup recovery. Replaying that linear
+path would duplicate context/model work, collide with materialized-task and
+observation guards, and reevaluate already committed readiness.
+
+The smallest correction is a checkpoint dispatcher inside the one existing
+driver. It derives the next step from exact turn/model-call/tool-call/task/
+evidence/observation/readiness linkage rather than treating `LoopPhase` as a
+complete program counter. A requestless turn may rebuild context; a STARTED
+model call resends its exact persisted request under at-least-once inference;
+a COMPLETED response never calls the provider again; an existing task enters
+`OperationRuntime.resume_task()`; accepted evidence is projected only when its
+observation is absent; committed readiness is not reevaluated; and terminal
+state is projected without another write. One narrow, agent-scoped nonterminal
+query will extend the existing store contract so the same loop can perform a
+portable startup pass. P2-07 still owns approval decisions/wake and the durable
+side-effect marker; P2-08 still owns Agent Home discovery, host admission,
+session composition, and the cross-process writer lock. No recovery service,
+second runtime, plan record, context-manifest hierarchy, or event-replay state
+machine is added.
+
 ## Tests last run
 
 Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
@@ -556,6 +600,7 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-05h root preservation and distribution gate | PASS — the root safe suite passes 2,498 tests with 221 deselected in 10.40s; root diff, symlink, disposition, and v1-fixture scans are clean; v2 wheel/sdist contain 27/42 entries at `2.0.0a0`, root wheel/sdist remain 401/442 entries at `1.0.0`, and fresh CPython 3.11/3.12 installs import v2 owners from their own site-packages |
 | P2-05h final independent audits | PASS after repair — the runtime, scope/distribution, and resumed test audits all report GO; pending-cancellation checks immediately after blob return and in its exception path close the sole reported blocker without changing blob ownership or the executor boundary |
 | P2-05h scoped checkpoint | PASS — exactly 2 ledger paths under `next/` are staged after a clean cached diff; configured whitespace, EOF, conflict, large-file, and applicable Black hooks pass; the containing local checkpoint records the completed gate |
+| P2-06a checkpoint/restart ownership inventory | PASS — direct plan/ADR/current-v2/v1-oracle inspection plus three independent read-only audits agree that the canonical snapshot already holds every semantic resume fact; the existing loop/runtime/store remain the only owners; one representative SQLite-reopen test precedes broader continuation and startup-query work |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
