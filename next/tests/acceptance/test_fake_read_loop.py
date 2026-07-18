@@ -91,6 +91,7 @@ class RecordingReadExecutor:
         ]
         assert task_events == [
             "task.created",
+            "governance.allowed",
             "task.ready",
             "task.claimed",
             "executor.started",
@@ -316,6 +317,7 @@ async def test_fake_reads_follow_the_only_durable_executor_path_in_order(
 
     action_events = [
         "task.created",
+        "governance.allowed",
         "task.ready",
         "task.claimed",
         "executor.started",

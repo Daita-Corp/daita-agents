@@ -44,6 +44,7 @@ from ..operations.checkpoints import (
     ModelCallStatus,
     OperationSnapshot,
 )
+from ..operations.governance import ApprovalRequest, ApprovalStatus
 from ..operations.leases import TaskClaimRequest, TaskLease, TaskLeaseGuard
 from ..operations.models import (
     AgentTrigger,
@@ -59,6 +60,7 @@ from ..operations.models import (
 )
 from ..operations.store import (
     CommitResult,
+    InvalidOperationCheckpointError,
     OperationAlreadyExistsError,
     OperationNotFoundError,
     OperationRevisionConflict,
@@ -765,6 +767,207 @@ _FENCED_TASK_EXECUTION_SCHEMA_SQL = (
 _BLOB_BACKED_EVIDENCE_SCHEMA_SQL = ("ALTER TABLE evidence ADD COLUMN blob_id TEXT",)
 
 
+_APPROVAL_SCHEMA_SQL = (
+    """
+    CREATE TABLE approvals (
+        operation_id TEXT NOT NULL REFERENCES operations(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        task_fingerprint TEXT NOT NULL CHECK (
+            length(task_fingerprint) = 71
+            AND substr(task_fingerprint, 1, 7) = 'sha256:'
+            AND substr(task_fingerprint, 8) NOT GLOB '*[^0-9a-f]*'
+        ),
+        policy_fingerprint TEXT NOT NULL CHECK (
+            length(policy_fingerprint) = 71
+            AND substr(policy_fingerprint, 1, 7) = 'sha256:'
+            AND substr(policy_fingerprint, 8) NOT GLOB '*[^0-9a-f]*'
+        ),
+        requested_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+            status IN ('pending', 'approved', 'denied', 'cancelled')
+        ),
+        decided_at TEXT,
+        decided_by TEXT,
+        decision_reason TEXT,
+        UNIQUE (operation_id, position),
+        UNIQUE (operation_id, id),
+        UNIQUE (operation_id, task_id),
+        CHECK (
+            (
+                status = 'pending'
+                AND decided_at IS NULL
+                AND decided_by IS NULL
+                AND decision_reason IS NULL
+            )
+            OR (
+                status != 'pending'
+                AND decided_at IS NOT NULL
+                AND decided_at >= requested_at
+                AND decided_by IS NOT NULL
+                AND length(trim(decided_by)) > 0
+                AND decision_reason IS NOT NULL
+                AND length(trim(decision_reason)) > 0
+            )
+        ),
+        FOREIGN KEY (operation_id, task_id)
+            REFERENCES tasks(operation_id, id) ON DELETE CASCADE
+    )
+    """.strip(),
+    "ALTER TABLE runtime_events ADD COLUMN approval_id TEXT",
+    """
+    INSERT INTO runtime_events(
+        id, operation_id, position, type, agent_id, agent_sequence, created_at,
+        session_id, turn_id, model_call_id, call_id, task_id, evidence_id,
+        capability_id, executor_id, payload_json, approval_id
+    )
+    WITH legacy_waiting AS (
+        SELECT
+            task.id AS task_id,
+            task.operation_id,
+            task.position AS task_position,
+            task.turn_id,
+            task.call_id,
+            task.capability_id,
+            task.executor_id,
+            task.updated_at,
+            operation.agent_id,
+            operation.session_id,
+            turn.model_response_id,
+            COALESCE((
+                SELECT MAX(existing.position) + 1
+                FROM runtime_events AS existing
+                WHERE existing.operation_id = task.operation_id
+            ), 0) AS operation_event_base,
+            COALESCE((
+                SELECT MAX(existing.agent_sequence)
+                FROM runtime_events AS existing
+                WHERE existing.agent_id = operation.agent_id
+            ), 0) AS agent_event_base,
+            ROW_NUMBER() OVER (
+                PARTITION BY task.operation_id ORDER BY task.position
+            ) - 1 AS operation_event_offset,
+            ROW_NUMBER() OVER (
+                PARTITION BY operation.agent_id
+                ORDER BY task.operation_id, task.position
+            ) AS agent_event_offset
+        FROM tasks AS task
+        JOIN operations AS operation ON operation.id = task.operation_id
+        JOIN turns AS turn
+            ON turn.operation_id = task.operation_id
+            AND turn.id = task.turn_id
+        WHERE task.status = 'waiting_for_approval'
+    )
+    SELECT
+        'daita:v2:migration:6:manual-recovery:'
+            || lower(hex(CAST(operation_id AS BLOB)))
+            || ':'
+            || lower(hex(CAST(task_id AS BLOB))),
+        operation_id,
+        operation_event_base + operation_event_offset,
+        'task.manual_recovery_required',
+        agent_id,
+        agent_event_base + agent_event_offset,
+        updated_at,
+        session_id,
+        turn_id,
+        model_response_id,
+        call_id,
+        task_id,
+        NULL,
+        capability_id,
+        executor_id,
+        '{"from_status":"waiting_for_approval","reason":"legacy_waiting_task_missing_approval","to_status":"manual_recovery_required"}',
+        NULL
+    FROM legacy_waiting
+    ORDER BY agent_id, agent_event_offset
+    """.strip(),
+    """
+    UPDATE operations
+    SET
+        revision = revision + 1,
+        status = CASE
+            WHEN status = 'waiting_for_approval' THEN 'running'
+            ELSE status
+        END
+    WHERE EXISTS (
+        SELECT 1
+        FROM tasks AS task
+        WHERE task.operation_id = operations.id
+            AND task.status = 'waiting_for_approval'
+    )
+    """.strip(),
+    """
+    UPDATE loop_state
+    SET
+        phase = 'awaiting_execution',
+        waiting_approval_id = NULL
+    WHERE EXISTS (
+        SELECT 1
+        FROM tasks AS task
+        WHERE task.operation_id = loop_state.operation_id
+            AND task.status = 'waiting_for_approval'
+    )
+    """.strip(),
+    """
+    UPDATE tasks
+    SET
+        status = 'manual_recovery_required',
+        manual_recovery_reason = 'legacy_waiting_task_missing_approval'
+    WHERE status = 'waiting_for_approval'
+    """.strip(),
+    """
+    CREATE INDEX approvals_operation_status_idx
+        ON approvals(operation_id, status, requested_at)
+    """.strip(),
+    """
+    CREATE TRIGGER approvals_reject_identity_update
+    BEFORE UPDATE ON approvals
+    WHEN NEW.operation_id != OLD.operation_id
+        OR NEW.position != OLD.position
+        OR NEW.id != OLD.id
+        OR NEW.task_id != OLD.task_id
+        OR NEW.task_fingerprint != OLD.task_fingerprint
+        OR NEW.policy_fingerprint != OLD.policy_fingerprint
+        OR NEW.requested_at != OLD.requested_at
+    BEGIN
+        SELECT RAISE(ABORT, 'approval identity is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER approvals_reject_terminal_update
+    BEFORE UPDATE ON approvals
+    WHEN OLD.status != 'pending'
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal approval is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER approvals_reject_delete
+    BEFORE DELETE ON approvals
+    BEGIN
+        SELECT RAISE(ABORT, 'approval history is append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER runtime_events_validate_approval_insert
+    BEFORE INSERT ON runtime_events
+    WHEN NEW.approval_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1
+            FROM approvals AS approval
+            WHERE approval.id = NEW.approval_id
+                AND approval.operation_id = NEW.operation_id
+                AND approval.task_id = NEW.task_id
+        )
+    BEGIN
+        SELECT RAISE(ABORT, 'event approval correlation is invalid');
+    END
+    """.strip(),
+)
+
+
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
 # Migration 3 assigns one append-only committed-event sequence per agent.
@@ -772,6 +975,9 @@ _BLOB_BACKED_EVIDENCE_SCHEMA_SQL = ("ALTER TABLE evidence ADD COLUMN blob_id TEX
 # fenced lease history. Legacy in-flight work is failed closed during upgrade.
 # Migration 5 adds the explicit nullable link from accepted evidence to the
 # separately durable content-addressed blob manifest.
+# Migration 6 normalizes exact approval decisions and correlates their events.
+# Legacy approval-waiting tasks have no exact fingerprints, so upgrade fails
+# them closed into manual recovery rather than synthesizing authority.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -797,6 +1003,11 @@ _MIGRATIONS = (
         version=5,
         name="link_blob_backed_evidence",
         statements=_BLOB_BACKED_EVIDENCE_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=6,
+        name="normalize_approval_lifecycle",
+        statements=_APPROVAL_SCHEMA_SQL,
     ),
 )
 
@@ -922,6 +1133,17 @@ class SQLiteOperationStore:
         _require_identity(trigger_id, "trigger_id")
         return await self._run_connection(
             lambda connection: _load_versioned_by_trigger(connection, trigger_id)
+        )
+
+    async def load_by_approval(
+        self,
+        approval_id: str,
+    ) -> VersionedOperation | None:
+        """Load the operation that owns one globally unique approval identity."""
+
+        _require_identity(approval_id, "approval_id")
+        return await self._run_connection(
+            lambda connection: _load_versioned_by_approval(connection, approval_id)
         )
 
     async def read_after(
@@ -1760,6 +1982,7 @@ def _create_operation(
                 _sqlite_text(trigger_row[0], "claimed operation id"),
             )
 
+        _validate_approval_id_claims(connection, snapshot)
         _insert_snapshot(connection, snapshot, revision=1)
         committed = VersionedOperation(snapshot=snapshot, revision=1)
         result = CommitResult(
@@ -1803,6 +2026,7 @@ def _commit_operation(
 
         current = _load_versioned_operation_in_transaction(connection, operation_id)
         committed_events = _validate_commit_candidate(current.snapshot, snapshot)
+        _validate_approval_id_claims(connection, snapshot)
         candidate_revision = actual_revision + 1
         _apply_commit_delta(
             connection,
@@ -2044,6 +2268,29 @@ def _observed_commit_proves_result(
     return observed == candidate
 
 
+def _validate_approval_id_claims(
+    connection: sqlite3.Connection,
+    snapshot: OperationSnapshot,
+) -> None:
+    operation_id = snapshot.operation.id
+    for approval in snapshot.approvals:
+        row = connection.execute(
+            "SELECT operation_id FROM approvals WHERE id = ?",
+            (approval.id,),
+        ).fetchone()
+        if row is None:
+            continue
+        claimed_operation_id = _sqlite_text(
+            row[0],
+            "approval operation id",
+        )
+        if claimed_operation_id != operation_id:
+            raise InvalidOperationCheckpointError(
+                operation_id,
+                f"approval identity is already claimed: {approval.id}",
+            )
+
+
 def _apply_commit_delta(
     connection: sqlite3.Connection,
     current: OperationSnapshot,
@@ -2177,6 +2424,7 @@ def _apply_commit_delta(
         )
 
     _apply_task_lease_delta(connection, current, candidate)
+    _apply_approval_delta(connection, current, candidate)
 
     for position in range(len(current.evidence), len(candidate.evidence)):
         _insert_evidence(
@@ -2290,6 +2538,51 @@ def _apply_task_lease_delta(
             operation_id,
             position,
             candidate.task_leases[position],
+        )
+
+
+def _apply_approval_delta(
+    connection: sqlite3.Connection,
+    current: OperationSnapshot,
+    candidate: OperationSnapshot,
+) -> None:
+    operation_id = candidate.operation.id
+    for position, (before, after) in enumerate(
+        zip(current.approvals, candidate.approvals, strict=False)
+    ):
+        if after == before:
+            continue
+        approval_update = connection.execute(
+            "UPDATE approvals SET status = ?, decided_at = ?, decided_by = ?, "
+            "decision_reason = ? WHERE operation_id = ? AND position = ? "
+            "AND id = ? AND task_id = ? AND task_fingerprint = ? "
+            "AND policy_fingerprint = ? AND requested_at = ? AND status = ? "
+            "AND decided_at IS ? AND decided_by IS ? AND decision_reason IS ?",
+            (
+                after.status.value,
+                _encode_optional_datetime(after.decided_at),
+                after.decided_by,
+                after.decision_reason,
+                operation_id,
+                position,
+                before.id,
+                before.task_id,
+                before.task_fingerprint,
+                before.policy_fingerprint,
+                _encode_datetime(before.requested_at),
+                before.status.value,
+                _encode_optional_datetime(before.decided_at),
+                before.decided_by,
+                before.decision_reason,
+            ),
+        )
+        _require_one_row(approval_update.rowcount, "approval", before.id)
+    for position in range(len(current.approvals), len(candidate.approvals)):
+        _insert_approval(
+            connection,
+            operation_id,
+            position,
+            candidate.approvals[position],
         )
 
 
@@ -2407,6 +2700,13 @@ def _insert_snapshot(
             operation.id,
             position,
             lease,
+        )
+    for position, approval in enumerate(snapshot.approvals):
+        _insert_approval(
+            connection,
+            operation.id,
+            position,
+            approval,
         )
     for position, evidence in enumerate(snapshot.evidence):
         _insert_evidence(connection, operation.id, position, evidence)
@@ -2595,6 +2895,34 @@ def _insert_task_lease(
     )
 
 
+def _insert_approval(
+    connection: sqlite3.Connection,
+    operation_id: str,
+    position: int,
+    approval: ApprovalRequest,
+) -> None:
+    connection.execute(
+        "INSERT INTO approvals("
+        "operation_id, position, id, task_id, task_fingerprint, "
+        "policy_fingerprint, requested_at, status, decided_at, decided_by, "
+        "decision_reason"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            operation_id,
+            position,
+            approval.id,
+            approval.task_id,
+            approval.task_fingerprint,
+            approval.policy_fingerprint,
+            _encode_datetime(approval.requested_at),
+            approval.status.value,
+            _encode_optional_datetime(approval.decided_at),
+            approval.decided_by,
+            approval.decision_reason,
+        ),
+    )
+
+
 def _insert_evidence(
     connection: sqlite3.Connection,
     operation_id: str,
@@ -2676,15 +3004,50 @@ def _insert_runtime_event(
     position: int,
     event: RuntimeEvent,
 ) -> None:
+    has_approval_id = _pragma_int(connection, "user_version") >= 6
+    if not has_approval_id:
+        if event.approval_id is not None:
+            raise SQLiteCorruptionError(
+                "historical runtime event schema cannot store approval identity"
+            )
+        connection.execute(
+            "INSERT INTO runtime_events("
+            "id, operation_id, position, type, agent_id, agent_sequence, created_at, "
+            "session_id, turn_id, model_call_id, call_id, task_id, evidence_id, "
+            "capability_id, executor_id, payload_json"
+            ") VALUES (?, ?, ?, ?, ?, ("
+            "SELECT COALESCE(MAX(agent_sequence), 0) + 1 FROM runtime_events "
+            "WHERE agent_id = ?"
+            "), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event.id,
+                operation_id,
+                position,
+                event.type,
+                event.agent_id,
+                event.agent_id,
+                _encode_datetime(event.created_at),
+                event.session_id,
+                event.turn_id,
+                event.model_call_id,
+                event.call_id,
+                event.task_id,
+                event.evidence_id,
+                event.capability_id,
+                event.executor_id,
+                canonical_json(event.payload),
+            ),
+        )
+        return
     connection.execute(
         "INSERT INTO runtime_events("
         "id, operation_id, position, type, agent_id, agent_sequence, created_at, "
         "session_id, turn_id, model_call_id, call_id, task_id, evidence_id, "
-        "capability_id, executor_id, payload_json"
+        "capability_id, executor_id, payload_json, approval_id"
         ") VALUES (?, ?, ?, ?, ?, ("
         "SELECT COALESCE(MAX(agent_sequence), 0) + 1 FROM runtime_events "
         "WHERE agent_id = ?"
-        "), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             event.id,
             operation_id,
@@ -2702,6 +3065,7 @@ def _insert_runtime_event(
             event.capability_id,
             event.executor_id,
             canonical_json(event.payload),
+            event.approval_id,
         ),
     )
 
@@ -2781,6 +3145,7 @@ def _decode_runtime_event_row(row: sqlite3.Row) -> RuntimeEvent:
         call_id=_optional_text(row["call_id"]),
         task_id=_optional_text(row["task_id"]),
         evidence_id=_optional_text(row["evidence_id"]),
+        approval_id=_optional_text(row["approval_id"]),
         capability_id=_optional_text(row["capability_id"]),
         executor_id=_optional_text(row["executor_id"]),
         payload=_decode_json_object(_sqlite_text(row["payload_json"], "event payload")),
@@ -2818,6 +3183,32 @@ def _load_versioned_by_trigger(
             else _load_versioned_operation_in_transaction(
                 connection,
                 _sqlite_text(row[0], "operation id"),
+            )
+        )
+        connection.execute("COMMIT")
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_versioned_by_approval(
+    connection: sqlite3.Connection,
+    approval_id: str,
+) -> VersionedOperation | None:
+    connection.execute("BEGIN")
+    try:
+        row = connection.execute(
+            "SELECT operation_id FROM approvals WHERE id = ?",
+            (approval_id,),
+        ).fetchone()
+        result = (
+            None
+            if row is None
+            else _load_versioned_operation_in_transaction(
+                connection,
+                _sqlite_text(row[0], "approval operation id"),
             )
         )
         connection.execute("COMMIT")
@@ -3005,6 +3396,7 @@ def _decode_snapshot(
         operation_id,
     )
     task_lease_rows = _operation_rows(connection, "task_leases", operation_id)
+    approval_rows = _operation_rows(connection, "approvals", operation_id)
     evidence_rows = _operation_rows(connection, "evidence", operation_id)
     observation_rows = _operation_rows(connection, "observations", operation_id)
     event_rows = _operation_rows(connection, "runtime_events", operation_id)
@@ -3155,6 +3547,32 @@ def _decode_snapshot(
         )
         for row in task_lease_rows
     )
+    approvals = tuple(
+        ApprovalRequest(
+            id=_sqlite_text(row["id"], "approval id"),
+            operation_id=operation_id,
+            task_id=_sqlite_text(row["task_id"], "approval task id"),
+            task_fingerprint=_sqlite_text(
+                row["task_fingerprint"],
+                "approval task fingerprint",
+            ),
+            policy_fingerprint=_sqlite_text(
+                row["policy_fingerprint"],
+                "approval policy fingerprint",
+            ),
+            requested_at=_decode_datetime(
+                _sqlite_text(row["requested_at"], "approval requested_at")
+            ),
+            status=ApprovalStatus(_sqlite_text(row["status"], "approval status")),
+            decided_at=_decode_optional_datetime(
+                row["decided_at"],
+                "approval decided_at",
+            ),
+            decided_by=_optional_text(row["decided_by"]),
+            decision_reason=_optional_text(row["decision_reason"]),
+        )
+        for row in approval_rows
+    )
     evidence = tuple(
         Evidence(
             id=_sqlite_text(row["id"], "evidence id"),
@@ -3212,6 +3630,7 @@ def _decode_snapshot(
         tasks=tasks,
         task_dependencies=task_dependencies,
         task_leases=task_leases,
+        approvals=approvals,
         evidence=evidence,
         observations=observations,
         events=events,
@@ -3230,6 +3649,7 @@ def _operation_rows(
         "tasks",
         "task_dependencies",
         "task_leases",
+        "approvals",
         "evidence",
         "observations",
         "runtime_events",

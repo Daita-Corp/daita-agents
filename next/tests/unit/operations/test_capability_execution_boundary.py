@@ -39,6 +39,12 @@ from daita.operations.models import (
     TriggerKind,
 )
 from daita.operations.checkpoints import OperationSnapshot
+from daita.operations.governance import (
+    DefaultPolicyEvaluator,
+    GovernanceDecision,
+    GovernanceFacts,
+    PolicyEffect,
+)
 from daita.operations.leases import TaskClaimRequest, TaskLeaseGuard
 from daita.operations.runtime import (
     OperationRuntime,
@@ -58,6 +64,25 @@ from daita.operations.store import (
 from daita.storage.sqlite import SQLiteOperationStore
 
 NOW = datetime(2026, 7, 17, 9, 0, tzinfo=timezone.utc)
+
+
+class ExecutionBoundaryTestPolicy(DefaultPolicyEvaluator):
+    """Keep low-level executor tests independent of approval progression."""
+
+    def evaluate(
+        self,
+        facts: GovernanceFacts,
+        *,
+        evaluated_at: datetime,
+    ) -> GovernanceDecision:
+        return GovernanceDecision(
+            effect=PolicyEffect.ALLOW,
+            code="execution_boundary_test_allowed",
+            reason="The test isolates the post-governance executor boundary.",
+            task_fingerprint=facts.task_fingerprint,
+            policy_fingerprint=self.profile.fingerprint,
+            evaluated_at=evaluated_at,
+        )
 
 
 class CandidateExecutor:
@@ -348,6 +373,7 @@ async def _runtime_with_committed_tool_call(
             capabilities=registry,
             clock=clock,
             store=store,
+            policy=ExecutionBoundaryTestPolicy(),
             lease_duration_seconds=lease_duration_seconds,
         )
     else:
@@ -356,6 +382,7 @@ async def _runtime_with_committed_tool_call(
             clock=clock,
             id_factory=id_factory,
             store=store,
+            policy=ExecutionBoundaryTestPolicy(),
             lease_duration_seconds=lease_duration_seconds,
         )
     started = await runtime.begin(
@@ -467,6 +494,7 @@ async def test_submit_executes_only_after_fenced_start_and_forwards_identity() -
         event.type for event in final.events if event.task_id == final.tasks[0].id
     ] == [
         "task.created",
+        "governance.allowed",
         "task.ready",
         "task.claimed",
         "executor.started",
@@ -510,6 +538,7 @@ async def test_wall_deadline_crossed_after_claim_blocks_executor_io() -> None:
     assert snapshot.evidence == ()
     assert [event.type for event in snapshot.events if event.task_id == task.id] == [
         "task.created",
+        "governance.allowed",
         "task.ready",
         "task.claimed",
         "executor.started",
@@ -854,6 +883,7 @@ async def test_fenced_start_failure_leaves_claim_without_executor_io() -> None:
     assert snapshot.task_leases[0].released_at is None
     assert [event.type for event in snapshot.events if event.task_id] == [
         "task.created",
+        "governance.allowed",
         "task.ready",
         "task.claimed",
     ]

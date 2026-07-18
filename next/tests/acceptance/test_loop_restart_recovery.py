@@ -40,6 +40,7 @@ from daita.loop.models import (
     Turn,
 )
 from daita.operations.checkpoints import OperationSnapshot
+from daita.operations.governance import ApprovalStatus
 from daita.operations.leases import TaskClaimRequest, TaskLeaseGuard
 from daita.operations.models import (
     ActionProposal,
@@ -1273,13 +1274,28 @@ async def test_resume_expired_unsafe_task_waits_for_manual_recovery(
             _tool_response(),
             budgets=LoopBudgets(max_wall_time_seconds=10),
         )
-        with pytest.raises(AbruptProcessExit):
+        assert (
             await first_runtime.submit(
                 _proposal(
                     started.operation.id,
                     turn.id,
                     capability_id=unsafe_capability.id,
                 )
+            )
+            is None
+        )
+        waiting = await first_runtime.inspect(started.operation.id)
+        await first_runtime.decide_approval(
+            waiting.approvals[0].id,
+            status=ApprovalStatus.APPROVED,
+            decided_by="restart-test",
+            reason="Exercise post-approval unsafe crash recovery.",
+        )
+        assert await first_runtime.resume_approval(started.operation.id)
+        with pytest.raises(AbruptProcessExit):
+            await first_runtime.resume_task(
+                started.operation.id,
+                waiting.tasks[0].id,
             )
         before_restart = await first_runtime.inspect(started.operation.id)
         assert before_restart.tasks[0].status is TaskStatus.RUNNING

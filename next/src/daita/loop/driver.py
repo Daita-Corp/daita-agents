@@ -118,6 +118,9 @@ class AgentLoop:
 
         while True:
             snapshot = await self._runtime.inspect(operation_id)
+            if snapshot.operation.status is OperationStatus.WAITING_FOR_APPROVAL:
+                if await self._runtime.resume_approval(operation_id):
+                    continue
             checkpoint_exit = self._checkpoint_exit(snapshot)
             if checkpoint_exit is not None:
                 return checkpoint_exit
@@ -406,6 +409,20 @@ class AgentLoop:
                 None,
             )
             if existing_task is not None:
+                failed_observation = next(
+                    (
+                        observation
+                        for observation in snapshot.observations
+                        if observation.task_id == existing_task.id
+                        and not observation.success
+                    ),
+                    None,
+                )
+                if failed_observation is not None and existing_task.status in {
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                }:
+                    return None
                 observed_evidence_ids = {
                     observation.evidence_id
                     for observation in snapshot.observations
@@ -549,6 +566,20 @@ class AgentLoop:
                         operation_id,
                         "action_processing_failed",
                     )
+                if evidence is None:
+                    current = await self._runtime.inspect(operation_id)
+                    task = next(
+                        task
+                        for task in current.tasks
+                        if task.turn_id == model_call.turn_id
+                        and task.call_id == call.id
+                    )
+                    if task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED} and any(
+                        observation.task_id == task.id and not observation.success
+                        for observation in current.observations
+                    ):
+                        return None
+                    return await self._task_checkpoint_exit(current, task.id)
             else:
                 try:
                     resumed_evidence = await self._runtime.resume_task(

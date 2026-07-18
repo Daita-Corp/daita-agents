@@ -500,6 +500,7 @@ async def test_invalid_action_is_observed_then_changed_action_repairs() -> None:
         "model_call.started",
         "model_response.recorded",
         "task.created",
+        "governance.allowed",
         "task.ready",
         "task.claimed",
         "executor.started",

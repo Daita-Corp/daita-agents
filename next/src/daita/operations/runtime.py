@@ -34,6 +34,14 @@ from ..loop.models import (
 )
 from ..storage.blobs import BlobMetadata, BlobPut, BlobStore
 from .checkpoints import ModelCall, ModelCallStatus, OperationSnapshot
+from .governance import (
+    ApprovalRequest,
+    ApprovalStatus,
+    DefaultPolicyEvaluator,
+    GovernanceDecision,
+    GovernanceFacts,
+    PolicyEffect,
+)
 from .models import (
     ActionProposal,
     ActionRejection,
@@ -101,6 +109,7 @@ class _OperationState:
     tasks: list[Task]
     task_dependencies: list[TaskDependency]
     task_leases: list[TaskLease]
+    approvals: list[ApprovalRequest]
     evidence: list[Evidence]
     observations: list[Observation]
     events: list[RuntimeEvent]
@@ -165,6 +174,7 @@ class OperationRuntime:
         capabilities: CapabilityRegistry | None = None,
         store: TaskExecutionStore | None = None,
         blob_store: BlobStore | None = None,
+        policy: DefaultPolicyEvaluator | None = None,
         lease_holder_id: str | None = None,
         lease_duration_seconds: float = 60.0,
     ) -> None:
@@ -185,6 +195,7 @@ class OperationRuntime:
             store if store is not None else InMemoryOperationStore(clock=clock)
         )
         self._blob_store = blob_store
+        self._policy = policy or DefaultPolicyEvaluator()
         self._lease_holder_id = lease_holder_id or _random_id("runtime-holder")
         self._lease_duration_seconds = float(lease_duration_seconds)
 
@@ -224,6 +235,7 @@ class OperationRuntime:
                 tasks=[],
                 task_dependencies=[],
                 task_leases=[],
+                approvals=[],
                 evidence=[],
                 observations=[],
                 events=[],
@@ -696,7 +708,7 @@ class OperationRuntime:
         proposal: ActionProposal,
         *,
         timeout_seconds: float | None = None,
-    ) -> Evidence:
+    ) -> Evidence | None:
         if not isinstance(proposal, ActionProposal):
             raise TypeError("proposal must be an ActionProposal")
         if timeout_seconds is not None and (
@@ -711,11 +723,385 @@ class OperationRuntime:
         )
 
         task = await self._materialize_task(proposal)
+        decision = await self._govern_task(task.operation_id, task.id)
+        if decision.effect is not PolicyEffect.ALLOW:
+            return None
         return await self._execute_materialized_task(
             task.operation_id,
             task.id,
             requested_timeout_seconds=requested_timeout_seconds,
         )
+
+    async def _govern_task(
+        self,
+        operation_id: str,
+        task_id: str,
+    ) -> GovernanceDecision:
+        """Persist the policy outcome before any task can reach executor I/O."""
+
+        async with self._lock:
+            state = await self._working_state(operation_id)
+            task_index, task = self._task(state, task_id)
+            if task.status is not TaskStatus.PENDING:
+                raise OperationStateError("only a pending task can enter governance")
+            self._resolve_task_execution(task)
+            facts = self._governance_facts(state, task)
+            now = self._clock()
+            decision = self._policy.evaluate(facts, evaluated_at=now)
+            model_call = self._completed_model_call_for_turn(state, task.turn_id)
+            event_fields = {
+                "turn_id": task.turn_id,
+                "model_call_id": model_call.id,
+                "call_id": task.call_id,
+                "task_id": task.id,
+                "capability_id": task.capability_id,
+                "executor_id": task.executor_id,
+            }
+            payload = {
+                "code": decision.code,
+                "policy_fingerprint": decision.policy_fingerprint,
+                "task_fingerprint": decision.task_fingerprint,
+            }
+
+            if decision.effect is PolicyEffect.ALLOW:
+                ready_task = replace(
+                    task,
+                    status=TaskStatus.READY,
+                    updated_at=now,
+                )
+                state.tasks[task_index] = ready_task
+                self._append_event(
+                    state,
+                    "governance.allowed",
+                    **event_fields,
+                    payload=payload,
+                )
+                self._append_event(
+                    state,
+                    "task.ready",
+                    **event_fields,
+                    payload={"task_id": task.id},
+                )
+            elif decision.effect is PolicyEffect.REQUIRE_APPROVAL:
+                approval = ApprovalRequest(
+                    id=self._id_factory("approval"),
+                    operation_id=operation_id,
+                    task_id=task.id,
+                    task_fingerprint=decision.task_fingerprint,
+                    policy_fingerprint=decision.policy_fingerprint,
+                    requested_at=now,
+                )
+                state.approvals.append(approval)
+                state.tasks[task_index] = replace(
+                    task,
+                    status=TaskStatus.WAITING_FOR_APPROVAL,
+                    updated_at=now,
+                )
+                state.operation = replace(
+                    state.operation,
+                    status=OperationStatus.WAITING_FOR_APPROVAL,
+                    updated_at=now,
+                )
+                state.loop_state = replace(
+                    state.loop_state,
+                    phase=LoopPhase.AWAITING_APPROVAL,
+                    waiting_approval_id=approval.id,
+                )
+                self._append_event(
+                    state,
+                    "governance.approval_required",
+                    **event_fields,
+                    approval_id=approval.id,
+                    payload={**payload, "approval_id": approval.id},
+                )
+                self._append_event(
+                    state,
+                    "approval.requested",
+                    **event_fields,
+                    approval_id=approval.id,
+                    payload={
+                        "approval_id": approval.id,
+                        "policy_fingerprint": decision.policy_fingerprint,
+                        "task_fingerprint": decision.task_fingerprint,
+                    },
+                )
+            else:
+                failed = replace(
+                    task,
+                    status=TaskStatus.FAILED,
+                    updated_at=now,
+                    error_code=decision.code,
+                )
+                state.tasks[task_index] = failed
+                observation = Observation(
+                    operation_id=operation_id,
+                    turn_id=task.turn_id,
+                    call_id=task.call_id,
+                    task_id=task.id,
+                    code=decision.code,
+                    message=decision.reason,
+                    payload=payload,
+                    success=False,
+                    created_at=now,
+                )
+                state.observations.append(observation)
+                state.loop_state = replace(
+                    state.loop_state,
+                    phase=LoopPhase.OBSERVING,
+                    observation_characters=(
+                        state.loop_state.observation_characters
+                        + self._observation_characters(observation)
+                    ),
+                )
+                self._append_event(
+                    state,
+                    "governance.denied",
+                    **event_fields,
+                    payload=payload,
+                )
+                self._append_event(
+                    state,
+                    "task.failed",
+                    **event_fields,
+                    payload={"task_id": task.id, "error_code": decision.code},
+                )
+                self._append_event(
+                    state,
+                    "observation.recorded",
+                    **event_fields,
+                    payload={"code": decision.code, "success": False},
+                )
+
+            state.operation = replace(state.operation, updated_at=now)
+            await self._commit(state)
+            return decision
+
+    async def decide_approval(
+        self,
+        approval_id: str,
+        *,
+        status: ApprovalStatus,
+        decided_by: str,
+        reason: str,
+    ) -> ApprovalRequest:
+        """CAS one pending approval; never execute or resume its task."""
+
+        _required_text(approval_id, "approval_id")
+        _required_text(decided_by, "decided_by")
+        _required_text(reason, "approval reason")
+        if not isinstance(status, ApprovalStatus):
+            raise TypeError("status must be an ApprovalStatus")
+        if status not in {ApprovalStatus.APPROVED, ApprovalStatus.DENIED}:
+            raise ValueError("approval decision must approve or deny")
+
+        async with self._lock:
+            committed = await self._store.load_by_approval(approval_id)
+            if committed is None:
+                raise KeyError(f"Unknown approval: {approval_id}")
+            state = self._state_from_snapshot(
+                committed.snapshot,
+                revision=committed.revision,
+            )
+            approval_index, approval = self._approval(state, approval_id)
+            if approval.status is not ApprovalStatus.PENDING:
+                if (
+                    approval.status is status
+                    and approval.decided_by == decided_by
+                    and approval.decision_reason == reason
+                ):
+                    return approval
+                raise OperationStateError(
+                    f"approval is already {approval.status.value}: {approval_id}"
+                )
+            if state.operation.status in {
+                OperationStatus.SUCCEEDED,
+                OperationStatus.FAILED,
+                OperationStatus.CANCELLED,
+                OperationStatus.INTERRUPTED,
+            }:
+                raise OperationStateError("approval operation is already terminal")
+
+            now = self._clock()
+            decided = replace(
+                approval,
+                status=status,
+                decided_at=now,
+                decided_by=decided_by,
+                decision_reason=reason,
+            )
+            state.approvals[approval_index] = decided
+            _, task = self._task(state, approval.task_id)
+            model_call = self._completed_model_call_for_turn(state, task.turn_id)
+            self._append_event(
+                state,
+                f"approval.{status.value}",
+                turn_id=task.turn_id,
+                model_call_id=model_call.id,
+                call_id=task.call_id,
+                task_id=task.id,
+                approval_id=approval.id,
+                capability_id=task.capability_id,
+                executor_id=task.executor_id,
+                payload={
+                    "approval_id": approval.id,
+                    "decided_by": decided_by,
+                    "reason": reason,
+                },
+            )
+            await self._commit(state)
+            return decided
+
+    async def resume_approval(self, operation_id: str) -> bool:
+        """Apply one decided approval to its exact task without executor I/O."""
+
+        _required_text(operation_id, "operation_id")
+        async with self._lock:
+            while True:
+                state = await self._working_state(operation_id)
+                if state.operation.status is not OperationStatus.WAITING_FOR_APPROVAL:
+                    return False
+                approval_id = state.loop_state.waiting_approval_id
+                if approval_id is None:
+                    raise OperationStateError(
+                        "approval-waiting operation has no approval identity"
+                    )
+                _, approval = self._approval(state, approval_id)
+                if approval.status is ApprovalStatus.PENDING:
+                    return False
+                task_index, task = self._task(state, approval.task_id)
+                if task.status is not TaskStatus.WAITING_FOR_APPROVAL:
+                    raise OperationStateError("approval task is not waiting")
+                self._resolve_task_execution(task)
+                facts = self._governance_facts(state, task)
+                current_decision = self._policy.evaluate(
+                    facts,
+                    evaluated_at=self._clock(),
+                )
+                if (
+                    approval.task_fingerprint != facts.task_fingerprint
+                    or approval.policy_fingerprint
+                    != current_decision.policy_fingerprint
+                    or current_decision.effect is not PolicyEffect.REQUIRE_APPROVAL
+                ):
+                    raise OperationStateError(
+                        "approval no longer matches the exact task and policy"
+                    )
+
+                now = self._clock()
+                model_call = self._completed_model_call_for_turn(state, task.turn_id)
+                event_fields = {
+                    "turn_id": task.turn_id,
+                    "model_call_id": model_call.id,
+                    "call_id": task.call_id,
+                    "task_id": task.id,
+                    "approval_id": approval.id,
+                    "capability_id": task.capability_id,
+                    "executor_id": task.executor_id,
+                }
+                if approval.status is ApprovalStatus.APPROVED:
+                    state.tasks[task_index] = replace(
+                        task,
+                        status=TaskStatus.READY,
+                        updated_at=now,
+                    )
+                    state.loop_state = replace(
+                        state.loop_state,
+                        phase=LoopPhase.AWAITING_EXECUTION,
+                        waiting_approval_id=None,
+                    )
+                    self._append_event(
+                        state,
+                        "approval.applied",
+                        **event_fields,
+                        payload={
+                            "approval_id": approval.id,
+                            "status": approval.status.value,
+                        },
+                    )
+                    self._append_event(
+                        state,
+                        "task.ready",
+                        **event_fields,
+                        payload={"task_id": task.id},
+                    )
+                else:
+                    error_code = f"approval_{approval.status.value}"
+                    state.tasks[task_index] = replace(
+                        task,
+                        status=(
+                            TaskStatus.FAILED
+                            if approval.status is ApprovalStatus.DENIED
+                            else TaskStatus.CANCELLED
+                        ),
+                        updated_at=now,
+                        error_code=(
+                            error_code
+                            if approval.status is ApprovalStatus.DENIED
+                            else None
+                        ),
+                    )
+                    observation = Observation(
+                        operation_id=operation_id,
+                        turn_id=task.turn_id,
+                        call_id=task.call_id,
+                        task_id=task.id,
+                        code=error_code,
+                        message=approval.decision_reason
+                        or "The approval was not granted.",
+                        payload={
+                            "approval_id": approval.id,
+                            "status": approval.status.value,
+                        },
+                        success=False,
+                        created_at=now,
+                    )
+                    state.observations.append(observation)
+                    state.loop_state = replace(
+                        state.loop_state,
+                        phase=LoopPhase.OBSERVING,
+                        waiting_approval_id=None,
+                        observation_characters=(
+                            state.loop_state.observation_characters
+                            + self._observation_characters(observation)
+                        ),
+                    )
+                    self._append_event(
+                        state,
+                        "approval.applied",
+                        **event_fields,
+                        payload={
+                            "approval_id": approval.id,
+                            "status": approval.status.value,
+                        },
+                    )
+                    self._append_event(
+                        state,
+                        (
+                            "task.failed"
+                            if approval.status is ApprovalStatus.DENIED
+                            else "task.cancelled"
+                        ),
+                        **event_fields,
+                        payload={"task_id": task.id, "error_code": error_code},
+                    )
+                    self._append_event(
+                        state,
+                        "observation.recorded",
+                        **event_fields,
+                        payload={"code": error_code, "success": False},
+                    )
+                state.operation = replace(
+                    state.operation,
+                    status=OperationStatus.RUNNING,
+                    updated_at=now,
+                )
+                try:
+                    await self._commit(state)
+                except OperationStateError as error:
+                    if isinstance(error.__cause__, OperationRevisionConflict):
+                        continue
+                    raise
+                return True
 
     async def resume_task(
         self,
@@ -738,6 +1124,7 @@ class OperationRuntime:
         requested_timeout_seconds = (
             None if timeout_seconds is None else float(timeout_seconds)
         )
+        needs_governance = False
 
         async with self._lock:
             try:
@@ -859,9 +1246,15 @@ class OperationRuntime:
                         f"task recovery produced non-executable state: "
                         f"{task.status.value}"
                     )
-            elif task.status not in {TaskStatus.PENDING, TaskStatus.READY}:
+            elif task.status is TaskStatus.PENDING:
+                needs_governance = True
+            elif task.status is not TaskStatus.READY:
                 raise OperationStateError(f"task is not resumable: {task.status.value}")
 
+        if needs_governance:
+            decision = await self._govern_task(operation_id, task_id)
+            if decision.effect is not PolicyEffect.ALLOW:
+                return None
         return await self._execute_materialized_task(
             operation_id,
             task_id,
@@ -984,7 +1377,6 @@ class OperationRuntime:
 
         # Persist readiness, claim a fenced lease, and durably cross the
         # executor-start boundary before the only external execution call.
-        wall_deadline_error: OperationWallTimeExceeded | None = None
         post_start_wall_deadline_error: OperationWallTimeExceeded | None = None
         lease_expired_before_io = False
         execution_timeout_seconds = 0.0
@@ -993,206 +1385,141 @@ class OperationRuntime:
         guard: TaskLeaseGuard | None = None
         async with self._lock:
             state = await self._working_state(operation_id)
-            task_index, committed_task = self._task(state, task_id)
+            _, committed_task = self._task(state, task_id)
             task = committed_task
             model_call = self._completed_model_call_for_turn(state, task.turn_id)
-            if committed_task.status not in {TaskStatus.PENDING, TaskStatus.READY}:
+            if committed_task.status is not TaskStatus.READY:
                 raise OperationStateError("task is no longer executable")
             self._resolve_task_execution(committed_task)
-            deadline_now = self._clock()
-            if deadline_now.tzinfo is None or deadline_now.utcoffset() is None:
+            ready_task = committed_task
+
+            claim_event = RuntimeEvent(
+                id=self._id_factory("event"),
+                type="task.claimed",
+                agent_id=state.operation.agent_id,
+                operation_id=state.operation.id,
+                session_id=state.operation.session_id,
+                turn_id=ready_task.turn_id,
+                model_call_id=model_call.id,
+                call_id=ready_task.call_id,
+                task_id=ready_task.id,
+                capability_id=ready_task.capability_id,
+                executor_id=ready_task.executor_id,
+                payload={},
+                created_at=self._clock(),
+            )
+            try:
+                claim, cancellation_requested = await _await_store_write(
+                    self._store.claim_task(
+                        TaskClaimRequest(
+                            operation_id=ready_task.operation_id,
+                            task_id=ready_task.id,
+                            holder_id=self._lease_holder_id,
+                            lease_duration_seconds=self._lease_duration_seconds,
+                            event=claim_event,
+                        ),
+                        expected_revision=state.revision,
+                    )
+                )
+            except OperationStoreError as error:
+                raise OperationStateError(
+                    f"task claim rejected: {ready_task.id}"
+                ) from error
+            if cancellation_requested:
+                raise asyncio.CancelledError
+
+            state = self._state_from_snapshot(
+                claim.commit_result.operation.snapshot,
+                revision=claim.commit_result.operation.revision,
+            )
+            task_index, claimed_task = self._task(state, ready_task.id)
+            _, executor = self._resolve_task_execution(claimed_task)
+            guard = TaskLeaseGuard(
+                operation_id=claimed_task.operation_id,
+                task_id=claimed_task.id,
+                holder_id=claim.lease.holder_id,
+                attempt=claim.lease.attempt,
+                fencing_token=claim.lease.fencing_token,
+            )
+            lease_index, claimed_lease = self._lease(state, guard)
+            state.tasks[task_index] = replace(
+                claimed_task,
+                status=TaskStatus.RUNNING,
+                updated_at=claimed_task.updated_at,
+            )
+            state.task_leases[lease_index] = replace(
+                claimed_lease,
+                started_at=claimed_lease.acquired_at,
+            )
+            self._append_event(
+                state,
+                "executor.started",
+                turn_id=claimed_task.turn_id,
+                model_call_id=model_call.id,
+                call_id=claimed_task.call_id,
+                task_id=claimed_task.id,
+                capability_id=claimed_task.capability_id,
+                executor_id=claimed_task.executor_id,
+                payload={
+                    "task_id": claimed_task.id,
+                    "executor_id": claimed_task.executor_id,
+                },
+            )
+            fenced_start_monotonic = asyncio.get_running_loop().time()
+            state = await self._commit_fenced(state, guard)
+            fenced_start_round_trip = max(
+                0.0,
+                asyncio.get_running_loop().time() - fenced_start_monotonic,
+            )
+            _, task = self._task(state, claimed_task.id)
+            _, started_lease = self._lease(state, guard)
+            _, executor = self._resolve_task_execution(task)
+            if started_lease.started_at is None:
+                raise OperationStateError("executor start lease was not committed")
+
+            # Readiness, claim, and fenced start are durable writes and may
+            # consume the remaining operation budget. Recompute both the
+            # wall and lease bounds from the committed start immediately
+            # before allowing executor I/O.
+            execution_now = self._clock()
+            if execution_now.tzinfo is None or execution_now.utcoffset() is None:
                 raise ValueError("runtime clock must return a timezone-aware datetime")
             elapsed_seconds = max(
                 0.0,
-                (deadline_now - state.operation.created_at).total_seconds(),
+                (execution_now - state.operation.created_at).total_seconds(),
             )
             remaining_wall_time = state.budgets.max_wall_time_seconds - elapsed_seconds
-            if remaining_wall_time <= 0 and committed_task.status is TaskStatus.PENDING:
-                state.tasks[task_index] = replace(
-                    committed_task,
-                    status=TaskStatus.FAILED,
-                    updated_at=deadline_now,
-                    error_code="task_timeout",
-                )
-                state.operation = replace(
-                    state.operation,
-                    updated_at=deadline_now,
-                )
-                self._append_event(
-                    state,
-                    "task.failed",
-                    turn_id=committed_task.turn_id,
-                    model_call_id=model_call.id,
-                    call_id=committed_task.call_id,
-                    task_id=committed_task.id,
-                    capability_id=committed_task.capability_id,
-                    executor_id=committed_task.executor_id,
-                    payload={
-                        "task_id": committed_task.id,
-                        "error_code": "task_timeout",
-                    },
-                )
-                await self._commit(state)
-                wall_deadline_error = OperationWallTimeExceeded(committed_task.id)
+            # Lease timestamps belong to the store's authoritative clock;
+            # never compare them with the independently injectable runtime
+            # clock. The fenced start supplies the exact remaining store
+            # interval at that commit boundary.
+            remaining_lease_time = (
+                started_lease.expires_at - started_lease.started_at
+            ).total_seconds() - fenced_start_round_trip
+            if remaining_wall_time <= 0:
+                post_start_wall_deadline_error = OperationWallTimeExceeded(task.id)
+            elif remaining_lease_time <= 0:
+                lease_expired_before_io = True
             else:
-                if committed_task.status is TaskStatus.PENDING:
-                    ready_at = self._clock()
-                    ready_task = replace(
-                        committed_task,
-                        status=TaskStatus.READY,
-                        updated_at=ready_at,
-                    )
-                    state.tasks[task_index] = ready_task
-                    state.operation = replace(state.operation, updated_at=ready_at)
-                    self._append_event(
-                        state,
-                        "task.ready",
-                        turn_id=ready_task.turn_id,
-                        model_call_id=model_call.id,
-                        call_id=ready_task.call_id,
-                        task_id=ready_task.id,
-                        capability_id=ready_task.capability_id,
-                        executor_id=ready_task.executor_id,
-                        payload={"task_id": ready_task.id},
-                    )
-                    await self._commit(state)
-                else:
-                    ready_task = committed_task
-                self._resolve_task_execution(ready_task)
+                # Reserve half of the live interval for cancellation and a
+                # fenced outcome. Until P2-05f adds renewal, the other half
+                # is the strict executor-timeout ceiling.
+                lease_safe_timeout = remaining_lease_time / 2.0
+                non_wall_timeout = min(
+                    state.budgets.task_timeout_seconds,
+                    (
+                        requested_timeout_seconds
+                        if requested_timeout_seconds is not None
+                        else math.inf
+                    ),
+                    lease_safe_timeout,
+                )
+                execution_timeout_seconds = min(
+                    remaining_wall_time,
+                    non_wall_timeout,
+                )
+                timeout_is_wall = remaining_wall_time <= non_wall_timeout
 
-                claim_event = RuntimeEvent(
-                    id=self._id_factory("event"),
-                    type="task.claimed",
-                    agent_id=state.operation.agent_id,
-                    operation_id=state.operation.id,
-                    session_id=state.operation.session_id,
-                    turn_id=ready_task.turn_id,
-                    model_call_id=model_call.id,
-                    call_id=ready_task.call_id,
-                    task_id=ready_task.id,
-                    capability_id=ready_task.capability_id,
-                    executor_id=ready_task.executor_id,
-                    payload={},
-                    created_at=self._clock(),
-                )
-                try:
-                    claim, cancellation_requested = await _await_store_write(
-                        self._store.claim_task(
-                            TaskClaimRequest(
-                                operation_id=ready_task.operation_id,
-                                task_id=ready_task.id,
-                                holder_id=self._lease_holder_id,
-                                lease_duration_seconds=self._lease_duration_seconds,
-                                event=claim_event,
-                            ),
-                            expected_revision=state.revision,
-                        )
-                    )
-                except OperationStoreError as error:
-                    raise OperationStateError(
-                        f"task claim rejected: {ready_task.id}"
-                    ) from error
-                if cancellation_requested:
-                    raise asyncio.CancelledError
-
-                state = self._state_from_snapshot(
-                    claim.commit_result.operation.snapshot,
-                    revision=claim.commit_result.operation.revision,
-                )
-                task_index, claimed_task = self._task(state, ready_task.id)
-                _, executor = self._resolve_task_execution(claimed_task)
-                guard = TaskLeaseGuard(
-                    operation_id=claimed_task.operation_id,
-                    task_id=claimed_task.id,
-                    holder_id=claim.lease.holder_id,
-                    attempt=claim.lease.attempt,
-                    fencing_token=claim.lease.fencing_token,
-                )
-                lease_index, claimed_lease = self._lease(state, guard)
-                state.tasks[task_index] = replace(
-                    claimed_task,
-                    status=TaskStatus.RUNNING,
-                    updated_at=claimed_task.updated_at,
-                )
-                state.task_leases[lease_index] = replace(
-                    claimed_lease,
-                    started_at=claimed_lease.acquired_at,
-                )
-                self._append_event(
-                    state,
-                    "executor.started",
-                    turn_id=claimed_task.turn_id,
-                    model_call_id=model_call.id,
-                    call_id=claimed_task.call_id,
-                    task_id=claimed_task.id,
-                    capability_id=claimed_task.capability_id,
-                    executor_id=claimed_task.executor_id,
-                    payload={
-                        "task_id": claimed_task.id,
-                        "executor_id": claimed_task.executor_id,
-                    },
-                )
-                fenced_start_monotonic = asyncio.get_running_loop().time()
-                state = await self._commit_fenced(state, guard)
-                fenced_start_round_trip = max(
-                    0.0,
-                    asyncio.get_running_loop().time() - fenced_start_monotonic,
-                )
-                _, task = self._task(state, claimed_task.id)
-                _, started_lease = self._lease(state, guard)
-                _, executor = self._resolve_task_execution(task)
-                if started_lease.started_at is None:
-                    raise OperationStateError("executor start lease was not committed")
-
-                # Readiness, claim, and fenced start are durable writes and may
-                # consume the remaining operation budget. Recompute both the
-                # wall and lease bounds from the committed start immediately
-                # before allowing executor I/O.
-                execution_now = self._clock()
-                if execution_now.tzinfo is None or execution_now.utcoffset() is None:
-                    raise ValueError(
-                        "runtime clock must return a timezone-aware datetime"
-                    )
-                elapsed_seconds = max(
-                    0.0,
-                    (execution_now - state.operation.created_at).total_seconds(),
-                )
-                remaining_wall_time = (
-                    state.budgets.max_wall_time_seconds - elapsed_seconds
-                )
-                # Lease timestamps belong to the store's authoritative clock;
-                # never compare them with the independently injectable runtime
-                # clock. The fenced start supplies the exact remaining store
-                # interval at that commit boundary.
-                remaining_lease_time = (
-                    started_lease.expires_at - started_lease.started_at
-                ).total_seconds() - fenced_start_round_trip
-                if remaining_wall_time <= 0:
-                    post_start_wall_deadline_error = OperationWallTimeExceeded(task.id)
-                elif remaining_lease_time <= 0:
-                    lease_expired_before_io = True
-                else:
-                    # Reserve half of the live interval for cancellation and a
-                    # fenced outcome. Until P2-05f adds renewal, the other half
-                    # is the strict executor-timeout ceiling.
-                    lease_safe_timeout = remaining_lease_time / 2.0
-                    non_wall_timeout = min(
-                        state.budgets.task_timeout_seconds,
-                        (
-                            requested_timeout_seconds
-                            if requested_timeout_seconds is not None
-                            else math.inf
-                        ),
-                        lease_safe_timeout,
-                    )
-                    execution_timeout_seconds = min(
-                        remaining_wall_time,
-                        non_wall_timeout,
-                    )
-                    timeout_is_wall = remaining_wall_time <= non_wall_timeout
-
-        if wall_deadline_error is not None:
-            raise wall_deadline_error
         assert executor is not None
         assert guard is not None
         if post_start_wall_deadline_error is not None:
@@ -1871,6 +2198,7 @@ class OperationRuntime:
             tasks=list(snapshot.tasks),
             task_dependencies=list(snapshot.task_dependencies),
             task_leases=list(snapshot.task_leases),
+            approvals=list(snapshot.approvals),
             evidence=list(snapshot.evidence),
             observations=list(snapshot.observations),
             events=list(snapshot.events),
@@ -2036,6 +2364,42 @@ class OperationRuntime:
             if task.id == task_id:
                 return index, task
         raise OperationStateError(f"unknown task: {task_id}")
+
+    @staticmethod
+    def _approval(
+        state: _OperationState,
+        approval_id: str,
+    ) -> tuple[int, ApprovalRequest]:
+        for index, approval in enumerate(state.approvals):
+            if approval.id == approval_id:
+                return index, approval
+        raise OperationStateError(f"unknown approval: {approval_id}")
+
+    @staticmethod
+    def _governance_facts(
+        state: _OperationState,
+        task: Task,
+    ) -> GovernanceFacts:
+        facts = task.execution_facts
+        return GovernanceFacts(
+            operation_id=task.operation_id,
+            task_id=task.id,
+            capability_id=task.capability_id,
+            executor_id=task.executor_id,
+            capability_fingerprint=facts.capability_fingerprint,
+            arguments_hash=facts.arguments_hash,
+            access_mode=facts.access_mode,
+            risk=facts.risk,
+            side_effecting=facts.side_effecting,
+            idempotent=facts.idempotent,
+            replay_safe=facts.replay_safe,
+            idempotency_key=facts.idempotency_key,
+            validation_passed=True,
+            in_scope=True,
+            destructive=False,
+            sensitivity_class="internal",
+            actor_id=f"{state.trigger.kind.value}:{state.trigger.source_id}",
+        )
 
     @staticmethod
     def _lease(
@@ -2240,6 +2604,7 @@ class OperationRuntime:
         call_id: str | None = None,
         task_id: str | None = None,
         evidence_id: str | None = None,
+        approval_id: str | None = None,
         capability_id: str | None = None,
         executor_id: str | None = None,
         payload: Mapping[str, object] | None = None,
@@ -2256,6 +2621,7 @@ class OperationRuntime:
                 call_id=call_id,
                 task_id=task_id,
                 evidence_id=evidence_id,
+                approval_id=approval_id,
                 capability_id=capability_id,
                 executor_id=executor_id,
                 payload=payload or {},
@@ -2311,8 +2677,48 @@ class OperationRuntime:
         )
         if active_task_index is not None:
             task = state.tasks[active_task_index]
+            if task.status is TaskStatus.WAITING_FOR_APPROVAL:
+                pending_approval = next(
+                    (
+                        (index, approval)
+                        for index, approval in enumerate(state.approvals)
+                        if approval.task_id == task.id
+                        and approval.status is ApprovalStatus.PENDING
+                    ),
+                    None,
+                )
+                if pending_approval is not None:
+                    approval_index, approval = pending_approval
+                    state.approvals[approval_index] = replace(
+                        approval,
+                        status=ApprovalStatus.CANCELLED,
+                        decided_at=now,
+                        decided_by="runtime:interrupt",
+                        decision_reason=reason,
+                    )
+                    model_call = self._completed_model_call_for_turn(
+                        state,
+                        task.turn_id,
+                    )
+                    self._append_event(
+                        state,
+                        "approval.cancelled",
+                        turn_id=task.turn_id,
+                        model_call_id=model_call.id,
+                        call_id=task.call_id,
+                        task_id=task.id,
+                        approval_id=approval.id,
+                        capability_id=task.capability_id,
+                        executor_id=task.executor_id,
+                        payload={"approval_id": approval.id, "reason": reason},
+                    )
             state.tasks[active_task_index] = replace(
                 task,
+                status=(
+                    TaskStatus.CANCELLED
+                    if task.status is TaskStatus.WAITING_FOR_APPROVAL
+                    else task.status
+                ),
                 cancellation_requested=True,
                 updated_at=now,
             )
@@ -2353,6 +2759,7 @@ class OperationRuntime:
         state.loop_state = replace(
             state.loop_state,
             phase=LoopPhase.TERMINAL,
+            waiting_approval_id=None,
             interruption_reason=reason,
         )
         self._append_event(
@@ -2380,6 +2787,7 @@ class OperationRuntime:
             tasks=tuple(state.tasks),
             task_dependencies=tuple(state.task_dependencies),
             task_leases=tuple(state.task_leases),
+            approvals=tuple(state.approvals),
             evidence=tuple(state.evidence),
             observations=tuple(state.observations),
             events=tuple(state.events),

@@ -433,8 +433,9 @@ async def test_cancellation_during_executor_io_preserves_running_task_intent() -
     assert len(snapshot.task_leases) == 1
     assert snapshot.task_leases[0].started_at is not None
     assert snapshot.task_leases[0].released_at is None
-    assert [event.type for event in snapshot.events][-6:] == [
+    assert [event.type for event in snapshot.events][-7:] == [
         "task.created",
+        "governance.allowed",
         "task.ready",
         "task.claimed",
         "executor.started",

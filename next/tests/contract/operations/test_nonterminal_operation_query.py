@@ -8,12 +8,29 @@ import sqlite3
 import pytest
 
 from daita.events.models import RuntimeEvent
-from daita.loop.models import LoopBudgets, LoopPhase, LoopState
-from daita.operations.checkpoints import OperationSnapshot
+from daita.llm.models import (
+    CanonicalMessage,
+    FinishReason,
+    MessageRole,
+    ModelRequest,
+    ModelResponse,
+    TextBlock,
+    ToolCall,
+    ToolDefinition,
+)
+from daita.loop.models import LoopBudgets, LoopPhase, LoopState, Turn
+from daita.operations.checkpoints import (
+    ModelCall,
+    ModelCallStatus,
+    OperationSnapshot,
+)
+from daita.operations.governance import ApprovalRequest
 from daita.operations.models import (
     AgentTrigger,
     Operation,
     OperationStatus,
+    Task,
+    TaskStatus,
     TriggerKind,
 )
 from daita.operations.store import InMemoryOperationStore, VersionedOperation
@@ -76,17 +93,119 @@ def _snapshot(
         payload={"status": status.value},
         created_at=NOW,
     )
+    approval_wait = status is OperationStatus.WAITING_FOR_APPROVAL
+    turns: tuple[Turn, ...] = ()
+    model_calls: tuple[ModelCall, ...] = ()
+    tasks: tuple[Task, ...] = ()
+    approvals: tuple[ApprovalRequest, ...] = ()
+    waiting_approval_id: str | None = None
+    if approval_wait:
+        turn_id = f"turn-{operation_id}"
+        model_call_id = f"model-{operation_id}"
+        call_id = f"call-{operation_id}"
+        task_id = f"task-{operation_id}"
+        waiting_approval_id = f"approval-{operation_id}"
+        request = ModelRequest(
+            operation_id=operation_id,
+            turn_id=turn_id,
+            messages=(
+                CanonicalMessage(
+                    agent_id=agent_id,
+                    operation_id=operation_id,
+                    turn_id=turn_id,
+                    role=MessageRole.USER,
+                    content=(TextBlock("Change the test marker."),),
+                ),
+            ),
+            tools=(
+                ToolDefinition(
+                    name="fake_write",
+                    description="Change one test marker.",
+                    input_schema={"type": "object"},
+                ),
+            ),
+        )
+        response = ModelResponse(
+            finish_reason=FinishReason.TOOL_CALLS,
+            tool_calls=(
+                ToolCall(
+                    id=call_id,
+                    name="fake_write",
+                    arguments={"value": "approved"},
+                ),
+            ),
+        )
+        model_calls = (
+            ModelCall(
+                id=model_call_id,
+                operation_id=operation_id,
+                turn_id=turn_id,
+                provider_id="mock:approval-query",
+                request=request,
+                response=response,
+                status=ModelCallStatus.COMPLETED,
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        )
+        turns = (
+            Turn(
+                id=turn_id,
+                operation_id=operation_id,
+                number=1,
+                model_request_id=model_call_id,
+                model_response_id=model_call_id,
+                created_at=NOW,
+            ),
+        )
+        tasks = (
+            Task(
+                id=task_id,
+                operation_id=operation_id,
+                turn_id=turn_id,
+                call_id=call_id,
+                capability_id="fake.write",
+                executor_id="fake.write.executor",
+                status=TaskStatus.WAITING_FOR_APPROVAL,
+                attempt=1,
+                arguments={"value": "approved"},
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        )
+        approvals = (
+            ApprovalRequest(
+                id=waiting_approval_id,
+                operation_id=operation_id,
+                task_id=task_id,
+                task_fingerprint="sha256:" + ("a" * 64),
+                policy_fingerprint="sha256:" + ("b" * 64),
+                requested_at=NOW,
+            ),
+        )
     return OperationSnapshot(
         trigger=trigger,
         operation=operation,
         loop_state=LoopState(
-            phase=LoopPhase.TERMINAL if terminal else LoopPhase.PREPARING_CONTEXT
+            phase=(
+                LoopPhase.TERMINAL
+                if terminal
+                else (
+                    LoopPhase.AWAITING_APPROVAL
+                    if approval_wait
+                    else LoopPhase.PREPARING_CONTEXT
+                )
+            ),
+            turn_count=1 if approval_wait else 0,
+            action_count=1 if approval_wait else 0,
+            waiting_approval_id=waiting_approval_id,
         ),
         budgets=LoopBudgets(),
-        turns=(),
-        model_calls=(),
+        turns=turns,
+        model_calls=model_calls,
         readiness=(),
-        tasks=(),
+        tasks=tasks,
+        approvals=approvals,
         evidence=(),
         observations=(),
         events=(event,),

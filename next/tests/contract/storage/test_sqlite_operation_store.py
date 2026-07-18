@@ -402,7 +402,6 @@ def _maximal_snapshot() -> OperationSnapshot:
             input_tokens=321,
             output_tokens=123,
             estimated_cost_usd=Decimal("12.3400"),
-            waiting_approval_id="approval-roundtrip",
             interruption_reason="host_restart",
             final_answer_candidate="Durable answer \u2713",
             no_progress_fingerprints=("fingerprint-z", "fingerprint-a"),

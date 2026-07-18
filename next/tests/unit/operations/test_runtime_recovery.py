@@ -482,7 +482,6 @@ async def test_resume_returns_existing_success_without_reexecuting() -> None:
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
         TaskStatus.MANUAL_RECOVERY_REQUIRED,
-        TaskStatus.WAITING_FOR_APPROVAL,
     ),
 )
 async def test_resume_rejects_terminal_non_success_without_reexecuting(

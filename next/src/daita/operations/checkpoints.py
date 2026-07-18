@@ -13,15 +13,18 @@ from enum import Enum
 
 from ..events.models import RuntimeEvent
 from ..llm.models import ModelRequest, ModelResponse
-from ..loop.models import LoopBudgets, LoopState, Readiness, Turn
+from ..loop.models import LoopBudgets, LoopPhase, LoopState, Readiness, Turn
 from .leases import TaskLease
+from .governance import ApprovalRequest, ApprovalStatus
 from .models import (
     AgentTrigger,
     Evidence,
     Observation,
     Operation,
+    OperationStatus,
     Task,
     TaskDependency,
+    TaskStatus,
 )
 
 
@@ -117,6 +120,7 @@ class OperationSnapshot:
     events: tuple[RuntimeEvent, ...]
     task_dependencies: tuple[TaskDependency, ...] = ()
     task_leases: tuple[TaskLease, ...] = ()
+    approvals: tuple[ApprovalRequest, ...] = ()
 
     def __post_init__(self) -> None:
         self._validate_root_records()
@@ -144,6 +148,7 @@ class OperationSnapshot:
             "tasks",
             "task_dependencies",
             "task_leases",
+            "approvals",
             "evidence",
             "observations",
             "events",
@@ -167,6 +172,7 @@ class OperationSnapshot:
             (self.tasks, Task, "tasks"),
             (self.task_dependencies, TaskDependency, "task_dependencies"),
             (self.task_leases, TaskLease, "task_leases"),
+            (self.approvals, ApprovalRequest, "approvals"),
             (self.evidence, Evidence, "evidence"),
             (self.observations, Observation, "observations"),
             (self.events, RuntimeEvent, "events"),
@@ -194,6 +200,7 @@ class OperationSnapshot:
         self._require_unique_ids(self.turns, "turn")
         self._require_unique_ids(self.model_calls, "model call")
         self._require_unique_ids(self.tasks, "task")
+        self._require_unique_ids(self.approvals, "approval")
         self._require_unique_ids(self.evidence, "evidence")
 
         operation_id = self.operation.id
@@ -202,6 +209,7 @@ class OperationSnapshot:
             model_call.id: model_call for model_call in self.model_calls
         }
         task_by_id = {task.id: task for task in self.tasks}
+        approval_by_id = {approval.id: approval for approval in self.approvals}
         evidence_by_id = {item.id: item for item in self.evidence}
         tool_call_ids_by_turn: dict[str, set[str]] = {}
         for model_call_record in self.model_calls:
@@ -269,6 +277,51 @@ class OperationSnapshot:
 
         self._validate_task_dependencies(task_by_id)
         self._validate_task_leases(task_by_id)
+        approval_task_ids: set[str] = set()
+        for approval in self.approvals:
+            if approval.operation_id != operation_id:
+                raise ValueError("approval operation does not match snapshot operation")
+            if approval.task_id not in task_by_id:
+                raise ValueError("approval task does not exist in snapshot")
+            if approval.task_id in approval_task_ids:
+                raise ValueError("task may have at most one approval request")
+            approval_task_ids.add(approval.task_id)
+
+        waiting_approval_id = self.loop_state.waiting_approval_id
+        operation_is_waiting = (
+            self.operation.status is OperationStatus.WAITING_FOR_APPROVAL
+        )
+        loop_is_waiting = self.loop_state.phase is LoopPhase.AWAITING_APPROVAL
+        if operation_is_waiting != loop_is_waiting:
+            raise ValueError("operation and loop approval-wait state must agree")
+        if operation_is_waiting != (waiting_approval_id is not None):
+            raise ValueError("approval-waiting state requires one approval identity")
+        if waiting_approval_id is not None:
+            waiting_approval = approval_by_id.get(waiting_approval_id)
+            if waiting_approval is None:
+                raise ValueError("loop waiting approval does not exist in snapshot")
+            if (
+                task_by_id[waiting_approval.task_id].status
+                is not TaskStatus.WAITING_FOR_APPROVAL
+            ):
+                raise ValueError("loop waiting approval task is not waiting")
+            if waiting_approval.status not in {
+                ApprovalStatus.PENDING,
+                ApprovalStatus.APPROVED,
+                ApprovalStatus.DENIED,
+            }:
+                raise ValueError("cancelled approval cannot remain an active wait")
+        waiting_tasks = tuple(
+            task
+            for task in self.tasks
+            if task.status is TaskStatus.WAITING_FOR_APPROVAL
+        )
+        if operation_is_waiting:
+            assert waiting_approval_id is not None
+            if len(waiting_tasks) != 1:
+                raise ValueError("approval wait requires exactly one waiting task")
+        elif waiting_tasks:
+            raise ValueError("waiting task requires an approval-waiting operation")
 
         for evidence_record in self.evidence:
             if evidence_record.operation_id != operation_id:
@@ -432,6 +485,7 @@ class OperationSnapshot:
         }
         task_by_id = {task.id: task for task in self.tasks}
         evidence_by_id = {item.id: item for item in self.evidence}
+        approval_by_id = {approval.id: approval for approval in self.approvals}
         tool_call_ids_by_model_call: dict[str, set[str]] = {}
         for model_call_record in self.model_calls:
             tool_call_ids_by_model_call[model_call_record.id] = (
@@ -489,6 +543,16 @@ class OperationSnapshot:
             task = None if event.task_id is None else task_by_id.get(event.task_id)
             if event.task_id is not None and task is None:
                 raise ValueError("event task does not exist in snapshot")
+            approval = (
+                None
+                if event.approval_id is None
+                else approval_by_id.get(event.approval_id)
+            )
+            if event.approval_id is not None and approval is None:
+                raise ValueError("event approval does not exist in snapshot")
+            if approval is not None:
+                if task is None or approval.task_id != task.id:
+                    raise ValueError("event approval does not match its task")
             if task is not None:
                 if (
                     event.turn_id is None

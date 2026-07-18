@@ -42,6 +42,7 @@ NOW = datetime(2026, 7, 17, 20, 0, tzinfo=timezone.utc)
 ZERO_SHA256 = "sha256:" + ("0" * 64)
 MIGRATION_FOUR_NAME = "normalize_fenced_task_execution"
 MIGRATION_FIVE_NAME = "link_blob_backed_evidence"
+MIGRATION_SIX_NAME = "normalize_approval_lifecycle"
 LEGACY_RECOVERY_REASON = "legacy_running_task_missing_lease"
 LEGACY_RECOVERY_EVENT_TYPE = "task.manual_recovery_required"
 
@@ -120,6 +121,21 @@ def _migration_five() -> sqlite_owner._SQLiteMigration:
     )
     migration = migrations[4]
     assert migration.name == MIGRATION_FIVE_NAME
+    return migration
+
+
+def _migration_six() -> sqlite_owner._SQLiteMigration:
+    migrations = tuple(sqlite_owner._MIGRATIONS)
+    assert tuple(migration.version for migration in migrations[:6]) == (
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+    )
+    migration = migrations[5]
+    assert migration.name == MIGRATION_SIX_NAME
     return migration
 
 
@@ -430,7 +446,7 @@ def _assert_evidence_blob_schema(path: Path) -> None:
     assert _columns(path, "evidence")["blob_id"] == ("TEXT", 0)
 
 
-async def test_public_schema_five_is_fixed_and_reopen_is_idempotent(
+async def test_public_schema_migrations_are_fixed_and_reopen_is_idempotent(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "fresh-v5.db"
@@ -451,7 +467,7 @@ async def test_public_schema_five_is_fixed_and_reopen_is_idempotent(
         (migration.version, migration.name, migration.checksum)
         for migration in sqlite_owner._MIGRATIONS
     )
-    assert _migration_rows(path)[-1][1] == MIGRATION_FIVE_NAME
+    assert _migration_rows(path)[-1][1] == MIGRATION_SIX_NAME
     _assert_task_execution_schema(path)
     _assert_evidence_blob_schema(path)
     first_image = _logical_database_image(path)
@@ -461,6 +477,7 @@ async def test_public_schema_five_is_fixed_and_reopen_is_idempotent(
 
     assert _logical_database_image(path) == first_image
     assert migration_five.version == 5
+    assert _migration_six().version == 6
 
 
 async def test_version_four_upgrade_adds_nullable_evidence_blob_id(
@@ -483,7 +500,7 @@ async def test_version_four_upgrade_adds_nullable_evidence_blob_id(
     )
     assert "blob_id" not in _columns(backup_path, "evidence")
     _assert_evidence_blob_schema(path)
-    assert _migration_rows(path)[-1][1] == MIGRATION_FIVE_NAME
+    assert _migration_rows(path)[-1][1] == MIGRATION_SIX_NAME
 
     connection = sqlite3.connect(path)
     try:

@@ -36,6 +36,7 @@ class RuntimeEvent:
     call_id: str | None = None
     task_id: str | None = None
     evidence_id: str | None = None
+    approval_id: str | None = None
     capability_id: str | None = None
     executor_id: str | None = None
     payload: Mapping[str, object] = field(default_factory=dict)
@@ -53,6 +54,7 @@ class RuntimeEvent:
             ("call_id", self.call_id),
             ("task_id", self.task_id),
             ("evidence_id", self.evidence_id),
+            ("approval_id", self.approval_id),
             ("capability_id", self.capability_id),
             ("executor_id", self.executor_id),
         ):

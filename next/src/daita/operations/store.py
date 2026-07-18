@@ -12,6 +12,7 @@ from typing import Literal, Protocol
 
 from ..events.models import RuntimeEvent
 from .checkpoints import OperationSnapshot
+from .governance import ApprovalStatus
 from .leases import TaskClaimRequest, TaskLease, TaskLeaseGuard
 from .models import OperationStatus, Task, TaskStatus
 
@@ -262,6 +263,11 @@ class OperationStore(Protocol):
         trigger_id: str,
     ) -> VersionedOperation | None: ...
 
+    async def load_by_approval(
+        self,
+        approval_id: str,
+    ) -> VersionedOperation | None: ...
+
     async def commit(
         self,
         snapshot: OperationSnapshot,
@@ -339,6 +345,7 @@ class InMemoryOperationStore:
         self._lock = asyncio.Lock()
         self._operations: dict[str, VersionedOperation] = {}
         self._operation_by_trigger: dict[str, str] = {}
+        self._operation_by_approval: dict[str, str] = {}
 
     async def create(self, snapshot: OperationSnapshot) -> CommitResult:
         _validate_new_checkpoint(snapshot)
@@ -350,6 +357,7 @@ class InMemoryOperationStore:
             claimed_operation_id = self._operation_by_trigger.get(trigger_id)
             if claimed_operation_id is not None:
                 raise TriggerAlreadyClaimedError(trigger_id, claimed_operation_id)
+            self._claim_approval_ids(snapshot)
 
             committed = VersionedOperation(snapshot=snapshot, revision=1)
             self._operations[operation_id] = committed
@@ -406,6 +414,17 @@ class InMemoryOperationStore:
                 return None
             return self._operations[operation_id]
 
+    async def load_by_approval(
+        self,
+        approval_id: str,
+    ) -> VersionedOperation | None:
+        _require_identity(approval_id, "approval_id")
+        async with self._lock:
+            operation_id = self._operation_by_approval.get(approval_id)
+            if operation_id is None:
+                return None
+            return self._operations[operation_id]
+
     async def commit(
         self,
         snapshot: OperationSnapshot,
@@ -431,6 +450,7 @@ class InMemoryOperationStore:
                 current.snapshot,
                 snapshot,
             )
+            self._claim_approval_ids(snapshot)
             committed = VersionedOperation(
                 snapshot=snapshot,
                 revision=current.revision + 1,
@@ -582,6 +602,7 @@ class InMemoryOperationStore:
         candidate: OperationSnapshot,
     ) -> CommitResult:
         committed_events = _committed_event_suffix(current.snapshot, candidate)
+        self._claim_approval_ids(candidate)
         committed = VersionedOperation(
             snapshot=candidate,
             revision=current.revision + 1,
@@ -591,6 +612,21 @@ class InMemoryOperationStore:
             operation=committed,
             committed_events=committed_events,
         )
+
+    def _claim_approval_ids(self, snapshot: OperationSnapshot) -> None:
+        operation_id = snapshot.operation.id
+        for approval in snapshot.approvals:
+            claimed_operation_id = self._operation_by_approval.get(approval.id)
+            if (
+                claimed_operation_id is not None
+                and claimed_operation_id != operation_id
+            ):
+                raise InvalidOperationCheckpointError(
+                    operation_id,
+                    f"approval identity is already claimed: {approval.id}",
+                )
+        for approval in snapshot.approvals:
+            self._operation_by_approval[approval.id] = operation_id
 
 
 _TaskExecutionMutation = Literal["claim", "renew", "fenced", "recover"]
@@ -1695,6 +1731,50 @@ def _validate_stable_history(
     actively_leased_task_ids = {
         lease.task_id for lease in current.task_leases if lease.released_at is None
     }
+    for appended_approval in candidate.approvals[len(current.approvals) :]:
+        if appended_approval.status is not ApprovalStatus.PENDING:
+            raise InvalidOperationCheckpointError(
+                operation_id,
+                f"new approval must be pending: {appended_approval.id}",
+            )
+    _validate_record_id_prefix(
+        current.approvals,
+        candidate.approvals,
+        operation_id,
+        "approval",
+    )
+    for before_approval, after_approval in zip(
+        current.approvals,
+        candidate.approvals,
+        strict=False,
+    ):
+        if (
+            after_approval.operation_id != before_approval.operation_id
+            or after_approval.task_id != before_approval.task_id
+            or after_approval.task_fingerprint != before_approval.task_fingerprint
+            or after_approval.policy_fingerprint != before_approval.policy_fingerprint
+            or after_approval.requested_at != before_approval.requested_at
+        ):
+            raise InvalidOperationCheckpointError(
+                operation_id,
+                f"committed approval identity is immutable: {before_approval.id}",
+            )
+        if before_approval.status is not ApprovalStatus.PENDING:
+            if after_approval != before_approval:
+                raise InvalidOperationCheckpointError(
+                    operation_id,
+                    f"terminal approval history is immutable: {before_approval.id}",
+                )
+        elif after_approval.status not in {
+            ApprovalStatus.PENDING,
+            ApprovalStatus.APPROVED,
+            ApprovalStatus.DENIED,
+            ApprovalStatus.CANCELLED,
+        }:
+            raise InvalidOperationCheckpointError(
+                operation_id,
+                f"invalid approval transition: {before_approval.id}",
+            )
     for appended_task in candidate.tasks[len(current.tasks) :]:
         if (
             appended_task.status is not TaskStatus.PENDING
@@ -1803,6 +1883,9 @@ def _validate_stable_history(
             TaskStatus.RUNNING: {TaskStatus.RUNNING},
             TaskStatus.WAITING_FOR_APPROVAL: {
                 TaskStatus.WAITING_FOR_APPROVAL,
+                TaskStatus.READY,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
             },
             TaskStatus.SUCCEEDED: {TaskStatus.SUCCEEDED},
             TaskStatus.FAILED: {TaskStatus.FAILED},
@@ -1819,6 +1902,27 @@ def _validate_stable_history(
                 "claim and fenced transitions require a lease",
             )
         if (
+            before_task.status is TaskStatus.WAITING_FOR_APPROVAL
+            and after_task.status is not TaskStatus.WAITING_FOR_APPROVAL
+        ):
+            approval = next(
+                (item for item in candidate.approvals if item.task_id == after_task.id),
+                None,
+            )
+            expected_approval_statuses = {
+                TaskStatus.READY: {ApprovalStatus.APPROVED},
+                TaskStatus.FAILED: {ApprovalStatus.DENIED},
+                TaskStatus.CANCELLED: {
+                    ApprovalStatus.APPROVED,
+                    ApprovalStatus.CANCELLED,
+                },
+            }[after_task.status]
+            if approval is None or approval.status not in expected_approval_statuses:
+                raise InvalidOperationCheckpointError(
+                    operation_id,
+                    f"approval does not authorize task transition: {after_task.id}",
+                )
+        if (
             before_task.status is TaskStatus.PENDING
             and after_task.status is TaskStatus.READY
         ):
@@ -1828,6 +1932,29 @@ def _validate_stable_history(
                     operation_id,
                     f"task {after_task.id} cannot become ready before dependencies "
                     f"succeed: {', '.join(not_ready)}",
+                )
+        if (
+            before_task.status is TaskStatus.PENDING
+            and after_task.status is TaskStatus.WAITING_FOR_APPROVAL
+        ):
+            approval = next(
+                (
+                    item
+                    for item in candidate.approvals
+                    if item.task_id == after_task.id
+                    and item.status is ApprovalStatus.PENDING
+                ),
+                None,
+            )
+            if (
+                approval is None
+                or candidate.loop_state.waiting_approval_id != approval.id
+                or candidate.operation.status
+                is not OperationStatus.WAITING_FOR_APPROVAL
+            ):
+                raise InvalidOperationCheckpointError(
+                    operation_id,
+                    f"waiting task requires its pending approval: {after_task.id}",
                 )
         if (
             before_task.id in actively_leased_task_ids

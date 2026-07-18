@@ -28,6 +28,7 @@ from daita.operations.checkpoints import (
     ModelCallStatus,
     OperationSnapshot,
 )
+from daita.operations.governance import ApprovalRequest
 from daita.operations.leases import TaskClaimRequest, TaskLease, TaskLeaseGuard
 from daita.operations.models import (
     AgentTrigger,
@@ -232,15 +233,33 @@ def _snapshot(
         payload={"message": "Run the target task."},
         created_at=NOW,
     )
+    waiting_for_approval = target_status is TaskStatus.WAITING_FOR_APPROVAL
     operation = Operation(
         id="operation-1",
         agent_id=trigger.agent_id,
         trigger_id=trigger.id,
         session_id=trigger.session_id,
-        status=OperationStatus.RUNNING,
+        status=(
+            OperationStatus.WAITING_FOR_APPROVAL
+            if waiting_for_approval
+            else OperationStatus.RUNNING
+        ),
         created_at=NOW,
         updated_at=NOW,
     )
+    approval_id = "approval-target"
+    approvals: tuple[ApprovalRequest, ...] = ()
+    if waiting_for_approval:
+        approvals = (
+            ApprovalRequest(
+                id=approval_id,
+                operation_id=operation.id,
+                task_id=target.id,
+                task_fingerprint="sha256:" + ("b" * 64),
+                policy_fingerprint="sha256:" + ("c" * 64),
+                requested_at=NOW,
+            ),
+        )
     tool_calls = tuple(
         ToolCall(id=task.call_id, name="fake.action", arguments=task.arguments)
         for task in tasks
@@ -307,9 +326,14 @@ def _snapshot(
         trigger=trigger,
         operation=operation,
         loop_state=LoopState(
-            phase=LoopPhase.AWAITING_EXECUTION,
+            phase=(
+                LoopPhase.AWAITING_APPROVAL
+                if waiting_for_approval
+                else LoopPhase.AWAITING_EXECUTION
+            ),
             turn_count=1,
             action_count=len(tasks),
+            waiting_approval_id=approval_id if waiting_for_approval else None,
         ),
         budgets=LoopBudgets(),
         turns=(turn,),
@@ -318,6 +342,7 @@ def _snapshot(
         tasks=tuple(tasks),
         task_dependencies=dependencies,
         task_leases=(),
+        approvals=approvals,
         evidence=evidence,
         observations=(),
         events=events,

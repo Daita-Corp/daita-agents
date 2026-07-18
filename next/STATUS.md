@@ -6,21 +6,29 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-07 — re-read governance/approval constraints and inventory
-  existing risk, policy, task-fingerprint, decision, wake, and side-effect owners
-  before any production edit
-- **Last completed task:** P2-06g — the final dual-interpreter, static,
-  architecture, root-oracle, clean-build/install, and independent review gates
-  pass and the containing local checkpoint closes whole-loop recovery
-- **Current checkpoint:** P2-06 is complete; proof checkpoint `110596b` covers
-  every crash frontier, and the containing ledger checkpoint records the final
-  644-test cross-version and preservation gate
+- **Active task:** stopped after completing P2-07; P2-08 has not started
+- **Last completed task:** P2-07 — durable approval wait/decision/resume and the
+  test-owned idempotent side-effect marker
+- **Current checkpoint:** P2-07 is complete in the local checkpoint containing
+  this ledger; P2-06 remains closed by `9ae878b`
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** stage only the two closing ledgers, re-run cached
-  diff/configured hooks, create the local Phase 2-06 checkpoint, then re-read
-  the binding governance sections and write the ordered test-first P2-07 plan
+- **Exact next action:** stop per user direction; on a future continuation,
+  begin P2-08 with the isolated agent-home and identity ownership inventory
+
+## Development cadence
+
+User direction on 2026-07-18 replaces the earlier mini-gate cadence:
+
+- use focused red/green tests while implementing each vertical slice;
+- format touched files only before a meaningful checkpoint commit;
+- run static analysis only when a changed typed boundary warrants it;
+- defer dual-interpreter, root-oracle, distribution, and broad review gates to
+  the consolidated P2-10 Phase 2 gate;
+- use subagents only for concrete parallel implementation or one targeted
+  safety review; and
+- keep ledger updates short and prioritize completing vertical slices.
 
 ## Mandatory architecture re-read
 
@@ -114,7 +122,7 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-04 | complete | SQLite transaction boundary; Section 8.4/11.5 contracts | Content-addressed blob store and durable committed-event log/subscription with per-agent monotonic cursors; event notification remains a post-commit wake hint | Temp/flush/hash/atomic-rename/orphan tests; rollback emits nothing; commit/publish gap replays; reconnect, slow subscriber, and cross-agent isolation tests | P2-03 |
 | P2-05 | complete | Persisted tasks/evidence/events; Section 8.5 recovery rules | Ready/claimed/running/approval-waiting/cancelled/manual-recovery task states, persisted execution-safety and idempotency facts, durable fenced leases, and a split materialize/claim/execute/commit path preserving the sole executor boundary | Claim race, lease expiry/reclaim, stale-fence rejection with no evidence/event, terminal skip, unknown side-effect outcome, and task/evidence/event atomicity tests | P2-04 |
 | P2-06 | complete | Durable checkpoints, tasks, evidence, observations, readiness, and leases | One loop with new-trigger and checkpoint-aware same-operation resume paths, plus startup recovery that reuses completed work and never rebuilds the plan from the original trigger | Crash/cancel injection at all seven Phase 2 boundaries; at-least-once started model call; terminal task skip; recovered response/evidence/observation/readiness paths do not repeat avoidable I/O | P2-05 |
-| P2-07 | active | Recovery runtime and persisted governance facts | Immutable risk/policy/task fingerprints, CAS approval records, and one test-owned durable fake side-effect marker with wait, decision-only approval mutation, wake, denial, same-operation resume, and exact-once idempotency | Pre-approval no-I/O, approval mutation no-I/O, exact-fingerprint resume, denial no-I/O, cancellation race with one winner, repeated/concurrent resume marker unchanged, stale holder blocked | P2-06 |
+| P2-07 | complete | Recovery runtime and persisted governance facts | Immutable risk/policy/task fingerprints, CAS approval records, and one test-owned durable fake side-effect marker with wait, decision-only approval mutation, wake, denial, same-operation resume, and exact-once idempotency | Pre-approval no-I/O, approval mutation no-I/O, exact-fingerprint resume, denial no-I/O, cancellation race with one winner, repeated/concurrent resume marker unchanged, stale holder blocked | P2-06 |
 | P2-08 | pending | SQLite composition, recovery, approvals, committed events | Strict isolated agent home and bootstrap identity manifest, authoritative DB identity, durable sessions/transcripts, shared per-agent writer lock, thin `Agent.create/open/run/inspect/resume`, and embedded composition only | Create/reopen/path/mismatch/concurrency/lock/session isolation/restart tests; default never touches v1 state; facade contains no loop/executor/provider behavior | P2-07 |
 | P2-09 | pending | Persisted embedded fake-capability loop; provider-neutral model contract | Separate canonical/provider call identity, normalized provider errors, lazy optional OpenAI Responses adapter, fake-client contract tests, and one live persisted fake-capability loop | Missing-extra/import isolation; response/tool continuation/error tests; architecture scan forbids provider execution; explicit credential/model live gate | P2-08 |
 | P2-10 | pending | Complete Phase 2 vertical slice | Consolidated restart, failure-injection, approval, event, import, architecture, static, cross-version, root-oracle, and clean-build evidence with parity/quality/ADR review | Complete Phase 2 gate suite on Python 3.11/3.12 plus live production-provider evidence; no mock substitutes for live evidence | P2-09 |
@@ -851,6 +859,21 @@ re-read and an updated ordered ledger.
   The runtime now checks its task's pending-cancellation state immediately after
   the adapter returns and in the exception path, preserving caller-cancellation
   precedence before any evidence can be accepted.
+
+## P2-07 checkpoint record
+
+- [x] Governance facts, policy/task fingerprints, approvals, and correlated
+      events persist in the existing operation aggregate and both stores.
+- [x] Approve/deny mutates approval state only; the normal loop resumes the same
+      operation, and denial is visible without executor I/O.
+- [x] The test-owned durable marker changes once after approval and remains
+      unchanged across denial, cancellation, repeated resume, and concurrency.
+- [x] A targeted review found and the implementation closed the pre-governance
+      crash gap; the post-fix review is GO and the executor accepts only READY.
+- [x] The final affected operation/storage/acceptance/architecture scope passes
+      573 tests; root oracle paths remain unchanged.
+- [x] P2-08 is deliberately not started. Broad cross-version, static,
+      distribution, and root-suite gates remain deferred to P2-10.
 
 ## Credentials and external dependencies
 
