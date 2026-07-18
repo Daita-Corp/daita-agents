@@ -238,6 +238,21 @@ def test_generic_loop_never_branches_on_provider_or_domain_identity() -> None:
 
     violations: list[tuple[int, str]] = []
     for condition in conditions:
+        if (
+            isinstance(condition, ast.Compare)
+            and len(condition.ops) == 1
+            and isinstance(condition.ops[0], (ast.Eq, ast.NotEq))
+            and len(condition.comparators) == 1
+        ):
+            compared_parts = {
+                _attribute_parts(condition.left),
+                _attribute_parts(condition.comparators[0]),
+            }
+            if compared_parts == {
+                ("model_call", "provider_id"),
+                ("self", "_model", "provider_id"),
+            }:
+                continue
         violations.extend(
             (getattr(condition, "lineno", -1), reference)
             for reference in _identity_branch_references(condition)

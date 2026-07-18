@@ -8,7 +8,7 @@ from typing import Protocol, TypeVar
 
 from ..llm.models import ModelRequest, ModelResponse, ToolCall, ToolDefinition
 from ..llm.protocols import ModelProvider
-from ..operations.checkpoints import ModelCallStatus, OperationSnapshot
+from ..operations.checkpoints import ModelCall, ModelCallStatus, OperationSnapshot
 from ..operations.models import (
     ActionProposal,
     ActionRejection,
@@ -16,6 +16,7 @@ from ..operations.models import (
     Evidence,
     Observation,
     OperationStatus,
+    TaskStatus,
 )
 from ..operations.runtime import (
     OperationWallTimeExceeded,
@@ -23,7 +24,7 @@ from ..operations.runtime import (
     OperationStateError,
     TaskExecutionTimeout,
 )
-from .models import LoopBudgets, LoopExit, LoopPhase, Readiness, Turn
+from .models import LoopBudgets, LoopExit, LoopExitKind, LoopPhase, Readiness, Turn
 
 _T = TypeVar("_T")
 
@@ -108,130 +109,184 @@ class AgentLoop:
 
         while True:
             snapshot = await self._runtime.inspect(operation_id)
-            committed_response = self._response_needing_progress(snapshot)
-            if committed_response is not None:
-                terminal = await self._process_response(
-                    operation_id,
-                    committed_response,
-                )
+            checkpoint_exit = self._checkpoint_exit(snapshot)
+            if checkpoint_exit is not None:
+                return checkpoint_exit
+
+            if not snapshot.turns:
+                terminal = await self._begin_next_turn(operation_id)
                 if terminal is not None:
                     return terminal
                 continue
 
-            terminal = await self._pre_turn_budget_exit(operation_id)
-            if terminal is not None:
-                return terminal
-            turn = await self._runtime.begin_turn(operation_id)
-            snapshot = await self._runtime.inspect(operation_id)
-            try:
-                tools = self._domain.tool_views(snapshot)
-                request = await self._await_with_wall_time(
-                    operation_id,
-                    lambda: self._context_builder.build(snapshot, turn, tools),
-                )
-                await self._raise_if_wall_exhausted(operation_id)
-                if request.tools != tools:
-                    raise ValueError(
-                        "context builder changed the domain tool projection"
-                    )
-                model_call = await self._runtime.begin_model_call(
-                    operation_id,
-                    turn.id,
-                    self._model.provider_id,
-                    request,
-                )
-            except _WallTimeExhausted:
-                raise
-            except Exception:
+            turn = snapshot.turns[-1]
+            if turn.model_request_id is None:
+                terminal = await self._begin_model_call(snapshot, turn)
+                if terminal is not None:
+                    return terminal
+                continue
+
+            model_call = next(
+                call
+                for call in snapshot.model_calls
+                if call.id == turn.model_request_id
+            )
+            if model_call.status is ModelCallStatus.STARTED:
+                terminal = await self._continue_model_call(model_call)
+                if terminal is not None:
+                    return terminal
+                continue
+            if model_call.status is ModelCallStatus.FAILED:
                 return await self._runtime.fail(
                     operation_id,
-                    "context_build_failed",
-                )
-            try:
-                response = await self._await_with_wall_time(
-                    operation_id,
-                    lambda: self._model.generate(request),
-                )
-            except _WallTimeExhausted:
-                raise
-            except Exception:
-                return await self._runtime.record_model_failure(
-                    operation_id,
-                    model_call.id,
-                    "model_provider_failure",
-                )
-            if not isinstance(response, ModelResponse):
-                return await self._runtime.record_model_failure(
-                    operation_id,
-                    model_call.id,
-                    "malformed_model_response",
+                    model_call.error_code or "model_provider_failure",
                 )
 
-            next_phase = (
-                LoopPhase.VALIDATING_ACTION
-                if response.tool_calls
-                else LoopPhase.SYNTHESIZING
-            )
-            await self._runtime.record_model_response(
-                operation_id,
-                model_call.id,
-                response,
-                next_phase=next_phase,
-            )
-            terminal = await self._process_response(operation_id, response)
+            terminal = await self._process_response(operation_id, model_call)
+            if terminal is not None:
+                return terminal
+            terminal = await self._begin_next_turn(operation_id)
             if terminal is not None:
                 return terminal
 
-    @staticmethod
-    def _response_needing_progress(
-        snapshot: OperationSnapshot,
-    ) -> ModelResponse | None:
-        """Return only a committed response with unfinished downstream work."""
+    async def _begin_next_turn(self, operation_id: str) -> LoopExit | None:
+        terminal = await self._pre_turn_budget_exit(operation_id)
+        if terminal is not None:
+            return terminal
+        await self._runtime.begin_turn(operation_id)
+        return None
 
-        if not snapshot.model_calls:
-            return None
-        model_call = snapshot.model_calls[-1]
-        if (
-            model_call.status is not ModelCallStatus.COMPLETED
-            or model_call.response is None
-        ):
-            return None
-        response = model_call.response
-        if response.tool_calls:
-            task_call_ids = {task.id: task.call_id for task in snapshot.tasks}
-            observed_call_ids = set()
-            for observation in snapshot.observations:
-                if observation.turn_id != model_call.turn_id:
-                    continue
-                if observation.call_id is not None:
-                    observed_call_ids.add(observation.call_id)
-                elif observation.task_id is not None:
-                    observed_call_ids.add(task_call_ids[observation.task_id])
-            if any(call.id not in observed_call_ids for call in response.tool_calls):
-                return response
-            return None
-        has_readiness = any(
-            event.type == "readiness.recorded" and event.model_call_id == model_call.id
-            for event in snapshot.events
+    async def _begin_model_call(
+        self,
+        snapshot: OperationSnapshot,
+        turn: Turn,
+    ) -> LoopExit | None:
+        """Build context only for a committed turn that has no request."""
+
+        terminal = await self._wall_budget_exit(snapshot.operation.id)
+        if terminal is not None:
+            return terminal
+        try:
+            tools = self._domain.tool_views(snapshot)
+            request = await self._await_with_wall_time(
+                snapshot.operation.id,
+                lambda: self._context_builder.build(snapshot, turn, tools),
+            )
+            await self._raise_if_wall_exhausted(snapshot.operation.id)
+            if request.tools != tools:
+                raise ValueError("context builder changed the domain tool projection")
+            await self._runtime.begin_model_call(
+                snapshot.operation.id,
+                turn.id,
+                self._model.provider_id,
+                request,
+            )
+        except _WallTimeExhausted:
+            raise
+        except Exception:
+            return await self._runtime.fail(
+                snapshot.operation.id,
+                "context_build_failed",
+            )
+        return None
+
+    async def _continue_model_call(self, model_call: ModelCall) -> LoopExit | None:
+        """Resend an exact STARTED request under at-least-once inference."""
+
+        operation_id = model_call.operation_id
+        if model_call.provider_id != self._model.provider_id:
+            return await self._runtime.record_model_failure(
+                operation_id,
+                model_call.id,
+                "model_provider_identity_changed",
+            )
+        try:
+            response = await self._await_with_wall_time(
+                operation_id,
+                lambda: self._model.generate(model_call.request),
+            )
+        except _WallTimeExhausted:
+            raise
+        except Exception:
+            return await self._runtime.record_model_failure(
+                operation_id,
+                model_call.id,
+                "model_provider_failure",
+            )
+        if not isinstance(response, ModelResponse):
+            return await self._runtime.record_model_failure(
+                operation_id,
+                model_call.id,
+                "malformed_model_response",
+            )
+
+        next_phase = (
+            LoopPhase.VALIDATING_ACTION
+            if response.tool_calls
+            else LoopPhase.SYNTHESIZING
         )
-        return None if has_readiness else response
+        await self._runtime.record_model_response(
+            operation_id,
+            model_call.id,
+            response,
+            next_phase=next_phase,
+        )
+        return None
+
+    @staticmethod
+    def _checkpoint_exit(snapshot: OperationSnapshot) -> LoopExit | None:
+        """Project persisted terminal/waiting operation state without mutation."""
+
+        kind = {
+            OperationStatus.SUCCEEDED: LoopExitKind.COMPLETED,
+            OperationStatus.FAILED: LoopExitKind.FAILED,
+            OperationStatus.CANCELLED: LoopExitKind.CANCELLED,
+            OperationStatus.INTERRUPTED: LoopExitKind.INTERRUPTED,
+        }.get(snapshot.operation.status)
+        if kind is not None:
+            return LoopExit(
+                operation_id=snapshot.operation.id,
+                kind=kind,
+                reason=snapshot.operation.terminal_reason or kind.value,
+                final_text=snapshot.operation.final_text,
+                created_at=snapshot.operation.updated_at,
+            )
+        waiting_reason = {
+            OperationStatus.WAITING_FOR_APPROVAL: "operation_waiting_for_approval",
+            OperationStatus.WAITING_FOR_INPUT: "operation_waiting_for_input",
+        }.get(snapshot.operation.status)
+        if waiting_reason is None:
+            return None
+        return LoopExit(
+            operation_id=snapshot.operation.id,
+            kind=LoopExitKind.WAITING,
+            reason=waiting_reason,
+            created_at=snapshot.operation.updated_at,
+        )
 
     async def _process_response(
         self,
         operation_id: str,
-        response: ModelResponse,
+        model_call: ModelCall,
     ) -> LoopExit | None:
         """Advance one already-committed normalized model response."""
 
-        terminal = await self._post_response_budget_exit(operation_id)
-        if terminal is not None:
-            return terminal
+        response = model_call.response
+        if response is None:
+            return await self._runtime.fail(
+                operation_id,
+                "checkpoint_recovery_failed",
+            )
 
         if response.tool_calls:
             return await self._process_actions(
                 operation_id,
-                response.tool_calls,
+                model_call,
             )
+
+        terminal = await self._post_response_budget_exit(operation_id)
+        if terminal is not None:
+            return terminal
 
         if response.text is None:
             return await self._runtime.fail(
@@ -240,27 +295,53 @@ class AgentLoop:
             )
         final_text = response.text
 
-        try:
-            readiness_snapshot = await self._runtime.inspect(operation_id)
-            readiness = await self._await_with_wall_time(
-                operation_id,
-                lambda: self._domain.evaluate_final_answer(
-                    final_text,
-                    readiness_snapshot,
-                ),
-            )
-        except _WallTimeExhausted:
-            raise
-        except Exception:
-            return await self._runtime.fail(
-                operation_id,
-                "readiness_evaluation_failed",
-            )
-        correction = await self._runtime.record_readiness(
-            operation_id,
-            final_text,
-            readiness,
+        readiness_snapshot = await self._runtime.inspect(operation_id)
+        readiness_event = next(
+            (
+                event
+                for event in readiness_snapshot.events
+                if event.type == "readiness.recorded"
+                and event.model_call_id == model_call.id
+            ),
+            None,
         )
+        if readiness_event is not None:
+            if not readiness_snapshot.readiness:
+                return await self._runtime.fail(
+                    operation_id,
+                    "checkpoint_recovery_failed",
+                )
+            readiness = readiness_snapshot.readiness[-1]
+            if (
+                readiness_event.payload.get("allowed") is not readiness.allowed
+                or readiness_event.payload.get("code") != readiness.code
+            ):
+                return await self._runtime.fail(
+                    operation_id,
+                    "checkpoint_recovery_failed",
+                )
+        else:
+            try:
+                readiness = await self._await_with_wall_time(
+                    operation_id,
+                    lambda: self._domain.evaluate_final_answer(
+                        final_text,
+                        readiness_snapshot,
+                    ),
+                )
+            except _WallTimeExhausted:
+                raise
+            except Exception:
+                return await self._runtime.fail(
+                    operation_id,
+                    "readiness_evaluation_failed",
+                )
+            await self._runtime.record_readiness(
+                operation_id,
+                final_text,
+                readiness,
+            )
+
         terminal = await self._wall_budget_exit(operation_id)
         if terminal is not None:
             return terminal
@@ -273,11 +354,10 @@ class AgentLoop:
                     budget="repairs",
                     limit=repaired.budgets.max_repairs,
                     used=repaired.loop_state.repair_count,
-                    turn_id=repaired.turns[-1].id,
+                    turn_id=model_call.turn_id,
                 )
             if (
-                correction is not None
-                and repaired.loop_state.observation_characters
+                repaired.loop_state.observation_characters
                 > repaired.budgets.max_observation_characters
             ):
                 return await self._runtime.fail_budget(
@@ -286,7 +366,7 @@ class AgentLoop:
                     budget="observation_characters",
                     limit=repaired.budgets.max_observation_characters,
                     used=repaired.loop_state.observation_characters,
-                    turn_id=correction.turn_id,
+                    turn_id=model_call.turn_id,
                 )
             return None
         await self._raise_if_wall_exhausted(operation_id)
@@ -295,16 +375,94 @@ class AgentLoop:
     async def _process_actions(
         self,
         operation_id: str,
-        calls: tuple[ToolCall, ...],
+        model_call: ModelCall,
     ) -> LoopExit | None:
         """Process one model response sequentially in declared call order."""
 
-        for call in calls:
-            terminal = await self._wall_budget_exit(operation_id, call_id=call.id)
-            if terminal is not None:
-                return terminal
-            try:
-                snapshot = await self._runtime.inspect(operation_id)
+        response = model_call.response
+        if response is None:
+            return await self._runtime.fail(
+                operation_id,
+                "checkpoint_recovery_failed",
+            )
+
+        for call_index, call in enumerate(response.tool_calls):
+            snapshot = await self._runtime.inspect(operation_id)
+            existing_task = next(
+                (
+                    task
+                    for task in snapshot.tasks
+                    if task.turn_id == model_call.turn_id and task.call_id == call.id
+                ),
+                None,
+            )
+            if existing_task is not None:
+                observed_evidence_ids = {
+                    observation.evidence_id
+                    for observation in snapshot.observations
+                    if observation.task_id == existing_task.id
+                    and observation.evidence_id is not None
+                }
+                if existing_task.evidence_ids and all(
+                    evidence_id in observed_evidence_ids
+                    for evidence_id in existing_task.evidence_ids
+                ):
+                    later_call_ids = {
+                        later_call.id
+                        for later_call in response.tool_calls[call_index + 1 :]
+                    }
+                    task_call_ids = {task.id: task.call_id for task in snapshot.tasks}
+                    has_later_progress = any(
+                        task.turn_id == model_call.turn_id
+                        and task.call_id in later_call_ids
+                        for task in snapshot.tasks
+                    ) or any(
+                        observation.turn_id == model_call.turn_id
+                        and (
+                            observation.call_id in later_call_ids
+                            or task_call_ids.get(observation.task_id or "")
+                            in later_call_ids
+                        )
+                        for observation in snapshot.observations
+                    )
+                    if not has_later_progress:
+                        terminal = await self._after_task_observation(
+                            operation_id,
+                            model_call.turn_id,
+                            call.id,
+                            existing_task.id,
+                        )
+                        if terminal is not None:
+                            return terminal
+                    continue
+            else:
+                rejection_event = next(
+                    (
+                        event
+                        for event in snapshot.events
+                        if event.type == "action.rejected"
+                        and event.model_call_id == model_call.id
+                        and event.call_id == call.id
+                    ),
+                    None,
+                )
+                if rejection_event is not None:
+                    return await self._after_action_rejection(
+                        operation_id,
+                        model_call.turn_id,
+                        call.id,
+                    )
+                if any(
+                    observation.turn_id == model_call.turn_id
+                    and observation.call_id == call.id
+                    for observation in snapshot.observations
+                ):
+                    continue
+
+            if existing_task is None:
+                terminal = await self._post_response_budget_exit(operation_id)
+                if terminal is not None:
+                    return terminal
                 if snapshot.loop_state.action_count >= snapshot.budgets.max_actions:
                     return await self._runtime.fail_budget(
                         operation_id,
@@ -312,154 +470,278 @@ class AgentLoop:
                         budget="actions",
                         limit=snapshot.budgets.max_actions,
                         used=snapshot.loop_state.action_count,
-                        turn_id=snapshot.turns[-1].id,
+                        turn_id=model_call.turn_id,
                         call_id=call.id,
                     )
-                validation = await self._await_with_wall_time(
-                    operation_id,
-                    lambda: self._domain.validate_action(call, snapshot),
-                )
-                await self._raise_if_wall_exhausted(operation_id)
-            except _WallTimeExhausted:
-                raise
-            except Exception:
-                return await self._runtime.fail(
-                    operation_id,
-                    "action_processing_failed",
-                )
-
-            if isinstance(validation, ActionRejection):
                 try:
-                    await self._runtime.record_action_rejection(
+                    validation = await self._await_with_wall_time(
                         operation_id,
-                        snapshot.turns[-1].id,
-                        call,
+                        lambda: self._domain.validate_action(call, snapshot),
+                    )
+                    await self._raise_if_wall_exhausted(operation_id)
+                except _WallTimeExhausted:
+                    raise
+                except Exception:
+                    return await self._runtime.fail(
+                        operation_id,
+                        "action_processing_failed",
+                    )
+
+                if isinstance(validation, ActionRejection):
+                    try:
+                        await self._runtime.record_action_rejection(
+                            operation_id,
+                            model_call.turn_id,
+                            call,
+                            validation,
+                        )
+                    except Exception:
+                        return await self._runtime.fail(
+                            operation_id,
+                            "action_processing_failed",
+                        )
+                    return await self._after_action_rejection(
+                        operation_id,
+                        model_call.turn_id,
+                        call.id,
+                    )
+
+                if not isinstance(validation, ActionProposal):
+                    return await self._runtime.fail(
+                        operation_id,
+                        "action_processing_failed",
+                    )
+
+                remaining_wall_time = await self._remaining_wall_time(operation_id)
+                try:
+                    evidence = await self._runtime.submit(
                         validation,
+                        timeout_seconds=remaining_wall_time,
+                    )
+                except OperationWallTimeExceeded as error:
+                    return await self._fail_wall_time(
+                        operation_id,
+                        call_id=call.id,
+                        task_id=error.task_id,
+                    )
+                except TaskExecutionTimeout as error:
+                    return await self._runtime.fail_budget(
+                        operation_id,
+                        "task_timeout",
+                        budget="task_timeout_seconds",
+                        limit=snapshot.budgets.task_timeout_seconds,
+                        used=error.timeout_seconds,
+                        turn_id=model_call.turn_id,
+                        call_id=call.id,
+                        task_id=error.task_id,
                     )
                 except Exception:
                     return await self._runtime.fail(
                         operation_id,
                         "action_processing_failed",
                     )
+            else:
+                try:
+                    resumed_evidence = await self._runtime.resume_task(
+                        operation_id,
+                        existing_task.id,
+                    )
+                except OperationWallTimeExceeded as error:
+                    return await self._fail_wall_time(
+                        operation_id,
+                        call_id=call.id,
+                        task_id=error.task_id,
+                    )
+                except TaskExecutionTimeout as error:
+                    return await self._runtime.fail_budget(
+                        operation_id,
+                        "task_timeout",
+                        budget="task_timeout_seconds",
+                        limit=snapshot.budgets.task_timeout_seconds,
+                        used=error.timeout_seconds,
+                        turn_id=model_call.turn_id,
+                        call_id=call.id,
+                        task_id=error.task_id,
+                    )
+                except OperationStateError:
+                    current = await self._runtime.inspect(operation_id)
+                    return await self._task_checkpoint_exit(
+                        current,
+                        existing_task.id,
+                    )
+                except Exception:
+                    return await self._runtime.fail(
+                        operation_id,
+                        "action_processing_failed",
+                    )
+
+                if resumed_evidence is None:
+                    current = await self._runtime.inspect(operation_id)
+                    return await self._task_checkpoint_exit(
+                        current,
+                        existing_task.id,
+                    )
+                evidence = resumed_evidence
+
+            completed = await self._runtime.inspect(operation_id)
+            completed_task = next(
+                task for task in completed.tasks if task.id == evidence.task_id
+            )
+            evidence_by_id = {item.id: item for item in completed.evidence}
+            observed_evidence_ids = {
+                observation.evidence_id
+                for observation in completed.observations
+                if observation.task_id == completed_task.id
+                and observation.evidence_id is not None
+            }
+            for evidence_id in completed_task.evidence_ids:
+                if evidence_id in observed_evidence_ids:
+                    continue
+                accepted_evidence = evidence_by_id[evidence_id]
                 terminal = await self._wall_budget_exit(
                     operation_id,
                     call_id=call.id,
+                    task_id=completed_task.id,
                 )
                 if terminal is not None:
                     return terminal
-                repaired = await self._runtime.inspect(operation_id)
-                if (
-                    repaired.loop_state.identical_failure_count
-                    >= repaired.budgets.max_identical_failures
-                ):
-                    return await self._runtime.fail_no_progress(
+                try:
+                    observation = await self._await_with_wall_time(
                         operation_id,
-                        call.id,
+                        lambda: self._domain.project_observation(accepted_evidence),
                     )
-                if repaired.loop_state.repair_count > repaired.budgets.max_repairs:
-                    return await self._runtime.fail_budget(
+                    await self._raise_if_wall_exhausted(operation_id)
+                    await self._runtime.append_observation(observation)
+                except _WallTimeExhausted:
+                    raise
+                except Exception:
+                    return await self._runtime.fail(
                         operation_id,
-                        "repair_budget_exhausted",
-                        budget="repairs",
-                        limit=repaired.budgets.max_repairs,
-                        used=repaired.loop_state.repair_count,
-                        turn_id=repaired.turns[-1].id,
-                        call_id=call.id,
+                        "action_processing_failed",
                     )
-                if (
-                    repaired.loop_state.observation_characters
-                    > repaired.budgets.max_observation_characters
-                ):
-                    return await self._runtime.fail_budget(
-                        operation_id,
-                        "observation_budget_exhausted",
-                        budget="observation_characters",
-                        limit=repaired.budgets.max_observation_characters,
-                        used=repaired.loop_state.observation_characters,
-                        turn_id=repaired.turns[-1].id,
-                        call_id=call.id,
-                    )
-                return None
-
-            if not isinstance(validation, ActionProposal):
-                return await self._runtime.fail(
+                terminal = await self._after_task_observation(
                     operation_id,
-                    "action_processing_failed",
+                    model_call.turn_id,
+                    call.id,
+                    completed_task.id,
                 )
-
-            remaining_wall_time = await self._remaining_wall_time(operation_id)
-            try:
-                evidence = await self._runtime.submit(
-                    validation,
-                    timeout_seconds=remaining_wall_time,
-                )
-            except OperationWallTimeExceeded as error:
-                return await self._fail_wall_time(
-                    operation_id,
-                    call_id=call.id,
-                    task_id=error.task_id,
-                )
-            except TaskExecutionTimeout as error:
-                return await self._runtime.fail_budget(
-                    operation_id,
-                    "task_timeout",
-                    budget="task_timeout_seconds",
-                    limit=snapshot.budgets.task_timeout_seconds,
-                    used=error.timeout_seconds,
-                    turn_id=snapshot.turns[-1].id,
-                    call_id=call.id,
-                    task_id=error.task_id,
-                )
-            except Exception:
-                return await self._runtime.fail(
-                    operation_id,
-                    "action_processing_failed",
-                )
-
-            terminal = await self._wall_budget_exit(
-                operation_id,
-                call_id=call.id,
-                task_id=evidence.task_id,
-            )
-            if terminal is not None:
-                return terminal
-            try:
-                observation = await self._await_with_wall_time(
-                    operation_id,
-                    lambda: self._domain.project_observation(evidence),
-                )
-                await self._raise_if_wall_exhausted(operation_id)
-                await self._runtime.append_observation(observation)
-            except _WallTimeExhausted:
-                raise
-            except Exception:
-                return await self._runtime.fail(
-                    operation_id,
-                    "action_processing_failed",
-                )
-            terminal = await self._wall_budget_exit(
-                operation_id,
-                call_id=call.id,
-                task_id=evidence.task_id,
-            )
-            if terminal is not None:
-                return terminal
-            observed = await self._runtime.inspect(operation_id)
-            if (
-                observed.loop_state.observation_characters
-                > observed.budgets.max_observation_characters
-            ):
-                return await self._runtime.fail_budget(
-                    operation_id,
-                    "observation_budget_exhausted",
-                    budget="observation_characters",
-                    limit=observed.budgets.max_observation_characters,
-                    used=observed.loop_state.observation_characters,
-                    turn_id=observation.turn_id,
-                    call_id=call.id,
-                    task_id=evidence.task_id,
-                )
+                if terminal is not None:
+                    return terminal
         return None
+
+    async def _after_action_rejection(
+        self,
+        operation_id: str,
+        turn_id: str,
+        call_id: str,
+    ) -> LoopExit | None:
+        terminal = await self._wall_budget_exit(operation_id, call_id=call_id)
+        if terminal is not None:
+            return terminal
+        repaired = await self._runtime.inspect(operation_id)
+        if (
+            repaired.loop_state.identical_failure_count
+            >= repaired.budgets.max_identical_failures
+        ):
+            return await self._runtime.fail_no_progress(operation_id, call_id)
+        if repaired.loop_state.repair_count > repaired.budgets.max_repairs:
+            return await self._runtime.fail_budget(
+                operation_id,
+                "repair_budget_exhausted",
+                budget="repairs",
+                limit=repaired.budgets.max_repairs,
+                used=repaired.loop_state.repair_count,
+                turn_id=turn_id,
+                call_id=call_id,
+            )
+        if (
+            repaired.loop_state.observation_characters
+            > repaired.budgets.max_observation_characters
+        ):
+            return await self._runtime.fail_budget(
+                operation_id,
+                "observation_budget_exhausted",
+                budget="observation_characters",
+                limit=repaired.budgets.max_observation_characters,
+                used=repaired.loop_state.observation_characters,
+                turn_id=turn_id,
+                call_id=call_id,
+            )
+        return None
+
+    async def _after_task_observation(
+        self,
+        operation_id: str,
+        turn_id: str,
+        call_id: str,
+        task_id: str,
+    ) -> LoopExit | None:
+        terminal = await self._wall_budget_exit(
+            operation_id,
+            call_id=call_id,
+            task_id=task_id,
+        )
+        if terminal is not None:
+            return terminal
+        observed = await self._runtime.inspect(operation_id)
+        if (
+            observed.loop_state.observation_characters
+            > observed.budgets.max_observation_characters
+        ):
+            return await self._runtime.fail_budget(
+                operation_id,
+                "observation_budget_exhausted",
+                budget="observation_characters",
+                limit=observed.budgets.max_observation_characters,
+                used=observed.loop_state.observation_characters,
+                turn_id=turn_id,
+                call_id=call_id,
+                task_id=task_id,
+            )
+        return None
+
+    async def _task_checkpoint_exit(
+        self,
+        snapshot: OperationSnapshot,
+        task_id: str,
+    ) -> LoopExit:
+        task = next(task for task in snapshot.tasks if task.id == task_id)
+        if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+            has_live_lease = any(
+                lease.task_id == task.id and lease.released_at is None
+                for lease in snapshot.task_leases
+            )
+            if not has_live_lease:
+                return await self._runtime.fail(
+                    snapshot.operation.id,
+                    "checkpoint_recovery_failed",
+                )
+            return LoopExit(
+                operation_id=snapshot.operation.id,
+                kind=LoopExitKind.WAITING,
+                reason="task_lease_active",
+                created_at=snapshot.operation.updated_at,
+            )
+        waiting_reason = {
+            TaskStatus.WAITING_FOR_APPROVAL: "waiting_for_approval",
+            TaskStatus.MANUAL_RECOVERY_REQUIRED: "manual_recovery_required",
+        }.get(task.status)
+        if waiting_reason is not None:
+            return LoopExit(
+                operation_id=snapshot.operation.id,
+                kind=LoopExitKind.WAITING,
+                reason=waiting_reason,
+                created_at=snapshot.operation.updated_at,
+            )
+        if task.status is TaskStatus.CANCELLED:
+            return await self._runtime.interrupt(
+                snapshot.operation.id,
+                "task_cancelled",
+            )
+        return await self._runtime.fail(
+            snapshot.operation.id,
+            "action_processing_failed",
+        )
 
     async def _pre_turn_budget_exit(
         self,

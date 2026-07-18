@@ -6,19 +6,19 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-06d — broaden the proven representative seam into the
-  complete checkpoint dispatcher without adding another runtime or loop
-- **Last completed task:** P2-06c — `AgentLoop.resume(operation_id)` consumes a
-  committed tool response after SQLite reopen without repeating its context or
-  model call; focused dual-interpreter/static checks and independent reviews pass
-- **Current checkpoint:** representative green continuation `4cfefaa`; the
-  broader P2-06d expected-red contract is recorded by the next test checkpoint
+- **Active task:** P2-06e — add the narrow agent-scoped nonterminal query to both
+  existing stores and iterate it through the same loop resume path at startup
+- **Last completed task:** P2-06d — the existing driver dispatches every durable
+  turn/model/task/evidence/observation/readiness/terminal checkpoint; exact
+  trigger redelivery and all three independent reviews pass
+- **Current checkpoint:** P2-06d green dispatcher is recorded by the commit
+  containing this ledger; expected-red checkpoint is `2d4bc92`
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** implement the six expected-red checkpoint states in the
-  same driver/runtime owners, preserving at-least-once STARTED inference and
-  zero-I/O reuse of persisted tasks, evidence, readiness, and terminal state
+- **Exact next action:** add expected-red portable query/startup-iteration tests
+  for deterministic agent scope, terminal exclusion, SQLite reopen/transaction
+  consistency, and reuse of `resume(operation_id)` before editing store owners
 
 ## Mandatory architecture re-read
 
@@ -161,8 +161,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-06a | complete | Read-only checkpoint/restart ownership inventory and renewed Sections 6/8.5–8.7/15 re-read | Existing `AgentLoop`, `OperationRuntime`, `OperationStore`, and canonical snapshot remain the only owners; exact replayable versus necessarily repeated work, seven crash boundaries, and P2-07/P2-08 deferrals are locked before production edits |
 | P2-06b | complete | One expected-red SQLite-reopen trajectory after model-response persistence but before task materialization | Same operation/turn/response survives reopen; initial context/model I/O does not repeat; one task/evidence/observation and only the necessary follow-up model call are expected |
 | P2-06c | complete | Representative checkpoint-aware continuation in the existing generic loop | `resume(operation_id)` enters the existing driver; no new loop/recovery runtime/module; a completed response is consumed without rebuilding context or repeating its model call; focused review passes before broader cases |
-| P2-06d | active | Complete checkpoint dispatcher over requestless turn, started/completed model call, ordered tool calls, task/evidence/observation, readiness, terminal state, and exact trigger redelivery | Persisted records, not coarse phase alone, select progression; STARTED inference is at-least-once; existing tasks use `resume_task()`; avoidable validation/executor/projection/readiness/model I/O is skipped; exact trigger redelivery enters the same driver |
-| P2-06e | pending | Portable agent-scoped nonterminal inspection plus startup recovery over both existing stores | Deterministic scoped query, SQLite single-transaction reopen, terminal exclusion, live-lease deferral, and startup iteration reuse the same loop; P2-08 retains Agent Home, host admission, and writer-lock composition |
+| P2-06d | complete | Complete checkpoint dispatcher over requestless turn, started/completed model call, ordered tool calls, task/evidence/observation, readiness, terminal state, and exact trigger redelivery | Persisted records, not coarse phase alone, select progression; STARTED inference is at-least-once; existing tasks use `resume_task()`; avoidable validation/executor/projection/readiness/model I/O is skipped; exact trigger redelivery enters the same driver |
+| P2-06e | active | Portable agent-scoped nonterminal inspection plus startup recovery over both existing stores | Deterministic scoped query, SQLite single-transaction reopen, terminal exclusion, live-lease deferral, and startup iteration reuse the same loop; P2-08 retains Agent Home, host admission, and writer-lock composition |
 | P2-06f | pending | All seven Phase 2 crash/restart trajectories and independent representative review | Abrupt process-exit injection at every required durable boundary; exact identity/event/counter assertions; safe replay versus manual recovery; blob orphan; terminal delivery replay; no second owner |
 | P2-06g | pending | Final P2-06 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local checkpoint |
 
@@ -607,6 +607,7 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | Initial P2-06b SQLite-reopen loop continuation | EXPECTED RED — exactly 1 failure and no collection/setup error; the committed response reopened intact, and execution stopped only because the existing `AgentLoop` has no `resume(operation_id)` entry |
 | P2-06c representative checkpoint continuation | PASS — 16 focused restart/fake-read/text/repair cases pass on CPython 3.11.15 and 3.12.7; the complete 605-test Python 3.11 suite and all 52 architecture tests pass; Black, compilation, and focused mypy are clean; independent code and test reviews report GO after both SQLite stores gained `finally` cleanup |
 | Initial P2-06d checkpoint-dispatch contract | EXPECTED RED — the representative response-before-task case still passes and exactly 6 new SQLite-reopen cases fail at the absent requestless-turn reuse, STARTED-call resend, persisted-task/evidence reuse, live-lease wait, and readiness/terminal/trigger-redelivery behavior; no collection, migration, or fixture error |
+| P2-06d complete checkpoint dispatcher | PASS after review repair — 16 SQLite restart cases cover requestless and STARTED calls, provider mismatch, mixed ordered calls, pending/live/failed/manual tasks, plural evidence, durable-frontier budget correlation, readiness, terminal and exact-trigger redelivery; all 621 v2 tests pass in 5.247s/5.564s on CPython 3.11.15/3.12.7; all 52 architecture tests pass; Black 80 files, compilation, mypy 23 production files, and pyright 1.1.411 with 0 errors/warnings are clean; all three independent reviews report GO |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture

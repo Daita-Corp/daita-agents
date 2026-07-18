@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from daita.capabilities import (
     AccessMode,
     Capability,
+    CapabilityExecutionError,
     CapabilityRegistry,
     EvidenceCandidate,
     ExecutionRequest,
@@ -28,10 +30,11 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.driver import AgentLoop
-from daita.loop.models import LoopExitKind, LoopPhase, Readiness, Turn
+from daita.loop.models import LoopBudgets, LoopExitKind, LoopPhase, Readiness, Turn
 from daita.operations.checkpoints import OperationSnapshot
 from daita.operations.models import (
     ActionProposal,
+    ActionRejection,
     AgentTrigger,
     Evidence,
     Observation,
@@ -40,7 +43,7 @@ from daita.operations.models import (
     TaskStatus,
     TriggerKind,
 )
-from daita.operations.runtime import OperationRuntime
+from daita.operations.runtime import OperationRuntime, OperationStateError
 from daita.storage.sqlite import SQLiteOperationStore
 
 NOW = datetime(2026, 7, 16, 20, 0, tzinfo=timezone.utc)
@@ -104,13 +107,30 @@ class ProcessExitExecutor(RecordingExecutor):
         raise AbruptProcessExit
 
 
+class FailingExecutor(RecordingExecutor):
+    async def execute(self, request: ExecutionRequest) -> EvidenceCandidate:
+        self.requests.append(request)
+        raise RuntimeError("injected executor failure")
+
+
+class MutableClock:
+    def __init__(self, current: datetime) -> None:
+        self.current = current
+
+    def __call__(self) -> datetime:
+        return self.current
+
+
 class MaterializeOnlyRuntime(OperationRuntime):
     async def materialize_only(self, proposal: ActionProposal) -> Task:
         return await self._materialize_task(proposal)
 
 
-def _registry(executor: RecordingExecutor) -> CapabilityRegistry:
-    capability = _capability()
+def _registry(
+    executor: RecordingExecutor,
+    capability: Capability | None = None,
+) -> CapabilityRegistry:
+    capability = _capability() if capability is None else capability
     return CapabilityRegistry(
         capabilities=(capability,),
         executors=(executor,),
@@ -178,7 +198,8 @@ class CountingDomain:
     ) -> Readiness:
         self.readiness_calls += 1
         assert text == "Recovered answer."
-        assert len(operation.evidence) == len(operation.observations) == 1
+        assert operation.evidence
+        assert len(operation.evidence) == len(operation.observations)
         return Readiness(
             allowed=True,
             code="ready.recovered",
@@ -236,6 +257,7 @@ class CountingContextBuilder:
         tools: tuple[ToolDefinition, ...],
     ) -> ModelRequest:
         self.calls += 1
+        messages: tuple[CanonicalMessage, ...]
         if not operation.model_calls:
             messages = (
                 CanonicalMessage(
@@ -249,9 +271,7 @@ class CountingContextBuilder:
         else:
             first_call = operation.model_calls[0]
             assert first_call.response is not None
-            task = operation.tasks[0]
-            observation = operation.observations[0]
-            messages = (
+            messages_list = [
                 *first_call.request.messages,
                 CanonicalMessage(
                     agent_id=operation.operation.agent_id,
@@ -260,23 +280,59 @@ class CountingContextBuilder:
                     role=MessageRole.ASSISTANT,
                     tool_calls=first_call.response.tool_calls,
                 ),
-                CanonicalMessage(
-                    agent_id=operation.operation.agent_id,
-                    operation_id=operation.operation.id,
-                    turn_id=first_call.turn_id,
-                    role=MessageRole.TOOL,
-                    content=(
-                        ToolResultBlock(
-                            call_id=task.call_id,
-                            output=observation.payload,
+            ]
+            for observation in operation.observations:
+                if observation.task_id is None:
+                    continue
+                task = next(
+                    task for task in operation.tasks if task.id == observation.task_id
+                )
+                messages_list.append(
+                    CanonicalMessage(
+                        agent_id=operation.operation.agent_id,
+                        operation_id=operation.operation.id,
+                        turn_id=first_call.turn_id,
+                        role=MessageRole.TOOL,
+                        content=(
+                            ToolResultBlock(
+                                call_id=task.call_id,
+                                output=observation.payload,
+                            ),
                         ),
-                    ),
-                ),
-            )
+                    )
+                )
+            messages = tuple(messages_list)
         return ModelRequest(
             operation_id=operation.operation.id,
             turn_id=turn.id,
             messages=messages,
+            tools=tools,
+        )
+
+
+class TextContextBuilder:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def build(
+        self,
+        operation: OperationSnapshot,
+        turn: Turn,
+        tools: tuple[ToolDefinition, ...],
+    ) -> ModelRequest:
+        self.calls += 1
+        return ModelRequest(
+            operation_id=operation.operation.id,
+            turn_id=turn.id,
+            messages=(
+                CanonicalMessage(
+                    agent_id=operation.operation.agent_id,
+                    operation_id=operation.operation.id,
+                    turn_id=turn.id,
+                    role=MessageRole.USER,
+                    content=(TextBlock("Continue from the committed correction."),),
+                ),
+            ),
             tools=tools,
         )
 
@@ -314,12 +370,48 @@ def _tool_response() -> ModelResponse:
     )
 
 
+def _two_tool_response() -> ModelResponse:
+    return ModelResponse(
+        tool_calls=(
+            ToolCall(
+                id="call-alpha",
+                name="read_fake_value",
+                arguments={"key": "alpha"},
+            ),
+            ToolCall(
+                id="call-beta",
+                name="read_fake_value",
+                arguments={"key": "beta"},
+            ),
+        ),
+        finish_reason=FinishReason.TOOL_CALLS,
+        usage=ModelUsage(input_tokens=8, output_tokens=5),
+    )
+
+
+def _three_tool_response() -> ModelResponse:
+    return ModelResponse(
+        tool_calls=(
+            *_two_tool_response().tool_calls,
+            ToolCall(
+                id="call-gamma",
+                name="read_fake_value",
+                arguments={"key": "gamma"},
+            ),
+        ),
+        finish_reason=FinishReason.TOOL_CALLS,
+        usage=ModelUsage(input_tokens=11, output_tokens=7),
+    )
+
+
 async def _seed_model_call(
     runtime: OperationRuntime,
     registry: CapabilityRegistry,
     response: ModelResponse | None,
+    *,
+    budgets: LoopBudgets = LoopBudgets(),
 ) -> tuple[OperationSnapshot, Turn, ModelRequest, str]:
-    started = await runtime.begin(_trigger())
+    started = await runtime.begin(_trigger(), budgets=budgets)
     turn = await runtime.begin_turn(started.operation.id)
     snapshot = await runtime.inspect(started.operation.id)
     request = await CountingContextBuilder().build(
@@ -347,13 +439,20 @@ async def _seed_model_call(
     return started, turn, request, model_call.id
 
 
-def _proposal(operation_id: str, turn_id: str) -> ActionProposal:
+def _proposal(
+    operation_id: str,
+    turn_id: str,
+    *,
+    capability_id: str = "fake.read",
+    call_id: str = "call-alpha",
+    key: str = "alpha",
+) -> ActionProposal:
     return ActionProposal(
         operation_id=operation_id,
         turn_id=turn_id,
-        call_id="call-alpha",
-        capability_id="fake.read",
-        arguments={"key": "alpha"},
+        call_id=call_id,
+        capability_id=capability_id,
+        arguments={"key": key},
         proposed_at=NOW,
     )
 
@@ -502,7 +601,10 @@ async def test_resume_reuses_requestless_turn_after_sqlite_reopen(
         await resumed_store.close()
 
     assert result.kind is LoopExitKind.COMPLETED
-    assert final.turns == (existing_turn,)
+    assert len(final.turns) == 1
+    assert final.turns[0].id == existing_turn.id
+    assert final.turns[0].number == existing_turn.number
+    assert final.turns[0].created_at == existing_turn.created_at
     assert final.model_calls[0].request.turn_id == existing_turn.id
     assert context.calls == 1
     assert domain.tool_view_calls == 1
@@ -553,7 +655,10 @@ async def test_resume_resends_exact_started_model_request_after_sqlite_reopen(
         await resumed_store.close()
 
     assert result.kind is LoopExitKind.COMPLETED
-    assert final.turns == (existing_turn,)
+    assert len(final.turns) == 1
+    assert final.turns[0].id == existing_turn.id
+    assert final.turns[0].number == existing_turn.number
+    assert final.turns[0].created_at == existing_turn.created_at
     assert len(final.model_calls) == 1
     assert final.model_calls[0].id == model_call_id
     assert final.model_calls[0].request == request
@@ -620,6 +725,90 @@ async def test_resume_existing_pending_task_without_revalidation(
     assert [event.type for event in final.events].count("task.created") == 1
 
 
+async def test_resume_mixed_multi_call_checkpoints_in_committed_order(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "mixed-multi-call.db"
+    first_executor = RecordingExecutor()
+    first_registry = _registry(first_executor)
+    first_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        first_runtime = MaterializeOnlyRuntime(
+            capabilities=first_registry,
+            store=first_store,
+            clock=lambda: NOW,
+        )
+        started, turn, _, _ = await _seed_model_call(
+            first_runtime,
+            first_registry,
+            _three_tool_response(),
+        )
+        first_evidence = await first_runtime.submit(
+            _proposal(started.operation.id, turn.id)
+        )
+        first_observation = await CountingDomain(first_registry).project_observation(
+            first_evidence
+        )
+        await first_runtime.append_observation(first_observation)
+        second_task = await first_runtime.materialize_only(
+            _proposal(
+                started.operation.id,
+                turn.id,
+                call_id="call-beta",
+                key="beta",
+            )
+        )
+        before_restart = await first_runtime.inspect(started.operation.id)
+        assert [task.call_id for task in before_restart.tasks] == [
+            "call-alpha",
+            "call-beta",
+        ]
+        assert second_task.status is TaskStatus.PENDING
+    finally:
+        await first_store.close()
+
+    resumed_executor = RecordingExecutor()
+    resumed_registry = _registry(resumed_executor)
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            clock=lambda: NOW,
+        )
+        domain = CountingDomain(resumed_registry)
+        provider = MockModelProvider((_final_response(),))
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=provider,
+            context_builder=CountingContextBuilder(),
+            domain=domain,
+        )
+
+        result = await loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert [task.call_id for task in final.tasks] == [
+        "call-alpha",
+        "call-beta",
+        "call-gamma",
+    ]
+    assert final.tasks[0] == before_restart.tasks[0]
+    assert final.tasks[1].id == second_task.id
+    assert [request.arguments["key"] for request in resumed_executor.requests] == [
+        "beta",
+        "gamma",
+    ]
+    assert domain.validation_calls == 1
+    assert domain.projection_calls == 2
+    assert len(final.evidence) == len(final.observations) == 3
+    assert [event.type for event in final.events].count("task.created") == 3
+    assert len(provider.requests) == 1
+
+
 async def test_resume_projects_existing_evidence_without_executor_replay(
     tmp_path: Path,
 ) -> None:
@@ -675,6 +864,81 @@ async def test_resume_projects_existing_evidence_without_executor_replay(
     assert resumed_executor.requests == []
 
 
+async def test_resume_projects_only_missing_item_from_plural_task_evidence(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "plural-evidence.db"
+    source_executor = RecordingExecutor()
+    source_registry = _registry(source_executor)
+    source_runtime = OperationRuntime(
+        capabilities=source_registry,
+        clock=lambda: NOW,
+    )
+    started, turn, _, _ = await _seed_model_call(
+        source_runtime,
+        source_registry,
+        _tool_response(),
+    )
+    first_evidence = await source_runtime.submit(
+        _proposal(started.operation.id, turn.id)
+    )
+    first_observation = await CountingDomain(source_registry).project_observation(
+        first_evidence
+    )
+    await source_runtime.append_observation(first_observation)
+    source = await source_runtime.inspect(started.operation.id)
+    second_evidence = replace(first_evidence, id="evidence-second")
+    plural_task = replace(
+        source.tasks[0],
+        evidence_ids=(first_evidence.id, second_evidence.id),
+    )
+    crafted = replace(
+        source,
+        tasks=(plural_task,),
+        evidence=(first_evidence, second_evidence),
+    )
+
+    seed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        await seed_store.create(crafted)
+    finally:
+        await seed_store.close()
+
+    resumed_executor = RecordingExecutor()
+    resumed_registry = _registry(resumed_executor)
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            clock=lambda: NOW,
+        )
+        domain = CountingDomain(resumed_registry)
+        provider = MockModelProvider((_final_response(),))
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=provider,
+            context_builder=CountingContextBuilder(),
+            domain=domain,
+        )
+
+        result = await loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert final.evidence == (first_evidence, second_evidence)
+    assert final.observations[0] == first_observation
+    assert [observation.evidence_id for observation in final.observations] == [
+        first_evidence.id,
+        second_evidence.id,
+    ]
+    assert domain.validation_calls == 0
+    assert domain.projection_calls == 1
+    assert resumed_executor.requests == []
+
+
 async def test_resume_live_running_task_returns_waiting_without_mutation(
     tmp_path: Path,
 ) -> None:
@@ -696,6 +960,7 @@ async def test_resume_live_running_task_returns_waiting_without_mutation(
         with pytest.raises(AbruptProcessExit):
             await first_runtime.submit(_proposal(started.operation.id, turn.id))
         before_restart = await first_runtime.inspect(started.operation.id)
+        before_versioned = await first_store.load(started.operation.id)
         assert before_restart.tasks[0].status is TaskStatus.RUNNING
     finally:
         await first_store.close()
@@ -719,15 +984,461 @@ async def test_resume_live_running_task_returns_waiting_without_mutation(
 
         result = await loop.resume(started.operation.id)
         after_resume = await resumed_runtime.inspect(started.operation.id)
+        after_versioned = await resumed_store.load(started.operation.id)
     finally:
         await resumed_store.close()
 
     assert result.kind is LoopExitKind.WAITING
     assert result.reason == "task_lease_active"
     assert after_resume == before_restart
+    assert after_versioned == before_versioned
     assert domain.validation_calls == 0
     assert domain.projection_calls == 0
     assert resumed_executor.requests == []
+
+
+async def test_resume_failed_task_terminalizes_operation_without_reexecution(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "failed-task.db"
+    first_executor = FailingExecutor()
+    first_registry = _registry(first_executor)
+    first_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=first_registry,
+            store=first_store,
+            clock=lambda: NOW,
+        )
+        started, turn, _, _ = await _seed_model_call(
+            first_runtime,
+            first_registry,
+            _tool_response(),
+        )
+        with pytest.raises(CapabilityExecutionError):
+            await first_runtime.submit(_proposal(started.operation.id, turn.id))
+        before_restart = await first_runtime.inspect(started.operation.id)
+        assert before_restart.tasks[0].status is TaskStatus.FAILED
+    finally:
+        await first_store.close()
+
+    resumed_executor = RecordingExecutor()
+    resumed_registry = _registry(resumed_executor)
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            clock=lambda: NOW,
+        )
+        domain = CountingDomain(resumed_registry)
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=MockModelProvider(()),
+            context_builder=CountingContextBuilder(),
+            domain=domain,
+        )
+
+        result = await loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "action_processing_failed"
+    assert final.operation.status is OperationStatus.FAILED
+    assert final.tasks[0] == before_restart.tasks[0]
+    assert domain.validation_calls == 0
+    assert domain.projection_calls == 0
+    assert resumed_executor.requests == []
+
+
+async def test_resume_expired_unsafe_task_waits_for_manual_recovery(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "manual-recovery-task.db"
+    clock = MutableClock(NOW)
+    unsafe_capability = replace(
+        _capability(),
+        id="fake.write",
+        access_mode=AccessMode.WRITE,
+        risk=RiskLevel.HIGH,
+        side_effecting=True,
+        idempotent=False,
+        replay_safe=False,
+    )
+    first_executor = ProcessExitExecutor()
+    first_registry = _registry(first_executor, unsafe_capability)
+    first_store = await SQLiteOperationStore.open(database_path, clock=clock)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=first_registry,
+            store=first_store,
+            clock=clock,
+        )
+        started, turn, _, _ = await _seed_model_call(
+            first_runtime,
+            first_registry,
+            _tool_response(),
+            budgets=LoopBudgets(max_wall_time_seconds=10),
+        )
+        with pytest.raises(AbruptProcessExit):
+            await first_runtime.submit(
+                _proposal(
+                    started.operation.id,
+                    turn.id,
+                    capability_id=unsafe_capability.id,
+                )
+            )
+        before_restart = await first_runtime.inspect(started.operation.id)
+        assert before_restart.tasks[0].status is TaskStatus.RUNNING
+        lease = before_restart.task_leases[0]
+    finally:
+        await first_store.close()
+
+    clock.current = lease.expires_at + timedelta(microseconds=1)
+    resumed_executor = RecordingExecutor()
+    resumed_registry = _registry(resumed_executor, unsafe_capability)
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=clock)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            clock=clock,
+        )
+        domain = CountingDomain(resumed_registry)
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=MockModelProvider(()),
+            context_builder=CountingContextBuilder(),
+            domain=domain,
+        )
+
+        result = await loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.WAITING
+    assert result.reason == "manual_recovery_required"
+    assert final.operation.status is OperationStatus.RUNNING
+    assert final.tasks[0].status is TaskStatus.MANUAL_RECOVERY_REQUIRED
+    assert final.tasks[0].manual_recovery_reason == "unknown_side_effect_outcome"
+    assert final.task_leases[0].released_at == clock.current
+    assert not any(event.type == "budget.exhausted" for event in final.events)
+    assert not any(event.type == "operation.failed" for event in final.events)
+    assert domain.validation_calls == 0
+    assert domain.projection_calls == 0
+    assert resumed_executor.requests == []
+
+
+async def test_resume_attributes_aggregate_observation_budget_to_durable_frontier(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "observation-frontier.db"
+    first_executor = RecordingExecutor()
+    first_registry = _registry(first_executor)
+    first_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=first_registry,
+            store=first_store,
+            clock=lambda: NOW,
+        )
+        started, turn, _, _ = await _seed_model_call(
+            first_runtime,
+            first_registry,
+            _two_tool_response(),
+            budgets=LoopBudgets(max_observation_characters=60),
+        )
+        domain = CountingDomain(first_registry)
+        first_evidence = await first_runtime.submit(
+            _proposal(started.operation.id, turn.id)
+        )
+        await first_runtime.append_observation(
+            await domain.project_observation(first_evidence)
+        )
+        after_first = await first_runtime.inspect(started.operation.id)
+        assert after_first.loop_state.observation_characters <= 60
+
+        second_evidence = await first_runtime.submit(
+            _proposal(
+                started.operation.id,
+                turn.id,
+                call_id="call-beta",
+                key="beta",
+            )
+        )
+        await first_runtime.append_observation(
+            await domain.project_observation(second_evidence)
+        )
+        before_restart = await first_runtime.inspect(started.operation.id)
+        assert before_restart.loop_state.observation_characters > 60
+        second_task = before_restart.tasks[1]
+    finally:
+        await first_store.close()
+
+    resumed_executor = RecordingExecutor()
+    resumed_registry = _registry(resumed_executor)
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            clock=lambda: NOW,
+        )
+        resumed_domain = CountingDomain(resumed_registry)
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=MockModelProvider(()),
+            context_builder=CountingContextBuilder(),
+            domain=resumed_domain,
+        )
+
+        result = await loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "observation_budget_exhausted"
+    budget_event = next(
+        event for event in final.events if event.type == "budget.exhausted"
+    )
+    assert budget_event.call_id == "call-beta"
+    assert budget_event.task_id == second_task.id
+    assert final.observations == before_restart.observations
+    assert resumed_domain.validation_calls == 0
+    assert resumed_domain.projection_calls == 0
+    assert resumed_executor.requests == []
+
+
+async def test_resume_replays_post_observation_budget_check_without_projection(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "observation-budget.db"
+    first_executor = RecordingExecutor()
+    first_registry = _registry(first_executor)
+    first_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=first_registry,
+            store=first_store,
+            clock=lambda: NOW,
+        )
+        started, turn, _, _ = await _seed_model_call(
+            first_runtime,
+            first_registry,
+            _tool_response(),
+            budgets=LoopBudgets(max_observation_characters=1),
+        )
+        evidence = await first_runtime.submit(_proposal(started.operation.id, turn.id))
+        observation = await CountingDomain(first_registry).project_observation(evidence)
+        await first_runtime.append_observation(observation)
+        before_restart = await first_runtime.inspect(started.operation.id)
+        assert before_restart.operation.status is OperationStatus.RUNNING
+    finally:
+        await first_store.close()
+
+    resumed_executor = RecordingExecutor()
+    resumed_registry = _registry(resumed_executor)
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            clock=lambda: NOW,
+        )
+        domain = CountingDomain(resumed_registry)
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=MockModelProvider(()),
+            context_builder=CountingContextBuilder(),
+            domain=domain,
+        )
+
+        result = await loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "observation_budget_exhausted"
+    assert final.operation.status is OperationStatus.FAILED
+    assert final.observations == before_restart.observations
+    assert domain.validation_calls == 0
+    assert domain.projection_calls == 0
+    assert resumed_executor.requests == []
+
+
+async def test_resume_replays_post_rejection_no_progress_check(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "rejection-check.db"
+    executor = RecordingExecutor()
+    registry = _registry(executor)
+    first_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=registry,
+            store=first_store,
+            clock=lambda: NOW,
+        )
+        started, turn, _, _ = await _seed_model_call(
+            first_runtime,
+            registry,
+            _tool_response(),
+            budgets=LoopBudgets(max_identical_failures=1),
+        )
+        await first_runtime.record_action_rejection(
+            started.operation.id,
+            turn.id,
+            _tool_response().tool_calls[0],
+            ActionRejection(
+                code="action.invalid",
+                message="The committed action is invalid.",
+            ),
+        )
+    finally:
+        await first_store.close()
+
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=registry,
+            store=resumed_store,
+            clock=lambda: NOW,
+        )
+        domain = CountingDomain(registry)
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=MockModelProvider(()),
+            context_builder=CountingContextBuilder(),
+            domain=domain,
+        )
+
+        result = await loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "no_progress_action_failure_limit"
+    assert final.operation.status is OperationStatus.FAILED
+    assert domain.validation_calls == 0
+    assert executor.requests == []
+
+
+async def test_resume_started_call_fails_closed_on_provider_identity_change(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "provider-identity.db"
+    executor = RecordingExecutor()
+    registry = _registry(executor)
+    first_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=registry,
+            store=first_store,
+            clock=lambda: NOW,
+        )
+        started, _, _, _ = await _seed_model_call(first_runtime, registry, None)
+    finally:
+        await first_store.close()
+
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=registry,
+            store=resumed_store,
+            clock=lambda: NOW,
+        )
+        context = CountingContextBuilder()
+        domain = TextDomain(registry)
+        provider = MockModelProvider((), provider_id="mock:replacement")
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=provider,
+            context_builder=context,
+            domain=domain,
+        )
+
+        result = await loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "model_provider_identity_changed"
+    assert final.operation.status is OperationStatus.FAILED
+    assert provider.requests == ()
+    assert context.calls == 0
+    assert domain.tool_view_calls == 0
+
+
+async def test_resume_reuses_committed_denied_readiness_without_reevaluation(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "denied-readiness.db"
+    executor = RecordingExecutor()
+    registry = _registry(executor)
+    first_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=registry,
+            store=first_store,
+            clock=lambda: NOW,
+        )
+        started, _, _, _ = await _seed_model_call(
+            first_runtime,
+            registry,
+            _final_response(),
+        )
+        denied = Readiness(
+            allowed=False,
+            code="ready.missing_fact",
+            message="One fact is still missing.",
+            evaluated_at=NOW,
+            missing_facts=("missing fact",),
+        )
+        await first_runtime.record_readiness(
+            started.operation.id,
+            "Recovered answer.",
+            denied,
+        )
+    finally:
+        await first_store.close()
+
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=registry,
+            store=resumed_store,
+            clock=lambda: NOW,
+        )
+        context = TextContextBuilder()
+        domain = TextDomain(registry)
+        provider = MockModelProvider((_final_response(),))
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=provider,
+            context_builder=context,
+            domain=domain,
+        )
+
+        result = await loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert len(final.readiness) == 2
+    assert final.readiness[0] == denied
+    assert final.readiness[-1].allowed
+    assert len(final.turns) == 2
+    assert context.calls == 1
+    assert domain.readiness_calls == 1
+    assert len(provider.requests) == 1
 
 
 async def test_resume_committed_readiness_and_terminal_redelivery_are_zero_io(
@@ -780,16 +1491,38 @@ async def test_resume_committed_readiness_and_terminal_redelivery_are_zero_io(
 
         first_result = await loop.resume(started.operation.id)
         terminal = await resumed_runtime.inspect(started.operation.id)
+        terminal_versioned = await resumed_store.load(started.operation.id)
         second_result = await loop.resume(started.operation.id)
         redelivered_result = await loop.run(_trigger())
+        changed_budget_loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=provider,
+            context_builder=context,
+            domain=domain,
+            budgets=LoopBudgets(max_turns=1),
+        )
+        changed_budget_result = await changed_budget_loop.run(_trigger())
+        mismatched_trigger = AgentTrigger(
+            id=_trigger().id,
+            agent_id=_trigger().agent_id,
+            kind=_trigger().kind,
+            source_id=_trigger().source_id,
+            payload={"key": "different"},
+            created_at=_trigger().created_at,
+        )
+        with pytest.raises(OperationStateError, match="different operation input"):
+            await loop.run(mismatched_trigger)
         after_redelivery = await resumed_runtime.inspect(started.operation.id)
+        after_redelivery_versioned = await resumed_store.load(started.operation.id)
     finally:
         await resumed_store.close()
 
     assert first_result.kind is LoopExitKind.COMPLETED
     assert second_result == first_result
     assert redelivered_result == first_result
+    assert changed_budget_result == first_result
     assert after_redelivery == terminal
+    assert after_redelivery_versioned == terminal_versioned
     assert context.calls == 0
     assert domain.tool_view_calls == 0
     assert domain.readiness_calls == 0

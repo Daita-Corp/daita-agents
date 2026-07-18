@@ -68,7 +68,7 @@ async def test_rejected_event_trigger_leaves_no_reservation_or_partial_state() -
     ]
 
 
-async def test_duplicate_trigger_is_rejected_until_phase2_resume_exists() -> None:
+async def test_exact_duplicate_trigger_returns_the_existing_operation() -> None:
     runtime = OperationRuntime(clock=lambda: NOW)
     trigger = AgentTrigger(
         id="trigger-1",
@@ -80,10 +80,11 @@ async def test_duplicate_trigger_is_rejected_until_phase2_resume_exists() -> Non
     )
     started = await runtime.begin(trigger)
 
-    with pytest.raises(RuntimeError, match="resume.*Phase 2"):
-        await runtime.begin(trigger)
+    redelivered = await runtime.begin(trigger)
 
     unchanged = await runtime.inspect(started.operation.id)
+    assert redelivered == started
+    assert unchanged == started
     assert [event.type for event in unchanged.events] == [
         "trigger.received",
         "operation.created",

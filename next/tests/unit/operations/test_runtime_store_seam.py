@@ -138,7 +138,7 @@ async def test_shared_store_is_authoritative_across_runtime_instances() -> None:
     assert observed.events[-1].type == "turn.created"
 
 
-async def test_two_runtimes_cannot_claim_the_same_trigger() -> None:
+async def test_two_runtimes_redeliver_the_same_exact_trigger_operation() -> None:
     store = InMemoryOperationStore()
     runtimes = (
         OperationRuntime(store=store, clock=lambda: NOW),
@@ -147,6 +147,34 @@ async def test_two_runtimes_cannot_claim_the_same_trigger() -> None:
 
     outcomes = await asyncio.gather(
         *(runtime.begin(_trigger()) for runtime in runtimes),
+        return_exceptions=True,
+    )
+
+    successes = [item for item in outcomes if isinstance(item, OperationSnapshot)]
+    assert len(successes) == 2
+    assert successes[0].operation.id == successes[1].operation.id
+    assert await store.load_by_trigger("trigger-1") is not None
+
+
+async def test_two_runtimes_cannot_claim_conflicting_trigger_inputs() -> None:
+    store = InMemoryOperationStore()
+    runtimes = (
+        OperationRuntime(store=store, clock=lambda: NOW),
+        OperationRuntime(store=store, clock=lambda: NOW),
+    )
+    conflicting = AgentTrigger(
+        id="trigger-1",
+        agent_id="agent-1",
+        kind=TriggerKind.USER,
+        source_id="user-1",
+        session_id="session-1",
+        payload={"message": "different"},
+        created_at=NOW,
+    )
+
+    outcomes = await asyncio.gather(
+        runtimes[0].begin(_trigger()),
+        runtimes[1].begin(conflicting),
         return_exceptions=True,
     )
 

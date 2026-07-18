@@ -236,12 +236,13 @@ class OperationRuntime:
                 )
             except TriggerAlreadyClaimedError as error:
                 existing = await self._store.load_by_trigger(trigger.id)
+                if existing is not None and existing.snapshot.trigger == trigger:
+                    return existing.snapshot
                 existing_id = (
                     "unknown" if existing is None else existing.snapshot.operation.id
                 )
                 raise OperationStateError(
-                    f"trigger already owns operation: {existing_id}; "
-                    "resume is introduced with persistent recovery in Phase 2"
+                    f"trigger already owns a different operation input: {existing_id}"
                 ) from error
             except OperationAlreadyExistsError as error:
                 raise OperationStateError(
