@@ -32,6 +32,7 @@ from ..loop.models import (
     Readiness,
     Turn,
 )
+from ..storage.blobs import BlobMetadata, BlobPut, BlobStore
 from .checkpoints import ModelCall, ModelCallStatus, OperationSnapshot
 from .models import (
     ActionProposal,
@@ -163,6 +164,7 @@ class OperationRuntime:
         id_factory: Callable[[str], str] = _random_id,
         capabilities: CapabilityRegistry | None = None,
         store: TaskExecutionStore | None = None,
+        blob_store: BlobStore | None = None,
         lease_holder_id: str | None = None,
         lease_duration_seconds: float = 60.0,
     ) -> None:
@@ -182,6 +184,7 @@ class OperationRuntime:
         self._store = (
             store if store is not None else InMemoryOperationStore(clock=clock)
         )
+        self._blob_store = blob_store
         self._lease_holder_id = lease_holder_id or _random_id("runtime-holder")
         self._lease_duration_seconds = float(lease_duration_seconds)
 
@@ -706,6 +709,167 @@ class OperationRuntime:
             None if timeout_seconds is None else float(timeout_seconds)
         )
 
+        task = await self._materialize_task(proposal)
+        return await self._execute_materialized_task(
+            task.operation_id,
+            task.id,
+            requested_timeout_seconds=requested_timeout_seconds,
+        )
+
+    async def resume_task(
+        self,
+        operation_id: str,
+        task_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Evidence | None:
+        """Recover one persisted task and execute only a replay-safe attempt."""
+
+        _required_text(operation_id, "operation_id")
+        _required_text(task_id, "task_id")
+        if timeout_seconds is not None and (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be finite and positive")
+        requested_timeout_seconds = (
+            None if timeout_seconds is None else float(timeout_seconds)
+        )
+
+        async with self._lock:
+            try:
+                committed = await self._store.load(operation_id)
+            except OperationNotFoundError as error:
+                raise KeyError(f"Unknown operation: {operation_id}") from error
+            state = self._state_from_snapshot(
+                committed.snapshot,
+                revision=committed.revision,
+            )
+            _, task = self._task(state, task_id)
+
+            if task.status is TaskStatus.SUCCEEDED:
+                return self._accepted_evidence(state, task.evidence_ids[-1])
+            if task.status in {
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.MANUAL_RECOVERY_REQUIRED,
+                TaskStatus.WAITING_FOR_APPROVAL,
+            }:
+                return None
+            if state.operation.status in {
+                OperationStatus.SUCCEEDED,
+                OperationStatus.FAILED,
+                OperationStatus.CANCELLED,
+                OperationStatus.INTERRUPTED,
+            }:
+                raise OperationStateError("operation is already terminal")
+
+            if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+                active_lease = next(
+                    (
+                        lease
+                        for lease in reversed(state.task_leases)
+                        if lease.task_id == task.id and lease.released_at is None
+                    ),
+                    None,
+                )
+                if active_lease is None:
+                    raise OperationStateError(
+                        f"task has no active recovery lease: {task.id}"
+                    )
+                guard = TaskLeaseGuard(
+                    operation_id=operation_id,
+                    task_id=task.id,
+                    holder_id=active_lease.holder_id,
+                    attempt=active_lease.attempt,
+                    fencing_token=active_lease.fencing_token,
+                )
+                placeholder_time = max(
+                    timestamp
+                    for timestamp in (
+                        state.operation.updated_at,
+                        task.updated_at,
+                        active_lease.acquired_at,
+                        active_lease.expires_at,
+                        active_lease.started_at,
+                        active_lease.renewed_at,
+                    )
+                    if timestamp is not None
+                )
+                lease_index, _ = self._lease(state, guard)
+                state.task_leases[lease_index] = replace(
+                    active_lease,
+                    released_at=placeholder_time,
+                    release_reason="recovery_requested",
+                )
+                state.operation = replace(
+                    state.operation,
+                    updated_at=placeholder_time,
+                )
+                model_call = self._completed_model_call_for_turn(
+                    state,
+                    task.turn_id,
+                )
+                state.events.append(
+                    RuntimeEvent(
+                        id=self._id_factory("event"),
+                        type="task.lease_lost",
+                        agent_id=state.operation.agent_id,
+                        operation_id=operation_id,
+                        session_id=state.operation.session_id,
+                        turn_id=task.turn_id,
+                        model_call_id=model_call.id,
+                        call_id=task.call_id,
+                        task_id=task.id,
+                        capability_id=task.capability_id,
+                        executor_id=task.executor_id,
+                        payload={},
+                        created_at=placeholder_time,
+                    )
+                )
+                try:
+                    recovered, cancellation_requested = await _await_store_write(
+                        self._store.recover_expired_task(
+                            self._snapshot(state),
+                            expected_revision=state.revision,
+                            guard=guard,
+                        )
+                    )
+                except OperationStoreError as error:
+                    raise OperationStateError(
+                        f"task recovery rejected: {task.id}"
+                    ) from error
+                if cancellation_requested:
+                    raise asyncio.CancelledError
+                state = self._state_from_snapshot(
+                    recovered.operation.snapshot,
+                    revision=recovered.operation.revision,
+                )
+                _, task = self._task(state, task.id)
+                if task.status in {
+                    TaskStatus.CANCELLED,
+                    TaskStatus.MANUAL_RECOVERY_REQUIRED,
+                }:
+                    return None
+                if task.status is not TaskStatus.READY:
+                    raise OperationStateError(
+                        f"task recovery produced non-executable state: "
+                        f"{task.status.value}"
+                    )
+            elif task.status not in {TaskStatus.PENDING, TaskStatus.READY}:
+                raise OperationStateError(f"task is not resumable: {task.status.value}")
+
+        return await self._execute_materialized_task(
+            operation_id,
+            task_id,
+            requested_timeout_seconds=requested_timeout_seconds,
+        )
+
+    async def _materialize_task(self, proposal: ActionProposal) -> Task:
+        """Persist one exact unexecuted task before any executor I/O."""
+
         # Commit the unexecuted task first. The proposal is untrusted until it
         # is bound to an exact tool call in a committed model response.
         async with self._lock:
@@ -807,6 +971,16 @@ class OperationRuntime:
             )
             await self._commit(state)
 
+        return task
+
+    async def _execute_materialized_task(
+        self,
+        operation_id: str,
+        task_id: str,
+        *,
+        requested_timeout_seconds: float | None,
+    ) -> Evidence:
+
         # Persist readiness, claim a fenced lease, and durably cross the
         # executor-start boundary before the only external execution call.
         wall_deadline_error: OperationWallTimeExceeded | None = None
@@ -817,11 +991,12 @@ class OperationRuntime:
         executor: Executor | None = None
         guard: TaskLeaseGuard | None = None
         async with self._lock:
-            state = await self._working_state(task.operation_id)
-            task_index, committed_task = self._task(state, task.id)
+            state = await self._working_state(operation_id)
+            task_index, committed_task = self._task(state, task_id)
+            task = committed_task
             model_call = self._completed_model_call_for_turn(state, task.turn_id)
-            if committed_task.status is not TaskStatus.PENDING:
-                raise OperationStateError("task is no longer pending")
+            if committed_task.status not in {TaskStatus.PENDING, TaskStatus.READY}:
+                raise OperationStateError("task is no longer executable")
             self._resolve_task_execution(committed_task)
             deadline_now = self._clock()
             if deadline_now.tzinfo is None or deadline_now.utcoffset() is None:
@@ -831,7 +1006,7 @@ class OperationRuntime:
                 (deadline_now - state.operation.created_at).total_seconds(),
             )
             remaining_wall_time = state.budgets.max_wall_time_seconds - elapsed_seconds
-            if remaining_wall_time <= 0:
+            if remaining_wall_time <= 0 and committed_task.status is TaskStatus.PENDING:
                 state.tasks[task_index] = replace(
                     committed_task,
                     status=TaskStatus.FAILED,
@@ -859,26 +1034,29 @@ class OperationRuntime:
                 await self._commit(state)
                 wall_deadline_error = OperationWallTimeExceeded(committed_task.id)
             else:
-                ready_at = self._clock()
-                ready_task = replace(
-                    committed_task,
-                    status=TaskStatus.READY,
-                    updated_at=ready_at,
-                )
-                state.tasks[task_index] = ready_task
-                state.operation = replace(state.operation, updated_at=ready_at)
-                self._append_event(
-                    state,
-                    "task.ready",
-                    turn_id=ready_task.turn_id,
-                    model_call_id=model_call.id,
-                    call_id=ready_task.call_id,
-                    task_id=ready_task.id,
-                    capability_id=ready_task.capability_id,
-                    executor_id=ready_task.executor_id,
-                    payload={"task_id": ready_task.id},
-                )
-                await self._commit(state)
+                if committed_task.status is TaskStatus.PENDING:
+                    ready_at = self._clock()
+                    ready_task = replace(
+                        committed_task,
+                        status=TaskStatus.READY,
+                        updated_at=ready_at,
+                    )
+                    state.tasks[task_index] = ready_task
+                    state.operation = replace(state.operation, updated_at=ready_at)
+                    self._append_event(
+                        state,
+                        "task.ready",
+                        turn_id=ready_task.turn_id,
+                        model_call_id=model_call.id,
+                        call_id=ready_task.call_id,
+                        task_id=ready_task.id,
+                        capability_id=ready_task.capability_id,
+                        executor_id=ready_task.executor_id,
+                        payload={"task_id": ready_task.id},
+                    )
+                    await self._commit(state)
+                else:
+                    ready_task = committed_task
                 self._resolve_task_execution(ready_task)
 
                 claim_event = RuntimeEvent(
@@ -1098,12 +1276,14 @@ class OperationRuntime:
         execution_identity_error: Exception | None = None
         accepted_candidate: EvidenceCandidate | None = None
         validation_error: EvidenceValidationError | None = None
+        evidence_id: str | None = None
+        blob_request: BlobPut | None = None
         async with self._lock:
             state = await self._working_state(task.operation_id)
-            task_index, committed_task = self._task(state, task.id)
-            model_call = self._completed_model_call_for_turn(state, task.turn_id)
+            _, committed_task = self._task(state, task.id)
             if committed_task.status is not TaskStatus.RUNNING:
                 raise OperationStateError("task is no longer running")
+            self._lease(state, guard)
             try:
                 _, current_executor = self._resolve_task_execution(committed_task)
             except OperationStateError as error:
@@ -1124,15 +1304,114 @@ class OperationRuntime:
                     # Failure publication needs its own copy-on-write transition.
                     validation_error = error
 
-            if accepted_candidate is None:
-                # Do not commit this working copy. The failure path reloads the
-                # prior checkpoint and preserves side-effect uncertainty.
-                pass
+            if accepted_candidate is not None:
+                evidence_id = self._id_factory("evidence")
+                artifact = accepted_candidate.artifact
+                if artifact is not None:
+                    blob_id = self._id_factory("blob")
+                    digest = "sha256:" + hashlib.sha256(artifact.content).hexdigest()
+                    blob_request = BlobPut(
+                        blob_id=blob_id,
+                        media_type=artifact.media_type,
+                        created_at=self._clock(),
+                        sensitivity_class=artifact.sensitivity_class,
+                        retention_class=artifact.retention_class,
+                        operation_id=task.operation_id,
+                        task_id=task.id,
+                        evidence_id=evidence_id,
+                        expected_digest=digest,
+                        encryption_metadata=artifact.encryption_metadata,
+                    )
+
+        if execution_identity_error is not None:
+            await self._record_execution_failure(
+                task.operation_id,
+                task.id,
+                guard,
+                "execution_identity_changed",
+            )
+            raise CapabilityExecutionError(
+                f"executor identity changed for task {task.id}"
+            ) from execution_identity_error
+        if validation_error is not None:
+            await self._record_execution_failure(
+                task.operation_id,
+                task.id,
+                guard,
+                "evidence_rejected",
+            )
+            raise validation_error
+
+        assert accepted_candidate is not None
+        assert evidence_id is not None
+        blob_metadata: BlobMetadata | None = None
+        if blob_request is not None:
+            artifact = accepted_candidate.artifact
+            assert artifact is not None
+            try:
+                if self._blob_store is None:
+                    raise RuntimeError(
+                        "artifact evidence requires a configured BlobStore"
+                    )
+                blob_metadata = await self._blob_store.put(
+                    blob_request,
+                    artifact.content,
+                )
+                expected_metadata = BlobMetadata(
+                    blob_id=blob_request.blob_id,
+                    digest=blob_request.expected_digest or "",
+                    size_bytes=len(artifact.content),
+                    media_type=blob_request.media_type,
+                    created_at=blob_request.created_at,
+                    sensitivity_class=blob_request.sensitivity_class,
+                    retention_class=blob_request.retention_class,
+                    operation_id=blob_request.operation_id,
+                    task_id=blob_request.task_id,
+                    evidence_id=blob_request.evidence_id,
+                    encryption_metadata=blob_request.encryption_metadata,
+                )
+                if (
+                    not isinstance(blob_metadata, BlobMetadata)
+                    or blob_metadata != expected_metadata
+                ):
+                    raise RuntimeError(
+                        "blob store returned metadata that differs from the "
+                        "requested evidence provenance"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                await self._record_execution_failure(
+                    task.operation_id,
+                    task.id,
+                    guard,
+                    "evidence_blob_failed",
+                )
+                raise CapabilityExecutionError(
+                    f"artifact persistence failed for task {task.id}"
+                ) from error
+
+        async with self._lock:
+            state = await self._working_state(task.operation_id)
+            task_index, committed_task = self._task(state, task.id)
+            model_call = self._completed_model_call_for_turn(state, task.turn_id)
+            if committed_task.status is not TaskStatus.RUNNING:
+                raise OperationStateError("task is no longer running")
+            try:
+                _, current_executor = self._resolve_task_execution(committed_task)
+            except OperationStateError as error:
+                execution_identity_error = error
             else:
+                if current_executor is not executor:
+                    execution_identity_error = OperationStateError(
+                        "task execution identity changed"
+                    )
+
+            if execution_identity_error is None:
                 placeholder_time = committed_task.updated_at
                 payload_json = canonical_json(accepted_candidate.payload)
                 evidence = Evidence(
-                    id=self._id_factory("evidence"),
+                    id=evidence_id,
                     operation_id=task.operation_id,
                     task_id=task.id,
                     turn_id=task.turn_id,
@@ -1144,10 +1423,13 @@ class OperationRuntime:
                     accepted=True,
                     payload=accepted_candidate.payload,
                     content_hash=(
-                        "sha256:"
+                        blob_metadata.digest
+                        if blob_metadata is not None
+                        else "sha256:"
                         + hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
                     ),
                     created_at=placeholder_time,
+                    blob_id=(None if blob_metadata is None else blob_metadata.blob_id),
                 )
                 state.evidence.append(evidence)
                 state.tasks[task_index] = replace(
@@ -1219,14 +1501,7 @@ class OperationRuntime:
             raise CapabilityExecutionError(
                 f"executor identity changed for task {task.id}"
             ) from execution_identity_error
-        await self._record_execution_failure(
-            task.operation_id,
-            task.id,
-            guard,
-            "evidence_rejected",
-        )
-        assert validation_error is not None
-        raise validation_error
+        raise AssertionError("validated evidence did not reach a terminal outcome")
 
     async def append_observation(self, observation: Observation) -> None:
         if not isinstance(observation, Observation):

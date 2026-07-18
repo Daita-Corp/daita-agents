@@ -168,12 +168,39 @@ class ExecutionRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidenceArtifact:
+    """Untrusted immutable bytes for runtime-owned durable materialization."""
+
+    content: bytes
+    media_type: str
+    sensitivity_class: str
+    retention_class: str
+    encryption_metadata: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.content, bytes):
+            raise TypeError("evidence artifact content must be bytes")
+        _required_text(self.media_type, "evidence artifact media_type")
+        _required_text(
+            self.sensitivity_class,
+            "evidence artifact sensitivity_class",
+        )
+        _required_text(self.retention_class, "evidence artifact retention_class")
+        object.__setattr__(
+            self,
+            "encryption_metadata",
+            FrozenJsonObject.from_mapping(self.encryption_metadata),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class EvidenceCandidate:
     """Untrusted executor output; the runtime supplies all authoritative IDs."""
 
     kind: str
     schema_version: int
     payload: Mapping[str, object] = field(default_factory=dict)
+    artifact: EvidenceArtifact | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.kind, "evidence candidate kind")
@@ -183,6 +210,11 @@ class EvidenceCandidate:
             or self.schema_version < 1
         ):
             raise ValueError("evidence schema_version must be a positive integer")
+        if self.artifact is not None and not isinstance(
+            self.artifact,
+            EvidenceArtifact,
+        ):
+            raise TypeError("evidence artifact must be an EvidenceArtifact or None")
         object.__setattr__(
             self,
             "payload",

@@ -6,21 +6,19 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-05 — define and implement persisted task execution,
-  durable fenced leases, and fail-closed recovery facts at the sole executor
-  boundary
-- **Last completed task:** P2-05e — the sole operation runtime now materializes,
-  readies, claims, fenced-starts, executes, validates, and fenced-commits tasks
-  with exact persisted execution identity and fail-closed time/fence handling
-- **Current checkpoint:** P2-05d task-lifecycle checkpoint `2092c5d`
+- **Active task:** P2-05h — run the final persisted-task execution, recovery,
+  blob-linkage, preservation, and checkpoint gate
+- **Last completed task:** P2-05g — independent representative read,
+  side-effect classification, and blob/persistence reviews found no remaining
+  P2-05 blocker
+- **Current checkpoint:** P2-05e runtime-boundary checkpoint `7e4ad01`
   (`feat(v2): implement fenced task lifecycle`)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** author and run P2-05f's expected-red runtime recovery
-  and blob-linkage cases: reclaim replay-safe expiry with the same idempotency
-  identity, classify unknown unsafe outcomes as manual recovery, skip terminal
-  work, and prove referenced blob durability precedes evidence acceptance
+- **Exact next action:** run P2-05h's final dual-Python suite, architecture and
+  static checks, root-oracle preservation scan, clean distribution builds, and
+  scoped hook review before the P2-05 checkpoint commit
 
 ## Mandatory architecture re-read
 
@@ -143,9 +141,9 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-05c | complete | Migration 4 and SQLite task/dependency/lease projection | Existing tasks backfill coherently; dependencies and leases normalize; exact create/commit/reopen projection, fail-closed legacy recovery, migration rollback, strict codecs, and schema-integrity tests pass |
 | P2-05d | complete | Durable materialize/readiness and fenced claim lifecycle | Task persists before claim; dependencies reuse terminal success; two claimers have one winner; expiry permits only declared replay-safe reclaim; terminal/cancelled/manual-recovery tasks never claim |
 | P2-05e | complete | Split operation-runtime materialize → claim → execute → validate → commit path | The sole existing runtime invokes the executor only with a live fence; stale holders commit no evidence/task/event; task/evidence/event success is atomic; timeouts/cancellation retain truthful durable intent |
-| P2-05f | active | Fail-closed execution recovery and blob-backed evidence linkage | Replay-safe reads may resume after expiry; side-effecting unknown outcomes become manual recovery unless persisted idempotency proves safe; durable blob references precede evidence acceptance; terminal work is skipped |
-| P2-05g | pending | Representative review before broader restart wiring | One read and one test-owned side-effect classification are independently reviewed; P2-06 retains startup/loop resume, and P2-07 retains real approval decision/wake behavior |
-| P2-05h | pending | Final P2-05 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local commit |
+| P2-05f | complete | Fail-closed execution recovery and blob-backed evidence linkage | Replay-safe reads may resume after expiry; side-effecting unknown outcomes become manual recovery unless persisted idempotency proves safe; durable blob references precede evidence acceptance; terminal work is skipped |
+| P2-05g | complete | Representative review before broader restart wiring | One read and one test-owned side-effect classification are independently reviewed; P2-06 retains startup/loop resume, and P2-07 retains real approval decision/wake behavior |
+| P2-05h | active | Final P2-05 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local commit |
 
 ## Files/components being changed or planned
 
@@ -387,6 +385,25 @@ recovery tasks are structurally nonclaimable. P2-06 retains startup scanning
 and whole-loop same-operation resume, P2-07 retains real approval decisions and
 wake behavior, and P2-08 retains the cross-process Agent Home writer lock.
 
+P2-05f separates one-time proposal materialization from the existing fenced
+execution path without adding another runtime. `resume_task()` loads the exact
+persisted task, asks the store-owned expiry classifier to recover the guarded
+attempt, and re-enters that same claim/start/execute/commit path only when the
+committed result is `ready`. A succeeded task returns its already accepted
+evidence, while failed, cancelled, approval-waiting, and manual-recovery work
+returns without registry lookup, executor I/O, or checkpoint mutation.
+
+Large/binary executor output uses an immutable untrusted `EvidenceArtifact`;
+the runtime, not the executor, allocates its evidence/blob IDs and writes an
+exact-provenance `BlobPut` through the existing portable `BlobStore` contract.
+It accepts evidence only after the store returns exact durable digest, size,
+media, retention, sensitivity, encryption, and operation/task/evidence facts.
+Missing, failed, mismatched, cancelled, expired, or stale-fence paths accept no
+evidence. A failure after the durable put intentionally leaves an inspectable
+unlinked blob for explicit orphan maintenance rather than claiming a
+distributed transaction. Migration 5 adds only nullable `evidence.blob_id`;
+blob content and manifest ownership stay out of SQLite and the generic loop.
+
 ## Tests last run
 
 Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
@@ -531,6 +548,9 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-05e adversarial deadline/recovery review | PASS after repair — independent repros additionally exposed runtime/store clock mixing, fenced-start acknowledgement consuming the committed lease interval, and system execution uncertainty being conflated with caller cancellation; store-interval plus monotonic round-trip bounds, zero-I/O expiry behavior, and `task.outcome_unknown` now preserve truthful replay/manual-recovery classification |
 | P2-05e complete dual-interpreter and static gate | PASS — all 572 v2 tests pass with 0 failures/errors in 4.402s/4.515s on CPython 3.11.15/3.12.7; all 51 architecture tests pass; Black is clean across 76 files, byte compilation succeeds, mypy is clean across 23 production source files, pyright 1.1.411 reports 0 errors/warnings, `git diff --check` is clean, and the root oracle scope has no diff |
 | P2-05e independent runtime and test release audits | PASS — final audits exercise exact post-claim wall expiry, independent clock skew, delayed start acknowledgement, lease-bounded timeout, stale terminal fence, unsafe/replay-safe side-effect uncertainty, cancellation suppression, SQLite atomic rollback, and sole-executor ownership with no remaining release blocker |
+| Initial P2-05f recovery/blob/projection contracts | EXPECTED RED — 8 runtime-recovery cases failed only on absent `resume_task`; 5 blob-runtime cases failed only on absent artifact materialization/put behavior while 9 canonical/prevalidation cases passed; Migration 5/projection reported 7 expected failures and 4 passes confined to absent `Evidence.blob_id`, schema, and codecs |
+| P2-05f fail-closed recovery and blob linkage | PASS — all 603 v2 tests and 52 architecture tests pass; expired replay-safe reads and stable-key side effects reclaim the same task at attempt/fence 2, unsafe outcomes become manual recovery, terminal work is zero-I/O/zero-delta, exact-provenance blobs are durable before fenced evidence acceptance, and post-put failure/cancellation/stale fences leave no accepted evidence |
+| P2-05g representative independent reviews | PASS — separate read, side-effect, and blob/persistence audits found no blocker; 48 focused cases pass on CPython 3.11/3.12, the store remains the sole recovery classifier, the runtime remains the sole executor/evidence boundary, Migration 5 remains exact and rollback-safe, and P2-06/P2-07 deferrals remain intact |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
@@ -747,10 +767,16 @@ re-read and an updated ordered ledger.
   and `RUNNING -> terminal/evidence` compatibility after moving the sole
   `OperationRuntime` to ready/claim/fenced execution. Independent review also
   required unknown side-effect annotation to use that same live fence; an
-  expired/stale holder now changes no checkpoint fact. P2-05f must consume the
-  existing store-owned expiry classifier, retain stable idempotency identity
-  across safe retry, skip terminal work, and link only already-durable blobs to
-  accepted evidence.
+  expired/stale holder now changes no checkpoint fact. P2-05f now consumes the
+  existing store-owned expiry classifier, retains stable idempotency identity
+  across safe retry, skips terminal work, and links only already-durable blobs
+  to accepted evidence.
+- P2-05f's first post-production focused run exposed test-only expectations
+  that compared canonical `FrozenJsonObject` values directly with dictionaries
+  and still expected manual recovery to raise instead of returning the locked
+  no-work result. The tests now use the established `.to_dict()` projection and
+  assert `None` plus exact zero durable delta; no production compatibility path
+  or exception special case was added.
 
 ## Credentials and external dependencies
 

@@ -41,6 +41,7 @@ from daita.storage.sqlite import SQLiteMigrationError, SQLiteOperationStore
 NOW = datetime(2026, 7, 17, 20, 0, tzinfo=timezone.utc)
 ZERO_SHA256 = "sha256:" + ("0" * 64)
 MIGRATION_FOUR_NAME = "normalize_fenced_task_execution"
+MIGRATION_FIVE_NAME = "link_blob_backed_evidence"
 LEGACY_RECOVERY_REASON = "legacy_running_task_missing_lease"
 LEGACY_RECOVERY_EVENT_TYPE = "task.manual_recovery_required"
 
@@ -105,6 +106,20 @@ def _migration_four() -> sqlite_owner._SQLiteMigration:
     assert tuple(migration.version for migration in migrations[:4]) == (1, 2, 3, 4)
     migration = migrations[3]
     assert migration.name == MIGRATION_FOUR_NAME
+    return migration
+
+
+def _migration_five() -> sqlite_owner._SQLiteMigration:
+    migrations = tuple(sqlite_owner._MIGRATIONS)
+    assert tuple(migration.version for migration in migrations[:5]) == (
+        1,
+        2,
+        3,
+        4,
+        5,
+    )
+    migration = migrations[4]
+    assert migration.name == MIGRATION_FIVE_NAME
     return migration
 
 
@@ -287,6 +302,50 @@ async def _seed_version_three(path: Path) -> OperationSnapshot:
     return snapshot
 
 
+async def _seed_version_four_with_evidence(
+    path: Path,
+) -> tuple[OperationSnapshot, str]:
+    snapshot = await _seed_version_three(path)
+    version_four = await sqlite_owner._open_with_migrations(
+        path,
+        migrations=(*_migration_prefix(), _migration_four()),
+        verify_owned_schema=True,
+    )
+    await version_four.close()
+
+    evidence_id = "evidence-version-four"
+    encoded_now = NOW.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "INSERT INTO evidence("
+            "operation_id, position, id, task_id, turn_id, capability_id, "
+            "executor_id, kind, schema_version, attempt, accepted, payload_json, "
+            "content_hash, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                snapshot.operation.id,
+                0,
+                evidence_id,
+                "task-pending",
+                "turn-legacy",
+                "legacy.read",
+                "legacy.executor",
+                "legacy.record",
+                1,
+                1,
+                0,
+                "{}",
+                ZERO_SHA256,
+                encoded_now,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return snapshot, evidence_id
+
+
 def _logical_database_image(path: Path) -> tuple[int, int, tuple[str, ...]]:
     connection = sqlite3.connect(path)
     try:
@@ -367,11 +426,23 @@ def _assert_task_execution_schema(path: Path) -> None:
     assert _foreign_key_targets(path, "task_leases") == ("operations", "tasks")
 
 
-async def test_public_schema_four_is_fixed_and_reopen_is_idempotent(
+def _assert_evidence_blob_schema(path: Path) -> None:
+    assert _columns(path, "evidence")["blob_id"] == ("TEXT", 0)
+
+
+async def test_public_schema_five_is_fixed_and_reopen_is_idempotent(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "fresh-v4.db"
-    migration_four = _migration_four()
+    path = tmp_path / "fresh-v5.db"
+    migration_five = _migration_five()
+    normalized_statements = tuple(
+        " ".join(statement.lower().split()) for statement in migration_five.statements
+    )
+    assert len(normalized_statements) == 1
+    assert normalized_statements[0].startswith(
+        "alter table evidence add column blob_id text"
+    )
+    assert "not null" not in normalized_statements[0]
 
     first = await SQLiteOperationStore.open(path)
     await first.close()
@@ -380,15 +451,53 @@ async def test_public_schema_four_is_fixed_and_reopen_is_idempotent(
         (migration.version, migration.name, migration.checksum)
         for migration in sqlite_owner._MIGRATIONS
     )
-    assert _migration_rows(path)[-1][1] == MIGRATION_FOUR_NAME
+    assert _migration_rows(path)[-1][1] == MIGRATION_FIVE_NAME
     _assert_task_execution_schema(path)
+    _assert_evidence_blob_schema(path)
     first_image = _logical_database_image(path)
 
     reopened = await SQLiteOperationStore.open(path)
     await reopened.close()
 
     assert _logical_database_image(path) == first_image
-    assert migration_four.version == 4
+    assert migration_five.version == 5
+
+
+async def test_version_four_upgrade_adds_nullable_evidence_blob_id(
+    tmp_path: Path,
+) -> None:
+    assert _migration_five().version == 5
+    path = tmp_path / "legacy-v4.db"
+    backup_path = tmp_path / "legacy-v4.exact-backup.db"
+    legacy, evidence_id = await _seed_version_four_with_evidence(path)
+    version_four_image = _logical_database_image(path)
+    version_four_migrations = (*_migration_prefix(), _migration_four())
+
+    upgraded = await SQLiteOperationStore.open(path, backup_path=backup_path)
+    await upgraded.close()
+
+    assert _logical_database_image(backup_path) == version_four_image
+    assert _migration_rows(backup_path) == tuple(
+        (migration.version, migration.name, migration.checksum)
+        for migration in version_four_migrations
+    )
+    assert "blob_id" not in _columns(backup_path, "evidence")
+    _assert_evidence_blob_schema(path)
+    assert _migration_rows(path)[-1][1] == MIGRATION_FIVE_NAME
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute(
+            "SELECT blob_id FROM evidence WHERE operation_id = ? AND id = ?",
+            (legacy.operation.id, evidence_id),
+        ).fetchone() == (None,)
+    finally:
+        connection.close()
+
+    upgraded_image = _logical_database_image(path)
+    reopened = await SQLiteOperationStore.open(path)
+    await reopened.close()
+    assert _logical_database_image(path) == upgraded_image
 
 
 async def test_version_three_upgrade_backfills_fail_closed_and_is_reopen_safe(
@@ -412,6 +521,7 @@ async def test_version_three_upgrade_backfills_fail_closed_and_is_reopen_safe(
         for migration in _migration_prefix()
     )
     _assert_task_execution_schema(path)
+    _assert_evidence_blob_schema(path)
 
     connection = sqlite3.connect(path)
     try:
@@ -782,3 +892,56 @@ async def test_failed_migration_four_restores_the_exact_version_three_image(
         ]
     finally:
         connection.close()
+
+
+async def test_failed_migration_five_restores_the_exact_version_four_image(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "failed-v5.db"
+    backup_path = tmp_path / "failed-v5.exact-backup.db"
+    legacy, evidence_id = await _seed_version_four_with_evidence(path)
+    version_four_image = _logical_database_image(path)
+    version_four_migrations = (*_migration_prefix(), _migration_four())
+    migration_five = _migration_five()
+    failing_migration = sqlite_owner._SQLiteMigration(
+        version=5,
+        name=migration_five.name,
+        statements=(
+            *migration_five.statements,
+            "INSERT INTO migration_five_forced_failure(value) VALUES (1)",
+        ),
+    )
+
+    with pytest.raises(
+        SQLiteMigrationError,
+        match=rf"migration 5 \({MIGRATION_FIVE_NAME}\) failed",
+    ):
+        await sqlite_owner._open_with_migrations(
+            path,
+            migrations=(*version_four_migrations, failing_migration),
+            backup_path=backup_path,
+            verify_owned_schema=True,
+        )
+
+    assert _logical_database_image(path) == version_four_image
+    assert _logical_database_image(backup_path) == version_four_image
+    assert _migration_rows(path) == tuple(
+        (migration.version, migration.name, migration.checksum)
+        for migration in version_four_migrations
+    )
+    assert "blob_id" not in _columns(path, "evidence")
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute(
+            "SELECT id FROM evidence WHERE operation_id = ? AND id = ?",
+            (legacy.operation.id, evidence_id),
+        ).fetchone() == (evidence_id,)
+    finally:
+        connection.close()
+
+    reopened = await sqlite_owner._open_with_migrations(
+        path,
+        migrations=version_four_migrations,
+        verify_owned_schema=True,
+    )
+    await reopened.close()

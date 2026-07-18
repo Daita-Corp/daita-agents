@@ -760,12 +760,16 @@ _FENCED_TASK_EXECUTION_SCHEMA_SQL = (
     """.strip(),
 )
 
+_BLOB_BACKED_EVIDENCE_SCHEMA_SQL = ("ALTER TABLE evidence ADD COLUMN blob_id TEXT",)
+
 
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
 # Migration 3 assigns one append-only committed-event sequence per agent.
 # Migration 4 persists immutable execution-safety facts, dependency edges, and
 # fenced lease history. Legacy in-flight work is failed closed during upgrade.
+# Migration 5 adds the explicit nullable link from accepted evidence to the
+# separately durable content-addressed blob manifest.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -786,6 +790,11 @@ _MIGRATIONS = (
         version=4,
         name="normalize_fenced_task_execution",
         statements=_FENCED_TASK_EXECUTION_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=5,
+        name="link_blob_backed_evidence",
+        statements=_BLOB_BACKED_EVIDENCE_SCHEMA_SQL,
     ),
 )
 
@@ -2583,8 +2592,8 @@ def _insert_evidence(
         "INSERT INTO evidence("
         "operation_id, position, id, task_id, turn_id, capability_id, "
         "executor_id, kind, schema_version, attempt, accepted, payload_json, "
-        "content_hash, created_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "content_hash, created_at, blob_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             operation_id,
             position,
@@ -2600,6 +2609,7 @@ def _insert_evidence(
             canonical_json(evidence.payload),
             evidence.content_hash,
             _encode_datetime(evidence.created_at),
+            evidence.blob_id,
         ),
     )
 
@@ -3111,6 +3121,7 @@ def _decode_snapshot(
             created_at=_decode_datetime(
                 _sqlite_text(row["created_at"], "evidence created_at")
             ),
+            blob_id=_optional_text(row["blob_id"]),
         )
         for row in evidence_rows
     )

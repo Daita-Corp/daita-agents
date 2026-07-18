@@ -6,7 +6,9 @@ import re
 
 NEXT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = NEXT_ROOT / "src" / "daita"
+CAPABILITIES = SOURCE_ROOT / "capabilities.py"
 EVENT_MODELS = SOURCE_ROOT / "events" / "models.py"
+OPERATION_MODELS = SOURCE_ROOT / "operations" / "models.py"
 OPERATION_CHECKPOINTS = SOURCE_ROOT / "operations" / "checkpoints.py"
 OPERATION_STORE = SOURCE_ROOT / "operations" / "store.py"
 OPERATION_RUNTIME = SOURCE_ROOT / "operations" / "runtime.py"
@@ -259,6 +261,43 @@ def test_blob_store_has_one_canonical_owner_and_no_generic_state_store() -> None
     }
 
 
+def test_runtime_links_blob_evidence_through_portable_contracts_only() -> None:
+    assert _class_locations("EvidenceArtifact", "Evidence") == {
+        "EvidenceArtifact": ["capabilities.py"],
+        "Evidence": ["operations/models.py"],
+    }
+    runtime = _class_definition(
+        _required_tree(OPERATION_RUNTIME),
+        "OperationRuntime",
+    )
+    constructor = next(
+        node
+        for node in runtime.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    blob_store_argument = next(
+        argument
+        for argument in constructor.args.kwonlyargs
+        if argument.arg == "blob_store"
+    )
+    assert blob_store_argument.annotation is not None
+    assert "BlobStore" in ast.unparse(blob_store_argument.annotation)
+
+    calls = [
+        _attribute_parts(node.func)
+        for node in ast.walk(runtime)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    assert calls.count(("self", "_blob_store", "put")) == 1
+    assert not any("LocalBlobStore" in ast.unparse(node) for node in ast.walk(runtime))
+
+    for path in (CAPABILITIES, OPERATION_MODELS):
+        assert all(
+            not _is_module_or_child(module, "storage")
+            for _, module in _imported_modules(_required_tree(path))
+        )
+
+
 def test_blob_store_does_not_import_runtime_execution_sql_or_provider_owners() -> None:
     tree = _required_tree(BLOB_STORE)
     forbidden_parents = {
@@ -335,7 +374,6 @@ def test_loop_and_runtime_do_not_own_sql_or_import_storage_adapters() -> None:
         *sql_modules,
     }
     forbidden_runtime_modules = {
-        "storage",
         "storage.sqlite",
         "operations.sqlite",
         "sqlite",
@@ -345,6 +383,21 @@ def test_loop_and_runtime_do_not_own_sql_or_import_storage_adapters() -> None:
         "asyncpg",
         "psycopg",
         "psycopg2",
+    }
+    runtime_tree = _required_tree(OPERATION_RUNTIME)
+    runtime_storage_imports = [
+        node
+        for node in ast.walk(runtime_tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module is not None
+        and _is_module_or_child(node.module, "storage")
+    ]
+    assert len(runtime_storage_imports) == 1
+    assert runtime_storage_imports[0].module == "storage.blobs"
+    assert {alias.name for alias in runtime_storage_imports[0].names} == {
+        "BlobMetadata",
+        "BlobPut",
+        "BlobStore",
     }
     sql_leader = re.compile(
         r"^(?:PRAGMA\b|CREATE\s+(?:TABLE|INDEX|TRIGGER|VIEW)\b|"

@@ -319,9 +319,22 @@ def test_operation_runtime_consumes_the_existing_fenced_store_contract() -> None
         for node in runtime.body
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "submit"
     )
-    store_calls = {
+    execution = next(
+        node
+        for node in runtime.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_execute_materialized_task"
+    )
+    submit_calls = {
         _attribute_parts(node.func)
         for node in ast.walk(submit)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert ("self", "_materialize_task") in submit_calls
+    assert ("self", "_execute_materialized_task") in submit_calls
+    store_calls = {
+        _attribute_parts(node.func)
+        for node in ast.walk(execution)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
     assert ("self", "_store", "claim_task") in store_calls

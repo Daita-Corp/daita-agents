@@ -336,8 +336,10 @@ commands actually run.
 Phase 2 status: **P2-02 canonical checkpoints and the authoritative in-memory
 operation-store seam, P2-03 normalized SQLite repository, P2-04 blob/event
 persistence, and P2-05d's cross-adapter fenced lifecycle are complete;
-P2-05e's sole-runtime execution migration is active. The overall Phase 2 gate
-has not been run or claimed.**
+P2-05e's sole-runtime execution migration and P2-05f/P2-05g fail-closed
+recovery, blob-evidence linkage, and representative reviews are complete;
+P2-05h's final checkpoint gate is active. The overall Phase 2 gate has not
+been run or claimed.**
 
 Plan Sections 6 and 15 were re-read in full after the Phase 1 gate and before
 any Phase 2 production edit. Later phases remain unstarted.
@@ -422,6 +424,9 @@ refreshed code/test-tree gate and P2-Q02p closes P2-03.
 | P2-Q04g | `next/` | P2-05e expected-red post-claim wall deadline, lease-bound timeout, and unknown side-effect timeout regressions | EXPECTED RED — exactly 3 failures proved executor I/O could begin after the wall deadline, outlive its configured lease, and freeze an unknown side-effect outcome as terminal failure |
 | P2-Q04h | `next/` | Independent adversarial clock/fence/recovery review and repaired focused regressions | PASS after repair — runtime/store clock skew, delayed fenced-start acknowledgement, system-uncertainty/caller-cancellation conflation, and stale unknown-outcome annotation were reproduced and closed; the final live-fenced RUNNING annotation is no-evidence/no-lease-change, expired/stale rejection is exact zero delta, and replay-safe stable-key versus unsafe manual-recovery classification remains viable |
 | P2-Q04i | `next/` and repository root | Final P2-05e dual-interpreter suite, architecture/static/preservation gates, and three independent release audits | PASS — 572 tests with 0 failures/errors in 4.402s/4.515s on CPython 3.11.15/3.12.7; 51 architecture tests; Black 76 files; compilation clean; mypy 23 production files; pyright 0 errors/warnings; diff/root scopes clean; all audits GO |
+| P2-Q04j | `next/` | P2-05f runtime recovery, blob-backed evidence, and Migration 5/projection contracts before production support | EXPECTED RED — 8 recovery failures were confined to absent `resume_task`; 5 blob-runtime failures were confined to absent artifact puts; 7 migration/projection failures were confined to absent `Evidence.blob_id`, schema, and codecs |
+| P2-Q04k | `next/` | Repaired focused recovery/blob/SQLite cases plus complete suite, architecture, and static checks | PASS — 603 complete and 52 architecture tests; Black 77 files; compilation clean; mypy 23 production files; pyright 0 errors/warnings; stable-key reclaim, manual recovery, terminal skip, exact blob-before-evidence ordering, orphan-on-gap behavior, and nullable Migration 5 projection pass |
+| P2-Q04l | current P2-05f diff | Three independent P2-05g representative read, side-effect, and blob/persistence audits | PASS — all audits GO; the store remains the sole expiry classifier, the runtime remains the sole executor/recovery/evidence boundary, stale fences accept nothing, SQLite rollback/reopen is exact, and broader startup/approval behavior remains deferred to P2-06/P2-07 |
 
 P2-Q03j through P2-Q03n close the refreshed P2-04 code/test-tree, preservation,
 distribution, review, and checkpoint gate.

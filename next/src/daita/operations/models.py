@@ -398,6 +398,7 @@ class Evidence:
     payload: Mapping[str, object]
     content_hash: str
     created_at: datetime
+    blob_id: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.id, "evidence id")
@@ -424,5 +425,7 @@ class Evidence:
         _required_text(self.content_hash, "evidence content_hash")
         if not self.content_hash.startswith("sha256:"):
             raise ValueError("evidence content_hash must use sha256")
+        if self.blob_id is not None:
+            _required_text(self.blob_id, "evidence blob_id")
         _aware(self.created_at, "evidence created_at")
         object.__setattr__(self, "payload", FrozenJsonObject.from_mapping(self.payload))

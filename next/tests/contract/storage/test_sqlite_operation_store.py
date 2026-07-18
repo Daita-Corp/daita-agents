@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import sqlite3
+
+import pytest
 
 from daita.events.models import RuntimeEvent
 from daita.llm.models import (
@@ -34,7 +37,7 @@ from daita.operations.models import (
     TaskStatus,
     TriggerKind,
 )
-from daita.storage.sqlite import SQLiteOperationStore
+from daita.storage.sqlite import SQLiteCorruptionError, SQLiteOperationStore
 
 OFFSET = timezone(timedelta(hours=5, minutes=30))
 EARLY = datetime(2026, 7, 17, 8, 9, 10, 111_222, tzinfo=OFFSET)
@@ -454,6 +457,85 @@ async def test_maximal_snapshot_round_trips_through_lookups_and_reopen(
     try:
         assert await reopened.load(snapshot.operation.id) == created.operation
         assert await reopened.load_by_trigger(snapshot.trigger.id) == created.operation
+    finally:
+        await reopened.close()
+
+
+async def test_evidence_blob_id_round_trips_with_nullable_legacy_rows(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "evidence-blobs.db"
+    original = _maximal_snapshot()
+    linked = replace(original.evidence[0], blob_id="blob-evidence-z")
+    unlinked = replace(original.evidence[1], blob_id=None)
+    snapshot = replace(original, evidence=(linked, unlinked))
+
+    store = await SQLiteOperationStore.open(path)
+    try:
+        created = await store.create(snapshot)
+        assert created.operation.snapshot == snapshot
+        assert await store.load(snapshot.operation.id) == created.operation
+    finally:
+        await store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute(
+            "SELECT id, blob_id FROM evidence "
+            "WHERE operation_id = ? ORDER BY position",
+            (snapshot.operation.id,),
+        ).fetchall() == [
+            (linked.id, linked.blob_id),
+            (unlinked.id, None),
+        ]
+    finally:
+        connection.close()
+
+    reopened = await SQLiteOperationStore.open(path)
+    try:
+        assert await reopened.load(snapshot.operation.id) == created.operation
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.parametrize(
+    "corrupt_blob_id",
+    (
+        "   ",
+        sqlite3.Binary(b"blob-id-must-be-text"),
+    ),
+    ids=("blank-text", "non-text"),
+)
+async def test_evidence_blob_id_codec_rejects_malformed_projection(
+    tmp_path: Path,
+    corrupt_blob_id: object,
+) -> None:
+    path = tmp_path / "corrupt-evidence-blob.db"
+    snapshot = _maximal_snapshot()
+    store = await SQLiteOperationStore.open(path)
+    try:
+        await store.create(snapshot)
+    finally:
+        await store.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "UPDATE evidence SET blob_id = ? WHERE operation_id = ? AND id = ?",
+            (
+                corrupt_blob_id,
+                snapshot.operation.id,
+                snapshot.evidence[0].id,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    reopened = await SQLiteOperationStore.open(path)
+    try:
+        with pytest.raises(SQLiteCorruptionError):
+            await reopened.load(snapshot.operation.id)
     finally:
         await reopened.close()
 
