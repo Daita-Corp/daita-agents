@@ -11,6 +11,7 @@ from daita.capabilities import (
     Capability,
     CapabilityExecutionError,
     CapabilityRegistry,
+    EvidenceArtifact,
     EvidenceCandidate,
     ExecutionRequest,
     RiskLevel,
@@ -39,6 +40,7 @@ from daita.loop.models import (
     Turn,
 )
 from daita.operations.checkpoints import OperationSnapshot
+from daita.operations.leases import TaskClaimRequest, TaskLeaseGuard
 from daita.operations.models import (
     ActionProposal,
     ActionRejection,
@@ -51,6 +53,12 @@ from daita.operations.models import (
     TriggerKind,
 )
 from daita.operations.runtime import OperationRuntime, OperationStateError
+from daita.operations.store import (
+    CommitResult,
+    TaskClaimResult,
+    VersionedOperation,
+)
+from daita.storage.blobs import BlobMetadata, BlobPut, LocalBlobStore
 from daita.storage.sqlite import SQLiteOperationStore
 
 NOW = datetime(2026, 7, 16, 20, 0, tzinfo=timezone.utc)
@@ -120,12 +128,184 @@ class FailingExecutor(RecordingExecutor):
         raise RuntimeError("injected executor failure")
 
 
+class ArtifactExecutor(RecordingExecutor):
+    async def execute(self, request: ExecutionRequest) -> EvidenceCandidate:
+        self.requests.append(request)
+        key = request.arguments["key"]
+        assert isinstance(key, str)
+        return EvidenceCandidate(
+            kind="fake.read.result",
+            schema_version=1,
+            payload={"key": key, "value": key.upper()},
+            artifact=EvidenceArtifact(
+                content=f'{{"key":"{key}","value":"{key.upper()}"}}'.encode(),
+                media_type="application/json",
+                sensitivity_class="internal",
+                retention_class="operation",
+            ),
+        )
+
+
+class CrashAfterCommittedEventStore:
+    """Raise process loss only after the SQLite delegate commits one event."""
+
+    def __init__(self, delegate: SQLiteOperationStore, event_type: str) -> None:
+        self.delegate = delegate
+        self.event_type = event_type
+        self.crashed = False
+
+    def _after_commit(self, result: CommitResult) -> None:
+        if self.crashed or not any(
+            event.type == self.event_type for event in result.committed_events
+        ):
+            return
+        self.crashed = True
+        raise AbruptProcessExit
+
+    async def create(self, snapshot: OperationSnapshot) -> CommitResult:
+        result = await self.delegate.create(snapshot)
+        self._after_commit(result)
+        return result
+
+    async def load(self, operation_id: str) -> VersionedOperation:
+        return await self.delegate.load(operation_id)
+
+    async def load_nonterminal(
+        self,
+        agent_id: str,
+    ) -> tuple[VersionedOperation, ...]:
+        return await self.delegate.load_nonterminal(agent_id)
+
+    async def load_by_trigger(
+        self,
+        trigger_id: str,
+    ) -> VersionedOperation | None:
+        return await self.delegate.load_by_trigger(trigger_id)
+
+    async def commit(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+    ) -> CommitResult:
+        result = await self.delegate.commit(
+            snapshot,
+            expected_revision=expected_revision,
+        )
+        self._after_commit(result)
+        return result
+
+    async def claim_task(
+        self,
+        request: TaskClaimRequest,
+        *,
+        expected_revision: int,
+    ) -> TaskClaimResult:
+        result = await self.delegate.claim_task(
+            request,
+            expected_revision=expected_revision,
+        )
+        self._after_commit(result.commit_result)
+        return result
+
+    async def renew_task_lease(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+        guard: TaskLeaseGuard,
+        lease_duration_seconds: float,
+    ) -> CommitResult:
+        result = await self.delegate.renew_task_lease(
+            snapshot,
+            expected_revision=expected_revision,
+            guard=guard,
+            lease_duration_seconds=lease_duration_seconds,
+        )
+        self._after_commit(result)
+        return result
+
+    async def commit_fenced(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+        guard: TaskLeaseGuard,
+    ) -> CommitResult:
+        result = await self.delegate.commit_fenced(
+            snapshot,
+            expected_revision=expected_revision,
+            guard=guard,
+        )
+        self._after_commit(result)
+        return result
+
+    async def recover_expired_task(
+        self,
+        snapshot: OperationSnapshot,
+        *,
+        expected_revision: int,
+        guard: TaskLeaseGuard,
+    ) -> CommitResult:
+        result = await self.delegate.recover_expired_task(
+            snapshot,
+            expected_revision=expected_revision,
+            guard=guard,
+        )
+        self._after_commit(result)
+        return result
+
+
+class CrashBeforeModelResponseRuntime(OperationRuntime):
+    """Lose one provider result while its STARTED request remains durable."""
+
+    crashed = False
+
+    async def record_model_response(
+        self,
+        operation_id: str,
+        model_call_id: str,
+        response: ModelResponse,
+        *,
+        next_phase: LoopPhase,
+    ) -> None:
+        if not self.crashed:
+            self.crashed = True
+            raise AbruptProcessExit
+        await super().record_model_response(
+            operation_id,
+            model_call_id,
+            response,
+            next_phase=next_phase,
+        )
+
+
+class CrashAfterPutBlobStore(LocalBlobStore):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.committed: BlobMetadata | None = None
+
+    async def put(self, request: BlobPut, content: bytes) -> BlobMetadata:
+        self.committed = await super().put(request, content)
+        raise AbruptProcessExit
+
+
 class MutableClock:
     def __init__(self, current: datetime) -> None:
         self.current = current
 
     def __call__(self) -> datetime:
         return self.current
+
+
+class NamespacedIds:
+    def __init__(self, namespace: str) -> None:
+        self.namespace = namespace
+        self.counts: dict[str, int] = {}
+
+    def __call__(self, prefix: str) -> str:
+        self.counts[prefix] = self.counts.get(prefix, 0) + 1
+        return f"{prefix}-{self.namespace}-{self.counts[prefix]}"
 
 
 class MaterializeOnlyRuntime(OperationRuntime):
@@ -1125,8 +1305,13 @@ async def test_resume_expired_unsafe_task_waits_for_manual_recovery(
             domain=domain,
         )
 
-        result = await loop.resume(started.operation.id)
-        final = await resumed_runtime.inspect(started.operation.id)
+        recovered = await loop.recover_startup("agent-restart")
+        assert tuple(exit.operation_id for exit in recovered) == (started.operation.id,)
+        result = recovered[0]
+        after_manual = await resumed_store.load(started.operation.id)
+        repeated = await loop.recover_startup("agent-restart")
+        after_repeated = await resumed_store.load(started.operation.id)
+        final = after_manual.snapshot
     finally:
         await resumed_store.close()
 
@@ -1136,6 +1321,10 @@ async def test_resume_expired_unsafe_task_waits_for_manual_recovery(
     assert final.tasks[0].status is TaskStatus.MANUAL_RECOVERY_REQUIRED
     assert final.tasks[0].manual_recovery_reason == "unknown_side_effect_outcome"
     assert final.task_leases[0].released_at == clock.current
+    assert final.task_leases[0].release_reason == "expired_unknown_outcome"
+    assert tuple(exit.kind for exit in repeated) == (LoopExitKind.WAITING,)
+    assert repeated[0].reason == "manual_recovery_required"
+    assert after_repeated == after_manual
     assert not any(event.type == "budget.exhausted" for event in final.events)
     assert not any(event.type == "operation.failed" for event in final.events)
     assert domain.validation_calls == 0
@@ -1728,3 +1917,532 @@ async def test_startup_recovery_defers_live_lease_and_drops_new_terminal(
     assert domain.readiness_calls == 0
     assert provider.requests == ()
     assert resumed_executor.requests == []
+
+
+@pytest.mark.parametrize(
+    "crash_event",
+    (
+        "turn.created",
+        "model_call.started",
+        "model_response.recorded",
+        "task.created",
+        "task.claimed",
+        "executor.started",
+        "evidence.accepted",
+        "observation.recorded",
+        "readiness.recorded",
+        "operation.succeeded",
+    ),
+)
+async def test_abrupt_exit_after_each_durable_loop_boundary_resumes_exactly(
+    tmp_path: Path,
+    crash_event: str,
+) -> None:
+    database_path = tmp_path / f"crash-{crash_event}.db"
+    clock = MutableClock(NOW)
+    first_executor = RecordingExecutor()
+    first_registry = _registry(first_executor)
+    first_store = await SQLiteOperationStore.open(database_path, clock=clock)
+    crash_store = CrashAfterCommittedEventStore(first_store, crash_event)
+    first_context = CountingContextBuilder()
+    first_domain = CountingDomain(first_registry)
+    first_provider = MockModelProvider((_tool_response(), _final_response()))
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=first_registry,
+            store=crash_store,
+            clock=clock,
+        )
+        first_loop = AgentLoop(
+            runtime=first_runtime,
+            model=first_provider,
+            context_builder=first_context,
+            domain=first_domain,
+        )
+
+        with pytest.raises(AbruptProcessExit):
+            await first_loop.run(_trigger())
+
+        assert crash_store.crashed
+        before = await first_store.load_by_trigger(_trigger().id)
+        assert before is not None
+        if crash_event == "executor.started":
+            clock.current = before.snapshot.task_leases[-1].expires_at + timedelta(
+                microseconds=1
+            )
+    finally:
+        await first_store.close()
+
+    remaining_responses = {
+        "turn.created": (_tool_response(), _final_response()),
+        "model_call.started": (_tool_response(), _final_response()),
+        "readiness.recorded": (),
+        "operation.succeeded": (),
+    }.get(crash_event, (_final_response(),))
+    resumed_executor = RecordingExecutor()
+    resumed_registry = _registry(resumed_executor)
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=clock)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            clock=clock,
+        )
+        resumed_context = CountingContextBuilder()
+        resumed_domain = CountingDomain(resumed_registry)
+        resumed_provider = MockModelProvider(remaining_responses)
+        resumed_loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=resumed_provider,
+            context_builder=resumed_context,
+            domain=resumed_domain,
+        )
+
+        if crash_event == "task.claimed":
+            live_before = await resumed_store.load(before.snapshot.operation.id)
+            live_exits = await resumed_loop.recover_startup("agent-restart")
+            live_after = await resumed_store.load(before.snapshot.operation.id)
+            assert tuple(exit.kind for exit in live_exits) == (LoopExitKind.WAITING,)
+            assert live_exits[0].reason == "task_lease_active"
+            assert live_before == before
+            assert live_after == live_before
+            assert resumed_context.calls == 0
+            assert resumed_domain.validation_calls == 0
+            assert resumed_domain.projection_calls == 0
+            assert resumed_domain.readiness_calls == 0
+            assert resumed_provider.requests == ()
+            assert resumed_executor.requests == []
+            clock.current = before.snapshot.task_leases[-1].expires_at + timedelta(
+                microseconds=1
+            )
+
+        if crash_event == "operation.succeeded":
+            assert await resumed_runtime.inspect_nonterminal("agent-restart") == ()
+            result = await resumed_loop.resume(before.snapshot.operation.id)
+        else:
+            recovered = await resumed_loop.recover_startup("agent-restart")
+            assert tuple(exit.operation_id for exit in recovered) == (
+                before.snapshot.operation.id,
+            )
+            result = recovered[0]
+        final = await resumed_store.load(before.snapshot.operation.id)
+        redelivered = await resumed_loop.run(_trigger())
+        after_redelivery = await resumed_store.load(before.snapshot.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert redelivered == result
+    assert after_redelivery == final
+    if crash_event == "operation.succeeded":
+        assert final == before
+    assert final.snapshot.operation.status is OperationStatus.SUCCEEDED
+    assert final.snapshot.trigger == before.snapshot.trigger
+    assert (
+        final.snapshot.events[: len(before.snapshot.events)] == before.snapshot.events
+    )
+    assert (
+        final.snapshot.evidence[: len(before.snapshot.evidence)]
+        == before.snapshot.evidence
+    )
+    assert (
+        final.snapshot.observations[: len(before.snapshot.observations)]
+        == before.snapshot.observations
+    )
+    assert (
+        final.snapshot.readiness[: len(before.snapshot.readiness)]
+        == before.snapshot.readiness
+    )
+    assert len(final.snapshot.turns) == 2
+    assert len(final.snapshot.model_calls) == 2
+    assert final.snapshot.loop_state.turn_count == 2
+    assert final.snapshot.loop_state.action_count == 1
+    assert final.snapshot.loop_state.input_tokens == 12
+    assert final.snapshot.loop_state.output_tokens == 5
+    assert final.snapshot.loop_state.observation_characters == 51
+    assert len(final.snapshot.tasks) == 1
+    assert len(final.snapshot.evidence) == 1
+    assert len(final.snapshot.observations) == 1
+    assert len(final.snapshot.readiness) == 1
+    assert final.snapshot.tasks[0].evidence_ids == (final.snapshot.evidence[0].id,)
+    assert final.snapshot.observations[0].evidence_id == final.snapshot.evidence[0].id
+    followup_request = final.snapshot.model_calls[1].request
+    assert [message.role for message in followup_request.messages] == [
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+    ]
+    tool_message = followup_request.messages[-1]
+    assert len(tool_message.content) == 1
+    tool_result = tool_message.content[0]
+    assert isinstance(tool_result, ToolResultBlock)
+    assert tool_result.call_id == final.snapshot.tasks[0].call_id
+    assert tool_result.output == final.snapshot.observations[0].payload
+    assert not tool_result.is_error
+    if before.snapshot.tasks:
+        assert final.snapshot.tasks[0].id == before.snapshot.tasks[0].id
+        assert (
+            final.snapshot.tasks[0].execution_facts
+            == before.snapshot.tasks[0].execution_facts
+        )
+
+    expected_attempt = 2 if crash_event in {"task.claimed", "executor.started"} else 1
+    assert final.snapshot.tasks[0].attempt == expected_attempt
+    assert len(final.snapshot.task_leases) == expected_attempt
+    assert tuple(lease.fencing_token for lease in final.snapshot.task_leases) == tuple(
+        range(1, expected_attempt + 1)
+    )
+    expected_release_reasons = {
+        "task.claimed": ("expired_before_start", "completed"),
+        "executor.started": ("expired_replay_safe", "completed"),
+    }.get(crash_event, ("completed",))
+    assert (
+        tuple(lease.release_reason for lease in final.snapshot.task_leases)
+        == expected_release_reasons
+    )
+    event_types = [event.type for event in final.snapshot.events]
+    assert event_types.count("model_call.started") == 2
+    assert event_types.count("model_response.recorded") == 2
+    assert event_types.count("task.created") == 1
+    assert event_types.count("evidence.accepted") == 1
+    assert event_types.count("observation.recorded") == 1
+    assert event_types.count("readiness.recorded") == 1
+    assert event_types.count("operation.succeeded") == 1
+    assert event_types.count("task.claimed") == expected_attempt
+    assert event_types.count("executor.started") == (
+        2 if crash_event == "executor.started" else 1
+    )
+
+    expected_initial_provider_calls = {
+        "turn.created": 0,
+        "model_call.started": 0,
+        "readiness.recorded": 2,
+        "operation.succeeded": 2,
+    }.get(crash_event, 1)
+    assert len(first_provider.requests) == expected_initial_provider_calls
+    assert len(first_executor.requests) == (
+        1
+        if crash_event
+        in {
+            "evidence.accepted",
+            "observation.recorded",
+            "readiness.recorded",
+            "operation.succeeded",
+        }
+        else 0
+    )
+    assert len(resumed_provider.requests) == len(remaining_responses)
+    assert first_context.calls + resumed_context.calls == 2
+    assert first_domain.validation_calls + resumed_domain.validation_calls == 1
+    assert first_domain.projection_calls + resumed_domain.projection_calls == 1
+    assert first_domain.readiness_calls + resumed_domain.readiness_calls == 1
+    assert len(resumed_executor.requests) == (
+        1
+        if crash_event
+        in {
+            "turn.created",
+            "model_call.started",
+            "model_response.recorded",
+            "task.created",
+            "task.claimed",
+            "executor.started",
+        }
+        else 0
+    )
+    assert resumed_domain.validation_calls == (
+        1
+        if crash_event
+        in {"turn.created", "model_call.started", "model_response.recorded"}
+        else 0
+    )
+    assert resumed_domain.projection_calls == (
+        1
+        if crash_event
+        in {
+            "turn.created",
+            "model_call.started",
+            "model_response.recorded",
+            "task.created",
+            "task.claimed",
+            "executor.started",
+            "evidence.accepted",
+        }
+        else 0
+    )
+    assert resumed_domain.readiness_calls == (
+        0 if crash_event in {"readiness.recorded", "operation.succeeded"} else 1
+    )
+
+
+async def test_process_exit_inside_safe_executor_reclaims_same_task_after_expiry(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "safe-executor-process-exit.db"
+    clock = MutableClock(NOW)
+    first_executor = ProcessExitExecutor()
+    first_registry = _registry(first_executor)
+    first_store = await SQLiteOperationStore.open(database_path, clock=clock)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=first_registry,
+            store=first_store,
+            clock=clock,
+        )
+        first_loop = AgentLoop(
+            runtime=first_runtime,
+            model=MockModelProvider((_tool_response(),)),
+            context_builder=CountingContextBuilder(),
+            domain=CountingDomain(first_registry),
+        )
+
+        with pytest.raises(AbruptProcessExit):
+            await first_loop.run(_trigger())
+
+        before = await first_store.load_by_trigger(_trigger().id)
+        assert before is not None
+        original_task = before.snapshot.tasks[0]
+        assert original_task.status is TaskStatus.RUNNING
+        assert original_task.attempt == 1
+        assert len(first_executor.requests) == 1
+    finally:
+        await first_store.close()
+
+    resumed_executor = RecordingExecutor()
+    resumed_registry = _registry(resumed_executor)
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=clock)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            clock=clock,
+        )
+        resumed_loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=MockModelProvider((_final_response(),)),
+            context_builder=CountingContextBuilder(),
+            domain=CountingDomain(resumed_registry),
+        )
+
+        live_before = await resumed_store.load(before.snapshot.operation.id)
+        live_exits = await resumed_loop.recover_startup("agent-restart")
+        live_after = await resumed_store.load(before.snapshot.operation.id)
+        assert tuple(exit.operation_id for exit in live_exits) == (
+            before.snapshot.operation.id,
+        )
+        assert live_exits[0].kind is LoopExitKind.WAITING
+        assert live_exits[0].reason == "task_lease_active"
+        assert live_before == before
+        assert live_after == live_before
+
+        clock.current = before.snapshot.task_leases[0].expires_at + timedelta(
+            microseconds=1
+        )
+        recovered = await resumed_loop.recover_startup("agent-restart")
+        assert tuple(exit.operation_id for exit in recovered) == (
+            before.snapshot.operation.id,
+        )
+        result = recovered[0]
+        final = await resumed_store.load(before.snapshot.operation.id)
+    finally:
+        await resumed_store.close()
+
+    recovered_task = final.snapshot.tasks[0]
+    assert result.kind is LoopExitKind.COMPLETED
+    assert recovered_task.id == original_task.id
+    assert recovered_task.execution_facts == original_task.execution_facts
+    assert recovered_task.status is TaskStatus.SUCCEEDED
+    assert recovered_task.attempt == 2
+    assert tuple(lease.fencing_token for lease in final.snapshot.task_leases) == (1, 2)
+    assert tuple(lease.release_reason for lease in final.snapshot.task_leases) == (
+        "expired_replay_safe",
+        "completed",
+    )
+    assert len(resumed_executor.requests) == 1
+    assert resumed_executor.requests[0].task_id == original_task.id
+    assert resumed_executor.requests[0].attempt == 2
+    assert resumed_executor.requests[0].fencing_token == 2
+    assert final.snapshot.loop_state.action_count == 1
+    assert len(final.snapshot.tasks) == 1
+    assert len(final.snapshot.evidence) == 1
+    assert final.snapshot.evidence[0].attempt == 2
+    assert len(final.snapshot.observations) == 1
+    event_types = [event.type for event in final.snapshot.events]
+    assert event_types.count("task.created") == 1
+    assert event_types.count("task.claimed") == 2
+    assert event_types.count("executor.started") == 2
+    assert event_types.count("evidence.accepted") == 1
+
+
+async def test_provider_result_lost_before_response_commit_resends_exact_request(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "unknown-model-outcome.db"
+    first_executor = RecordingExecutor()
+    first_registry = _registry(first_executor)
+    first_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    first_provider = MockModelProvider((_tool_response(),))
+    try:
+        first_runtime = CrashBeforeModelResponseRuntime(
+            capabilities=first_registry,
+            store=first_store,
+            clock=lambda: NOW,
+        )
+        first_loop = AgentLoop(
+            runtime=first_runtime,
+            model=first_provider,
+            context_builder=CountingContextBuilder(),
+            domain=CountingDomain(first_registry),
+        )
+
+        with pytest.raises(AbruptProcessExit):
+            await first_loop.run(_trigger())
+
+        before = await first_store.load_by_trigger(_trigger().id)
+        assert before is not None
+        started_call = before.snapshot.model_calls[0]
+        assert started_call.response is None
+        assert first_provider.requests == (started_call.request,)
+    finally:
+        await first_store.close()
+
+    resumed_executor = RecordingExecutor()
+    resumed_registry = _registry(resumed_executor)
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    resumed_provider = MockModelProvider((_tool_response(), _final_response()))
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            clock=lambda: NOW,
+        )
+        resumed_loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=resumed_provider,
+            context_builder=CountingContextBuilder(),
+            domain=CountingDomain(resumed_registry),
+        )
+
+        recovered = await resumed_loop.recover_startup("agent-restart")
+        assert tuple(exit.operation_id for exit in recovered) == (
+            before.snapshot.operation.id,
+        )
+        result = recovered[0]
+        final = await resumed_store.load(before.snapshot.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert resumed_provider.requests[0] == started_call.request
+    assert final.snapshot.model_calls[0].id == started_call.id
+    assert final.snapshot.model_calls[0].response == _tool_response()
+    assert final.snapshot.loop_state.input_tokens == 12
+    assert final.snapshot.loop_state.output_tokens == 5
+    first_call_events = [
+        event.type
+        for event in final.snapshot.events
+        if event.model_call_id == started_call.id
+    ]
+    assert first_call_events.count("model_call.started") == 1
+    assert first_call_events.count("model_response.recorded") == 1
+    assert first_executor.requests == []
+    assert len(resumed_executor.requests) == 1
+
+
+async def test_blob_put_crash_leaves_unlinked_orphan_then_safe_retry_links_new_blob(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "blob-orphan.db"
+    blob_root = tmp_path / "blobs"
+    clock = MutableClock(NOW)
+    first_executor = ArtifactExecutor()
+    first_registry = _registry(first_executor)
+    crashing_blobs = CrashAfterPutBlobStore(blob_root)
+    first_store = await SQLiteOperationStore.open(database_path, clock=clock)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=first_registry,
+            store=first_store,
+            blob_store=crashing_blobs,
+            clock=clock,
+            id_factory=NamespacedIds("before-crash"),
+        )
+        first_loop = AgentLoop(
+            runtime=first_runtime,
+            model=MockModelProvider((_tool_response(),)),
+            context_builder=CountingContextBuilder(),
+            domain=CountingDomain(first_registry),
+        )
+
+        with pytest.raises(AbruptProcessExit):
+            await first_loop.run(_trigger())
+
+        before = await first_store.load_by_trigger(_trigger().id)
+        assert before is not None
+        assert crashing_blobs.committed is not None
+        orphan = crashing_blobs.committed
+        assert before.snapshot.tasks[0].status is TaskStatus.RUNNING
+        assert before.snapshot.evidence == ()
+        clock.current = before.snapshot.task_leases[-1].expires_at + timedelta(
+            microseconds=1
+        )
+    finally:
+        await first_store.close()
+
+    resumed_executor = ArtifactExecutor()
+    resumed_registry = _registry(resumed_executor)
+    resumed_blobs = LocalBlobStore(blob_root)
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=clock)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            blob_store=resumed_blobs,
+            clock=clock,
+            id_factory=NamespacedIds("after-crash"),
+        )
+        resumed_loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=MockModelProvider((_final_response(),)),
+            context_builder=CountingContextBuilder(),
+            domain=CountingDomain(resumed_registry),
+        )
+
+        recovered = await resumed_loop.recover_startup("agent-restart")
+        assert tuple(exit.operation_id for exit in recovered) == (
+            before.snapshot.operation.id,
+        )
+        result = recovered[0]
+        final = await resumed_store.load(before.snapshot.operation.id)
+        orphan_after = await resumed_blobs.metadata(orphan.blob_id)
+        orphan_reader = await resumed_blobs.open(orphan.blob_id)
+        async with orphan_reader:
+            orphan_content = await orphan_reader.read(orphan.size_bytes)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert orphan_after == orphan
+    assert orphan_content == b'{"key":"alpha","value":"ALPHA"}'
+    assert orphan.blob_id.startswith("blob-before-crash-")
+    assert orphan.evidence_id is not None
+    assert orphan.evidence_id.startswith("evidence-before-crash-")
+    assert final.snapshot.tasks[0].attempt == 2
+    assert tuple(lease.release_reason for lease in final.snapshot.task_leases) == (
+        "expired_replay_safe",
+        "completed",
+    )
+    assert len(final.snapshot.evidence) == 1
+    assert final.snapshot.evidence[0].attempt == 2
+    assert final.snapshot.evidence[0].blob_id is not None
+    assert final.snapshot.evidence[0].blob_id.startswith("blob-after-crash-")
+    assert final.snapshot.evidence[0].id.startswith("evidence-after-crash-")
+    assert final.snapshot.evidence[0].blob_id != orphan.blob_id
+    assert final.snapshot.evidence[0].id != orphan.evidence_id
+    assert all(item.blob_id != orphan.blob_id for item in final.snapshot.evidence)
+    assert all(
+        event.evidence_id != orphan.evidence_id for event in final.snapshot.events
+    )
+    assert len(first_executor.requests) == 1
+    assert len(resumed_executor.requests) == 1
+    assert resumed_executor.requests[0].attempt == 2
+    assert resumed_executor.requests[0].fencing_token == 2
