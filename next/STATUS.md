@@ -6,19 +6,18 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-05h — run the final persisted-task execution, recovery,
-  blob-linkage, preservation, and checkpoint gate
-- **Last completed task:** P2-05g — independent representative read,
-  side-effect classification, and blob/persistence reviews found no remaining
-  P2-05 blocker
-- **Current checkpoint:** P2-05e runtime-boundary checkpoint `7e4ad01`
-  (`feat(v2): implement fenced task lifecycle`)
+- **Active task:** P2-06a — inventory the existing loop, operation-runtime,
+  checkpoint, and startup-recovery seams before any restart production edit
+- **Last completed task:** P2-05h — final persisted-task execution, recovery,
+  blob-linkage, preservation, distribution, and independent release gate
+- **Current checkpoint:** P2-05 recovery/blob checkpoint `cf43e11` plus the
+  cancellation-precedence repair `4cc8492`
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** run P2-05h's final dual-Python suite, architecture and
-  static checks, root-oracle preservation scan, clean distribution builds, and
-  scoped hook review before the P2-05 checkpoint commit
+- **Exact next action:** complete P2-06a's read-only ownership inventory and
+  lock the expected-red seven-boundary crash/cancellation sequence before any
+  production edit
 
 ## Mandatory architecture re-read
 
@@ -101,8 +100,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-02 | complete | In-memory operation runtime commit seam; canonical operation/loop/model records | Narrow async optimistic `OperationStore` contract, in-memory implementation, canonical event/model-call/snapshot records, and one representative trigger/operation checkpoint migrated without changing loop semantics | 218 tests on each Python version; canonical linkage/history/cancellation/CAS adversarial regressions; architecture/static/isolation/build gates and independent review pass | P2-01 |
 | P2-03 | complete | Proven P2-02 seam; Section 11.2 lifecycle inventory | SQLite engine with v2 marker, WAL, foreign keys, busy timeout, correctness-first synchronous mode, checksummed ordered migrations, SQLite-API backup-before-migrate, compatibility rejection, normalized lifecycle tables, and transactional optimistic operation repository | Fresh/reopen/concurrent-CAS/rollback/migration/interruption/future-or-unknown-schema tests; every runtime lifecycle record round-trips independently | P2-02 |
 | P2-04 | complete | SQLite transaction boundary; Section 8.4/11.5 contracts | Content-addressed blob store and durable committed-event log/subscription with per-agent monotonic cursors; event notification remains a post-commit wake hint | Temp/flush/hash/atomic-rename/orphan tests; rollback emits nothing; commit/publish gap replays; reconnect, slow subscriber, and cross-agent isolation tests | P2-03 |
-| P2-05 | active | Persisted tasks/evidence/events; Section 8.5 recovery rules | Ready/claimed/running/approval-waiting/cancelled/manual-recovery task states, persisted execution-safety and idempotency facts, durable fenced leases, and a split materialize/claim/execute/commit path preserving the sole executor boundary | Claim race, lease expiry/reclaim, stale-fence rejection with no evidence/event, terminal skip, unknown side-effect outcome, and task/evidence/event atomicity tests | P2-04 |
-| P2-06 | pending | Durable checkpoints, tasks, evidence, observations, readiness, and leases | One loop with new-trigger and checkpoint-aware same-operation resume paths, plus startup recovery that reuses completed work and never rebuilds the plan from the original trigger | Crash/cancel injection at all seven Phase 2 boundaries; at-least-once started model call; terminal task skip; recovered response/evidence/observation/readiness paths do not repeat avoidable I/O | P2-05 |
+| P2-05 | complete | Persisted tasks/evidence/events; Section 8.5 recovery rules | Ready/claimed/running/approval-waiting/cancelled/manual-recovery task states, persisted execution-safety and idempotency facts, durable fenced leases, and a split materialize/claim/execute/commit path preserving the sole executor boundary | Claim race, lease expiry/reclaim, stale-fence rejection with no evidence/event, terminal skip, unknown side-effect outcome, and task/evidence/event atomicity tests | P2-04 |
+| P2-06 | active | Durable checkpoints, tasks, evidence, observations, readiness, and leases | One loop with new-trigger and checkpoint-aware same-operation resume paths, plus startup recovery that reuses completed work and never rebuilds the plan from the original trigger | Crash/cancel injection at all seven Phase 2 boundaries; at-least-once started model call; terminal task skip; recovered response/evidence/observation/readiness paths do not repeat avoidable I/O | P2-05 |
 | P2-07 | pending | Recovery runtime and persisted governance facts | Immutable risk/policy/task fingerprints, CAS approval records, and one test-owned durable fake side-effect marker with wait, decision-only approval mutation, wake, denial, same-operation resume, and exact-once idempotency | Pre-approval no-I/O, approval mutation no-I/O, exact-fingerprint resume, denial no-I/O, cancellation race with one winner, repeated/concurrent resume marker unchanged, stale holder blocked | P2-06 |
 | P2-08 | pending | SQLite composition, recovery, approvals, committed events | Strict isolated agent home and bootstrap identity manifest, authoritative DB identity, durable sessions/transcripts, shared per-agent writer lock, thin `Agent.create/open/run/inspect/resume`, and embedded composition only | Create/reopen/path/mismatch/concurrency/lock/session isolation/restart tests; default never touches v1 state; facade contains no loop/executor/provider behavior | P2-07 |
 | P2-09 | pending | Persisted embedded fake-capability loop; provider-neutral model contract | Separate canonical/provider call identity, normalized provider errors, lazy optional OpenAI Responses adapter, fake-client contract tests, and one live persisted fake-capability loop | Missing-extra/import isolation; response/tool continuation/error tests; architecture scan forbids provider execution; explicit credential/model live gate | P2-08 |
@@ -143,7 +142,7 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-05e | complete | Split operation-runtime materialize → claim → execute → validate → commit path | The sole existing runtime invokes the executor only with a live fence; stale holders commit no evidence/task/event; task/evidence/event success is atomic; timeouts/cancellation retain truthful durable intent |
 | P2-05f | complete | Fail-closed execution recovery and blob-backed evidence linkage | Replay-safe reads may resume after expiry; side-effecting unknown outcomes become manual recovery unless persisted idempotency proves safe; durable blob references precede evidence acceptance; terminal work is skipped |
 | P2-05g | complete | Representative review before broader restart wiring | One read and one test-owned side-effect classification are independently reviewed; P2-06 retains startup/loop resume, and P2-07 retains real approval decision/wake behavior |
-| P2-05h | active | Final P2-05 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local commit |
+| P2-05h | complete | Final P2-05 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local checkpoint; all independent audits GO after the cancellation-precedence repair |
 
 ## Files/components being changed or planned
 
@@ -549,8 +548,14 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-05e complete dual-interpreter and static gate | PASS — all 572 v2 tests pass with 0 failures/errors in 4.402s/4.515s on CPython 3.11.15/3.12.7; all 51 architecture tests pass; Black is clean across 76 files, byte compilation succeeds, mypy is clean across 23 production source files, pyright 1.1.411 reports 0 errors/warnings, `git diff --check` is clean, and the root oracle scope has no diff |
 | P2-05e independent runtime and test release audits | PASS — final audits exercise exact post-claim wall expiry, independent clock skew, delayed start acknowledgement, lease-bounded timeout, stale terminal fence, unsafe/replay-safe side-effect uncertainty, cancellation suppression, SQLite atomic rollback, and sole-executor ownership with no remaining release blocker |
 | Initial P2-05f recovery/blob/projection contracts | EXPECTED RED — 8 runtime-recovery cases failed only on absent `resume_task`; 5 blob-runtime cases failed only on absent artifact materialization/put behavior while 9 canonical/prevalidation cases passed; Migration 5/projection reported 7 expected failures and 4 passes confined to absent `Evidence.blob_id`, schema, and codecs |
-| P2-05f fail-closed recovery and blob linkage | PASS — all 603 v2 tests and 52 architecture tests pass; expired replay-safe reads and stable-key side effects reclaim the same task at attempt/fence 2, unsafe outcomes become manual recovery, terminal work is zero-I/O/zero-delta, exact-provenance blobs are durable before fenced evidence acceptance, and post-put failure/cancellation/stale fences leave no accepted evidence |
+| P2-05f fail-closed recovery and blob linkage | PASS — all 603 pre-audit v2 tests and 52 architecture tests pass; expired replay-safe reads and stable-key side effects reclaim the same task at attempt/fence 2, unsafe outcomes become manual recovery, terminal work is zero-I/O/zero-delta, exact-provenance blobs are durable before fenced evidence acceptance, and post-put failure/cancellation/stale fences leave no accepted evidence |
 | P2-05g representative independent reviews | PASS — separate read, side-effect, and blob/persistence audits found no blocker; 48 focused cases pass on CPython 3.11/3.12, the store remains the sole recovery classifier, the runtime remains the sole executor/evidence boundary, Migration 5 remains exact and rollback-safe, and P2-06/P2-07 deferrals remain intact |
+| P2-05h cancellation-suppression audit | EXPECTED RED — exactly 1 failure proved a blob adapter that caught caller `CancelledError` and returned valid metadata could let the runtime accept evidence instead of restoring cancellation precedence |
+| P2-05h repaired dual-interpreter gate | PASS — all 604 v2 tests pass with 0 failures/errors in 4.659s/4.762s on CPython 3.11.15/3.12.7; the new cancellation-suppressing blob regression passes |
+| P2-05h final static and architecture gate | PASS — all 52 architecture tests pass; Black is clean across 79 files, byte compilation succeeds, mypy is clean across 23 production files, and pyright 1.1.411 reports 0 errors/warnings |
+| P2-05h root preservation and distribution gate | PASS — the root safe suite passes 2,498 tests with 221 deselected in 10.40s; root diff, symlink, disposition, and v1-fixture scans are clean; v2 wheel/sdist contain 27/42 entries at `2.0.0a0`, root wheel/sdist remain 401/442 entries at `1.0.0`, and fresh CPython 3.11/3.12 installs import v2 owners from their own site-packages |
+| P2-05h final independent audits | PASS after repair — the runtime, scope/distribution, and resumed test audits all report GO; pending-cancellation checks immediately after blob return and in its exception path close the sole reported blocker without changing blob ownership or the executor boundary |
+| P2-05h scoped checkpoint | PASS — exactly 2 ledger paths under `next/` are staged after a clean cached diff; configured whitespace, EOF, conflict, large-file, and applicable Black hooks pass; the containing local checkpoint records the completed gate |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture
@@ -777,6 +782,12 @@ re-read and an updated ordered ledger.
   no-work result. The tests now use the established `.to_dict()` projection and
   assert `None` plus exact zero durable delta; no production compatibility path
   or exception special case was added.
+- P2-05h's final adversarial test audit added a blob-store double that swallowed
+  caller cancellation and returned valid metadata. The first run failed exactly
+  once because the runtime checked cancellation only while awaiting the put.
+  The runtime now checks its task's pending-cancellation state immediately after
+  the adapter returns and in the exception path, preserving caller-cancellation
+  precedence before any evidence can be accepted.
 
 ## Credentials and external dependencies
 
