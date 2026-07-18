@@ -1357,6 +1357,9 @@ class OperationRuntime:
                     blob_request,
                     artifact.content,
                 )
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise asyncio.CancelledError
                 expected_metadata = BlobMetadata(
                     blob_id=blob_request.blob_id,
                     digest=blob_request.expected_digest or "",
@@ -1381,6 +1384,9 @@ class OperationRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise asyncio.CancelledError from error
                 await self._record_execution_failure(
                     task.operation_id,
                     task.id,

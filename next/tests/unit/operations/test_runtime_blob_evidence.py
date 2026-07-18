@@ -112,6 +112,21 @@ class DurableBarrierBlobStore(RecordingLocalBlobStore):
         return metadata
 
 
+class CancellationSuppressingBlobStore(RecordingLocalBlobStore):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.put_committed = asyncio.Event()
+
+    async def put(self, request: BlobPut, content: bytes) -> BlobMetadata:
+        metadata = await super().put(request, content)
+        self.put_committed.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return metadata
+        raise AssertionError("blob-store wait unexpectedly completed")
+
+
 class FailingBlobStore:
     def __init__(self) -> None:
         self.requests: list[tuple[BlobPut, bytes]] = []
@@ -525,6 +540,24 @@ async def test_cancellation_after_durable_put_cannot_accept_evidence(
     tmp_path: Path,
 ) -> None:
     blob_store = DurableBarrierBlobStore(tmp_path / "blobs")
+    case = await _runtime_case(_candidate(), blob_store=blob_store)
+    submission = asyncio.create_task(case.runtime.submit(_proposal(case)))
+
+    await asyncio.wait_for(blob_store.put_committed.wait(), timeout=1.0)
+    submission.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await submission
+
+    request, content = blob_store.requests[0]
+    await _assert_durable_blob(blob_store.root, request, content)
+    snapshot = await case.runtime.inspect(case.operation_id)
+    _assert_no_terminal_evidence(snapshot)
+
+
+async def test_blob_store_cannot_suppress_caller_cancellation_and_accept_evidence(
+    tmp_path: Path,
+) -> None:
+    blob_store = CancellationSuppressingBlobStore(tmp_path / "blobs")
     case = await _runtime_case(_candidate(), blob_store=blob_store)
     submission = asyncio.create_task(case.runtime.submit(_proposal(case)))
 
