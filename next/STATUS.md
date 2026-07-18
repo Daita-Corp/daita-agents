@@ -6,16 +6,19 @@ project. Update it before and after every material task.
 ## Current position
 
 - **Active phase:** Phase 2 — persistent local loop
-- **Active task:** P2-06c — implement the representative checkpoint-aware
-  continuation in the existing generic loop and review it before broadening
-- **Last completed task:** P2-06b — the first SQLite-reopen continuation test
-  failed exactly once on the intentionally absent `AgentLoop.resume` entry
-- **Current checkpoint:** P2-06 ownership/sequence checkpoint `b5cafb7`
+- **Active task:** P2-06d — broaden the proven representative seam into the
+  complete checkpoint dispatcher without adding another runtime or loop
+- **Last completed task:** P2-06c — `AgentLoop.resume(operation_id)` consumes a
+  committed tool response after SQLite reopen without repeating its context or
+  model call; focused dual-interpreter/static checks and independent reviews pass
+- **Current checkpoint:** representative green continuation is recorded by the
+  commit containing this ledger; expected-red parent is `cb8f562`
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** make the existing driver consume the committed tool
-  response by operation ID, then run and independently review that one slice
+- **Exact next action:** add expected-red checkpoint-dispatch trajectories for
+  requestless/started/completed model work, existing task and observation work,
+  committed readiness, and terminal replay, then implement them in the same driver
 
 ## Mandatory architecture re-read
 
@@ -157,8 +160,8 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | --- | --- | --- | --- |
 | P2-06a | complete | Read-only checkpoint/restart ownership inventory and renewed Sections 6/8.5–8.7/15 re-read | Existing `AgentLoop`, `OperationRuntime`, `OperationStore`, and canonical snapshot remain the only owners; exact replayable versus necessarily repeated work, seven crash boundaries, and P2-07/P2-08 deferrals are locked before production edits |
 | P2-06b | complete | One expected-red SQLite-reopen trajectory after model-response persistence but before task materialization | Same operation/turn/response survives reopen; initial context/model I/O does not repeat; one task/evidence/observation and only the necessary follow-up model call are expected |
-| P2-06c | active | Representative checkpoint-aware continuation in the existing generic loop | `resume(operation_id)` and exact trigger redelivery enter the same driver; no new loop/recovery runtime/module; completed response is consumed without rebuilding context or the original trigger plan; focused review passes before broader cases |
-| P2-06d | pending | Complete checkpoint dispatcher over requestless turn, started/completed model call, ordered tool calls, task/evidence/observation, readiness, and terminal state | Persisted records, not coarse phase alone, select progression; STARTED inference is at-least-once; existing tasks use `resume_task()`; avoidable validation/executor/projection/readiness/model I/O is skipped |
+| P2-06c | complete | Representative checkpoint-aware continuation in the existing generic loop | `resume(operation_id)` enters the existing driver; no new loop/recovery runtime/module; a completed response is consumed without rebuilding context or repeating its model call; focused review passes before broader cases |
+| P2-06d | active | Complete checkpoint dispatcher over requestless turn, started/completed model call, ordered tool calls, task/evidence/observation, readiness, terminal state, and exact trigger redelivery | Persisted records, not coarse phase alone, select progression; STARTED inference is at-least-once; existing tasks use `resume_task()`; avoidable validation/executor/projection/readiness/model I/O is skipped; exact trigger redelivery enters the same driver |
 | P2-06e | pending | Portable agent-scoped nonterminal inspection plus startup recovery over both existing stores | Deterministic scoped query, SQLite single-transaction reopen, terminal exclusion, live-lease deferral, and startup iteration reuse the same loop; P2-08 retains Agent Home, host admission, and writer-lock composition |
 | P2-06f | pending | All seven Phase 2 crash/restart trajectories and independent representative review | Abrupt process-exit injection at every required durable boundary; exact identity/event/counter assertions; safe replay versus manual recovery; blob orphan; terminal delivery replay; no second owner |
 | P2-06g | pending | Final P2-06 review and checkpoint | Dual-Python full/static/architecture/oracle/build gates, scoped hooks, and local checkpoint |
@@ -602,6 +605,7 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 | P2-05h scoped checkpoint | PASS — exactly 2 ledger paths under `next/` are staged after a clean cached diff; configured whitespace, EOF, conflict, large-file, and applicable Black hooks pass; the containing local checkpoint records the completed gate |
 | P2-06a checkpoint/restart ownership inventory | PASS — direct plan/ADR/current-v2/v1-oracle inspection plus three independent read-only audits agree that the canonical snapshot already holds every semantic resume fact; the existing loop/runtime/store remain the only owners; one representative SQLite-reopen test precedes broader continuation and startup-query work |
 | Initial P2-06b SQLite-reopen loop continuation | EXPECTED RED — exactly 1 failure and no collection/setup error; the committed response reopened intact, and execution stopped only because the existing `AgentLoop` has no `resume(operation_id)` entry |
+| P2-06c representative checkpoint continuation | PASS — 16 focused restart/fake-read/text/repair cases pass on CPython 3.11.15 and 3.12.7; the complete 605-test Python 3.11 suite and all 52 architecture tests pass; Black, compilation, and focused mypy are clean; independent code and test reviews report GO after both SQLite stores gained `finally` cleanup |
 
 Phase 0 and every Phase 1 task are complete. This ledger is committed by the
 exact Phase 1 gate commit; Phase 2 begins only after its mandatory architecture

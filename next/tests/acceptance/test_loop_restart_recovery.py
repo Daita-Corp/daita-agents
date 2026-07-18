@@ -243,77 +243,82 @@ async def test_resume_reuses_committed_tool_response_after_sqlite_reopen(
     first_executor = RecordingExecutor()
     first_registry = _registry(first_executor)
     first_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
-    first_runtime = OperationRuntime(
-        capabilities=first_registry,
-        store=first_store,
-        clock=lambda: NOW,
-    )
-    initial_context = CountingContextBuilder()
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=first_registry,
+            store=first_store,
+            clock=lambda: NOW,
+        )
+        initial_context = CountingContextBuilder()
 
-    started = await first_runtime.begin(_trigger())
-    turn = await first_runtime.begin_turn(started.operation.id)
-    before_request = await first_runtime.inspect(started.operation.id)
-    request = await initial_context.build(
-        before_request,
-        turn,
-        first_registry.tool_definitions(),
-    )
-    model_call = await first_runtime.begin_model_call(
-        started.operation.id,
-        turn.id,
-        "mock:scripted",
-        request,
-    )
-    committed_response = ModelResponse(
-        tool_calls=(
-            ToolCall(
-                id="call-alpha",
-                name="read_fake_value",
-                arguments={"key": "alpha"},
+        started = await first_runtime.begin(_trigger())
+        turn = await first_runtime.begin_turn(started.operation.id)
+        before_request = await first_runtime.inspect(started.operation.id)
+        request = await initial_context.build(
+            before_request,
+            turn,
+            first_registry.tool_definitions(),
+        )
+        model_call = await first_runtime.begin_model_call(
+            started.operation.id,
+            turn.id,
+            "mock:scripted",
+            request,
+        )
+        committed_response = ModelResponse(
+            tool_calls=(
+                ToolCall(
+                    id="call-alpha",
+                    name="read_fake_value",
+                    arguments={"key": "alpha"},
+                ),
             ),
-        ),
-        finish_reason=FinishReason.TOOL_CALLS,
-        usage=ModelUsage(input_tokens=5, output_tokens=3),
-    )
-    await first_runtime.record_model_response(
-        started.operation.id,
-        model_call.id,
-        committed_response,
-        next_phase=LoopPhase.VALIDATING_ACTION,
-    )
-    before_restart = await first_runtime.inspect(started.operation.id)
-    assert before_restart.tasks == ()
-    assert before_restart.model_calls[0].response == committed_response
-    await first_store.close()
+            finish_reason=FinishReason.TOOL_CALLS,
+            usage=ModelUsage(input_tokens=5, output_tokens=3),
+        )
+        await first_runtime.record_model_response(
+            started.operation.id,
+            model_call.id,
+            committed_response,
+            next_phase=LoopPhase.VALIDATING_ACTION,
+        )
+        before_restart = await first_runtime.inspect(started.operation.id)
+        assert before_restart.tasks == ()
+        assert before_restart.model_calls[0].response == committed_response
+    finally:
+        await first_store.close()
 
     resumed_executor = RecordingExecutor()
     resumed_registry = _registry(resumed_executor)
     resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
-    resumed_runtime = OperationRuntime(
-        capabilities=resumed_registry,
-        store=resumed_store,
-        clock=lambda: NOW,
-    )
-    resumed_context = CountingContextBuilder()
-    resumed_domain = CountingDomain(resumed_registry)
-    resumed_provider = MockModelProvider(
-        (
-            ModelResponse(
-                text="Recovered answer.",
-                finish_reason=FinishReason.STOP,
-                usage=ModelUsage(input_tokens=7, output_tokens=2),
-            ),
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=resumed_registry,
+            store=resumed_store,
+            clock=lambda: NOW,
         )
-    )
-    resumed_loop = AgentLoop(
-        runtime=resumed_runtime,
-        model=resumed_provider,
-        context_builder=resumed_context,
-        domain=resumed_domain,
-    )
+        resumed_context = CountingContextBuilder()
+        resumed_domain = CountingDomain(resumed_registry)
+        resumed_provider = MockModelProvider(
+            (
+                ModelResponse(
+                    text="Recovered answer.",
+                    finish_reason=FinishReason.STOP,
+                    usage=ModelUsage(input_tokens=7, output_tokens=2),
+                ),
+            )
+        )
+        resumed_loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=resumed_provider,
+            context_builder=resumed_context,
+            domain=resumed_domain,
+        )
 
-    result = await resumed_loop.resume(started.operation.id)
-    final = await resumed_runtime.inspect(started.operation.id)
+        result = await resumed_loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
 
     assert result.kind is LoopExitKind.COMPLETED
     assert final.operation.status is OperationStatus.SUCCEEDED
@@ -332,4 +337,3 @@ async def test_resume_reuses_committed_tool_response_after_sqlite_reopen(
     assert [event.type for event in final.events].count("task.created") == 1
     assert [event.type for event in final.events].count("model_response.recorded") == 2
     resumed_provider.assert_consumed()
-    await resumed_store.close()

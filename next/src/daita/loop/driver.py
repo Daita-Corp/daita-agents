@@ -8,7 +8,7 @@ from typing import Protocol, TypeVar
 
 from ..llm.models import ModelRequest, ModelResponse, ToolCall, ToolDefinition
 from ..llm.protocols import ModelProvider
-from ..operations.checkpoints import OperationSnapshot
+from ..operations.checkpoints import ModelCallStatus, OperationSnapshot
 from ..operations.models import (
     ActionProposal,
     ActionRejection,
@@ -86,8 +86,14 @@ class AgentLoop:
 
     async def run(self, trigger: AgentTrigger) -> LoopExit:
         operation = await self._runtime.begin(trigger, budgets=self._budgets)
-        operation_id = operation.operation.id
+        return await self._continue_operation(operation.operation.id)
 
+    async def resume(self, operation_id: str) -> LoopExit:
+        """Continue one known operation from its authoritative checkpoint."""
+
+        return await self._continue_operation(operation_id)
+
+    async def _continue_operation(self, operation_id: str) -> LoopExit:
         try:
             try:
                 return await self._run_operation(operation_id)
@@ -101,6 +107,17 @@ class AgentLoop:
         """Run one already-committed operation under its bound budgets."""
 
         while True:
+            snapshot = await self._runtime.inspect(operation_id)
+            committed_response = self._response_needing_progress(snapshot)
+            if committed_response is not None:
+                terminal = await self._process_response(
+                    operation_id,
+                    committed_response,
+                )
+                if terminal is not None:
+                    return terminal
+                continue
+
             terminal = await self._pre_turn_budget_exit(operation_id)
             if terminal is not None:
                 return terminal
@@ -161,77 +178,119 @@ class AgentLoop:
                 response,
                 next_phase=next_phase,
             )
-            terminal = await self._post_response_budget_exit(operation_id)
+            terminal = await self._process_response(operation_id, response)
             if terminal is not None:
                 return terminal
 
-            if response.tool_calls:
-                terminal = await self._process_actions(
-                    operation_id,
-                    response.tool_calls,
-                )
-                if terminal is not None:
-                    return terminal
-                continue
+    @staticmethod
+    def _response_needing_progress(
+        snapshot: OperationSnapshot,
+    ) -> ModelResponse | None:
+        """Return only a committed response with unfinished downstream work."""
 
-            if response.text is None:
-                return await self._runtime.fail(
-                    operation_id,
-                    "model_response_missing_text",
-                )
-            final_text = response.text
+        if not snapshot.model_calls:
+            return None
+        model_call = snapshot.model_calls[-1]
+        if (
+            model_call.status is not ModelCallStatus.COMPLETED
+            or model_call.response is None
+        ):
+            return None
+        response = model_call.response
+        if response.tool_calls:
+            task_call_ids = {task.id: task.call_id for task in snapshot.tasks}
+            observed_call_ids = set()
+            for observation in snapshot.observations:
+                if observation.turn_id != model_call.turn_id:
+                    continue
+                if observation.call_id is not None:
+                    observed_call_ids.add(observation.call_id)
+                elif observation.task_id is not None:
+                    observed_call_ids.add(task_call_ids[observation.task_id])
+            if any(call.id not in observed_call_ids for call in response.tool_calls):
+                return response
+            return None
+        has_readiness = any(
+            event.type == "readiness.recorded" and event.model_call_id == model_call.id
+            for event in snapshot.events
+        )
+        return None if has_readiness else response
 
-            try:
-                readiness_snapshot = await self._runtime.inspect(operation_id)
-                readiness = await self._await_with_wall_time(
-                    operation_id,
-                    lambda: self._domain.evaluate_final_answer(
-                        final_text,
-                        readiness_snapshot,
-                    ),
-                )
-            except _WallTimeExhausted:
-                raise
-            except Exception:
-                return await self._runtime.fail(
-                    operation_id,
-                    "readiness_evaluation_failed",
-                )
-            correction = await self._runtime.record_readiness(
+    async def _process_response(
+        self,
+        operation_id: str,
+        response: ModelResponse,
+    ) -> LoopExit | None:
+        """Advance one already-committed normalized model response."""
+
+        terminal = await self._post_response_budget_exit(operation_id)
+        if terminal is not None:
+            return terminal
+
+        if response.tool_calls:
+            return await self._process_actions(
                 operation_id,
-                final_text,
-                readiness,
+                response.tool_calls,
             )
-            terminal = await self._wall_budget_exit(operation_id)
-            if terminal is not None:
-                return terminal
-            if not readiness.allowed:
-                repaired = await self._runtime.inspect(operation_id)
-                if repaired.loop_state.repair_count > repaired.budgets.max_repairs:
-                    return await self._runtime.fail_budget(
-                        operation_id,
-                        "repair_budget_exhausted",
-                        budget="repairs",
-                        limit=repaired.budgets.max_repairs,
-                        used=repaired.loop_state.repair_count,
-                        turn_id=repaired.turns[-1].id,
-                    )
-                if (
-                    correction is not None
-                    and repaired.loop_state.observation_characters
-                    > repaired.budgets.max_observation_characters
-                ):
-                    return await self._runtime.fail_budget(
-                        operation_id,
-                        "observation_budget_exhausted",
-                        budget="observation_characters",
-                        limit=repaired.budgets.max_observation_characters,
-                        used=repaired.loop_state.observation_characters,
-                        turn_id=correction.turn_id,
-                    )
-                continue
-            await self._raise_if_wall_exhausted(operation_id)
-            return await self._runtime.complete(operation_id, final_text)
+
+        if response.text is None:
+            return await self._runtime.fail(
+                operation_id,
+                "model_response_missing_text",
+            )
+        final_text = response.text
+
+        try:
+            readiness_snapshot = await self._runtime.inspect(operation_id)
+            readiness = await self._await_with_wall_time(
+                operation_id,
+                lambda: self._domain.evaluate_final_answer(
+                    final_text,
+                    readiness_snapshot,
+                ),
+            )
+        except _WallTimeExhausted:
+            raise
+        except Exception:
+            return await self._runtime.fail(
+                operation_id,
+                "readiness_evaluation_failed",
+            )
+        correction = await self._runtime.record_readiness(
+            operation_id,
+            final_text,
+            readiness,
+        )
+        terminal = await self._wall_budget_exit(operation_id)
+        if terminal is not None:
+            return terminal
+        if not readiness.allowed:
+            repaired = await self._runtime.inspect(operation_id)
+            if repaired.loop_state.repair_count > repaired.budgets.max_repairs:
+                return await self._runtime.fail_budget(
+                    operation_id,
+                    "repair_budget_exhausted",
+                    budget="repairs",
+                    limit=repaired.budgets.max_repairs,
+                    used=repaired.loop_state.repair_count,
+                    turn_id=repaired.turns[-1].id,
+                )
+            if (
+                correction is not None
+                and repaired.loop_state.observation_characters
+                > repaired.budgets.max_observation_characters
+            ):
+                return await self._runtime.fail_budget(
+                    operation_id,
+                    "observation_budget_exhausted",
+                    budget="observation_characters",
+                    limit=repaired.budgets.max_observation_characters,
+                    used=repaired.loop_state.observation_characters,
+                    turn_id=correction.turn_id,
+                )
+            return None
+        await self._raise_if_wall_exhausted(operation_id)
+        return await self._runtime.complete(operation_id, final_text)
 
     async def _process_actions(
         self,
