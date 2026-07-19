@@ -74,3 +74,28 @@ def test_inventory_matches_deterministic_generator_output() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == INVENTORY.read_text(encoding="utf-8")
+
+
+def test_phase_3_inventory_excludes_explicitly_deferred_integrations() -> None:
+    phases = {row["path"]: row["v2_phase"] for row in _inventory_rows()}
+
+    for path in (
+        "tests/integration/catalog/test_catalog_aws_live.py",
+        "tests/integration/catalog/test_catalog_azure_live.py",
+        "tests/integration/catalog/test_catalog_gcp_live.py",
+        "tests/integration/catalog/test_catalog_github_live.py",
+        "tests/integration/catalog/test_catalog_mongodb_live.py",
+        "tests/integration/catalog/test_catalog_mysql_live.py",
+        "tests/unit/catalog/test_catalog_azure.py",
+        "tests/unit/plugins/test_plugin_mysql.py",
+    ):
+        assert phases[path] == "post-MVP"
+
+    for path in (
+        "tests/integration/evals/test_from_db_evals_live.py",
+        "tests/integration/evals/test_from_db_quality_benchmark_live.py",
+        "tests/integration/from_db/test_from_db_tracing_telemetry_live.py",
+        "tests/integration/from_db/test_schema_synthesis_specificity_live.py",
+        "tests/unit/db/test_from_db_tracing_telemetry.py",
+    ):
+        assert phases[path] == "Phase 9"

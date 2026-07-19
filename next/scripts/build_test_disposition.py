@@ -79,6 +79,28 @@ PORT_LEAF = {
     ),
 }
 
+# The Phase 0 filename heuristic is deliberately conservative, but Phase 3's
+# SQLite-only scope is now concrete. These explicit dispositions prevent a
+# path containing ``catalog`` or ``from_db`` from silently pulling deferred
+# integrations or Phase 9 hardening into the data vertical slice.
+PHASE_OVERRIDES = {
+    "tests/integration/catalog/test_catalog_aws_live.py": "post-MVP",
+    "tests/integration/catalog/test_catalog_azure_live.py": "post-MVP",
+    "tests/integration/catalog/test_catalog_gcp_live.py": "post-MVP",
+    "tests/integration/catalog/test_catalog_github_live.py": "post-MVP",
+    "tests/integration/catalog/test_catalog_mongodb_live.py": "post-MVP",
+    "tests/integration/catalog/test_catalog_mysql_live.py": "post-MVP",
+    "tests/integration/evals/test_from_db_evals_live.py": "Phase 9",
+    "tests/integration/evals/test_from_db_quality_benchmark_live.py": "Phase 9",
+    "tests/integration/focus/test_focus_sql_live.py": "post-MVP",
+    "tests/integration/from_db/test_from_db_tracing_telemetry_live.py": "Phase 9",
+    "tests/integration/from_db/test_schema_synthesis_specificity_live.py": "Phase 9",
+    "tests/unit/catalog/test_catalog_azure.py": "post-MVP",
+    "tests/unit/db/test_from_db_tracing_telemetry.py": "Phase 9",
+    "tests/unit/focus/test_focus_sql_backend.py": "post-MVP",
+    "tests/unit/plugins/test_plugin_mysql.py": "post-MVP",
+}
+
 
 @dataclass(frozen=True)
 class DispositionRow:
@@ -107,6 +129,9 @@ def tracked_test_modules() -> tuple[str, ...]:
 
 
 def _phase_for(path: str) -> str:
+    overridden = PHASE_OVERRIDES.get(path)
+    if overridden is not None:
+        return overridden
     lowered = path.lower()
     if "/performance/" in lowered:
         return "Phase 9"

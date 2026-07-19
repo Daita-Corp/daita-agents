@@ -8,8 +8,9 @@ and backup-before-migrate behavior for the concrete adapter.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
@@ -20,7 +21,35 @@ import sqlite3
 from typing import TypeVar
 
 from .._json import canonical_json
+from ..adapters.models import SourceRegistration
 from ..capabilities import AccessMode, RiskLevel
+from ..catalog.models import (
+    CatalogFacet,
+    CatalogPath,
+    CatalogPathStep,
+    CatalogRelationship,
+    CatalogResource,
+    CatalogResourceRevision,
+    CatalogSearchHit,
+    CatalogSearchRequest,
+    CatalogSearchResult,
+    CatalogSync,
+    CatalogSyncStatus,
+    CatalogTraversalRequest,
+    CatalogTraversalResult,
+    FacetKind,
+    RelationshipDirection,
+    RelationshipFieldPair,
+    RelationshipKind,
+    RelationshipProvenance,
+    ResourceKind,
+    Sensitivity,
+    SourceCatalogSnapshot,
+)
+from ..catalog.protocols import (
+    CatalogResourceNotFoundError,
+    CatalogSyncConflictError,
+)
 from ..events.models import CommittedEvent, EventCursor, RuntimeEvent
 from ..events.protocols import (
     EventCursorMismatchError,
@@ -92,6 +121,8 @@ DAITA_V2_APPLICATION_ID = 0x44414932  # ASCII ``DAI2``.
 _MAX_COMMITTED_EVENT_READ_LIMIT = 1_000
 _COMMITTED_EVENT_SUBSCRIPTION_BATCH_SIZE = 100
 _COMMITTED_EVENT_POLL_INTERVAL_SECONDS = 0.25
+_CATALOG_SEARCH_MAX_TERMS = 32
+_CATALOG_SEARCH_TERM = re.compile(r"[A-Za-z0-9]+")
 
 
 def _sqlite_utc_now() -> datetime:
@@ -1009,6 +1040,136 @@ _AGENT_SESSION_SCHEMA_SQL = (
     """.strip(),
 )
 
+_CATALOG_SCHEMA_SQL = (
+    """
+    CREATE TABLE attached_sources (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        adapter_id TEXT NOT NULL,
+        native_identity TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        configuration_json TEXT NOT NULL,
+        attached_at TEXT NOT NULL,
+        detached_at TEXT,
+        UNIQUE (agent_id, adapter_id, native_identity)
+    )
+    """.strip(),
+    """
+    CREATE INDEX attached_sources_agent_active_idx
+        ON attached_sources(agent_id, detached_at, display_name, id)
+    """.strip(),
+    """
+    CREATE TABLE catalog_syncs (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        source_id TEXT NOT NULL,
+        adapter_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        source_revision TEXT,
+        resource_count INTEGER NOT NULL CHECK (resource_count >= 0),
+        relationship_count INTEGER NOT NULL CHECK (relationship_count >= 0),
+        error_code TEXT
+    )
+    """.strip(),
+    """
+    CREATE INDEX catalog_syncs_agent_source_started_idx
+        ON catalog_syncs(agent_id, source_id, started_at, id)
+    """.strip(),
+    """
+    CREATE TABLE catalog_resource_revisions (
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        resource_id TEXT NOT NULL,
+        revision TEXT NOT NULL,
+        sync_id TEXT NOT NULL REFERENCES catalog_syncs(id),
+        observed_at TEXT NOT NULL,
+        facet_revisions_json TEXT NOT NULL,
+        relationship_revisions_json TEXT NOT NULL,
+        source_revision TEXT,
+        PRIMARY KEY (agent_id, resource_id, revision, sync_id)
+    )
+    """.strip(),
+    """
+    CREATE INDEX catalog_resource_revisions_lookup_idx
+        ON catalog_resource_revisions(
+            agent_id, resource_id, revision, observed_at, sync_id
+        )
+    """.strip(),
+    """
+    CREATE TABLE catalog_facets (
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        resource_id TEXT NOT NULL,
+        sync_id TEXT NOT NULL REFERENCES catalog_syncs(id),
+        kind TEXT NOT NULL,
+        schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
+        revision TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY (agent_id, resource_id, revision, sync_id, kind)
+    )
+    """.strip(),
+    """
+    CREATE TABLE catalog_relationships (
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        id TEXT NOT NULL,
+        revision TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        from_resource_id TEXT NOT NULL,
+        to_resource_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        provenance TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        sync_id TEXT NOT NULL REFERENCES catalog_syncs(id),
+        observed_at TEXT NOT NULL,
+        field_pairs_json TEXT NOT NULL,
+        attributes_json TEXT NOT NULL,
+        PRIMARY KEY (agent_id, id, sync_id)
+    )
+    """.strip(),
+    """
+    CREATE INDEX catalog_relationships_traversal_idx
+        ON catalog_relationships(
+            agent_id, sync_id, from_resource_id, to_resource_id, kind, id
+        )
+    """.strip(),
+    """
+    CREATE TABLE catalog_resources (
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        id TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        native_identity TEXT NOT NULL,
+        external_uri TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        sensitivity TEXT NOT NULL,
+        current_revision TEXT NOT NULL,
+        current_sync_id TEXT NOT NULL REFERENCES catalog_syncs(id),
+        first_observed_at TEXT NOT NULL,
+        last_observed_at TEXT NOT NULL,
+        PRIMARY KEY (agent_id, id),
+        UNIQUE (agent_id, source_id, kind, native_identity)
+    )
+    """.strip(),
+    """
+    CREATE INDEX catalog_resources_source_name_idx
+        ON catalog_resources(agent_id, source_id, kind, name, id)
+    """.strip(),
+    """
+    CREATE VIRTUAL TABLE catalog_resource_search USING fts5(
+        agent_id UNINDEXED,
+        resource_id UNINDEXED,
+        source_id UNINDEXED,
+        kind UNINDEXED,
+        name,
+        native_identity,
+        external_uri,
+        structural_text,
+        tokenize = 'unicode61'
+    )
+    """.strip(),
+)
+
 
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
@@ -1023,6 +1184,9 @@ _AGENT_SESSION_SCHEMA_SQL = (
 # Migration 7 adds the authoritative per-home agent identity and durable session
 # directory. Canonical transcript content remains operation-owned and is read
 # from the already-normalized trigger/model/observation rows.
+# Migration 8 adds attached-source ownership, catalog sync history, complete
+# current-source projections, revision components, bounded FTS5 search, and
+# relationship traversal facts.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -1058,6 +1222,11 @@ _MIGRATIONS = (
         version=7,
         name="add_agent_identity_and_sessions",
         statements=_AGENT_SESSION_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=8,
+        name="add_source_and_catalog_store",
+        statements=_CATALOG_SCHEMA_SQL,
     ),
 )
 
@@ -1183,6 +1352,198 @@ class SQLiteOperationStore:
                 agent_id,
                 session_id,
             )
+        )
+
+    async def register_source(
+        self,
+        registration: SourceRegistration,
+    ) -> SourceRegistration:
+        """Persist one immutable source attachment idempotently."""
+
+        if not isinstance(registration, SourceRegistration):
+            raise TypeError("registration must be a SourceRegistration record")
+        return await self._run_connection(
+            lambda connection: _register_source(connection, registration)
+        )
+
+    async def load_source(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> SourceRegistration | None:
+        """Load one agent-scoped source registration."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(source_id, "source_id")
+        return await self._run_connection(
+            lambda connection: _load_source(connection, agent_id, source_id)
+        )
+
+    async def list_sources(
+        self,
+        agent_id: str,
+    ) -> tuple[SourceRegistration, ...]:
+        """List source registrations in deterministic attachment order."""
+
+        _require_identity(agent_id, "agent_id")
+        return await self._run_connection(
+            lambda connection: _list_sources(connection, agent_id)
+        )
+
+    async def detach_source(
+        self,
+        agent_id: str,
+        source_id: str,
+        detached_at: datetime,
+    ) -> SourceRegistration:
+        """Persist the one-way detach transition for a registered source."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(source_id, "source_id")
+        if (
+            not isinstance(detached_at, datetime)
+            or detached_at.tzinfo is None
+            or detached_at.utcoffset() is None
+        ):
+            raise ValueError("detached_at must be timezone-aware")
+        return await self._run_connection(
+            lambda connection: _detach_source(
+                connection,
+                agent_id,
+                source_id,
+                detached_at,
+            )
+        )
+
+    async def record_sync(self, sync: CatalogSync) -> CatalogSync:
+        """Persist one catalog sync lifecycle transition."""
+
+        if not isinstance(sync, CatalogSync):
+            raise TypeError("sync must be a CatalogSync record")
+        return await self._run_connection(
+            lambda connection: _record_catalog_sync(connection, sync)
+        )
+
+    async def commit_snapshot(
+        self,
+        snapshot: SourceCatalogSnapshot,
+    ) -> SourceCatalogSnapshot:
+        """Atomically replace one source projection and retain revision history."""
+
+        if not isinstance(snapshot, SourceCatalogSnapshot):
+            raise TypeError("snapshot must be a SourceCatalogSnapshot record")
+        return await self._run_connection(
+            lambda connection: _commit_catalog_snapshot(connection, snapshot)
+        )
+
+    async def load_sync(
+        self,
+        agent_id: str,
+        sync_id: str,
+    ) -> CatalogSync | None:
+        """Load one agent-scoped catalog sync."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(sync_id, "sync_id")
+        return await self._run_connection(
+            lambda connection: _load_catalog_sync(connection, agent_id, sync_id)
+        )
+
+    async def load_resource(
+        self,
+        agent_id: str,
+        resource_id: str,
+    ) -> CatalogResource | None:
+        """Load one current agent-scoped catalog resource."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(resource_id, "resource_id")
+        return await self._run_connection(
+            lambda connection: _load_catalog_resource(
+                connection,
+                agent_id,
+                resource_id,
+            )
+        )
+
+    async def list_resources(
+        self,
+        agent_id: str,
+        source_id: str | None = None,
+    ) -> tuple[CatalogResource, ...]:
+        """List the deterministic current resource projection for one agent."""
+
+        _require_identity(agent_id, "agent_id")
+        if source_id is not None:
+            _require_identity(source_id, "source_id")
+        return await self._run_connection(
+            lambda connection: _list_catalog_resources(
+                connection,
+                agent_id,
+                source_id,
+            )
+        )
+
+    async def load_revision(
+        self,
+        agent_id: str,
+        resource_id: str,
+        revision: str,
+    ) -> CatalogResourceRevision | None:
+        """Load a deterministic observation of one structural revision."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(resource_id, "resource_id")
+        _require_identity(revision, "revision")
+        return await self._run_connection(
+            lambda connection: _load_catalog_revision(
+                connection,
+                agent_id,
+                resource_id,
+                revision,
+            )
+        )
+
+    async def load_facets(
+        self,
+        agent_id: str,
+        resource_id: str,
+        revision: str | None = None,
+    ) -> tuple[CatalogFacet, ...]:
+        """Load facets for one resource's current persisted projection."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(resource_id, "resource_id")
+        if revision is not None:
+            _require_identity(revision, "revision")
+        return await self._run_connection(
+            lambda connection: _load_current_catalog_facets(
+                connection,
+                agent_id,
+                resource_id,
+                revision,
+            )
+        )
+
+    async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
+        """Run one bounded literal-token FTS search over current resources."""
+
+        if not isinstance(request, CatalogSearchRequest):
+            raise TypeError("request must be a CatalogSearchRequest record")
+        return await self._run_connection(
+            lambda connection: _search_catalog(connection, request)
+        )
+
+    async def traverse(
+        self,
+        request: CatalogTraversalRequest,
+    ) -> CatalogTraversalResult:
+        """Traverse current catalog relationships under explicit hard bounds."""
+
+        if not isinstance(request, CatalogTraversalRequest):
+            raise TypeError("request must be a CatalogTraversalRequest record")
+        return await self._run_connection(
+            lambda connection: _traverse_catalog(connection, request)
         )
 
     async def create(self, snapshot: OperationSnapshot) -> CommitResult:
@@ -2105,6 +2466,1237 @@ def _load_agent_identity(connection: sqlite3.Connection) -> AgentIdentity | None
         raise SQLiteCorruptionError(
             "cannot reconstruct authoritative agent identity"
         ) from error
+
+
+def _decode_source_registration_row(row: sqlite3.Row) -> SourceRegistration:
+    try:
+        return SourceRegistration(
+            id=_sqlite_text(row["id"], "source registration id"),
+            agent_id=_sqlite_text(row["agent_id"], "source registration agent_id"),
+            adapter_id=_sqlite_text(
+                row["adapter_id"],
+                "source registration adapter_id",
+            ),
+            native_identity=_sqlite_text(
+                row["native_identity"],
+                "source registration native_identity",
+            ),
+            display_name=_sqlite_text(
+                row["display_name"],
+                "source registration display_name",
+            ),
+            configuration=_decode_json_object(
+                _sqlite_text(
+                    row["configuration_json"],
+                    "source registration configuration",
+                )
+            ),
+            attached_at=_decode_datetime(
+                _sqlite_text(row["attached_at"], "source registration attached_at")
+            ),
+            detached_at=_decode_optional_datetime(
+                row["detached_at"],
+                "source registration detached_at",
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError("cannot reconstruct source registration") from error
+
+
+_SOURCE_REGISTRATION_SELECT = (
+    "SELECT id, agent_id, adapter_id, native_identity, display_name, "
+    "configuration_json, attached_at, detached_at FROM attached_sources"
+)
+
+
+def _load_source_any_agent(
+    connection: sqlite3.Connection,
+    source_id: str,
+) -> SourceRegistration | None:
+    row = connection.execute(
+        _SOURCE_REGISTRATION_SELECT + " WHERE id = ?",
+        (source_id,),
+    ).fetchone()
+    return None if row is None else _decode_source_registration_row(row)
+
+
+def _load_source(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    source_id: str,
+) -> SourceRegistration | None:
+    registration = _load_source_any_agent(connection, source_id)
+    if registration is None or registration.agent_id != agent_id:
+        return None
+    return registration
+
+
+def _list_sources(
+    connection: sqlite3.Connection,
+    agent_id: str,
+) -> tuple[SourceRegistration, ...]:
+    rows = connection.execute(
+        _SOURCE_REGISTRATION_SELECT + " WHERE agent_id = ? ORDER BY attached_at, id",
+        (agent_id,),
+    ).fetchall()
+    return tuple(_decode_source_registration_row(row) for row in rows)
+
+
+def _register_source(
+    connection: sqlite3.Connection,
+    registration: SourceRegistration,
+) -> SourceRegistration:
+    if registration.detached_at is not None:
+        raise ValueError("cannot register a source that is already detached")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != registration.agent_id:
+            raise AgentIdentityConflictError(
+                "source agent does not match the authoritative database identity"
+            )
+        current = _load_source_any_agent(connection, registration.id)
+        if current == registration:
+            connection.execute("COMMIT")
+            return registration
+        if current is not None:
+            raise SQLiteStoreError(f"source registration conflict: {registration.id}")
+        try:
+            connection.execute(
+                "INSERT INTO attached_sources(id, agent_id, adapter_id, "
+                "native_identity, display_name, configuration_json, attached_at, "
+                "detached_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    registration.id,
+                    registration.agent_id,
+                    registration.adapter_id,
+                    registration.native_identity,
+                    registration.display_name,
+                    canonical_json(registration.configuration),
+                    _encode_datetime(registration.attached_at),
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise SQLiteStoreError(
+                f"source registration conflict: {registration.id}"
+            ) from error
+        connection.execute("COMMIT")
+        return registration
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _detach_source(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    source_id: str,
+    detached_at: datetime,
+) -> SourceRegistration:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        current = _load_source(connection, agent_id, source_id)
+        if current is None:
+            raise SQLiteStoreError(f"unknown source registration: {source_id}")
+        if current.detached_at is not None:
+            raise SQLiteStoreError(f"source is already detached: {source_id}")
+        detached = current.detach(detached_at)
+        cursor = connection.execute(
+            "UPDATE attached_sources SET detached_at = ? "
+            "WHERE id = ? AND agent_id = ? AND detached_at IS NULL",
+            (_encode_datetime(detached_at), source_id, agent_id),
+        )
+        if cursor.rowcount != 1:
+            raise SQLiteStoreError(f"source detach conflict: {source_id}")
+        connection.execute("COMMIT")
+        return detached
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _require_catalog_agent(
+    connection: sqlite3.Connection,
+    *,
+    agent_id: str,
+    source_id: str,
+    sync_id: str,
+) -> None:
+    identity = _load_agent_identity(connection)
+    if identity is None or identity.id != agent_id:
+        raise CatalogSyncConflictError(
+            source_id,
+            sync_id,
+            "agent_identity_mismatch",
+        )
+
+
+def _catalog_sync_values(sync: CatalogSync) -> tuple[object, ...]:
+    return (
+        sync.id,
+        sync.agent_id,
+        sync.source_id,
+        sync.adapter_id,
+        sync.status.value,
+        _encode_datetime(sync.started_at),
+        _encode_optional_datetime(sync.completed_at),
+        sync.source_revision,
+        sync.resource_count,
+        sync.relationship_count,
+        sync.error_code,
+    )
+
+
+def _decode_catalog_sync_row(row: sqlite3.Row) -> CatalogSync:
+    try:
+        return CatalogSync(
+            id=_sqlite_text(row["id"], "catalog sync id"),
+            agent_id=_sqlite_text(row["agent_id"], "catalog sync agent_id"),
+            source_id=_sqlite_text(row["source_id"], "catalog sync source_id"),
+            adapter_id=_sqlite_text(row["adapter_id"], "catalog sync adapter_id"),
+            status=CatalogSyncStatus(
+                _sqlite_text(row["status"], "catalog sync status")
+            ),
+            started_at=_decode_datetime(
+                _sqlite_text(row["started_at"], "catalog sync started_at")
+            ),
+            completed_at=_decode_optional_datetime(
+                row["completed_at"],
+                "catalog sync completed_at",
+            ),
+            source_revision=_optional_text(row["source_revision"]),
+            resource_count=_sqlite_int(
+                row["resource_count"],
+                "catalog sync resource_count",
+            ),
+            relationship_count=_sqlite_int(
+                row["relationship_count"],
+                "catalog sync relationship_count",
+            ),
+            error_code=_optional_text(row["error_code"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError("cannot reconstruct catalog sync") from error
+
+
+def _load_catalog_sync_any_agent(
+    connection: sqlite3.Connection,
+    sync_id: str,
+) -> CatalogSync | None:
+    row = connection.execute(
+        "SELECT id, agent_id, source_id, adapter_id, status, started_at, "
+        "completed_at, source_revision, resource_count, relationship_count, "
+        "error_code FROM catalog_syncs WHERE id = ?",
+        (sync_id,),
+    ).fetchone()
+    return None if row is None else _decode_catalog_sync_row(row)
+
+
+def _load_catalog_sync(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    sync_id: str,
+) -> CatalogSync | None:
+    sync = _load_catalog_sync_any_agent(connection, sync_id)
+    if sync is None or sync.agent_id != agent_id:
+        return None
+    return sync
+
+
+def _catalog_sync_identity_matches(left: CatalogSync, right: CatalogSync) -> bool:
+    return (
+        left.id == right.id
+        and left.agent_id == right.agent_id
+        and left.source_id == right.source_id
+        and left.adapter_id == right.adapter_id
+        and left.started_at == right.started_at
+    )
+
+
+def _insert_catalog_sync(connection: sqlite3.Connection, sync: CatalogSync) -> None:
+    connection.execute(
+        "INSERT INTO catalog_syncs(id, agent_id, source_id, adapter_id, status, "
+        "started_at, completed_at, source_revision, resource_count, "
+        "relationship_count, error_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        _catalog_sync_values(sync),
+    )
+
+
+def _update_catalog_sync(connection: sqlite3.Connection, sync: CatalogSync) -> None:
+    connection.execute(
+        "UPDATE catalog_syncs SET status = ?, completed_at = ?, "
+        "source_revision = ?, resource_count = ?, relationship_count = ?, "
+        "error_code = ? WHERE id = ?",
+        (
+            sync.status.value,
+            _encode_optional_datetime(sync.completed_at),
+            sync.source_revision,
+            sync.resource_count,
+            sync.relationship_count,
+            sync.error_code,
+            sync.id,
+        ),
+    )
+
+
+def _record_catalog_sync(
+    connection: sqlite3.Connection,
+    sync: CatalogSync,
+) -> CatalogSync:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _require_catalog_agent(
+            connection,
+            agent_id=sync.agent_id,
+            source_id=sync.source_id,
+            sync_id=sync.id,
+        )
+        current = _load_catalog_sync_any_agent(connection, sync.id)
+        if current == sync:
+            connection.execute("COMMIT")
+            return sync
+        if sync.status is CatalogSyncStatus.SUCCEEDED:
+            raise CatalogSyncConflictError(
+                sync.source_id,
+                sync.id,
+                "successful_sync_requires_snapshot",
+            )
+        if current is None:
+            _insert_catalog_sync(connection, sync)
+        else:
+            if not _catalog_sync_identity_matches(current, sync):
+                raise CatalogSyncConflictError(
+                    sync.source_id,
+                    sync.id,
+                    "identity_changed",
+                )
+            if current.status is not CatalogSyncStatus.RUNNING:
+                raise CatalogSyncConflictError(
+                    sync.source_id,
+                    sync.id,
+                    "already_terminal",
+                )
+            if sync.status is CatalogSyncStatus.RUNNING:
+                raise CatalogSyncConflictError(
+                    sync.source_id,
+                    sync.id,
+                    "running_sync_changed",
+                )
+            _update_catalog_sync(connection, sync)
+        connection.execute("COMMIT")
+        return sync
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _decode_catalog_resource_row(row: sqlite3.Row) -> CatalogResource:
+    try:
+        return CatalogResource(
+            id=_sqlite_text(row["id"], "catalog resource id"),
+            agent_id=_sqlite_text(row["agent_id"], "catalog resource agent_id"),
+            source_id=_sqlite_text(row["source_id"], "catalog resource source_id"),
+            native_identity=_sqlite_text(
+                row["native_identity"],
+                "catalog resource native_identity",
+            ),
+            external_uri=_sqlite_text(
+                row["external_uri"],
+                "catalog resource external_uri",
+            ),
+            kind=ResourceKind(_sqlite_text(row["kind"], "catalog resource kind")),
+            name=_sqlite_text(row["name"], "catalog resource name"),
+            sensitivity=Sensitivity(
+                _sqlite_text(row["sensitivity"], "catalog resource sensitivity")
+            ),
+            current_revision=_sqlite_text(
+                row["current_revision"],
+                "catalog resource current_revision",
+            ),
+            current_sync_id=_sqlite_text(
+                row["current_sync_id"],
+                "catalog resource current_sync_id",
+            ),
+            first_observed_at=_decode_datetime(
+                _sqlite_text(
+                    row["first_observed_at"],
+                    "catalog resource first_observed_at",
+                )
+            ),
+            last_observed_at=_decode_datetime(
+                _sqlite_text(
+                    row["last_observed_at"],
+                    "catalog resource last_observed_at",
+                )
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError("cannot reconstruct catalog resource") from error
+
+
+_CATALOG_RESOURCE_SELECT = (
+    "SELECT id, agent_id, source_id, native_identity, external_uri, kind, name, "
+    "sensitivity, current_revision, current_sync_id, first_observed_at, "
+    "last_observed_at FROM catalog_resources"
+)
+
+
+def _load_catalog_resource(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    resource_id: str,
+) -> CatalogResource | None:
+    row = connection.execute(
+        _CATALOG_RESOURCE_SELECT + " WHERE agent_id = ? AND id = ?",
+        (agent_id, resource_id),
+    ).fetchone()
+    return None if row is None else _decode_catalog_resource_row(row)
+
+
+def _list_catalog_resources(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    source_id: str | None,
+) -> tuple[CatalogResource, ...]:
+    if source_id is None:
+        rows = connection.execute(
+            _CATALOG_RESOURCE_SELECT
+            + " WHERE agent_id = ? ORDER BY source_id, kind, name, id",
+            (agent_id,),
+        ).fetchall()
+    else:
+        rows = connection.execute(
+            _CATALOG_RESOURCE_SELECT
+            + " WHERE agent_id = ? AND source_id = ? ORDER BY kind, name, id",
+            (agent_id, source_id),
+        ).fetchall()
+    return tuple(_decode_catalog_resource_row(row) for row in rows)
+
+
+def _decode_catalog_revision_row(row: sqlite3.Row) -> CatalogResourceRevision:
+    try:
+        return CatalogResourceRevision(
+            resource_id=_sqlite_text(
+                row["resource_id"],
+                "catalog revision resource_id",
+            ),
+            revision=_sqlite_text(row["revision"], "catalog revision"),
+            sync_id=_sqlite_text(row["sync_id"], "catalog revision sync_id"),
+            observed_at=_decode_datetime(
+                _sqlite_text(row["observed_at"], "catalog revision observed_at")
+            ),
+            facet_revisions=_decode_string_tuple(
+                _sqlite_text(
+                    row["facet_revisions_json"],
+                    "catalog facet revisions",
+                )
+            ),
+            relationship_revisions=_decode_string_tuple(
+                _sqlite_text(
+                    row["relationship_revisions_json"],
+                    "catalog relationship revisions",
+                )
+            ),
+            source_revision=_optional_text(row["source_revision"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError("cannot reconstruct catalog revision") from error
+
+
+def _load_catalog_revision(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    resource_id: str,
+    revision: str,
+) -> CatalogResourceRevision | None:
+    row = connection.execute(
+        "SELECT revision_row.resource_id, revision_row.revision, "
+        "revision_row.sync_id, revision_row.observed_at, "
+        "revision_row.facet_revisions_json, "
+        "revision_row.relationship_revisions_json, revision_row.source_revision "
+        "FROM catalog_resource_revisions AS revision_row "
+        "LEFT JOIN catalog_resources AS resource "
+        "ON resource.agent_id = revision_row.agent_id "
+        "AND resource.id = revision_row.resource_id "
+        "WHERE revision_row.agent_id = ? AND revision_row.resource_id = ? "
+        "AND revision_row.revision = ? "
+        "ORDER BY (revision_row.sync_id = resource.current_sync_id) DESC, "
+        "revision_row.observed_at DESC, revision_row.sync_id DESC LIMIT 1",
+        (agent_id, resource_id, revision),
+    ).fetchone()
+    return None if row is None else _decode_catalog_revision_row(row)
+
+
+def _decode_catalog_facet_row(row: sqlite3.Row) -> CatalogFacet:
+    try:
+        return CatalogFacet(
+            resource_id=_sqlite_text(row["resource_id"], "catalog facet resource_id"),
+            sync_id=_sqlite_text(row["sync_id"], "catalog facet sync_id"),
+            kind=FacetKind(_sqlite_text(row["kind"], "catalog facet kind")),
+            schema_version=_sqlite_int(
+                row["schema_version"],
+                "catalog facet schema_version",
+            ),
+            revision=_sqlite_text(row["revision"], "catalog facet revision"),
+            payload=_decode_json_object(
+                _sqlite_text(row["payload_json"], "catalog facet payload")
+            ),
+            observed_at=_decode_datetime(
+                _sqlite_text(row["observed_at"], "catalog facet observed_at")
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError("cannot reconstruct catalog facet") from error
+
+
+def _load_current_catalog_facets(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    resource_id: str,
+    revision: str | None,
+) -> tuple[CatalogFacet, ...]:
+    resource = _load_catalog_resource(connection, agent_id, resource_id)
+    if resource is None:
+        return ()
+    if revision is not None and revision != resource.current_revision:
+        return ()
+    current_revision = _load_catalog_revision(
+        connection,
+        agent_id,
+        resource_id,
+        resource.current_revision,
+    )
+    if current_revision is None:
+        raise SQLiteCorruptionError(
+            "catalog resource references a missing current revision"
+        )
+    rows = connection.execute(
+        "SELECT resource_id, sync_id, kind, schema_version, revision, "
+        "payload_json, observed_at FROM catalog_facets WHERE agent_id = ? "
+        "AND resource_id = ? AND sync_id = ? ORDER BY kind, revision",
+        (agent_id, resource_id, resource.current_sync_id),
+    ).fetchall()
+    facets = tuple(_decode_catalog_facet_row(row) for row in rows)
+    if {facet.revision for facet in facets} != set(current_revision.facet_revisions):
+        raise SQLiteCorruptionError(
+            "catalog current facets disagree with the resource revision"
+        )
+    return facets
+
+
+def _decode_relationship_field_pairs(
+    value: object,
+) -> tuple[RelationshipFieldPair, ...]:
+    if not isinstance(value, list):
+        raise ValueError("catalog relationship field pairs must be an array")
+    pairs: list[RelationshipFieldPair] = []
+    for item in value:
+        payload = _expect_object(
+            item,
+            keys={"ordinal", "source_field", "target_field"},
+            label="catalog relationship field pair",
+        )
+        pairs.append(
+            RelationshipFieldPair(
+                source_field=_sqlite_text(
+                    payload["source_field"],
+                    "catalog relationship source_field",
+                ),
+                target_field=_sqlite_text(
+                    payload["target_field"],
+                    "catalog relationship target_field",
+                ),
+                ordinal=_sqlite_int(
+                    payload["ordinal"],
+                    "catalog relationship field-pair ordinal",
+                ),
+            )
+        )
+    return tuple(pairs)
+
+
+def _decode_catalog_relationship_row(row: sqlite3.Row) -> CatalogRelationship:
+    try:
+        field_pairs = _decode_relationship_field_pairs(
+            _decode_json(
+                _sqlite_text(
+                    row["field_pairs_json"],
+                    "catalog relationship field pairs",
+                )
+            )
+        )
+        return CatalogRelationship(
+            id=_sqlite_text(row["id"], "catalog relationship id"),
+            revision=_sqlite_text(row["revision"], "catalog relationship revision"),
+            source_id=_sqlite_text(
+                row["source_id"],
+                "catalog relationship source_id",
+            ),
+            from_resource_id=_sqlite_text(
+                row["from_resource_id"],
+                "catalog relationship from_resource_id",
+            ),
+            to_resource_id=_sqlite_text(
+                row["to_resource_id"],
+                "catalog relationship to_resource_id",
+            ),
+            kind=RelationshipKind(
+                _sqlite_text(row["kind"], "catalog relationship kind")
+            ),
+            provenance=RelationshipProvenance(
+                _sqlite_text(
+                    row["provenance"],
+                    "catalog relationship provenance",
+                )
+            ),
+            confidence=_sqlite_real(
+                row["confidence"],
+                "catalog relationship confidence",
+            ),
+            sync_id=_sqlite_text(row["sync_id"], "catalog relationship sync_id"),
+            observed_at=_decode_datetime(
+                _sqlite_text(
+                    row["observed_at"],
+                    "catalog relationship observed_at",
+                )
+            ),
+            field_pairs=field_pairs,
+            attributes=_decode_json_object(
+                _sqlite_text(
+                    row["attributes_json"],
+                    "catalog relationship attributes",
+                )
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError(
+            "cannot reconstruct catalog relationship"
+        ) from error
+
+
+_CATALOG_RELATIONSHIP_SELECT = (
+    "SELECT id, revision, source_id, from_resource_id, to_resource_id, kind, "
+    "provenance, confidence, sync_id, observed_at, field_pairs_json, "
+    "attributes_json FROM catalog_relationships"
+)
+
+
+def _load_catalog_relationships_for_sync(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    sync_id: str,
+) -> tuple[CatalogRelationship, ...]:
+    rows = connection.execute(
+        _CATALOG_RELATIONSHIP_SELECT
+        + " WHERE agent_id = ? AND sync_id = ? ORDER BY id",
+        (agent_id, sync_id),
+    ).fetchall()
+    return tuple(_decode_catalog_relationship_row(row) for row in rows)
+
+
+def _catalog_snapshot_matches_current(
+    connection: sqlite3.Connection,
+    snapshot: SourceCatalogSnapshot,
+) -> bool:
+    resources = _list_catalog_resources(
+        connection,
+        snapshot.sync.agent_id,
+        snapshot.sync.source_id,
+    )
+    if resources != tuple(
+        sorted(
+            snapshot.resources, key=lambda item: (item.kind.value, item.name, item.id)
+        )
+    ):
+        return False
+    revisions: list[CatalogResourceRevision] = []
+    facets: list[CatalogFacet] = []
+    for resource in resources:
+        revision = _load_catalog_revision(
+            connection,
+            snapshot.sync.agent_id,
+            resource.id,
+            resource.current_revision,
+        )
+        if revision is None:
+            return False
+        revisions.append(revision)
+        facets.extend(
+            _load_current_catalog_facets(
+                connection,
+                snapshot.sync.agent_id,
+                resource.id,
+                resource.current_revision,
+            )
+        )
+    relationships = _load_catalog_relationships_for_sync(
+        connection,
+        snapshot.sync.agent_id,
+        snapshot.sync.id,
+    )
+    return (
+        tuple(sorted(revisions, key=lambda item: item.resource_id))
+        == tuple(sorted(snapshot.revisions, key=lambda item: item.resource_id))
+        and tuple(
+            sorted(
+                facets,
+                key=lambda item: (item.resource_id, item.kind.value, item.revision),
+            )
+        )
+        == tuple(
+            sorted(
+                snapshot.facets,
+                key=lambda item: (item.resource_id, item.kind.value, item.revision),
+            )
+        )
+        and relationships
+        == tuple(sorted(snapshot.relationships, key=lambda item: item.id))
+    )
+
+
+def _catalog_snapshot_is_stale(
+    connection: sqlite3.Connection,
+    sync: CatalogSync,
+) -> bool:
+    row = connection.execute(
+        "SELECT started_at, completed_at, id FROM catalog_syncs "
+        "WHERE agent_id = ? AND source_id = ? AND status = ? AND id != ? "
+        "ORDER BY completed_at DESC, started_at DESC, id DESC LIMIT 1",
+        (
+            sync.agent_id,
+            sync.source_id,
+            CatalogSyncStatus.SUCCEEDED.value,
+            sync.id,
+        ),
+    ).fetchone()
+    if row is None:
+        return False
+    latest_completed = _decode_datetime(
+        _sqlite_text(row["completed_at"], "latest catalog completed_at")
+    )
+    latest_started = _decode_datetime(
+        _sqlite_text(row["started_at"], "latest catalog started_at")
+    )
+    assert sync.completed_at is not None
+    return (latest_completed, latest_started, _sqlite_text(row["id"], "sync id")) > (
+        sync.completed_at,
+        sync.started_at,
+        sync.id,
+    )
+
+
+def _insert_catalog_revision(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    revision: CatalogResourceRevision,
+) -> None:
+    connection.execute(
+        "INSERT INTO catalog_resource_revisions(agent_id, resource_id, revision, "
+        "sync_id, observed_at, facet_revisions_json, "
+        "relationship_revisions_json, source_revision) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            agent_id,
+            revision.resource_id,
+            revision.revision,
+            revision.sync_id,
+            _encode_datetime(revision.observed_at),
+            canonical_json(revision.facet_revisions),
+            canonical_json(revision.relationship_revisions),
+            revision.source_revision,
+        ),
+    )
+
+
+def _insert_catalog_facet(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    facet: CatalogFacet,
+) -> None:
+    connection.execute(
+        "INSERT INTO catalog_facets(agent_id, resource_id, sync_id, kind, "
+        "schema_version, revision, payload_json, observed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            agent_id,
+            facet.resource_id,
+            facet.sync_id,
+            facet.kind.value,
+            facet.schema_version,
+            facet.revision,
+            canonical_json(facet.payload),
+            _encode_datetime(facet.observed_at),
+        ),
+    )
+
+
+def _insert_catalog_relationship(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    relationship: CatalogRelationship,
+) -> None:
+    connection.execute(
+        "INSERT INTO catalog_relationships(agent_id, id, revision, source_id, "
+        "from_resource_id, to_resource_id, kind, provenance, confidence, "
+        "sync_id, observed_at, field_pairs_json, attributes_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            agent_id,
+            relationship.id,
+            relationship.revision,
+            relationship.source_id,
+            relationship.from_resource_id,
+            relationship.to_resource_id,
+            relationship.kind.value,
+            relationship.provenance.value,
+            relationship.confidence,
+            relationship.sync_id,
+            _encode_datetime(relationship.observed_at),
+            canonical_json(
+                tuple(pair.to_payload() for pair in relationship.field_pairs)
+            ),
+            canonical_json(relationship.attributes),
+        ),
+    )
+
+
+def _insert_catalog_resource(
+    connection: sqlite3.Connection,
+    resource: CatalogResource,
+) -> None:
+    connection.execute(
+        "INSERT INTO catalog_resources(agent_id, id, source_id, native_identity, "
+        "external_uri, kind, name, sensitivity, current_revision, "
+        "current_sync_id, first_observed_at, last_observed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            resource.agent_id,
+            resource.id,
+            resource.source_id,
+            resource.native_identity,
+            resource.external_uri,
+            resource.kind.value,
+            resource.name,
+            resource.sensitivity.value,
+            resource.current_revision,
+            resource.current_sync_id,
+            _encode_datetime(resource.first_observed_at),
+            _encode_datetime(resource.last_observed_at),
+        ),
+    )
+
+
+def _catalog_structural_text(
+    resource_id: str,
+    facets: tuple[CatalogFacet, ...],
+    relationships: tuple[CatalogRelationship, ...],
+) -> str:
+    parts: list[str] = []
+    for facet in facets:
+        if facet.resource_id == resource_id:
+            parts.extend((facet.kind.value, canonical_json(facet.payload)))
+    for relationship in relationships:
+        if resource_id not in {
+            relationship.from_resource_id,
+            relationship.to_resource_id,
+        }:
+            continue
+        parts.extend(
+            (
+                relationship.kind.value,
+                canonical_json(
+                    tuple(pair.to_payload() for pair in relationship.field_pairs)
+                ),
+                canonical_json(relationship.attributes),
+            )
+        )
+    return " ".join(parts)
+
+
+def _commit_catalog_snapshot(
+    connection: sqlite3.Connection,
+    snapshot: SourceCatalogSnapshot,
+) -> SourceCatalogSnapshot:
+    sync = snapshot.sync
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _require_catalog_agent(
+            connection,
+            agent_id=sync.agent_id,
+            source_id=sync.source_id,
+            sync_id=sync.id,
+        )
+        current = _load_catalog_sync_any_agent(connection, sync.id)
+        if current is not None:
+            if not _catalog_sync_identity_matches(current, sync):
+                raise CatalogSyncConflictError(
+                    sync.source_id,
+                    sync.id,
+                    "identity_changed",
+                )
+        current_resources = {
+            resource.id: resource
+            for resource in _list_catalog_resources(
+                connection,
+                sync.agent_id,
+                sync.source_id,
+            )
+        }
+        normalized_resources: list[CatalogResource] = []
+        for resource in snapshot.resources:
+            previous = current_resources.get(resource.id)
+            if previous is None:
+                first_observed_at = resource.last_observed_at
+            else:
+                if (
+                    resource.agent_id,
+                    resource.source_id,
+                    resource.native_identity,
+                    resource.kind,
+                ) != (
+                    previous.agent_id,
+                    previous.source_id,
+                    previous.native_identity,
+                    previous.kind,
+                ):
+                    raise CatalogSyncConflictError(
+                        sync.source_id,
+                        sync.id,
+                        "resource_identity_changed",
+                    )
+                if resource.last_observed_at < previous.last_observed_at:
+                    raise CatalogSyncConflictError(
+                        sync.source_id,
+                        sync.id,
+                        "resource_freshness_regressed",
+                    )
+                first_observed_at = previous.first_observed_at
+            normalized_resources.append(
+                replace(resource, first_observed_at=first_observed_at)
+            )
+        normalized_snapshot = replace(
+            snapshot,
+            resources=tuple(normalized_resources),
+        )
+        if current is not None:
+            if current.status is not CatalogSyncStatus.RUNNING:
+                if current == sync and _catalog_snapshot_matches_current(
+                    connection,
+                    normalized_snapshot,
+                ):
+                    connection.execute("COMMIT")
+                    return normalized_snapshot
+                raise CatalogSyncConflictError(
+                    sync.source_id,
+                    sync.id,
+                    "already_terminal",
+                )
+        if _catalog_snapshot_is_stale(connection, sync):
+            raise CatalogSyncConflictError(
+                sync.source_id,
+                sync.id,
+                "stale_snapshot",
+            )
+        snapshot = normalized_snapshot
+        if current is None:
+            _insert_catalog_sync(connection, sync)
+        else:
+            _update_catalog_sync(connection, sync)
+
+        for revision in snapshot.revisions:
+            _insert_catalog_revision(connection, sync.agent_id, revision)
+        for facet in snapshot.facets:
+            _insert_catalog_facet(connection, sync.agent_id, facet)
+        for relationship in snapshot.relationships:
+            _insert_catalog_relationship(connection, sync.agent_id, relationship)
+
+        connection.execute(
+            "DELETE FROM catalog_resource_search WHERE agent_id = ? AND source_id = ?",
+            (sync.agent_id, sync.source_id),
+        )
+        connection.execute(
+            "DELETE FROM catalog_resources WHERE agent_id = ? AND source_id = ?",
+            (sync.agent_id, sync.source_id),
+        )
+        for resource in snapshot.resources:
+            _insert_catalog_resource(connection, resource)
+            connection.execute(
+                "INSERT INTO catalog_resource_search(agent_id, resource_id, "
+                "source_id, kind, name, native_identity, external_uri, "
+                "structural_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    resource.agent_id,
+                    resource.id,
+                    resource.source_id,
+                    resource.kind.value,
+                    resource.name,
+                    resource.native_identity,
+                    resource.external_uri,
+                    _catalog_structural_text(
+                        resource.id,
+                        snapshot.facets,
+                        snapshot.relationships,
+                    ),
+                ),
+            )
+        connection.execute("COMMIT")
+        return snapshot
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _catalog_search_terms(query: str) -> tuple[str, ...]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for match in _CATALOG_SEARCH_TERM.finditer(query.lower()):
+        term = match.group(0)
+        if term in seen:
+            continue
+        seen.add(term)
+        terms.append(term)
+        if len(terms) == _CATALOG_SEARCH_MAX_TERMS:
+            break
+    return tuple(terms)
+
+
+def _catalog_search_filters(
+    request: CatalogSearchRequest,
+    *,
+    table_name: str,
+) -> tuple[list[str], list[object]]:
+    filters = [f"{table_name}.agent_id = ?"]
+    parameters: list[object] = [request.agent_id]
+    if request.source_ids:
+        placeholders = ", ".join("?" for _ in request.source_ids)
+        filters.append(f"{table_name}.source_id IN ({placeholders})")
+        parameters.extend(request.source_ids)
+    if request.resource_kinds:
+        placeholders = ", ".join("?" for _ in request.resource_kinds)
+        filters.append(f"{table_name}.kind IN ({placeholders})")
+        parameters.extend(kind.value for kind in request.resource_kinds)
+    return filters, parameters
+
+
+def _catalog_hit_match_fields(
+    row: sqlite3.Row,
+    terms: tuple[str, ...],
+) -> tuple[str, ...]:
+    fields: list[str] = []
+    for field_name in ("name", "native_identity", "external_uri", "structural_text"):
+        value = _sqlite_text(row[field_name], f"catalog search {field_name}").lower()
+        if any(term in value for term in terms):
+            fields.append(
+                "structure" if field_name == "structural_text" else field_name
+            )
+    return tuple(fields)
+
+
+def _decode_catalog_search_hit(
+    row: sqlite3.Row,
+    terms: tuple[str, ...],
+) -> CatalogSearchHit:
+    try:
+        rank_value = row["rank_value"]
+        if not isinstance(rank_value, (int, float)) or isinstance(rank_value, bool):
+            raise TypeError("catalog search rank must be numeric")
+        score = min(1_000_000.0, max(0.0, -float(rank_value)))
+        matched_fields = _catalog_hit_match_fields(row, terms) if terms else ()
+        return CatalogSearchHit(
+            resource_id=_sqlite_text(row["id"], "catalog search resource id"),
+            source_id=_sqlite_text(row["source_id"], "catalog search source id"),
+            kind=ResourceKind(_sqlite_text(row["kind"], "catalog search kind")),
+            name=_sqlite_text(row["name"], "catalog search name"),
+            revision=_sqlite_text(row["current_revision"], "catalog search revision"),
+            sensitivity=Sensitivity(
+                _sqlite_text(row["sensitivity"], "catalog search sensitivity")
+            ),
+            score=score,
+            matched_fields=matched_fields,
+            match_reasons=("lexical_fts",) if terms else (),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError("cannot reconstruct catalog search hit") from error
+
+
+def _search_catalog(
+    connection: sqlite3.Connection,
+    request: CatalogSearchRequest,
+) -> CatalogSearchResult:
+    terms = _catalog_search_terms(request.query)
+    resource_filters, resource_parameters = _catalog_search_filters(
+        request,
+        table_name="resource",
+    )
+    if not terms:
+        where = " AND ".join(resource_filters)
+        total_row = connection.execute(
+            f"SELECT COUNT(*) FROM catalog_resources AS resource WHERE {where}",
+            tuple(resource_parameters),
+        ).fetchone()
+        assert total_row is not None
+        total_matches = _sqlite_int(total_row[0], "catalog search total")
+        rows = connection.execute(
+            "SELECT resource.id, resource.source_id, resource.kind, resource.name, "
+            "resource.native_identity, resource.external_uri, '' AS structural_text, "
+            "resource.current_revision, resource.sensitivity, 0.0 AS rank_value "
+            f"FROM catalog_resources AS resource WHERE {where} "
+            "ORDER BY resource.name COLLATE BINARY, resource.id LIMIT ?",
+            (*resource_parameters, request.limit),
+        ).fetchall()
+    else:
+        fts_query = " OR ".join(f'"{term}"' for term in terms)
+        filters = ["catalog_resource_search MATCH ?", *resource_filters]
+        parameters: list[object] = [fts_query, *resource_parameters]
+        where = " AND ".join(filters)
+        total_row = connection.execute(
+            "SELECT COUNT(*) FROM catalog_resource_search "
+            "JOIN catalog_resources AS resource "
+            "ON resource.agent_id = catalog_resource_search.agent_id "
+            "AND resource.id = catalog_resource_search.resource_id "
+            f"WHERE {where}",
+            tuple(parameters),
+        ).fetchone()
+        assert total_row is not None
+        total_matches = _sqlite_int(total_row[0], "catalog search total")
+        rows = connection.execute(
+            "SELECT resource.id, resource.source_id, resource.kind, resource.name, "
+            "catalog_resource_search.native_identity AS native_identity, "
+            "catalog_resource_search.external_uri AS external_uri, "
+            "catalog_resource_search.structural_text AS structural_text, "
+            "resource.current_revision, resource.sensitivity, "
+            "bm25(catalog_resource_search) AS rank_value "
+            "FROM catalog_resource_search JOIN catalog_resources AS resource "
+            "ON resource.agent_id = catalog_resource_search.agent_id "
+            "AND resource.id = catalog_resource_search.resource_id "
+            f"WHERE {where} ORDER BY rank_value, resource.name COLLATE BINARY, "
+            "resource.id LIMIT ?",
+            (*parameters, request.limit),
+        ).fetchall()
+    hits = tuple(_decode_catalog_search_hit(row, terms) for row in rows)
+    return CatalogSearchResult(
+        request=request,
+        hits=hits,
+        total_matches=total_matches,
+        truncated=total_matches > len(hits),
+    )
+
+
+def _catalog_adjacency(
+    connection: sqlite3.Connection,
+    request: CatalogTraversalRequest,
+    resource_id: str,
+) -> tuple[CatalogRelationship, ...]:
+    filters = [
+        "relationship.agent_id = ?",
+        "(relationship.from_resource_id = ? OR relationship.to_resource_id = ?)",
+    ]
+    parameters: list[object] = [request.agent_id, resource_id, resource_id]
+    if request.relationship_kinds:
+        placeholders = ", ".join("?" for _ in request.relationship_kinds)
+        filters.append(f"relationship.kind IN ({placeholders})")
+        parameters.extend(kind.value for kind in request.relationship_kinds)
+    rows = connection.execute(
+        "SELECT relationship.id, relationship.revision, relationship.source_id, "
+        "relationship.from_resource_id, relationship.to_resource_id, "
+        "relationship.kind, relationship.provenance, relationship.confidence, "
+        "relationship.sync_id, relationship.observed_at, "
+        "relationship.field_pairs_json, relationship.attributes_json "
+        "FROM catalog_relationships AS relationship "
+        "JOIN catalog_resources AS from_resource "
+        "ON from_resource.agent_id = relationship.agent_id "
+        "AND from_resource.id = relationship.from_resource_id "
+        "AND from_resource.current_sync_id = relationship.sync_id "
+        "JOIN catalog_resources AS to_resource "
+        "ON to_resource.agent_id = relationship.agent_id "
+        "AND to_resource.id = relationship.to_resource_id "
+        "AND to_resource.current_sync_id = relationship.sync_id WHERE "
+        + " AND ".join(filters)
+        + " ORDER BY relationship.id LIMIT ?",
+        (*parameters, request.max_edges + 1),
+    ).fetchall()
+    return tuple(_decode_catalog_relationship_row(row) for row in rows)
+
+
+def _traverse_catalog(
+    connection: sqlite3.Connection,
+    request: CatalogTraversalRequest,
+) -> CatalogTraversalResult:
+    for resource_id in (*request.from_resource_ids, *request.to_resource_ids):
+        if _load_catalog_resource(connection, request.agent_id, resource_id) is None:
+            raise CatalogResourceNotFoundError(request.agent_id, resource_id)
+
+    targets = set(request.to_resource_ids)
+    roots = request.from_resource_ids[: request.max_nodes]
+    truncated = len(roots) < len(request.from_resource_ids)
+    visited_nodes = set(roots)
+    visited_edges: set[str] = set()
+    queue: deque[tuple[str, tuple[str, ...], tuple[CatalogPathStep, ...]]] = deque(
+        (resource_id, (resource_id,), ()) for resource_id in roots
+    )
+    paths: list[CatalogPath] = []
+
+    while queue:
+        current_id, resource_ids, steps = queue.popleft()
+        if current_id in targets:
+            paths.append(CatalogPath(resource_ids=resource_ids, steps=steps))
+            if len(paths) >= request.max_paths:
+                truncated = truncated or bool(queue)
+                break
+            continue
+        if len(steps) >= request.max_depth:
+            truncated = True
+            continue
+
+        adjacency = _catalog_adjacency(connection, request, current_id)
+        if len(adjacency) > request.max_edges:
+            truncated = True
+        for relationship in adjacency:
+            if relationship.id in visited_edges:
+                continue
+            if len(visited_edges) >= request.max_edges:
+                truncated = True
+                break
+            visited_edges.add(relationship.id)
+            if relationship.from_resource_id == current_id:
+                neighbor_id = relationship.to_resource_id
+                direction = RelationshipDirection.FORWARD
+            else:
+                neighbor_id = relationship.from_resource_id
+                direction = RelationshipDirection.REVERSE
+            if neighbor_id in resource_ids:
+                continue
+            if neighbor_id not in visited_nodes:
+                if len(visited_nodes) >= request.max_nodes:
+                    truncated = True
+                    continue
+                visited_nodes.add(neighbor_id)
+            step = CatalogPathStep(
+                relationship_id=relationship.id,
+                from_resource_id=current_id,
+                to_resource_id=neighbor_id,
+                direction=direction,
+            )
+            queue.append(
+                (
+                    neighbor_id,
+                    (*resource_ids, neighbor_id),
+                    (*steps, step),
+                )
+            )
+
+    return CatalogTraversalResult(
+        request=request,
+        paths=tuple(paths),
+        reachable=bool(paths),
+        visited_nodes=len(visited_nodes),
+        visited_edges=len(visited_edges),
+        truncated=truncated,
+    )
 
 
 def _create_session(connection: sqlite3.Connection, session: Session) -> Session:

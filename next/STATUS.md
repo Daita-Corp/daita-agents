@@ -5,15 +5,15 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 2 complete; Phase 3 has not started
-- **Active task:** paused after P2-11 — consolidated Phase 2 completion gate
-- **Last completed task:** P2-11 — final Phase 2 evidence and exact gate commit
-- **Current checkpoint:** P2-09 baseline `da79c88`; the local commit containing
-  this ledger is the sole P2-10/P2-11 completion checkpoint
+- **Active phase:** Phase 4 — non-database proof
+- **Active task:** P4-01 — local-file and cross-source contract inventory
+- **Last completed task:** P3-06 — consolidated Phase 3 gate
+- **Current checkpoint:** Phase 3 gate (this ledger's containing commit)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** stop and await explicit Phase 3 authorization
+- **Exact next action:** re-read the Phase 4 security, adapter, file-facet,
+  comparison, and Journey B contracts; lock one lean local-file vertical plan
 
 ## Development cadence
 
@@ -23,10 +23,15 @@ User direction on 2026-07-18 replaces the earlier mini-gate cadence:
 - format touched files only before a meaningful checkpoint commit;
 - run static analysis only when a changed typed boundary warrants it;
 - defer dual-interpreter, root-oracle, distribution, and broad review gates to
-  the consolidated P2-10 Phase 2 gate;
+  one consolidated gate at the end of each phase;
 - use subagents only for concrete parallel implementation or one targeted
   safety review; and
 - keep ledger updates short and prioritize completing vertical slices.
+
+User direction for Phase 3 further requires a lean checkpoint cadence: use
+focused red/green tests inside each coherent vertical slice, avoid per-helper
+or per-internal-task commits, and reserve the broad dual-interpreter, static,
+root-oracle, distribution, and review matrix for P3-06.
 
 ## Mandatory architecture re-read
 
@@ -66,6 +71,17 @@ canonical checkpoints rather than replay the original trigger semantically;
 model inference remains at-least-once; terminal tasks, observations, and
 readiness are reused; and the operation runtime/store remain the only
 execution and durable-state authorities.
+
+Before Phase 3 production edits, Sections 6 and 15 were re-read in full on
+2026-07-18 together with Sections 8.9, 8.13–8.15, 10.1–10.2, 11.3, 14.1–14.3,
+17.5–17.6, Journey A, the Phase 3 work/gate, and ADRs 0004/0006/0008/0010/0011.
+The renewed constraints are that catalog is the sole owner of resource truth;
+the data domain consumes catalog contracts and never source clients; source
+query I/O becomes a persisted task executed only by `OperationRuntime`;
+discovery/inspection remain bounded catalog workflows; SQL is parsed and
+scope-validated before connector I/O; external schema/value text is bounded
+untrusted data; and no file, PostgreSQL, memory, monitor, telemetry-exporter,
+or broad extension work enters the SQLite-only Phase 3 slice.
 
 ## Current architectural decisions
 
@@ -125,6 +141,34 @@ The binding rationale and consequences are recorded in `next/decisions/`.
 | P2-09 | complete | Persisted embedded fake-capability loop; provider-neutral model contract | Separate canonical/provider call identity, normalized provider errors, lazy optional OpenAI Responses adapter, fake-client contract tests, and one live persisted fake-capability loop | Final 44-case provider/model/SQLite/architecture selection and the credential-gated SQLite-backed live loop pass with explicit `gpt-4.1-mini`; encrypted reasoning continuation survives persistence and the provider remains translation-only | P2-08 |
 | P2-10 | complete | Complete Phase 2 vertical slice | Consolidated restart, failure-injection, approval, event, import, architecture, static, cross-version, root-oracle, and clean-build evidence with parity/quality/ADR review | 727 selected deterministic tests pass on Python 3.11/3.12; 59 architecture tests, static checks, root oracle, distributions, fresh imports, and audited live-provider evidence pass | P2-09 |
 | P2-11 | complete | Passing P2-10 results | Final Phase 2 ledger/evidence and coherent exact gate commit | Exactly 13 paths under `next/`; scoped diff/hooks pass; containing commit uses `chore(v2-phase-2): complete phase 2 gate` | P2-10 |
+
+## Ordered Phase 3 tasks
+
+The user-requested lean cadence deliberately uses six coherent tasks and one
+final broad gate rather than per-helper checkpoints.
+
+| ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
+| --- | --- | --- | --- | --- | --- |
+| P3-01 | complete | Re-read Sections 6/15 and Phase 3 supporting sections; ADRs; Phase 2 owners; v1 catalog/SQL references; parity/disposition inventories | Reconciled SQLite-only scope, exact owner/contract inventory, focused expected-red sequence, corrected later-phase test dispositions, and this ordered plan | Read-only owner/leaf inventory; 4 disposition architecture cases pass; no production edit or new architecture owner | Phase 2 gate |
+| P3-02 | complete | P3-01 contracts; existing SQLite migration engine | Immutable resource/facet/relationship/revision/sync records plus narrow catalog store/service contracts and SQLite migration with atomic sync, FTS5 search, and bounded deterministic traversal | 16 model/protocol cases plus focused SQLite catalog/source/service rollback, isolation, refresh, search, traversal, and executor coverage pass | P3-01 |
+| P3-03 | complete | Catalog service; capability/runtime seams; public Agent composition | Narrow resource-adapter declarations and persisted source lifecycle with a SQLite adapter that discovers/inspects catalog structure and exposes a read-only query executor | 17 adapter/discovery/query cases and 6 source/catalog store cases pass; invalid SQL reaches no connector I/O | P3-02 |
+| P3-04 | complete | SQLite adapter/capability; v1 SQL leaf references; generic loop/domain protocol | Deterministic SQLite SQL parsing, source/table/column/parameter/limit validation, bounded evidence/result projections, untrusted catalog context, data-domain observations, and evidence-grounded readiness | 35 focused SQL/result/controller/context cases pass; premature completion is repaired and evidence citation is mandatory | P3-03 |
+| P3-05 | complete | Complete deterministic SQLite data vertical | Public `Agent.attach/run/inspect` Journey A with catalog discovery/search/inspection, accepted query evidence, restart-safe inspection, and complete correlation events | Scripted public journey passes in 0.86s; catalog and invalid/valid query trajectory, source immutability, evidence, readiness, transcript, and reopen are asserted | P3-04 |
+| P3-06 | complete | Passing P3-02 through P3-05 slices | Consolidated Phase 3 regression, architecture, static, dual-Python, root-oracle, distribution/fresh-install, ledger/parity, and scoped gate commit | 817 selected tests pass on Python 3.11/3.12; 60 architecture and 2,498 root tests pass; static, distribution, fresh-install, scope, and repaired final review gates pass; containing commit uses `chore(v2-phase-3): complete phase 3 gate` | P3-05 |
+
+## Ordered Phase 4 tasks
+
+The Phase 4 cadence remains phase-level: focused tests while implementing the
+vertical, then one consolidated gate and commit.
+
+| ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
+| --- | --- | --- | --- | --- | --- |
+| P4-01 | active | Phase 4 work/gate and Journey B; Sections 6/15; file security, adapter, catalog, evidence, and projection contracts; Phase 3 owners | Exact sandbox/file/facet/read/comparison/relationship/context owner map and focused expected-red sequence | Read-only plan/current-tree inventory; explicit scope and deferrals; no production edit | Phase 3 gate |
+| P4-02 | pending | P4-01 contracts; resource adapter declarations and source store | Sandboxed local-directory adapter with explicit canonical roots, bounded deterministic discovery/inspection/health, and persisted lifecycle | Escape/symlink/special-file/limit/cancellation/reopen cases; declaration admission and no direct loop I/O | P4-01 |
+| P4-03 | pending | Local-file adapter; catalog models/store | CSV and JSON resource facets plus bounded reads through declared runtime capabilities and accepted evidence | Encoding/size/row/depth/key/value bounds; untrusted labeling; invalid paths reach no file I/O | P4-02 |
+| P4-04 | pending | SQLite and file evidence; catalog relationships | Tabular comparison capability/evidence, justified cross-source relationships, and bounded cross-source context | Key/duplicate/null/type/discrepancy/truncation cases; revisions and source provenance remain inspectable | P4-03 |
+| P4-05 | pending | Complete deterministic non-database vertical | Public Journey B: find newest allowed export, compare with SQLite customers, explain discrepancies, and retain evidence | Scripted `Agent.attach/run/inspect`, restart-safe evidence/transcript, forbidden-path and stale-input repair | P4-04 |
+| P4-06 | pending | Passing P4-02 through P4-05 slices | Consolidated dual-Python/static/architecture/root/distribution/review gate and one Phase 4 commit | Exact commands/results in `QUALITY_GATES.md`; no Phase 5 work in gate commit | P4-05 |
 
 ### Ordered P2-03 internal tasks
 

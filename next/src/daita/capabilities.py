@@ -230,6 +230,44 @@ class Executor(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class ExtensionDeclarations:
+    """Immutable capability identities advertised by one extension boundary."""
+
+    capabilities: tuple[Capability, ...] = ()
+    executor_ids: tuple[str, ...] = ()
+    tool_views: tuple[ToolView, ...] = ()
+
+    def __post_init__(self) -> None:
+        capabilities = tuple(self.capabilities)
+        executor_ids = tuple(self.executor_ids)
+        tool_views = tuple(self.tool_views)
+        if any(not isinstance(item, Capability) for item in capabilities):
+            raise TypeError("extension capabilities must contain Capability records")
+        if any(not isinstance(item, ToolView) for item in tool_views):
+            raise TypeError("extension tool_views must contain ToolView records")
+        for executor_id in executor_ids:
+            _required_text(executor_id, "extension executor id")
+        capability_ids = tuple(item.id for item in capabilities)
+        view_names = tuple(item.name for item in tool_views)
+        for values, field_name in (
+            (capability_ids, "capability ids"),
+            (executor_ids, "executor ids"),
+            (view_names, "tool view names"),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"extension declarations have duplicate {field_name}")
+        if {item.executor_id for item in capabilities} != set(executor_ids):
+            raise ValueError(
+                "extension executor ids must exactly match declared capabilities"
+            )
+        if any(item.capability_id not in capability_ids for item in tool_views):
+            raise ValueError("extension tool view references an undeclared capability")
+        object.__setattr__(self, "capabilities", capabilities)
+        object.__setattr__(self, "executor_ids", executor_ids)
+        object.__setattr__(self, "tool_views", tool_views)
+
+
+@dataclass(frozen=True, slots=True)
 class _Registration:
     capability: Capability
     executor: Executor
@@ -326,6 +364,33 @@ class CapabilityRegistry:
         frozen = FrozenJsonObject.from_mapping(arguments)
         _validate_object(capability.input_schema, frozen, CapabilityInputError)
         return frozen
+
+    def validate_declarations(self, declarations: ExtensionDeclarations) -> None:
+        """Admit an extension only when its advertised contracts are registered."""
+
+        if not isinstance(declarations, ExtensionDeclarations):
+            raise TypeError("declarations must be ExtensionDeclarations")
+        for capability in declarations.capabilities:
+            try:
+                registered = self.capability(capability.id)
+            except KeyError as error:
+                raise ValueError(
+                    f"extension capability is not registered: {capability.id}"
+                ) from error
+            if registered != capability:
+                raise ValueError(
+                    f"extension capability contract differs from registry: "
+                    f"{capability.id}"
+                )
+        for executor_id in declarations.executor_ids:
+            if executor_id not in self._executors:
+                raise ValueError(f"extension executor is not registered: {executor_id}")
+        for view in declarations.tool_views:
+            registered_view = self._tool_views.get(view.name)
+            if registered_view != view:
+                raise ValueError(
+                    f"extension tool view differs from registry: {view.name}"
+                )
 
     def validate_evidence(
         self,

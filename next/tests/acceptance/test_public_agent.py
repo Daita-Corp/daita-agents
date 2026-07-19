@@ -229,7 +229,12 @@ async def test_invalid_embedded_composition_writes_no_agent_home(
     tmp_path: Path,
 ) -> None:
     with pytest.raises(AgentNotConfiguredError):
-        await Agent.create("atlas", root=tmp_path, model=_provider("unused"))
+        await Agent.create(
+            "atlas",
+            root=tmp_path,
+            model=_provider("unused"),
+            context_builder=TextContext(),
+        )
     assert not (tmp_path / "agents" / "atlas").exists()
 
 

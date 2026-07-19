@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Self
 
+from .adapters.models import SourceRegistration
+from .adapters.protocols import ResourceSource
 from .capabilities import CapabilityRegistry
 from .hosting.embedded import (
     AgentAlreadyExistsError,
@@ -104,6 +106,9 @@ class Agent:
 
     async def run(self, message: str, *, session_id: str | None = None) -> LoopExit:
         return await self._embedded.run(message, session_id=session_id)
+
+    async def attach(self, source: ResourceSource) -> SourceRegistration:
+        return await self._embedded.attach(source)
 
     async def inspect(self, operation_id: str) -> OperationSnapshot:
         return await self._embedded.inspect(operation_id)

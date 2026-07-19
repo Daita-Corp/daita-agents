@@ -477,6 +477,42 @@ Every row is backed by the executed evidence above.
 The production-provider row is satisfied by P2-Q07b; its live evidence was
 audited for internal consistency and not rerun at additional paid cost.
 
+## Phase 3 — data vertical slice and catalog
+
+Status: **PASS. Phase 3 is complete and Phase 4 may begin.**
+
+The Phase 3 gate will be recorded through a lean evidence sequence:
+
+| ID | Scope | Required evidence before PASS |
+| --- | --- | --- |
+| P3-Q01 | Scope and contract inventory | SQLite-only task/test map; deferred cloud/additional-database dispositions reconciled; catalog/data/adapter/runtime owners and expected-red slices locked |
+| P3-Q02 | Catalog vertical | Resource/facet/relationship/revision/sync contracts; atomic SQLite catalog persistence; FTS search; bounded traversal; reopen/rollback/corruption proof |
+| P3-Q03 | SQLite source vertical | Persisted source lifecycle; discovery/inspection; declared query capability/executor; source-scope and sole-executor architecture proof |
+| P3-Q04 | SQL and data-domain vertical | Pre-I/O SQL/scope/parameter validation; bounded accepted evidence and projections; untrusted context; repair and evidence-grounded readiness |
+| P3-Q05 | Public Journey A | `Agent.attach/run/inspect` discovers/searches/inspects SQLite catalog state, executes only validated SQL, completes from accepted evidence, and remains inspectable after reopen |
+| P3-Q06 | Consolidated phase gate | Focused and complete deterministic suites on Python 3.11/3.12; architecture/import/static/root-oracle/distribution/fresh-install checks; parity/ledger review; scoped hooks and exact gate commit |
+
+### Executed Phase 3 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P3-Q01a | plan, ADRs, current v2, and root v1 oracle (read-only) | Re-read Sections 6/15 and Phase 3 supporting sections; inventory catalog/SQL/source/projection/readiness owners and leaf tests; independently audit documentation and Phase 3 scope | PASS — no new product decision is required; six coherent tasks cover the SQLite-only vertical; exact catalog/data/runtime/adapter owners and focused contract slices are locked before production edits |
+| P3-Q01b | `next/` | `../.venv/bin/python scripts/build_test_disposition.py --write`; isolated `pytest -o addopts='' tests/architecture/test_test_disposition.py -q -p no:cacheprovider` | PASS — 4 passed in 0.05s; deferred cloud, MySQL/MongoDB, Focus, telemetry, evaluation, and schema-synthesis paths no longer silently expand Phase 3 |
+| P3-Q02a | `next/` | Focused catalog model/protocol/store/service/source selections | PASS — immutable identity/revision/facet/relationship/sync contracts, Migration 8, atomic snapshot replacement, FTS, traversal, isolation, rollback, reopen, and refresh semantics pass |
+| P3-Q03a | `next/` | Focused adapter/discovery/query/declaration selections | PASS — read-only SQLite discovery/inspection/query, persisted source lifecycle, stable declarations, same-source refresh, and cancellation-safe connection ownership pass; invalid SQL reaches no connector I/O |
+| P3-Q04a | `next/` | Focused SQL/result/controller/context and query-freshness selections | PASS — 35 original data-domain cases plus 8 freshness/provenance cases pass; missing/malformed/stale catalog facts fail closed before user SQL, and accepted evidence carries bounded revision provenance |
+| P3-Q05a | `next/` | `tests/acceptance/test_sqlite_catalog_journey.py` and public reattach journey | PASS — catalog search/inspect, premature completion repair, mutation rejection, bounded query evidence/citation, transcript/reopen, declaration admission, and repeated attach all pass |
+| P3-Q06a | `next/` | Complete isolated suite with `PYTHONPATH=src:<site-packages> <python> -S -m pytest -o addopts='' tests/ -m 'not requires_llm and not requires_db' -q --tb=short -p no:cacheprovider` on CPython 3.11.15 and 3.12.7 | PASS — 817 selected and 1 deselected in 9.93s/10.70s |
+| P3-Q06b | `next/` | Black check; byte compilation; full mypy with `MYPYPATH=src`; pyright 1.1.411 | PASS — Black reports 132 files unchanged; compilation clean; mypy reports no issues in 131 files; pyright reports 0 errors/warnings |
+| P3-Q06c | repository root and `next/` | Isolated architecture suite; disposition reproduction; root-oracle diff from `8545f85`; symlink and diff scans | PASS — 60 architecture tests; generated disposition is current; no root change, v2 symlink, or diff error |
+| P3-Q06d | repository root | `.venv/bin/python -m pytest tests/ -m 'not requires_llm and not requires_db' -q --tb=short -p no:cacheprovider` | PASS — 2,498 passed and 221 deselected in 10.00s; the root oracle remains unchanged |
+| P3-Q06e | clean copies under `/private/tmp/daita-v2-p3-gate.Y4lCqE` and `/private/tmp/daita-root-p3-gate.xQPYFd` | Build v2/root sdist and wheel without isolation; inspect cross-inclusion; install v2 wheel without dependencies into fresh CPython 3.11/3.12 environments; isolated import smoke | PASS — v2 wheel/sdist contain 53/73 entries at `2.0.0a0`; root remains 401/442 at `1.0.0`; no tests/scripts/nested `next/` cross the v2 distribution and no `next/` crosses root; both fresh imports resolve to their own `site-packages` without optional SDKs |
+| P3-Q06f | final Phase 3 diff | Independent boundary review, four root-cause repairs, parity/ledger/scope review, configured hooks, and exact containing commit | PASS — repeated attach history, source freshness/provenance, adapter declaration admission, and cancellation-safe discovery were repaired with regressions; every changed repository path remains under `next/`; the containing commit is `chore(v2-phase-3): complete phase 3 gate` |
+
+No live provider or external database run was required for Phase 3: the
+production-model translation boundary was already proven in Phase 2, while
+the Phase 3 gate is the deterministic local SQLite data journey.
+
 ## Live and external gates
 
 - Phase 0 requires no live provider or external database.

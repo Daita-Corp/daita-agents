@@ -252,8 +252,12 @@ def test_sqlite_adapter_imports_only_canonical_records_and_standard_library() ->
     assert imported_modules == {
         "__future__",
         "_json",
+        "adapters.models",
         "asyncio",
         "capabilities",
+        "catalog.models",
+        "catalog.protocols",
+        "collections",
         "collections.abc",
         "dataclasses",
         "datetime",
@@ -370,6 +374,10 @@ def test_sqlite_adapter_has_no_opaque_snapshot_or_history_rewrite_sql() -> None:
         "UPSERT operation",
     )
     assert all(forbidden.search(sample) is not None for sample in samples)
+    allowed_current_projection_deletes = {
+        "delete from catalog_resource_search where agent_id = ? and source_id = ?",
+        "delete from catalog_resources where agent_id = ? and source_id = ?",
+    }
 
     violations = [
         (node.lineno, node.value)
@@ -377,6 +385,8 @@ def test_sqlite_adapter_has_no_opaque_snapshot_or_history_rewrite_sql() -> None:
         if isinstance(node, ast.Constant)
         and isinstance(node.value, str)
         and forbidden.search(node.value) is not None
+        and " ".join(node.value.lower().split())
+        not in allowed_current_projection_deletes
     ]
 
     assert violations == []

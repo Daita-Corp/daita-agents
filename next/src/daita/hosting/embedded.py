@@ -14,7 +14,19 @@ import tomllib
 from typing import Self, TypeVar
 from uuid import uuid4
 
+from ..adapters.models import DiscoveryRequest, SourceRegistration
+from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
+from ..adapters.sqlite_query import SQLiteQueryBackend
+from ..catalog.capabilities import catalog_declarations
+from ..catalog.models import CatalogSync, CatalogSyncStatus
+from ..catalog.service import CatalogService
 from ..capabilities import CapabilityRegistry
+from ..domains.data import (
+    CatalogDataView,
+    DataContextBuilder,
+    DataDomainController,
+    sqlite_query_declarations,
+)
 from ..identity import AgentIdentity
 from ..llm.protocols import ModelProvider
 from ..loop.driver import AgentLoop, ContextBuilder, DomainController
@@ -43,15 +55,19 @@ def _validate_loop_configuration(
     model: ModelProvider | None,
     context_builder: ContextBuilder | None,
     domain: DomainController | None,
+    capabilities: CapabilityRegistry | None,
 ) -> None:
-    configured = (
-        model is not None,
-        context_builder is not None,
-        domain is not None,
-    )
-    if any(configured) and not all(configured):
+    if model is None and (context_builder is not None or domain is not None):
         raise AgentNotConfiguredError(
-            "model, context_builder, and domain must be configured together"
+            "context_builder and domain require a configured model"
+        )
+    if (context_builder is None) != (domain is None):
+        raise AgentNotConfiguredError(
+            "context_builder and domain must be configured together"
+        )
+    if model is not None and context_builder is None and capabilities is not None:
+        raise AgentNotConfiguredError(
+            "custom capabilities require a custom context_builder and domain"
         )
 
 
@@ -168,6 +184,7 @@ class EmbeddedAgent:
         writer_lock: _WriterLock,
         store: SQLiteOperationStore,
         loop: AgentLoop | None,
+        capabilities: CapabilityRegistry,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
     ) -> None:
@@ -176,6 +193,7 @@ class EmbeddedAgent:
         self._writer_lock = writer_lock
         self._store = store
         self._loop = loop
+        self._capabilities = capabilities
         self._clock = clock
         self._id_factory = id_factory
         self._mutation_lock = asyncio.Lock()
@@ -196,7 +214,7 @@ class EmbeddedAgent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
     ) -> Self:
-        _validate_loop_configuration(model, context_builder, domain)
+        _validate_loop_configuration(model, context_builder, domain, capabilities)
         resolved_clock = _utc_now if clock is None else clock
         resolved_id_factory = _new_id if id_factory is None else id_factory
         admission, admission_cancelled = await _await_sync_completion(
@@ -224,7 +242,10 @@ class EmbeddedAgent:
                 display_name=name,
                 created_at=created_at,
             )
-            store = await SQLiteOperationStore.open(state_path)
+            store = await SQLiteOperationStore.open(
+                state_path,
+                clock=resolved_clock,
+            )
             await store.initialize_identity(identity)
             _, manifest_cancelled = await _await_sync_completion(
                 lambda: _write_manifest(home, identity)
@@ -275,7 +296,7 @@ class EmbeddedAgent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
     ) -> Self:
-        _validate_loop_configuration(model, context_builder, domain)
+        _validate_loop_configuration(model, context_builder, domain, capabilities)
         resolved_clock = _utc_now if clock is None else clock
         resolved_id_factory = _new_id if id_factory is None else id_factory
         admission, admission_cancelled = await _await_sync_completion(
@@ -293,7 +314,10 @@ class EmbeddedAgent:
             manifest = manifest_result
             if manifest_cancelled:
                 raise asyncio.CancelledError
-            store = await SQLiteOperationStore.open(home / "state.db")
+            store = await SQLiteOperationStore.open(
+                home / "state.db",
+                clock=resolved_clock,
+            )
             identity = await store.load_identity()
             if identity is None or identity != manifest:
                 raise AgentIdentityMismatchError(
@@ -338,23 +362,47 @@ class EmbeddedAgent:
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
     ) -> Self:
-        _validate_loop_configuration(model, context_builder, domain)
+        _validate_loop_configuration(model, context_builder, domain, capabilities)
+        resolved_context = context_builder
+        resolved_domain = domain
+        resolved_capabilities = capabilities
+        if context_builder is None and domain is None and capabilities is None:
+            catalog_service = CatalogService(store)
+            data_view = CatalogDataView(store, catalog_service)
+            catalog = catalog_declarations(identity.id, catalog_service)
+            query = sqlite_query_declarations(
+                identity.id,
+                SQLiteQueryBackend(store, data_view),
+            )
+            resolved_capabilities = CapabilityRegistry(
+                capabilities=(*catalog.capabilities, *query.capabilities),
+                executors=(*catalog.executors, *query.executors),
+                tool_views=(*catalog.tool_views, *query.tool_views),
+            )
+            if model is not None:
+                resolved_context = DataContextBuilder(data_view)
+                resolved_domain = DataDomainController(
+                    resolved_capabilities,
+                    data_view,
+                    clock=clock,
+                )
+        active_capabilities = resolved_capabilities or CapabilityRegistry()
         runtime = OperationRuntime(
             clock=clock,
             id_factory=id_factory,
-            capabilities=capabilities,
+            capabilities=active_capabilities,
             store=store,
             blob_store=LocalBlobStore(home / "blobs"),
             policy=policy,
         )
         loop = (
             None
-            if model is None or context_builder is None or domain is None
+            if model is None or resolved_context is None or resolved_domain is None
             else AgentLoop(
                 runtime=runtime,
                 model=model,
-                context_builder=context_builder,
-                domain=domain,
+                context_builder=resolved_context,
+                domain=resolved_domain,
                 budgets=budgets,
             )
         )
@@ -364,6 +412,7 @@ class EmbeddedAgent:
             writer_lock=writer_lock,
             store=store,
             loop=loop,
+            capabilities=active_capabilities,
             clock=clock,
             id_factory=id_factory,
         )
@@ -387,6 +436,95 @@ class EmbeddedAgent:
                 created_at=self._clock(),
             )
             return await loop.run(trigger)
+
+    async def attach(self, source: ResourceSource) -> SourceRegistration:
+        """Run one bounded source discovery and commit its complete catalog view."""
+
+        if not isinstance(source, ResourceSource):
+            raise TypeError("source must provide async open(...)")
+        async with self._mutation_lock:
+            self._require_open()
+            started_at = self._clock()
+            adapter = await source.open(
+                agent_id=self.identity.id,
+                attached_at=started_at,
+                clock=self._clock,
+            )
+            if not isinstance(adapter, ResourceAdapter):
+                raise TypeError("source open() must return a ResourceAdapter")
+            try:
+                self._capabilities.validate_declarations(adapter.declarations())
+            except (TypeError, ValueError) as error:
+                await adapter.close()
+                raise AgentHomeError(
+                    "source declarations do not match the configured runtime"
+                ) from error
+            registration = adapter.registration
+            sync_id = self._id_factory("catalog-sync")
+            running = CatalogSync(
+                id=sync_id,
+                agent_id=self.identity.id,
+                source_id=registration.id,
+                adapter_id=registration.adapter_id,
+                status=CatalogSyncStatus.RUNNING,
+                started_at=started_at,
+            )
+            try:
+                await self._store.record_sync(running)
+                result = await adapter.discover(
+                    DiscoveryRequest(
+                        agent_id=self.identity.id,
+                        source_id=registration.id,
+                        sync_id=sync_id,
+                        requested_at=started_at,
+                    )
+                )
+                existing = await self._store.load_source(
+                    self.identity.id,
+                    registration.id,
+                )
+                if existing is None:
+                    committed_registration = await self._store.register_source(
+                        registration
+                    )
+                elif (
+                    existing.active
+                    and existing.adapter_id == registration.adapter_id
+                    and existing.native_identity == registration.native_identity
+                    and existing.configuration == registration.configuration
+                ):
+                    committed_registration = existing
+                else:
+                    raise AgentHomeError(
+                        f"source registration conflicts with existing source: "
+                        f"{registration.id}"
+                    )
+                await self._store.commit_snapshot(result.snapshot)
+                return committed_registration
+            except BaseException as error:
+                failed_at = self._clock()
+                error_code = (
+                    error.code
+                    if isinstance(error, ResourceAdapterError)
+                    else "source_attach_failed"
+                )
+                failed = CatalogSync(
+                    id=sync_id,
+                    agent_id=self.identity.id,
+                    source_id=registration.id,
+                    adapter_id=registration.adapter_id,
+                    status=CatalogSyncStatus.FAILED,
+                    started_at=started_at,
+                    completed_at=max(failed_at, started_at),
+                    error_code=error_code,
+                )
+                try:
+                    await self._store.record_sync(failed)
+                except BaseException:
+                    pass
+                raise
+            finally:
+                await adapter.close()
 
     async def inspect(self, operation_id: str) -> OperationSnapshot:
         self._require_open()
