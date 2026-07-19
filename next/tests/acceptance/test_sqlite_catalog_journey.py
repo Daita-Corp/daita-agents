@@ -9,6 +9,7 @@ from daita._json import FrozenJsonObject
 from daita.catalog import ResourceKind, catalog_resource_id
 from daita.llm.models import (
     FinishReason,
+    ModelProfile,
     ModelRequest,
     ModelResponse,
     TextBlock,
@@ -17,6 +18,12 @@ from daita.llm.models import (
 from daita.loop.models import LoopExitKind
 
 NOW = datetime(2026, 7, 18, 22, 0, tzinfo=timezone.utc)
+PROFILE = ModelProfile(
+    id="mock:sqlite-journey",
+    context_window_tokens=32_768,
+    max_output_tokens=4_096,
+    supports_tools=True,
+)
 
 
 class JourneyProvider:
@@ -73,6 +80,7 @@ async def test_public_persistent_grounded_sqlite_journey(tmp_path: Path) -> None
         "atlas",
         root=tmp_path / "state",
         model=provider,
+        model_profile=PROFILE,
         clock=lambda: NOW,
         id_factory=_ids(),
     )

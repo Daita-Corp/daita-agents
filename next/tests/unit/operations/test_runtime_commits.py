@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from daita._json import FrozenJsonObject
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -89,6 +90,55 @@ async def test_exact_duplicate_trigger_returns_the_existing_operation() -> None:
         "trigger.received",
         "operation.created",
     ]
+
+
+async def test_context_built_event_carries_the_request_selection_metadata() -> None:
+    runtime = OperationRuntime(clock=lambda: NOW)
+    started = await runtime.begin(
+        AgentTrigger(
+            id="trigger-context-audit",
+            agent_id="agent-1",
+            kind=TriggerKind.USER,
+            source_id="user-1",
+            payload={"message": "hello"},
+            created_at=NOW,
+        )
+    )
+    turn = await runtime.begin_turn(started.operation.id)
+    selection = {
+        "profile_id": "mock:scripted",
+        "schema_version": 1,
+        "selected_blocks": [{"id": "data.intent"}],
+    }
+    request = ModelRequest(
+        operation_id=started.operation.id,
+        turn_id=turn.id,
+        messages=(
+            CanonicalMessage(
+                agent_id="agent-1",
+                operation_id=started.operation.id,
+                turn_id=turn.id,
+                role=MessageRole.USER,
+                content=(TextBlock("hello"),),
+            ),
+        ),
+        context_selection=selection,
+    )
+
+    model_call = await runtime.begin_model_call(
+        started.operation.id,
+        turn.id,
+        "mock:scripted",
+        request,
+    )
+    snapshot = await runtime.inspect(started.operation.id)
+
+    context_event = next(
+        event for event in snapshot.events if event.type == "context.built"
+    )
+    assert context_event.model_call_id == model_call.id
+    assert isinstance(context_event.payload, FrozenJsonObject)
+    assert context_event.payload.to_dict() == {"context_selection": selection}
 
 
 async def test_failed_in_memory_commit_does_not_publish_partial_state() -> None:

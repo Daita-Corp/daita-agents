@@ -6,13 +6,109 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
+import re
 
-from .._json import FrozenJsonObject
+from .._json import FrozenJsonObject, canonical_json
+
+_MAX_CONTEXT_SELECTION_CHARACTERS = 256 * 1_024
 
 
 def _required_text(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
+
+
+_PROVIDER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProfile:
+    """Capabilities and hard token limits for one canonical model identity.
+
+    Profiles are provider-neutral configuration. Provider adapters translate
+    requests; they do not own context budgeting or routing policy.
+    """
+
+    id: str
+    context_window_tokens: int
+    max_output_tokens: int
+    supports_tools: bool = False
+    supports_parallel_tools: bool = False
+    supports_structured_output: bool = False
+    supports_streaming: bool = False
+    supports_reasoning: bool = False
+    supports_vision: bool = False
+    supports_documents: bool = False
+    supports_prompt_caching: bool = False
+    supports_native_continuation: bool = False
+    input_cost_per_million_usd: Decimal | None = None
+    output_cost_per_million_usd: Decimal | None = None
+    data_routing_classification: str = "standard"
+    available: bool = True
+    healthy: bool = True
+
+    def __post_init__(self) -> None:
+        _required_text(self.id, "model-profile id")
+        if len(self.id) > 256 or any(character.isspace() for character in self.id):
+            raise ValueError(
+                "model-profile id must be a bounded provider:model identity"
+            )
+        provider, separator, model = self.id.partition(":")
+        if not separator or not _PROVIDER_ID.fullmatch(provider) or not model:
+            raise ValueError("model-profile id must use canonical provider:model form")
+        for token_value, field_name in (
+            (self.context_window_tokens, "context_window_tokens"),
+            (self.max_output_tokens, "max_output_tokens"),
+        ):
+            if (
+                not isinstance(token_value, int)
+                or isinstance(token_value, bool)
+                or token_value < 1
+            ):
+                raise ValueError(f"{field_name} must be a positive integer")
+        if self.max_output_tokens >= self.context_window_tokens:
+            raise ValueError(
+                "max_output_tokens must leave positive model input capacity"
+            )
+        for field_name in (
+            "supports_tools",
+            "supports_parallel_tools",
+            "supports_structured_output",
+            "supports_streaming",
+            "supports_reasoning",
+            "supports_vision",
+            "supports_documents",
+            "supports_prompt_caching",
+            "supports_native_continuation",
+            "available",
+            "healthy",
+        ):
+            if not isinstance(getattr(self, field_name), bool):
+                raise TypeError(f"{field_name} must be a boolean")
+        if self.supports_parallel_tools and not self.supports_tools:
+            raise ValueError("parallel tool support requires native tool support")
+        for cost_value, field_name in (
+            (self.input_cost_per_million_usd, "input_cost_per_million_usd"),
+            (self.output_cost_per_million_usd, "output_cost_per_million_usd"),
+        ):
+            if cost_value is None:
+                continue
+            if not isinstance(cost_value, Decimal):
+                raise TypeError(f"{field_name} must be a Decimal or None")
+            if not cost_value.is_finite() or cost_value < 0:
+                raise ValueError(f"{field_name} must be finite and non-negative")
+        _required_text(
+            self.data_routing_classification,
+            "data_routing_classification",
+        )
+        if len(self.data_routing_classification) > 64:
+            raise ValueError("data_routing_classification must be bounded")
+
+    @property
+    def maximum_input_tokens(self) -> int:
+        """Input capacity after reserving the model's full output allowance."""
+
+        return self.context_window_tokens - self.max_output_tokens
 
 
 class MessageRole(str, Enum):
@@ -187,12 +283,14 @@ class ModelRequest:
     turn_id: str
     messages: tuple[CanonicalMessage, ...]
     tools: tuple[ToolDefinition, ...] = ()
+    context_selection: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _required_text(self.operation_id, "model-request operation_id")
         _required_text(self.turn_id, "model-request turn_id")
         messages = tuple(self.messages)
         tools = tuple(self.tools)
+        context_selection = FrozenJsonObject.from_mapping(self.context_selection)
         if not messages:
             raise ValueError("model request must contain at least one message")
         if any(not isinstance(message, CanonicalMessage) for message in messages):
@@ -206,8 +304,23 @@ class ModelRequest:
         tool_names = [tool.name for tool in tools]
         if len(tool_names) != len(set(tool_names)):
             raise ValueError("Duplicate tool definitions in one model request")
+        if context_selection:
+            schema_version = context_selection.get("schema_version")
+            if (
+                not isinstance(schema_version, int)
+                or isinstance(schema_version, bool)
+                or schema_version < 1
+            ):
+                raise ValueError(
+                    "model-request context selection requires a positive schema_version"
+                )
+        if len(canonical_json(context_selection)) > _MAX_CONTEXT_SELECTION_CHARACTERS:
+            raise ValueError(
+                "model-request context selection exceeds its character bound"
+            )
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
+        object.__setattr__(self, "context_selection", context_selection)
 
 
 @dataclass(frozen=True, slots=True)

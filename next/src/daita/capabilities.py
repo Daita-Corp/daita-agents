@@ -329,6 +329,12 @@ class CapabilityRegistry:
         self._executors = executor_by_id
         self._tool_views = view_by_name
 
+    @property
+    def capability_ids(self) -> frozenset[str]:
+        """Return the immutable semantic IDs available to bounded selectors."""
+
+        return frozenset(self._registrations)
+
     def capability(self, capability_id: str) -> Capability:
         try:
             return self._registrations[capability_id].capability

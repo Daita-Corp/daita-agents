@@ -87,6 +87,7 @@ def test_registry_projects_only_model_visible_capability_fields() -> None:
     )
 
     assert registry.capability("fake.read") is capability
+    assert registry.capability_ids == frozenset({"fake.read"})
     tool = registry.tool_definitions()[0]
     assert tool.name == "read_fake_value"
     assert tool.description == "Read one fake value by key."

@@ -547,6 +547,41 @@ special-case execution paths.
 No live provider or external database run was required for Phase 4. The gate
 uses only sandboxed test-owned local files and SQLite state.
 
+## Phase 5 — context, memory, skills, and learning
+
+Status: **PASS. Phase 5 is complete and Phase 6 may begin.**
+
+Phase 5 used focused tests for its coherent owner slices and one consolidated
+cross-version/static/package gate.
+
+### Executed Phase 5 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P5-Q01 | plan, ADRs, current v2, and root v1 references (read-only) | Re-read Sections 6/15, Phase 5, context/session/memory/learning/skill sections, Journey C, current owners, and retained v1 behavior references | PASS — context, model-profile, compression, memory, learning, skill, Migration 9, public API, and acceptance owners were locked without adding a parallel loop/runtime/catalog owner |
+| P5-Q02 | `next/` | Focused context, model-profile, compression, memory, learning, skill, SQLite-state, public-composition, and Journey C selections | PASS — the consolidated affected selection passed 210 tests; final provenance/approval integration additions passed 2 tests; the active-skill pointer repair selection passed 6 tests |
+| P5-Q03 | `next/` | Public learning, session-compression, skill-guidance, and skill-change acceptance journeys | PASS — exact correction changes a later grounded result; transcripts compress without losing required facts; skills guide but cannot govern; proposal acceptance, rollback history, and reopen remain inspectable |
+| P5-Q04 | `next/` | Independent context/memory/skill/storage review plus exact Phase 5 architecture assertions | PASS after repair — discovery now leaves all active skill-index metadata pinned and activation swaps it atomically under CAS; derived FTS projection refresh is distinguished from append-only history; no remaining blocker |
+| P5-Q05 | `next/` | Complete isolated suite with `PYTHONPATH=src:<site-packages> <python> -S -m pytest -o addopts='' tests/ -m 'not requires_llm and not requires_db' -q --tb=short -p no:cacheprovider` on CPython 3.11.15 and 3.12.7 | PASS — 1,014 selected and 1 deselected in 25.11s/26.47s |
+| P5-Q06 | `next/` | One Black formatting pass; byte compilation; `MYPYPATH=src mypy src/daita tests scripts/build_test_disposition.py`; pyright 1.1.411 | PASS after explicit narrowing — 11 files formatted and 172 unchanged; compilation clean; mypy reports no issues in 182 files; pyright reports 0 errors/warnings |
+| P5-Q07 | repository root and `next/` | Isolated architecture suite; generated test-disposition check; root-oracle diff from `e0bab24`; symlink, sole-executor, and diff scans | PASS — 69 architecture tests; disposition current; no root change, v2 symlink, or diff error; the sole production executor invocation remains in `operations/runtime.py` |
+| P5-Q08 | repository root | `.venv/bin/python -m pytest tests/ -m 'not requires_llm and not requires_db' -q --tb=short -p no:cacheprovider` | PASS — 2,498 passed and 221 deselected in 11.43s; the frozen v1 oracle remains unchanged |
+| P5-Q09 | clean copies under `/private/tmp/daita-p5-packaging.EY70gJ` | Build v2/root sdist and wheel without isolation; inspect cross-inclusion; install v2 wheel without dependencies into fresh CPython 3.11/3.12 environments; isolated import smoke | PASS — v2 wheel/sdist contain 73/96 entries at `2.0.0a0`; root remains 401/442 at `1.0.0`; archive boundaries are clean; both fresh environments import all 68 packaged modules from their own `site-packages` without optional SDKs |
+| P5-Q10 | final Phase 5 diff | Parity/ledger/README/scope review, configured hooks, and exact containing commit | PASS — every changed repository path remains under `next/`; actual Phase 5 test paths replace stale planned paths; the containing commit is `chore(v2-phase-5): complete phase 5 gate` |
+
+The first complete gate exposed two stale Phase 2 architecture-test
+assumptions, not behavioral failures: the SQLite canonical-record allowlist
+predated the Phase 5 records, and its append-only scanner treated replacement
+of the derived memory FTS projection as history deletion. The guardrails now
+name the new canonical modules and exact derived projection while continuing
+to reject memory-version rewrites. The first consolidated static pass then
+found explicit narrowing gaps at two production and seven test boundaries;
+all were repaired without ignores or behavioral changes.
+
+No live provider or external database run was required for Phase 5. The live
+OpenAI boundary was already proven in Phase 2, and all Phase 5 state is local,
+deterministic SQLite/file state.
+
 ## Live and external gates
 
 - Phase 0 requires no live provider or external database.

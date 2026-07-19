@@ -11,6 +11,7 @@ from daita._json import FrozenJsonObject
 from daita.catalog import ResourceKind, catalog_resource_id
 from daita.llm.models import (
     FinishReason,
+    ModelProfile,
     ModelRequest,
     ModelResponse,
     ToolCall,
@@ -20,6 +21,12 @@ from daita.loop.models import LoopExitKind
 NOW = datetime(2026, 7, 19, 2, 0, tzinfo=timezone.utc)
 OLD_MTIME = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
 NEW_MTIME = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+PROFILE = ModelProfile(
+    id="mock:local-file-comparison-journey",
+    context_window_tokens=32_768,
+    max_output_tokens=4_096,
+    supports_tools=True,
+)
 
 
 class JourneyProvider:
@@ -140,6 +147,7 @@ async def test_public_cross_source_local_file_comparison_journey(
         "atlas",
         root=state_root,
         model=provider,
+        model_profile=PROFILE,
         clock=lambda: NOW,
         id_factory=_ids(),
     )

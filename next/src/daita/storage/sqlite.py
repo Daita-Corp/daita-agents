@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -50,16 +50,35 @@ from ..catalog.protocols import (
     CatalogResourceNotFoundError,
     CatalogSyncConflictError,
 )
+from ..context.session import (
+    SessionApprovalStateFact,
+    SessionOperationFacts,
+    SessionResourceScopeFact,
+)
 from ..events.models import CommittedEvent, EventCursor, RuntimeEvent
 from ..events.protocols import (
     EventCursorMismatchError,
     EventCursorNotFoundError,
 )
 from ..identity import AgentIdentity, AgentIdentityConflictError
+from ..learning import (
+    LearningCandidateCategory,
+    LearningDecision,
+    LearningProposal,
+    LearningProposalKind,
+    LearningProposalState,
+    LearningProvenance,
+    LearningRejectionCategory,
+    LearningSourceOutcome,
+    LearningStoreConflictError,
+    LearningTransitionError,
+    resolve_learning_proposal,
+)
 from ..llm.models import (
     CanonicalMessage,
     FinishReason,
     MessageRole,
+    ModelProfile,
     ModelRequest,
     ModelResponse,
     ModelUsage,
@@ -68,7 +87,29 @@ from ..llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
+from ..llm.protocols import ModelProfileConflictError
 from ..loop.models import LoopBudgets, LoopPhase, LoopState, Readiness, Turn
+from ..memory.models import (
+    MemoryCreator,
+    MemoryHistory,
+    MemoryKind,
+    MemoryProvenance,
+    MemoryProvenanceKind,
+    MemoryRecord,
+    MemoryRestoreRequest,
+    MemoryScope,
+    MemorySensitivity,
+    MemorySnapshot,
+    MemoryState,
+    MemorySupersessionRequest,
+    MemoryVersion,
+)
+from ..memory.learning import (
+    ExplicitCorrectionCommit,
+    ExplicitCorrectionResult,
+    ExplicitCorrectionStoreConflictError,
+)
+from ..memory.protocols import MemoryStoreConflictError
 from ..operations.checkpoints import (
     ModelCall,
     ModelCallStatus,
@@ -114,7 +155,26 @@ from ..operations.store import (
 from ..sessions import (
     Session,
     SessionAlreadyExistsError,
+    SessionCompressionCheckpoint,
     SessionTranscript,
+)
+from ..skills.models import (
+    Skill,
+    SkillActivation,
+    SkillActivationMode,
+    SkillIndex,
+    SkillInspection,
+    SkillSource,
+    SkillVersion,
+)
+from ..skills.learning import (
+    SkillChangeAcceptanceResult,
+    SkillChangeCommit,
+    SkillChangeConflictError,
+)
+from ..skills.service import (
+    SkillActivationConflictError,
+    SkillDiscoveryError,
 )
 
 DAITA_V2_APPLICATION_ID = 0x44414932  # ASCII ``DAI2``.
@@ -1170,6 +1230,454 @@ _CATALOG_SCHEMA_SQL = (
     """.strip(),
 )
 
+_CONTEXT_MEMORY_LEARNING_SKILL_SCHEMA_SQL = (
+    """
+    CREATE TABLE agent_model_profiles (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+        profile_id TEXT NOT NULL,
+        context_window_tokens INTEGER NOT NULL CHECK (context_window_tokens > 0),
+        max_output_tokens INTEGER NOT NULL CHECK (
+            max_output_tokens > 0 AND max_output_tokens < context_window_tokens
+        ),
+        supports_tools INTEGER NOT NULL CHECK (supports_tools IN (0, 1)),
+        supports_parallel_tools INTEGER NOT NULL CHECK (
+            supports_parallel_tools IN (0, 1)
+        ),
+        supports_structured_output INTEGER NOT NULL CHECK (
+            supports_structured_output IN (0, 1)
+        ),
+        supports_streaming INTEGER NOT NULL CHECK (supports_streaming IN (0, 1)),
+        supports_reasoning INTEGER NOT NULL CHECK (supports_reasoning IN (0, 1)),
+        supports_vision INTEGER NOT NULL CHECK (supports_vision IN (0, 1)),
+        supports_documents INTEGER NOT NULL CHECK (supports_documents IN (0, 1)),
+        supports_prompt_caching INTEGER NOT NULL CHECK (
+            supports_prompt_caching IN (0, 1)
+        ),
+        supports_native_continuation INTEGER NOT NULL CHECK (
+            supports_native_continuation IN (0, 1)
+        ),
+        input_cost_per_million_usd TEXT,
+        output_cost_per_million_usd TEXT,
+        data_routing_classification TEXT NOT NULL,
+        available INTEGER NOT NULL CHECK (available IN (0, 1)),
+        healthy INTEGER NOT NULL CHECK (healthy IN (0, 1)),
+        CHECK (supports_parallel_tools = 0 OR supports_tools = 1)
+    )
+    """.strip(),
+    """
+    CREATE TRIGGER agent_model_profiles_reject_update
+    BEFORE UPDATE ON agent_model_profiles
+    BEGIN
+        SELECT RAISE(ABORT, 'agent model-profile binding is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER agent_model_profiles_reject_delete
+    BEFORE DELETE ON agent_model_profiles
+    BEGIN
+        SELECT RAISE(ABORT, 'agent model-profile binding is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TABLE session_compression_checkpoints (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        version INTEGER NOT NULL CHECK (version >= 1),
+        through_position INTEGER NOT NULL CHECK (through_position >= 0),
+        through_operation_id TEXT NOT NULL REFERENCES operations(id),
+        source_fingerprint TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (agent_id, session_id, version)
+    )
+    """.strip(),
+    """
+    CREATE INDEX session_compression_current_idx
+        ON session_compression_checkpoints(agent_id, session_id, version DESC)
+    """.strip(),
+    """
+    CREATE TABLE session_compression_operations (
+        checkpoint_id TEXT NOT NULL REFERENCES session_compression_checkpoints(id),
+        position INTEGER NOT NULL CHECK (position >= 0),
+        operation_id TEXT NOT NULL REFERENCES operations(id),
+        PRIMARY KEY (checkpoint_id, position),
+        UNIQUE (checkpoint_id, operation_id)
+    )
+    """.strip(),
+    """
+    CREATE TABLE session_compression_evidence (
+        checkpoint_id TEXT NOT NULL REFERENCES session_compression_checkpoints(id),
+        position INTEGER NOT NULL CHECK (position >= 0),
+        evidence_id TEXT NOT NULL REFERENCES evidence(id),
+        PRIMARY KEY (checkpoint_id, position),
+        UNIQUE (checkpoint_id, evidence_id)
+    )
+    """.strip(),
+    """
+    CREATE TABLE session_compression_approvals (
+        checkpoint_id TEXT NOT NULL REFERENCES session_compression_checkpoints(id),
+        position INTEGER NOT NULL CHECK (position >= 0),
+        approval_id TEXT NOT NULL REFERENCES approvals(id),
+        PRIMARY KEY (checkpoint_id, position),
+        UNIQUE (checkpoint_id, approval_id)
+    )
+    """.strip(),
+    """
+    CREATE TABLE session_compression_resources (
+        checkpoint_id TEXT NOT NULL REFERENCES session_compression_checkpoints(id),
+        position INTEGER NOT NULL CHECK (position >= 0),
+        resource_id TEXT NOT NULL,
+        PRIMARY KEY (checkpoint_id, position),
+        UNIQUE (checkpoint_id, resource_id)
+    )
+    """.strip(),
+    """
+    CREATE TRIGGER session_compression_checkpoints_reject_update
+    BEFORE UPDATE ON session_compression_checkpoints
+    BEGIN
+        SELECT RAISE(ABORT, 'session compression checkpoints are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER session_compression_checkpoints_reject_delete
+    BEFORE DELETE ON session_compression_checkpoints
+    BEGIN
+        SELECT RAISE(ABORT, 'session compression checkpoints are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER session_compression_operations_reject_update
+    BEFORE UPDATE ON session_compression_operations
+    BEGIN
+        SELECT RAISE(ABORT, 'session compression operation links are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER session_compression_operations_reject_delete
+    BEFORE DELETE ON session_compression_operations
+    BEGIN
+        SELECT RAISE(ABORT, 'session compression operation links are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER session_compression_evidence_reject_update
+    BEFORE UPDATE ON session_compression_evidence
+    BEGIN
+        SELECT RAISE(ABORT, 'session compression evidence links are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER session_compression_evidence_reject_delete
+    BEFORE DELETE ON session_compression_evidence
+    BEGIN
+        SELECT RAISE(ABORT, 'session compression evidence links are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER session_compression_approvals_reject_update
+    BEFORE UPDATE ON session_compression_approvals
+    BEGIN
+        SELECT RAISE(ABORT, 'session compression approval links are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER session_compression_approvals_reject_delete
+    BEFORE DELETE ON session_compression_approvals
+    BEGIN
+        SELECT RAISE(ABORT, 'session compression approval links are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER session_compression_resources_reject_update
+    BEFORE UPDATE ON session_compression_resources
+    BEGIN
+        SELECT RAISE(ABORT, 'session compression resource links are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER session_compression_resources_reject_delete
+    BEFORE DELETE ON session_compression_resources
+    BEGIN
+        SELECT RAISE(ABORT, 'session compression resource links are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TABLE memory_records (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        user_id TEXT,
+        session_id TEXT REFERENCES sessions(id),
+        source_id TEXT,
+        resource_id TEXT,
+        scope_fingerprint TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        logical_key TEXT NOT NULL,
+        current_version INTEGER NOT NULL CHECK (current_version >= 1),
+        state TEXT NOT NULL CHECK (state IN ('active', 'superseded', 'rejected')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        superseded_by_id TEXT REFERENCES memory_records(id),
+        UNIQUE (agent_id, scope_fingerprint, kind, logical_key),
+        CHECK (resource_id IS NULL OR source_id IS NOT NULL),
+        CHECK (
+            (state = 'superseded' AND superseded_by_id IS NOT NULL)
+            OR (state != 'superseded' AND superseded_by_id IS NULL)
+        )
+    )
+    """.strip(),
+    """
+    CREATE INDEX memory_records_scope_idx
+        ON memory_records(
+            agent_id, state, user_id, session_id, source_id, resource_id,
+            updated_at, id
+        )
+    """.strip(),
+    """
+    CREATE TABLE memory_versions (
+        memory_id TEXT NOT NULL REFERENCES memory_records(id),
+        version INTEGER NOT NULL CHECK (version >= 1),
+        content TEXT NOT NULL,
+        creator TEXT NOT NULL,
+        confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+        sensitivity TEXT NOT NULL CHECK (
+            sensitivity IN ('public', 'internal', 'confidential', 'restricted')
+        ),
+        provenance_kind TEXT NOT NULL,
+        provenance_content_hash TEXT NOT NULL,
+        provenance_operation_id TEXT REFERENCES operations(id),
+        provenance_trigger_id TEXT REFERENCES triggers(id),
+        provenance_evidence_id TEXT REFERENCES evidence(id),
+        provenance_session_id TEXT REFERENCES sessions(id),
+        provenance_external_ref TEXT,
+        attributes_json TEXT NOT NULL,
+        expires_at TEXT,
+        resource_revision TEXT,
+        supersedes_version INTEGER,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (memory_id, version),
+        CHECK (
+            (version = 1 AND supersedes_version IS NULL)
+            OR (version > 1 AND supersedes_version IS NOT NULL
+                AND supersedes_version < version)
+        )
+    )
+    """.strip(),
+    """
+    CREATE TRIGGER memory_versions_reject_update
+    BEFORE UPDATE ON memory_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'memory versions are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER memory_versions_reject_delete
+    BEFORE DELETE ON memory_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'memory versions are append-only');
+    END
+    """.strip(),
+    """
+    CREATE VIRTUAL TABLE memory_search USING fts5(
+        memory_id UNINDEXED,
+        logical_key,
+        content,
+        attributes,
+        tokenize = 'unicode61'
+    )
+    """.strip(),
+    """
+    CREATE TABLE learning_proposals (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        kind TEXT NOT NULL CHECK (kind IN ('memory', 'skill')),
+        category TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('proposed', 'committed', 'rejected')),
+        operation_id TEXT NOT NULL REFERENCES operations(id),
+        trigger_id TEXT NOT NULL REFERENCES triggers(id),
+        source_outcome TEXT NOT NULL,
+        source_hash TEXT NOT NULL,
+        evidence_id TEXT REFERENCES evidence(id),
+        evidence_accepted INTEGER NOT NULL CHECK (evidence_accepted IN (0, 1)),
+        candidate_hash TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        candidate_payload_json TEXT,
+        created_at TEXT NOT NULL,
+        resolved_at TEXT,
+        decision_hash TEXT,
+        result_memory_id TEXT,
+        result_memory_version INTEGER,
+        result_skill_id TEXT,
+        result_skill_version INTEGER,
+        rejection_category TEXT,
+        rejection_reason TEXT,
+        UNIQUE (agent_id, idempotency_key)
+    )
+    """.strip(),
+    """
+    CREATE INDEX learning_proposals_list_idx
+        ON learning_proposals(agent_id, operation_id, state, created_at, id)
+    """.strip(),
+    """
+    CREATE TABLE learning_decisions (
+        proposal_id TEXT NOT NULL REFERENCES learning_proposals(id),
+        decision_hash TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        candidate_hash TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('committed', 'rejected')),
+        decided_at TEXT NOT NULL,
+        result_memory_id TEXT,
+        result_memory_version INTEGER,
+        result_skill_id TEXT,
+        result_skill_version INTEGER,
+        rejection_category TEXT,
+        rejection_reason TEXT,
+        PRIMARY KEY (proposal_id, decision_hash)
+    )
+    """.strip(),
+    """
+    CREATE TRIGGER learning_proposals_reject_identity_update
+    BEFORE UPDATE ON learning_proposals
+    WHEN OLD.state != 'proposed'
+        OR NEW.id != OLD.id
+        OR NEW.agent_id != OLD.agent_id
+        OR NEW.kind != OLD.kind
+        OR NEW.category != OLD.category
+        OR NEW.operation_id != OLD.operation_id
+        OR NEW.trigger_id != OLD.trigger_id
+        OR NEW.source_outcome != OLD.source_outcome
+        OR NEW.source_hash != OLD.source_hash
+        OR NEW.evidence_id IS NOT OLD.evidence_id
+        OR NEW.evidence_accepted != OLD.evidence_accepted
+        OR NEW.candidate_hash != OLD.candidate_hash
+        OR NEW.idempotency_key != OLD.idempotency_key
+        OR NEW.created_at != OLD.created_at
+    BEGIN
+        SELECT RAISE(ABORT, 'learning proposal identity is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER learning_proposals_reject_delete
+    BEFORE DELETE ON learning_proposals
+    BEGIN
+        SELECT RAISE(ABORT, 'learning proposal history is append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER learning_decisions_reject_update
+    BEFORE UPDATE ON learning_decisions
+    BEGIN
+        SELECT RAISE(ABORT, 'learning decisions are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER learning_decisions_reject_delete
+    BEFORE DELETE ON learning_decisions
+    BEGIN
+        SELECT RAISE(ABORT, 'learning decisions are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TABLE skills (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        stable_name TEXT NOT NULL,
+        source TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (agent_id, stable_name)
+    )
+    """.strip(),
+    """
+    CREATE TABLE skill_versions (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        skill_id TEXT NOT NULL REFERENCES skills(id),
+        stable_name TEXT NOT NULL,
+        version TEXT NOT NULL,
+        description TEXT NOT NULL,
+        domains_json TEXT NOT NULL,
+        resource_kinds_json TEXT NOT NULL,
+        required_capability_ids_json TEXT NOT NULL,
+        activation_mode TEXT NOT NULL,
+        sensitivity_notes TEXT,
+        policy_notes TEXT,
+        source TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        instructions TEXT NOT NULL,
+        source_path TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE (agent_id, skill_id, version)
+    )
+    """.strip(),
+    """
+    CREATE TABLE skill_indexes (
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        skill_id TEXT NOT NULL REFERENCES skills(id),
+        version_id TEXT NOT NULL REFERENCES skill_versions(id),
+        stable_name TEXT NOT NULL,
+        version TEXT NOT NULL,
+        description TEXT NOT NULL,
+        domains_json TEXT NOT NULL,
+        resource_kinds_json TEXT NOT NULL,
+        required_capability_ids_json TEXT NOT NULL,
+        activation_mode TEXT NOT NULL,
+        source TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        active_version_id TEXT REFERENCES skill_versions(id),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (agent_id, skill_id)
+    )
+    """.strip(),
+    """
+    CREATE INDEX skill_indexes_name_idx
+        ON skill_indexes(agent_id, stable_name, skill_id)
+    """.strip(),
+    """
+    CREATE TABLE skill_activations (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        skill_id TEXT NOT NULL REFERENCES skills(id),
+        version_id TEXT NOT NULL REFERENCES skill_versions(id),
+        previous_version_id TEXT REFERENCES skill_versions(id),
+        actor_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        activated_at TEXT NOT NULL
+    )
+    """.strip(),
+    """
+    CREATE INDEX skill_activations_history_idx
+        ON skill_activations(agent_id, skill_id, activated_at, id)
+    """.strip(),
+    """
+    CREATE TRIGGER skill_versions_reject_update
+    BEFORE UPDATE ON skill_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'skill versions are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER skill_versions_reject_delete
+    BEFORE DELETE ON skill_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'skill versions are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER skill_activations_reject_update
+    BEFORE UPDATE ON skill_activations
+    BEGIN
+        SELECT RAISE(ABORT, 'skill activations are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER skill_activations_reject_delete
+    BEFORE DELETE ON skill_activations
+    BEGIN
+        SELECT RAISE(ABORT, 'skill activations are append-only');
+    END
+    """.strip(),
+)
+
 
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
@@ -1187,6 +1695,8 @@ _CATALOG_SCHEMA_SQL = (
 # Migration 8 adds attached-source ownership, catalog sync history, complete
 # current-source projections, revision components, bounded FTS5 search, and
 # relationship traversal facts.
+# Migration 9 adds append-only session compression, scoped versioned memory,
+# redaction-safe learning proposals, and immutable skill version history.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -1227,6 +1737,11 @@ _MIGRATIONS = (
         version=8,
         name="add_source_and_catalog_store",
         statements=_CATALOG_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=9,
+        name="add_context_memory_learning_and_skills",
+        statements=_CONTEXT_MEMORY_LEARNING_SKILL_SCHEMA_SQL,
     ),
 )
 
@@ -1328,6 +1843,32 @@ class SQLiteOperationStore:
 
         return await self._run_connection(_load_agent_identity)
 
+    async def bind_model_profile(
+        self,
+        agent_id: str,
+        profile: ModelProfile,
+    ) -> ModelProfile:
+        """Bind or verify the agent's one immutable built-in model profile."""
+
+        _require_identity(agent_id, "agent_id")
+        if not isinstance(profile, ModelProfile):
+            raise TypeError("profile must be a ModelProfile")
+        return await self._run_connection(
+            lambda connection: _bind_agent_model_profile(
+                connection,
+                agent_id,
+                profile,
+            )
+        )
+
+    async def load_model_profile(self, agent_id: str) -> ModelProfile | None:
+        """Load the agent's exact configured built-in model profile."""
+
+        _require_identity(agent_id, "agent_id")
+        return await self._run_connection(
+            lambda connection: _load_agent_model_profile(connection, agent_id)
+        )
+
     async def create_session(self, session: Session) -> Session:
         """Persist one stable session identity before its first operation."""
 
@@ -1352,6 +1893,395 @@ class SQLiteOperationStore:
                 agent_id,
                 session_id,
             )
+        )
+
+    async def load_session_compression(
+        self,
+        agent_id: str,
+        session_id: str,
+    ) -> SessionCompressionCheckpoint | None:
+        """Load the latest immutable compression checkpoint for one session."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(session_id, "session_id")
+        return await self._run_connection(
+            lambda connection: _load_session_compression(
+                connection,
+                agent_id,
+                session_id,
+            )
+        )
+
+    async def commit_session_compression(
+        self,
+        checkpoint: SessionCompressionCheckpoint,
+        *,
+        expected_version: int,
+    ) -> SessionCompressionCheckpoint:
+        """Append one exact session-prefix checkpoint under a version guard."""
+
+        if not isinstance(checkpoint, SessionCompressionCheckpoint):
+            raise TypeError("checkpoint must be a SessionCompressionCheckpoint")
+        if (
+            not isinstance(expected_version, int)
+            or isinstance(expected_version, bool)
+            or expected_version < 0
+        ):
+            raise ValueError("expected_version must be a non-negative integer")
+        return await self._run_connection(
+            lambda connection: _commit_session_compression(
+                connection,
+                checkpoint,
+                expected_version=expected_version,
+            )
+        )
+
+    async def load_session_operation(
+        self,
+        operation_id: str,
+    ) -> SessionOperationFacts | None:
+        """Load the bounded durable facts used by session compression."""
+
+        _require_identity(operation_id, "operation_id")
+        return await self._run_connection(
+            lambda connection: _load_session_operation_facts(
+                connection,
+                operation_id,
+            )
+        )
+
+    async def create_memory(
+        self,
+        record: MemoryRecord,
+        version: MemoryVersion,
+    ) -> MemoryHistory:
+        """Create one memory head and its immutable first version atomically."""
+
+        if not isinstance(record, MemoryRecord):
+            raise TypeError("record must be a MemoryRecord")
+        if not isinstance(version, MemoryVersion):
+            raise TypeError("version must be a MemoryVersion")
+        return await self._run_connection(
+            lambda connection: _create_memory(connection, record, version)
+        )
+
+    async def recall_candidates(
+        self,
+        *,
+        query: str,
+        scope: MemoryScope,
+        states: tuple[MemoryState, ...],
+        sensitivities: tuple[MemorySensitivity, ...],
+        unexpired_at: datetime,
+        limit: int,
+    ) -> tuple[MemorySnapshot, ...]:
+        """Return scoped current memory rows after structured pre-filtering."""
+
+        _require_identity(query, "memory query")
+        _validate_memory_query(scope, states, sensitivities, limit)
+        if (
+            not isinstance(unexpired_at, datetime)
+            or unexpired_at.tzinfo is None
+            or unexpired_at.utcoffset() is None
+        ):
+            raise ValueError("unexpired_at must be timezone-aware")
+        return await self._run_connection(
+            lambda connection: _recall_memory_candidates(
+                connection,
+                query=query,
+                scope=scope,
+                states=states,
+                sensitivities=sensitivities,
+                unexpired_at=unexpired_at,
+                limit=limit,
+            )
+        )
+
+    async def list_candidates(
+        self,
+        *,
+        scope: MemoryScope,
+        states: tuple[MemoryState, ...],
+        sensitivities: tuple[MemorySensitivity, ...],
+        limit: int,
+    ) -> tuple[MemorySnapshot, ...]:
+        """List current scoped memory rows without lexical ranking."""
+
+        _validate_memory_query(scope, states, sensitivities, limit)
+        return await self._run_connection(
+            lambda connection: _list_memory_candidates(
+                connection,
+                scope=scope,
+                states=states,
+                sensitivities=sensitivities,
+                limit=limit,
+            )
+        )
+
+    async def load_history(
+        self,
+        agent_id: str,
+        memory_id: str,
+    ) -> MemoryHistory | None:
+        """Load one agent-scoped memory and all immutable versions."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(memory_id, "memory_id")
+        return await self._run_connection(
+            lambda connection: _load_memory_history(
+                connection,
+                agent_id,
+                memory_id,
+            )
+        )
+
+    async def supersede(
+        self,
+        request: MemorySupersessionRequest,
+    ) -> MemoryHistory:
+        """Append a replacement memory version under an exact head guard."""
+
+        if not isinstance(request, MemorySupersessionRequest):
+            raise TypeError("request must be a MemorySupersessionRequest")
+        return await self._run_connection(
+            lambda connection: _replace_memory_version(
+                connection,
+                agent_id=request.agent_id,
+                memory_id=request.memory_id,
+                expected_version=request.expected_version,
+                replacement=request.replacement,
+                restore_version=None,
+            )
+        )
+
+    async def restore(self, request: MemoryRestoreRequest) -> MemoryHistory:
+        """Append a validated copy of one historical memory version."""
+
+        if not isinstance(request, MemoryRestoreRequest):
+            raise TypeError("request must be a MemoryRestoreRequest")
+        return await self._run_connection(
+            lambda connection: _replace_memory_version(
+                connection,
+                agent_id=request.agent_id,
+                memory_id=request.memory_id,
+                expected_version=request.expected_version,
+                replacement=request.replacement,
+                restore_version=request.restore_version,
+            )
+        )
+
+    async def load_resource_alias(
+        self,
+        scope: MemoryScope,
+        logical_key: str,
+    ) -> MemoryHistory | None:
+        """Load one exact resource-alias logical identity and its history."""
+
+        if not isinstance(scope, MemoryScope):
+            raise TypeError("scope must be a MemoryScope")
+        _require_identity(logical_key, "logical_key")
+        return await self._run_connection(
+            lambda connection: _load_resource_alias(
+                connection,
+                scope,
+                logical_key,
+            )
+        )
+
+    async def commit_explicit_correction(
+        self,
+        request: ExplicitCorrectionCommit,
+    ) -> ExplicitCorrectionResult:
+        """Atomically commit one correction proposal and alias-memory change."""
+
+        if not isinstance(request, ExplicitCorrectionCommit):
+            raise TypeError("request must be an ExplicitCorrectionCommit")
+        return await self._run_connection(
+            lambda connection: _commit_explicit_correction(connection, request)
+        )
+
+    async def create_proposal(
+        self,
+        proposal: LearningProposal,
+    ) -> LearningProposal:
+        """Persist a proposal idempotently without retaining rejected payloads."""
+
+        if not isinstance(proposal, LearningProposal):
+            raise TypeError("proposal must be a LearningProposal")
+        return await self._run_connection(
+            lambda connection: _create_learning_proposal(connection, proposal)
+        )
+
+    async def load_proposal(
+        self,
+        agent_id: str,
+        proposal_id: str,
+    ) -> LearningProposal | None:
+        """Load one proposal within its authoritative agent scope."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(proposal_id, "proposal_id")
+        return await self._run_connection(
+            lambda connection: _load_learning_proposal(
+                connection,
+                agent_id,
+                proposal_id,
+            )
+        )
+
+    async def list_proposals(
+        self,
+        agent_id: str,
+        *,
+        operation_id: str | None,
+        states: tuple[LearningProposalState, ...],
+        limit: int,
+    ) -> tuple[LearningProposal, ...]:
+        """List bounded proposal history using explicit state filters."""
+
+        _require_identity(agent_id, "agent_id")
+        if operation_id is not None:
+            _require_identity(operation_id, "operation_id")
+        if not states or any(
+            not isinstance(state, LearningProposalState) for state in states
+        ):
+            raise ValueError("states must contain LearningProposalState values")
+        if len(states) != len(set(states)):
+            raise ValueError("states cannot contain duplicates")
+        _require_bounded_limit(limit, maximum=200)
+        return await self._run_connection(
+            lambda connection: _list_learning_proposals(
+                connection,
+                agent_id,
+                operation_id=operation_id,
+                states=states,
+                limit=limit,
+            )
+        )
+
+    async def resolve_proposal(
+        self,
+        decision: LearningDecision,
+        *,
+        expected_state: LearningProposalState,
+    ) -> LearningProposal:
+        """Commit one idempotent terminal learning decision under state CAS."""
+
+        if not isinstance(decision, LearningDecision):
+            raise TypeError("decision must be a LearningDecision")
+        if not isinstance(expected_state, LearningProposalState):
+            raise TypeError("expected_state must be a LearningProposalState")
+        return await self._run_connection(
+            lambda connection: _resolve_learning_proposal(
+                connection,
+                decision,
+                expected_state=expected_state,
+            )
+        )
+
+    async def record_discovery(
+        self,
+        skill: Skill,
+        version: SkillVersion,
+        index: SkillIndex,
+    ) -> SkillIndex:
+        """Record one immutable discovered version and refresh its projection."""
+
+        if not isinstance(skill, Skill):
+            raise TypeError("skill must be a Skill")
+        if not isinstance(version, SkillVersion):
+            raise TypeError("version must be a SkillVersion")
+        if not isinstance(index, SkillIndex):
+            raise TypeError("index must be a SkillIndex")
+        return await self._run_connection(
+            lambda connection: _record_skill_discovery(
+                connection,
+                skill,
+                version,
+                index,
+            )
+        )
+
+    async def list_skill_index(self, agent_id: str) -> tuple[SkillIndex, ...]:
+        """List compact skill projections in deterministic name order."""
+
+        _require_identity(agent_id, "agent_id")
+        return await self._run_connection(
+            lambda connection: _list_skill_index(connection, agent_id)
+        )
+
+    async def load_skill_index(
+        self,
+        agent_id: str,
+        skill_id: str,
+    ) -> SkillIndex | None:
+        """Load one compact skill projection by stable identity."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(skill_id, "skill_id")
+        return await self._run_connection(
+            lambda connection: _load_skill_index(connection, agent_id, skill_id)
+        )
+
+    async def load_skill_version(
+        self,
+        agent_id: str,
+        version_id: str,
+    ) -> SkillVersion | None:
+        """Load one immutable skill version within its agent scope."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(version_id, "version_id")
+        return await self._run_connection(
+            lambda connection: _load_skill_version(connection, agent_id, version_id)
+        )
+
+    async def inspect_skill(
+        self,
+        agent_id: str,
+        skill_id: str,
+    ) -> SkillInspection | None:
+        """Load one skill's complete version and activation audit history."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(skill_id, "skill_id")
+        return await self._run_connection(
+            lambda connection: _inspect_skill(connection, agent_id, skill_id)
+        )
+
+    async def activate_skill(
+        self,
+        activation: SkillActivation,
+        *,
+        expected_active_version_id: str | None,
+    ) -> SkillInspection:
+        """Append one activation and compare-and-swap the active projection."""
+
+        if not isinstance(activation, SkillActivation):
+            raise TypeError("activation must be a SkillActivation")
+        if expected_active_version_id is not None:
+            _require_identity(
+                expected_active_version_id,
+                "expected_active_version_id",
+            )
+        return await self._run_connection(
+            lambda connection: _activate_skill(
+                connection,
+                activation,
+                expected_active_version_id=expected_active_version_id,
+            )
+        )
+
+    async def commit_skill_change(
+        self,
+        request: SkillChangeCommit,
+    ) -> SkillChangeAcceptanceResult:
+        """Atomically accept, version, activate, and resolve a skill proposal."""
+
+        if not isinstance(request, SkillChangeCommit):
+            raise TypeError("request must be a SkillChangeCommit")
+        return await self._run_connection(
+            lambda connection: _commit_skill_change(connection, request)
         )
 
     async def register_source(
@@ -2465,6 +3395,136 @@ def _load_agent_identity(connection: sqlite3.Connection) -> AgentIdentity | None
     except (TypeError, ValueError) as error:
         raise SQLiteCorruptionError(
             "cannot reconstruct authoritative agent identity"
+        ) from error
+
+
+def _bind_agent_model_profile(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    profile: ModelProfile,
+) -> ModelProfile:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != agent_id:
+            raise ModelProfileConflictError(
+                "model profile belongs to another or uninitialized agent"
+            )
+        current = _load_agent_model_profile(connection, agent_id)
+        if current is None:
+            connection.execute(
+                "INSERT INTO agent_model_profiles("
+                "agent_id, profile_id, context_window_tokens, max_output_tokens, "
+                "supports_tools, supports_parallel_tools, "
+                "supports_structured_output, supports_streaming, "
+                "supports_reasoning, supports_vision, supports_documents, "
+                "supports_prompt_caching, supports_native_continuation, "
+                "input_cost_per_million_usd, output_cost_per_million_usd, "
+                "data_routing_classification, available, healthy"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    agent_id,
+                    profile.id,
+                    profile.context_window_tokens,
+                    profile.max_output_tokens,
+                    int(profile.supports_tools),
+                    int(profile.supports_parallel_tools),
+                    int(profile.supports_structured_output),
+                    int(profile.supports_streaming),
+                    int(profile.supports_reasoning),
+                    int(profile.supports_vision),
+                    int(profile.supports_documents),
+                    int(profile.supports_prompt_caching),
+                    int(profile.supports_native_continuation),
+                    (
+                        None
+                        if profile.input_cost_per_million_usd is None
+                        else _encode_decimal(profile.input_cost_per_million_usd)
+                    ),
+                    (
+                        None
+                        if profile.output_cost_per_million_usd is None
+                        else _encode_decimal(profile.output_cost_per_million_usd)
+                    ),
+                    profile.data_routing_classification,
+                    int(profile.available),
+                    int(profile.healthy),
+                ),
+            )
+            current = profile
+        elif current != profile:
+            raise ModelProfileConflictError(
+                "agent is already bound to a different model profile"
+            )
+        connection.execute("COMMIT")
+        return current
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_agent_model_profile(
+    connection: sqlite3.Connection,
+    agent_id: str,
+) -> ModelProfile | None:
+    rows = connection.execute(
+        "SELECT profile_id, context_window_tokens, max_output_tokens, "
+        "supports_tools, supports_parallel_tools, supports_structured_output, "
+        "supports_streaming, supports_reasoning, supports_vision, "
+        "supports_documents, supports_prompt_caching, "
+        "supports_native_continuation, input_cost_per_million_usd, "
+        "output_cost_per_million_usd, data_routing_classification, available, "
+        "healthy FROM agent_model_profiles WHERE agent_id = ?",
+        (agent_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise SQLiteCorruptionError(
+            "agent database must contain at most one model-profile binding"
+        )
+    row = rows[0]
+    try:
+        input_cost = row["input_cost_per_million_usd"]
+        output_cost = row["output_cost_per_million_usd"]
+        return ModelProfile(
+            id=_sqlite_text(row["profile_id"], "model-profile id"),
+            context_window_tokens=_sqlite_int(
+                row["context_window_tokens"],
+                "model-profile context_window_tokens",
+            ),
+            max_output_tokens=_sqlite_int(
+                row["max_output_tokens"],
+                "model-profile max_output_tokens",
+            ),
+            supports_tools=_decode_bool(row["supports_tools"]),
+            supports_parallel_tools=_decode_bool(row["supports_parallel_tools"]),
+            supports_structured_output=_decode_bool(row["supports_structured_output"]),
+            supports_streaming=_decode_bool(row["supports_streaming"]),
+            supports_reasoning=_decode_bool(row["supports_reasoning"]),
+            supports_vision=_decode_bool(row["supports_vision"]),
+            supports_documents=_decode_bool(row["supports_documents"]),
+            supports_prompt_caching=_decode_bool(row["supports_prompt_caching"]),
+            supports_native_continuation=_decode_bool(
+                row["supports_native_continuation"]
+            ),
+            input_cost_per_million_usd=(
+                None if input_cost is None else _decode_decimal(input_cost)
+            ),
+            output_cost_per_million_usd=(
+                None if output_cost is None else _decode_decimal(output_cost)
+            ),
+            data_routing_classification=_sqlite_text(
+                row["data_routing_classification"],
+                "model-profile data_routing_classification",
+            ),
+            available=_decode_bool(row["available"]),
+            healthy=_decode_bool(row["healthy"]),
+        )
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError(
+            "cannot reconstruct authoritative agent model profile"
         ) from error
 
 
@@ -3697,6 +4757,2731 @@ def _traverse_catalog(
         visited_edges=len(visited_edges),
         truncated=truncated,
     )
+
+
+def _load_session_operation_facts(
+    connection: sqlite3.Connection,
+    operation_id: str,
+) -> SessionOperationFacts | None:
+    row = connection.execute(
+        "SELECT operation.id, operation.agent_id, operation.session_id, "
+        "operation.revision, operation.status, operation.final_text, "
+        "operation.terminal_reason, trigger.payload_json AS trigger_payload_json "
+        "FROM operations AS operation "
+        "JOIN triggers AS trigger ON trigger.id = operation.trigger_id "
+        "WHERE operation.id = ?",
+        (operation_id,),
+    ).fetchone()
+    if row is None or row["session_id"] is None:
+        return None
+    try:
+        evidence_rows = connection.execute(
+            "SELECT id, payload_json FROM evidence "
+            "WHERE operation_id = ? AND accepted = 1 ORDER BY position",
+            (operation_id,),
+        ).fetchall()
+        approval_rows = connection.execute(
+            "SELECT id, status FROM approvals "
+            "WHERE operation_id = ? ORDER BY position",
+            (operation_id,),
+        ).fetchall()
+        observation_rows = connection.execute(
+            "SELECT payload_json FROM observations "
+            "WHERE operation_id = ? AND success = 1 ORDER BY position",
+            (operation_id,),
+        ).fetchall()
+        evidence_payloads = tuple(
+            _decode_json_object(
+                _sqlite_text(
+                    payload_row["payload_json"],
+                    "session operation evidence payload",
+                )
+            )
+            for payload_row in evidence_rows
+        )
+        observation_payloads = tuple(
+            _decode_json_object(
+                _sqlite_text(
+                    payload_row["payload_json"],
+                    "session operation observation payload",
+                )
+            )
+            for payload_row in observation_rows
+        )
+        resource_ids: list[str] = []
+        seen_resources: set[str] = set()
+        for payload in (*evidence_payloads, *observation_payloads):
+            for resource_id in _resource_ids_from_json(payload):
+                if resource_id not in seen_resources:
+                    seen_resources.add(resource_id)
+                    resource_ids.append(resource_id)
+        scope_by_resource: dict[str, SessionResourceScopeFact] = {}
+        for payload in evidence_payloads:
+            for scope_fact in _resource_scope_facts_from_json(payload):
+                previous = scope_by_resource.get(scope_fact.resource_id)
+                if previous is not None and previous != scope_fact:
+                    raise ValueError(
+                        "accepted evidence contains conflicting resource revision scope"
+                    )
+                scope_by_resource[scope_fact.resource_id] = scope_fact
+        trigger_payload = _decode_json_object(
+            _sqlite_text(
+                row["trigger_payload_json"],
+                "session operation trigger payload",
+            )
+        )
+        return SessionOperationFacts(
+            operation_id=_sqlite_text(row["id"], "session operation id"),
+            agent_id=_sqlite_text(row["agent_id"], "session operation agent_id"),
+            session_id=_sqlite_text(
+                row["session_id"],
+                "session operation session_id",
+            ),
+            revision=str(_sqlite_int(row["revision"], "session operation revision")),
+            status=_sqlite_text(row["status"], "session operation status"),
+            evidence_ids=tuple(
+                _sqlite_text(item["id"], "session operation evidence id")
+                for item in evidence_rows
+            ),
+            approval_ids=tuple(
+                _sqlite_text(item["id"], "session operation approval id")
+                for item in approval_rows
+            ),
+            resource_ids=tuple(resource_ids),
+            final_text=_optional_text(row["final_text"]),
+            objective=_bounded_session_fact(trigger_payload.get("message"), 2_048),
+            terminal_reason=_bounded_session_fact(row["terminal_reason"], 512),
+            approval_state_facts=tuple(
+                SessionApprovalStateFact(
+                    approval_id=_sqlite_text(
+                        item["id"],
+                        "session operation approval fact id",
+                    ),
+                    status=ApprovalStatus(
+                        _sqlite_text(
+                            item["status"],
+                            "session operation approval fact status",
+                        )
+                    ),
+                )
+                for item in approval_rows
+            ),
+            resource_scope_facts=tuple(
+                scope_by_resource[resource_id]
+                for resource_id in resource_ids
+                if resource_id in scope_by_resource
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError(
+            f"cannot reconstruct session operation facts {operation_id}"
+        ) from error
+
+
+def _resource_ids_from_json(value: object) -> tuple[str, ...]:
+    values: list[str] = []
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if key == "resource_id" and isinstance(item, str) and item.strip():
+                values.append(item)
+            elif key == "resource_ids" and isinstance(item, (list, tuple)):
+                values.extend(
+                    child for child in item if isinstance(child, str) and child.strip()
+                )
+            else:
+                values.extend(_resource_ids_from_json(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            values.extend(_resource_ids_from_json(item))
+    return tuple(values)
+
+
+def _resource_scope_facts_from_json(
+    value: object,
+) -> tuple[SessionResourceScopeFact, ...]:
+    facts: list[SessionResourceScopeFact] = []
+    if isinstance(value, Mapping):
+        source_id = value.get("source_id")
+        source_revision = value.get("source_revision")
+        if (
+            isinstance(source_id, str)
+            and source_id.strip()
+            and isinstance(source_revision, str)
+            and source_revision.strip()
+        ):
+            resource_id = value.get("resource_id")
+            resource_revision = value.get("resource_revision")
+            if (
+                isinstance(resource_id, str)
+                and resource_id.strip()
+                and isinstance(resource_revision, str)
+                and resource_revision.strip()
+            ):
+                facts.append(
+                    SessionResourceScopeFact(
+                        source_id=source_id,
+                        resource_id=resource_id,
+                        source_revision=source_revision,
+                        resource_revision=resource_revision,
+                    )
+                )
+            resource_revisions = value.get("resource_revisions")
+            if isinstance(resource_revisions, (list, tuple)):
+                for item in resource_revisions:
+                    if not isinstance(item, Mapping):
+                        continue
+                    item_resource_id = item.get("resource_id")
+                    item_revision = item.get("revision")
+                    if (
+                        isinstance(item_resource_id, str)
+                        and item_resource_id.strip()
+                        and isinstance(item_revision, str)
+                        and item_revision.strip()
+                    ):
+                        facts.append(
+                            SessionResourceScopeFact(
+                                source_id=source_id,
+                                resource_id=item_resource_id,
+                                source_revision=source_revision,
+                                resource_revision=item_revision,
+                            )
+                        )
+        for item in value.values():
+            facts.extend(_resource_scope_facts_from_json(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            facts.extend(_resource_scope_facts_from_json(item))
+    return tuple(facts)
+
+
+def _bounded_session_fact(value: object, maximum: int) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    if len(value) <= maximum:
+        return value
+    marker = "…[truncated]"
+    return value[: maximum - len(marker)] + marker
+
+
+def _load_session_compression(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    session_id: str,
+) -> SessionCompressionCheckpoint | None:
+    connection.execute("BEGIN")
+    try:
+        checkpoint = _load_session_compression_in_transaction(
+            connection,
+            agent_id,
+            session_id,
+        )
+        connection.execute("COMMIT")
+        return checkpoint
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_session_compression_in_transaction(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    session_id: str,
+) -> SessionCompressionCheckpoint | None:
+    rows = connection.execute(
+        "SELECT * FROM session_compression_checkpoints "
+        "WHERE agent_id = ? AND session_id = ? ORDER BY version",
+        (agent_id, session_id),
+    ).fetchall()
+    if not rows:
+        return None
+    try:
+        versions = tuple(
+            _sqlite_int(row["version"], "session compression version") for row in rows
+        )
+        if versions != tuple(range(1, len(rows) + 1)):
+            raise SQLiteCorruptionError(
+                "session compression versions must be contiguous from one"
+            )
+        return _decode_session_compression(connection, rows[-1])
+    except SQLiteCorruptionError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError(
+            f"cannot reconstruct session compression for {session_id}"
+        ) from error
+
+
+def _decode_session_compression(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> SessionCompressionCheckpoint:
+    checkpoint_id = _sqlite_text(row["id"], "session compression id")
+
+    def references(table: str, column: str) -> tuple[str, ...]:
+        if table not in {
+            "session_compression_operations",
+            "session_compression_evidence",
+            "session_compression_approvals",
+            "session_compression_resources",
+        }:
+            raise ValueError("unsupported session compression reference table")
+        values = connection.execute(
+            f"SELECT position, {column} FROM {table} "
+            "WHERE checkpoint_id = ? ORDER BY position",
+            (checkpoint_id,),
+        ).fetchall()
+        _validate_contiguous_positions(
+            values,
+            label=f"session compression {column}",
+        )
+        return tuple(
+            _sqlite_text(value[column], f"session compression {column}")
+            for value in values
+        )
+
+    return SessionCompressionCheckpoint(
+        id=checkpoint_id,
+        agent_id=_sqlite_text(row["agent_id"], "session compression agent_id"),
+        session_id=_sqlite_text(row["session_id"], "session compression session_id"),
+        version=_sqlite_int(row["version"], "session compression version"),
+        through_position=_sqlite_int(
+            row["through_position"],
+            "session compression through_position",
+        ),
+        through_operation_id=_sqlite_text(
+            row["through_operation_id"],
+            "session compression through operation id",
+        ),
+        source_fingerprint=_sqlite_text(
+            row["source_fingerprint"],
+            "session compression source fingerprint",
+        ),
+        summary=_sqlite_text(row["summary"], "session compression summary"),
+        operation_ids=references(
+            "session_compression_operations",
+            "operation_id",
+        ),
+        evidence_ids=references("session_compression_evidence", "evidence_id"),
+        approval_ids=references("session_compression_approvals", "approval_id"),
+        resource_ids=references("session_compression_resources", "resource_id"),
+        created_at=_decode_datetime(
+            _sqlite_text(row["created_at"], "session compression created_at")
+        ),
+    )
+
+
+def _commit_session_compression(
+    connection: sqlite3.Connection,
+    checkpoint: SessionCompressionCheckpoint,
+    *,
+    expected_version: int,
+) -> SessionCompressionCheckpoint:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != checkpoint.agent_id:
+            raise AgentIdentityConflictError(
+                "compression checkpoint agent does not match database identity"
+            )
+        current = _load_session_compression_in_transaction(
+            connection,
+            checkpoint.agent_id,
+            checkpoint.session_id,
+        )
+        current_version = 0 if current is None else current.version
+        if current_version != expected_version:
+            raise SQLiteStoreError(
+                f"session compression version changed: expected {expected_version}, "
+                f"found {current_version}"
+            )
+        if checkpoint.version != expected_version + 1:
+            raise SQLiteStoreError(
+                "session compression checkpoint version does not follow its guard"
+            )
+        session_row = connection.execute(
+            "SELECT 1 FROM sessions WHERE id = ? AND agent_id = ?",
+            (checkpoint.session_id, checkpoint.agent_id),
+        ).fetchone()
+        if session_row is None:
+            raise SQLiteStoreError("compression checkpoint session does not exist")
+        prefix_rows = connection.execute(
+            "SELECT link.position, operation.id, operation.agent_id, "
+            "operation.session_id FROM session_operations AS link "
+            "JOIN operations AS operation ON operation.id = link.operation_id "
+            "WHERE link.session_id = ? AND link.position <= ? ORDER BY link.position",
+            (checkpoint.session_id, checkpoint.through_position),
+        ).fetchall()
+        _validate_contiguous_positions(prefix_rows, label="compression source prefix")
+        prefix_ids = tuple(
+            _sqlite_text(row["id"], "compression source operation id")
+            for row in prefix_rows
+        )
+        if (
+            checkpoint.through_position != len(checkpoint.operation_ids) - 1
+            or prefix_ids != checkpoint.operation_ids
+            or not prefix_ids
+            or prefix_ids[-1] != checkpoint.through_operation_id
+            or any(
+                _sqlite_text(row["agent_id"], "compression source agent_id")
+                != checkpoint.agent_id
+                or _sqlite_text(row["session_id"], "compression source session_id")
+                != checkpoint.session_id
+                for row in prefix_rows
+            )
+        ):
+            raise SQLiteStoreError(
+                "compression checkpoint does not match the exact session prefix"
+            )
+        facts = tuple(
+            _load_session_operation_facts(connection, operation_id)
+            for operation_id in prefix_ids
+        )
+        if any(item is None for item in facts):
+            raise SQLiteStoreError("compression checkpoint source facts are missing")
+        typed_facts = tuple(item for item in facts if item is not None)
+        expected_evidence = _ordered_unique_strings(
+            evidence_id for item in typed_facts for evidence_id in item.evidence_ids
+        )
+        expected_approvals = _ordered_unique_strings(
+            approval_id for item in typed_facts for approval_id in item.approval_ids
+        )
+        expected_resources = _ordered_unique_strings(
+            resource_id for item in typed_facts for resource_id in item.resource_ids
+        )
+        if (
+            checkpoint.evidence_ids != expected_evidence
+            or checkpoint.approval_ids != expected_approvals
+            or checkpoint.resource_ids != expected_resources
+        ):
+            raise SQLiteStoreError(
+                "compression checkpoint references do not match its source prefix"
+            )
+        summary = _decode_json_object(checkpoint.summary)
+        required_summary = {
+            "operation_ids": list(checkpoint.operation_ids),
+            "evidence_ids": list(checkpoint.evidence_ids),
+            "approval_ids": list(checkpoint.approval_ids),
+            "resource_ids": list(checkpoint.resource_ids),
+        }
+        if any(summary.get(key) != value for key, value in required_summary.items()):
+            raise SQLiteStoreError(
+                "compression checkpoint summary omits its durable references"
+            )
+        connection.execute(
+            "INSERT INTO session_compression_checkpoints("
+            "id, agent_id, session_id, version, through_position, "
+            "through_operation_id, source_fingerprint, summary, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                checkpoint.id,
+                checkpoint.agent_id,
+                checkpoint.session_id,
+                checkpoint.version,
+                checkpoint.through_position,
+                checkpoint.through_operation_id,
+                checkpoint.source_fingerprint,
+                checkpoint.summary,
+                _encode_datetime(checkpoint.created_at),
+            ),
+        )
+        for table, column, values in (
+            (
+                "session_compression_operations",
+                "operation_id",
+                checkpoint.operation_ids,
+            ),
+            (
+                "session_compression_evidence",
+                "evidence_id",
+                checkpoint.evidence_ids,
+            ),
+            (
+                "session_compression_approvals",
+                "approval_id",
+                checkpoint.approval_ids,
+            ),
+            (
+                "session_compression_resources",
+                "resource_id",
+                checkpoint.resource_ids,
+            ),
+        ):
+            connection.executemany(
+                f"INSERT INTO {table}(checkpoint_id, position, {column}) "
+                "VALUES (?, ?, ?)",
+                (
+                    (checkpoint.id, position, value)
+                    for position, value in enumerate(values)
+                ),
+            )
+        connection.execute("COMMIT")
+        return checkpoint
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _ordered_unique_strings(values: Iterable[str]) -> tuple[str, ...]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return tuple(result)
+
+
+_MEMORY_SNAPSHOT_COLUMNS = """
+    record.id AS record_id,
+    record.agent_id AS record_agent_id,
+    record.user_id AS record_user_id,
+    record.session_id AS record_session_id,
+    record.source_id AS record_source_id,
+    record.resource_id AS record_resource_id,
+    record.scope_fingerprint AS record_scope_fingerprint,
+    record.kind AS record_kind,
+    record.logical_key AS record_logical_key,
+    record.current_version AS record_current_version,
+    record.state AS record_state,
+    record.created_at AS record_created_at,
+    record.updated_at AS record_updated_at,
+    record.superseded_by_id AS record_superseded_by_id,
+    version.memory_id AS version_memory_id,
+    version.version AS version_number,
+    version.content AS version_content,
+    version.creator AS version_creator,
+    version.confidence AS version_confidence,
+    version.sensitivity AS version_sensitivity,
+    version.provenance_kind AS version_provenance_kind,
+    version.provenance_content_hash AS version_provenance_content_hash,
+    version.provenance_operation_id AS version_provenance_operation_id,
+    version.provenance_trigger_id AS version_provenance_trigger_id,
+    version.provenance_evidence_id AS version_provenance_evidence_id,
+    version.provenance_session_id AS version_provenance_session_id,
+    version.provenance_external_ref AS version_provenance_external_ref,
+    version.attributes_json AS version_attributes_json,
+    version.expires_at AS version_expires_at,
+    version.resource_revision AS version_resource_revision,
+    version.supersedes_version AS version_supersedes_version,
+    version.created_at AS version_created_at
+""".strip()
+
+
+def _require_bounded_limit(limit: int, *, maximum: int) -> None:
+    if (
+        not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or limit < 1
+        or limit > maximum
+    ):
+        raise ValueError(f"limit must be an integer from 1 through {maximum}")
+
+
+def _validate_memory_query(
+    scope: MemoryScope,
+    states: tuple[MemoryState, ...],
+    sensitivities: tuple[MemorySensitivity, ...],
+    limit: int,
+) -> None:
+    if not isinstance(scope, MemoryScope):
+        raise TypeError("scope must be a MemoryScope")
+    if not states or any(not isinstance(state, MemoryState) for state in states):
+        raise ValueError("states must contain MemoryState values")
+    if len(states) != len(set(states)):
+        raise ValueError("states cannot contain duplicates")
+    if not sensitivities or any(
+        not isinstance(value, MemorySensitivity) for value in sensitivities
+    ):
+        raise ValueError("sensitivities must contain MemorySensitivity values")
+    if len(sensitivities) != len(set(sensitivities)):
+        raise ValueError("sensitivities cannot contain duplicates")
+    _require_bounded_limit(limit, maximum=256)
+
+
+def _validate_memory_runtime_references(
+    connection: sqlite3.Connection,
+    record: MemoryRecord,
+    version: MemoryVersion,
+) -> None:
+    identity = _load_agent_identity(connection)
+    if identity is None or identity.id != record.scope.agent_id:
+        raise AgentIdentityConflictError(
+            "memory agent does not match the authoritative database identity"
+        )
+    if record.scope.session_id is not None:
+        session = connection.execute(
+            "SELECT agent_id FROM sessions WHERE id = ?",
+            (record.scope.session_id,),
+        ).fetchone()
+        if (
+            session is None
+            or _sqlite_text(session[0], "memory session agent_id")
+            != record.scope.agent_id
+        ):
+            raise MemoryStoreConflictError("memory session is outside its agent scope")
+    if record.scope.source_id is not None:
+        source = connection.execute(
+            "SELECT agent_id FROM attached_sources WHERE id = ?",
+            (record.scope.source_id,),
+        ).fetchone()
+        if (
+            source is None
+            or _sqlite_text(source[0], "memory source agent_id")
+            != record.scope.agent_id
+        ):
+            raise MemoryStoreConflictError("memory source is outside its agent scope")
+    provenance = version.provenance
+    if provenance.operation_id is not None:
+        operation = connection.execute(
+            "SELECT agent_id, trigger_id, session_id FROM operations WHERE id = ?",
+            (provenance.operation_id,),
+        ).fetchone()
+        if operation is None or (
+            _sqlite_text(operation["agent_id"], "memory operation agent_id")
+            != record.scope.agent_id
+        ):
+            raise MemoryStoreConflictError(
+                "memory provenance operation is outside its agent scope"
+            )
+        if (
+            provenance.trigger_id is not None
+            and _sqlite_text(operation["trigger_id"], "memory operation trigger_id")
+            != provenance.trigger_id
+        ):
+            raise MemoryStoreConflictError(
+                "memory provenance trigger does not own its operation"
+            )
+    if provenance.evidence_id is not None:
+        evidence = connection.execute(
+            "SELECT operation_id, accepted FROM evidence WHERE id = ?",
+            (provenance.evidence_id,),
+        ).fetchone()
+        if (
+            evidence is None
+            or _sqlite_int(evidence["accepted"], "memory evidence accepted") != 1
+            or _sqlite_text(evidence["operation_id"], "memory evidence operation_id")
+            != provenance.operation_id
+        ):
+            raise MemoryStoreConflictError(
+                "memory provenance requires accepted evidence from its operation"
+            )
+    if provenance.session_id is not None:
+        session = connection.execute(
+            "SELECT agent_id FROM sessions WHERE id = ?",
+            (provenance.session_id,),
+        ).fetchone()
+        if (
+            session is None
+            or _sqlite_text(session[0], "memory provenance session agent_id")
+            != record.scope.agent_id
+        ):
+            raise MemoryStoreConflictError(
+                "memory provenance session is outside its agent scope"
+            )
+
+
+def _create_memory(
+    connection: sqlite3.Connection,
+    record: MemoryRecord,
+    version: MemoryVersion,
+) -> MemoryHistory:
+    try:
+        MemorySnapshot(record=record, version=version)
+    except (TypeError, ValueError) as error:
+        raise MemoryStoreConflictError(
+            "memory record and first version do not form one snapshot"
+        ) from error
+    if record.current_version != 1 or version.version != 1:
+        raise MemoryStoreConflictError("new memory must begin at version one")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _validate_memory_runtime_references(connection, record, version)
+        existing = _load_memory_history_in_transaction(
+            connection,
+            record.scope.agent_id,
+            record.id,
+        )
+        if existing is not None:
+            if existing.record == record and existing.versions == (version,):
+                connection.execute("COMMIT")
+                return existing
+            raise MemoryStoreConflictError(f"memory already exists: {record.id}")
+        try:
+            _insert_memory_record(connection, record)
+            _insert_memory_version(connection, version)
+            _replace_memory_search(connection, record, version)
+        except sqlite3.IntegrityError as error:
+            raise MemoryStoreConflictError(
+                "memory logical identity or durable reference is already claimed"
+            ) from error
+        history = _load_memory_history_in_transaction(
+            connection,
+            record.scope.agent_id,
+            record.id,
+        )
+        assert history is not None
+        connection.execute("COMMIT")
+        return history
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _insert_memory_record(
+    connection: sqlite3.Connection,
+    record: MemoryRecord,
+) -> None:
+    connection.execute(
+        "INSERT INTO memory_records("
+        "id, agent_id, user_id, session_id, source_id, resource_id, "
+        "scope_fingerprint, kind, logical_key, current_version, state, "
+        "created_at, updated_at, superseded_by_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            record.id,
+            record.scope.agent_id,
+            record.scope.user_id,
+            record.scope.session_id,
+            record.scope.source_id,
+            record.scope.resource_id,
+            record.scope.fingerprint,
+            record.kind.value,
+            record.logical_key,
+            record.current_version,
+            record.state.value,
+            _encode_datetime(record.created_at),
+            _encode_datetime(record.updated_at),
+            record.superseded_by_id,
+        ),
+    )
+
+
+def _insert_memory_version(
+    connection: sqlite3.Connection,
+    version: MemoryVersion,
+) -> None:
+    provenance = version.provenance
+    connection.execute(
+        "INSERT INTO memory_versions("
+        "memory_id, version, content, creator, confidence, sensitivity, "
+        "provenance_kind, provenance_content_hash, provenance_operation_id, "
+        "provenance_trigger_id, provenance_evidence_id, provenance_session_id, "
+        "provenance_external_ref, attributes_json, expires_at, resource_revision, "
+        "supersedes_version, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            version.memory_id,
+            version.version,
+            version.content,
+            version.creator.value,
+            version.confidence,
+            version.sensitivity.value,
+            provenance.kind.value,
+            provenance.content_hash,
+            provenance.operation_id,
+            provenance.trigger_id,
+            provenance.evidence_id,
+            provenance.session_id,
+            provenance.external_ref,
+            canonical_json(version.attributes),
+            _encode_optional_datetime(version.expires_at),
+            version.resource_revision,
+            version.supersedes_version,
+            _encode_datetime(version.created_at),
+        ),
+    )
+
+
+def _replace_memory_search(
+    connection: sqlite3.Connection,
+    record: MemoryRecord,
+    version: MemoryVersion,
+) -> None:
+    connection.execute("DELETE FROM memory_search WHERE memory_id = ?", (record.id,))
+    connection.execute(
+        "INSERT INTO memory_search(memory_id, logical_key, content, attributes) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            record.id,
+            record.logical_key,
+            version.content,
+            canonical_json(version.attributes),
+        ),
+    )
+
+
+def _decode_memory_record(row: sqlite3.Row) -> MemoryRecord:
+    scope = MemoryScope(
+        agent_id=_sqlite_text(row["record_agent_id"], "memory agent_id"),
+        user_id=_optional_text(row["record_user_id"]),
+        session_id=_optional_text(row["record_session_id"]),
+        source_id=_optional_text(row["record_source_id"]),
+        resource_id=_optional_text(row["record_resource_id"]),
+    )
+    stored_fingerprint = _sqlite_text(
+        row["record_scope_fingerprint"],
+        "memory scope fingerprint",
+    )
+    if scope.fingerprint != stored_fingerprint:
+        raise SQLiteCorruptionError(
+            "memory scope fingerprint does not match its fields"
+        )
+    return MemoryRecord(
+        id=_sqlite_text(row["record_id"], "memory id"),
+        scope=scope,
+        kind=MemoryKind(_sqlite_text(row["record_kind"], "memory kind")),
+        logical_key=_sqlite_text(row["record_logical_key"], "memory logical_key"),
+        current_version=_sqlite_int(
+            row["record_current_version"],
+            "memory current_version",
+        ),
+        state=MemoryState(_sqlite_text(row["record_state"], "memory state")),
+        created_at=_decode_datetime(
+            _sqlite_text(row["record_created_at"], "memory created_at")
+        ),
+        updated_at=_decode_datetime(
+            _sqlite_text(row["record_updated_at"], "memory updated_at")
+        ),
+        superseded_by_id=_optional_text(row["record_superseded_by_id"]),
+    )
+
+
+def _decode_memory_version(row: sqlite3.Row) -> MemoryVersion:
+    return MemoryVersion(
+        memory_id=_sqlite_text(row["version_memory_id"], "memory version memory_id"),
+        version=_sqlite_int(row["version_number"], "memory version"),
+        content=_sqlite_text(row["version_content"], "memory content"),
+        creator=MemoryCreator(_sqlite_text(row["version_creator"], "memory creator")),
+        confidence=_sqlite_real(row["version_confidence"], "memory confidence"),
+        sensitivity=MemorySensitivity(
+            _sqlite_text(row["version_sensitivity"], "memory sensitivity")
+        ),
+        provenance=MemoryProvenance(
+            kind=MemoryProvenanceKind(
+                _sqlite_text(
+                    row["version_provenance_kind"],
+                    "memory provenance kind",
+                )
+            ),
+            content_hash=_sqlite_text(
+                row["version_provenance_content_hash"],
+                "memory provenance content_hash",
+            ),
+            operation_id=_optional_text(row["version_provenance_operation_id"]),
+            trigger_id=_optional_text(row["version_provenance_trigger_id"]),
+            evidence_id=_optional_text(row["version_provenance_evidence_id"]),
+            session_id=_optional_text(row["version_provenance_session_id"]),
+            external_ref=_optional_text(row["version_provenance_external_ref"]),
+        ),
+        created_at=_decode_datetime(
+            _sqlite_text(row["version_created_at"], "memory version created_at")
+        ),
+        attributes=_decode_json_object(
+            _sqlite_text(row["version_attributes_json"], "memory attributes")
+        ),
+        expires_at=_decode_optional_datetime(
+            row["version_expires_at"],
+            "memory expires_at",
+        ),
+        resource_revision=_optional_text(row["version_resource_revision"]),
+        supersedes_version=(
+            None
+            if row["version_supersedes_version"] is None
+            else _sqlite_int(
+                row["version_supersedes_version"],
+                "memory supersedes_version",
+            )
+        ),
+    )
+
+
+def _decode_memory_snapshot(row: sqlite3.Row) -> MemorySnapshot:
+    try:
+        return MemorySnapshot(
+            record=_decode_memory_record(row),
+            version=_decode_memory_version(row),
+        )
+    except SQLiteCorruptionError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError("cannot reconstruct memory snapshot") from error
+
+
+def _memory_structured_filters(
+    *,
+    scope: MemoryScope,
+    states: tuple[MemoryState, ...],
+    sensitivities: tuple[MemorySensitivity, ...],
+    unexpired_at: datetime | None,
+) -> tuple[list[str], list[object]]:
+    state_slots = ", ".join("?" for _ in states)
+    sensitivity_slots = ", ".join("?" for _ in sensitivities)
+    filters = [
+        "record.agent_id = ?",
+        f"record.state IN ({state_slots})",
+        f"version.sensitivity IN ({sensitivity_slots})",
+        "(record.user_id IS NULL OR record.user_id = ?)",
+        "(record.session_id IS NULL OR record.session_id = ?)",
+        "(record.source_id IS NULL OR record.source_id = ?)",
+        "(record.resource_id IS NULL OR record.resource_id = ?)",
+    ]
+    parameters: list[object] = [
+        scope.agent_id,
+        *(state.value for state in states),
+        *(sensitivity.value for sensitivity in sensitivities),
+        scope.user_id,
+        scope.session_id,
+        scope.source_id,
+        scope.resource_id,
+    ]
+    if unexpired_at is not None:
+        filters.append("(version.expires_at IS NULL OR version.expires_at > ?)")
+        parameters.append(_encode_datetime(unexpired_at))
+    return filters, parameters
+
+
+def _memory_search_terms(query: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(re.findall(r"\w+", query.casefold())))[:32]
+
+
+def _list_memory_candidates(
+    connection: sqlite3.Connection,
+    *,
+    scope: MemoryScope,
+    states: tuple[MemoryState, ...],
+    sensitivities: tuple[MemorySensitivity, ...],
+    limit: int,
+) -> tuple[MemorySnapshot, ...]:
+    filters, parameters = _memory_structured_filters(
+        scope=scope,
+        states=states,
+        sensitivities=sensitivities,
+        unexpired_at=None,
+    )
+    rows = connection.execute(
+        f"SELECT {_MEMORY_SNAPSHOT_COLUMNS} FROM memory_records AS record "
+        "JOIN memory_versions AS version ON version.memory_id = record.id "
+        "AND version.version = record.current_version "
+        f"WHERE {' AND '.join(filters)} "
+        "ORDER BY record.updated_at DESC, record.id LIMIT ?",
+        (*parameters, limit),
+    ).fetchall()
+    return tuple(_decode_memory_snapshot(row) for row in rows)
+
+
+def _recall_memory_candidates(
+    connection: sqlite3.Connection,
+    *,
+    query: str,
+    scope: MemoryScope,
+    states: tuple[MemoryState, ...],
+    sensitivities: tuple[MemorySensitivity, ...],
+    unexpired_at: datetime,
+    limit: int,
+) -> tuple[MemorySnapshot, ...]:
+    filters, parameters = _memory_structured_filters(
+        scope=scope,
+        states=states,
+        sensitivities=sensitivities,
+        unexpired_at=unexpired_at,
+    )
+    terms = _memory_search_terms(query)
+    if not terms:
+        return _list_memory_candidates(
+            connection,
+            scope=scope,
+            states=states,
+            sensitivities=sensitivities,
+            limit=limit,
+        )
+    fts_query = " OR ".join(f'"{term}"' for term in terms)
+    rows = connection.execute(
+        "WITH eligible(memory_id) AS MATERIALIZED ("
+        "SELECT record.id FROM memory_records AS record "
+        "JOIN memory_versions AS version ON version.memory_id = record.id "
+        "AND version.version = record.current_version "
+        f"WHERE {' AND '.join(filters)}"
+        ") "
+        f"SELECT {_MEMORY_SNAPSHOT_COLUMNS}, bm25(memory_search) AS rank_value "
+        "FROM eligible JOIN memory_search ON memory_search.memory_id = eligible.memory_id "
+        "JOIN memory_records AS record ON record.id = eligible.memory_id "
+        "JOIN memory_versions AS version ON version.memory_id = record.id "
+        "AND version.version = record.current_version "
+        "WHERE memory_search MATCH ? "
+        "ORDER BY rank_value, record.updated_at DESC, record.id LIMIT ?",
+        (*parameters, fts_query, limit),
+    ).fetchall()
+    return tuple(_decode_memory_snapshot(row) for row in rows)
+
+
+def _load_memory_history(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    memory_id: str,
+) -> MemoryHistory | None:
+    connection.execute("BEGIN")
+    try:
+        history = _load_memory_history_in_transaction(connection, agent_id, memory_id)
+        connection.execute("COMMIT")
+        return history
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_memory_history_in_transaction(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    memory_id: str,
+) -> MemoryHistory | None:
+    record_row = connection.execute(
+        f"SELECT {_MEMORY_SNAPSHOT_COLUMNS} FROM memory_records AS record "
+        "JOIN memory_versions AS version ON version.memory_id = record.id "
+        "AND version.version = record.current_version "
+        "WHERE record.agent_id = ? AND record.id = ?",
+        (agent_id, memory_id),
+    ).fetchone()
+    if record_row is None:
+        return None
+    try:
+        record = _decode_memory_record(record_row)
+        version_rows = connection.execute(
+            "SELECT memory_id AS version_memory_id, version AS version_number, "
+            "content AS version_content, creator AS version_creator, "
+            "confidence AS version_confidence, sensitivity AS version_sensitivity, "
+            "provenance_kind AS version_provenance_kind, "
+            "provenance_content_hash AS version_provenance_content_hash, "
+            "provenance_operation_id AS version_provenance_operation_id, "
+            "provenance_trigger_id AS version_provenance_trigger_id, "
+            "provenance_evidence_id AS version_provenance_evidence_id, "
+            "provenance_session_id AS version_provenance_session_id, "
+            "provenance_external_ref AS version_provenance_external_ref, "
+            "attributes_json AS version_attributes_json, "
+            "expires_at AS version_expires_at, "
+            "resource_revision AS version_resource_revision, "
+            "supersedes_version AS version_supersedes_version, "
+            "created_at AS version_created_at "
+            "FROM memory_versions WHERE memory_id = ? ORDER BY version",
+            (memory_id,),
+        ).fetchall()
+        versions = tuple(_decode_memory_version(row) for row in version_rows)
+        if tuple(item.version for item in versions) != tuple(
+            range(1, len(versions) + 1)
+        ):
+            raise SQLiteCorruptionError(
+                f"memory versions are not contiguous: {memory_id}"
+            )
+        return MemoryHistory(record=record, versions=versions)
+    except SQLiteCorruptionError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError(
+            f"cannot reconstruct memory history {memory_id}"
+        ) from error
+
+
+def _replace_memory_version(
+    connection: sqlite3.Connection,
+    *,
+    agent_id: str,
+    memory_id: str,
+    expected_version: int,
+    replacement: MemoryVersion,
+    restore_version: int | None,
+) -> MemoryHistory:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        history = _load_memory_history_in_transaction(
+            connection,
+            agent_id,
+            memory_id,
+        )
+        if history is None:
+            raise MemoryStoreConflictError(f"memory does not exist: {memory_id}")
+        if (
+            history.record.state is not MemoryState.ACTIVE
+            or history.record.current_version != expected_version
+        ):
+            raise MemoryStoreConflictError(
+                f"memory {memory_id} head changed before replacement"
+            )
+        if (
+            replacement.memory_id != memory_id
+            or replacement.version != expected_version + 1
+            or replacement.supersedes_version != expected_version
+        ):
+            raise MemoryStoreConflictError(
+                "replacement does not follow the guarded memory version"
+            )
+        if replacement.resource_revision is not None and (
+            history.record.scope.resource_id is None
+        ):
+            raise MemoryStoreConflictError(
+                "revision-bound replacement requires resource-scoped memory"
+            )
+        if restore_version is not None:
+            source = next(
+                (item for item in history.versions if item.version == restore_version),
+                None,
+            )
+            if source is None:
+                raise MemoryStoreConflictError(
+                    f"restore version does not exist: {restore_version}"
+                )
+            for field_name in (
+                "content",
+                "attributes",
+                "confidence",
+                "sensitivity",
+                "expires_at",
+                "resource_revision",
+            ):
+                if getattr(source, field_name) != getattr(replacement, field_name):
+                    raise MemoryStoreConflictError(
+                        f"restore replacement changed historical {field_name}"
+                    )
+        _validate_memory_runtime_references(connection, history.record, replacement)
+        _insert_memory_version(connection, replacement)
+        updated_record = MemoryRecord(
+            id=history.record.id,
+            scope=history.record.scope,
+            kind=history.record.kind,
+            logical_key=history.record.logical_key,
+            current_version=replacement.version,
+            state=history.record.state,
+            created_at=history.record.created_at,
+            updated_at=max(history.record.updated_at, replacement.created_at),
+            superseded_by_id=history.record.superseded_by_id,
+        )
+        connection.execute(
+            "UPDATE memory_records SET current_version = ?, updated_at = ? "
+            "WHERE id = ? AND agent_id = ? AND current_version = ?",
+            (
+                updated_record.current_version,
+                _encode_datetime(updated_record.updated_at),
+                memory_id,
+                agent_id,
+                expected_version,
+            ),
+        )
+        if connection.execute("SELECT changes()").fetchone()[0] != 1:
+            raise MemoryStoreConflictError(
+                f"memory {memory_id} head changed before replacement"
+            )
+        _replace_memory_search(connection, updated_record, replacement)
+        updated = _load_memory_history_in_transaction(connection, agent_id, memory_id)
+        assert updated is not None
+        connection.execute("COMMIT")
+        return updated
+    except sqlite3.IntegrityError as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise MemoryStoreConflictError(
+            f"memory {memory_id} replacement conflicts with durable history"
+        ) from error
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_resource_alias(
+    connection: sqlite3.Connection,
+    scope: MemoryScope,
+    logical_key: str,
+) -> MemoryHistory | None:
+    connection.execute("BEGIN")
+    try:
+        history = _load_resource_alias_in_transaction(
+            connection,
+            scope,
+            logical_key,
+        )
+        connection.execute("COMMIT")
+        return history
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_resource_alias_in_transaction(
+    connection: sqlite3.Connection,
+    scope: MemoryScope,
+    logical_key: str,
+) -> MemoryHistory | None:
+    row = connection.execute(
+        "SELECT id FROM memory_records WHERE agent_id = ? "
+        "AND scope_fingerprint = ? AND kind = ? AND logical_key = ?",
+        (
+            scope.agent_id,
+            scope.fingerprint,
+            MemoryKind.RESOURCE_ALIAS.value,
+            logical_key,
+        ),
+    ).fetchone()
+    if row is None:
+        return None
+    return _load_memory_history_in_transaction(
+        connection,
+        scope.agent_id,
+        _sqlite_text(row[0], "resource alias memory id"),
+    )
+
+
+def _explicit_proposal_identity_matches(
+    stored: LearningProposal,
+    request: LearningProposal,
+) -> bool:
+    return (
+        stored.id,
+        stored.kind,
+        stored.category,
+        stored.provenance,
+        stored.candidate_hash,
+        stored.idempotency_key,
+        stored.candidate_payload,
+    ) == (
+        request.id,
+        request.kind,
+        request.category,
+        request.provenance,
+        request.candidate_hash,
+        request.idempotency_key,
+        request.candidate_payload,
+    )
+
+
+def _validate_explicit_replay_memory(
+    stored: LearningProposal,
+    memory: MemoryHistory,
+    intended: MemorySnapshot,
+) -> None:
+    result_version = stored.result_memory_version
+    if stored.result_memory_id != memory.record.id or result_version is None:
+        raise SQLiteCorruptionError(
+            "committed correction does not reference its memory history"
+        )
+    historical = next(
+        (version for version in memory.versions if version.version == result_version),
+        None,
+    )
+    if historical is None:
+        raise SQLiteCorruptionError(
+            "committed correction memory version is absent from history"
+        )
+    expected = intended.version
+    if memory.record.logical_identity != intended.record.logical_identity or any(
+        getattr(historical, field_name) != getattr(expected, field_name)
+        for field_name in (
+            "content",
+            "creator",
+            "confidence",
+            "sensitivity",
+            "provenance",
+            "attributes",
+            "expires_at",
+            "resource_revision",
+        )
+    ):
+        raise ExplicitCorrectionStoreConflictError(
+            "idempotency key already committed another semantic correction"
+        )
+
+
+def _commit_explicit_correction(
+    connection: sqlite3.Connection,
+    request: ExplicitCorrectionCommit,
+) -> ExplicitCorrectionResult:
+    proposal = request.proposal
+    agent_id = proposal.provenance.agent_id
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        replay_row = connection.execute(
+            "SELECT * FROM learning_proposals "
+            "WHERE agent_id = ? AND idempotency_key = ?",
+            (agent_id, proposal.idempotency_key),
+        ).fetchone()
+        if replay_row is not None:
+            stored = _decode_learning_proposal(replay_row)
+            _validate_learning_decision_history(connection, stored)
+            if not _explicit_proposal_identity_matches(stored, proposal):
+                raise ExplicitCorrectionStoreConflictError(
+                    "idempotency key is already claimed by another proposal"
+                )
+            if stored.state is LearningProposalState.PROPOSED:
+                raise SQLiteCorruptionError(
+                    "atomic correction left a nonterminal proposal"
+                )
+            if stored.state is LearningProposalState.REJECTED:
+                if proposal.state is not LearningProposalState.REJECTED:
+                    raise ExplicitCorrectionStoreConflictError(
+                        "idempotency key already resolved as rejected"
+                    )
+                result = ExplicitCorrectionResult(
+                    proposal=stored,
+                    memory=None,
+                    replayed=True,
+                )
+                connection.execute("COMMIT")
+                return result
+            if request.intended_memory is None:
+                raise ExplicitCorrectionStoreConflictError(
+                    "idempotency key already resolved as committed"
+                )
+            assert stored.result_memory_id is not None
+            history = _load_memory_history_in_transaction(
+                connection,
+                agent_id,
+                stored.result_memory_id,
+            )
+            if history is None:
+                raise SQLiteCorruptionError(
+                    "committed correction memory history is missing"
+                )
+            _validate_explicit_replay_memory(
+                stored,
+                history,
+                request.intended_memory,
+            )
+            result = ExplicitCorrectionResult(
+                proposal=stored,
+                memory=history,
+                replayed=True,
+            )
+            connection.execute("COMMIT")
+            return result
+
+        duplicate_id = connection.execute(
+            "SELECT 1 FROM learning_proposals WHERE id = ?",
+            (proposal.id,),
+        ).fetchone()
+        if duplicate_id is not None:
+            raise ExplicitCorrectionStoreConflictError(
+                "proposal identity is already claimed by another idempotency key"
+            )
+        _validate_learning_runtime_references(connection, proposal)
+        if proposal.state is LearningProposalState.REJECTED:
+            _insert_learning_proposal_row(connection, proposal)
+            _insert_learning_decision(
+                connection,
+                _learning_decision_from_proposal(proposal),
+            )
+            result = ExplicitCorrectionResult(
+                proposal=proposal,
+                memory=None,
+                replayed=False,
+            )
+            connection.execute("COMMIT")
+            return result
+
+        intended = request.intended_memory
+        decision = request.decision
+        assert intended is not None and decision is not None
+        try:
+            resolved = resolve_learning_proposal(proposal, decision)
+        except LearningTransitionError as error:
+            raise ExplicitCorrectionStoreConflictError(
+                "correction decision does not match its proposal"
+            ) from error
+        if (
+            intended.record.scope.agent_id != agent_id
+            or intended.record.kind is not MemoryKind.RESOURCE_ALIAS
+            or intended.record.state is not MemoryState.ACTIVE
+            or resolved.result_memory_id != intended.record.id
+            or resolved.result_memory_version != intended.version.version
+        ):
+            raise ExplicitCorrectionStoreConflictError(
+                "correction proposal and intended memory do not match"
+            )
+        _validate_memory_runtime_references(
+            connection,
+            intended.record,
+            intended.version,
+        )
+        existing = _load_resource_alias_in_transaction(
+            connection,
+            intended.record.scope,
+            intended.record.logical_key,
+        )
+        if request.expected_memory_version is None:
+            if existing is not None:
+                raise ExplicitCorrectionStoreConflictError(
+                    "resource alias was created before correction commit"
+                )
+            if intended.record.current_version != 1 or intended.version.version != 1:
+                raise ExplicitCorrectionStoreConflictError(
+                    "new correction memory must begin at version one"
+                )
+            _insert_memory_record(connection, intended.record)
+            _insert_memory_version(connection, intended.version)
+            _replace_memory_search(connection, intended.record, intended.version)
+        else:
+            expected = request.expected_memory_version
+            if (
+                existing is None
+                or existing.record.state is not MemoryState.ACTIVE
+                or existing.record.current_version != expected
+            ):
+                raise ExplicitCorrectionStoreConflictError(
+                    "resource alias head changed before correction commit"
+                )
+            if (
+                intended.record.id != existing.record.id
+                or intended.record.scope != existing.record.scope
+                or intended.record.kind is not existing.record.kind
+                or intended.record.logical_key != existing.record.logical_key
+                or intended.record.created_at != existing.record.created_at
+                or intended.record.superseded_by_id != existing.record.superseded_by_id
+                or intended.record.current_version != expected + 1
+                or intended.record.updated_at < existing.record.updated_at
+            ):
+                raise ExplicitCorrectionStoreConflictError(
+                    "correction intended memory changed stable record identity"
+                )
+            _insert_memory_version(connection, intended.version)
+            connection.execute(
+                "UPDATE memory_records SET current_version = ?, updated_at = ? "
+                "WHERE id = ? AND agent_id = ? AND current_version = ? "
+                "AND state = 'active'",
+                (
+                    intended.record.current_version,
+                    _encode_datetime(intended.record.updated_at),
+                    intended.record.id,
+                    agent_id,
+                    expected,
+                ),
+            )
+            changed_row = connection.execute("SELECT changes()").fetchone()
+            assert changed_row is not None
+            if _sqlite_int(changed_row[0], "correction memory changes") != 1:
+                raise ExplicitCorrectionStoreConflictError(
+                    "resource alias head changed during correction commit"
+                )
+            _replace_memory_search(connection, intended.record, intended.version)
+        _insert_learning_proposal_row(connection, resolved)
+        _insert_learning_decision(connection, decision)
+        history = _load_memory_history_in_transaction(
+            connection,
+            agent_id,
+            intended.record.id,
+        )
+        assert history is not None
+        result = ExplicitCorrectionResult(
+            proposal=resolved,
+            memory=history,
+            replayed=False,
+        )
+        connection.execute("COMMIT")
+        return result
+    except sqlite3.IntegrityError as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise ExplicitCorrectionStoreConflictError(
+            "correction conflicts with durable proposal or memory history"
+        ) from error
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _validate_learning_runtime_references(
+    connection: sqlite3.Connection,
+    proposal: LearningProposal,
+) -> None:
+    identity = _load_agent_identity(connection)
+    agent_id = proposal.provenance.agent_id
+    if identity is None or identity.id != agent_id:
+        raise AgentIdentityConflictError(
+            "learning proposal agent does not match database identity"
+        )
+    operation = connection.execute(
+        "SELECT agent_id, trigger_id, status FROM operations WHERE id = ?",
+        (proposal.provenance.operation_id,),
+    ).fetchone()
+    if (
+        operation is None
+        or _sqlite_text(operation["agent_id"], "learning operation agent_id")
+        != agent_id
+        or _sqlite_text(operation["trigger_id"], "learning operation trigger_id")
+        != proposal.provenance.trigger_id
+    ):
+        raise LearningStoreConflictError(
+            "learning provenance does not match an operation in its agent scope"
+        )
+    operation_status = OperationStatus(
+        _sqlite_text(operation["status"], "learning operation status")
+    )
+    actual_outcome = {
+        OperationStatus.SUCCEEDED: LearningSourceOutcome.SUCCEEDED,
+        OperationStatus.FAILED: LearningSourceOutcome.FAILED,
+        OperationStatus.CANCELLED: LearningSourceOutcome.CANCELLED,
+        OperationStatus.INTERRUPTED: LearningSourceOutcome.INTERRUPTED,
+        OperationStatus.WAITING_FOR_APPROVAL: LearningSourceOutcome.BLOCKED,
+        OperationStatus.WAITING_FOR_INPUT: LearningSourceOutcome.BLOCKED,
+    }.get(operation_status)
+    if (
+        actual_outcome is None
+        or actual_outcome is not proposal.provenance.source_outcome
+    ):
+        raise LearningStoreConflictError(
+            "learning source outcome does not match durable operation status"
+        )
+    if proposal.provenance.evidence_id is not None:
+        evidence = connection.execute(
+            "SELECT operation_id, accepted FROM evidence WHERE id = ?",
+            (proposal.provenance.evidence_id,),
+        ).fetchone()
+        if (
+            evidence is None
+            or _sqlite_text(
+                evidence["operation_id"],
+                "learning evidence operation_id",
+            )
+            != proposal.provenance.operation_id
+            or _sqlite_int(evidence["accepted"], "learning evidence accepted") != 1
+        ):
+            raise LearningStoreConflictError(
+                "learning provenance evidence is not accepted by its operation"
+            )
+
+
+def _learning_create_matches(
+    existing: LearningProposal,
+    candidate: LearningProposal,
+) -> bool:
+    return (
+        existing.kind,
+        existing.category,
+        existing.provenance,
+        existing.candidate_hash,
+        existing.idempotency_key,
+    ) == (
+        candidate.kind,
+        candidate.category,
+        candidate.provenance,
+        candidate.candidate_hash,
+        candidate.idempotency_key,
+    )
+
+
+def _create_learning_proposal(
+    connection: sqlite3.Connection,
+    proposal: LearningProposal,
+) -> LearningProposal:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        _validate_learning_runtime_references(connection, proposal)
+        existing_row = connection.execute(
+            "SELECT * FROM learning_proposals "
+            "WHERE agent_id = ? AND (id = ? OR idempotency_key = ?) "
+            "ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1",
+            (
+                proposal.provenance.agent_id,
+                proposal.id,
+                proposal.idempotency_key,
+                proposal.id,
+            ),
+        ).fetchone()
+        if existing_row is not None:
+            existing = _decode_learning_proposal(existing_row)
+            _validate_learning_decision_history(connection, existing)
+            if _learning_create_matches(existing, proposal):
+                connection.execute("COMMIT")
+                return existing
+            raise LearningStoreConflictError(
+                "learning proposal identity or idempotency key is already claimed"
+            )
+        _insert_learning_proposal_row(connection, proposal)
+        if proposal.state is not LearningProposalState.PROPOSED:
+            _insert_learning_decision(
+                connection,
+                _learning_decision_from_proposal(proposal),
+            )
+        stored = _load_learning_proposal_in_transaction(
+            connection,
+            proposal.provenance.agent_id,
+            proposal.id,
+        )
+        assert stored is not None
+        connection.execute("COMMIT")
+        return stored
+    except sqlite3.IntegrityError as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise LearningStoreConflictError(
+            "learning proposal conflicts with durable identity or provenance"
+        ) from error
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _insert_learning_proposal_row(
+    connection: sqlite3.Connection,
+    proposal: LearningProposal,
+) -> None:
+    connection.execute(
+        "INSERT INTO learning_proposals("
+        "id, agent_id, kind, category, state, operation_id, trigger_id, "
+        "source_outcome, source_hash, evidence_id, evidence_accepted, "
+        "candidate_hash, idempotency_key, candidate_payload_json, created_at, "
+        "resolved_at, decision_hash, result_memory_id, result_memory_version, "
+        "result_skill_id, result_skill_version, rejection_category, "
+        "rejection_reason"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "?, ?, ?, ?)",
+        _learning_proposal_values(proposal),
+    )
+
+
+def _learning_proposal_values(proposal: LearningProposal) -> tuple[object, ...]:
+    provenance = proposal.provenance
+    return (
+        proposal.id,
+        provenance.agent_id,
+        proposal.kind.value,
+        proposal.category.value,
+        proposal.state.value,
+        provenance.operation_id,
+        provenance.trigger_id,
+        provenance.source_outcome.value,
+        provenance.source_hash,
+        provenance.evidence_id,
+        int(provenance.evidence_accepted),
+        proposal.candidate_hash,
+        proposal.idempotency_key,
+        (
+            None
+            if proposal.candidate_payload is None
+            else canonical_json(proposal.candidate_payload)
+        ),
+        _encode_datetime(proposal.created_at),
+        _encode_optional_datetime(proposal.resolved_at),
+        proposal.decision_hash,
+        proposal.result_memory_id,
+        proposal.result_memory_version,
+        proposal.result_skill_id,
+        proposal.result_skill_version,
+        (
+            None
+            if proposal.rejection_category is None
+            else proposal.rejection_category.value
+        ),
+        proposal.rejection_reason,
+    )
+
+
+def _decode_learning_proposal(row: sqlite3.Row) -> LearningProposal:
+    try:
+        payload_value = row["candidate_payload_json"]
+        return LearningProposal(
+            id=_sqlite_text(row["id"], "learning proposal id"),
+            kind=LearningProposalKind(
+                _sqlite_text(row["kind"], "learning proposal kind")
+            ),
+            category=LearningCandidateCategory(
+                _sqlite_text(row["category"], "learning proposal category")
+            ),
+            state=LearningProposalState(
+                _sqlite_text(row["state"], "learning proposal state")
+            ),
+            provenance=LearningProvenance(
+                agent_id=_sqlite_text(row["agent_id"], "learning proposal agent_id"),
+                operation_id=_sqlite_text(
+                    row["operation_id"],
+                    "learning proposal operation_id",
+                ),
+                trigger_id=_sqlite_text(
+                    row["trigger_id"],
+                    "learning proposal trigger_id",
+                ),
+                source_outcome=LearningSourceOutcome(
+                    _sqlite_text(
+                        row["source_outcome"],
+                        "learning proposal source_outcome",
+                    )
+                ),
+                source_hash=_sqlite_text(
+                    row["source_hash"],
+                    "learning proposal source_hash",
+                ),
+                evidence_id=_optional_text(row["evidence_id"]),
+                evidence_accepted=_decode_bool(row["evidence_accepted"]),
+            ),
+            candidate_hash=_sqlite_text(
+                row["candidate_hash"],
+                "learning proposal candidate_hash",
+            ),
+            idempotency_key=_sqlite_text(
+                row["idempotency_key"],
+                "learning proposal idempotency_key",
+            ),
+            candidate_payload=(
+                None
+                if payload_value is None
+                else _decode_json_object(
+                    _sqlite_text(
+                        payload_value,
+                        "learning proposal candidate payload",
+                    )
+                )
+            ),
+            created_at=_decode_datetime(
+                _sqlite_text(row["created_at"], "learning proposal created_at")
+            ),
+            resolved_at=_decode_optional_datetime(
+                row["resolved_at"],
+                "learning proposal resolved_at",
+            ),
+            decision_hash=_optional_text(row["decision_hash"]),
+            result_memory_id=_optional_text(row["result_memory_id"]),
+            result_memory_version=(
+                None
+                if row["result_memory_version"] is None
+                else _sqlite_int(
+                    row["result_memory_version"],
+                    "learning proposal result_memory_version",
+                )
+            ),
+            result_skill_id=_optional_text(row["result_skill_id"]),
+            result_skill_version=(
+                None
+                if row["result_skill_version"] is None
+                else _sqlite_int(
+                    row["result_skill_version"],
+                    "learning proposal result_skill_version",
+                )
+            ),
+            rejection_category=(
+                None
+                if row["rejection_category"] is None
+                else LearningRejectionCategory(
+                    _sqlite_text(
+                        row["rejection_category"],
+                        "learning proposal rejection_category",
+                    )
+                )
+            ),
+            rejection_reason=_optional_text(row["rejection_reason"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        proposal_id = _optional_text(row["id"]) or "unknown"
+        raise SQLiteCorruptionError(
+            f"cannot reconstruct learning proposal {proposal_id}"
+        ) from error
+
+
+def _learning_decision_from_proposal(proposal: LearningProposal) -> LearningDecision:
+    if proposal.state is LearningProposalState.PROPOSED:
+        raise ValueError("proposed learning has no terminal decision")
+    assert proposal.resolved_at is not None
+    return LearningDecision(
+        proposal_id=proposal.id,
+        idempotency_key=proposal.idempotency_key,
+        candidate_hash=proposal.candidate_hash,
+        state=proposal.state,
+        decided_at=proposal.resolved_at,
+        result_memory_id=proposal.result_memory_id,
+        result_memory_version=proposal.result_memory_version,
+        result_skill_id=proposal.result_skill_id,
+        result_skill_version=proposal.result_skill_version,
+        rejection_category=proposal.rejection_category,
+        rejection_reason=proposal.rejection_reason,
+    )
+
+
+def _insert_learning_decision(
+    connection: sqlite3.Connection,
+    decision: LearningDecision,
+) -> None:
+    connection.execute(
+        "INSERT INTO learning_decisions("
+        "proposal_id, decision_hash, idempotency_key, candidate_hash, state, "
+        "decided_at, result_memory_id, result_memory_version, result_skill_id, "
+        "result_skill_version, rejection_category, rejection_reason"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            decision.proposal_id,
+            decision.fingerprint,
+            decision.idempotency_key,
+            decision.candidate_hash,
+            decision.state.value,
+            _encode_datetime(decision.decided_at),
+            decision.result_memory_id,
+            decision.result_memory_version,
+            decision.result_skill_id,
+            decision.result_skill_version,
+            (
+                None
+                if decision.rejection_category is None
+                else decision.rejection_category.value
+            ),
+            decision.rejection_reason,
+        ),
+    )
+
+
+def _validate_learning_decision_history(
+    connection: sqlite3.Connection,
+    proposal: LearningProposal,
+) -> None:
+    rows = connection.execute(
+        "SELECT decision_hash FROM learning_decisions WHERE proposal_id = ?",
+        (proposal.id,),
+    ).fetchall()
+    if proposal.state is LearningProposalState.PROPOSED:
+        if rows:
+            raise SQLiteCorruptionError(
+                "proposed learning unexpectedly has a terminal decision"
+            )
+        return
+    if len(rows) != 1 or (
+        _sqlite_text(rows[0][0], "learning decision hash") != proposal.decision_hash
+    ):
+        raise SQLiteCorruptionError(
+            "terminal learning proposal decision history does not match"
+        )
+
+
+def _load_learning_proposal(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    proposal_id: str,
+) -> LearningProposal | None:
+    connection.execute("BEGIN")
+    try:
+        proposal = _load_learning_proposal_in_transaction(
+            connection,
+            agent_id,
+            proposal_id,
+        )
+        connection.execute("COMMIT")
+        return proposal
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_learning_proposal_in_transaction(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    proposal_id: str,
+) -> LearningProposal | None:
+    row = connection.execute(
+        "SELECT * FROM learning_proposals WHERE agent_id = ? AND id = ?",
+        (agent_id, proposal_id),
+    ).fetchone()
+    if row is None:
+        return None
+    proposal = _decode_learning_proposal(row)
+    _validate_learning_decision_history(connection, proposal)
+    return proposal
+
+
+def _list_learning_proposals(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    operation_id: str | None,
+    states: tuple[LearningProposalState, ...],
+    limit: int,
+) -> tuple[LearningProposal, ...]:
+    state_slots = ", ".join("?" for _ in states)
+    filters = ["agent_id = ?", f"state IN ({state_slots})"]
+    parameters: list[object] = [agent_id, *(state.value for state in states)]
+    if operation_id is not None:
+        filters.append("operation_id = ?")
+        parameters.append(operation_id)
+    rows = connection.execute(
+        "SELECT * FROM learning_proposals "
+        f"WHERE {' AND '.join(filters)} "
+        "ORDER BY created_at DESC, id LIMIT ?",
+        (*parameters, limit),
+    ).fetchall()
+    proposals = tuple(_decode_learning_proposal(row) for row in rows)
+    for proposal in proposals:
+        _validate_learning_decision_history(connection, proposal)
+    return proposals
+
+
+def _resolve_learning_proposal(
+    connection: sqlite3.Connection,
+    decision: LearningDecision,
+    *,
+    expected_state: LearningProposalState,
+) -> LearningProposal:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        row = connection.execute(
+            "SELECT * FROM learning_proposals WHERE id = ?",
+            (decision.proposal_id,),
+        ).fetchone()
+        if row is None:
+            raise LearningStoreConflictError(
+                f"learning proposal does not exist: {decision.proposal_id}"
+            )
+        proposal = _decode_learning_proposal(row)
+        _validate_learning_decision_history(connection, proposal)
+        if proposal.state is not LearningProposalState.PROPOSED:
+            try:
+                replayed = resolve_learning_proposal(proposal, decision)
+            except LearningTransitionError as error:
+                raise LearningStoreConflictError(
+                    "learning proposal already has another decision"
+                ) from error
+            connection.execute("COMMIT")
+            return replayed
+        if proposal.state is not expected_state:
+            raise LearningStoreConflictError(
+                f"learning proposal state changed: expected {expected_state.value}, "
+                f"found {proposal.state.value}"
+            )
+        try:
+            resolved = resolve_learning_proposal(proposal, decision)
+        except LearningTransitionError as error:
+            raise LearningStoreConflictError(
+                "learning decision does not match the durable proposal"
+            ) from error
+        _insert_learning_decision(connection, decision)
+        values = _learning_proposal_values(resolved)
+        connection.execute(
+            "UPDATE learning_proposals SET state = ?, candidate_payload_json = ?, "
+            "resolved_at = ?, decision_hash = ?, result_memory_id = ?, "
+            "result_memory_version = ?, result_skill_id = ?, "
+            "result_skill_version = ?, rejection_category = ?, rejection_reason = ? "
+            "WHERE id = ? AND state = ?",
+            (
+                values[4],
+                values[13],
+                values[15],
+                values[16],
+                values[17],
+                values[18],
+                values[19],
+                values[20],
+                values[21],
+                values[22],
+                proposal.id,
+                expected_state.value,
+            ),
+        )
+        changed_row = connection.execute("SELECT changes()").fetchone()
+        assert changed_row is not None
+        if _sqlite_int(changed_row[0], "learning resolution changes") != 1:
+            raise LearningStoreConflictError(
+                "learning proposal state changed during resolution"
+            )
+        stored = _load_learning_proposal_in_transaction(
+            connection,
+            proposal.provenance.agent_id,
+            proposal.id,
+        )
+        assert stored is not None
+        connection.execute("COMMIT")
+        return stored
+    except sqlite3.IntegrityError as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise LearningStoreConflictError(
+            "learning decision conflicts with durable history"
+        ) from error
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _record_skill_discovery(
+    connection: sqlite3.Connection,
+    skill: Skill,
+    version: SkillVersion,
+    index: SkillIndex,
+) -> SkillIndex:
+    if (
+        skill.agent_id != version.agent_id
+        or skill.agent_id != index.agent_id
+        or skill.id != version.skill_id
+        or skill.id != index.skill_id
+        or skill.stable_name != version.stable_name
+        or skill.stable_name != index.stable_name
+        or skill.source is not version.source
+        or skill.source is not index.source
+        or not index.matches(version)
+    ):
+        raise SkillDiscoveryError(
+            "skill, version, and index do not describe one discovery"
+        )
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != skill.agent_id:
+            raise AgentIdentityConflictError(
+                "skill agent does not match the authoritative database identity"
+            )
+        skill_row = connection.execute(
+            "SELECT * FROM skills WHERE agent_id = ? AND (id = ? OR stable_name = ?) "
+            "ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1",
+            (skill.agent_id, skill.id, skill.stable_name, skill.id),
+        ).fetchone()
+        if skill_row is None:
+            connection.execute(
+                "INSERT INTO skills(id, agent_id, stable_name, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    skill.id,
+                    skill.agent_id,
+                    skill.stable_name,
+                    skill.source.value,
+                    _encode_datetime(skill.created_at),
+                ),
+            )
+        elif _decode_skill(skill_row) != skill:
+            raise SkillDiscoveryError(
+                "skill identity or stable name is already claimed"
+            )
+        version_row = connection.execute(
+            "SELECT * FROM skill_versions WHERE agent_id = ? AND "
+            "(id = ? OR (skill_id = ? AND version = ?)) "
+            "ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1",
+            (
+                skill.agent_id,
+                version.id,
+                skill.id,
+                version.version,
+                version.id,
+            ),
+        ).fetchone()
+        if version_row is None:
+            _insert_skill_version(connection, version)
+        elif _decode_skill_version(version_row) != version:
+            raise SkillDiscoveryError(
+                "skill version identity or semantic version is already claimed"
+            )
+        current_row = connection.execute(
+            "SELECT * FROM skill_indexes WHERE agent_id = ? AND skill_id = ?",
+            (skill.agent_id, skill.id),
+        ).fetchone()
+        current = None if current_row is None else _decode_skill_index(current_row)
+        if (
+            current is not None
+            and index.active_version_id is not None
+            and index.active_version_id != current.active_version_id
+        ):
+            raise SkillDiscoveryError(
+                "skill discovery cannot change the active version"
+            )
+        stored_index = (
+            current
+            if current is not None and current.active_version_id is not None
+            else SkillIndex.from_version(
+                version,
+                active_version_id=None,
+                updated_at=max(
+                    index.updated_at,
+                    current.updated_at if current is not None else index.updated_at,
+                ),
+            )
+        )
+        if current is None:
+            connection.execute(
+                "INSERT INTO skill_indexes("
+                "agent_id, skill_id, version_id, stable_name, version, description, "
+                "domains_json, resource_kinds_json, required_capability_ids_json, "
+                "activation_mode, source, content_hash, active_version_id, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _skill_index_values(stored_index),
+            )
+        elif current != stored_index:
+            connection.execute(
+                "UPDATE skill_indexes SET version_id = ?, stable_name = ?, "
+                "version = ?, description = ?, domains_json = ?, "
+                "resource_kinds_json = ?, required_capability_ids_json = ?, "
+                "activation_mode = ?, source = ?, content_hash = ?, "
+                "active_version_id = ?, updated_at = ? "
+                "WHERE agent_id = ? AND skill_id = ?",
+                (
+                    *_skill_index_values(stored_index)[2:],
+                    stored_index.agent_id,
+                    stored_index.skill_id,
+                ),
+            )
+        connection.execute("COMMIT")
+        return stored_index
+    except sqlite3.IntegrityError as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise SkillDiscoveryError(
+            "skill discovery conflicts with durable identity or history"
+        ) from error
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _decode_skill(row: sqlite3.Row) -> Skill:
+    try:
+        return Skill(
+            id=_sqlite_text(row["id"], "skill id"),
+            agent_id=_sqlite_text(row["agent_id"], "skill agent_id"),
+            stable_name=_sqlite_text(row["stable_name"], "skill stable_name"),
+            source=SkillSource(_sqlite_text(row["source"], "skill source")),
+            created_at=_decode_datetime(
+                _sqlite_text(row["created_at"], "skill created_at")
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError("cannot reconstruct skill identity") from error
+
+
+def _insert_skill_version(
+    connection: sqlite3.Connection,
+    version: SkillVersion,
+) -> None:
+    connection.execute(
+        "INSERT INTO skill_versions("
+        "id, agent_id, skill_id, stable_name, version, description, domains_json, "
+        "resource_kinds_json, required_capability_ids_json, activation_mode, "
+        "sensitivity_notes, policy_notes, source, content_hash, instructions, "
+        "source_path, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            version.id,
+            version.agent_id,
+            version.skill_id,
+            version.stable_name,
+            version.version,
+            version.description,
+            canonical_json(version.domains),
+            canonical_json(version.resource_kinds),
+            canonical_json(version.required_capability_ids),
+            version.activation_mode.value,
+            version.sensitivity_notes,
+            version.policy_notes,
+            version.source.value,
+            version.content_hash,
+            version.instructions,
+            version.source_path,
+            _encode_datetime(version.created_at),
+        ),
+    )
+
+
+def _decode_skill_version(row: sqlite3.Row) -> SkillVersion:
+    try:
+        return SkillVersion(
+            id=_sqlite_text(row["id"], "skill version id"),
+            agent_id=_sqlite_text(row["agent_id"], "skill version agent_id"),
+            skill_id=_sqlite_text(row["skill_id"], "skill version skill_id"),
+            stable_name=_sqlite_text(
+                row["stable_name"],
+                "skill version stable_name",
+            ),
+            version=_sqlite_text(row["version"], "skill version"),
+            description=_sqlite_text(
+                row["description"],
+                "skill version description",
+            ),
+            domains=_decode_string_tuple(
+                _sqlite_text(row["domains_json"], "skill version domains")
+            ),
+            resource_kinds=_decode_string_tuple(
+                _sqlite_text(
+                    row["resource_kinds_json"],
+                    "skill version resource kinds",
+                )
+            ),
+            required_capability_ids=_decode_string_tuple(
+                _sqlite_text(
+                    row["required_capability_ids_json"],
+                    "skill version capability ids",
+                )
+            ),
+            activation_mode=SkillActivationMode(
+                _sqlite_text(
+                    row["activation_mode"],
+                    "skill version activation mode",
+                )
+            ),
+            sensitivity_notes=_optional_text(row["sensitivity_notes"]),
+            policy_notes=_optional_text(row["policy_notes"]),
+            source=SkillSource(_sqlite_text(row["source"], "skill version source")),
+            content_hash=_sqlite_text(
+                row["content_hash"],
+                "skill version content_hash",
+            ),
+            instructions=_sqlite_text(
+                row["instructions"],
+                "skill version instructions",
+            ),
+            source_path=_optional_text(row["source_path"]),
+            created_at=_decode_datetime(
+                _sqlite_text(row["created_at"], "skill version created_at")
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError("cannot reconstruct skill version") from error
+
+
+def _skill_index_values(index: SkillIndex) -> tuple[object, ...]:
+    return (
+        index.agent_id,
+        index.skill_id,
+        index.version_id,
+        index.stable_name,
+        index.version,
+        index.description,
+        canonical_json(index.domains),
+        canonical_json(index.resource_kinds),
+        canonical_json(index.required_capability_ids),
+        index.activation_mode.value,
+        index.source.value,
+        index.content_hash,
+        index.active_version_id,
+        _encode_datetime(index.updated_at),
+    )
+
+
+def _decode_skill_index(row: sqlite3.Row) -> SkillIndex:
+    try:
+        return SkillIndex(
+            agent_id=_sqlite_text(row["agent_id"], "skill index agent_id"),
+            skill_id=_sqlite_text(row["skill_id"], "skill index skill_id"),
+            version_id=_sqlite_text(row["version_id"], "skill index version_id"),
+            stable_name=_sqlite_text(
+                row["stable_name"],
+                "skill index stable_name",
+            ),
+            version=_sqlite_text(row["version"], "skill index version"),
+            description=_sqlite_text(
+                row["description"],
+                "skill index description",
+            ),
+            domains=_decode_string_tuple(
+                _sqlite_text(row["domains_json"], "skill index domains")
+            ),
+            resource_kinds=_decode_string_tuple(
+                _sqlite_text(
+                    row["resource_kinds_json"],
+                    "skill index resource kinds",
+                )
+            ),
+            required_capability_ids=_decode_string_tuple(
+                _sqlite_text(
+                    row["required_capability_ids_json"],
+                    "skill index capability ids",
+                )
+            ),
+            activation_mode=SkillActivationMode(
+                _sqlite_text(
+                    row["activation_mode"],
+                    "skill index activation mode",
+                )
+            ),
+            source=SkillSource(_sqlite_text(row["source"], "skill index source")),
+            content_hash=_sqlite_text(
+                row["content_hash"],
+                "skill index content_hash",
+            ),
+            active_version_id=_optional_text(row["active_version_id"]),
+            updated_at=_decode_datetime(
+                _sqlite_text(row["updated_at"], "skill index updated_at")
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError("cannot reconstruct skill index") from error
+
+
+def _list_skill_index(
+    connection: sqlite3.Connection,
+    agent_id: str,
+) -> tuple[SkillIndex, ...]:
+    rows = connection.execute(
+        "SELECT * FROM skill_indexes WHERE agent_id = ? "
+        "ORDER BY stable_name, skill_id",
+        (agent_id,),
+    ).fetchall()
+    return tuple(_decode_skill_index(row) for row in rows)
+
+
+def _load_skill_index(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    skill_id: str,
+) -> SkillIndex | None:
+    row = connection.execute(
+        "SELECT * FROM skill_indexes WHERE agent_id = ? AND skill_id = ?",
+        (agent_id, skill_id),
+    ).fetchone()
+    return None if row is None else _decode_skill_index(row)
+
+
+def _load_skill_version(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    version_id: str,
+) -> SkillVersion | None:
+    row = connection.execute(
+        "SELECT * FROM skill_versions WHERE agent_id = ? AND id = ?",
+        (agent_id, version_id),
+    ).fetchone()
+    return None if row is None else _decode_skill_version(row)
+
+
+def _decode_skill_activation(row: sqlite3.Row) -> SkillActivation:
+    try:
+        return SkillActivation(
+            id=_sqlite_text(row["id"], "skill activation id"),
+            agent_id=_sqlite_text(row["agent_id"], "skill activation agent_id"),
+            skill_id=_sqlite_text(row["skill_id"], "skill activation skill_id"),
+            version_id=_sqlite_text(
+                row["version_id"],
+                "skill activation version_id",
+            ),
+            previous_version_id=_optional_text(row["previous_version_id"]),
+            actor_id=_sqlite_text(row["actor_id"], "skill activation actor_id"),
+            reason=_sqlite_text(row["reason"], "skill activation reason"),
+            activated_at=_decode_datetime(
+                _sqlite_text(row["activated_at"], "skill activation activated_at")
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError("cannot reconstruct skill activation") from error
+
+
+def _inspect_skill(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    skill_id: str,
+) -> SkillInspection | None:
+    skill_row = connection.execute(
+        "SELECT * FROM skills WHERE agent_id = ? AND id = ?",
+        (agent_id, skill_id),
+    ).fetchone()
+    if skill_row is None:
+        return None
+    index_row = connection.execute(
+        "SELECT * FROM skill_indexes WHERE agent_id = ? AND skill_id = ?",
+        (agent_id, skill_id),
+    ).fetchone()
+    if index_row is None:
+        raise SQLiteCorruptionError("discovered skill is missing its index")
+    version_rows = connection.execute(
+        "SELECT * FROM skill_versions WHERE agent_id = ? AND skill_id = ? "
+        "ORDER BY created_at, id",
+        (agent_id, skill_id),
+    ).fetchall()
+    activation_rows = connection.execute(
+        "SELECT * FROM skill_activations WHERE agent_id = ? AND skill_id = ? "
+        "ORDER BY activated_at, id",
+        (agent_id, skill_id),
+    ).fetchall()
+    try:
+        return SkillInspection(
+            skill=_decode_skill(skill_row),
+            index=_decode_skill_index(index_row),
+            versions=tuple(_decode_skill_version(row) for row in version_rows),
+            activations=tuple(_decode_skill_activation(row) for row in activation_rows),
+        )
+    except SQLiteCorruptionError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise SQLiteCorruptionError(
+            f"cannot reconstruct skill inspection {skill_id}"
+        ) from error
+
+
+def _activate_skill(
+    connection: sqlite3.Connection,
+    activation: SkillActivation,
+    *,
+    expected_active_version_id: str | None,
+) -> SkillInspection:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != activation.agent_id:
+            raise AgentIdentityConflictError(
+                "skill activation agent does not match database identity"
+            )
+        existing_activation_row = connection.execute(
+            "SELECT * FROM skill_activations WHERE id = ?",
+            (activation.id,),
+        ).fetchone()
+        index = _load_skill_index(
+            connection,
+            activation.agent_id,
+            activation.skill_id,
+        )
+        if index is None:
+            raise SkillActivationConflictError(f"unknown skill: {activation.skill_id}")
+        if existing_activation_row is not None:
+            if (
+                _decode_skill_activation(existing_activation_row) == activation
+                and index.active_version_id == activation.version_id
+            ):
+                inspection = _inspect_skill(
+                    connection,
+                    activation.agent_id,
+                    activation.skill_id,
+                )
+                assert inspection is not None
+                connection.execute("COMMIT")
+                return inspection
+            raise SkillActivationConflictError(
+                "skill activation identity is already claimed"
+            )
+        if (
+            index.active_version_id != expected_active_version_id
+            or activation.previous_version_id != expected_active_version_id
+        ):
+            raise SkillActivationConflictError(
+                f"skill {activation.skill_id} active version changed"
+            )
+        version = _load_skill_version(
+            connection,
+            activation.agent_id,
+            activation.version_id,
+        )
+        if version is None or version.skill_id != activation.skill_id:
+            raise SkillActivationConflictError(
+                f"unknown skill version: {activation.version_id}"
+            )
+        activated_index = SkillIndex.from_version(
+            version,
+            active_version_id=version.id,
+            updated_at=max(index.updated_at, activation.activated_at),
+        )
+        connection.execute(
+            "INSERT INTO skill_activations("
+            "id, agent_id, skill_id, version_id, previous_version_id, actor_id, "
+            "reason, activated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                activation.id,
+                activation.agent_id,
+                activation.skill_id,
+                activation.version_id,
+                activation.previous_version_id,
+                activation.actor_id,
+                activation.reason,
+                _encode_datetime(activation.activated_at),
+            ),
+        )
+        connection.execute(
+            "UPDATE skill_indexes SET version_id = ?, stable_name = ?, "
+            "version = ?, description = ?, domains_json = ?, "
+            "resource_kinds_json = ?, required_capability_ids_json = ?, "
+            "activation_mode = ?, source = ?, content_hash = ?, "
+            "active_version_id = ?, updated_at = ? "
+            "WHERE agent_id = ? AND skill_id = ? AND active_version_id IS ?",
+            (
+                *_skill_index_values(activated_index)[2:],
+                activation.agent_id,
+                activation.skill_id,
+                expected_active_version_id,
+            ),
+        )
+        changed_row = connection.execute("SELECT changes()").fetchone()
+        assert changed_row is not None
+        if _sqlite_int(changed_row[0], "skill activation changes") != 1:
+            raise SkillActivationConflictError(
+                f"skill {activation.skill_id} active version changed"
+            )
+        inspection = _inspect_skill(
+            connection,
+            activation.agent_id,
+            activation.skill_id,
+        )
+        assert inspection is not None
+        connection.execute("COMMIT")
+        return inspection
+    except sqlite3.IntegrityError as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise SkillActivationConflictError(
+            "skill activation conflicts with durable history"
+        ) from error
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _commit_skill_change(
+    connection: sqlite3.Connection,
+    request: SkillChangeCommit,
+) -> SkillChangeAcceptanceResult:
+    agent_id = request.skill.agent_id
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != agent_id:
+            raise SkillChangeConflictError(
+                "skill change agent does not match database identity"
+            )
+        durable = _load_learning_proposal_in_transaction(
+            connection,
+            agent_id,
+            request.proposal.id,
+        )
+        if durable is None:
+            raise SkillChangeConflictError("skill-change proposal does not exist")
+        if durable.state is LearningProposalState.COMMITTED:
+            try:
+                expected = resolve_learning_proposal(
+                    request.proposal,
+                    request.decision,
+                )
+            except LearningTransitionError as error:
+                raise SkillChangeConflictError(
+                    "skill-change replay decision does not match its proposal"
+                ) from error
+            if durable != expected:
+                raise SkillChangeConflictError(
+                    "skill-change proposal already has another decision"
+                )
+            inspection = _inspect_skill(connection, agent_id, request.skill.id)
+            if inspection is None:
+                raise SQLiteCorruptionError(
+                    "committed skill change is missing its skill history"
+                )
+            stored_version = next(
+                (item for item in inspection.versions if item.id == request.version.id),
+                None,
+            )
+            stored_activation = next(
+                (
+                    item
+                    for item in inspection.activations
+                    if item.id == request.activation.id
+                ),
+                None,
+            )
+            if (
+                stored_version != request.version
+                or stored_activation != request.activation
+            ):
+                raise SkillChangeConflictError(
+                    "skill-change replay does not match durable skill history"
+                )
+            result = SkillChangeAcceptanceResult(
+                proposal=durable,
+                inspection=inspection,
+                replayed=True,
+            )
+            connection.execute("COMMIT")
+            return result
+        if durable.state is not LearningProposalState.PROPOSED or (
+            durable != request.proposal
+        ):
+            raise SkillChangeConflictError(
+                "skill-change proposal state or identity changed"
+            )
+        _validate_learning_runtime_references(connection, durable)
+
+        expected_staged = SkillIndex.from_version(
+            request.version,
+            active_version_id=request.expected_active_version_id,
+        )
+        if request.staged_index != expected_staged:
+            raise SkillChangeConflictError(
+                "skill-change staged index is not the canonical proposal projection"
+            )
+        skill_row = connection.execute(
+            "SELECT * FROM skills WHERE agent_id = ? AND (id = ? OR stable_name = ?) "
+            "ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1",
+            (
+                agent_id,
+                request.skill.id,
+                request.skill.stable_name,
+                request.skill.id,
+            ),
+        ).fetchone()
+        current_index: SkillIndex | None = None
+        if skill_row is None:
+            if request.expected_skill_version_count != 0 or (
+                request.expected_active_version_id is not None
+            ):
+                raise SkillChangeConflictError(
+                    "skill-change expected durable history for a new skill"
+                )
+        else:
+            if _decode_skill(skill_row) != request.skill:
+                raise SkillChangeConflictError(
+                    "skill identity or stable name is already claimed"
+                )
+            inspection = _inspect_skill(connection, agent_id, request.skill.id)
+            if inspection is None:
+                raise SQLiteCorruptionError(
+                    "durable skill identity is missing its history"
+                )
+            if len(inspection.versions) != request.expected_skill_version_count:
+                raise SkillChangeConflictError(
+                    "skill-change immutable version count changed"
+                )
+            current_index = inspection.index
+            if current_index.active_version_id != request.expected_active_version_id:
+                raise SkillChangeConflictError("skill-change active version changed")
+
+        claimed_version = connection.execute(
+            "SELECT * FROM skill_versions WHERE agent_id = ? AND "
+            "(id = ? OR (skill_id = ? AND version = ?)) "
+            "ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1",
+            (
+                agent_id,
+                request.version.id,
+                request.skill.id,
+                request.version.version,
+                request.version.id,
+            ),
+        ).fetchone()
+        if claimed_version is not None:
+            raise SkillChangeConflictError(
+                "skill-change version identity or semantic version is already claimed"
+            )
+        if skill_row is None:
+            connection.execute(
+                "INSERT INTO skills(id, agent_id, stable_name, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    request.skill.id,
+                    agent_id,
+                    request.skill.stable_name,
+                    request.skill.source.value,
+                    _encode_datetime(request.skill.created_at),
+                ),
+            )
+        _insert_skill_version(connection, request.version)
+        final_index = SkillIndex.from_version(
+            request.version,
+            active_version_id=request.version.id,
+            updated_at=max(
+                request.staged_index.updated_at,
+                request.activation.activated_at,
+            ),
+        )
+        if current_index is None:
+            connection.execute(
+                "INSERT INTO skill_indexes("
+                "agent_id, skill_id, version_id, stable_name, version, description, "
+                "domains_json, resource_kinds_json, required_capability_ids_json, "
+                "activation_mode, source, content_hash, active_version_id, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _skill_index_values(final_index),
+            )
+        else:
+            connection.execute(
+                "UPDATE skill_indexes SET version_id = ?, stable_name = ?, "
+                "version = ?, description = ?, domains_json = ?, "
+                "resource_kinds_json = ?, required_capability_ids_json = ?, "
+                "activation_mode = ?, source = ?, content_hash = ?, "
+                "active_version_id = ?, updated_at = ? "
+                "WHERE agent_id = ? AND skill_id = ? AND active_version_id IS ?",
+                (
+                    *_skill_index_values(final_index)[2:],
+                    agent_id,
+                    request.skill.id,
+                    request.expected_active_version_id,
+                ),
+            )
+            changed_row = connection.execute("SELECT changes()").fetchone()
+            assert changed_row is not None
+            if _sqlite_int(changed_row[0], "skill-change index changes") != 1:
+                raise SkillChangeConflictError(
+                    "skill-change active version changed during commit"
+                )
+        connection.execute(
+            "INSERT INTO skill_activations("
+            "id, agent_id, skill_id, version_id, previous_version_id, actor_id, "
+            "reason, activated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                request.activation.id,
+                request.activation.agent_id,
+                request.activation.skill_id,
+                request.activation.version_id,
+                request.activation.previous_version_id,
+                request.activation.actor_id,
+                request.activation.reason,
+                _encode_datetime(request.activation.activated_at),
+            ),
+        )
+        try:
+            resolved = resolve_learning_proposal(durable, request.decision)
+        except LearningTransitionError as error:
+            raise SkillChangeConflictError(
+                "skill-change decision does not match its proposal"
+            ) from error
+        _insert_learning_decision(connection, request.decision)
+        values = _learning_proposal_values(resolved)
+        connection.execute(
+            "UPDATE learning_proposals SET state = ?, candidate_payload_json = ?, "
+            "resolved_at = ?, decision_hash = ?, result_memory_id = ?, "
+            "result_memory_version = ?, result_skill_id = ?, "
+            "result_skill_version = ?, rejection_category = ?, rejection_reason = ? "
+            "WHERE id = ? AND agent_id = ? AND state = ?",
+            (
+                values[4],
+                values[13],
+                values[15],
+                values[16],
+                values[17],
+                values[18],
+                values[19],
+                values[20],
+                values[21],
+                values[22],
+                durable.id,
+                agent_id,
+                LearningProposalState.PROPOSED.value,
+            ),
+        )
+        changed_row = connection.execute("SELECT changes()").fetchone()
+        assert changed_row is not None
+        if _sqlite_int(changed_row[0], "skill-change proposal changes") != 1:
+            raise SkillChangeConflictError(
+                "skill-change proposal changed during commit"
+            )
+        inspection = _inspect_skill(connection, agent_id, request.skill.id)
+        if inspection is None:
+            raise SQLiteCorruptionError(
+                "accepted skill change is missing its committed history"
+            )
+        stored = _load_learning_proposal_in_transaction(
+            connection,
+            agent_id,
+            durable.id,
+        )
+        if stored is None or stored != resolved:
+            raise SQLiteCorruptionError(
+                "accepted skill change proposal did not round-trip"
+            )
+        result = SkillChangeAcceptanceResult(
+            proposal=stored,
+            inspection=inspection,
+            replayed=False,
+        )
+        connection.execute("COMMIT")
+        return result
+    except sqlite3.IntegrityError as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise SkillChangeConflictError(
+            "skill change conflicts with durable proposal or skill history"
+        ) from error
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
 
 
 def _create_session(connection: sqlite3.Connection, session: Session) -> Session:
@@ -6003,7 +9788,8 @@ def _message_from_data(value: object) -> CanonicalMessage:
 def _encode_model_request(request: ModelRequest) -> str:
     return canonical_json(
         {
-            "codec_version": 1,
+            "codec_version": 2,
+            "context_selection": request.context_selection,
             "messages": [_message_to_data(message) for message in request.messages],
             "operation_id": request.operation_id,
             "tools": [_tool_definition_to_data(tool) for tool in request.tools],
@@ -6013,12 +9799,28 @@ def _encode_model_request(request: ModelRequest) -> str:
 
 
 def _decode_model_request(value: str) -> ModelRequest:
-    data = _expect_object(
-        _decode_json(value),
-        keys={"codec_version", "messages", "operation_id", "tools", "turn_id"},
-        label="model request",
+    decoded = _decode_json(value)
+    if not isinstance(decoded, dict):
+        raise ValueError("model request must be a JSON object")
+    codec_version = _expect_int(
+        decoded.get("codec_version"),
+        "model-request codec version",
     )
-    if _expect_int(data["codec_version"], "model-request codec version") != 1:
+    legacy_keys = {"codec_version", "messages", "operation_id", "tools", "turn_id"}
+    if codec_version == 1:
+        data = _expect_object(decoded, keys=legacy_keys, label="model request")
+        context_selection: Mapping[str, object] = {}
+    elif codec_version == 2:
+        data = _expect_object(
+            decoded,
+            keys=legacy_keys | {"context_selection"},
+            label="model request",
+        )
+        selection_value = data["context_selection"]
+        if not isinstance(selection_value, dict):
+            raise ValueError("model-request context selection must be a JSON object")
+        context_selection = selection_value
+    else:
         raise ValueError("unknown model-request codec version")
     return ModelRequest(
         operation_id=_expect_text(data["operation_id"], "request operation_id"),
@@ -6031,6 +9833,7 @@ def _decode_model_request(value: str) -> ModelRequest:
             _tool_definition_from_data(item)
             for item in _expect_list(data["tools"], "request tools")
         ),
+        context_selection=context_selection,
     )
 
 

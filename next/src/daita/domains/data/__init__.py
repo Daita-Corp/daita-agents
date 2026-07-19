@@ -1,6 +1,6 @@
 """Data-domain contracts, deterministic validation, and loop projections."""
 
-from .context import CatalogContextReader, DataContextBuilder
+from .context import CatalogContextReader, DataContextBuilder, SessionContextProjector
 from .catalog import CatalogDataView
 from .capabilities import (
     SQLITE_QUERY_EXECUTOR_ID,
@@ -100,6 +100,7 @@ __all__ = [
     "SQLiteQueryExecutor",
     "SQLiteReadBackend",
     "SQLiteReadResult",
+    "SessionContextProjector",
     "TABULAR_COMPARISON_MEDIA_TYPE",
     "TABULAR_COMPARE_CAPABILITY_ID",
     "TABULAR_COMPARE_EVIDENCE_KIND",

@@ -2,16 +2,24 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sqlite3
 
 import pytest
 
+from daita.context import (
+    ContextKind,
+    SessionCompressionPolicy,
+    SessionCompressionService,
+)
 from daita.events.models import RuntimeEvent
+from daita.identity import AgentIdentity
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
     MessageRole,
+    ModelProfile,
     ModelRequest,
     ModelResponse,
     TextBlock,
@@ -37,6 +45,7 @@ from daita.operations.store import (
     InvalidOperationCheckpointError,
     OperationNotFoundError,
 )
+from daita.sessions import Session
 from daita.storage import sqlite as sqlite_owner
 from daita.storage.sqlite import SQLiteOperationStore
 
@@ -255,6 +264,94 @@ def _decided_snapshot(
     )
 
 
+def _denied_terminal_snapshot() -> OperationSnapshot:
+    waiting = _waiting_snapshot()
+    denied = _decided_snapshot(waiting, ApprovalStatus.DENIED)
+    return replace(
+        denied,
+        operation=replace(
+            denied.operation,
+            status=OperationStatus.FAILED,
+            terminal_reason="approval_denied",
+            updated_at=DECIDED_AT,
+        ),
+        loop_state=replace(
+            denied.loop_state,
+            phase=LoopPhase.TERMINAL,
+            waiting_approval_id=None,
+        ),
+        tasks=(
+            replace(
+                denied.tasks[0],
+                status=TaskStatus.FAILED,
+                error_code="approval_denied",
+                updated_at=DECIDED_AT,
+            ),
+        ),
+        events=(
+            *denied.events,
+            _event(
+                denied,
+                operation_id=denied.operation.id,
+                event_id=f"{denied.operation.id}:failed",
+                event_type="operation.failed",
+                created_at=DECIDED_AT,
+            ),
+        ),
+    )
+
+
+def _plain_session_snapshot(
+    operation_id: str,
+    *,
+    created_at: datetime,
+    current: bool = False,
+) -> OperationSnapshot:
+    trigger = AgentTrigger(
+        id=f"{operation_id}:trigger",
+        agent_id="agent-approval",
+        kind=TriggerKind.USER,
+        source_id="user-approval",
+        session_id="session-approval",
+        payload={"message": f"Request for {operation_id}."},
+        created_at=created_at,
+    )
+    operation = Operation(
+        id=operation_id,
+        agent_id=trigger.agent_id,
+        trigger_id=trigger.id,
+        session_id=trigger.session_id,
+        status=OperationStatus.RUNNING if current else OperationStatus.SUCCEEDED,
+        final_text=None if current else f"Answer for {operation_id}.",
+        terminal_reason=None if current else "completed",
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    return OperationSnapshot(
+        trigger=trigger,
+        operation=operation,
+        loop_state=LoopState(
+            phase=LoopPhase.PREPARING_CONTEXT if current else LoopPhase.TERMINAL
+        ),
+        budgets=LoopBudgets(),
+        turns=(),
+        model_calls=(),
+        readiness=(),
+        tasks=(),
+        evidence=(),
+        observations=(),
+        events=(
+            _event(
+                None,
+                operation_id=operation_id,
+                event_id=f"{operation_id}:created",
+                event_type="operation.created" if current else "operation.completed",
+                created_at=created_at,
+            ),
+        ),
+    )
+
+
 async def test_migration_six_normalizes_approvals_and_event_correlation(
     tmp_path: Path,
 ) -> None:
@@ -264,7 +361,7 @@ async def test_migration_six_normalizes_approvals_and_event_correlation(
 
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (8,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (9,)
         approval_columns = tuple(
             row[1] for row in connection.execute("PRAGMA table_info(approvals)")
         )
@@ -497,3 +594,110 @@ async def test_failed_event_insert_rolls_back_approval_decision(tmp_path: Path) 
         assert loaded.snapshot.approvals[0].status is ApprovalStatus.PENDING
     finally:
         await store.close()
+
+
+async def test_real_sqlite_compression_projects_persisted_approval_state(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    denied = _denied_terminal_snapshot()
+    recent = _plain_session_snapshot(
+        "operation-recent",
+        created_at=NOW + timedelta(minutes=1),
+    )
+    current = _plain_session_snapshot(
+        "operation-current",
+        created_at=NOW + timedelta(minutes=2),
+        current=True,
+    )
+    store = await SQLiteOperationStore.open(path)
+    try:
+        await store.initialize_identity(
+            AgentIdentity(
+                id="agent-approval",
+                display_name="Approval compression",
+                created_at=NOW,
+            )
+        )
+        await store.create_session(
+            Session(
+                id="session-approval",
+                agent_id="agent-approval",
+                title="Approval compression",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        await store.create(denied)
+        await store.create(recent)
+        await store.create(current)
+    finally:
+        await store.close()
+
+    reopened = await SQLiteOperationStore.open(path)
+    try:
+        approval_facts = await reopened.load_session_operation(denied.operation.id)
+        assert approval_facts is not None
+        assert approval_facts.approval_ids == ("approval-global",)
+        assert tuple(
+            (fact.approval_id, fact.status)
+            for fact in approval_facts.approval_state_facts
+        ) == (("approval-global", ApprovalStatus.DENIED),)
+
+        service = SessionCompressionService(
+            transcripts=reopened,
+            checkpoints=reopened,
+            operations=reopened,
+            committer=reopened,
+            policy=SessionCompressionPolicy(
+                compression_threshold_tokens=1,
+                retain_latest_operations=1,
+            ),
+            clock=lambda: NOW + timedelta(minutes=3),
+            id_factory=lambda prefix: f"{prefix}-approval-projection",
+        )
+        projection = await service.project(
+            agent_id="agent-approval",
+            session_id="session-approval",
+            current_operation_id=current.operation.id,
+            profile=ModelProfile(
+                id="mock:approval-compression",
+                context_window_tokens=20_000,
+                max_output_tokens=1_000,
+            ),
+        )
+
+        assert projection.compressed_now
+        checkpoint = projection.checkpoint
+        assert checkpoint is not None
+        assert checkpoint.operation_ids == (denied.operation.id,)
+        assert checkpoint.approval_ids == ("approval-global",)
+        expected_approvals = [
+            {
+                "approval_id": "approval-global",
+                "operation_id": denied.operation.id,
+                "state": "denied",
+            }
+        ]
+        assert json.loads(checkpoint.summary)["approvals"] == expected_approvals
+        assert tuple(block.kind for block in projection.blocks) == (
+            ContextKind.SESSION_SUMMARY,
+            ContextKind.SESSION_RECENT,
+        )
+        assert all(block.required for block in projection.blocks)
+        summary_text = projection.blocks[0].messages[0].content[0]
+        assert isinstance(summary_text, TextBlock)
+        prefix = "UNTRUSTED_SESSION_SUMMARY="
+        assert summary_text.text.startswith(prefix)
+        projected_summary = json.loads(summary_text.text.removeprefix(prefix))
+        assert projected_summary["approval_ids"] == ["approval-global"]
+        assert projected_summary["approvals"] == expected_approvals
+        assert (
+            await reopened.load_session_compression(
+                "agent-approval",
+                "session-approval",
+            )
+            == checkpoint
+        )
+    finally:
+        await reopened.close()

@@ -94,6 +94,33 @@ def _minimal_model_snapshot() -> OperationSnapshot:
                 ),
             ),
         ),
+        context_selection={
+            "estimated_input_tokens": 23,
+            "input_limit_tokens": 100,
+            "omitted_blocks": [],
+            "output_reserve_tokens": 20,
+            "profile_id": "mock:codec-corruption",
+            "schema_version": 1,
+            "selected_blocks": [
+                {
+                    "estimated_tokens": 23,
+                    "id": "data.intent",
+                    "kind": "intent",
+                    "owner": "data",
+                    "priority": 1_000_000,
+                    "provenance": [
+                        {
+                            "kind": "operation.trigger",
+                            "reference_id": trigger.id,
+                            "revision": None,
+                        }
+                    ],
+                    "required": True,
+                    "trust": "trusted_runtime",
+                }
+            ],
+            "tool_tokens": 0,
+        },
     )
     response = ModelResponse(
         finish_reason=FinishReason.STOP,
@@ -202,6 +229,35 @@ async def _assert_typed_corruption(path: Path) -> None:
         await store.close()
 
 
+async def test_model_request_context_selection_roundtrips_and_decodes_v1(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    await _create_valid_database(path)
+
+    store = await SQLiteOperationStore.open(path)
+    try:
+        loaded = await store.load(OPERATION_ID)
+        context_selection = loaded.snapshot.model_calls[0].request.context_selection
+        assert context_selection["schema_version"] == 1
+        assert context_selection["profile_id"] == "mock:codec-corruption"
+        assert context_selection["selected_blocks"]
+    finally:
+        await store.close()
+
+    def downgrade_to_v1(request: dict[str, object]) -> None:
+        request["codec_version"] = 1
+        request.pop("context_selection")
+
+    _edit_request_json(path, downgrade_to_v1)
+    legacy_store = await SQLiteOperationStore.open(path)
+    try:
+        legacy = await legacy_store.load(OPERATION_ID)
+        assert not legacy.snapshot.model_calls[0].request.context_selection
+    finally:
+        await legacy_store.close()
+
+
 @pytest.mark.parametrize(
     "corrupt_json",
     (
@@ -227,7 +283,7 @@ async def test_load_rejects_corrupt_generic_json(
 
 
 def _set_unknown_request_codec(request: dict[str, object]) -> None:
-    request["codec_version"] = 2
+    request["codec_version"] = 3
 
 
 def _set_unknown_content_kind(request: dict[str, object]) -> None:

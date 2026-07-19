@@ -222,6 +222,7 @@ class LoopExit:
     reason: str
     created_at: datetime
     final_text: str | None = None
+    post_operation_notices: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _required_text(self.operation_id, "loop-exit operation_id")
@@ -233,3 +234,14 @@ class LoopExit:
             _required_text(self.final_text, "loop-exit final text")
         if self.kind is LoopExitKind.COMPLETED and self.final_text is None:
             raise ValueError("completed loop exit requires final text")
+        notices = tuple(self.post_operation_notices)
+        if len(notices) > 16 or any(
+            not isinstance(notice, str) or not notice.strip() or len(notice) > 256
+            for notice in notices
+        ):
+            raise ValueError(
+                "loop-exit post-operation notices must be 16 bounded strings or fewer"
+            )
+        if len(notices) != len(set(notices)):
+            raise ValueError("loop-exit post-operation notices cannot be duplicated")
+        object.__setattr__(self, "post_operation_notices", notices)

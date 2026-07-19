@@ -1,8 +1,11 @@
 # Daita autonomous agent v2 replacement
 
-This is the isolated replacement project for Daita 2.0. It currently contains
-the Phase 0 architecture constitution and import firewall only; it is not yet a
-functional agent package.
+This is the isolated replacement project for Daita 2.0. Through Phase 5 it is
+a functional persistent embedded agent: the generic loop, governed execution,
+SQLite recovery, catalog-backed SQLite and sandboxed-file data paths,
+provenance-bearing context, session compression, scoped memory/learning, and
+versioned procedural skills are implemented. Local hosting, monitors, broader
+candidate integrations, and cutover remain later phases.
 
 The governing plan is the local
 `../docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md` fingerprinted in
@@ -67,7 +70,7 @@ security hardening, and tested fresh-state behavior.
 Passing the replacement-candidate gate does not authorize Phase 10. Root
 `daita/` may be removed or replaced only after explicit human approval.
 
-## Phase 0 records
+## Project records
 
 - [`STATUS.md`](STATUS.md) — active task ledger and exact resume action
 - [`PARITY_MATRIX.md`](PARITY_MATRIX.md) — v1 feature and behavior dispositions

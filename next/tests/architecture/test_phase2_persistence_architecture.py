@@ -259,6 +259,7 @@ def test_sqlite_adapter_imports_only_canonical_records_and_standard_library() ->
         "catalog.protocols",
         "collections",
         "collections.abc",
+        "context.session",
         "dataclasses",
         "datetime",
         "decimal",
@@ -267,8 +268,13 @@ def test_sqlite_adapter_imports_only_canonical_records_and_standard_library() ->
         "hashlib",
         "identity",
         "json",
+        "learning",
         "llm.models",
+        "llm.protocols",
         "loop.models",
+        "memory.learning",
+        "memory.models",
+        "memory.protocols",
         "operations.checkpoints",
         "operations.governance",
         "operations.leases",
@@ -278,6 +284,9 @@ def test_sqlite_adapter_imports_only_canonical_records_and_standard_library() ->
         "re",
         "sessions",
         "sqlite3",
+        "skills.learning",
+        "skills.models",
+        "skills.service",
         "typing",
     }
 
@@ -377,6 +386,7 @@ def test_sqlite_adapter_has_no_opaque_snapshot_or_history_rewrite_sql() -> None:
     allowed_current_projection_deletes = {
         "delete from catalog_resource_search where agent_id = ? and source_id = ?",
         "delete from catalog_resources where agent_id = ? and source_id = ?",
+        "delete from memory_search where memory_id = ?",
     }
 
     violations = [

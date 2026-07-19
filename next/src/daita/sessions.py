@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import re
 from typing import Protocol
 
 from .llm.models import CanonicalMessage
+
+_SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_MAX_CHECKPOINT_REFERENCES = 1_024
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -71,6 +75,85 @@ class SessionTranscript:
         object.__setattr__(self, "messages", messages)
 
 
+@dataclass(frozen=True, slots=True)
+class SessionCompressionCheckpoint:
+    """Versioned extractive summary of an immutable session-history prefix."""
+
+    id: str
+    agent_id: str
+    session_id: str
+    version: int
+    through_position: int
+    through_operation_id: str
+    source_fingerprint: str
+    summary: str
+    operation_ids: tuple[str, ...]
+    created_at: datetime
+    evidence_ids: tuple[str, ...] = ()
+    approval_ids: tuple[str, ...] = ()
+    resource_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.id, "compression checkpoint id"),
+            (self.agent_id, "compression checkpoint agent_id"),
+            (self.session_id, "compression checkpoint session_id"),
+            (self.through_operation_id, "compression checkpoint operation id"),
+            (self.summary, "compression checkpoint summary"),
+        ):
+            _required_text(value, name)
+        if len(self.summary) > 32_768:
+            raise ValueError("compression checkpoint summary exceeds 32768 characters")
+        if (
+            not isinstance(self.version, int)
+            or isinstance(self.version, bool)
+            or self.version < 1
+        ):
+            raise ValueError("compression checkpoint version must be positive")
+        if (
+            not isinstance(self.through_position, int)
+            or isinstance(self.through_position, bool)
+            or self.through_position < 0
+        ):
+            raise ValueError("compression checkpoint position cannot be negative")
+        if (
+            not isinstance(self.source_fingerprint, str)
+            or _SHA256.fullmatch(self.source_fingerprint) is None
+        ):
+            raise ValueError("compression checkpoint fingerprint must use sha256")
+        normalized: dict[str, tuple[str, ...]] = {}
+        for name, values in (
+            ("operation_ids", self.operation_ids),
+            ("evidence_ids", self.evidence_ids),
+            ("approval_ids", self.approval_ids),
+            ("resource_ids", self.resource_ids),
+        ):
+            items = tuple(values)
+            if len(items) > _MAX_CHECKPOINT_REFERENCES:
+                raise ValueError(f"compression checkpoint {name} exceeds its bound")
+            if any(not isinstance(item, str) or not item.strip() for item in items):
+                raise ValueError(
+                    f"compression checkpoint {name} must contain non-empty strings"
+                )
+            if len(items) != len(set(items)):
+                raise ValueError(f"compression checkpoint {name} contains duplicates")
+            normalized[name] = items
+        if not normalized["operation_ids"] or (
+            self.through_operation_id not in normalized["operation_ids"]
+        ):
+            raise ValueError(
+                "compression checkpoint frontier must be a summarized operation"
+            )
+        if (
+            not isinstance(self.created_at, datetime)
+            or self.created_at.tzinfo is None
+            or self.created_at.utcoffset() is None
+        ):
+            raise ValueError("compression checkpoint created_at must be timezone-aware")
+        for name, items in normalized.items():
+            object.__setattr__(self, name, items)
+
+
 class SessionAlreadyExistsError(RuntimeError):
     """Raised when a session identity is already claimed."""
 
@@ -85,3 +168,18 @@ class SessionStore(Protocol):
     async def load_session(
         self, agent_id: str, session_id: str
     ) -> SessionTranscript | None: ...
+
+
+class SessionCompressionStore(Protocol):
+    async def load_session_compression(
+        self,
+        agent_id: str,
+        session_id: str,
+    ) -> SessionCompressionCheckpoint | None: ...
+
+    async def commit_session_compression(
+        self,
+        checkpoint: SessionCompressionCheckpoint,
+        *,
+        expected_version: int,
+    ) -> SessionCompressionCheckpoint: ...

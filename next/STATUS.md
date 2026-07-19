@@ -5,15 +5,16 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 5 — context, memory, skills, and learning
-- **Active task:** P5-01 — Phase 5 contract and owner inventory
-- **Last completed task:** P4-06 — consolidated Phase 4 gate
-- **Current checkpoint:** Phase 4 gate (this ledger's containing commit)
+- **Active phase:** Phase 6 — local host and monitors
+- **Active task:** P6-02 — monitor lifecycle and Migration 10
+- **Last completed task:** P6-01 — Phase 6 contract and owner inventory
+- **Current checkpoint:** Phase 5 gate (this ledger's containing commit)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** re-read the Phase 5 context compression, memory,
-  skills, learning, and Journey C contracts; lock one lean vertical plan
+- **Exact next action:** re-read the Phase 6 host/monitor contracts, then add
+  the normalized monitor lifecycle records and Migration 10 without creating
+  another execution path
 
 ## Development cadence
 
@@ -94,6 +95,18 @@ operation runtime; model-visible inputs use resource/evidence IDs rather than
 host paths or rows; and accepted current-operation evidence from both sources
 grounds every comparison answer. CSV/JSON inference, fuzzy matching, pandas,
 arbitrary flattening, and inferred file-to-table relationships remain deferred.
+
+Before Phase 5 production edits, Sections 6 and 15 were re-read in full on
+2026-07-18 together with Sections 8.10-8.11, 9.3, 10, 11.4, 11.8, 12.4,
+Journey C, the Phase 5 work/gate, and the memory/learning/skill preservation
+inventory. The renewed constraints are that context owns projection rather
+than session/catalog/memory/skill state; compression never deletes canonical
+operation history; memory is scoped, versioned, provenance-backed,
+sensitivity-aware, revision-filtered, and reversible; learning consumes
+explicit corrections or completed facts but never learns failed/blocked work;
+skills are bounded procedures that reference registered capability IDs and
+can neither declare executors nor alter policy; and SQLite remains the one
+local composition without becoming a generic state-store abstraction.
 
 ## Current architectural decisions
 
@@ -181,6 +194,37 @@ vertical, then one consolidated gate and commit.
 | P4-04 | complete | SQLite and file evidence; catalog relationships | Tabular comparison capability/evidence, justified cross-source relationships, and bounded cross-source context | Strict typed keys/values, null/missing/duplicate keys, deterministic discrepancies, partial disclosure, accepted-evidence/blob/provenance validation, and root-folder containment pass | P4-03 |
 | P4-05 | complete | Complete deterministic non-database vertical | Public Journey B: find newest allowed export, compare with SQLite customers, explain discrepancies, and retain evidence | Seven-task public trajectory selects inspected newest file, compares accepted file/SQLite evidence, persists blob/citations/transcript, rejects premature completion, and reopens identically | P4-04 |
 | P4-06 | complete | Passing P4-02 through P4-05 slices | Consolidated dual-Python/static/architecture/root/distribution/review gate and one Phase 4 commit | 867 selected tests pass on Python 3.11/3.12; 65 architecture and 2,498 root tests pass; static, distribution, fresh-import, scope, and repaired security review gates pass; containing commit uses `chore(v2-phase-4): complete phase 4 gate` | P4-05 |
+
+## Ordered Phase 5 tasks
+
+Phase 5 keeps six coherent implementation slices and one broad gate. Focused
+tests protect each owner; dual-interpreter, static, root-oracle, distribution,
+and packaging checks remain consolidated in P5-07.
+
+| ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
+| --- | --- | --- | --- | --- | --- |
+| P5-01 | complete | Phase 5 work/gate; Sections 6/15, 8.10-8.11, 9.3, 10, 11.4/11.8, Journey C; current context/session/catalog/capability/SQLite owners; v1 memory/skill references | Exact context, session-summary, memory, learning, skill, migration, public API, and Journey C owner map with explicit deferrals | Read-only plan/current/v1 inventory complete; existing loop/runtime/catalog/session owners remain; one Migration 9 lifecycle slice and focused test map locked; no production edit | Phase 4 gate |
+| P5-02 | complete | P5-01 context/session inventory | Canonical model profiles and provenance-bearing context blocks, deterministic token budgeting, and versioned extractive session-compression checkpoints | Required/optional budgeting, untrusted delimiting, exact selected-context audit, compression preservation, reopen, and transcript authority pass | P5-01 |
+| P5-03 | complete | Context projection and catalog freshness owners | Scoped versioned memory records, provenance, sensitivity/expiry/revision filtering, FTS recall, inspection, supersession, and restore history | Structured filters, stale/superseded/PII/isolation cases, atomic lifecycle commits, and reopen behavior pass | P5-02 |
+| P5-04 | complete | Memory lifecycle; completed-operation and capability seams | Learning proposals for explicit corrections and evidence-backed facts, safety decisions, rejected-candidate hashes, and post-operation commit without loop-owned learning writes | Failed/blocked work cannot learn; sensitive rejection is content-free; proposal resolution and exact provenance are durable and idempotent | P5-03 |
+| P5-05 | complete | Context/capability IDs; shared learning proposals | Bounded `SKILL.md` discovery, compact SQLite index, immutable versions, explicit activation/rollback, inspection, context selection, and audited change proposals | Strict file bounds; inert procedures; capability validation; activation CAS/history/reopen; atomic proposal acceptance; malicious guidance boundary pass | P5-04 |
+| P5-06 | complete | Complete context, memory, learning, and skill slices | Public Journey C across correction, later-session recall, exact grounded query value/evidence, stale revision, PII rejection, supersession, and restart | Learning, session-compression, skill-guidance, and skill-change public journeys pass with inspectable provenance and history after reopen | P5-05 |
+| P5-07 | complete | Passing P5-02 through P5-06 slices | Consolidated dual-Python/static/architecture/root/distribution/review gate and one Phase 5 commit | 1,014 selected v2 tests pass on Python 3.11/3.12; 69 architecture and 2,498 root tests pass; static, distribution, fresh-import, scope, and independent reviews pass; containing commit uses `chore(v2-phase-5): complete phase 5 gate` | P5-06 |
+
+## Ordered Phase 6 tasks
+
+Phase 6 uses four coherent host/monitor slices and one broad gate. The
+scheduler creates ordinary triggers and operations; the existing loop/runtime
+remain the only progression and execution owners.
+
+| ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
+| --- | --- | --- | --- | --- | --- |
+| P6-01 | complete | Phase 6 work/gate; Sections 6/15 and host/monitor supporting sections; current loop/runtime/embedded/event owners; retained v1 monitor behaviors | Exact lifecycle, persistence, scheduler, host, public API, CLI, and deferral map | Read-only inventory locks one Migration 10, ordinary monitor triggers, foreground-only background work, and a six-task lean sequence; no production edit | Phase 5 gate |
+| P6-02 | active | P6-01 owner map; SQLite/event contracts | Versioned monitor definitions, inert proposal/confirmation, schedules, fenced tick leases, stable occurrences/runs, findings, checkpoints, cooldown/backoff, and next-run state | Schedule bounds; lifecycle/reopen; atomic event/state commits; claim races; stale fences; pause/resume/delete/run-now; catch-up once | P6-01 |
+| P6-03 | pending | Monitor store/service; existing loop/runtime/recovery | One-shot due scheduler maps each stable occurrence to one ordinary monitor trigger and operation | Expiry/reclaim reuses trigger; checkpoint/outcome atomicity; evidence-backed findings; no direct executor/adapter/policy/provider path | P6-02 |
+| P6-04 | pending | Embedded composition; scheduler; event subscription; recovery and approval/cancel APIs | Foreground local `AgentHost` owns lock, migrations, durable inbox, scheduling cadence, wakeups, health, streaming, recovery, and graceful shutdown | Inbox replay; same-operation approval wake; cancellation; drain/release; restart recovery; zero hidden embedded tasks | P6-03 |
+| P6-05 | pending | Host contracts and public facades | Public monitor/control/event surfaces plus bounded Unix-socket local client/server and development CLI journey | Host/client/CLI acceptances; permissions/framing/idempotency; first-run, chat, inspect, approval, and monitor commands | P6-04 |
+| P6-06 | pending | Passing P6-02 through P6-05 slices | Consolidated dual-Python/static/architecture/root/distribution/review gate and one Phase 6 commit | Exact commands/results in `QUALITY_GATES.md`; targeted scheduler-fencing and shutdown review; no Phase 7 implementation in gate commit | P6-05 |
 
 ### Ordered P2-03 internal tasks
 

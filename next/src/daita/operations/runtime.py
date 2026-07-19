@@ -356,6 +356,7 @@ class OperationRuntime:
                 "context.built",
                 turn_id=turn_id,
                 model_call_id=model_call.id,
+                payload={"context_selection": request.context_selection},
             )
             self._append_event(
                 state,

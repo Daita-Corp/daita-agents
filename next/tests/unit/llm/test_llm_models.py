@@ -243,6 +243,51 @@ def test_model_request_rejects_cross_operation_messages_and_duplicate_tools() ->
         )
 
 
+def test_model_request_freezes_versioned_bounded_context_selection() -> None:
+    message = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.USER,
+        content=(TextBlock("hello"),),
+    )
+    selected_blocks: list[dict[str, object]] = [{"id": "data.intent"}]
+    metadata: dict[str, object] = {
+        "schema_version": 1,
+        "selected_blocks": selected_blocks,
+    }
+
+    request = ModelRequest(
+        operation_id="operation-1",
+        turn_id="turn-1",
+        messages=(message,),
+        context_selection=metadata,
+    )
+    selected_blocks[0]["id"] = "mutated"
+
+    assert isinstance(request.context_selection, FrozenJsonObject)
+    assert request.context_selection.to_dict() == {
+        "schema_version": 1,
+        "selected_blocks": [{"id": "data.intent"}],
+    }
+    with pytest.raises(ValueError, match="schema_version"):
+        ModelRequest(
+            operation_id="operation-1",
+            turn_id="turn-1",
+            messages=(message,),
+            context_selection={"schema_version": 0},
+        )
+    with pytest.raises(ValueError, match="character bound"):
+        ModelRequest(
+            operation_id="operation-1",
+            turn_id="turn-1",
+            messages=(message,),
+            context_selection={
+                "schema_version": 1,
+                "oversized": "x" * (256 * 1_024),
+            },
+        )
+
+
 def test_response_is_strict_and_preserves_mixed_text_and_ordered_calls() -> None:
     first = ToolCall(id="call-1", name="fake.read", arguments={"key": "alpha"})
     second = ToolCall(id="call-2", name="fake.read", arguments={"key": "beta"})

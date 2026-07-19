@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timezone
 import errno
+from hashlib import sha256
 import os
 from pathlib import Path
 import re
@@ -14,6 +16,7 @@ import tomllib
 from typing import Self, TypeVar
 from uuid import uuid4
 
+from .._json import canonical_json
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.local_files import LocalDirectoryReadBackend
@@ -22,6 +25,12 @@ from ..catalog.capabilities import catalog_declarations
 from ..catalog.models import CatalogSync, CatalogSyncStatus
 from ..catalog.service import CatalogService
 from ..capabilities import CapabilityRegistry
+from ..context import (
+    MemoryContextProjector,
+    SessionCompressionPolicy,
+    SessionCompressionService,
+    SkillContextProjector,
+)
 from ..domains.data import (
     CatalogDataView,
     DataContextBuilder,
@@ -32,14 +41,41 @@ from ..domains.data import (
     tabular_comparison_declarations,
 )
 from ..identity import AgentIdentity
-from ..llm.protocols import ModelProvider
+from ..learning import LearningProvenance, LearningSourceOutcome
+from ..llm.models import ModelProfile
+from ..llm.protocols import ModelProfileConflictError, ModelProvider
 from ..loop.driver import AgentLoop, ContextBuilder, DomainController
-from ..loop.models import LoopBudgets, LoopExit
+from ..loop.models import LoopBudgets, LoopExit, LoopExitKind, LoopPhase
+from ..memory.learning import (
+    RESOURCE_ALIAS_CORRECTION_PREFIX,
+    ExplicitCorrectionLearningError,
+    ExplicitCorrectionLearningService,
+    ExplicitCorrectionResult,
+)
+from ..memory.models import (
+    MemoryInspection,
+    MemoryInspectionRequest,
+    MemoryListRequest,
+    MemoryListResult,
+    MemoryRecallRequest,
+    MemoryRecallResult,
+    MemoryRestoreRequest,
+    MemorySupersessionRequest,
+)
+from ..memory.service import MemoryService
 from ..operations.checkpoints import OperationSnapshot
 from ..operations.governance import DefaultPolicyEvaluator
-from ..operations.models import AgentTrigger, TriggerKind
+from ..operations.models import AgentTrigger, OperationStatus, TriggerKind
 from ..operations.runtime import OperationRuntime
 from ..sessions import Session, SessionAlreadyExistsError, SessionTranscript
+from ..skills.models import SkillIndex, SkillInspection, SkillSource
+from ..skills.learning import (
+    SkillChangeAcceptanceResult,
+    SkillChangeCandidate,
+    SkillChangeLearningService,
+    SkillChangeProposalResult,
+)
+from ..skills.service import SkillService
 from ..storage.blobs import LocalBlobStore
 from ..storage.sqlite import SQLiteOperationStore
 
@@ -57,13 +93,18 @@ def _new_id(prefix: str) -> str:
 
 def _validate_loop_configuration(
     model: ModelProvider | None,
+    model_profile: ModelProfile | None,
     context_builder: ContextBuilder | None,
     domain: DomainController | None,
     capabilities: CapabilityRegistry | None,
+    *,
+    require_default_profile: bool,
 ) -> None:
-    if model is None and (context_builder is not None or domain is not None):
+    if model is None and (
+        model_profile is not None or context_builder is not None or domain is not None
+    ):
         raise AgentNotConfiguredError(
-            "context_builder and domain require a configured model"
+            "model_profile, context_builder, and domain require a configured model"
         )
     if (context_builder is None) != (domain is None):
         raise AgentNotConfiguredError(
@@ -72,6 +113,43 @@ def _validate_loop_configuration(
     if model is not None and context_builder is None and capabilities is not None:
         raise AgentNotConfiguredError(
             "custom capabilities require a custom context_builder and domain"
+        )
+    if model_profile is not None and not isinstance(model_profile, ModelProfile):
+        raise TypeError("model_profile must be a ModelProfile or None")
+    if (
+        model is not None
+        and model_profile is not None
+        and model_profile.id != model.provider_id
+    ):
+        raise AgentNotConfiguredError(
+            "model_profile id must match the configured model provider_id"
+        )
+    if model_profile is not None and (
+        not model_profile.available or not model_profile.healthy
+    ):
+        raise AgentNotConfiguredError(
+            "the configured model profile must be available and healthy"
+        )
+    if model_profile is not None and context_builder is not None:
+        raise AgentNotConfiguredError(
+            "a custom context_builder owns its own model-profile budgeting"
+        )
+    if (
+        model_profile is not None
+        and context_builder is None
+        and not model_profile.supports_tools
+    ):
+        raise AgentNotConfiguredError(
+            "the default data agent requires a tool-capable model profile"
+        )
+    if (
+        require_default_profile
+        and model is not None
+        and model_profile is None
+        and context_builder is None
+    ):
+        raise AgentNotConfiguredError(
+            "the default data agent requires an explicit model profile"
         )
 
 
@@ -125,6 +203,21 @@ class HostActiveError(AgentHomeError):
 
 class AgentNotConfiguredError(AgentHomeError):
     """Raised when run/resume has no composed loop dependencies."""
+
+
+class SessionOperationActiveError(AgentHomeError):
+    """Raised before creating a second operation in one active session."""
+
+    code = "session_operation_active"
+
+    def __init__(self, session_id: str, operation_id: str, status: str) -> None:
+        self.session_id = session_id
+        self.operation_id = operation_id
+        self.status = status
+        super().__init__(
+            f"session_operation_active: session {session_id} already has "
+            f"nonterminal operation {operation_id} ({status})"
+        )
 
 
 class _WriterLock:
@@ -189,6 +282,11 @@ class EmbeddedAgent:
         store: SQLiteOperationStore,
         loop: AgentLoop | None,
         capabilities: CapabilityRegistry,
+        model_profile: ModelProfile | None,
+        memory_service: MemoryService,
+        skill_service: SkillService,
+        learning_service: ExplicitCorrectionLearningService,
+        skill_change_service: SkillChangeLearningService,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
     ) -> None:
@@ -198,6 +296,11 @@ class EmbeddedAgent:
         self._store = store
         self._loop = loop
         self._capabilities = capabilities
+        self.model_profile = model_profile
+        self._memory_service = memory_service
+        self._skill_service = skill_service
+        self._learning_service = learning_service
+        self._skill_change_service = skill_change_service
         self._clock = clock
         self._id_factory = id_factory
         self._mutation_lock = asyncio.Lock()
@@ -210,6 +313,7 @@ class EmbeddedAgent:
         *,
         root: str | Path | None = None,
         model: ModelProvider | None = None,
+        model_profile: ModelProfile | None = None,
         context_builder: ContextBuilder | None = None,
         domain: DomainController | None = None,
         capabilities: CapabilityRegistry | None = None,
@@ -218,7 +322,14 @@ class EmbeddedAgent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
     ) -> Self:
-        _validate_loop_configuration(model, context_builder, domain, capabilities)
+        _validate_loop_configuration(
+            model,
+            model_profile,
+            context_builder,
+            domain,
+            capabilities,
+            require_default_profile=True,
+        )
         resolved_clock = _utc_now if clock is None else clock
         resolved_id_factory = _new_id if id_factory is None else id_factory
         admission, admission_cancelled = await _await_sync_completion(
@@ -251,6 +362,19 @@ class EmbeddedAgent:
                 clock=resolved_clock,
             )
             await store.initialize_identity(identity)
+            resolved_profile = (
+                model_profile if model is not None and context_builder is None else None
+            )
+            if resolved_profile is not None:
+                try:
+                    resolved_profile = await store.bind_model_profile(
+                        identity.id,
+                        resolved_profile,
+                    )
+                except ModelProfileConflictError as error:
+                    raise AgentNotConfiguredError(
+                        "agent model profile changed during creation"
+                    ) from error
             _, manifest_cancelled = await _await_sync_completion(
                 lambda: _write_manifest(home, identity)
             )
@@ -263,6 +387,7 @@ class EmbeddedAgent:
                 writer_lock=writer_lock,
                 store=store,
                 model=model,
+                model_profile=resolved_profile,
                 context_builder=context_builder,
                 domain=domain,
                 capabilities=capabilities,
@@ -292,6 +417,7 @@ class EmbeddedAgent:
         *,
         root: str | Path | None = None,
         model: ModelProvider | None = None,
+        model_profile: ModelProfile | None = None,
         context_builder: ContextBuilder | None = None,
         domain: DomainController | None = None,
         capabilities: CapabilityRegistry | None = None,
@@ -300,7 +426,14 @@ class EmbeddedAgent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
     ) -> Self:
-        _validate_loop_configuration(model, context_builder, domain, capabilities)
+        _validate_loop_configuration(
+            model,
+            model_profile,
+            context_builder,
+            domain,
+            capabilities,
+            require_default_profile=False,
+        )
         resolved_clock = _utc_now if clock is None else clock
         resolved_id_factory = _new_id if id_factory is None else id_factory
         admission, admission_cancelled = await _await_sync_completion(
@@ -327,12 +460,60 @@ class EmbeddedAgent:
                 raise AgentIdentityMismatchError(
                     "agent.toml does not match authoritative state.db identity"
                 )
+            stored_profile = await store.load_model_profile(identity.id)
+            resolved_profile: ModelProfile | None
+            if model is None:
+                resolved_profile = stored_profile
+            elif context_builder is not None:
+                if (
+                    stored_profile is not None
+                    and stored_profile.id != model.provider_id
+                ):
+                    raise AgentNotConfiguredError(
+                        "configured model provider differs from the stored profile"
+                    )
+                resolved_profile = None
+            elif stored_profile is None:
+                if model_profile is None:
+                    raise AgentNotConfiguredError(
+                        "the default data agent requires an explicit model profile "
+                        "on its first configured open"
+                    )
+                try:
+                    resolved_profile = await store.bind_model_profile(
+                        identity.id,
+                        model_profile,
+                    )
+                except ModelProfileConflictError as error:
+                    raise AgentNotConfiguredError(
+                        "agent model profile changed during open"
+                    ) from error
+            else:
+                if stored_profile.id != model.provider_id:
+                    raise AgentNotConfiguredError(
+                        "configured model provider differs from the stored profile"
+                    )
+                if model_profile is not None and model_profile != stored_profile:
+                    raise AgentNotConfiguredError(
+                        "configured model profile differs from the stored profile"
+                    )
+                resolved_profile = stored_profile
+            if model is not None and context_builder is None:
+                _validate_loop_configuration(
+                    model,
+                    resolved_profile,
+                    context_builder,
+                    domain,
+                    capabilities,
+                    require_default_profile=True,
+                )
             return cls._compose(
                 identity=identity,
                 home=home,
                 writer_lock=writer_lock,
                 store=store,
                 model=model,
+                model_profile=resolved_profile,
                 context_builder=context_builder,
                 domain=domain,
                 capabilities=capabilities,
@@ -358,6 +539,7 @@ class EmbeddedAgent:
         writer_lock: _WriterLock,
         store: SQLiteOperationStore,
         model: ModelProvider | None,
+        model_profile: ModelProfile | None,
         context_builder: ContextBuilder | None,
         domain: DomainController | None,
         capabilities: CapabilityRegistry | None,
@@ -366,13 +548,15 @@ class EmbeddedAgent:
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
     ) -> Self:
-        _validate_loop_configuration(model, context_builder, domain, capabilities)
         resolved_context = context_builder
         resolved_domain = domain
         resolved_capabilities = capabilities
         blob_store = LocalBlobStore(home / "blobs")
+        catalog_service = CatalogService(store)
+        memory_service = MemoryService(store, clock=clock)
+        resolved_profile = model_profile
+        data_view: CatalogDataView | None = None
         if context_builder is None and domain is None and capabilities is None:
-            catalog_service = CatalogService(store)
             data_view = CatalogDataView(store, catalog_service)
             catalog = catalog_declarations(identity.id, catalog_service)
             query = sqlite_query_declarations(
@@ -411,14 +595,61 @@ class EmbeddedAgent:
                     *comparison.tool_views,
                 ),
             )
-            if model is not None:
-                resolved_context = DataContextBuilder(data_view)
-                resolved_domain = DataDomainController(
-                    resolved_capabilities,
-                    data_view,
-                    clock=clock,
-                )
         active_capabilities = resolved_capabilities or CapabilityRegistry()
+        skills_root = _ensure_agent_directory(home, "skills")
+        skill_service = SkillService(
+            agent_id=identity.id,
+            root=skills_root,
+            source=SkillSource.USER,
+            store=store,
+            capability_ids=active_capabilities.capability_ids,
+            clock=clock,
+            id_factory=id_factory,
+        )
+        learning_service = ExplicitCorrectionLearningService(
+            catalog=store,
+            store=store,
+            clock=clock,
+        )
+        skill_change_service = SkillChangeLearningService(
+            agent_id=identity.id,
+            store=store,
+            skills=skill_service,
+            clock=clock,
+            id_factory=id_factory,
+        )
+        if model is not None and data_view is not None:
+            assert resolved_profile is not None
+            if not resolved_profile.supports_tools:
+                raise AgentNotConfiguredError(
+                    "the default data agent requires a tool-capable model profile"
+                )
+            session_context = SessionCompressionService(
+                transcripts=store,
+                checkpoints=store,
+                operations=store,
+                committer=store,
+                policy=SessionCompressionPolicy(
+                    compression_threshold_tokens=max(
+                        1,
+                        resolved_profile.maximum_input_tokens * 3 // 4,
+                    )
+                ),
+                clock=clock,
+                id_factory=id_factory,
+            )
+            resolved_context = DataContextBuilder(
+                data_view,
+                profile=resolved_profile,
+                session_projector=session_context,
+                memory_projector=MemoryContextProjector(memory_service),
+                skill_projector=SkillContextProjector(skill_service),
+            )
+            resolved_domain = DataDomainController(
+                active_capabilities,
+                data_view,
+                clock=clock,
+            )
         runtime = OperationRuntime(
             clock=clock,
             id_factory=id_factory,
@@ -445,6 +676,11 @@ class EmbeddedAgent:
             store=store,
             loop=loop,
             capabilities=active_capabilities,
+            model_profile=resolved_profile,
+            memory_service=memory_service,
+            skill_service=skill_service,
+            learning_service=learning_service,
+            skill_change_service=skill_change_service,
             clock=clock,
             id_factory=id_factory,
         )
@@ -467,7 +703,13 @@ class EmbeddedAgent:
                 payload={"message": message},
                 created_at=self._clock(),
             )
-            return await loop.run(trigger)
+            result = await loop.run(trigger)
+            notice = await self._learn_completed_correction(result)
+            return (
+                result
+                if notice is None
+                else replace(result, post_operation_notices=(notice,))
+            )
 
     async def attach(self, source: ResourceSource) -> SourceRegistration:
         """Run one bounded source discovery and commit its complete catalog view."""
@@ -566,7 +808,13 @@ class EmbeddedAgent:
         loop = self._require_loop()
         async with self._mutation_lock:
             self._require_open()
-            return await loop.resume(operation_id)
+            result = await loop.resume(operation_id)
+            notice = await self._learn_completed_correction(result)
+            return (
+                result
+                if notice is None
+                else replace(result, post_operation_notices=(notice,))
+            )
 
     async def transcript(self, session_id: str) -> SessionTranscript:
         self._require_open()
@@ -574,6 +822,180 @@ class EmbeddedAgent:
         if transcript is None:
             raise KeyError(f"unknown session: {session_id}")
         return transcript
+
+    async def recall_memory(
+        self,
+        request: MemoryRecallRequest,
+    ) -> MemoryRecallResult:
+        self._require_open()
+        if not isinstance(request, MemoryRecallRequest):
+            raise TypeError("request must be a MemoryRecallRequest")
+        self._require_memory_agent(request.scope.agent_id)
+        return await self._memory_service.recall(request)
+
+    async def list_memories(
+        self,
+        request: MemoryListRequest,
+    ) -> MemoryListResult:
+        self._require_open()
+        if not isinstance(request, MemoryListRequest):
+            raise TypeError("request must be a MemoryListRequest")
+        self._require_memory_agent(request.scope.agent_id)
+        return await self._memory_service.list(request)
+
+    async def inspect_memory(
+        self,
+        request: MemoryInspectionRequest,
+    ) -> MemoryInspection:
+        self._require_open()
+        if not isinstance(request, MemoryInspectionRequest):
+            raise TypeError("request must be a MemoryInspectionRequest")
+        self._require_memory_agent(request.agent_id)
+        return await self._memory_service.inspect(request)
+
+    async def supersede_memory(
+        self,
+        request: MemorySupersessionRequest,
+    ) -> MemoryInspection:
+        if not isinstance(request, MemorySupersessionRequest):
+            raise TypeError("request must be a MemorySupersessionRequest")
+        async with self._mutation_lock:
+            self._require_open()
+            self._require_memory_agent(request.agent_id)
+            return await self._memory_service.supersede(request)
+
+    async def restore_memory(
+        self,
+        request: MemoryRestoreRequest,
+    ) -> MemoryInspection:
+        if not isinstance(request, MemoryRestoreRequest):
+            raise TypeError("request must be a MemoryRestoreRequest")
+        async with self._mutation_lock:
+            self._require_open()
+            self._require_memory_agent(request.agent_id)
+            return await self._memory_service.restore(request)
+
+    async def refresh_skills(self) -> tuple[SkillIndex, ...]:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._skill_service.refresh()
+
+    async def list_skills(self) -> tuple[SkillIndex, ...]:
+        self._require_open()
+        return await self._skill_service.list()
+
+    async def inspect_skill(self, skill_id: str) -> SkillInspection:
+        self._require_open()
+        return await self._skill_service.inspect(skill_id)
+
+    async def activate_skill(
+        self,
+        skill_id: str,
+        version_id: str,
+        *,
+        expected_active_version_id: str | None,
+        actor_id: str,
+        reason: str,
+    ) -> SkillInspection:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._skill_service.activate(
+                skill_id,
+                version_id,
+                expected_active_version_id=expected_active_version_id,
+                actor_id=actor_id,
+                reason=reason,
+            )
+
+    async def propose_skill_change(
+        self,
+        source_operation_id: str,
+        candidate: SkillChangeCandidate,
+    ) -> SkillChangeProposalResult:
+        if not isinstance(source_operation_id, str) or not source_operation_id.strip():
+            raise ValueError("source_operation_id must be a non-empty string")
+        if not isinstance(candidate, SkillChangeCandidate):
+            raise TypeError("candidate must be a SkillChangeCandidate")
+        async with self._mutation_lock:
+            self._require_open()
+            snapshot = (await self._store.load(source_operation_id)).snapshot
+            if (
+                snapshot.operation.agent_id != self.identity.id
+                or snapshot.operation.status is not OperationStatus.SUCCEEDED
+                or snapshot.loop_state.phase is not LoopPhase.TERMINAL
+                or snapshot.trigger.kind is not TriggerKind.USER
+            ):
+                raise ValueError(
+                    "skill-change source must be a completed successful user operation"
+                )
+            message = snapshot.trigger.payload.get("message")
+            if not isinstance(message, str) or not message.strip():
+                raise ValueError(
+                    "skill-change source user operation must contain a message"
+                )
+            source_hash = (
+                "sha256:"
+                + sha256(
+                    canonical_json(snapshot.trigger.payload).encode("utf-8")
+                ).hexdigest()
+            )
+            return await self._skill_change_service.propose(
+                candidate,
+                LearningProvenance(
+                    agent_id=self.identity.id,
+                    operation_id=snapshot.operation.id,
+                    trigger_id=snapshot.trigger.id,
+                    source_outcome=LearningSourceOutcome.SUCCEEDED,
+                    source_hash=source_hash,
+                ),
+            )
+
+    async def accept_skill_change(
+        self,
+        proposal_id: str,
+        *,
+        expected_active_version_id: str | None,
+        actor_id: str,
+        reason: str,
+    ) -> SkillChangeAcceptanceResult:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._skill_change_service.accept(
+                proposal_id,
+                expected_active_version_id=expected_active_version_id,
+                actor_id=actor_id,
+                reason=reason,
+            )
+
+    async def learn_correction(
+        self,
+        operation_id: str,
+    ) -> ExplicitCorrectionResult:
+        async with self._mutation_lock:
+            self._require_open()
+            snapshot = (await self._store.load(operation_id)).snapshot
+            return await self._learning_service.learn(snapshot)
+
+    async def _learn_completed_correction(self, result: LoopExit) -> str | None:
+        if result.kind is not LoopExitKind.COMPLETED:
+            return None
+        snapshot = (await self._store.load(result.operation_id)).snapshot
+        message = snapshot.trigger.payload.get("message")
+        if not isinstance(message, str) or not message.startswith(
+            RESOURCE_ALIAS_CORRECTION_PREFIX
+        ):
+            return None
+        try:
+            await self._learning_service.learn(snapshot)
+        except ExplicitCorrectionLearningError:
+            return "learning.correction_failed"
+        except Exception:
+            return "learning.post_operation_unavailable"
+        return None
+
+    def _require_memory_agent(self, agent_id: str) -> None:
+        if agent_id != self.identity.id:
+            raise ValueError("memory request belongs to another agent")
 
     async def close(self) -> None:
         async with self._mutation_lock:
@@ -590,6 +1012,7 @@ class EmbeddedAgent:
             raise ValueError("session_id must be a non-empty string")
         existing = await self._store.load_session(self.identity.id, session_id)
         if existing is not None:
+            await self._require_session_idle(session_id)
             return existing.session
         now = self._clock()
         session = Session(
@@ -605,7 +1028,24 @@ class EmbeddedAgent:
             raced = await self._store.load_session(self.identity.id, session_id)
             if raced is None:
                 raise
+            await self._require_session_idle(session_id)
             return raced.session
+
+    async def _require_session_idle(self, session_id: str) -> None:
+        nonterminal = await self._store.load_nonterminal(self.identity.id)
+        active = tuple(
+            item.snapshot.operation
+            for item in nonterminal
+            if item.snapshot.operation.session_id == session_id
+        )
+        if not active:
+            return
+        operation = active[0]
+        raise SessionOperationActiveError(
+            session_id,
+            operation.id,
+            operation.status.value,
+        )
 
     def _require_loop(self) -> AgentLoop:
         self._require_open()
@@ -657,6 +1097,22 @@ def _admit_agent_home(
     _require_unaliased_path(run, "agent run directory")
     os.chmod(run, 0o700)
     return home, _WriterLock.acquire(run / "host.lock")
+
+
+def _ensure_agent_directory(home: Path, name: str) -> Path:
+    if not isinstance(name, str) or not name or "/" in name or name in {".", ".."}:
+        raise AgentHomeError("agent service directory name is invalid")
+    path = home / name
+    _require_unaliased_path(path, f"agent {name} directory")
+    try:
+        path.mkdir(mode=0o700, exist_ok=True)
+    except OSError as error:
+        raise AgentHomeError(f"cannot create agent {name} directory") from error
+    resolved = _require_unaliased_path(path, f"agent {name} directory")
+    if not resolved.is_dir():
+        raise AgentHomeError(f"agent {name} path must be a directory")
+    os.chmod(resolved, 0o700)
+    return resolved
 
 
 def _require_unaliased_path(path: Path, label: str) -> Path:

@@ -133,10 +133,12 @@ def test_readiness_and_exit_records_fail_closed() -> None:
         kind=LoopExitKind.FAILED,
         reason="turn_budget_exhausted",
         created_at=NOW,
+        post_operation_notices=("learning.correction_failed",),
     )
 
     assert allowed.missing_facts == ()
     assert failed.final_text is None
+    assert failed.post_operation_notices == ("learning.correction_failed",)
 
     with pytest.raises(ValueError, match="missing facts"):
         Readiness(
@@ -162,6 +164,15 @@ def test_readiness_and_exit_records_fail_closed() -> None:
             kind=LoopExitKind.COMPLETED,
             reason="completed",
             created_at=NOW,
+        )
+
+    with pytest.raises(ValueError, match="duplicated"):
+        LoopExit(
+            operation_id="op-1",
+            kind=LoopExitKind.FAILED,
+            reason="failed",
+            created_at=NOW,
+            post_operation_notices=("learning.failed", "learning.failed"),
         )
 
 
