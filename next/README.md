@@ -1,11 +1,11 @@
 # Daita autonomous agent v2 replacement
 
-This is the isolated replacement project for Daita 2.0. Through Phase 5 it is
-a functional persistent embedded agent: the generic loop, governed execution,
+This is the isolated replacement project for Daita 2.0. Through Phase 6 it is
+a functional persistent local agent: the generic loop, governed execution,
 SQLite recovery, catalog-backed SQLite and sandboxed-file data paths,
-provenance-bearing context, session compression, scoped memory/learning, and
-versioned procedural skills are implemented. Local hosting, monitors, broader
-candidate integrations, and cutover remain later phases.
+provenance-bearing context, session compression, scoped memory/learning,
+versioned procedural skills, durable monitors, and a foreground local host are
+implemented. Broader candidate integrations and cutover remain later phases.
 
 The governing plan is the local
 `../docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md` fingerprinted in
@@ -55,6 +55,62 @@ python3.11 -m venv .venv
 
 Python 3.11 and 3.12 are the tested candidate versions. Optional source and
 provider SDKs will be added only to matching extras and imported lazily.
+
+## Local development host
+
+The Phase 6 CLI is intentionally thin. Except for initial bootstrap, mutations
+travel over the private per-agent Unix socket to the foreground `AgentHost`,
+which remains the only local writer. Start with an isolated state root:
+
+```bash
+daita --root /tmp/daita-next agent init atlas --idempotency-key init-atlas
+daita --root /tmp/daita-next serve atlas --openai-model gpt-4.1-mini
+```
+
+`serve` resolves `OPENAI_API_KEY` through the provider SDK at request time; the
+secret is not stored in the agent home. In another terminal, attach a source,
+inspect the model/host, submit work, and inspect its durable operation:
+
+```bash
+daita --root /tmp/daita-next source attach atlas sqlite /absolute/path/sales.db \
+  --idempotency-key attach-sales-v1
+daita --root /tmp/daita-next model status atlas
+daita --root /tmp/daita-next host health atlas
+daita --root /tmp/daita-next chat submit atlas "Summarize today's sales" \
+  --session-id sales-chat --idempotency-key chat-sales-1
+daita --root /tmp/daita-next operation inspect atlas <operation-id>
+daita --root /tmp/daita-next events read atlas --limit 100
+```
+
+If inspection reports a waiting approval, the decision updates only the
+persisted approval and wakes the same operation through the host:
+
+```bash
+daita --root /tmp/daita-next approval approve atlas <approval-id> \
+  --actor local-user --reason "Reviewed impact" \
+  --idempotency-key approve-<approval-id>
+```
+
+Monitor creation is proposal-first. The definition is inert until its exact
+candidate hash is confirmed:
+
+```bash
+daita --root /tmp/daita-next monitor propose atlas daily-sales \
+  --definition '{"name":"Daily sales","objective":"Summarize sales changes.","scope":{"source_ids":[],"resource_ids":[]},"schedule":{"kind":"cron","expression":"0 8 * * 1-5","timezone":"UTC"}}' \
+  --idempotency-key propose-daily-sales-v1
+daita --root /tmp/daita-next monitor confirm atlas <proposal-id> \
+  --candidate-hash <candidate-hash> --actor local-user \
+  --reason "Reviewed schedule and scope" \
+  --idempotency-key confirm-daily-sales-v1
+daita --root /tmp/daita-next monitor inspect atlas daily-sales
+daita --root /tmp/daita-next monitor run-now atlas daily-sales \
+  --idempotency-key run-daily-sales-1
+```
+
+Every CLI response is one strict JSON object. `events read` and the current
+socket `events follow` response are bounded cursor pages; Python callers that
+need a live read-only stream use `AgentHost.subscribe_events()` while the host
+is running. OS-service installation and remote transports remain deferred.
 
 ## Phase gates
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Self
@@ -10,6 +10,7 @@ from typing import Self
 from .adapters.models import SourceRegistration
 from .adapters.protocols import ResourceSource
 from .capabilities import CapabilityRegistry
+from .events.models import CommittedEvent, EventCursor
 from .hosting.embedded import (
     AgentAlreadyExistsError,
     AgentHomeError,
@@ -25,8 +26,20 @@ from .llm.models import ModelProfile
 from .llm.protocols import ModelProvider
 from .loop.driver import ContextBuilder, DomainController
 from .loop.models import LoopBudgets, LoopExit
+from .monitors.models import (
+    Monitor,
+    MonitorConfirmation,
+    MonitorDefinition,
+    MonitorInspection,
+    MonitorProposal,
+    MonitorStatus,
+)
 from .operations.checkpoints import OperationSnapshot
-from .operations.governance import DefaultPolicyEvaluator
+from .operations.governance import (
+    ApprovalRequest,
+    ApprovalStatus,
+    DefaultPolicyEvaluator,
+)
 from .sessions import SessionTranscript
 from .memory.learning import ExplicitCorrectionResult
 from .memory.models import (
@@ -142,6 +155,175 @@ class Agent:
 
     async def resume(self, operation_id: str) -> LoopExit:
         return await self._embedded.resume(operation_id)
+
+    async def approve(
+        self,
+        approval_id: str,
+        *,
+        decided_by: str,
+        reason: str,
+    ) -> ApprovalRequest:
+        return await self._embedded.decide_approval(
+            approval_id,
+            status=ApprovalStatus.APPROVED,
+            decided_by=decided_by,
+            reason=reason,
+        )
+
+    async def reject(
+        self,
+        approval_id: str,
+        *,
+        decided_by: str,
+        reason: str,
+    ) -> ApprovalRequest:
+        return await self._embedded.decide_approval(
+            approval_id,
+            status=ApprovalStatus.DENIED,
+            decided_by=decided_by,
+            reason=reason,
+        )
+
+    async def cancel(
+        self,
+        operation_id: str,
+        *,
+        reason: str = "user_cancelled",
+    ) -> LoopExit:
+        return await self._embedded.interrupt(operation_id, reason)
+
+    async def events(
+        self,
+        cursor: EventCursor | None = None,
+        *,
+        limit: int = 100,
+    ) -> tuple[CommittedEvent, ...]:
+        return await self._embedded.read_events(cursor, limit=limit)
+
+    def subscribe_events(
+        self,
+        cursor: EventCursor | None = None,
+    ) -> AsyncIterator[CommittedEvent]:
+        return self._embedded.subscribe_events(cursor)
+
+    async def propose_monitor(
+        self,
+        monitor_id: str,
+        definition: MonitorDefinition,
+        *,
+        idempotency_key: str,
+        source_operation_id: str | None = None,
+    ) -> MonitorProposal:
+        return await self._embedded.propose_monitor(
+            monitor_id,
+            definition,
+            idempotency_key=idempotency_key,
+            source_operation_id=source_operation_id,
+        )
+
+    async def confirm_monitor(
+        self,
+        proposal_id: str,
+        *,
+        candidate_hash: str,
+        actor_id: str,
+        reason: str,
+    ) -> MonitorInspection:
+        return await self._embedded.confirm_monitor(
+            proposal_id,
+            candidate_hash=candidate_hash,
+            actor_id=actor_id,
+            reason=reason,
+        )
+
+    async def reject_monitor(
+        self,
+        proposal_id: str,
+        *,
+        candidate_hash: str,
+        actor_id: str,
+        reason: str,
+    ) -> MonitorConfirmation:
+        return await self._embedded.reject_monitor(
+            proposal_id,
+            candidate_hash=candidate_hash,
+            actor_id=actor_id,
+            reason=reason,
+        )
+
+    async def list_monitors(
+        self,
+        *,
+        statuses: tuple[MonitorStatus, ...] | None = None,
+        include_deleted: bool = False,
+        limit: int = 100,
+    ) -> tuple[Monitor, ...]:
+        return await self._embedded.list_monitors(
+            statuses=statuses,
+            include_deleted=include_deleted,
+            limit=limit,
+        )
+
+    async def list_monitor_proposals(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[MonitorProposal, ...]:
+        return await self._embedded.list_monitor_proposals(limit=limit)
+
+    async def inspect_monitor(self, monitor_id: str) -> MonitorInspection:
+        return await self._embedded.inspect_monitor(monitor_id)
+
+    async def pause_monitor(
+        self,
+        monitor_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+        operation_id: str | None = None,
+    ) -> MonitorInspection:
+        return await self._embedded.pause_monitor(
+            monitor_id,
+            actor_id=actor_id,
+            reason=reason,
+            idempotency_key=idempotency_key,
+            operation_id=operation_id,
+        )
+
+    async def resume_monitor(
+        self,
+        monitor_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+        operation_id: str | None = None,
+    ) -> MonitorInspection:
+        return await self._embedded.resume_monitor(
+            monitor_id,
+            actor_id=actor_id,
+            reason=reason,
+            idempotency_key=idempotency_key,
+            operation_id=operation_id,
+        )
+
+    async def delete_monitor(
+        self,
+        monitor_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+        operation_id: str | None = None,
+    ) -> MonitorInspection:
+        return await self._embedded.delete_monitor(
+            monitor_id,
+            actor_id=actor_id,
+            reason=reason,
+            idempotency_key=idempotency_key,
+            operation_id=operation_id,
+        )
 
     async def transcript(self, session_id: str) -> SessionTranscript:
         return await self._embedded.transcript(session_id)

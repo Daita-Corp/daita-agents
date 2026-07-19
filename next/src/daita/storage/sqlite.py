@@ -61,6 +61,16 @@ from ..events.protocols import (
     EventCursorNotFoundError,
 )
 from ..identity import AgentIdentity, AgentIdentityConflictError
+from ..hosting.inbox import (
+    HostInboxEnqueueConflictError,
+    HostInboxItem,
+    HostInboxKind,
+    HostInboxNotFoundError,
+    HostInboxRevisionConflict,
+    HostInboxStatus,
+    HostMutationAdmission,
+    HostMutationConflictError,
+)
 from ..learning import (
     LearningCandidateCategory,
     LearningDecision,
@@ -110,6 +120,50 @@ from ..memory.learning import (
     ExplicitCorrectionStoreConflictError,
 )
 from ..memory.protocols import MemoryStoreConflictError
+from ..monitors.models import (
+    CatchUpPolicy,
+    CronSchedule,
+    IntervalSchedule,
+    Monitor,
+    MonitorBudgetOverrides,
+    MonitorCheckpoint,
+    MonitorCondition,
+    MonitorConditionKind,
+    MonitorConfirmation,
+    MonitorConfirmationDecision,
+    MonitorDefinition,
+    MonitorFinding,
+    MonitorFindingSeverity,
+    MonitorInspection,
+    MonitorLifecycleAction,
+    MonitorLifecycleRecord,
+    MonitorOccurrence,
+    MonitorOccurrenceKind,
+    MonitorProposal,
+    MonitorRun,
+    MonitorRunStatus,
+    MonitorScheduleState,
+    MonitorScope,
+    MonitorStatus,
+    MonitorTickLease,
+    MonitorTimingPolicy,
+    MonitorVersion,
+)
+from ..monitors.store import (
+    ExpiredMonitorLeaseError,
+    MonitorClaimResult,
+    MonitorConfirmationCommit,
+    MonitorConflictError,
+    MonitorLifecycleCommit,
+    MonitorNotFoundError,
+    MonitorOccurrenceClaim,
+    MonitorOutcomeCommit,
+    MonitorOutcomeResult,
+    MonitorProposalConflictError,
+    MonitorProposalNotFoundError,
+    StaleMonitorFenceError,
+    MonitorTickClaimConflictError,
+)
 from ..operations.checkpoints import (
     ModelCall,
     ModelCallStatus,
@@ -1679,6 +1733,678 @@ _CONTEXT_MEMORY_LEARNING_SKILL_SCHEMA_SQL = (
 )
 
 
+_MONITOR_SCHEMA_SQL = (
+    """
+    CREATE TABLE monitor_proposals (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        intended_monitor_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        candidate_hash TEXT NOT NULL,
+        candidate_json TEXT NOT NULL,
+        source_operation_id TEXT REFERENCES operations(id),
+        created_at TEXT NOT NULL,
+        UNIQUE (agent_id, id),
+        UNIQUE (agent_id, idempotency_key)
+    )
+    """.strip(),
+    """
+    CREATE INDEX monitor_proposals_history_idx
+        ON monitor_proposals(agent_id, created_at, id)
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_proposals_validate_source_insert
+    BEFORE INSERT ON monitor_proposals
+    WHEN NEW.source_operation_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM operations AS operation
+            WHERE operation.id = NEW.source_operation_id
+                AND operation.agent_id = NEW.agent_id
+        )
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor proposal source scope is invalid');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_proposals_reject_update
+    BEFORE UPDATE ON monitor_proposals
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor proposals are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_proposals_reject_delete
+    BEFORE DELETE ON monitor_proposals
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor proposals are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TABLE monitors (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        status TEXT NOT NULL CHECK (status IN ('enabled', 'paused', 'deleted')),
+        current_version INTEGER NOT NULL CHECK (current_version >= 1),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        paused_at TEXT,
+        deleted_at TEXT,
+        UNIQUE (agent_id, id),
+        CHECK (updated_at >= created_at),
+        CHECK (
+            (status = 'enabled' AND paused_at IS NULL AND deleted_at IS NULL)
+            OR (status = 'paused' AND paused_at IS NOT NULL AND deleted_at IS NULL)
+            OR (status = 'deleted' AND deleted_at IS NOT NULL)
+        )
+    )
+    """.strip(),
+    """
+    CREATE INDEX monitors_status_idx
+        ON monitors(agent_id, status, updated_at, id)
+    """.strip(),
+    """
+    CREATE TRIGGER monitors_reject_identity_update
+    BEFORE UPDATE ON monitors
+    WHEN NEW.id != OLD.id
+        OR NEW.agent_id != OLD.agent_id
+        OR NEW.created_at != OLD.created_at
+        OR NEW.revision != OLD.revision + 1
+        OR NEW.current_version < OLD.current_version
+        OR NEW.current_version > OLD.current_version + 1
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor identity or revision is invalid');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitors_reject_terminal_update
+    BEFORE UPDATE ON monitors
+    WHEN OLD.status = 'deleted'
+    BEGIN
+        SELECT RAISE(ABORT, 'deleted monitor is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitors_reject_delete
+    BEFORE DELETE ON monitors
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor history is retained');
+    END
+    """.strip(),
+    """
+    CREATE TABLE monitor_versions (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        monitor_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (version >= 1),
+        definition_json TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        proposal_id TEXT NOT NULL,
+        source_operation_id TEXT REFERENCES operations(id),
+        created_at TEXT NOT NULL,
+        UNIQUE (agent_id, id),
+        UNIQUE (agent_id, monitor_id, version),
+        FOREIGN KEY (agent_id, monitor_id)
+            REFERENCES monitors(agent_id, id),
+        FOREIGN KEY (agent_id, proposal_id)
+            REFERENCES monitor_proposals(agent_id, id)
+    )
+    """.strip(),
+    """
+    CREATE INDEX monitor_versions_history_idx
+        ON monitor_versions(agent_id, monitor_id, version, id)
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_versions_validate_source_insert
+    BEFORE INSERT ON monitor_versions
+    WHEN NEW.source_operation_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM operations AS operation
+            WHERE operation.id = NEW.source_operation_id
+                AND operation.agent_id = NEW.agent_id
+        )
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor version source scope is invalid');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_versions_reject_update
+    BEFORE UPDATE ON monitor_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor versions are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_versions_reject_delete
+    BEFORE DELETE ON monitor_versions
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor versions are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TABLE monitor_confirmations (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        proposal_id TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision IN ('confirmed', 'rejected')),
+        candidate_hash TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        decided_at TEXT NOT NULL,
+        resulting_monitor_id TEXT,
+        resulting_version_id TEXT,
+        UNIQUE (agent_id, id),
+        UNIQUE (agent_id, proposal_id),
+        FOREIGN KEY (agent_id, proposal_id)
+            REFERENCES monitor_proposals(agent_id, id),
+        CHECK (
+            (decision = 'confirmed'
+                AND resulting_monitor_id IS NOT NULL
+                AND resulting_version_id IS NOT NULL)
+            OR (decision = 'rejected'
+                AND resulting_monitor_id IS NULL
+                AND resulting_version_id IS NULL)
+        )
+    )
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_confirmations_reject_update
+    BEFORE UPDATE ON monitor_confirmations
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor confirmations are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_confirmations_reject_delete
+    BEFORE DELETE ON monitor_confirmations
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor confirmations are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TABLE monitor_lifecycle (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        monitor_id TEXT NOT NULL,
+        action TEXT NOT NULL CHECK (
+            action IN ('activate', 'update', 'pause', 'resume', 'delete', 'run_now')
+        ),
+        from_status TEXT CHECK (from_status IN ('enabled', 'paused', 'deleted')),
+        to_status TEXT NOT NULL CHECK (to_status IN ('enabled', 'paused', 'deleted')),
+        from_revision INTEGER NOT NULL CHECK (from_revision >= 0),
+        to_revision INTEGER NOT NULL CHECK (to_revision = from_revision + 1),
+        monitor_version INTEGER NOT NULL CHECK (monitor_version >= 1),
+        actor_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        operation_id TEXT REFERENCES operations(id),
+        UNIQUE (agent_id, id),
+        UNIQUE (agent_id, idempotency_key),
+        FOREIGN KEY (agent_id, monitor_id)
+            REFERENCES monitors(agent_id, id)
+    )
+    """.strip(),
+    """
+    CREATE INDEX monitor_lifecycle_history_idx
+        ON monitor_lifecycle(agent_id, monitor_id, to_revision, id)
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_lifecycle_validate_operation_insert
+    BEFORE INSERT ON monitor_lifecycle
+    WHEN NEW.operation_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM operations AS operation
+            WHERE operation.id = NEW.operation_id
+                AND operation.agent_id = NEW.agent_id
+        )
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor lifecycle operation scope is invalid');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_lifecycle_reject_update
+    BEFORE UPDATE ON monitor_lifecycle
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor lifecycle is append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_lifecycle_reject_delete
+    BEFORE DELETE ON monitor_lifecycle
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor lifecycle is append-only');
+    END
+    """.strip(),
+    """
+    CREATE TABLE monitor_schedule_state (
+        agent_id TEXT NOT NULL,
+        monitor_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        next_scheduled_at TEXT,
+        updated_at TEXT NOT NULL,
+        last_scheduled_at TEXT,
+        cooldown_until TEXT,
+        backoff_until TEXT,
+        consecutive_failures INTEGER NOT NULL CHECK (consecutive_failures >= 0),
+        consecutive_matches INTEGER NOT NULL CHECK (consecutive_matches >= 0),
+        checkpoint_version INTEGER NOT NULL CHECK (checkpoint_version >= 0),
+        last_occurrence_id TEXT,
+        last_run_id TEXT,
+        last_operation_id TEXT REFERENCES operations(id),
+        PRIMARY KEY (agent_id, monitor_id),
+        FOREIGN KEY (agent_id, monitor_id)
+            REFERENCES monitors(agent_id, id)
+    )
+    """.strip(),
+    """
+    CREATE INDEX monitor_schedule_due_idx
+        ON monitor_schedule_state(agent_id, next_scheduled_at, monitor_id)
+    """.strip(),
+    """
+    CREATE TABLE monitor_occurrences (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        monitor_id TEXT NOT NULL,
+        monitor_version INTEGER NOT NULL CHECK (monitor_version >= 1),
+        kind TEXT NOT NULL CHECK (kind IN ('scheduled', 'run_now')),
+        scheduled_for TEXT NOT NULL,
+        occurrence_key TEXT NOT NULL,
+        trigger_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        manual_key TEXT,
+        UNIQUE (agent_id, id),
+        UNIQUE (agent_id, occurrence_key),
+        UNIQUE (trigger_id),
+        UNIQUE (run_id),
+        FOREIGN KEY (agent_id, monitor_id, monitor_version)
+            REFERENCES monitor_versions(agent_id, monitor_id, version),
+        CHECK (
+            (kind = 'scheduled' AND manual_key IS NULL)
+            OR (kind = 'run_now' AND manual_key IS NOT NULL)
+        )
+    )
+    """.strip(),
+    """
+    CREATE INDEX monitor_occurrences_history_idx
+        ON monitor_occurrences(agent_id, monitor_id, scheduled_for, id)
+    """.strip(),
+    """
+    CREATE UNIQUE INDEX monitor_occurrences_manual_key_idx
+        ON monitor_occurrences(agent_id, monitor_id, manual_key)
+        WHERE manual_key IS NOT NULL
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_occurrences_reject_update
+    BEFORE UPDATE ON monitor_occurrences
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor occurrences are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_occurrences_reject_delete
+    BEFORE DELETE ON monitor_occurrences
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor occurrences are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TABLE monitor_tick_leases (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        monitor_id TEXT NOT NULL,
+        occurrence_id TEXT NOT NULL,
+        holder_id TEXT NOT NULL,
+        fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+        claimed_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        released_at TEXT,
+        release_reason TEXT,
+        UNIQUE (agent_id, id),
+        UNIQUE (agent_id, occurrence_id, fencing_token),
+        FOREIGN KEY (agent_id, occurrence_id)
+            REFERENCES monitor_occurrences(agent_id, id),
+        FOREIGN KEY (agent_id, monitor_id)
+            REFERENCES monitors(agent_id, id),
+        CHECK (expires_at > claimed_at),
+        CHECK ((released_at IS NULL) = (release_reason IS NULL))
+    )
+    """.strip(),
+    """
+    CREATE UNIQUE INDEX monitor_tick_leases_live_idx
+        ON monitor_tick_leases(agent_id, occurrence_id)
+        WHERE released_at IS NULL
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_tick_leases_reject_identity_update
+    BEFORE UPDATE ON monitor_tick_leases
+    WHEN NEW.id != OLD.id
+        OR NEW.agent_id != OLD.agent_id
+        OR NEW.monitor_id != OLD.monitor_id
+        OR NEW.occurrence_id != OLD.occurrence_id
+        OR NEW.holder_id != OLD.holder_id
+        OR NEW.fencing_token != OLD.fencing_token
+        OR NEW.claimed_at != OLD.claimed_at
+        OR NEW.expires_at != OLD.expires_at
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor tick-lease identity is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_tick_leases_reject_terminal_update
+    BEFORE UPDATE ON monitor_tick_leases
+    WHEN OLD.released_at IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'released monitor tick lease is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_tick_leases_reject_delete
+    BEFORE DELETE ON monitor_tick_leases
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor tick-lease history is append-only');
+    END
+    """.strip(),
+    """
+    CREATE TABLE monitor_runs (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        monitor_id TEXT NOT NULL,
+        occurrence_id TEXT NOT NULL,
+        trigger_id TEXT NOT NULL,
+        attempt INTEGER NOT NULL CHECK (attempt >= 1),
+        fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+        status TEXT NOT NULL CHECK (
+            status IN ('pending', 'running', 'waiting', 'succeeded', 'failed',
+                'cancelled', 'skipped')
+        ),
+        started_at TEXT NOT NULL,
+        operation_id TEXT UNIQUE REFERENCES operations(id),
+        completed_at TEXT,
+        failure_reason TEXT,
+        UNIQUE (agent_id, id),
+        UNIQUE (agent_id, occurrence_id),
+        UNIQUE (trigger_id),
+        FOREIGN KEY (agent_id, occurrence_id)
+            REFERENCES monitor_occurrences(agent_id, id),
+        FOREIGN KEY (agent_id, monitor_id)
+            REFERENCES monitors(agent_id, id),
+        CHECK (
+            (status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+                AND completed_at IS NOT NULL)
+            OR (status IN ('pending', 'running', 'waiting')
+                AND completed_at IS NULL)
+        )
+    )
+    """.strip(),
+    """
+    CREATE INDEX monitor_runs_history_idx
+        ON monitor_runs(agent_id, monitor_id, started_at, id)
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_runs_reject_identity_update
+    BEFORE UPDATE ON monitor_runs
+    WHEN NEW.id != OLD.id
+        OR NEW.agent_id != OLD.agent_id
+        OR NEW.monitor_id != OLD.monitor_id
+        OR NEW.occurrence_id != OLD.occurrence_id
+        OR NEW.trigger_id != OLD.trigger_id
+        OR NEW.attempt < OLD.attempt
+        OR NEW.fencing_token < OLD.fencing_token
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor run identity or fence is invalid');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_runs_reject_terminal_update
+    BEFORE UPDATE ON monitor_runs
+    WHEN OLD.completed_at IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal monitor run is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_runs_reject_delete
+    BEFORE DELETE ON monitor_runs
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor run history is retained');
+    END
+    """.strip(),
+    """
+    CREATE TABLE monitor_checkpoints (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        monitor_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (version >= 1),
+        run_id TEXT NOT NULL,
+        cursor_json TEXT NOT NULL,
+        cursor_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        previous_version INTEGER,
+        UNIQUE (agent_id, id),
+        UNIQUE (agent_id, monitor_id, version),
+        UNIQUE (agent_id, run_id),
+        FOREIGN KEY (agent_id, run_id)
+            REFERENCES monitor_runs(agent_id, id),
+        CHECK (
+            (version = 1 AND previous_version IS NULL)
+            OR (version > 1 AND previous_version = version - 1)
+        )
+    )
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_checkpoints_reject_update
+    BEFORE UPDATE ON monitor_checkpoints
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor checkpoints are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_checkpoints_reject_delete
+    BEFORE DELETE ON monitor_checkpoints
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor checkpoints are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TABLE monitor_findings (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        monitor_id TEXT NOT NULL,
+        occurrence_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL REFERENCES operations(id),
+        evidence_id TEXT NOT NULL REFERENCES evidence(id),
+        severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
+        summary TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (agent_id, id),
+        UNIQUE (agent_id, run_id, dedupe_key),
+        FOREIGN KEY (agent_id, run_id)
+            REFERENCES monitor_runs(agent_id, id),
+        FOREIGN KEY (agent_id, occurrence_id)
+            REFERENCES monitor_occurrences(agent_id, id),
+        FOREIGN KEY (agent_id, monitor_id)
+            REFERENCES monitors(agent_id, id)
+    )
+    """.strip(),
+    """
+    CREATE INDEX monitor_findings_history_idx
+        ON monitor_findings(agent_id, monitor_id, created_at, id)
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_findings_validate_evidence_insert
+    BEFORE INSERT ON monitor_findings
+    WHEN NOT EXISTS (
+        SELECT 1
+        FROM evidence
+        JOIN operations ON operations.id = evidence.operation_id
+        WHERE evidence.id = NEW.evidence_id
+            AND evidence.operation_id = NEW.operation_id
+            AND evidence.accepted = 1
+            AND operations.agent_id = NEW.agent_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor finding evidence is invalid');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_findings_reject_update
+    BEFORE UPDATE ON monitor_findings
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor findings are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER monitor_findings_reject_delete
+    BEFORE DELETE ON monitor_findings
+    BEGIN
+        SELECT RAISE(ABORT, 'monitor findings are append-only');
+    END
+    """.strip(),
+    "ALTER TABLE runtime_events ADD COLUMN monitor_id TEXT",
+    """
+    CREATE INDEX runtime_events_monitor_idx
+        ON runtime_events(agent_id, monitor_id, agent_sequence)
+    """.strip(),
+    """
+    CREATE TRIGGER runtime_events_validate_monitor_insert
+    BEFORE INSERT ON runtime_events
+    WHEN NEW.monitor_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM monitors
+            WHERE monitors.id = NEW.monitor_id
+                AND monitors.agent_id = NEW.agent_id
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM monitor_proposals
+            WHERE monitor_proposals.intended_monitor_id = NEW.monitor_id
+                AND monitor_proposals.agent_id = NEW.agent_id
+        )
+    BEGIN
+        SELECT RAISE(ABORT, 'event monitor correlation is invalid');
+    END
+    """.strip(),
+)
+
+
+_HOST_INBOX_SCHEMA_SQL = (
+    """
+    CREATE TABLE host_inbox (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        kind TEXT NOT NULL CHECK (kind IN ('trigger', 'approval_wake')),
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision IN (1, 2)),
+        status TEXT NOT NULL CHECK (status IN ('pending', 'completed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        trigger_id TEXT,
+        operation_id TEXT REFERENCES operations(id),
+        error TEXT,
+        UNIQUE (agent_id, id),
+        UNIQUE (agent_id, idempotency_key),
+        CHECK (updated_at >= created_at),
+        CHECK (
+            (kind = 'trigger' AND trigger_id IS NOT NULL)
+            OR (kind = 'approval_wake' AND trigger_id IS NULL)
+        ),
+        CHECK (
+            (status = 'pending' AND revision = 1
+                AND updated_at = created_at
+                AND operation_id IS NULL AND error IS NULL)
+            OR (status = 'completed' AND revision = 2)
+        )
+    )
+    """.strip(),
+    """
+    CREATE INDEX host_inbox_pending_idx
+        ON host_inbox(agent_id, status, created_at, id)
+    """.strip(),
+    """
+    CREATE TRIGGER host_inbox_reject_identity_update
+    BEFORE UPDATE ON host_inbox
+    WHEN NEW.id != OLD.id
+        OR NEW.agent_id != OLD.agent_id
+        OR NEW.kind != OLD.kind
+        OR NEW.idempotency_key != OLD.idempotency_key
+        OR NEW.request_hash != OLD.request_hash
+        OR NEW.payload_json != OLD.payload_json
+        OR NEW.created_at != OLD.created_at
+        OR NEW.trigger_id IS NOT OLD.trigger_id
+        OR NEW.revision != OLD.revision + 1
+    BEGIN
+        SELECT RAISE(ABORT, 'host inbox request identity is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER host_inbox_reject_terminal_update
+    BEFORE UPDATE ON host_inbox
+    WHEN OLD.status = 'completed'
+    BEGIN
+        SELECT RAISE(ABORT, 'completed host inbox item is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER host_inbox_validate_operation_update
+    BEFORE UPDATE ON host_inbox
+    WHEN NEW.operation_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM operations AS operation
+            WHERE operation.id = NEW.operation_id
+                AND operation.agent_id = NEW.agent_id
+                AND (
+                    NEW.kind != 'trigger'
+                    OR operation.trigger_id = NEW.trigger_id
+                )
+        )
+    BEGIN
+        SELECT RAISE(ABORT, 'host inbox operation correlation is invalid');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER host_inbox_reject_delete
+    BEFORE DELETE ON host_inbox
+    BEGIN
+        SELECT RAISE(ABORT, 'host inbox history is retained');
+    END
+    """.strip(),
+)
+
+
+_HOST_MUTATION_ADMISSION_SCHEMA_SQL = (
+    """
+    CREATE TABLE host_mutation_admissions (
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        idempotency_key TEXT NOT NULL,
+        method TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (agent_id, idempotency_key)
+    )
+    """.strip(),
+    """
+    CREATE TRIGGER host_mutation_admissions_reject_update
+    BEFORE UPDATE ON host_mutation_admissions
+    BEGIN
+        SELECT RAISE(ABORT, 'host mutation admission is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER host_mutation_admissions_reject_delete
+    BEFORE DELETE ON host_mutation_admissions
+    BEGIN
+        SELECT RAISE(ABORT, 'host mutation admission is retained');
+    END
+    """.strip(),
+)
+
+
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
 # Migration 3 assigns one append-only committed-event sequence per agent.
@@ -1697,6 +2423,15 @@ _CONTEXT_MEMORY_LEARNING_SKILL_SCHEMA_SQL = (
 # relationship traversal facts.
 # Migration 9 adds append-only session compression, scoped versioned memory,
 # redaction-safe learning proposals, and immutable skill version history.
+# Migration 10 adds the durable monitor control plane, stable scheduled
+# occurrences, fenced tick claims, atomic outcomes, and monitor event
+# correlation without introducing an alternate operation-execution path.
+# Migration 11 adds the foreground host's durable, idempotent trigger and
+# approval-wake inbox. The single writer owns processing, so no queue lease or
+# parallel scheduling authority is introduced here.
+# Migration 12 binds each local-control idempotency key to one canonical method
+# and parameter hash before dispatch. The admission ledger owns no execution or
+# result state; route owners remain responsible for replay-safe recovery.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -1742,6 +2477,21 @@ _MIGRATIONS = (
         version=9,
         name="add_context_memory_learning_and_skills",
         statements=_CONTEXT_MEMORY_LEARNING_SKILL_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=10,
+        name="add_monitor_lifecycle_and_scheduling",
+        statements=_MONITOR_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=11,
+        name="add_host_trigger_inbox",
+        statements=_HOST_INBOX_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=12,
+        name="bind_host_mutation_idempotency",
+        statements=_HOST_MUTATION_ADMISSION_SCHEMA_SQL,
     ),
 )
 
@@ -1842,6 +2592,68 @@ class SQLiteOperationStore:
         """Load the authoritative database identity, if initialized."""
 
         return await self._run_connection(_load_agent_identity)
+
+    async def admit_host_mutation(
+        self,
+        request: HostMutationAdmission,
+    ) -> HostMutationAdmission:
+        """Bind one client key to an exact local-control mutation."""
+
+        if not isinstance(request, HostMutationAdmission):
+            raise TypeError("request must be a HostMutationAdmission")
+        return await self._run_connection(
+            lambda connection: _admit_host_mutation(connection, request)
+        )
+
+    async def enqueue_host_inbox(self, item: HostInboxItem) -> HostInboxItem:
+        """Enqueue one host request idempotently under its canonical hash."""
+
+        if not isinstance(item, HostInboxItem):
+            raise TypeError("item must be a HostInboxItem")
+        if item.status is not HostInboxStatus.PENDING:
+            raise ValueError("new host inbox item must be pending")
+        return await self._run_connection(
+            lambda connection: _enqueue_host_inbox(connection, item)
+        )
+
+    async def list_pending_host_inbox(
+        self,
+        agent_id: str,
+        *,
+        limit: int,
+    ) -> tuple[HostInboxItem, ...]:
+        """List bounded pending work in deterministic FIFO order."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_bounded_limit(limit, maximum=1_000)
+        return await self._run_connection(
+            lambda connection: _list_pending_host_inbox(
+                connection,
+                agent_id,
+                limit=limit,
+            )
+        )
+
+    async def complete_host_inbox(
+        self,
+        item: HostInboxItem,
+        *,
+        expected_revision: int,
+    ) -> HostInboxItem:
+        """Complete one exact inbox request under an optimistic CAS guard."""
+
+        if not isinstance(item, HostInboxItem):
+            raise TypeError("item must be a HostInboxItem")
+        if item.status is not HostInboxStatus.COMPLETED:
+            raise ValueError("host inbox completion must be completed")
+        _require_revision(expected_revision)
+        return await self._run_connection(
+            lambda connection: _complete_host_inbox(
+                connection,
+                item,
+                expected_revision=expected_revision,
+            )
+        )
 
     async def bind_model_profile(
         self,
@@ -2283,6 +3095,260 @@ class SQLiteOperationStore:
         return await self._run_connection(
             lambda connection: _commit_skill_change(connection, request)
         )
+
+    async def create_monitor_proposal(
+        self,
+        proposal: MonitorProposal,
+        event: RuntimeEvent,
+    ) -> MonitorProposal:
+        """Persist one inert monitor proposal and its event atomically."""
+
+        if not isinstance(proposal, MonitorProposal):
+            raise TypeError("proposal must be a MonitorProposal")
+        _validate_monitor_event(event, proposal.agent_id, proposal.intended_monitor_id)
+        result, committed_events = await self._run_connection(
+            lambda connection: _create_monitor_proposal(connection, proposal, event)
+        )
+        self._publish_committed_event_wake_hints(committed_events)
+        return result
+
+    async def load_monitor_proposal(
+        self,
+        agent_id: str,
+        proposal_id: str,
+    ) -> MonitorProposal | None:
+        """Load one inert proposal in its authoritative agent scope."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(proposal_id, "proposal_id")
+        return await self._run_connection(
+            lambda connection: _load_monitor_proposal(
+                connection,
+                agent_id,
+                proposal_id,
+            )
+        )
+
+    async def load_monitor_confirmation(
+        self,
+        agent_id: str,
+        proposal_id: str,
+    ) -> MonitorConfirmation | None:
+        """Load the terminal confirmation for one proposal, if present."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(proposal_id, "proposal_id")
+        return await self._run_connection(
+            lambda connection: _load_monitor_confirmation(
+                connection,
+                agent_id,
+                proposal_id,
+            )
+        )
+
+    async def list_monitor_proposals(
+        self,
+        agent_id: str,
+        *,
+        limit: int,
+    ) -> tuple[MonitorProposal, ...]:
+        """List bounded proposal history in deterministic creation order."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_bounded_limit(limit, maximum=200)
+        return await self._run_connection(
+            lambda connection: _list_monitor_proposals(
+                connection,
+                agent_id,
+                limit=limit,
+            )
+        )
+
+    async def commit_monitor_confirmation(
+        self,
+        commit: MonitorConfirmationCommit,
+    ) -> MonitorInspection | None:
+        """Resolve a proposal and optionally activate version one atomically."""
+
+        if not isinstance(commit, MonitorConfirmationCommit):
+            raise TypeError("commit must be a MonitorConfirmationCommit")
+        result, committed_events = await self._run_connection(
+            lambda connection: _commit_monitor_confirmation(connection, commit)
+        )
+        self._publish_committed_event_wake_hints(committed_events)
+        return result
+
+    async def inspect_monitor(
+        self,
+        agent_id: str,
+        monitor_id: str,
+    ) -> MonitorInspection | None:
+        """Load one monitor's complete durable lifecycle projection."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(monitor_id, "monitor_id")
+        return await self._run_connection(
+            lambda connection: _inspect_monitor(connection, agent_id, monitor_id)
+        )
+
+    async def list_monitors(
+        self,
+        agent_id: str,
+        *,
+        statuses: tuple[MonitorStatus, ...],
+        limit: int,
+    ) -> tuple[Monitor, ...]:
+        """List current monitor projections under explicit status filters."""
+
+        _require_identity(agent_id, "agent_id")
+        if not statuses or any(
+            not isinstance(status, MonitorStatus) for status in statuses
+        ):
+            raise ValueError("statuses must contain MonitorStatus values")
+        if len(statuses) != len(set(statuses)):
+            raise ValueError("statuses cannot contain duplicates")
+        _require_bounded_limit(limit, maximum=200)
+        return await self._run_connection(
+            lambda connection: _list_monitors(
+                connection,
+                agent_id,
+                statuses=statuses,
+                limit=limit,
+            )
+        )
+
+    async def commit_monitor_lifecycle(
+        self,
+        commit: MonitorLifecycleCommit,
+        *,
+        expected_revision: int,
+    ) -> MonitorInspection:
+        """Commit one versioned monitor transition under an exact CAS guard."""
+
+        if not isinstance(commit, MonitorLifecycleCommit):
+            raise TypeError("commit must be a MonitorLifecycleCommit")
+        _require_revision(expected_revision)
+        result, committed_events = await self._run_connection(
+            lambda connection: _commit_monitor_lifecycle(
+                connection,
+                commit,
+                expected_revision=expected_revision,
+            )
+        )
+        self._publish_committed_event_wake_hints(committed_events)
+        return result
+
+    async def list_due_monitors(
+        self,
+        agent_id: str,
+        *,
+        now: datetime,
+        limit: int,
+    ) -> tuple[MonitorInspection, ...]:
+        """Load enabled due monitors after durable cooldown/backoff gates."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_monitor_datetime(now, "now")
+        _require_bounded_limit(limit, maximum=200)
+        return await self._run_connection(
+            lambda connection: _list_due_monitors(
+                connection,
+                agent_id,
+                now=now,
+                limit=limit,
+            )
+        )
+
+    async def claim_monitor_occurrence(
+        self,
+        claim: MonitorOccurrenceClaim,
+        *,
+        expected_monitor_revision: int,
+        expected_schedule_revision: int,
+        checked_at: datetime,
+    ) -> MonitorClaimResult:
+        """Create or reclaim one stable occurrence under a durable fence."""
+
+        if not isinstance(claim, MonitorOccurrenceClaim):
+            raise TypeError("claim must be a MonitorOccurrenceClaim")
+        _require_revision(expected_monitor_revision)
+        _require_revision(expected_schedule_revision)
+        _require_monitor_datetime(checked_at, "checked_at")
+        result, committed_events = await self._run_connection(
+            lambda connection: _claim_monitor_occurrence(
+                connection,
+                claim,
+                expected_monitor_revision=expected_monitor_revision,
+                expected_schedule_revision=expected_schedule_revision,
+                checked_at=checked_at,
+            )
+        )
+        self._publish_committed_event_wake_hints(committed_events)
+        return result
+
+    async def load_monitor_claim_by_manual_key(
+        self,
+        agent_id: str,
+        monitor_id: str,
+        manual_key: str,
+    ) -> MonitorClaimResult | None:
+        """Load the authoritative run-now occurrence, run, and latest lease."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(monitor_id, "monitor_id")
+        _require_identity(manual_key, "manual_key")
+        return await self._run_connection(
+            lambda connection: _load_monitor_claim_by_manual_key(
+                connection,
+                agent_id,
+                monitor_id,
+                manual_key,
+            )
+        )
+
+    async def load_occurrence_by_trigger(
+        self,
+        agent_id: str,
+        trigger_id: str,
+    ) -> MonitorOccurrence | None:
+        """Resolve a stable monitor occurrence from its ordinary trigger ID."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(trigger_id, "trigger_id")
+        return await self._run_connection(
+            lambda connection: _load_monitor_occurrence_by_trigger(
+                connection,
+                agent_id,
+                trigger_id,
+            )
+        )
+
+    async def commit_monitor_outcome(
+        self,
+        commit: MonitorOutcomeCommit,
+        *,
+        expected_monitor_revision: int,
+        expected_schedule_revision: int,
+        checked_at: datetime,
+    ) -> MonitorOutcomeResult:
+        """Commit a fenced run outcome, checkpoint, finding, and events."""
+
+        if not isinstance(commit, MonitorOutcomeCommit):
+            raise TypeError("commit must be a MonitorOutcomeCommit")
+        _require_revision(expected_monitor_revision)
+        _require_revision(expected_schedule_revision)
+        _require_monitor_datetime(checked_at, "checked_at")
+        result, committed_events = await self._run_connection(
+            lambda connection: _commit_monitor_outcome(
+                connection,
+                commit,
+                expected_monitor_revision=expected_monitor_revision,
+                expected_schedule_revision=expected_schedule_revision,
+                checked_at=checked_at,
+            )
+        )
+        self._publish_committed_event_wake_hints(committed_events)
+        return result
 
     async def register_source(
         self,
@@ -7484,6 +8550,2522 @@ def _commit_skill_change(
         raise
 
 
+def _require_monitor_datetime(value: datetime, field_name: str) -> None:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise ValueError(f"{field_name} must be timezone-aware")
+
+
+def _validate_monitor_event(
+    event: RuntimeEvent,
+    agent_id: str,
+    monitor_id: str,
+) -> None:
+    if not isinstance(event, RuntimeEvent):
+        raise TypeError("monitor event must be a RuntimeEvent")
+    if event.agent_id != agent_id or event.monitor_id != monitor_id:
+        raise ValueError("monitor event scope does not match its lifecycle record")
+
+
+def _monitor_definition_data(definition: MonitorDefinition) -> dict[str, object]:
+    schedule: dict[str, object]
+    if isinstance(definition.schedule, IntervalSchedule):
+        schedule = {
+            "anchor_at": _encode_datetime(definition.schedule.anchor_at),
+            "interval_seconds": definition.schedule.interval_seconds,
+            "kind": "interval",
+        }
+    else:
+        schedule = {
+            "expression": definition.schedule.expression,
+            "kind": "cron",
+            "timezone_name": definition.schedule.timezone_name,
+        }
+    return {
+        "budget_overrides": {
+            "max_capability_calls": definition.budget_overrides.max_capability_calls,
+            "max_turns": definition.budget_overrides.max_turns,
+            "max_wall_time_seconds": definition.budget_overrides.max_wall_time_seconds,
+        },
+        "condition": {
+            "configuration": definition.condition.configuration,
+            "expression": definition.condition.expression,
+            "kind": definition.condition.kind.value,
+        },
+        "name": definition.name,
+        "objective": definition.objective,
+        "operation_template": definition.operation_template,
+        "policy_overrides": definition.policy_overrides,
+        "schedule": schedule,
+        "scope": {
+            "resource_ids": definition.scope.resource_ids,
+            "source_ids": definition.scope.source_ids,
+        },
+        "timing": {
+            "backoff_multiplier": definition.timing.backoff_multiplier,
+            "catch_up": definition.timing.catch_up.value,
+            "cooldown_seconds": definition.timing.cooldown_seconds,
+            "initial_backoff_seconds": definition.timing.initial_backoff_seconds,
+            "max_backoff_seconds": definition.timing.max_backoff_seconds,
+        },
+    }
+
+
+def _monitor_mapping(value: object, field_name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise SQLiteCorruptionError(f"{field_name} must be a JSON object")
+    if any(not isinstance(key, str) for key in value):
+        raise SQLiteCorruptionError(f"{field_name} contains a non-string key")
+    return value
+
+
+def _monitor_text(value: object, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise SQLiteCorruptionError(f"{field_name} must be text")
+    return value
+
+
+def _monitor_optional_text(value: object, field_name: str) -> str | None:
+    if value is None:
+        return None
+    return _monitor_text(value, field_name)
+
+
+def _monitor_int(value: object, field_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise SQLiteCorruptionError(f"{field_name} must be an integer")
+    return value
+
+
+def _monitor_optional_int(value: object, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _monitor_int(value, field_name)
+
+
+def _monitor_float(value: object, field_name: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise SQLiteCorruptionError(f"{field_name} must be numeric")
+    return float(value)
+
+
+def _monitor_string_tuple(value: object, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise SQLiteCorruptionError(f"{field_name} must be a JSON string array")
+    return tuple(value)
+
+
+def _decode_monitor_definition(value: str) -> MonitorDefinition:
+    data = _monitor_mapping(_decode_json_object(value), "monitor definition")
+    schedule_data = _monitor_mapping(data.get("schedule"), "monitor schedule")
+    schedule_kind = _monitor_text(schedule_data.get("kind"), "schedule kind")
+    schedule: IntervalSchedule | CronSchedule
+    if schedule_kind == "interval":
+        schedule = IntervalSchedule(
+            interval_seconds=_monitor_int(
+                schedule_data.get("interval_seconds"),
+                "interval seconds",
+            ),
+            anchor_at=_decode_datetime(
+                _monitor_text(schedule_data.get("anchor_at"), "schedule anchor")
+            ),
+        )
+    elif schedule_kind == "cron":
+        schedule = CronSchedule(
+            expression=_monitor_text(
+                schedule_data.get("expression"),
+                "cron expression",
+            ),
+            timezone_name=_monitor_text(
+                schedule_data.get("timezone_name"),
+                "cron timezone",
+            ),
+        )
+    else:
+        raise SQLiteCorruptionError(f"unsupported monitor schedule: {schedule_kind}")
+    scope_data = _monitor_mapping(data.get("scope"), "monitor scope")
+    condition_data = _monitor_mapping(data.get("condition"), "monitor condition")
+    budget_data = _monitor_mapping(
+        data.get("budget_overrides"),
+        "monitor budget overrides",
+    )
+    timing_data = _monitor_mapping(data.get("timing"), "monitor timing")
+    return MonitorDefinition(
+        name=_monitor_text(data.get("name"), "monitor name"),
+        objective=_monitor_text(data.get("objective"), "monitor objective"),
+        scope=MonitorScope(
+            source_ids=_monitor_string_tuple(
+                scope_data.get("source_ids"),
+                "monitor source scope",
+            ),
+            resource_ids=_monitor_string_tuple(
+                scope_data.get("resource_ids"),
+                "monitor resource scope",
+            ),
+        ),
+        schedule=schedule,
+        condition=MonitorCondition(
+            kind=MonitorConditionKind(
+                _monitor_text(condition_data.get("kind"), "condition kind")
+            ),
+            expression=_monitor_optional_text(
+                condition_data.get("expression"),
+                "condition expression",
+            ),
+            configuration=_monitor_mapping(
+                condition_data.get("configuration"),
+                "condition configuration",
+            ),
+        ),
+        budget_overrides=MonitorBudgetOverrides(
+            max_turns=_monitor_optional_int(
+                budget_data.get("max_turns"),
+                "budget max_turns",
+            ),
+            max_capability_calls=_monitor_optional_int(
+                budget_data.get("max_capability_calls"),
+                "budget max_capability_calls",
+            ),
+            max_wall_time_seconds=_monitor_optional_int(
+                budget_data.get("max_wall_time_seconds"),
+                "budget max_wall_time_seconds",
+            ),
+        ),
+        timing=MonitorTimingPolicy(
+            catch_up=CatchUpPolicy(
+                _monitor_text(timing_data.get("catch_up"), "catch-up policy")
+            ),
+            cooldown_seconds=_monitor_int(
+                timing_data.get("cooldown_seconds"),
+                "cooldown seconds",
+            ),
+            initial_backoff_seconds=_monitor_int(
+                timing_data.get("initial_backoff_seconds"),
+                "initial backoff seconds",
+            ),
+            max_backoff_seconds=_monitor_int(
+                timing_data.get("max_backoff_seconds"),
+                "max backoff seconds",
+            ),
+            backoff_multiplier=_monitor_float(
+                timing_data.get("backoff_multiplier"),
+                "backoff multiplier",
+            ),
+        ),
+        policy_overrides=_monitor_mapping(
+            data.get("policy_overrides"),
+            "monitor policy overrides",
+        ),
+        operation_template=_monitor_mapping(
+            data.get("operation_template"),
+            "monitor operation template",
+        ),
+    )
+
+
+def _monitor_proposal_values(proposal: MonitorProposal) -> tuple[object, ...]:
+    return (
+        proposal.id,
+        proposal.agent_id,
+        proposal.intended_monitor_id,
+        proposal.idempotency_key,
+        proposal.candidate_hash,
+        canonical_json(_monitor_definition_data(proposal.candidate)),
+        proposal.source_operation_id,
+        _encode_datetime(proposal.created_at),
+    )
+
+
+def _decode_monitor_proposal_row(row: sqlite3.Row) -> MonitorProposal:
+    return MonitorProposal(
+        id=_sqlite_text(row["id"], "monitor proposal id"),
+        agent_id=_sqlite_text(row["agent_id"], "monitor proposal agent_id"),
+        intended_monitor_id=_sqlite_text(
+            row["intended_monitor_id"],
+            "intended monitor id",
+        ),
+        idempotency_key=_sqlite_text(
+            row["idempotency_key"],
+            "monitor proposal idempotency key",
+        ),
+        candidate=_decode_monitor_definition(
+            _sqlite_text(row["candidate_json"], "monitor proposal candidate")
+        ),
+        candidate_hash=_sqlite_text(
+            row["candidate_hash"],
+            "monitor proposal candidate hash",
+        ),
+        source_operation_id=_optional_text(row["source_operation_id"]),
+        created_at=_decode_datetime(
+            _sqlite_text(row["created_at"], "monitor proposal created_at")
+        ),
+    )
+
+
+def _monitor_confirmation_values(
+    confirmation: MonitorConfirmation,
+) -> tuple[object, ...]:
+    return (
+        confirmation.id,
+        confirmation.agent_id,
+        confirmation.proposal_id,
+        confirmation.decision.value,
+        confirmation.candidate_hash,
+        confirmation.actor_id,
+        confirmation.reason,
+        _encode_datetime(confirmation.decided_at),
+        confirmation.resulting_monitor_id,
+        confirmation.resulting_version_id,
+    )
+
+
+def _decode_monitor_confirmation_row(row: sqlite3.Row) -> MonitorConfirmation:
+    return MonitorConfirmation(
+        id=_sqlite_text(row["id"], "monitor confirmation id"),
+        agent_id=_sqlite_text(row["agent_id"], "monitor confirmation agent_id"),
+        proposal_id=_sqlite_text(row["proposal_id"], "monitor proposal id"),
+        decision=MonitorConfirmationDecision(
+            _sqlite_text(row["decision"], "monitor confirmation decision")
+        ),
+        candidate_hash=_sqlite_text(
+            row["candidate_hash"],
+            "monitor confirmation candidate hash",
+        ),
+        actor_id=_sqlite_text(row["actor_id"], "monitor confirmation actor"),
+        reason=_sqlite_text(row["reason"], "monitor confirmation reason"),
+        decided_at=_decode_datetime(
+            _sqlite_text(row["decided_at"], "monitor confirmation decided_at")
+        ),
+        resulting_monitor_id=_optional_text(row["resulting_monitor_id"]),
+        resulting_version_id=_optional_text(row["resulting_version_id"]),
+    )
+
+
+def _monitor_values(monitor: Monitor) -> tuple[object, ...]:
+    return (
+        monitor.id,
+        monitor.agent_id,
+        monitor.status.value,
+        monitor.current_version,
+        monitor.revision,
+        _encode_datetime(monitor.created_at),
+        _encode_datetime(monitor.updated_at),
+        None if monitor.paused_at is None else _encode_datetime(monitor.paused_at),
+        None if monitor.deleted_at is None else _encode_datetime(monitor.deleted_at),
+    )
+
+
+def _decode_monitor_row(row: sqlite3.Row) -> Monitor:
+    return Monitor(
+        id=_sqlite_text(row["id"], "monitor id"),
+        agent_id=_sqlite_text(row["agent_id"], "monitor agent_id"),
+        status=MonitorStatus(_sqlite_text(row["status"], "monitor status")),
+        current_version=_sqlite_int(row["current_version"], "monitor current version"),
+        revision=_sqlite_int(row["revision"], "monitor revision"),
+        created_at=_decode_datetime(
+            _sqlite_text(row["created_at"], "monitor created_at")
+        ),
+        updated_at=_decode_datetime(
+            _sqlite_text(row["updated_at"], "monitor updated_at")
+        ),
+        paused_at=(
+            None
+            if row["paused_at"] is None
+            else _decode_datetime(_sqlite_text(row["paused_at"], "monitor paused_at"))
+        ),
+        deleted_at=(
+            None
+            if row["deleted_at"] is None
+            else _decode_datetime(_sqlite_text(row["deleted_at"], "monitor deleted_at"))
+        ),
+    )
+
+
+def _monitor_version_values(version: MonitorVersion) -> tuple[object, ...]:
+    return (
+        version.id,
+        version.agent_id,
+        version.monitor_id,
+        version.version,
+        canonical_json(_monitor_definition_data(version.definition)),
+        version.content_hash,
+        version.proposal_id,
+        version.source_operation_id,
+        _encode_datetime(version.created_at),
+    )
+
+
+def _decode_monitor_version_row(row: sqlite3.Row) -> MonitorVersion:
+    return MonitorVersion(
+        id=_sqlite_text(row["id"], "monitor version id"),
+        agent_id=_sqlite_text(row["agent_id"], "monitor version agent_id"),
+        monitor_id=_sqlite_text(row["monitor_id"], "monitor version monitor_id"),
+        version=_sqlite_int(row["version"], "monitor version"),
+        definition=_decode_monitor_definition(
+            _sqlite_text(row["definition_json"], "monitor definition")
+        ),
+        content_hash=_sqlite_text(row["content_hash"], "monitor version hash"),
+        proposal_id=_sqlite_text(row["proposal_id"], "monitor version proposal id"),
+        source_operation_id=_optional_text(row["source_operation_id"]),
+        created_at=_decode_datetime(
+            _sqlite_text(row["created_at"], "monitor version created_at")
+        ),
+    )
+
+
+def _monitor_lifecycle_values(
+    lifecycle: MonitorLifecycleRecord,
+) -> tuple[object, ...]:
+    return (
+        lifecycle.id,
+        lifecycle.agent_id,
+        lifecycle.monitor_id,
+        lifecycle.action.value,
+        None if lifecycle.from_status is None else lifecycle.from_status.value,
+        lifecycle.to_status.value,
+        lifecycle.from_revision,
+        lifecycle.to_revision,
+        lifecycle.monitor_version,
+        lifecycle.actor_id,
+        lifecycle.reason,
+        lifecycle.idempotency_key,
+        _encode_datetime(lifecycle.occurred_at),
+        lifecycle.operation_id,
+    )
+
+
+def _decode_monitor_lifecycle_row(row: sqlite3.Row) -> MonitorLifecycleRecord:
+    return MonitorLifecycleRecord(
+        id=_sqlite_text(row["id"], "monitor lifecycle id"),
+        agent_id=_sqlite_text(row["agent_id"], "monitor lifecycle agent_id"),
+        monitor_id=_sqlite_text(row["monitor_id"], "monitor lifecycle monitor_id"),
+        action=MonitorLifecycleAction(
+            _sqlite_text(row["action"], "monitor lifecycle action")
+        ),
+        from_status=(
+            None
+            if row["from_status"] is None
+            else MonitorStatus(
+                _sqlite_text(row["from_status"], "monitor lifecycle from status")
+            )
+        ),
+        to_status=MonitorStatus(
+            _sqlite_text(row["to_status"], "monitor lifecycle to status")
+        ),
+        from_revision=_sqlite_int(
+            row["from_revision"],
+            "monitor lifecycle from revision",
+        ),
+        to_revision=_sqlite_int(
+            row["to_revision"],
+            "monitor lifecycle to revision",
+        ),
+        monitor_version=_sqlite_int(
+            row["monitor_version"],
+            "monitor lifecycle version",
+        ),
+        actor_id=_sqlite_text(row["actor_id"], "monitor lifecycle actor"),
+        reason=_sqlite_text(row["reason"], "monitor lifecycle reason"),
+        idempotency_key=_sqlite_text(
+            row["idempotency_key"],
+            "monitor lifecycle idempotency key",
+        ),
+        occurred_at=_decode_datetime(
+            _sqlite_text(row["occurred_at"], "monitor lifecycle occurred_at")
+        ),
+        operation_id=_optional_text(row["operation_id"]),
+    )
+
+
+def _monitor_schedule_state_values(
+    state: MonitorScheduleState,
+) -> tuple[object, ...]:
+    return (
+        state.agent_id,
+        state.monitor_id,
+        state.revision,
+        (
+            None
+            if state.next_scheduled_at is None
+            else _encode_datetime(state.next_scheduled_at)
+        ),
+        _encode_datetime(state.updated_at),
+        (
+            None
+            if state.last_scheduled_at is None
+            else _encode_datetime(state.last_scheduled_at)
+        ),
+        (
+            None
+            if state.cooldown_until is None
+            else _encode_datetime(state.cooldown_until)
+        ),
+        None if state.backoff_until is None else _encode_datetime(state.backoff_until),
+        state.consecutive_failures,
+        state.consecutive_matches,
+        state.checkpoint_version,
+        state.last_occurrence_id,
+        state.last_run_id,
+        state.last_operation_id,
+    )
+
+
+def _decode_monitor_schedule_state_row(row: sqlite3.Row) -> MonitorScheduleState:
+    return MonitorScheduleState(
+        agent_id=_sqlite_text(row["agent_id"], "monitor state agent_id"),
+        monitor_id=_sqlite_text(row["monitor_id"], "monitor state monitor_id"),
+        revision=_sqlite_int(row["revision"], "monitor state revision"),
+        next_scheduled_at=_decode_optional_datetime(
+            row["next_scheduled_at"],
+            "monitor next scheduled_at",
+        ),
+        updated_at=_decode_datetime(
+            _sqlite_text(row["updated_at"], "monitor state updated_at")
+        ),
+        last_scheduled_at=_decode_optional_datetime(
+            row["last_scheduled_at"],
+            "monitor last scheduled_at",
+        ),
+        cooldown_until=_decode_optional_datetime(
+            row["cooldown_until"],
+            "monitor cooldown_until",
+        ),
+        backoff_until=_decode_optional_datetime(
+            row["backoff_until"],
+            "monitor backoff_until",
+        ),
+        consecutive_failures=_sqlite_int(
+            row["consecutive_failures"],
+            "monitor consecutive failures",
+        ),
+        consecutive_matches=_sqlite_int(
+            row["consecutive_matches"],
+            "monitor consecutive matches",
+        ),
+        checkpoint_version=_sqlite_int(
+            row["checkpoint_version"],
+            "monitor checkpoint version",
+        ),
+        last_occurrence_id=_optional_text(row["last_occurrence_id"]),
+        last_run_id=_optional_text(row["last_run_id"]),
+        last_operation_id=_optional_text(row["last_operation_id"]),
+    )
+
+
+def _monitor_occurrence_values(
+    occurrence: MonitorOccurrence,
+) -> tuple[object, ...]:
+    return (
+        occurrence.id,
+        occurrence.agent_id,
+        occurrence.monitor_id,
+        occurrence.monitor_version,
+        occurrence.kind.value,
+        _encode_datetime(occurrence.scheduled_for),
+        occurrence.occurrence_key,
+        occurrence.trigger_id,
+        occurrence.run_id,
+        _encode_datetime(occurrence.created_at),
+        occurrence.manual_key,
+    )
+
+
+def _decode_monitor_occurrence_row(row: sqlite3.Row) -> MonitorOccurrence:
+    return MonitorOccurrence(
+        id=_sqlite_text(row["id"], "monitor occurrence id"),
+        agent_id=_sqlite_text(row["agent_id"], "monitor occurrence agent_id"),
+        monitor_id=_sqlite_text(row["monitor_id"], "monitor occurrence monitor_id"),
+        monitor_version=_sqlite_int(
+            row["monitor_version"],
+            "monitor occurrence version",
+        ),
+        kind=MonitorOccurrenceKind(
+            _sqlite_text(row["kind"], "monitor occurrence kind")
+        ),
+        scheduled_for=_decode_datetime(
+            _sqlite_text(row["scheduled_for"], "monitor occurrence scheduled_for")
+        ),
+        occurrence_key=_sqlite_text(
+            row["occurrence_key"],
+            "monitor occurrence key",
+        ),
+        trigger_id=_sqlite_text(row["trigger_id"], "monitor trigger id"),
+        run_id=_sqlite_text(row["run_id"], "monitor run id"),
+        created_at=_decode_datetime(
+            _sqlite_text(row["created_at"], "monitor occurrence created_at")
+        ),
+        manual_key=_optional_text(row["manual_key"]),
+    )
+
+
+def _monitor_lease_values(lease: MonitorTickLease) -> tuple[object, ...]:
+    return (
+        lease.id,
+        lease.agent_id,
+        lease.monitor_id,
+        lease.occurrence_id,
+        lease.holder_id,
+        lease.fencing_token,
+        _encode_datetime(lease.claimed_at),
+        _encode_datetime(lease.expires_at),
+        None if lease.released_at is None else _encode_datetime(lease.released_at),
+        lease.release_reason,
+    )
+
+
+def _decode_monitor_lease_row(row: sqlite3.Row) -> MonitorTickLease:
+    return MonitorTickLease(
+        id=_sqlite_text(row["id"], "monitor lease id"),
+        agent_id=_sqlite_text(row["agent_id"], "monitor lease agent_id"),
+        monitor_id=_sqlite_text(row["monitor_id"], "monitor lease monitor_id"),
+        occurrence_id=_sqlite_text(
+            row["occurrence_id"],
+            "monitor lease occurrence_id",
+        ),
+        holder_id=_sqlite_text(row["holder_id"], "monitor lease holder_id"),
+        fencing_token=_sqlite_int(row["fencing_token"], "monitor lease fence"),
+        claimed_at=_decode_datetime(
+            _sqlite_text(row["claimed_at"], "monitor lease claimed_at")
+        ),
+        expires_at=_decode_datetime(
+            _sqlite_text(row["expires_at"], "monitor lease expires_at")
+        ),
+        released_at=_decode_optional_datetime(
+            row["released_at"],
+            "monitor lease released_at",
+        ),
+        release_reason=_optional_text(row["release_reason"]),
+    )
+
+
+def _monitor_run_values(run: MonitorRun) -> tuple[object, ...]:
+    return (
+        run.id,
+        run.agent_id,
+        run.monitor_id,
+        run.occurrence_id,
+        run.trigger_id,
+        run.attempt,
+        run.fencing_token,
+        run.status.value,
+        _encode_datetime(run.started_at),
+        run.operation_id,
+        None if run.completed_at is None else _encode_datetime(run.completed_at),
+        run.failure_reason,
+    )
+
+
+def _decode_monitor_run_row(row: sqlite3.Row) -> MonitorRun:
+    return MonitorRun(
+        id=_sqlite_text(row["id"], "monitor run id"),
+        agent_id=_sqlite_text(row["agent_id"], "monitor run agent_id"),
+        monitor_id=_sqlite_text(row["monitor_id"], "monitor run monitor_id"),
+        occurrence_id=_sqlite_text(
+            row["occurrence_id"],
+            "monitor run occurrence_id",
+        ),
+        trigger_id=_sqlite_text(row["trigger_id"], "monitor run trigger_id"),
+        attempt=_sqlite_int(row["attempt"], "monitor run attempt"),
+        fencing_token=_sqlite_int(row["fencing_token"], "monitor run fence"),
+        status=MonitorRunStatus(_sqlite_text(row["status"], "monitor run status")),
+        started_at=_decode_datetime(
+            _sqlite_text(row["started_at"], "monitor run started_at")
+        ),
+        operation_id=_optional_text(row["operation_id"]),
+        completed_at=_decode_optional_datetime(
+            row["completed_at"],
+            "monitor run completed_at",
+        ),
+        failure_reason=_optional_text(row["failure_reason"]),
+    )
+
+
+def _monitor_checkpoint_values(
+    checkpoint: MonitorCheckpoint,
+) -> tuple[object, ...]:
+    return (
+        checkpoint.id,
+        checkpoint.agent_id,
+        checkpoint.monitor_id,
+        checkpoint.version,
+        checkpoint.run_id,
+        canonical_json(checkpoint.cursor),
+        checkpoint.cursor_hash,
+        _encode_datetime(checkpoint.created_at),
+        checkpoint.previous_version,
+    )
+
+
+def _decode_monitor_checkpoint_row(row: sqlite3.Row) -> MonitorCheckpoint:
+    return MonitorCheckpoint(
+        id=_sqlite_text(row["id"], "monitor checkpoint id"),
+        agent_id=_sqlite_text(row["agent_id"], "monitor checkpoint agent_id"),
+        monitor_id=_sqlite_text(row["monitor_id"], "monitor checkpoint monitor_id"),
+        version=_sqlite_int(row["version"], "monitor checkpoint version"),
+        run_id=_sqlite_text(row["run_id"], "monitor checkpoint run_id"),
+        cursor=_decode_json_object(
+            _sqlite_text(row["cursor_json"], "monitor checkpoint cursor")
+        ),
+        cursor_hash=_sqlite_text(
+            row["cursor_hash"],
+            "monitor checkpoint cursor hash",
+        ),
+        created_at=_decode_datetime(
+            _sqlite_text(row["created_at"], "monitor checkpoint created_at")
+        ),
+        previous_version=(
+            None
+            if row["previous_version"] is None
+            else _sqlite_int(row["previous_version"], "previous checkpoint version")
+        ),
+    )
+
+
+def _monitor_finding_values(finding: MonitorFinding) -> tuple[object, ...]:
+    return (
+        finding.id,
+        finding.agent_id,
+        finding.monitor_id,
+        finding.occurrence_id,
+        finding.run_id,
+        finding.operation_id,
+        finding.evidence_id,
+        finding.severity.value,
+        finding.summary,
+        canonical_json(finding.details),
+        finding.dedupe_key,
+        _encode_datetime(finding.created_at),
+    )
+
+
+def _decode_monitor_finding_row(row: sqlite3.Row) -> MonitorFinding:
+    return MonitorFinding(
+        id=_sqlite_text(row["id"], "monitor finding id"),
+        agent_id=_sqlite_text(row["agent_id"], "monitor finding agent_id"),
+        monitor_id=_sqlite_text(row["monitor_id"], "monitor finding monitor_id"),
+        occurrence_id=_sqlite_text(
+            row["occurrence_id"],
+            "monitor finding occurrence_id",
+        ),
+        run_id=_sqlite_text(row["run_id"], "monitor finding run_id"),
+        operation_id=_sqlite_text(
+            row["operation_id"],
+            "monitor finding operation_id",
+        ),
+        evidence_id=_sqlite_text(row["evidence_id"], "monitor finding evidence_id"),
+        severity=MonitorFindingSeverity(
+            _sqlite_text(row["severity"], "monitor finding severity")
+        ),
+        summary=_sqlite_text(row["summary"], "monitor finding summary"),
+        details=_decode_json_object(
+            _sqlite_text(row["details_json"], "monitor finding details")
+        ),
+        dedupe_key=_sqlite_text(row["dedupe_key"], "monitor finding dedupe key"),
+        created_at=_decode_datetime(
+            _sqlite_text(row["created_at"], "monitor finding created_at")
+        ),
+    )
+
+
+def _insert_monitor_version(
+    connection: sqlite3.Connection,
+    version: MonitorVersion,
+) -> None:
+    connection.execute(
+        "INSERT INTO monitor_versions("
+        "id, agent_id, monitor_id, version, definition_json, content_hash, "
+        "proposal_id, source_operation_id, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        _monitor_version_values(version),
+    )
+
+
+def _insert_monitor_lifecycle(
+    connection: sqlite3.Connection,
+    lifecycle: MonitorLifecycleRecord,
+) -> None:
+    connection.execute(
+        "INSERT INTO monitor_lifecycle("
+        "id, agent_id, monitor_id, action, from_status, to_status, "
+        "from_revision, to_revision, monitor_version, actor_id, reason, "
+        "idempotency_key, occurred_at, operation_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        _monitor_lifecycle_values(lifecycle),
+    )
+
+
+def _insert_monitor_schedule_state(
+    connection: sqlite3.Connection,
+    state: MonitorScheduleState,
+) -> None:
+    connection.execute(
+        "INSERT INTO monitor_schedule_state("
+        "agent_id, monitor_id, revision, next_scheduled_at, updated_at, "
+        "last_scheduled_at, cooldown_until, backoff_until, consecutive_failures, "
+        "consecutive_matches, checkpoint_version, last_occurrence_id, last_run_id, "
+        "last_operation_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        _monitor_schedule_state_values(state),
+    )
+
+
+def _load_monitor_proposal_in_transaction(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    proposal_id: str,
+) -> MonitorProposal | None:
+    row = connection.execute(
+        "SELECT * FROM monitor_proposals WHERE agent_id = ? AND id = ?",
+        (agent_id, proposal_id),
+    ).fetchone()
+    return None if row is None else _decode_monitor_proposal_row(row)
+
+
+def _load_monitor_confirmation_in_transaction(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    proposal_id: str,
+) -> MonitorConfirmation | None:
+    row = connection.execute(
+        "SELECT * FROM monitor_confirmations " "WHERE agent_id = ? AND proposal_id = ?",
+        (agent_id, proposal_id),
+    ).fetchone()
+    return None if row is None else _decode_monitor_confirmation_row(row)
+
+
+def _load_monitor_in_transaction(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    monitor_id: str,
+) -> Monitor | None:
+    row = connection.execute(
+        "SELECT * FROM monitors WHERE agent_id = ? AND id = ?",
+        (agent_id, monitor_id),
+    ).fetchone()
+    return None if row is None else _decode_monitor_row(row)
+
+
+def _load_monitor_state_in_transaction(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    monitor_id: str,
+) -> MonitorScheduleState | None:
+    row = connection.execute(
+        "SELECT * FROM monitor_schedule_state WHERE agent_id = ? AND monitor_id = ?",
+        (agent_id, monitor_id),
+    ).fetchone()
+    return None if row is None else _decode_monitor_schedule_state_row(row)
+
+
+def _inspect_monitor_in_transaction(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    monitor_id: str,
+) -> MonitorInspection | None:
+    monitor = _load_monitor_in_transaction(connection, agent_id, monitor_id)
+    if monitor is None:
+        return None
+    state = _load_monitor_state_in_transaction(connection, agent_id, monitor_id)
+    if state is None:
+        raise SQLiteCorruptionError(f"monitor {monitor_id} is missing schedule state")
+    versions = tuple(
+        _decode_monitor_version_row(row)
+        for row in connection.execute(
+            "SELECT * FROM monitor_versions WHERE agent_id = ? AND monitor_id = ? "
+            "ORDER BY version, id",
+            (agent_id, monitor_id),
+        ).fetchall()
+    )
+    lifecycle = tuple(
+        _decode_monitor_lifecycle_row(row)
+        for row in connection.execute(
+            "SELECT * FROM monitor_lifecycle WHERE agent_id = ? AND monitor_id = ? "
+            "ORDER BY to_revision, id",
+            (agent_id, monitor_id),
+        ).fetchall()
+    )
+    proposal_rows = connection.execute(
+        "SELECT proposal.* FROM monitor_proposals AS proposal "
+        "JOIN monitor_versions AS version ON version.proposal_id = proposal.id "
+        "AND version.agent_id = proposal.agent_id "
+        "WHERE version.agent_id = ? AND version.monitor_id = ? "
+        "ORDER BY proposal.created_at, proposal.id",
+        (agent_id, monitor_id),
+    ).fetchall()
+    proposals = tuple(_decode_monitor_proposal_row(row) for row in proposal_rows)
+    proposal_ids = tuple(proposal.id for proposal in proposals)
+    confirmations: tuple[MonitorConfirmation, ...]
+    if proposal_ids:
+        placeholders = ",".join("?" for _ in proposal_ids)
+        confirmations = tuple(
+            _decode_monitor_confirmation_row(row)
+            for row in connection.execute(
+                "SELECT * FROM monitor_confirmations WHERE agent_id = ? "
+                f"AND proposal_id IN ({placeholders}) ORDER BY decided_at, id",
+                (agent_id, *proposal_ids),
+            ).fetchall()
+        )
+    else:
+        confirmations = ()
+    occurrences = tuple(
+        _decode_monitor_occurrence_row(row)
+        for row in connection.execute(
+            "SELECT * FROM monitor_occurrences WHERE agent_id = ? AND monitor_id = ? "
+            "ORDER BY scheduled_for, id",
+            (agent_id, monitor_id),
+        ).fetchall()
+    )
+    leases = tuple(
+        _decode_monitor_lease_row(row)
+        for row in connection.execute(
+            "SELECT * FROM monitor_tick_leases WHERE agent_id = ? AND monitor_id = ? "
+            "ORDER BY claimed_at, fencing_token, id",
+            (agent_id, monitor_id),
+        ).fetchall()
+    )
+    runs = tuple(
+        _decode_monitor_run_row(row)
+        for row in connection.execute(
+            "SELECT * FROM monitor_runs WHERE agent_id = ? AND monitor_id = ? "
+            "ORDER BY started_at, id",
+            (agent_id, monitor_id),
+        ).fetchall()
+    )
+    findings = tuple(
+        _decode_monitor_finding_row(row)
+        for row in connection.execute(
+            "SELECT * FROM monitor_findings WHERE agent_id = ? AND monitor_id = ? "
+            "ORDER BY created_at, id",
+            (agent_id, monitor_id),
+        ).fetchall()
+    )
+    checkpoints = tuple(
+        _decode_monitor_checkpoint_row(row)
+        for row in connection.execute(
+            "SELECT * FROM monitor_checkpoints WHERE agent_id = ? AND monitor_id = ? "
+            "ORDER BY version, id",
+            (agent_id, monitor_id),
+        ).fetchall()
+    )
+    return MonitorInspection(
+        monitor=monitor,
+        versions=versions,
+        lifecycle=lifecycle,
+        schedule_state=state,
+        proposals=proposals,
+        confirmations=confirmations,
+        occurrences=occurrences,
+        leases=leases,
+        runs=runs,
+        findings=findings,
+        checkpoints=checkpoints,
+    )
+
+
+def _insert_standalone_monitor_event(
+    connection: sqlite3.Connection,
+    event: RuntimeEvent,
+) -> None:
+    if event.operation_id is not None:
+        raise ValueError("standalone monitor event cannot identify an operation")
+    if any(
+        value is not None
+        for value in (
+            event.session_id,
+            event.turn_id,
+            event.model_call_id,
+            event.call_id,
+            event.task_id,
+            event.evidence_id,
+            event.approval_id,
+        )
+    ):
+        raise ValueError("standalone monitor event has operation-owned correlation")
+    connection.execute(
+        "INSERT INTO runtime_events("
+        "id, operation_id, position, type, agent_id, agent_sequence, created_at, "
+        "session_id, turn_id, model_call_id, call_id, task_id, evidence_id, "
+        "capability_id, executor_id, payload_json, approval_id, monitor_id"
+        ") VALUES (?, NULL, NULL, ?, ?, ("
+        "SELECT COALESCE(MAX(agent_sequence), 0) + 1 FROM runtime_events "
+        "WHERE agent_id = ?"
+        "), ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, ?)",
+        (
+            event.id,
+            event.type,
+            event.agent_id,
+            event.agent_id,
+            _encode_datetime(event.created_at),
+            event.capability_id,
+            event.executor_id,
+            canonical_json(event.payload),
+            event.monitor_id,
+        ),
+    )
+
+
+def _append_monitor_events_in_transaction(
+    connection: sqlite3.Connection,
+    events: tuple[RuntimeEvent, ...],
+) -> None:
+    for event in events:
+        if event.operation_id is None:
+            _insert_standalone_monitor_event(connection, event)
+            continue
+        current = _load_versioned_operation_in_transaction(
+            connection,
+            event.operation_id,
+        )
+        snapshot = current.snapshot
+        candidate_operation = replace(
+            snapshot.operation,
+            updated_at=max(snapshot.operation.updated_at, event.created_at),
+        )
+        candidate = replace(
+            snapshot,
+            operation=candidate_operation,
+            events=(*snapshot.events, event),
+        )
+        _validate_commit_candidate(snapshot, candidate)
+        _apply_commit_delta(
+            connection,
+            snapshot,
+            candidate,
+            expected_revision=current.revision,
+            candidate_revision=current.revision + 1,
+        )
+
+
+def _create_monitor_proposal(
+    connection: sqlite3.Connection,
+    proposal: MonitorProposal,
+    event: RuntimeEvent,
+) -> tuple[MonitorProposal, tuple[RuntimeEvent, ...]]:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != proposal.agent_id:
+            raise AgentIdentityConflictError(
+                "monitor proposal does not match database identity"
+            )
+        existing_row = connection.execute(
+            "SELECT * FROM monitor_proposals WHERE agent_id = ? "
+            "AND (id = ? OR idempotency_key = ?) ORDER BY id LIMIT 1",
+            (proposal.agent_id, proposal.id, proposal.idempotency_key),
+        ).fetchone()
+        if existing_row is not None:
+            existing = _decode_monitor_proposal_row(existing_row)
+            if (
+                existing.agent_id != proposal.agent_id
+                or existing.intended_monitor_id != proposal.intended_monitor_id
+                or existing.idempotency_key != proposal.idempotency_key
+                or existing.candidate_hash != proposal.candidate_hash
+                or existing.source_operation_id != proposal.source_operation_id
+            ):
+                raise MonitorProposalConflictError(
+                    proposal.id,
+                    "identity or idempotency key already names another candidate",
+                )
+            connection.execute("COMMIT")
+            return existing, ()
+        connection.execute(
+            "INSERT INTO monitor_proposals("
+            "id, agent_id, intended_monitor_id, idempotency_key, candidate_hash, "
+            "candidate_json, source_operation_id, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            _monitor_proposal_values(proposal),
+        )
+        _append_monitor_events_in_transaction(connection, (event,))
+        connection.execute("COMMIT")
+        return proposal, (event,)
+    except sqlite3.IntegrityError as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise MonitorProposalConflictError(
+            proposal.id,
+            "durable identity or event correlation conflicts",
+        ) from error
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_monitor_proposal(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    proposal_id: str,
+) -> MonitorProposal | None:
+    connection.execute("BEGIN")
+    try:
+        result = _load_monitor_proposal_in_transaction(
+            connection,
+            agent_id,
+            proposal_id,
+        )
+        connection.execute("COMMIT")
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_monitor_confirmation(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    proposal_id: str,
+) -> MonitorConfirmation | None:
+    connection.execute("BEGIN")
+    try:
+        result = _load_monitor_confirmation_in_transaction(
+            connection,
+            agent_id,
+            proposal_id,
+        )
+        connection.execute("COMMIT")
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _list_monitor_proposals(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    limit: int,
+) -> tuple[MonitorProposal, ...]:
+    connection.execute("BEGIN")
+    try:
+        result = tuple(
+            _decode_monitor_proposal_row(row)
+            for row in connection.execute(
+                "SELECT * FROM monitor_proposals WHERE agent_id = ? "
+                "ORDER BY created_at, id LIMIT ?",
+                (agent_id, limit),
+            ).fetchall()
+        )
+        connection.execute("COMMIT")
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _validate_monitor_activation(
+    proposal: MonitorProposal,
+    commit: MonitorConfirmationCommit,
+) -> None:
+    confirmation = commit.confirmation
+    if confirmation.agent_id != proposal.agent_id:
+        raise MonitorProposalConflictError(proposal.id, "agent scope changed")
+    if (
+        confirmation.candidate_hash != proposal.candidate_hash
+        or confirmation.decided_at < proposal.created_at
+    ):
+        raise MonitorProposalConflictError(
+            proposal.id,
+            "confirmation does not match the proposed candidate",
+        )
+    if confirmation.decision is MonitorConfirmationDecision.REJECTED:
+        return
+    assert commit.monitor is not None
+    assert commit.version is not None
+    assert commit.lifecycle is not None
+    assert commit.schedule_state is not None
+    if (
+        commit.monitor.id != proposal.intended_monitor_id
+        or commit.version.definition != proposal.candidate
+        or commit.version.content_hash != proposal.candidate_hash
+        or commit.version.proposal_id != proposal.id
+        or confirmation.resulting_version_id != commit.version.id
+        or commit.monitor.status is not MonitorStatus.ENABLED
+        or commit.monitor.revision != 1
+        or commit.schedule_state.revision != 1
+        or commit.lifecycle.action is not MonitorLifecycleAction.ACTIVATE
+        or commit.lifecycle.from_status is not None
+        or commit.lifecycle.to_status is not MonitorStatus.ENABLED
+        or commit.lifecycle.monitor_version != 1
+    ):
+        raise MonitorProposalConflictError(
+            proposal.id,
+            "activation records do not reproduce the confirmed proposal",
+        )
+
+
+def _commit_monitor_confirmation(
+    connection: sqlite3.Connection,
+    commit: MonitorConfirmationCommit,
+) -> tuple[MonitorInspection | None, tuple[RuntimeEvent, ...]]:
+    confirmation = commit.confirmation
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        proposal = _load_monitor_proposal_in_transaction(
+            connection,
+            confirmation.agent_id,
+            commit.proposal_id,
+        )
+        if proposal is None:
+            raise MonitorProposalNotFoundError(
+                confirmation.agent_id,
+                commit.proposal_id,
+            )
+        existing = _load_monitor_confirmation_in_transaction(
+            connection,
+            confirmation.agent_id,
+            commit.proposal_id,
+        )
+        if existing is not None:
+            if (
+                existing.decision is not confirmation.decision
+                or existing.candidate_hash != confirmation.candidate_hash
+                or existing.actor_id != confirmation.actor_id
+                or existing.reason != confirmation.reason
+            ):
+                raise MonitorProposalConflictError(
+                    commit.proposal_id,
+                    "proposal already has a different confirmation",
+                )
+            result = (
+                None
+                if existing.resulting_monitor_id is None
+                else _inspect_monitor_in_transaction(
+                    connection,
+                    existing.agent_id,
+                    existing.resulting_monitor_id,
+                )
+            )
+            connection.execute("COMMIT")
+            return result, ()
+        _validate_monitor_activation(proposal, commit)
+        if confirmation.decision is MonitorConfirmationDecision.CONFIRMED:
+            assert commit.monitor is not None
+            assert commit.version is not None
+            assert commit.lifecycle is not None
+            assert commit.schedule_state is not None
+            if (
+                _load_monitor_in_transaction(
+                    connection,
+                    commit.monitor.agent_id,
+                    commit.monitor.id,
+                )
+                is not None
+            ):
+                raise MonitorProposalConflictError(
+                    commit.proposal_id,
+                    "intended monitor identity is already active",
+                )
+            connection.execute(
+                "INSERT INTO monitors("
+                "id, agent_id, status, current_version, revision, created_at, "
+                "updated_at, paused_at, deleted_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _monitor_values(commit.monitor),
+            )
+            _insert_monitor_version(connection, commit.version)
+            _insert_monitor_lifecycle(connection, commit.lifecycle)
+            _insert_monitor_schedule_state(connection, commit.schedule_state)
+        connection.execute(
+            "INSERT INTO monitor_confirmations("
+            "id, agent_id, proposal_id, decision, candidate_hash, actor_id, "
+            "reason, decided_at, resulting_monitor_id, resulting_version_id"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            _monitor_confirmation_values(confirmation),
+        )
+        _append_monitor_events_in_transaction(connection, (commit.event,))
+        result = (
+            None
+            if confirmation.resulting_monitor_id is None
+            else _inspect_monitor_in_transaction(
+                connection,
+                confirmation.agent_id,
+                confirmation.resulting_monitor_id,
+            )
+        )
+        connection.execute("COMMIT")
+        return result, (commit.event,)
+    except sqlite3.IntegrityError as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise MonitorProposalConflictError(
+            commit.proposal_id,
+            "confirmation conflicts with durable monitor history",
+        ) from error
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _inspect_monitor(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    monitor_id: str,
+) -> MonitorInspection | None:
+    connection.execute("BEGIN")
+    try:
+        result = _inspect_monitor_in_transaction(connection, agent_id, monitor_id)
+        connection.execute("COMMIT")
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _list_monitors(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    statuses: tuple[MonitorStatus, ...],
+    limit: int,
+) -> tuple[Monitor, ...]:
+    connection.execute("BEGIN")
+    try:
+        placeholders = ",".join("?" for _ in statuses)
+        rows = connection.execute(
+            "SELECT * FROM monitors WHERE agent_id = ? "
+            f"AND status IN ({placeholders}) ORDER BY created_at, id LIMIT ?",
+            (agent_id, *(status.value for status in statuses), limit),
+        ).fetchall()
+        result = tuple(_decode_monitor_row(row) for row in rows)
+        connection.execute("COMMIT")
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_lifecycle_by_idempotency(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    idempotency_key: str,
+) -> MonitorLifecycleRecord | None:
+    row = connection.execute(
+        "SELECT * FROM monitor_lifecycle WHERE agent_id = ? AND idempotency_key = ?",
+        (agent_id, idempotency_key),
+    ).fetchone()
+    return None if row is None else _decode_monitor_lifecycle_row(row)
+
+
+def _validate_monitor_lifecycle_commit(
+    connection: sqlite3.Connection,
+    current: Monitor,
+    current_state: MonitorScheduleState,
+    commit: MonitorLifecycleCommit,
+    *,
+    expected_revision: int,
+) -> None:
+    monitor = commit.monitor
+    lifecycle = commit.lifecycle
+    state = commit.schedule_state
+    if current.revision != expected_revision:
+        raise MonitorConflictError(
+            current.id,
+            expected_revision=expected_revision,
+            actual_revision=current.revision,
+        )
+    if (
+        lifecycle.from_revision != current.revision
+        or lifecycle.to_revision != monitor.revision
+        or lifecycle.from_status is not current.status
+        or lifecycle.to_status is not monitor.status
+        or state.revision != current_state.revision + 1
+        or state.updated_at < current_state.updated_at
+    ):
+        raise MonitorConflictError(
+            current.id,
+            expected_revision=expected_revision,
+            actual_revision=current.revision,
+        )
+    if lifecycle.action is MonitorLifecycleAction.UPDATE:
+        if (
+            commit.version is None
+            or monitor.current_version != current.current_version + 1
+            or lifecycle.monitor_version != monitor.current_version
+        ):
+            raise ValueError(
+                "monitor update requires the exact next definition version"
+            )
+        proposal = _load_monitor_proposal_in_transaction(
+            connection,
+            monitor.agent_id,
+            commit.version.proposal_id,
+        )
+        if proposal is None:
+            raise MonitorProposalNotFoundError(
+                monitor.agent_id,
+                commit.version.proposal_id,
+            )
+    elif (
+        commit.version is not None or monitor.current_version != current.current_version
+    ):
+        raise ValueError("only monitor update may activate a new definition version")
+    expected_actions: dict[
+        MonitorLifecycleAction, tuple[MonitorStatus, MonitorStatus]
+    ] = {
+        MonitorLifecycleAction.PAUSE: (MonitorStatus.ENABLED, MonitorStatus.PAUSED),
+        MonitorLifecycleAction.RESUME: (MonitorStatus.PAUSED, MonitorStatus.ENABLED),
+        MonitorLifecycleAction.DELETE: (current.status, MonitorStatus.DELETED),
+        MonitorLifecycleAction.RUN_NOW: (current.status, current.status),
+        MonitorLifecycleAction.UPDATE: (current.status, current.status),
+    }
+    expected_statuses = expected_actions.get(lifecycle.action)
+    if expected_statuses is None or expected_statuses != (
+        current.status,
+        monitor.status,
+    ):
+        raise ValueError(
+            "monitor lifecycle action does not match its status transition"
+        )
+
+
+def _commit_monitor_lifecycle(
+    connection: sqlite3.Connection,
+    commit: MonitorLifecycleCommit,
+    *,
+    expected_revision: int,
+) -> tuple[MonitorInspection, tuple[RuntimeEvent, ...]]:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        replay = _load_lifecycle_by_idempotency(
+            connection,
+            commit.monitor.agent_id,
+            commit.lifecycle.idempotency_key,
+        )
+        if replay is not None:
+            if (
+                replay.monitor_id != commit.lifecycle.monitor_id
+                or replay.action is not commit.lifecycle.action
+                or replay.actor_id != commit.lifecycle.actor_id
+                or replay.reason != commit.lifecycle.reason
+                or replay.operation_id != commit.lifecycle.operation_id
+            ):
+                raise MonitorConflictError(
+                    commit.monitor.id,
+                    expected_revision=expected_revision,
+                    actual_revision=replay.to_revision,
+                )
+            inspection = _inspect_monitor_in_transaction(
+                connection,
+                commit.monitor.agent_id,
+                commit.monitor.id,
+            )
+            if (
+                inspection is None
+                or inspection.monitor.revision < replay.to_revision
+                or replay not in inspection.lifecycle
+            ):
+                actual = 0 if inspection is None else inspection.monitor.revision
+                raise MonitorConflictError(
+                    commit.monitor.id,
+                    expected_revision=commit.monitor.revision,
+                    actual_revision=actual,
+                )
+            connection.execute("COMMIT")
+            return inspection, ()
+        current = _load_monitor_in_transaction(
+            connection,
+            commit.monitor.agent_id,
+            commit.monitor.id,
+        )
+        if current is None:
+            raise MonitorNotFoundError(commit.monitor.agent_id, commit.monitor.id)
+        current_state = _load_monitor_state_in_transaction(
+            connection,
+            commit.monitor.agent_id,
+            commit.monitor.id,
+        )
+        if current_state is None:
+            raise SQLiteCorruptionError(
+                f"monitor {commit.monitor.id} is missing schedule state"
+            )
+        _validate_monitor_lifecycle_commit(
+            connection,
+            current,
+            current_state,
+            commit,
+            expected_revision=expected_revision,
+        )
+        if commit.version is not None:
+            proposal = _load_monitor_proposal_in_transaction(
+                connection,
+                commit.monitor.agent_id,
+                commit.version.proposal_id,
+            )
+            confirmation = _load_monitor_confirmation_in_transaction(
+                connection,
+                commit.monitor.agent_id,
+                commit.version.proposal_id,
+            )
+            if (
+                proposal is None
+                or confirmation is None
+                or confirmation.decision is not MonitorConfirmationDecision.CONFIRMED
+                or confirmation.candidate_hash != commit.version.content_hash
+                or proposal.candidate != commit.version.definition
+            ):
+                raise MonitorProposalConflictError(
+                    commit.version.proposal_id,
+                    "definition update is not an exactly confirmed proposal",
+                )
+            _insert_monitor_version(connection, commit.version)
+        monitor_values = _monitor_values(commit.monitor)
+        changed = connection.execute(
+            "UPDATE monitors SET status = ?, current_version = ?, revision = ?, "
+            "updated_at = ?, paused_at = ?, deleted_at = ? "
+            "WHERE agent_id = ? AND id = ? AND revision = ?",
+            (
+                monitor_values[2],
+                monitor_values[3],
+                monitor_values[4],
+                monitor_values[6],
+                monitor_values[7],
+                monitor_values[8],
+                commit.monitor.agent_id,
+                commit.monitor.id,
+                expected_revision,
+            ),
+        )
+        if changed.rowcount != 1:
+            latest = _load_monitor_in_transaction(
+                connection,
+                commit.monitor.agent_id,
+                commit.monitor.id,
+            )
+            raise MonitorConflictError(
+                commit.monitor.id,
+                expected_revision=expected_revision,
+                actual_revision=0 if latest is None else latest.revision,
+            )
+        state_values = _monitor_schedule_state_values(commit.schedule_state)
+        state_update = connection.execute(
+            "UPDATE monitor_schedule_state SET revision = ?, next_scheduled_at = ?, "
+            "updated_at = ?, last_scheduled_at = ?, cooldown_until = ?, "
+            "backoff_until = ?, consecutive_failures = ?, consecutive_matches = ?, "
+            "checkpoint_version = ?, last_occurrence_id = ?, last_run_id = ?, "
+            "last_operation_id = ? WHERE agent_id = ? AND monitor_id = ? "
+            "AND revision = ?",
+            (
+                *state_values[2:],
+                commit.schedule_state.agent_id,
+                commit.schedule_state.monitor_id,
+                current_state.revision,
+            ),
+        )
+        if state_update.rowcount != 1:
+            raise MonitorConflictError(
+                commit.monitor.id,
+                expected_revision=current_state.revision,
+                actual_revision=current_state.revision,
+            )
+        _insert_monitor_lifecycle(connection, commit.lifecycle)
+        _append_monitor_events_in_transaction(connection, (commit.event,))
+        result = _inspect_monitor_in_transaction(
+            connection,
+            commit.monitor.agent_id,
+            commit.monitor.id,
+        )
+        assert result is not None
+        connection.execute("COMMIT")
+        return result, (commit.event,)
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _list_due_monitors(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    now: datetime,
+    limit: int,
+) -> tuple[MonitorInspection, ...]:
+    connection.execute("BEGIN")
+    try:
+        now_text = _encode_datetime(now)
+        rows = connection.execute(
+            "SELECT monitor.id FROM monitors AS monitor "
+            "JOIN monitor_schedule_state AS state "
+            "ON state.agent_id = monitor.agent_id AND state.monitor_id = monitor.id "
+            "WHERE monitor.agent_id = ? AND monitor.status = 'enabled' "
+            "AND state.next_scheduled_at IS NOT NULL "
+            "AND state.next_scheduled_at <= ? "
+            "AND (state.cooldown_until IS NULL OR state.cooldown_until <= ?) "
+            "AND (state.backoff_until IS NULL OR state.backoff_until <= ?) "
+            "ORDER BY state.next_scheduled_at, monitor.id LIMIT ?",
+            (agent_id, now_text, now_text, now_text, limit),
+        ).fetchall()
+        inspections: list[MonitorInspection] = []
+        for row in rows:
+            inspection = _inspect_monitor_in_transaction(
+                connection,
+                agent_id,
+                _sqlite_text(row[0], "due monitor id"),
+            )
+            if inspection is None:
+                raise SQLiteCorruptionError("due monitor projection disappeared")
+            inspections.append(inspection)
+        connection.execute("COMMIT")
+        return tuple(inspections)
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_monitor_occurrence_in_transaction(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    occurrence_id: str,
+) -> MonitorOccurrence | None:
+    row = connection.execute(
+        "SELECT * FROM monitor_occurrences WHERE agent_id = ? AND id = ?",
+        (agent_id, occurrence_id),
+    ).fetchone()
+    return None if row is None else _decode_monitor_occurrence_row(row)
+
+
+def _load_monitor_occurrence_by_trigger(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    trigger_id: str,
+) -> MonitorOccurrence | None:
+    connection.execute("BEGIN")
+    try:
+        row = connection.execute(
+            "SELECT * FROM monitor_occurrences WHERE agent_id = ? AND trigger_id = ?",
+            (agent_id, trigger_id),
+        ).fetchone()
+        result = None if row is None else _decode_monitor_occurrence_row(row)
+        connection.execute("COMMIT")
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_monitor_claim_by_manual_key(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    monitor_id: str,
+    manual_key: str,
+) -> MonitorClaimResult | None:
+    connection.execute("BEGIN")
+    try:
+        row = connection.execute(
+            "SELECT * FROM monitor_occurrences WHERE agent_id = ? "
+            "AND monitor_id = ? AND manual_key = ?",
+            (agent_id, monitor_id, manual_key),
+        ).fetchone()
+        if row is None:
+            connection.execute("COMMIT")
+            return None
+        occurrence = _decode_monitor_occurrence_row(row)
+        run = _load_monitor_run_in_transaction(
+            connection,
+            agent_id,
+            occurrence.run_id,
+        )
+        lease = _load_latest_monitor_lease(
+            connection,
+            agent_id,
+            occurrence.id,
+        )
+        if run is None or lease is None:
+            raise SQLiteCorruptionError(
+                "run-now occurrence is missing its run or lease"
+            )
+        result = MonitorClaimResult(
+            occurrence=occurrence,
+            lease=lease,
+            run=run,
+        )
+        connection.execute("COMMIT")
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_active_monitor_lease(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    occurrence_id: str,
+) -> MonitorTickLease | None:
+    row = connection.execute(
+        "SELECT * FROM monitor_tick_leases WHERE agent_id = ? "
+        "AND occurrence_id = ? AND released_at IS NULL",
+        (agent_id, occurrence_id),
+    ).fetchone()
+    return None if row is None else _decode_monitor_lease_row(row)
+
+
+def _load_latest_monitor_lease(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    occurrence_id: str,
+) -> MonitorTickLease | None:
+    row = connection.execute(
+        "SELECT * FROM monitor_tick_leases WHERE agent_id = ? "
+        "AND occurrence_id = ? ORDER BY fencing_token DESC LIMIT 1",
+        (agent_id, occurrence_id),
+    ).fetchone()
+    return None if row is None else _decode_monitor_lease_row(row)
+
+
+def _load_monitor_run_in_transaction(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    run_id: str,
+) -> MonitorRun | None:
+    row = connection.execute(
+        "SELECT * FROM monitor_runs WHERE agent_id = ? AND id = ?",
+        (agent_id, run_id),
+    ).fetchone()
+    return None if row is None else _decode_monitor_run_row(row)
+
+
+def _validate_monitor_claim_frontier(
+    monitor: Monitor,
+    state: MonitorScheduleState,
+    claim: MonitorOccurrenceClaim,
+    *,
+    expected_monitor_revision: int,
+    expected_schedule_revision: int,
+    checked_at: datetime,
+) -> None:
+    occurrence = claim.occurrence
+    if monitor.revision != expected_monitor_revision:
+        raise MonitorConflictError(
+            monitor.id,
+            expected_revision=expected_monitor_revision,
+            actual_revision=monitor.revision,
+        )
+    if state.revision != expected_schedule_revision:
+        raise MonitorConflictError(
+            monitor.id,
+            expected_revision=expected_schedule_revision,
+            actual_revision=state.revision,
+        )
+    if occurrence.monitor_version != monitor.current_version:
+        raise ValueError("occurrence does not use the active monitor version")
+    if occurrence.kind is MonitorOccurrenceKind.SCHEDULED:
+        if monitor.status is not MonitorStatus.ENABLED:
+            raise ValueError("only an enabled monitor may claim a scheduled occurrence")
+        if (
+            state.next_scheduled_at is None
+            or occurrence.scheduled_for != state.next_scheduled_at
+            or occurrence.scheduled_for > checked_at
+            or (state.cooldown_until is not None and state.cooldown_until > checked_at)
+            or (state.backoff_until is not None and state.backoff_until > checked_at)
+        ):
+            raise ValueError("scheduled occurrence is not at the durable due frontier")
+    elif monitor.status is MonitorStatus.DELETED:
+        raise ValueError("deleted monitor cannot claim a run-now occurrence")
+    if claim.lease.released_at is not None:
+        raise ValueError("new monitor claim lease must be active")
+    if claim.run.status is not MonitorRunStatus.PENDING:
+        raise ValueError("new monitor claim run must be pending")
+
+
+def _claim_monitor_occurrence(
+    connection: sqlite3.Connection,
+    claim: MonitorOccurrenceClaim,
+    *,
+    expected_monitor_revision: int,
+    expected_schedule_revision: int,
+    checked_at: datetime,
+) -> tuple[MonitorClaimResult, tuple[RuntimeEvent, ...]]:
+    occurrence = claim.occurrence
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        monitor = _load_monitor_in_transaction(
+            connection,
+            occurrence.agent_id,
+            occurrence.monitor_id,
+        )
+        if monitor is None:
+            raise MonitorNotFoundError(occurrence.agent_id, occurrence.monitor_id)
+        state = _load_monitor_state_in_transaction(
+            connection,
+            occurrence.agent_id,
+            occurrence.monitor_id,
+        )
+        if state is None:
+            raise SQLiteCorruptionError(
+                f"monitor {occurrence.monitor_id} is missing schedule state"
+            )
+        _validate_monitor_claim_frontier(
+            monitor,
+            state,
+            claim,
+            expected_monitor_revision=expected_monitor_revision,
+            expected_schedule_revision=expected_schedule_revision,
+            checked_at=checked_at,
+        )
+        if occurrence.manual_key is not None:
+            manual_row = connection.execute(
+                "SELECT * FROM monitor_occurrences WHERE agent_id = ? "
+                "AND monitor_id = ? AND manual_key = ?",
+                (
+                    occurrence.agent_id,
+                    occurrence.monitor_id,
+                    occurrence.manual_key,
+                ),
+            ).fetchone()
+            if manual_row is not None:
+                replayed_occurrence = _decode_monitor_occurrence_row(manual_row)
+                replayed_run = _load_monitor_run_in_transaction(
+                    connection,
+                    occurrence.agent_id,
+                    replayed_occurrence.run_id,
+                )
+                replayed_lease = _load_active_monitor_lease(
+                    connection,
+                    occurrence.agent_id,
+                    replayed_occurrence.id,
+                ) or _load_latest_monitor_lease(
+                    connection,
+                    occurrence.agent_id,
+                    replayed_occurrence.id,
+                )
+                if replayed_run is None or replayed_lease is None:
+                    raise SQLiteCorruptionError(
+                        "run-now occurrence is missing its run or lease"
+                    )
+                if claim.lease.fencing_token == 1 and claim.run.attempt == 1:
+                    connection.execute("COMMIT")
+                    return (
+                        MonitorClaimResult(
+                            occurrence=replayed_occurrence,
+                            lease=replayed_lease,
+                            run=replayed_run,
+                        ),
+                        (),
+                    )
+                if replayed_occurrence != occurrence:
+                    raise ValueError("stable run-now occurrence identity changed")
+        stored_occurrence = _load_monitor_occurrence_in_transaction(
+            connection,
+            occurrence.agent_id,
+            occurrence.id,
+        )
+        if stored_occurrence is None:
+            if claim.lease.fencing_token != 1 or claim.run.attempt != 1:
+                raise ValueError(
+                    "first monitor occurrence claim must use fence/attempt one"
+                )
+            connection.execute(
+                "INSERT INTO monitor_occurrences("
+                "id, agent_id, monitor_id, monitor_version, kind, scheduled_for, "
+                "occurrence_key, trigger_id, run_id, created_at, manual_key"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _monitor_occurrence_values(occurrence),
+            )
+            connection.execute(
+                "INSERT INTO monitor_tick_leases("
+                "id, agent_id, monitor_id, occurrence_id, holder_id, fencing_token, "
+                "claimed_at, expires_at, released_at, release_reason"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _monitor_lease_values(claim.lease),
+            )
+            connection.execute(
+                "INSERT INTO monitor_runs("
+                "id, agent_id, monitor_id, occurrence_id, trigger_id, attempt, "
+                "fencing_token, status, started_at, operation_id, completed_at, "
+                "failure_reason"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _monitor_run_values(claim.run),
+            )
+        else:
+            if stored_occurrence != occurrence:
+                raise ValueError("stable monitor occurrence identity changed")
+            active = _load_active_monitor_lease(
+                connection,
+                occurrence.agent_id,
+                occurrence.id,
+            )
+            stored_run = _load_monitor_run_in_transaction(
+                connection,
+                occurrence.agent_id,
+                occurrence.run_id,
+            )
+            if stored_run is None:
+                raise SQLiteCorruptionError("monitor occurrence is missing its run")
+            if active is not None and active.expires_at > checked_at:
+                if active == claim.lease and stored_run == claim.run:
+                    connection.execute("COMMIT")
+                    return (
+                        MonitorClaimResult(
+                            occurrence=occurrence,
+                            lease=active,
+                            run=stored_run,
+                        ),
+                        (),
+                    )
+                raise MonitorTickClaimConflictError(
+                    occurrence.id,
+                    holder_id=active.holder_id,
+                    fencing_token=active.fencing_token,
+                    expires_at=active.expires_at,
+                )
+            if stored_run.completed_at is not None:
+                latest = active or _load_latest_monitor_lease(
+                    connection,
+                    occurrence.agent_id,
+                    occurrence.id,
+                )
+                assert latest is not None
+                raise MonitorTickClaimConflictError(
+                    occurrence.id,
+                    holder_id=latest.holder_id,
+                    fencing_token=latest.fencing_token,
+                    expires_at=latest.expires_at,
+                )
+            latest = active or _load_latest_monitor_lease(
+                connection,
+                occurrence.agent_id,
+                occurrence.id,
+            )
+            if latest is None:
+                raise SQLiteCorruptionError("monitor occurrence has no lease history")
+            if active is not None:
+                connection.execute(
+                    "UPDATE monitor_tick_leases SET released_at = ?, "
+                    "release_reason = 'expired_reclaimed' "
+                    "WHERE id = ? AND released_at IS NULL",
+                    (_encode_datetime(checked_at), active.id),
+                )
+            if (
+                claim.lease.fencing_token != latest.fencing_token + 1
+                or claim.run.fencing_token != claim.lease.fencing_token
+                or claim.run.attempt != stored_run.attempt + 1
+            ):
+                raise StaleMonitorFenceError(
+                    occurrence.id,
+                    expected_fencing_token=latest.fencing_token + 1,
+                    actual_fencing_token=claim.lease.fencing_token,
+                )
+            connection.execute(
+                "INSERT INTO monitor_tick_leases("
+                "id, agent_id, monitor_id, occurrence_id, holder_id, fencing_token, "
+                "claimed_at, expires_at, released_at, release_reason"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _monitor_lease_values(claim.lease),
+            )
+            run_values = _monitor_run_values(claim.run)
+            connection.execute(
+                "UPDATE monitor_runs SET attempt = ?, fencing_token = ?, status = ?, "
+                "started_at = ?, operation_id = ?, completed_at = ?, "
+                "failure_reason = ? WHERE agent_id = ? AND id = ?",
+                (
+                    *run_values[5:],
+                    occurrence.agent_id,
+                    occurrence.run_id,
+                ),
+            )
+        _append_monitor_events_in_transaction(connection, (claim.event,))
+        connection.execute("COMMIT")
+        return (
+            MonitorClaimResult(
+                occurrence=occurrence,
+                lease=claim.lease,
+                run=claim.run,
+            ),
+            (claim.event,),
+        )
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _validate_monitor_operation_link(
+    connection: sqlite3.Connection,
+    run: MonitorRun,
+) -> None:
+    if run.operation_id is None:
+        return
+    row = connection.execute(
+        "SELECT operation.agent_id, operation.trigger_id "
+        "FROM operations AS operation WHERE operation.id = ?",
+        (run.operation_id,),
+    ).fetchone()
+    if row is None:
+        raise OperationNotFoundError(run.operation_id)
+    if (
+        _sqlite_text(row["agent_id"], "monitor operation agent_id") != run.agent_id
+        or _sqlite_text(row["trigger_id"], "monitor operation trigger_id")
+        != run.trigger_id
+    ):
+        raise ValueError("monitor run operation does not use its stable trigger")
+
+
+def _commit_monitor_outcome(
+    connection: sqlite3.Connection,
+    commit: MonitorOutcomeCommit,
+    *,
+    expected_monitor_revision: int,
+    expected_schedule_revision: int,
+    checked_at: datetime,
+) -> tuple[MonitorOutcomeResult, tuple[RuntimeEvent, ...]]:
+    guard = commit.guard
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        monitor = _load_monitor_in_transaction(
+            connection,
+            guard.agent_id,
+            guard.monitor_id,
+        )
+        if monitor is None:
+            raise MonitorNotFoundError(guard.agent_id, guard.monitor_id)
+        if monitor.revision != expected_monitor_revision:
+            raise MonitorConflictError(
+                monitor.id,
+                expected_revision=expected_monitor_revision,
+                actual_revision=monitor.revision,
+            )
+        state = _load_monitor_state_in_transaction(
+            connection,
+            guard.agent_id,
+            guard.monitor_id,
+        )
+        if state is None:
+            raise SQLiteCorruptionError(
+                f"monitor {monitor.id} is missing schedule state"
+            )
+        if state.revision != expected_schedule_revision:
+            raise MonitorConflictError(
+                monitor.id,
+                expected_revision=expected_schedule_revision,
+                actual_revision=state.revision,
+            )
+        active = _load_active_monitor_lease(
+            connection,
+            guard.agent_id,
+            guard.occurrence_id,
+        )
+        latest = active or _load_latest_monitor_lease(
+            connection,
+            guard.agent_id,
+            guard.occurrence_id,
+        )
+        actual_fence = 0 if latest is None else latest.fencing_token
+        if (
+            active is None
+            or active.holder_id != guard.holder_id
+            or active.fencing_token != guard.fencing_token
+        ):
+            raise StaleMonitorFenceError(
+                guard.occurrence_id,
+                expected_fencing_token=guard.fencing_token,
+                actual_fencing_token=actual_fence,
+            )
+        if active.expires_at <= checked_at:
+            raise ExpiredMonitorLeaseError(
+                guard.occurrence_id,
+                fencing_token=guard.fencing_token,
+                expires_at=active.expires_at,
+                checked_at=checked_at,
+            )
+        if commit.released_lease.id != active.id or (
+            commit.released_lease.agent_id,
+            commit.released_lease.monitor_id,
+            commit.released_lease.occurrence_id,
+            commit.released_lease.holder_id,
+            commit.released_lease.fencing_token,
+            commit.released_lease.claimed_at,
+            commit.released_lease.expires_at,
+        ) != (
+            active.agent_id,
+            active.monitor_id,
+            active.occurrence_id,
+            active.holder_id,
+            active.fencing_token,
+            active.claimed_at,
+            active.expires_at,
+        ):
+            raise StaleMonitorFenceError(
+                guard.occurrence_id,
+                expected_fencing_token=guard.fencing_token,
+                actual_fencing_token=actual_fence,
+            )
+        stored_run = _load_monitor_run_in_transaction(
+            connection,
+            guard.agent_id,
+            commit.run.id,
+        )
+        if stored_run is None:
+            raise SQLiteCorruptionError("monitor outcome is missing its claimed run")
+        if (
+            stored_run.completed_at is not None
+            or stored_run.occurrence_id != guard.occurrence_id
+            or stored_run.fencing_token != guard.fencing_token
+            or commit.run.attempt != stored_run.attempt
+            or commit.run.fencing_token != stored_run.fencing_token
+            or commit.run.started_at != stored_run.started_at
+        ):
+            raise StaleMonitorFenceError(
+                guard.occurrence_id,
+                expected_fencing_token=guard.fencing_token,
+                actual_fencing_token=stored_run.fencing_token,
+            )
+        _validate_monitor_operation_link(connection, commit.run)
+        if (
+            commit.schedule_state.revision != state.revision + 1
+            or commit.schedule_state.updated_at < state.updated_at
+            or commit.schedule_state.last_occurrence_id != guard.occurrence_id
+            or commit.schedule_state.last_run_id != commit.run.id
+            or commit.schedule_state.last_operation_id != commit.run.operation_id
+        ):
+            raise MonitorConflictError(
+                monitor.id,
+                expected_revision=state.revision + 1,
+                actual_revision=commit.schedule_state.revision,
+            )
+        if commit.checkpoint is None:
+            if commit.schedule_state.checkpoint_version != state.checkpoint_version:
+                raise ValueError(
+                    "outcome without checkpoint cannot advance its version"
+                )
+        elif (
+            commit.checkpoint.agent_id != guard.agent_id
+            or commit.checkpoint.monitor_id != guard.monitor_id
+            or commit.checkpoint.version != state.checkpoint_version + 1
+            or commit.schedule_state.checkpoint_version != commit.checkpoint.version
+        ):
+            raise ValueError("monitor checkpoint does not advance the exact frontier")
+        if commit.finding is not None:
+            if (
+                commit.finding.agent_id != guard.agent_id
+                or commit.finding.monitor_id != guard.monitor_id
+                or commit.finding.occurrence_id != guard.occurrence_id
+                or commit.finding.operation_id != commit.run.operation_id
+            ):
+                raise ValueError("monitor finding does not match the outcome")
+        run_values = _monitor_run_values(commit.run)
+        run_update = connection.execute(
+            "UPDATE monitor_runs SET attempt = ?, fencing_token = ?, status = ?, "
+            "started_at = ?, operation_id = ?, completed_at = ?, failure_reason = ? "
+            "WHERE agent_id = ? AND id = ? AND fencing_token = ? "
+            "AND completed_at IS NULL",
+            (
+                *run_values[5:],
+                guard.agent_id,
+                commit.run.id,
+                guard.fencing_token,
+            ),
+        )
+        if run_update.rowcount != 1:
+            raise StaleMonitorFenceError(
+                guard.occurrence_id,
+                expected_fencing_token=guard.fencing_token,
+                actual_fencing_token=actual_fence,
+            )
+        released_at = commit.released_lease.released_at
+        if released_at is None:
+            raise ValueError("monitor outcome requires a released lease")
+        lease_update = connection.execute(
+            "UPDATE monitor_tick_leases SET released_at = ?, release_reason = ? "
+            "WHERE id = ? AND released_at IS NULL AND holder_id = ? "
+            "AND fencing_token = ?",
+            (
+                _encode_datetime(released_at),
+                commit.released_lease.release_reason,
+                active.id,
+                guard.holder_id,
+                guard.fencing_token,
+            ),
+        )
+        if lease_update.rowcount != 1:
+            raise StaleMonitorFenceError(
+                guard.occurrence_id,
+                expected_fencing_token=guard.fencing_token,
+                actual_fencing_token=actual_fence,
+            )
+        state_values = _monitor_schedule_state_values(commit.schedule_state)
+        state_update = connection.execute(
+            "UPDATE monitor_schedule_state SET revision = ?, next_scheduled_at = ?, "
+            "updated_at = ?, last_scheduled_at = ?, cooldown_until = ?, "
+            "backoff_until = ?, consecutive_failures = ?, consecutive_matches = ?, "
+            "checkpoint_version = ?, last_occurrence_id = ?, last_run_id = ?, "
+            "last_operation_id = ? WHERE agent_id = ? AND monitor_id = ? "
+            "AND revision = ?",
+            (
+                *state_values[2:],
+                guard.agent_id,
+                guard.monitor_id,
+                expected_schedule_revision,
+            ),
+        )
+        if state_update.rowcount != 1:
+            raise MonitorConflictError(
+                monitor.id,
+                expected_revision=expected_schedule_revision,
+                actual_revision=state.revision,
+            )
+        if commit.checkpoint is not None:
+            connection.execute(
+                "INSERT INTO monitor_checkpoints("
+                "id, agent_id, monitor_id, version, run_id, cursor_json, "
+                "cursor_hash, created_at, previous_version"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _monitor_checkpoint_values(commit.checkpoint),
+            )
+        if commit.finding is not None:
+            connection.execute(
+                "INSERT INTO monitor_findings("
+                "id, agent_id, monitor_id, occurrence_id, run_id, operation_id, "
+                "evidence_id, severity, summary, details_json, dedupe_key, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _monitor_finding_values(commit.finding),
+            )
+        _append_monitor_events_in_transaction(connection, commit.events)
+        inspection = _inspect_monitor_in_transaction(
+            connection,
+            guard.agent_id,
+            guard.monitor_id,
+        )
+        if inspection is None:
+            raise SQLiteCorruptionError("monitor disappeared during outcome commit")
+        result = MonitorOutcomeResult(
+            inspection=inspection,
+            run=commit.run,
+            finding=commit.finding,
+        )
+        connection.execute("COMMIT")
+        return result, commit.events
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _host_inbox_values(item: HostInboxItem) -> tuple[object, ...]:
+    return (
+        item.id,
+        item.agent_id,
+        item.kind.value,
+        item.idempotency_key,
+        item.request_hash,
+        canonical_json(item.payload),
+        item.revision,
+        item.status.value,
+        _encode_datetime(item.created_at),
+        _encode_datetime(item.updated_at),
+        item.trigger_id,
+        item.operation_id,
+        item.error,
+    )
+
+
+def _decode_host_mutation_admission_row(
+    row: sqlite3.Row,
+) -> HostMutationAdmission:
+    return HostMutationAdmission(
+        agent_id=_sqlite_text(row["agent_id"], "host mutation agent_id"),
+        idempotency_key=_sqlite_text(
+            row["idempotency_key"],
+            "host mutation idempotency key",
+        ),
+        method=_sqlite_text(row["method"], "host mutation method"),
+        request_hash=_sqlite_text(
+            row["request_hash"],
+            "host mutation request hash",
+        ),
+        created_at=_decode_datetime(
+            _sqlite_text(row["created_at"], "host mutation created_at")
+        ),
+    )
+
+
+def _admit_host_mutation(
+    connection: sqlite3.Connection,
+    request: HostMutationAdmission,
+) -> HostMutationAdmission:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != request.agent_id:
+            raise AgentIdentityConflictError(
+                "host mutation does not match database identity"
+            )
+        row = connection.execute(
+            "SELECT * FROM host_mutation_admissions "
+            "WHERE agent_id = ? AND idempotency_key = ?",
+            (request.agent_id, request.idempotency_key),
+        ).fetchone()
+        if row is not None:
+            existing = _decode_host_mutation_admission_row(row)
+            if (
+                existing.method != request.method
+                or existing.request_hash != request.request_hash
+            ):
+                raise HostMutationConflictError(
+                    request.agent_id,
+                    request.idempotency_key,
+                )
+            connection.execute("COMMIT")
+            return existing
+        connection.execute(
+            "INSERT INTO host_mutation_admissions("
+            "agent_id, idempotency_key, method, request_hash, created_at"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (
+                request.agent_id,
+                request.idempotency_key,
+                request.method,
+                request.request_hash,
+                _encode_datetime(request.created_at),
+            ),
+        )
+        connection.execute("COMMIT")
+        return request
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _decode_host_inbox_row(row: sqlite3.Row) -> HostInboxItem:
+    return HostInboxItem(
+        id=_sqlite_text(row["id"], "host inbox id"),
+        agent_id=_sqlite_text(row["agent_id"], "host inbox agent_id"),
+        kind=HostInboxKind(_sqlite_text(row["kind"], "host inbox kind")),
+        idempotency_key=_sqlite_text(
+            row["idempotency_key"],
+            "host inbox idempotency key",
+        ),
+        request_hash=_sqlite_text(row["request_hash"], "host inbox request hash"),
+        payload=_decode_json_object(
+            _sqlite_text(row["payload_json"], "host inbox payload")
+        ),
+        revision=_sqlite_int(row["revision"], "host inbox revision"),
+        status=HostInboxStatus(_sqlite_text(row["status"], "host inbox status")),
+        created_at=_decode_datetime(
+            _sqlite_text(row["created_at"], "host inbox created_at")
+        ),
+        updated_at=_decode_datetime(
+            _sqlite_text(row["updated_at"], "host inbox updated_at")
+        ),
+        trigger_id=_optional_text(row["trigger_id"]),
+        operation_id=_optional_text(row["operation_id"]),
+        error=_optional_text(row["error"]),
+    )
+
+
+def _load_host_inbox_in_transaction(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    item_id: str,
+) -> HostInboxItem | None:
+    row = connection.execute(
+        "SELECT * FROM host_inbox WHERE agent_id = ? AND id = ?",
+        (agent_id, item_id),
+    ).fetchone()
+    return None if row is None else _decode_host_inbox_row(row)
+
+
+def _enqueue_host_inbox(
+    connection: sqlite3.Connection,
+    item: HostInboxItem,
+) -> HostInboxItem:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != item.agent_id:
+            raise AgentIdentityConflictError(
+                "host inbox item does not match database identity"
+            )
+        rows = tuple(
+            _decode_host_inbox_row(row)
+            for row in connection.execute(
+                "SELECT * FROM host_inbox WHERE agent_id = ? "
+                "AND (id = ? OR idempotency_key = ?)",
+                (item.agent_id, item.id, item.idempotency_key),
+            ).fetchall()
+        )
+        if rows:
+            exact_key = tuple(
+                existing
+                for existing in rows
+                if existing.idempotency_key == item.idempotency_key
+            )
+            id_collision = tuple(
+                existing for existing in rows if existing.id == item.id
+            )
+            if (
+                len(exact_key) != 1
+                or exact_key[0].request_hash != item.request_hash
+                or (id_collision and id_collision[0].id != exact_key[0].id)
+            ):
+                raise HostInboxEnqueueConflictError(
+                    item.agent_id,
+                    item.idempotency_key,
+                )
+            connection.execute("COMMIT")
+            return exact_key[0]
+        connection.execute(
+            "INSERT INTO host_inbox("
+            "id, agent_id, kind, idempotency_key, request_hash, payload_json, "
+            "revision, status, created_at, updated_at, trigger_id, operation_id, error"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            _host_inbox_values(item),
+        )
+        connection.execute("COMMIT")
+        return item
+    except sqlite3.IntegrityError as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise HostInboxEnqueueConflictError(
+            item.agent_id,
+            item.idempotency_key,
+        ) from error
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _list_pending_host_inbox(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    limit: int,
+) -> tuple[HostInboxItem, ...]:
+    connection.execute("BEGIN")
+    try:
+        result = tuple(
+            _decode_host_inbox_row(row)
+            for row in connection.execute(
+                "SELECT * FROM host_inbox WHERE agent_id = ? AND status = 'pending' "
+                "ORDER BY created_at, id LIMIT ?",
+                (agent_id, limit),
+            ).fetchall()
+        )
+        connection.execute("COMMIT")
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _validate_host_inbox_completion_link(
+    connection: sqlite3.Connection,
+    item: HostInboxItem,
+) -> None:
+    if item.operation_id is None:
+        return
+    row = connection.execute(
+        "SELECT agent_id, trigger_id FROM operations WHERE id = ?",
+        (item.operation_id,),
+    ).fetchone()
+    if row is None:
+        raise OperationNotFoundError(item.operation_id)
+    if _sqlite_text(row["agent_id"], "host inbox operation agent_id") != item.agent_id:
+        raise ValueError("host inbox operation belongs to another agent")
+    if item.kind is HostInboxKind.TRIGGER:
+        if (
+            _sqlite_text(row["trigger_id"], "host inbox operation trigger_id")
+            != item.trigger_id
+        ):
+            raise ValueError("host inbox completion operation claimed another trigger")
+        return
+    approval_id = item.payload.get("approval_id")
+    if not isinstance(approval_id, str) or not approval_id.strip():
+        raise ValueError("approval wake payload requires approval_id")
+    approval_row = connection.execute(
+        "SELECT 1 FROM approvals WHERE id = ? AND operation_id = ?",
+        (approval_id, item.operation_id),
+    ).fetchone()
+    if approval_row is None:
+        raise ValueError("approval wake completion operation owns another approval")
+
+
+def _complete_host_inbox(
+    connection: sqlite3.Connection,
+    item: HostInboxItem,
+    *,
+    expected_revision: int,
+) -> HostInboxItem:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        current = _load_host_inbox_in_transaction(
+            connection,
+            item.agent_id,
+            item.id,
+        )
+        if current is None:
+            raise HostInboxNotFoundError(item.agent_id, item.id)
+        if current.revision != expected_revision:
+            raise HostInboxRevisionConflict(
+                item.id,
+                expected_revision=expected_revision,
+                actual_revision=current.revision,
+            )
+        if (
+            item.revision != current.revision + 1
+            or item.idempotency_key != current.idempotency_key
+            or item.request_hash != current.request_hash
+            or item.kind is not current.kind
+            or item.payload != current.payload
+            or item.trigger_id != current.trigger_id
+            or item.created_at != current.created_at
+            or item.updated_at < current.updated_at
+        ):
+            raise HostInboxRevisionConflict(
+                item.id,
+                expected_revision=current.revision + 1,
+                actual_revision=item.revision,
+            )
+        _validate_host_inbox_completion_link(connection, item)
+        values = _host_inbox_values(item)
+        updated = connection.execute(
+            "UPDATE host_inbox SET revision = ?, status = ?, updated_at = ?, "
+            "operation_id = ?, error = ? WHERE agent_id = ? AND id = ? "
+            "AND revision = ? AND status = 'pending'",
+            (
+                values[6],
+                values[7],
+                values[9],
+                values[11],
+                values[12],
+                item.agent_id,
+                item.id,
+                expected_revision,
+            ),
+        )
+        if updated.rowcount != 1:
+            latest = _load_host_inbox_in_transaction(
+                connection,
+                item.agent_id,
+                item.id,
+            )
+            raise HostInboxRevisionConflict(
+                item.id,
+                expected_revision=expected_revision,
+                actual_revision=0 if latest is None else latest.revision,
+            )
+        connection.execute("COMMIT")
+        return item
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _create_session(connection: sqlite3.Connection, session: Session) -> Session:
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -8757,6 +12339,43 @@ def _insert_runtime_event(
     event: RuntimeEvent,
 ) -> None:
     has_approval_id = _pragma_int(connection, "user_version") >= 6
+    has_monitor_id = _pragma_int(connection, "user_version") >= 10
+    if not has_monitor_id and event.monitor_id is not None:
+        raise SQLiteCorruptionError(
+            "historical runtime event schema cannot store monitor identity"
+        )
+    if has_monitor_id:
+        connection.execute(
+            "INSERT INTO runtime_events("
+            "id, operation_id, position, type, agent_id, agent_sequence, created_at, "
+            "session_id, turn_id, model_call_id, call_id, task_id, evidence_id, "
+            "capability_id, executor_id, payload_json, approval_id, monitor_id"
+            ") VALUES (?, ?, ?, ?, ?, ("
+            "SELECT COALESCE(MAX(agent_sequence), 0) + 1 FROM runtime_events "
+            "WHERE agent_id = ?"
+            "), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event.id,
+                operation_id,
+                position,
+                event.type,
+                event.agent_id,
+                event.agent_id,
+                _encode_datetime(event.created_at),
+                event.session_id,
+                event.turn_id,
+                event.model_call_id,
+                event.call_id,
+                event.task_id,
+                event.evidence_id,
+                event.capability_id,
+                event.executor_id,
+                canonical_json(event.payload),
+                event.approval_id,
+                event.monitor_id,
+            ),
+        )
+        return
     if not has_approval_id:
         if event.approval_id is not None:
             raise SQLiteCorruptionError(
@@ -8898,6 +12517,9 @@ def _decode_runtime_event_row(row: sqlite3.Row) -> RuntimeEvent:
         task_id=_optional_text(row["task_id"]),
         evidence_id=_optional_text(row["evidence_id"]),
         approval_id=_optional_text(row["approval_id"]),
+        monitor_id=(
+            _optional_text(row["monitor_id"]) if "monitor_id" in row.keys() else None
+        ),
         capability_id=_optional_text(row["capability_id"]),
         executor_id=_optional_text(row["executor_id"]),
         payload=_decode_json_object(_sqlite_text(row["payload_json"], "event payload")),

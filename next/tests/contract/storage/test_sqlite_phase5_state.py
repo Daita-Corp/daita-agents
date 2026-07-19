@@ -279,10 +279,10 @@ async def test_migration_nine_and_session_compression_are_versioned_and_exact(
     path = tmp_path / "phase5.db"
     store, _ = await _open_home(path, operations=2)
 
-    assert sqlite_owner._MIGRATIONS[-1].version == 9
-    assert sqlite_owner._MIGRATIONS[-1].name == (
-        "add_context_memory_learning_and_skills"
+    migration_nine = next(
+        migration for migration in sqlite_owner._MIGRATIONS if migration.version == 9
     )
+    assert migration_nine.name == ("add_context_memory_learning_and_skills")
     facts = await store.load_session_operation("operation-1")
     assert facts is not None
     assert facts.session_id == SESSION_ID
@@ -339,7 +339,7 @@ async def test_migration_nine_and_session_compression_are_versioned_and_exact(
 
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (9,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (12,)
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             connection.execute(
                 "UPDATE session_compression_checkpoints SET summary = 'x'"

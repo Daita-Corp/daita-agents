@@ -5,16 +5,16 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 6 — local host and monitors
-- **Active task:** P6-02 — monitor lifecycle and Migration 10
-- **Last completed task:** P6-01 — Phase 6 contract and owner inventory
-- **Current checkpoint:** Phase 5 gate (this ledger's containing commit)
+- **Active phase:** Phase 7 — governance, write proof, and approval resume
+- **Active task:** P7-01 — Phase 7 scope and owner inventory
+- **Last completed task:** P6-06 — consolidated Phase 6 gate
+- **Current checkpoint:** Phase 6 gate (this ledger's containing commit)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** re-read the Phase 6 host/monitor contracts, then add
-  the normalized monitor lifecycle records and Migration 10 without creating
-  another execution path
+- **Exact next action:** after the Phase 6 gate commit, re-read the Phase 7
+  governance/write requirements and map the smallest controlled-write slice
+  onto the existing capability, policy, approval, evidence, and runtime owners
 
 ## Development cadence
 
@@ -220,11 +220,11 @@ remain the only progression and execution owners.
 | ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
 | --- | --- | --- | --- | --- | --- |
 | P6-01 | complete | Phase 6 work/gate; Sections 6/15 and host/monitor supporting sections; current loop/runtime/embedded/event owners; retained v1 monitor behaviors | Exact lifecycle, persistence, scheduler, host, public API, CLI, and deferral map | Read-only inventory locks one Migration 10, ordinary monitor triggers, foreground-only background work, and a six-task lean sequence; no production edit | Phase 5 gate |
-| P6-02 | active | P6-01 owner map; SQLite/event contracts | Versioned monitor definitions, inert proposal/confirmation, schedules, fenced tick leases, stable occurrences/runs, findings, checkpoints, cooldown/backoff, and next-run state | Schedule bounds; lifecycle/reopen; atomic event/state commits; claim races; stale fences; pause/resume/delete/run-now; catch-up once | P6-01 |
-| P6-03 | pending | Monitor store/service; existing loop/runtime/recovery | One-shot due scheduler maps each stable occurrence to one ordinary monitor trigger and operation | Expiry/reclaim reuses trigger; checkpoint/outcome atomicity; evidence-backed findings; no direct executor/adapter/policy/provider path | P6-02 |
-| P6-04 | pending | Embedded composition; scheduler; event subscription; recovery and approval/cancel APIs | Foreground local `AgentHost` owns lock, migrations, durable inbox, scheduling cadence, wakeups, health, streaming, recovery, and graceful shutdown | Inbox replay; same-operation approval wake; cancellation; drain/release; restart recovery; zero hidden embedded tasks | P6-03 |
-| P6-05 | pending | Host contracts and public facades | Public monitor/control/event surfaces plus bounded Unix-socket local client/server and development CLI journey | Host/client/CLI acceptances; permissions/framing/idempotency; first-run, chat, inspect, approval, and monitor commands | P6-04 |
-| P6-06 | pending | Passing P6-02 through P6-05 slices | Consolidated dual-Python/static/architecture/root/distribution/review gate and one Phase 6 commit | Exact commands/results in `QUALITY_GATES.md`; targeted scheduler-fencing and shutdown review; no Phase 7 implementation in gate commit | P6-05 |
+| P6-02 | complete | P6-01 owner map; SQLite/event contracts | Versioned monitor definitions, inert proposal/confirmation, schedules, fenced tick leases, stable occurrences/runs, findings, checkpoints, cooldown/backoff, and next-run state | 66 focused normal-import cases pass; Migration 10 lifecycle/reopen, event/state atomicity, claim races, stale fences, pause/resume/delete/run-now, and pre-v10 fail-closed correlation are covered | P6-01 |
+| P6-03 | complete | Monitor store/service; existing loop/runtime/recovery | One-shot due scheduler maps each stable occurrence to one ordinary monitor trigger and operation | 39 focused monitor/store/architecture cases pass; stable trigger reclaim, waiting resume, claim conflict, accepted-evidence finding/checkpoint, cooldown/backoff, catch-up once, and cancellation recovery are covered | P6-02 |
+| P6-04 | complete | Embedded composition; scheduler; event subscription; recovery and approval/cancel APIs | Foreground local `AgentHost` owns lock, migrations, durable inbox, scheduling cadence, wakeups, health, streaming, recovery, and graceful shutdown | Migration 11 plus 15 focused hosting cases; inbox/restart replay, approval wake, user/monitor cancellation without cadence loss, tracked recovery, multi-batch drain, failure-safe shutdown, lock release, and zero hidden idle tasks are covered | P6-03 |
+| P6-05 | complete | Host contracts and public facades | Public monitor/control/event surfaces plus bounded Unix-socket local client/server and development CLI journey | Migration 12 durably binds control mutation keys; the final repaired focused selection passes 147 tests covering framing, permissions, replay/conflict semantics, bootstrap, source/chat/inspect/approval/monitor routes, deadline-bounded connections, and restart behavior | P6-04 |
+| P6-06 | complete | Passing P6-02 through P6-05 slices | Consolidated dual-Python/static/architecture/root/distribution/review gate and one Phase 6 commit | 1,154 tests per Python version, 77 architecture, 2,498 root, mypy/pyright/compile, clean wheel installs, repaired independent safety review, and the unrestricted real AF_UNIX lifecycle/health smoke pass; containing commit uses `chore(v2-phase-6): complete phase 6 gate` | P6-05 |
 
 ### Ordered P2-03 internal tasks
 

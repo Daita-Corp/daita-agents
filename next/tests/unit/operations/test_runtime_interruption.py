@@ -20,6 +20,7 @@ from daita.operations.runtime import (
     ModelCall,
     ModelCallStatus,
     OperationRuntime,
+    OperationStateError,
 )
 
 NOW = datetime(2026, 7, 17, 12, 30, tzinfo=timezone.utc)
@@ -109,6 +110,24 @@ async def test_interrupt_returns_typed_exit_and_marks_active_model_intent() -> N
         "model_call.cancellation_requested",
         "operation.interrupted",
     ]
+
+
+async def test_exact_interruption_replay_is_a_durable_noop() -> None:
+    runtime, operation_id, _ = await _runtime_with_active_model_call()
+
+    first = await runtime.interrupt(operation_id, "operator_cancelled")
+    after_first = await runtime.inspect(operation_id)
+    replay = await runtime.interrupt(operation_id, "operator_cancelled")
+    after_replay = await runtime.inspect(operation_id)
+
+    assert replay == first
+    assert after_replay == after_first
+
+    with pytest.raises(
+        OperationStateError,
+        match="already interrupted for another reason",
+    ):
+        await runtime.interrupt(operation_id, "different_reason")
 
 
 async def test_interrupt_event_failure_commits_no_partial_state() -> None:

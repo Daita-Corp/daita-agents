@@ -2092,8 +2092,17 @@ class OperationRuntime:
         _required_text(reason, "interruption reason")
         async with self._lock:
             while True:
-                state = await self._working_state(operation_id)
+                try:
+                    committed = await self._store.load(operation_id)
+                except OperationNotFoundError as error:
+                    raise KeyError(f"Unknown operation: {operation_id}") from error
+                state = self._state_from_snapshot(
+                    committed.snapshot,
+                    revision=committed.revision,
+                )
                 result = self._interrupt_locked(state, reason)
+                if committed.snapshot.operation.status is OperationStatus.INTERRUPTED:
+                    return result
                 try:
                     await self._commit(state)
                 except OperationStateError as error:
@@ -2660,6 +2669,23 @@ class OperationRuntime:
         state: _OperationState,
         reason: str,
     ) -> LoopExit:
+        if state.operation.status is OperationStatus.INTERRUPTED:
+            if state.operation.terminal_reason != reason:
+                raise OperationStateError(
+                    "operation was already interrupted for another reason"
+                )
+            return LoopExit(
+                operation_id=state.operation.id,
+                kind=LoopExitKind.INTERRUPTED,
+                reason=reason,
+                created_at=state.operation.updated_at,
+            )
+        if state.operation.status in {
+            OperationStatus.SUCCEEDED,
+            OperationStatus.FAILED,
+            OperationStatus.CANCELLED,
+        }:
+            raise OperationStateError("operation is already terminal")
         now = self._clock()
         active_task_index = next(
             (

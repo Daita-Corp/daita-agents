@@ -24,6 +24,7 @@ def _event() -> RuntimeEvent:
         call_id="call-1",
         task_id="task-1",
         evidence_id="evidence-1",
+        monitor_id="monitor-1",
         capability_id="fake.read",
         executor_id="fake.executor",
         payload={"nested": {"values": [1, 2]}},
@@ -48,6 +49,7 @@ def test_runtime_event_is_provider_neutral_correlated_and_mutation_isolated() ->
     assert event.call_id == "call-1"
     assert event.task_id == "task-1"
     assert event.evidence_id == "evidence-1"
+    assert event.monitor_id == "monitor-1"
     assert event.capability_id == "fake.read"
     assert event.executor_id == "fake.executor"
     assert event.created_at == NOW
@@ -79,6 +81,7 @@ def test_runtime_event_requires_stable_identity_and_aware_creation_time() -> Non
         "call_id",
         "task_id",
         "evidence_id",
+        "monitor_id",
         "capability_id",
         "executor_id",
     ),

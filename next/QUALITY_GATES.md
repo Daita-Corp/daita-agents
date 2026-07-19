@@ -582,6 +582,32 @@ No live provider or external database run was required for Phase 5. The live
 OpenAI boundary was already proven in Phase 2, and all Phase 5 state is local,
 deterministic SQLite/file state.
 
+## Phase 6 — local host and monitors
+
+Status: **PASS. Phase 6 is complete and Phase 7 may begin.**
+
+Phase 6 retained the lean phase-level cadence: focused tests during the four
+host/monitor slices, followed by one consolidated cross-version, static,
+architecture, root-oracle, packaging, and targeted safety-review gate.
+
+### Executed Phase 6 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P6-Q01 | plan, ADRs, current v2, and retained v1 monitor/host references (read-only) | Re-read Sections 6/15, Phase 6, hosting/concurrency/monitor sections, Journey/CLI requirements, current owners, and retained v1 behaviors | PASS — foreground-only host ownership, ordinary monitor triggers/operations, one-shot scheduling, durable inbox/wakeups, and replaceable thin CLI boundaries were locked before production edits |
+| P6-Q02 | `next/` | Focused monitor models/store/service/scheduler, SQLite Migration 10, host inbox/control, client/server/CLI, public monitor lifecycle, and Phase 6 architecture selections | PASS — final repaired selection passes 147 tests; strict framing/permissions, durable mutation-key binding, restart recovery, scheduler fencing, run-now reclaim, graceful shutdown, bootstrap, source/chat/inspect/approval/monitor routes, and no hidden embedded tasks are covered |
+| P6-Q03 | `next/` | Targeted scheduler-fencing, host-shutdown, and local-transport safety review | PASS after root-cause repair — expired manual claims now reclaim the stable occurrence at fence/attempt +1; accepted socket handlers have bounded reads and settle before host/store shutdown; Migration 12 binds every control mutation key to one exact method/parameter hash; source attach and interruption are replay-safe after an admitted-request crash |
+| P6-Q04 | `next/` | Complete isolated suite with `PYTHONPATH=src:<site-packages> <python> -S -m pytest -o addopts='' tests/ -m 'not requires_llm and not requires_db' -q --tb=short -p no:cacheprovider` on CPython 3.11.15 and 3.12.7 | PASS — 1,154 passed, 1 skipped, and 1 deselected in 47.53s/50.32s; the skip is only the real AF_UNIX bind forbidden by this sandbox |
+| P6-Q05 | `next/` | One phase formatter pass plus one targeted post-review formatting pass; byte compilation; `MYPYPATH=src mypy src/daita tests scripts/build_test_disposition.py`; pyright 1.1.411 | PASS — final formatting completed; compilation clean; mypy reports no issues in 208 files; pyright reports 0 errors/warnings |
+| P6-Q06 | `next/` | Isolated architecture suite; import/diff/symlink/sole-executor scans | PASS — 77 architecture tests; host/monitor packages add no alternate executor, provider, SQLite, or hidden-background-work owner; every socket mutation is admission-gated |
+| P6-Q07 | repository root | `.venv/bin/python -m pytest -o addopts='' tests/ -m 'not requires_llm and not requires_db' -q --tb=short -p no:cacheprovider` | PASS — 2,498 passed and 221 deselected in 15.57s; the frozen v1 oracle remains unchanged |
+| P6-Q08 | clean copy under `/private/tmp/daita-v2-p6-gate.Q1MbTG` | Build v2 sdist/wheel without isolation; inspect archive boundaries; install wheel without dependencies into fresh CPython 3.11/3.12 environments; import every packaged module and run installed `daita --help` | PASS — wheel/sdist contain 84/108 entries; no tests/scripts/nested `next/` are packaged; both environments import all 78 modules from `site-packages` and the console script starts without optional SDKs |
+| P6-Q09 | unrestricted local execution | `PYTHONPATH=src ../.venv/bin/python -m pytest -o addopts='' -q -rA tests/unit/hosting/test_local_server.py::test_private_socket_lifecycle_and_health_when_sandbox_allows_bind` | PASS — 1 passed in 0.12s; the actual AF_UNIX server/client health request, private run directory, `0600` socket, ownership checks, cleanup, and host shutdown all complete successfully |
+
+No live model or external database was required for Phase 6. The real socket
+smoke used only a test-owned agent home and mock/no-model health request; it
+required no credential and performed no external network I/O.
+
 ## Live and external gates
 
 - Phase 0 requires no live provider or external database.

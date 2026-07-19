@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import datetime, timezone
 import errno
@@ -40,6 +40,7 @@ from ..domains.data import (
     sqlite_query_declarations,
     tabular_comparison_declarations,
 )
+from ..events.models import CommittedEvent, EventCursor
 from ..identity import AgentIdentity
 from ..learning import LearningProvenance, LearningSourceOutcome
 from ..llm.models import ModelProfile
@@ -63,8 +64,22 @@ from ..memory.models import (
     MemorySupersessionRequest,
 )
 from ..memory.service import MemoryService
+from ..monitors.models import (
+    Monitor,
+    MonitorConfirmation,
+    MonitorDefinition,
+    MonitorInspection,
+    MonitorProposal,
+    MonitorStatus,
+)
+from ..monitors.service import MonitorService
+from ..monitors.store import MonitorClaimResult
 from ..operations.checkpoints import OperationSnapshot
-from ..operations.governance import DefaultPolicyEvaluator
+from ..operations.governance import (
+    ApprovalRequest,
+    ApprovalStatus,
+    DefaultPolicyEvaluator,
+)
 from ..operations.models import AgentTrigger, OperationStatus, TriggerKind
 from ..operations.runtime import OperationRuntime
 from ..sessions import Session, SessionAlreadyExistsError, SessionTranscript
@@ -89,6 +104,31 @@ def _utc_now() -> datetime:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
+
+
+def _source_sync_id(agent_id: str, idempotency_key: str) -> str:
+    if (
+        not isinstance(idempotency_key, str)
+        or not idempotency_key
+        or idempotency_key != idempotency_key.strip()
+    ):
+        raise ValueError("idempotency_key must be bounded non-empty text")
+    try:
+        encoded = idempotency_key.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("idempotency_key must be valid UTF-8 text") from error
+    if len(encoded) > 256:
+        raise ValueError("idempotency_key exceeds 256 UTF-8 bytes")
+    digest = sha256(
+        canonical_json(
+            {
+                "agent_id": agent_id,
+                "idempotency_key": idempotency_key,
+                "owner": "source.attach",
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"catalog-sync-{digest}"
 
 
 def _validate_loop_configuration(
@@ -280,10 +320,12 @@ class EmbeddedAgent:
         home: Path,
         writer_lock: _WriterLock,
         store: SQLiteOperationStore,
+        runtime: OperationRuntime,
         loop: AgentLoop | None,
         capabilities: CapabilityRegistry,
         model_profile: ModelProfile | None,
         memory_service: MemoryService,
+        monitor_service: MonitorService,
         skill_service: SkillService,
         learning_service: ExplicitCorrectionLearningService,
         skill_change_service: SkillChangeLearningService,
@@ -294,10 +336,12 @@ class EmbeddedAgent:
         self.home = home
         self._writer_lock = writer_lock
         self._store = store
+        self._runtime = runtime
         self._loop = loop
         self._capabilities = capabilities
         self.model_profile = model_profile
         self._memory_service = memory_service
+        self._monitor_service = monitor_service
         self._skill_service = skill_service
         self._learning_service = learning_service
         self._skill_change_service = skill_change_service
@@ -340,6 +384,7 @@ class EmbeddedAgent:
             writer_lock.release()
             raise asyncio.CancelledError
         store: SQLiteOperationStore | None = None
+        bootstrap_started = False
         bootstrap_published = False
         try:
             manifest_path = home / "agent.toml"
@@ -351,6 +396,7 @@ class EmbeddedAgent:
                 or state_path.is_symlink()
             ):
                 raise AgentAlreadyExistsError(f"agent already exists: {name}")
+            bootstrap_started = True
             created_at = resolved_clock()
             identity = AgentIdentity(
                 id=resolved_id_factory("agent"),
@@ -402,7 +448,7 @@ class EmbeddedAgent:
                     await store.close()
             finally:
                 try:
-                    if not bootstrap_published:
+                    if bootstrap_started and not bootstrap_published:
                         await _await_sync_completion(
                             lambda: _cleanup_failed_create(home)
                         )
@@ -554,6 +600,12 @@ class EmbeddedAgent:
         blob_store = LocalBlobStore(home / "blobs")
         catalog_service = CatalogService(store)
         memory_service = MemoryService(store, clock=clock)
+        monitor_service = MonitorService(
+            agent_id=identity.id,
+            store=store,
+            clock=clock,
+            id_factory=id_factory,
+        )
         resolved_profile = model_profile
         data_view: CatalogDataView | None = None
         if context_builder is None and domain is None and capabilities is None:
@@ -674,10 +726,12 @@ class EmbeddedAgent:
             home=home,
             writer_lock=writer_lock,
             store=store,
+            runtime=runtime,
             loop=loop,
             capabilities=active_capabilities,
             model_profile=resolved_profile,
             memory_service=memory_service,
+            monitor_service=monitor_service,
             skill_service=skill_service,
             learning_service=learning_service,
             skill_change_service=skill_change_service,
@@ -686,15 +740,11 @@ class EmbeddedAgent:
         )
 
     async def run(self, message: str, *, session_id: str | None = None) -> LoopExit:
-        loop = self._require_loop()
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
-        async with self._mutation_lock:
-            self._require_open()
-            if session_id is not None:
-                await self._ensure_session(session_id, message)
-            trigger_id = self._id_factory("trigger")
-            trigger = AgentTrigger(
+        trigger_id = self._id_factory("trigger")
+        return await self.run_trigger(
+            AgentTrigger(
                 id=trigger_id,
                 agent_id=self.identity.id,
                 kind=TriggerKind.USER,
@@ -703,25 +753,56 @@ class EmbeddedAgent:
                 payload={"message": message},
                 created_at=self._clock(),
             )
-            result = await loop.run(trigger)
-            notice = await self._learn_completed_correction(result)
-            return (
-                result
-                if notice is None
-                else replace(result, post_operation_notices=(notice,))
-            )
+        )
 
-    async def attach(self, source: ResourceSource) -> SourceRegistration:
+    async def run_trigger(self, trigger: AgentTrigger) -> LoopExit:
+        """Run one exact durable trigger through the single canonical loop."""
+
+        loop = self._require_loop()
+        if not isinstance(trigger, AgentTrigger):
+            raise TypeError("trigger must be an AgentTrigger")
+        if trigger.agent_id != self.identity.id:
+            raise ValueError("trigger belongs to another agent")
+        async with self._mutation_lock:
+            self._require_open()
+            if trigger.kind is TriggerKind.USER:
+                message = trigger.payload.get("message")
+                if not isinstance(message, str) or not message.strip():
+                    raise ValueError(
+                        "user trigger payload must contain a non-empty message"
+                    )
+                if trigger.session_id is not None:
+                    existing = await self._store.load_by_trigger(trigger.id)
+                    if existing is None:
+                        await self._ensure_session(trigger.session_id, message)
+                    elif existing.snapshot.trigger != trigger:
+                        raise ValueError(
+                            "trigger identity already owns different durable input"
+                        )
+            result = await loop.run(trigger)
+            return await self._with_post_operation_learning(result)
+
+    async def attach(
+        self,
+        source: ResourceSource,
+        *,
+        idempotency_key: str | None = None,
+    ) -> SourceRegistration:
         """Run one bounded source discovery and commit its complete catalog view."""
 
         if not isinstance(source, ResourceSource):
             raise TypeError("source must provide async open(...)")
+        stable_sync_id = (
+            None
+            if idempotency_key is None
+            else _source_sync_id(self.identity.id, idempotency_key)
+        )
         async with self._mutation_lock:
             self._require_open()
-            started_at = self._clock()
+            opened_at = self._clock()
             adapter = await source.open(
                 agent_id=self.identity.id,
-                attached_at=started_at,
+                attached_at=opened_at,
                 clock=self._clock,
             )
             if not isinstance(adapter, ResourceAdapter):
@@ -734,16 +815,59 @@ class EmbeddedAgent:
                     "source declarations do not match the configured runtime"
                 ) from error
             registration = adapter.registration
-            sync_id = self._id_factory("catalog-sync")
-            running = CatalogSync(
-                id=sync_id,
-                agent_id=self.identity.id,
-                source_id=registration.id,
-                adapter_id=registration.adapter_id,
-                status=CatalogSyncStatus.RUNNING,
-                started_at=started_at,
+            sync_id = (
+                self._id_factory("catalog-sync")
+                if stable_sync_id is None
+                else stable_sync_id
             )
             try:
+                existing_sync = await self._store.load_sync(
+                    self.identity.id,
+                    sync_id,
+                )
+                started_at = (
+                    opened_at if existing_sync is None else existing_sync.started_at
+                )
+                running = CatalogSync(
+                    id=sync_id,
+                    agent_id=self.identity.id,
+                    source_id=registration.id,
+                    adapter_id=registration.adapter_id,
+                    status=CatalogSyncStatus.RUNNING,
+                    started_at=started_at,
+                )
+            except BaseException:
+                await adapter.close()
+                raise
+            try:
+                if existing_sync is not None:
+                    if (
+                        existing_sync.source_id != registration.id
+                        or existing_sync.adapter_id != registration.adapter_id
+                    ):
+                        raise AgentHomeError(
+                            "source idempotency key is bound to another source"
+                        )
+                    if existing_sync.status is CatalogSyncStatus.SUCCEEDED:
+                        replayed = await self._store.load_source(
+                            self.identity.id,
+                            registration.id,
+                        )
+                        if (
+                            replayed is None
+                            or not replayed.active
+                            or replayed.adapter_id != registration.adapter_id
+                            or replayed.native_identity != registration.native_identity
+                            or replayed.configuration != registration.configuration
+                        ):
+                            raise AgentHomeError(
+                                "successful source attachment has inconsistent state"
+                            )
+                        return replayed
+                    if existing_sync.status is not CatalogSyncStatus.RUNNING:
+                        raise AgentHomeError(
+                            "source attachment idempotency key names a failed sync"
+                        )
                 await self._store.record_sync(running)
                 result = await adapter.discover(
                     DiscoveryRequest(
@@ -809,11 +933,221 @@ class EmbeddedAgent:
         async with self._mutation_lock:
             self._require_open()
             result = await loop.resume(operation_id)
-            notice = await self._learn_completed_correction(result)
-            return (
-                result
-                if notice is None
-                else replace(result, post_operation_notices=(notice,))
+            return await self._with_post_operation_learning(result)
+
+    async def recover_startup(self) -> tuple[LoopExit, ...]:
+        """Resume one ordered snapshot of this agent's recoverable operations."""
+
+        loop = self._require_loop()
+        async with self._mutation_lock:
+            self._require_open()
+            recovered = await loop.recover_startup(self.identity.id)
+            exits: list[LoopExit] = []
+            for result in recovered:
+                exits.append(await self._with_post_operation_learning(result))
+            return tuple(exits)
+
+    async def decide_approval(
+        self,
+        approval_id: str,
+        *,
+        status: ApprovalStatus,
+        decided_by: str,
+        reason: str,
+    ) -> ApprovalRequest:
+        """Persist an approval decision without executing or resuming work."""
+
+        self._require_open()
+        return await self._runtime.decide_approval(
+            approval_id,
+            status=status,
+            decided_by=decided_by,
+            reason=reason,
+        )
+
+    async def interrupt(
+        self,
+        operation_id: str,
+        reason: str = "user_cancelled",
+    ) -> LoopExit:
+        """Persist runtime-owned interruption without waiting for loop admission."""
+
+        self._require_open()
+        return await self._runtime.interrupt(operation_id, reason)
+
+    async def inspect_nonterminal(self) -> tuple[OperationSnapshot, ...]:
+        self._require_open()
+        return await self._runtime.inspect_nonterminal(self.identity.id)
+
+    async def read_events(
+        self,
+        cursor: EventCursor | None = None,
+        *,
+        limit: int = 100,
+    ) -> tuple[CommittedEvent, ...]:
+        self._require_open()
+        return await self._store.read_after(
+            self.identity.id,
+            cursor,
+            limit=limit,
+        )
+
+    def subscribe_events(
+        self,
+        cursor: EventCursor | None = None,
+    ) -> AsyncIterator[CommittedEvent]:
+        self._require_open()
+        return self._store.subscribe(self.identity.id, cursor)
+
+    async def propose_monitor(
+        self,
+        monitor_id: str,
+        definition: MonitorDefinition,
+        *,
+        idempotency_key: str,
+        source_operation_id: str | None = None,
+    ) -> MonitorProposal:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._monitor_service.propose(
+                monitor_id,
+                definition,
+                idempotency_key=idempotency_key,
+                source_operation_id=source_operation_id,
+            )
+
+    async def confirm_monitor(
+        self,
+        proposal_id: str,
+        *,
+        candidate_hash: str,
+        actor_id: str,
+        reason: str,
+    ) -> MonitorInspection:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._monitor_service.confirm(
+                proposal_id,
+                candidate_hash=candidate_hash,
+                actor_id=actor_id,
+                reason=reason,
+            )
+
+    async def reject_monitor(
+        self,
+        proposal_id: str,
+        *,
+        candidate_hash: str,
+        actor_id: str,
+        reason: str,
+    ) -> MonitorConfirmation:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._monitor_service.reject(
+                proposal_id,
+                candidate_hash=candidate_hash,
+                actor_id=actor_id,
+                reason=reason,
+            )
+
+    async def list_monitors(
+        self,
+        *,
+        statuses: tuple[MonitorStatus, ...] | None = None,
+        include_deleted: bool = False,
+        limit: int = 100,
+    ) -> tuple[Monitor, ...]:
+        self._require_open()
+        return await self._monitor_service.list(
+            statuses=statuses,
+            include_deleted=include_deleted,
+            limit=limit,
+        )
+
+    async def list_monitor_proposals(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[MonitorProposal, ...]:
+        self._require_open()
+        return await self._monitor_service.list_proposals(limit=limit)
+
+    async def inspect_monitor(self, monitor_id: str) -> MonitorInspection:
+        self._require_open()
+        return await self._monitor_service.inspect(monitor_id)
+
+    async def pause_monitor(
+        self,
+        monitor_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+        operation_id: str | None = None,
+    ) -> MonitorInspection:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._monitor_service.pause(
+                monitor_id,
+                actor_id=actor_id,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                operation_id=operation_id,
+            )
+
+    async def resume_monitor(
+        self,
+        monitor_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+        operation_id: str | None = None,
+    ) -> MonitorInspection:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._monitor_service.resume(
+                monitor_id,
+                actor_id=actor_id,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                operation_id=operation_id,
+            )
+
+    async def delete_monitor(
+        self,
+        monitor_id: str,
+        *,
+        actor_id: str,
+        reason: str,
+        idempotency_key: str,
+        operation_id: str | None = None,
+    ) -> MonitorInspection:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._monitor_service.delete(
+                monitor_id,
+                actor_id=actor_id,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                operation_id=operation_id,
+            )
+
+    async def claim_monitor_run_now(
+        self,
+        monitor_id: str,
+        *,
+        idempotency_key: str,
+        holder_id: str,
+        lease_seconds: float = 300.0,
+    ) -> MonitorClaimResult:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._monitor_service.run_now(
+                monitor_id,
+                idempotency_key=idempotency_key,
+                holder_id=holder_id,
+                lease_seconds=lease_seconds,
             )
 
     async def transcript(self, session_id: str) -> SessionTranscript:
@@ -992,6 +1326,14 @@ class EmbeddedAgent:
         except Exception:
             return "learning.post_operation_unavailable"
         return None
+
+    async def _with_post_operation_learning(self, result: LoopExit) -> LoopExit:
+        notice = await self._learn_completed_correction(result)
+        return (
+            result
+            if notice is None
+            else replace(result, post_operation_notices=(notice,))
+        )
 
     def _require_memory_agent(self, agent_id: str) -> None:
         if agent_id != self.identity.id:
