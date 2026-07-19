@@ -28,6 +28,7 @@ from daita.llm.models import (
     ContentBlock,
     MessageRole,
     ModelProfile,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -105,6 +106,7 @@ def _facts(
     terminal_reason: str | None = None,
     approval_state_facts: tuple[SessionApprovalStateFact, ...] = (),
     resource_scope_facts: tuple[SessionResourceScopeFact, ...] = (),
+    sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
 ) -> SessionOperationFacts:
     return SessionOperationFacts(
         operation_id=operation_id,
@@ -112,6 +114,7 @@ def _facts(
         session_id=SESSION_ID,
         revision=f"revision-{operation_id}",
         status="succeeded" if operation_id != "op-current" else "running",
+        sensitivity=sensitivity,
         evidence_ids=evidence_ids,
         approval_ids=approval_ids,
         resource_ids=resource_ids,
@@ -221,7 +224,13 @@ async def test_small_history_rebinds_and_keeps_tool_exchange_indivisible() -> No
     transcript = _transcript(("op-tool", "op-current"), (*history, *current))
     backend = MemorySessionBackend(
         transcript,
-        {"op-tool": _facts("op-tool"), "op-current": _facts("op-current")},
+        {
+            "op-tool": _facts(
+                "op-tool",
+                sensitivity=ModelSensitivity.RESTRICTED,
+            ),
+            "op-current": _facts("op-current"),
+        },
     )
 
     projection = await _service(backend, threshold=10_000).project(
@@ -235,6 +244,7 @@ async def test_small_history_rebinds_and_keeps_tool_exchange_indivisible() -> No
     assert projection.checkpoint is None
     assert backend.commits == 0
     assert projection.historical_operation_ids == ("op-tool",)
+    assert projection.sensitivity is ModelSensitivity.RESTRICTED
     assert len(projection.blocks) == 1
     block = projection.blocks[0]
     assert block.kind is ContextKind.SESSION_RECENT

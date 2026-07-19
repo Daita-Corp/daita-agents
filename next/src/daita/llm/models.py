@@ -126,6 +126,153 @@ class FinishReason(str, Enum):
     ERROR = "error"
 
 
+class ModelSensitivity(str, Enum):
+    """Authoritative data-routing sensitivity attached before provider I/O."""
+
+    PUBLIC = "public"
+    INTERNAL = "internal"
+    CONFIDENTIAL = "confidential"
+    RESTRICTED = "restricted"
+
+    @property
+    def routing_rank(self) -> int:
+        return (
+            ModelSensitivity.PUBLIC,
+            ModelSensitivity.INTERNAL,
+            ModelSensitivity.CONFIDENTIAL,
+            ModelSensitivity.RESTRICTED,
+        ).index(self)
+
+
+class ModelRouteAttemptOutcome(str, Enum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRouteAttempt:
+    """One bounded provider attempt without request, response, or vendor text."""
+
+    provider_id: str
+    attempt: int
+    outcome: ModelRouteAttemptOutcome
+    latency_ms: int
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        _required_text(self.provider_id, "route-attempt provider_id")
+        if (
+            not isinstance(self.attempt, int)
+            or isinstance(self.attempt, bool)
+            or self.attempt < 1
+        ):
+            raise ValueError("route-attempt attempt must be a positive integer")
+        if not isinstance(self.outcome, ModelRouteAttemptOutcome):
+            raise TypeError("route-attempt outcome must be ModelRouteAttemptOutcome")
+        if (
+            not isinstance(self.latency_ms, int)
+            or isinstance(self.latency_ms, bool)
+            or self.latency_ms < 0
+        ):
+            raise ValueError("route-attempt latency_ms must be non-negative")
+        if self.error_code is not None:
+            _required_text(self.error_code, "route-attempt error_code")
+            if len(self.error_code) > 128:
+                raise ValueError("route-attempt error_code exceeds 128 characters")
+        if (self.outcome is ModelRouteAttemptOutcome.SUCCEEDED) != (
+            self.error_code is None
+        ):
+            raise ValueError(
+                "successful route attempts cannot have errors and failed attempts require one"
+            )
+
+    def to_payload(self) -> FrozenJsonObject:
+        return FrozenJsonObject.from_mapping(
+            {
+                "attempt": self.attempt,
+                "error_code": self.error_code,
+                "latency_ms": self.latency_ms,
+                "outcome": self.outcome.value,
+                "provider_id": self.provider_id,
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRoutingTrace:
+    """Persistable route outcome and exact ordered provider attempts."""
+
+    route_id: str
+    primary_provider_id: str
+    attempts: tuple[ModelRouteAttempt, ...]
+    selected_provider_id: str | None = None
+    terminal_error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        _required_text(self.route_id, "routing route_id")
+        _required_text(self.primary_provider_id, "routing primary_provider_id")
+        attempts = tuple(self.attempts)
+        if any(not isinstance(item, ModelRouteAttempt) for item in attempts):
+            raise TypeError("routing attempts must contain ModelRouteAttempt records")
+        if len(attempts) > 64:
+            raise ValueError("routing attempts exceed the bounded trace size")
+        positions: dict[str, int] = {}
+        for item in attempts:
+            expected = positions.get(item.provider_id, 0) + 1
+            if item.attempt != expected:
+                raise ValueError(
+                    "routing attempt numbers must be contiguous per provider"
+                )
+            positions[item.provider_id] = item.attempt
+        if self.selected_provider_id is not None:
+            _required_text(self.selected_provider_id, "routing selected_provider_id")
+        if self.terminal_error_code is not None:
+            _required_text(self.terminal_error_code, "routing terminal_error_code")
+            if len(self.terminal_error_code) > 128:
+                raise ValueError("routing terminal_error_code exceeds 128 characters")
+        if (self.selected_provider_id is None) == (self.terminal_error_code is None):
+            raise ValueError(
+                "routing trace requires exactly one selected provider or terminal error"
+            )
+        if self.selected_provider_id is not None:
+            if not attempts:
+                raise ValueError("successful routing trace requires an attempt")
+            final = attempts[-1]
+            if (
+                final.provider_id != self.selected_provider_id
+                or final.outcome is not ModelRouteAttemptOutcome.SUCCEEDED
+            ):
+                raise ValueError(
+                    "selected provider must own the final successful attempt"
+                )
+            if any(
+                item.outcome is ModelRouteAttemptOutcome.SUCCEEDED
+                for item in attempts[:-1]
+            ):
+                raise ValueError("routing cannot continue after a successful attempt")
+        elif attempts:
+            final = attempts[-1]
+            if (
+                final.outcome is not ModelRouteAttemptOutcome.FAILED
+                or final.error_code != self.terminal_error_code
+            ):
+                raise ValueError(
+                    "terminal route error must match the final failed attempt"
+                )
+        object.__setattr__(self, "attempts", attempts)
+
+    def to_payload(self) -> FrozenJsonObject:
+        return FrozenJsonObject.from_mapping(
+            {
+                "attempts": [item.to_payload() for item in self.attempts],
+                "primary_provider_id": self.primary_provider_id,
+                "route_id": self.route_id,
+                "selected_provider_id": self.selected_provider_id,
+                "terminal_error_code": self.terminal_error_code,
+            }
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class TextBlock:
     text: str
@@ -190,6 +337,7 @@ class CanonicalMessage:
     turn_id: str | None = None
     session_id: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
+    provider_id: str | None = None
     provider_metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -201,6 +349,8 @@ class CanonicalMessage:
             _required_text(self.turn_id, "message turn_id")
         if self.session_id is not None:
             _required_text(self.session_id, "message session_id")
+        if self.provider_id is not None:
+            _required_text(self.provider_id, "message provider_id")
 
         content = tuple(self.content)
         tool_calls = tuple(self.tool_calls)
@@ -215,8 +365,12 @@ class CanonicalMessage:
         if tool_calls and self.role is not MessageRole.ASSISTANT:
             raise ValueError("only an assistant message may contain tool calls")
         provider_metadata = FrozenJsonObject.from_mapping(self.provider_metadata)
-        if provider_metadata and self.role is not MessageRole.ASSISTANT:
-            raise ValueError("only an assistant message may contain provider metadata")
+        if (
+            provider_metadata or self.provider_id is not None
+        ) and self.role is not MessageRole.ASSISTANT:
+            raise ValueError(
+                "only an assistant message may contain provider identity or metadata"
+            )
 
         has_tool_result = any(isinstance(block, ToolResultBlock) for block in content)
         if self.role is MessageRole.TOOL:
@@ -283,6 +437,8 @@ class ModelRequest:
     turn_id: str
     messages: tuple[CanonicalMessage, ...]
     tools: tuple[ToolDefinition, ...] = ()
+    response_schema: Mapping[str, object] | None = None
+    sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
     context_selection: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -291,6 +447,11 @@ class ModelRequest:
         messages = tuple(self.messages)
         tools = tuple(self.tools)
         context_selection = FrozenJsonObject.from_mapping(self.context_selection)
+        response_schema = (
+            None
+            if self.response_schema is None
+            else FrozenJsonObject.from_mapping(self.response_schema)
+        )
         if not messages:
             raise ValueError("model request must contain at least one message")
         if any(not isinstance(message, CanonicalMessage) for message in messages):
@@ -318,8 +479,18 @@ class ModelRequest:
             raise ValueError(
                 "model-request context selection exceeds its character bound"
             )
+        if response_schema is not None:
+            if not response_schema:
+                raise ValueError("model-request response_schema cannot be empty")
+            if len(canonical_json(response_schema)) > 64 * 1_024:
+                raise ValueError(
+                    "model-request response_schema exceeds its character bound"
+                )
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("model-request sensitivity must be ModelSensitivity")
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
+        object.__setattr__(self, "response_schema", response_schema)
         object.__setattr__(self, "context_selection", context_selection)
 
 
@@ -329,8 +500,10 @@ class ModelResponse:
     text: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
     usage: ModelUsage = field(default_factory=ModelUsage)
+    provider_id: str | None = None
     provider_response_id: str | None = None
     provider_metadata: Mapping[str, object] = field(default_factory=dict)
+    routing: ModelRoutingTrace | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.finish_reason, FinishReason):
@@ -360,9 +533,74 @@ class ModelResponse:
             raise TypeError("usage must be a ModelUsage record")
         if self.provider_response_id is not None:
             _required_text(self.provider_response_id, "provider_response_id")
+        if self.provider_id is not None:
+            _required_text(self.provider_id, "model-response provider_id")
+        if self.routing is not None:
+            if not isinstance(self.routing, ModelRoutingTrace):
+                raise TypeError("routing must be a ModelRoutingTrace or None")
+            if (
+                self.routing.selected_provider_id is None
+                or self.routing.selected_provider_id != self.provider_id
+            ):
+                raise ValueError(
+                    "successful routing must select the response provider_id"
+                )
         object.__setattr__(self, "tool_calls", tool_calls)
         object.__setattr__(
             self,
             "provider_metadata",
             FrozenJsonObject.from_mapping(self.provider_metadata),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelTextDelta:
+    """One ordered non-empty text fragment from a streaming provider."""
+
+    text: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str) or not self.text:
+            raise ValueError("model text delta must be a non-empty string")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelToolCallDelta:
+    """One ordered fragment of a provider tool call's JSON arguments."""
+
+    index: int
+    arguments_delta: str
+    id: str | None = None
+    name: str | None = None
+    provider_call_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.index, int)
+            or isinstance(self.index, bool)
+            or self.index < 0
+        ):
+            raise ValueError("tool-call delta index must be non-negative")
+        if not isinstance(self.arguments_delta, str):
+            raise TypeError("tool-call arguments_delta must be a string")
+        for value, field_name in (
+            (self.id, "tool-call delta id"),
+            (self.name, "tool-call delta name"),
+            (self.provider_call_id, "tool-call delta provider_call_id"),
+        ):
+            if value is not None:
+                _required_text(value, field_name)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelStreamCompleted:
+    """Terminal stream event carrying the same canonical response as generate."""
+
+    response: ModelResponse
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.response, ModelResponse):
+            raise TypeError("stream completion response must be ModelResponse")
+
+
+ModelStreamEvent = ModelTextDelta | ModelToolCallDelta | ModelStreamCompleted

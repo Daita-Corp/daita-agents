@@ -22,6 +22,7 @@ from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, Resource
 from ..adapters.local_files import LocalDirectoryReadBackend
 from ..adapters.sqlite import SQLiteSource
 from ..adapters.sqlite_query import SQLiteQueryBackend
+from ..adapters.postgresql_query import PostgreSQLQueryBackend
 from ..adapters.sqlite_update import SQLiteUpdateBackend
 from ..catalog.capabilities import catalog_declarations
 from ..catalog.models import CatalogSync, CatalogSyncStatus
@@ -39,6 +40,7 @@ from ..domains.data import (
     DataDomainController,
     PersistedAcceptedEvidenceDatasetReader,
     local_file_read_declarations,
+    postgresql_query_declarations,
     sqlite_query_declarations,
     sqlite_update_declarations,
     tabular_comparison_declarations,
@@ -96,6 +98,7 @@ from ..skills.learning import (
 from ..skills.service import SkillService
 from ..storage.blobs import LocalBlobStore
 from ..storage.sqlite import SQLiteOperationStore
+from ..security import EnvironmentSecretProvider, SecretProvider
 
 _AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _T = TypeVar("_T")
@@ -423,6 +426,7 @@ class EmbeddedAgent:
         budgets: LoopBudgets = LoopBudgets(),
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
+        secret_provider: SecretProvider | None = None,
     ) -> Self:
         _validate_loop_configuration(
             model,
@@ -499,6 +503,7 @@ class EmbeddedAgent:
                 budgets=budgets,
                 clock=resolved_clock,
                 id_factory=resolved_id_factory,
+                secret_provider=secret_provider,
             )
         except BaseException:
             try:
@@ -529,6 +534,7 @@ class EmbeddedAgent:
         budgets: LoopBudgets = LoopBudgets(),
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
+        secret_provider: SecretProvider | None = None,
     ) -> Self:
         _validate_loop_configuration(
             model,
@@ -625,6 +631,7 @@ class EmbeddedAgent:
                 budgets=budgets,
                 clock=resolved_clock,
                 id_factory=resolved_id_factory,
+                secret_provider=secret_provider,
             )
         except BaseException:
             try:
@@ -651,6 +658,7 @@ class EmbeddedAgent:
         budgets: LoopBudgets,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
+        secret_provider: SecretProvider | None,
     ) -> Self:
         resolved_context = context_builder
         resolved_domain = domain
@@ -665,13 +673,24 @@ class EmbeddedAgent:
             id_factory=id_factory,
         )
         resolved_profile = model_profile
+        resolved_secret_provider = secret_provider or EnvironmentSecretProvider()
+        if not isinstance(resolved_secret_provider, SecretProvider):
+            raise TypeError("secret_provider must implement SecretProvider")
         data_view: CatalogDataView | None = None
         if context_builder is None and domain is None and capabilities is None:
             data_view = CatalogDataView(store, catalog_service)
             catalog = catalog_declarations(identity.id, catalog_service)
-            query = sqlite_query_declarations(
+            sqlite_query = sqlite_query_declarations(
                 identity.id,
                 SQLiteQueryBackend(store, data_view),
+            )
+            postgresql_query = postgresql_query_declarations(
+                identity.id,
+                PostgreSQLQueryBackend(
+                    store,
+                    data_view,
+                    resolved_secret_provider,
+                ),
             )
             update = sqlite_update_declarations(
                 identity.id,
@@ -697,21 +716,24 @@ class EmbeddedAgent:
             resolved_capabilities = CapabilityRegistry(
                 capabilities=(
                     *catalog.capabilities,
-                    *query.capabilities,
+                    *sqlite_query.capabilities,
+                    *postgresql_query.capabilities,
                     *update.capabilities,
                     *file_read.capabilities,
                     *comparison.capabilities,
                 ),
                 executors=(
                     *catalog.executors,
-                    *query.executors,
+                    *sqlite_query.executors,
+                    *postgresql_query.executors,
                     *update.executors,
                     *file_read.executors,
                     *comparison.executors,
                 ),
                 tool_views=(
                     *catalog.tool_views,
-                    *query.tool_views,
+                    *sqlite_query.tool_views,
+                    *postgresql_query.tool_views,
                     *update.tool_views,
                     *file_read.tool_views,
                     *comparison.tool_views,

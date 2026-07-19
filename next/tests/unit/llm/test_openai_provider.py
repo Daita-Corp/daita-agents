@@ -13,6 +13,9 @@ from daita.llm.models import (
     FinishReason,
     MessageRole,
     ModelRequest,
+    ModelStreamCompleted,
+    ModelTextDelta,
+    ModelToolCallDelta,
     TextBlock,
     ToolCall,
     ToolDefinition,
@@ -37,6 +40,22 @@ class FakeResponses:
 class FakeClient:
     def __init__(self, *items: object) -> None:
         self.responses = FakeResponses(*items)
+
+
+class FakeStream:
+    def __init__(self, *events: object) -> None:
+        self._events = list(events)
+
+    def __aiter__(self) -> FakeStream:
+        return self
+
+    async def __anext__(self) -> object:
+        if not self._events:
+            raise StopAsyncIteration
+        event = self._events.pop(0)
+        if isinstance(event, BaseException):
+            raise event
+        return event
 
 
 class SimpleNamespaceError(Exception):
@@ -113,6 +132,162 @@ async def test_text_translation_uses_responses_without_provider_state() -> None:
     assert response.usage.output_tokens == 7
     assert response.usage.cache_read_tokens == 3
     assert response.usage.reasoning_tokens == 2
+
+
+async def test_structured_output_schema_uses_native_responses_format() -> None:
+    client = FakeClient(_text_response('{"answer":42}'))
+    provider = OpenAIResponsesProvider("gpt-test", client=client)
+    request = ModelRequest(
+        operation_id="operation-1",
+        turn_id="turn-1",
+        messages=(_message(MessageRole.USER, "answer"),),
+        response_schema={
+            "type": "object",
+            "properties": {"answer": {"type": "integer"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
+    )
+
+    response = await provider.generate(request)
+
+    assert response.text == '{"answer":42}'
+    assert client.responses.calls[0]["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "daita_response",
+            "schema": {
+                "type": "object",
+                "properties": {"answer": {"type": "integer"}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+    }
+
+
+async def test_stream_normalizes_text_and_terminal_response() -> None:
+    raw = _text_response("hel lo")
+    client = FakeClient(
+        FakeStream(
+            SimpleNamespace(type="response.output_text.delta", delta="hel"),
+            SimpleNamespace(type="response.output_text.delta", delta=" "),
+            SimpleNamespace(type="response.output_text.delta", delta="lo"),
+            SimpleNamespace(type="response.completed", response=raw),
+        )
+    )
+    provider = OpenAIResponsesProvider("gpt-test", client=client)
+
+    events = [event async for event in provider.stream(_request())]
+
+    assert events[:3] == [
+        ModelTextDelta("hel"),
+        ModelTextDelta(" "),
+        ModelTextDelta("lo"),
+    ]
+    terminal = events[3]
+    assert isinstance(terminal, ModelStreamCompleted)
+    assert terminal.response.text == "hel lo"
+    assert terminal.response.provider_id == "openai:gpt-test"
+    assert client.responses.calls[0]["stream"] is True
+
+
+async def test_stream_keeps_tool_delta_and_completion_call_identity_stable() -> None:
+    raw = SimpleNamespace(
+        id="response-tools",
+        status="completed",
+        output=(
+            SimpleNamespace(
+                type="function_call",
+                call_id="provider-call",
+                name="fake.read",
+                arguments='{"key":"alpha"}',
+            ),
+        ),
+        output_text="",
+        usage=None,
+    )
+    client = FakeClient(
+        FakeStream(
+            SimpleNamespace(
+                type="response.output_item.added",
+                output_index=0,
+                item=SimpleNamespace(
+                    type="function_call",
+                    call_id="provider-call",
+                    name="fake.read",
+                ),
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                output_index=0,
+                delta='{"key":',
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta",
+                output_index=0,
+                delta='"alpha"}',
+            ),
+            SimpleNamespace(type="response.completed", response=raw),
+        )
+    )
+    provider = OpenAIResponsesProvider(
+        "gpt-test",
+        client=client,
+        id_factory=lambda _prefix: "canonical-call",
+    )
+
+    events = [event async for event in provider.stream(_request())]
+
+    assert events[:3] == [
+        ModelToolCallDelta(
+            index=0,
+            arguments_delta="",
+            id="canonical-call",
+            name="fake.read",
+            provider_call_id="provider-call",
+        ),
+        ModelToolCallDelta(
+            index=0,
+            arguments_delta='{"key":',
+            id="canonical-call",
+            name="fake.read",
+            provider_call_id="provider-call",
+        ),
+        ModelToolCallDelta(
+            index=0,
+            arguments_delta='"alpha"}',
+            id="canonical-call",
+            name="fake.read",
+            provider_call_id="provider-call",
+        ),
+    ]
+    terminal = events[3]
+    assert isinstance(terminal, ModelStreamCompleted)
+    assert terminal.response.tool_calls[0].id == "canonical-call"
+    assert terminal.response.tool_calls[0].provider_call_id == "provider-call"
+
+
+async def test_stream_requires_terminal_event_and_propagates_cancellation() -> None:
+    missing_terminal = OpenAIResponsesProvider(
+        "gpt-test",
+        client=FakeClient(
+            FakeStream(
+                SimpleNamespace(type="response.output_text.delta", delta="partial")
+            )
+        ),
+    )
+    with pytest.raises(ModelProviderError) as captured:
+        _ = [event async for event in missing_terminal.stream(_request())]
+    assert captured.value.code is ProviderErrorCode.MALFORMED_RESPONSE
+
+    cancelled = OpenAIResponsesProvider(
+        "gpt-test",
+        client=FakeClient(FakeStream(asyncio.CancelledError())),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        _ = [event async for event in cancelled.stream(_request())]
 
 
 async def test_tools_and_multiple_calls_keep_canonical_and_provider_ids_separate() -> (
@@ -195,6 +370,7 @@ async def test_followup_rebuilds_function_call_and_output_from_canonical_message
         turn_id="turn-1",
         role=MessageRole.ASSISTANT,
         tool_calls=(call,),
+        provider_id="openai:gpt-test",
     )
     tool_result = CanonicalMessage(
         agent_id="agent-1",
@@ -231,6 +407,57 @@ async def test_followup_rebuilds_function_call_and_output_from_canonical_message
         },
     ]
     assert "previous_response_id" not in client.responses.calls[0]
+
+
+async def test_foreign_provider_state_is_not_replayed() -> None:
+    assistant = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        turn_id="turn-1",
+        role=MessageRole.ASSISTANT,
+        tool_calls=(
+            ToolCall(
+                id="canonical-call",
+                provider_call_id="foreign-call",
+                name="fake.read",
+                arguments={"key": "alpha"},
+            ),
+        ),
+        provider_id="anthropic:foreign",
+        provider_metadata={
+            "openai_replay_items": [
+                {"type": "reasoning", "encrypted_content": "foreign"}
+            ]
+        },
+    )
+    tool_result = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        turn_id="turn-1",
+        role=MessageRole.TOOL,
+        content=(ToolResultBlock(call_id="canonical-call", output={"value": 42}),),
+    )
+    client = FakeClient(_text_response("42"))
+    provider = OpenAIResponsesProvider("gpt-test", client=client)
+
+    await provider.generate(
+        _request(_message(MessageRole.USER, "read alpha"), assistant, tool_result)
+    )
+
+    assert client.responses.calls[0]["input"] == [
+        {"role": "user", "content": "read alpha"},
+        {
+            "type": "function_call",
+            "call_id": "canonical-call",
+            "name": "fake.read",
+            "arguments": '{"key":"alpha"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "canonical-call",
+            "output": '{"is_error":false,"output":{"value":42}}',
+        },
+    ]
 
 
 async def test_reasoning_items_are_persistable_and_replayed_before_tool_outputs() -> (
@@ -270,6 +497,7 @@ async def test_reasoning_items_are_persistable_and_replayed_before_tool_outputs(
         turn_id="turn-1",
         role=MessageRole.ASSISTANT,
         tool_calls=first.tool_calls,
+        provider_id="openai:gpt-test",
         provider_metadata=first.provider_metadata,
     )
     tool_result = CanonicalMessage(

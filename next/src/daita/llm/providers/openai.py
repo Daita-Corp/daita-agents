@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from decimal import Decimal
 import json
 from typing import Protocol, cast
 from uuid import uuid4
 
 from ..._json import FrozenJsonObject, canonical_json, thaw_json
-from ..errors import ModelProviderError, ProviderErrorCode
+from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from ..models import (
     CanonicalMessage,
     FinishReason,
     MessageRole,
     ModelRequest,
     ModelResponse,
+    ModelStreamCompleted,
+    ModelStreamEvent,
+    ModelTextDelta,
+    ModelToolCallDelta,
     ModelUsage,
     TextBlock,
     ToolCall,
@@ -45,6 +49,7 @@ class OpenAIResponsesProvider:
         model: str,
         *,
         api_key: str | None = None,
+        max_output_tokens: int | None = None,
         client: _OpenAIClient | None = None,
         id_factory: Callable[[str], str] | None = None,
     ) -> None:
@@ -54,8 +59,15 @@ class OpenAIResponsesProvider:
             not isinstance(api_key, str) or not api_key.strip()
         ):
             raise ValueError("api_key must be a non-empty string when provided")
+        if max_output_tokens is not None and (
+            not isinstance(max_output_tokens, int)
+            or isinstance(max_output_tokens, bool)
+            or max_output_tokens < 1
+        ):
+            raise ValueError("max_output_tokens must be a positive integer")
         self.model = model
         self._api_key = api_key
+        self._max_output_tokens = max_output_tokens
         self._client = client
         self._id_factory = _new_id if id_factory is None else id_factory
 
@@ -79,25 +91,28 @@ class OpenAIResponsesProvider:
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
-        arguments: dict[str, object] = {
-            "model": self.model,
-            "input": _response_input(request.messages),
-            "include": ["reasoning.encrypted_content"],
-            "store": False,
-        }
-        if request.tools:
-            arguments["tools"] = [
-                {
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": FrozenJsonObject.from_mapping(
-                        tool.input_schema
-                    ).to_dict(),
-                    "strict": False,
-                }
-                for tool in request.tools
-            ]
+        failure: ModelProviderError | None = None
+        try:
+            return await self._generate(request)
+        except asyncio.CancelledError:
+            raise
+        except ImportError:
+            raise
+        except ModelProviderError as error:
+            failure = error
+        except Exception:
+            failure = ModelProviderError(
+                ProviderErrorCode.MALFORMED_RESPONSE,
+                "OpenAI provider boundary failed",
+            )
+        if failure is None:
+            raise AssertionError("OpenAI provider failed without an error")
+        raise detached_provider_error(failure)
+
+    async def _generate(self, request: ModelRequest) -> ModelResponse:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        arguments = self._request_arguments(request)
         try:
             response = await self.client.responses.create(**arguments)
         except asyncio.CancelledError:
@@ -118,7 +133,194 @@ class OpenAIResponsesProvider:
                 "OpenAI returned a malformed response",
             ) from error
 
-    def _decode_response(self, response: object) -> ModelResponse:
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        """Translate ordered Responses API events into canonical stream events."""
+
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        failure: ModelProviderError | None = None
+        try:
+            async for event in self._stream(request):
+                yield event
+            return
+        except asyncio.CancelledError:
+            raise
+        except ImportError:
+            raise
+        except ModelProviderError as error:
+            failure = error
+        except Exception:
+            failure = ModelProviderError(
+                ProviderErrorCode.MALFORMED_RESPONSE,
+                "OpenAI provider boundary failed",
+            )
+        if failure is None:
+            raise AssertionError("OpenAI provider failed without an error")
+        raise detached_provider_error(failure)
+
+    async def _stream(
+        self,
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        arguments = self._request_arguments(request)
+        arguments["stream"] = True
+        try:
+            stream = await self.client.responses.create(**arguments)
+        except asyncio.CancelledError:
+            raise
+        except ImportError:
+            raise
+        except ModelProviderError:
+            raise
+        except Exception as error:
+            raise _normalize_error(error) from error
+
+        canonical_ids_by_index: dict[int, str] = {}
+        canonical_ids_by_provider_call_id: dict[str, str] = {}
+        provider_call_ids_by_index: dict[int, str] = {}
+        names_by_index: dict[int, str] = {}
+        allocated_ids: set[str] = set()
+        completed = False
+        try:
+            async for event in cast(AsyncIterator[object], stream):
+                event_type = _required_text(_field(event, "type"), "stream event type")
+                if event_type == "response.output_text.delta":
+                    delta = _nonempty_fragment(_field(event, "delta"), "text delta")
+                    yield ModelTextDelta(delta)
+                elif event_type == "response.output_item.added":
+                    item = _field(event, "item")
+                    if _field(item, "type", None) != "function_call":
+                        continue
+                    index = _nonnegative_int(
+                        _field(event, "output_index"), "output index"
+                    )
+                    provider_call_id = _required_text(
+                        _field(item, "call_id"), "provider call_id"
+                    )
+                    name = _required_text(_field(item, "name"), "function name")
+                    canonical_id = canonical_ids_by_index.get(index)
+                    if canonical_id is None:
+                        canonical_id = self._id_factory("call")
+                        if canonical_id in allocated_ids:
+                            raise ValueError("id_factory returned a duplicate call ID")
+                        allocated_ids.add(canonical_id)
+                        canonical_ids_by_index[index] = canonical_id
+                    canonical_ids_by_provider_call_id[provider_call_id] = canonical_id
+                    provider_call_ids_by_index[index] = provider_call_id
+                    names_by_index[index] = name
+                    yield ModelToolCallDelta(
+                        index=index,
+                        arguments_delta="",
+                        id=canonical_id,
+                        name=name,
+                        provider_call_id=provider_call_id,
+                    )
+                elif event_type == "response.function_call_arguments.delta":
+                    index = _nonnegative_int(
+                        _field(event, "output_index"), "output index"
+                    )
+                    canonical_id = canonical_ids_by_index.get(index)
+                    if canonical_id is None:
+                        canonical_id = self._id_factory("call")
+                        if canonical_id in allocated_ids:
+                            raise ValueError("id_factory returned a duplicate call ID")
+                        allocated_ids.add(canonical_id)
+                        canonical_ids_by_index[index] = canonical_id
+                    yield ModelToolCallDelta(
+                        index=index,
+                        arguments_delta=_required_text(
+                            _field(event, "delta"), "function arguments delta"
+                        ),
+                        id=canonical_id,
+                        name=names_by_index.get(index),
+                        provider_call_id=provider_call_ids_by_index.get(index),
+                    )
+                elif event_type in {
+                    "response.completed",
+                    "response.incomplete",
+                    "response.failed",
+                }:
+                    response = self._decode_response(
+                        _field(event, "response"),
+                        canonical_ids_by_index=canonical_ids_by_index,
+                        canonical_ids_by_provider_call_id=(
+                            canonical_ids_by_provider_call_id
+                        ),
+                    )
+                    yield ModelStreamCompleted(response)
+                    completed = True
+                    return
+                elif event_type == "error":
+                    code = _optional_text(
+                        _field(event, "code", None), "stream error code"
+                    )
+                    raise ModelProviderError(
+                        _code_from_provider_value(code),
+                        "OpenAI stream failed",
+                    )
+        except asyncio.CancelledError:
+            raise
+        except ImportError:
+            raise
+        except ModelProviderError:
+            raise
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ModelProviderError(
+                ProviderErrorCode.MALFORMED_RESPONSE,
+                "OpenAI returned a malformed stream",
+            ) from error
+        except Exception as error:
+            raise _normalize_error(error) from error
+        if not completed:
+            raise ModelProviderError(
+                ProviderErrorCode.MALFORMED_RESPONSE,
+                "OpenAI stream ended without a terminal response",
+            )
+
+    def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
+        arguments: dict[str, object] = {
+            "model": self.model,
+            "input": _response_input(request.messages, self.provider_id),
+            "include": ["reasoning.encrypted_content"],
+            "store": False,
+        }
+        if self._max_output_tokens is not None:
+            arguments["max_output_tokens"] = self._max_output_tokens
+        if request.tools:
+            arguments["tools"] = [
+                {
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": FrozenJsonObject.from_mapping(
+                        tool.input_schema
+                    ).to_dict(),
+                    "strict": False,
+                }
+                for tool in request.tools
+            ]
+        if request.response_schema is not None:
+            arguments["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "daita_response",
+                    "schema": FrozenJsonObject.from_mapping(
+                        request.response_schema
+                    ).to_dict(),
+                    "strict": True,
+                }
+            }
+        return arguments
+
+    def _decode_response(
+        self,
+        response: object,
+        *,
+        canonical_ids_by_index: Mapping[int, str] | None = None,
+        canonical_ids_by_provider_call_id: Mapping[str, str] | None = None,
+    ) -> ModelResponse:
         status = _optional_text(_field(response, "status", None), "response status")
         if status == "failed":
             failure = _field(response, "error", None)
@@ -136,7 +338,13 @@ class OpenAIResponsesProvider:
         calls: list[ToolCall] = []
         replay_items: list[dict[str, object]] = []
         canonical_ids: set[str] = set()
-        for item in output:
+        index_ids = {} if canonical_ids_by_index is None else canonical_ids_by_index
+        provider_ids = (
+            {}
+            if canonical_ids_by_provider_call_id is None
+            else canonical_ids_by_provider_call_id
+        )
+        for output_index, item in enumerate(output):
             item_type = _required_text(_field(item, "type"), "response item type")
             if item_type == "function_call":
                 provider_call_id = _required_text(
@@ -149,7 +357,12 @@ class OpenAIResponsesProvider:
                 decoded_arguments = json.loads(encoded_arguments)
                 if not isinstance(decoded_arguments, dict):
                     raise ValueError("function arguments must decode to an object")
-                canonical_id = self._id_factory("call")
+                canonical_id = provider_ids.get(
+                    provider_call_id,
+                    index_ids.get(output_index),
+                )
+                if canonical_id is None:
+                    canonical_id = self._id_factory("call")
                 if canonical_id in canonical_ids:
                     raise ValueError("id_factory returned a duplicate call ID")
                 canonical_ids.add(canonical_id)
@@ -199,6 +412,7 @@ class OpenAIResponsesProvider:
             text=normalized_text,
             tool_calls=tuple(calls),
             usage=_decode_usage(_field(response, "usage", None)),
+            provider_id=self.provider_id,
             provider_response_id=response_id,
             provider_metadata=provider_metadata,
         )
@@ -207,28 +421,33 @@ class OpenAIResponsesProvider:
 OpenAIProvider = OpenAIResponsesProvider
 
 
-def _response_input(messages: tuple[CanonicalMessage, ...]) -> list[dict[str, object]]:
+def _response_input(
+    messages: tuple[CanonicalMessage, ...],
+    provider_id: str,
+) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     provider_call_ids: dict[str, str] = {}
     for message in messages:
-        metadata = FrozenJsonObject.from_mapping(message.provider_metadata)
-        replay_value = metadata.get("openai_replay_items")
-        if replay_value is not None:
-            replay_items = thaw_json(replay_value)
-            if not isinstance(replay_items, list):
-                raise ModelProviderError(
-                    ProviderErrorCode.INVALID_REQUEST,
-                    "OpenAI replay metadata must contain JSON objects",
-                )
-            decoded_replay_items: list[dict[str, object]] = []
-            for replay_item in replay_items:
-                if not isinstance(replay_item, dict):
+        same_origin = message.provider_id == provider_id
+        if same_origin:
+            metadata = FrozenJsonObject.from_mapping(message.provider_metadata)
+            replay_value = metadata.get("openai_replay_items")
+            if replay_value is not None:
+                replay_items = thaw_json(replay_value)
+                if not isinstance(replay_items, list):
                     raise ModelProviderError(
                         ProviderErrorCode.INVALID_REQUEST,
                         "OpenAI replay metadata must contain JSON objects",
                     )
-                decoded_replay_items.append(replay_item)
-            items.extend(decoded_replay_items)
+                decoded_replay_items: list[dict[str, object]] = []
+                for replay_item in replay_items:
+                    if not isinstance(replay_item, dict):
+                        raise ModelProviderError(
+                            ProviderErrorCode.INVALID_REQUEST,
+                            "OpenAI replay metadata must contain JSON objects",
+                        )
+                    decoded_replay_items.append(replay_item)
+                items.extend(decoded_replay_items)
         text = "\n".join(
             block.text for block in message.content if isinstance(block, TextBlock)
         ).strip()
@@ -236,7 +455,9 @@ def _response_input(messages: tuple[CanonicalMessage, ...]) -> list[dict[str, ob
             items.append({"role": message.role.value, "content": text})
         if message.role is MessageRole.ASSISTANT:
             for call in message.tool_calls:
-                provider_call_id = call.provider_call_id or call.id
+                provider_call_id = (
+                    call.provider_call_id if same_origin else None
+                ) or call.id
                 provider_call_ids[call.id] = provider_call_id
                 items.append(
                     {
@@ -333,7 +554,11 @@ def _normalize_error(error: Exception) -> ModelProviderError:
     )
     code = _optional_text(_field(error, "code", None), "provider error code")
     name = type(error).__name__.lower()
-    if isinstance(error, (asyncio.TimeoutError, TimeoutError)) or "timeout" in name:
+    if (
+        isinstance(error, (asyncio.TimeoutError, TimeoutError))
+        or status == 408
+        or "timeout" in name
+    ):
         normalized = ProviderErrorCode.TIMEOUT
     elif status in {401, 403} or "authentication" in name or "permission" in name:
         normalized = ProviderErrorCode.AUTHENTICATION_ERROR
@@ -355,12 +580,20 @@ def _normalize_error(error: Exception) -> ModelProviderError:
 
 
 def _code_from_provider_value(value: str | None) -> ProviderErrorCode:
+    if value in {"authentication_error", "invalid_api_key", "permission_denied"}:
+        return ProviderErrorCode.AUTHENTICATION_ERROR
+    if value in {"rate_limit_error", "rate_limit_exceeded"}:
+        return ProviderErrorCode.RATE_LIMIT_ERROR
     if value in {"context_length_exceeded", "context_window_exceeded"}:
         return ProviderErrorCode.CONTEXT_OVERFLOW
     if value in {"content_policy_violation", "content_blocked"}:
         return ProviderErrorCode.CONTENT_BLOCKED
     if value in {"model_not_found", "unknown_model"}:
         return ProviderErrorCode.MODEL_NOT_FOUND
+    if value in {"invalid_request", "invalid_request_error"}:
+        return ProviderErrorCode.INVALID_REQUEST
+    if value in {"timeout", "request_timeout"}:
+        return ProviderErrorCode.TIMEOUT
     return ProviderErrorCode.PROVIDER_UNAVAILABLE
 
 
@@ -392,6 +625,12 @@ def _optional_text(value: object, label: str) -> str | None:
     if value is None:
         return None
     return _required_text(value, label)
+
+
+def _nonempty_fragment(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    return value
 
 
 def _nonnegative_int(value: object, label: str) -> int:

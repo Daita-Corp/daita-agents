@@ -91,6 +91,10 @@ from ..llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelRouteAttempt,
+    ModelRouteAttemptOutcome,
+    ModelRoutingTrace,
+    ModelSensitivity,
     ModelUsage,
     TextBlock,
     ToolCall,
@@ -5952,6 +5956,11 @@ def _load_session_operation_facts(
             "WHERE operation_id = ? AND success = 1 ORDER BY position",
             (operation_id,),
         ).fetchall()
+        model_request_rows = connection.execute(
+            "SELECT request_json FROM model_calls "
+            "WHERE operation_id = ? ORDER BY position",
+            (operation_id,),
+        ).fetchall()
         evidence_payloads = tuple(
             _decode_json_object(
                 _sqlite_text(
@@ -5992,6 +6001,19 @@ def _load_session_operation_facts(
                 "session operation trigger payload",
             )
         )
+        sensitivity = max(
+            (
+                _decode_model_request(
+                    _sqlite_text(
+                        request_row["request_json"],
+                        "session operation model request",
+                    )
+                ).sensitivity
+                for request_row in model_request_rows
+            ),
+            default=ModelSensitivity.INTERNAL,
+            key=lambda item: item.routing_rank,
+        )
         return SessionOperationFacts(
             operation_id=_sqlite_text(row["id"], "session operation id"),
             agent_id=_sqlite_text(row["agent_id"], "session operation agent_id"),
@@ -6001,6 +6023,7 @@ def _load_session_operation_facts(
             ),
             revision=str(_sqlite_int(row["revision"], "session operation revision")),
             status=_sqlite_text(row["status"], "session operation status"),
+            sensitivity=sensitivity,
             evidence_ids=tuple(
                 _sqlite_text(item["id"], "session operation evidence id")
                 for item in evidence_rows
@@ -11266,6 +11289,7 @@ def _load_session_transcript(
                         role=MessageRole.ASSISTANT,
                         content=content,
                         tool_calls=response.tool_calls,
+                        provider_id=response.provider_id,
                         provider_metadata=response.provider_metadata,
                     )
                 )
@@ -13569,6 +13593,8 @@ def _message_to_data(message: CanonicalMessage) -> dict[str, object]:
         "tool_calls": [_tool_call_to_data(call) for call in message.tool_calls],
         "turn_id": message.turn_id,
     }
+    if message.provider_id is not None:
+        data["provider_id"] = message.provider_id
     if message.provider_metadata:
         data["provider_metadata"] = message.provider_metadata
     return data
@@ -13588,7 +13614,12 @@ def _message_from_data(value: object) -> CanonicalMessage:
             "turn_id",
         }
     )
-    if frozenset(value) not in (legacy_keys, legacy_keys | {"provider_metadata"}):
+    optional_keys = frozenset({"provider_id", "provider_metadata"})
+    message_keys = frozenset(value)
+    if (
+        not legacy_keys <= message_keys
+        or not message_keys <= legacy_keys | optional_keys
+    ):
         raise ValueError("canonical message has unknown or missing fields")
     data = value
     provider_metadata = data.get("provider_metadata", {})
@@ -13608,6 +13639,10 @@ def _message_from_data(value: object) -> CanonicalMessage:
             _tool_call_from_data(item)
             for item in _expect_list(data["tool_calls"], "message tool calls")
         ),
+        provider_id=_expect_optional_text(
+            data.get("provider_id"),
+            "message provider_id",
+        ),
         provider_metadata=provider_metadata,
     )
 
@@ -13615,10 +13650,12 @@ def _message_from_data(value: object) -> CanonicalMessage:
 def _encode_model_request(request: ModelRequest) -> str:
     return canonical_json(
         {
-            "codec_version": 2,
+            "codec_version": 3,
             "context_selection": request.context_selection,
             "messages": [_message_to_data(message) for message in request.messages],
             "operation_id": request.operation_id,
+            "response_schema": request.response_schema,
+            "sensitivity": request.sensitivity.value,
             "tools": [_tool_definition_to_data(tool) for tool in request.tools],
             "turn_id": request.turn_id,
         }
@@ -13637,6 +13674,8 @@ def _decode_model_request(value: str) -> ModelRequest:
     if codec_version == 1:
         data = _expect_object(decoded, keys=legacy_keys, label="model request")
         context_selection: Mapping[str, object] = {}
+        response_schema: Mapping[str, object] | None = None
+        sensitivity = ModelSensitivity.INTERNAL
     elif codec_version == 2:
         data = _expect_object(
             decoded,
@@ -13647,6 +13686,25 @@ def _decode_model_request(value: str) -> ModelRequest:
         if not isinstance(selection_value, dict):
             raise ValueError("model-request context selection must be a JSON object")
         context_selection = selection_value
+        response_schema = None
+        sensitivity = ModelSensitivity.INTERNAL
+    elif codec_version == 3:
+        data = _expect_object(
+            decoded,
+            keys=legacy_keys | {"context_selection", "response_schema", "sensitivity"},
+            label="model request",
+        )
+        selection_value = data["context_selection"]
+        if not isinstance(selection_value, dict):
+            raise ValueError("model-request context selection must be a JSON object")
+        context_selection = selection_value
+        schema_value = data["response_schema"]
+        if schema_value is not None and not isinstance(schema_value, dict):
+            raise ValueError("model-request response schema must be a JSON object")
+        response_schema = schema_value
+        sensitivity = ModelSensitivity(
+            _expect_text(data["sensitivity"], "model-request sensitivity")
+        )
     else:
         raise ValueError("unknown model-request codec version")
     return ModelRequest(
@@ -13660,6 +13718,8 @@ def _decode_model_request(value: str) -> ModelRequest:
             _tool_definition_from_data(item)
             for item in _expect_list(data["tools"], "request tools")
         ),
+        response_schema=response_schema,
+        sensitivity=sensitivity,
         context_selection=context_selection,
     )
 
@@ -13706,13 +13766,91 @@ def _usage_from_data(value: object) -> ModelUsage:
     )
 
 
+def _routing_to_data(routing: ModelRoutingTrace) -> dict[str, object]:
+    return {
+        "attempts": [
+            {
+                "attempt": item.attempt,
+                "error_code": item.error_code,
+                "latency_ms": item.latency_ms,
+                "outcome": item.outcome.value,
+                "provider_id": item.provider_id,
+            }
+            for item in routing.attempts
+        ],
+        "primary_provider_id": routing.primary_provider_id,
+        "route_id": routing.route_id,
+        "selected_provider_id": routing.selected_provider_id,
+        "terminal_error_code": routing.terminal_error_code,
+    }
+
+
+def _routing_from_data(value: object) -> ModelRoutingTrace:
+    data = _expect_object(
+        value,
+        keys={
+            "attempts",
+            "primary_provider_id",
+            "route_id",
+            "selected_provider_id",
+            "terminal_error_code",
+        },
+        label="model routing trace",
+    )
+    attempts: list[ModelRouteAttempt] = []
+    for value_item in _expect_list(data["attempts"], "model routing attempts"):
+        item = _expect_object(
+            value_item,
+            keys={
+                "attempt",
+                "error_code",
+                "latency_ms",
+                "outcome",
+                "provider_id",
+            },
+            label="model routing attempt",
+        )
+        attempts.append(
+            ModelRouteAttempt(
+                provider_id=_expect_text(
+                    item["provider_id"], "route-attempt provider id"
+                ),
+                attempt=_expect_int(item["attempt"], "route-attempt number"),
+                outcome=ModelRouteAttemptOutcome(
+                    _expect_text(item["outcome"], "route-attempt outcome")
+                ),
+                latency_ms=_expect_int(item["latency_ms"], "route-attempt latency"),
+                error_code=_expect_optional_text(
+                    item["error_code"], "route-attempt error code"
+                ),
+            )
+        )
+    return ModelRoutingTrace(
+        route_id=_expect_text(data["route_id"], "routing route id"),
+        primary_provider_id=_expect_text(
+            data["primary_provider_id"], "routing primary provider id"
+        ),
+        attempts=tuple(attempts),
+        selected_provider_id=_expect_optional_text(
+            data["selected_provider_id"], "routing selected provider id"
+        ),
+        terminal_error_code=_expect_optional_text(
+            data["terminal_error_code"], "routing terminal error code"
+        ),
+    )
+
+
 def _encode_model_response(response: ModelResponse) -> str:
     return canonical_json(
         {
-            "codec_version": 1,
+            "codec_version": 2,
             "finish_reason": response.finish_reason.value,
+            "provider_id": response.provider_id,
             "provider_metadata": response.provider_metadata,
             "provider_response_id": response.provider_response_id,
+            "routing": (
+                None if response.routing is None else _routing_to_data(response.routing)
+            ),
             "text": response.text,
             "tool_calls": [_tool_call_to_data(call) for call in response.tool_calls],
             "usage": _usage_to_data(response.usage),
@@ -13721,20 +13859,36 @@ def _encode_model_response(response: ModelResponse) -> str:
 
 
 def _decode_model_response(value: str) -> ModelResponse:
-    data = _expect_object(
-        _decode_json(value),
-        keys={
-            "codec_version",
-            "finish_reason",
-            "provider_metadata",
-            "provider_response_id",
-            "text",
-            "tool_calls",
-            "usage",
-        },
-        label="model response",
+    decoded = _decode_json(value)
+    if not isinstance(decoded, dict):
+        raise ValueError("model response must be a JSON object")
+    codec_version = _expect_int(
+        decoded.get("codec_version"),
+        "model-response codec version",
     )
-    if _expect_int(data["codec_version"], "model-response codec version") != 1:
+    legacy_keys = {
+        "codec_version",
+        "finish_reason",
+        "provider_metadata",
+        "provider_response_id",
+        "text",
+        "tool_calls",
+        "usage",
+    }
+    if codec_version == 1:
+        data = _expect_object(decoded, keys=legacy_keys, label="model response")
+        provider_id = None
+        routing = None
+    elif codec_version == 2:
+        data = _expect_object(
+            decoded,
+            keys=legacy_keys | {"provider_id", "routing"},
+            label="model response",
+        )
+        provider_id = _expect_optional_text(data["provider_id"], "response provider id")
+        routing_value = data["routing"]
+        routing = None if routing_value is None else _routing_from_data(routing_value)
+    else:
         raise ValueError("unknown model-response codec version")
     provider_metadata = data["provider_metadata"]
     if not isinstance(provider_metadata, dict):
@@ -13749,9 +13903,11 @@ def _decode_model_response(value: str) -> ModelResponse:
             for item in _expect_list(data["tool_calls"], "response tool calls")
         ),
         usage=_usage_from_data(data["usage"]),
+        provider_id=provider_id,
         provider_response_id=_expect_optional_text(
             data["provider_response_id"],
             "provider response id",
         ),
         provider_metadata=provider_metadata,
+        routing=routing,
     )

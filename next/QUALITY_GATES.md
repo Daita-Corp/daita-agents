@@ -635,10 +635,39 @@ No live model or external database was required for Phase 7. The controlled
 source and durable marker are test-owned local SQLite files; production-model
 translation was proven in Phase 2, and PostgreSQL belongs to Phase 8.
 
+## Phase 8 — PostgreSQL and multi-provider parity
+
+Status: **PASS. Phase 8 is complete and Phase 9 may begin.**
+
+Phase 8 added PostgreSQL through the existing catalog/capability/runtime path,
+five retained provider families through adapter-local wire translations, and
+one policy-aware router over canonical model state. It introduced no second
+loop, data runtime, catalog, executor boundary, or provider-owned transcript.
+
+### Executed Phase 8 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P8-Q01 | plan, ADRs, current v2, and retained v1 references (read-only) | Re-read Sections 6/15, PostgreSQL/data/model/security sections, Phase 8, Journey F, and the Phase 9 live boundary | PASS — existing catalog, capability, operation-runtime, canonical-model, provider-adapter, and router seams were selected; stable SQLite identities and all isolation rules were retained |
+| P8-Q02 | `next/` | Focused PostgreSQL adapter/query/source/catalog/controller/SQL/security and public Journey F selections | PASS — the final affected data selection passes 105 tests; exact schema-qualified base tables, supported built-in types/functions, `ONLY`, bounded projection, cancellation cleanup, detached diagnostics, secret references, case-distinct identifiers, and non-replay-safe execution facts are covered |
+| P8-Q03 | `next/` | Shared six-provider conformance, provider-specific fake clients, registry, routing, continuation/reopen, security, and provider architecture selections | PASS — OpenAI, Anthropic, Gemini, Grok, Ollama, and generic OpenAI-compatible adapters normalize applicable text/tools/streaming/usage/errors/cancellation and lazy extras; routing proves capability/context/sensitivity admission, bounded fallback, canonical continuation, cost, telemetry, and missing-estimate fail-closed behavior |
+| P8-Q04 | final PostgreSQL and model-security reviews | Independently review narrowed PostgreSQL authority and provider/router exception, fallback, sensitivity, continuation, and persistence boundaries | PASS after root-cause repair — PostgreSQL rejects views/foreign/custom-type and unsafe resolution paths before user SQL; provider exceptions are detached from raw tracebacks/causes/contexts, HTTP 408 normalizes to timeout, and a missing input estimate causes zero provider I/O |
+| P8-Q05 | `next/` | Complete isolated suite on CPython 3.11.15 and 3.12.7 with `not requires_llm and not requires_db` | PASS — 1,459 passed and 2 skipped in 48.50s/51.17s; skips are the environment-gated real local-socket and live rows, not substituted mocks |
+| P8-Q06 | `next/` | One formatting pass; final Black check; byte compilation; full mypy; pyright 1.1.411; isolated architecture suite; generated disposition check | PASS after explicit narrowing — Black reports all 242 files unchanged, compilation clean, mypy no issues in 241 files, pyright 0 errors/warnings, 84 architecture tests pass, and disposition generation is current |
+| P8-Q07 | repository root | `.venv/bin/python -m pytest -o addopts='' tests/ -m 'not requires_llm and not requires_db' -q --tb=short -p no:cacheprovider` | PASS — 2,498 passed and 221 deselected in 10.48s; the frozen v1 oracle remains unchanged |
+| P8-Q08 | clean copy under `/private/tmp/daita-v2-p8-gate.Pqsut2` | Build sdist/wheel without isolation; inspect boundaries; install wheel without dependencies in fresh CPython 3.11/3.12 environments; import every packaged module and run installed `daita --help` | PASS — wheel/sdist contain 96/121 entries; no tests/scripts/nested `next`/cache/bytecode paths are packaged; both environments import all 91 modules from `site-packages` and start the CLI without optional SDKs |
+| P8-Q09 | final Phase 8 diff | Parity/ledger/README/ADR/scope review, configured hooks, and exact containing commit | PASS — every changed repository path remains under `next/`; root v1 is untouched; the containing commit is `chore(v2-phase-8): complete phase 8 gate` |
+
+Live Anthropic, Gemini, Grok, Ollama, generic-compatible, and real PostgreSQL
+checks were **NOT RUN** in Phase 8. Their adapters are proven with protocol-
+shaped fakes, but Phase 9 owns the required credential/service-backed live
+acceptance and no mock result will satisfy those rows. The earlier actual
+OpenAI persisted-loop evidence remains recorded under Phase 2.
+
 ## Live and external gates
 
 - Phase 0 requires no live provider or external database.
 - The Phase 2 production-model gate passed with an explicit model and actual
   OpenAI API call; the credential value was neither printed nor persisted.
-- PostgreSQL and other later-phase live checks remain **NOT RUN** until their
-  owning phases. No mock result will satisfy those gates.
+- PostgreSQL and retained-provider live checks remain **NOT RUN** until the
+  Phase 9 acceptance gate. No mock result will satisfy those gates.

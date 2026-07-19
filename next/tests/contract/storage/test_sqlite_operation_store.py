@@ -17,6 +17,10 @@ from daita.llm.models import (
     MessageRole,
     ModelRequest,
     ModelResponse,
+    ModelRouteAttempt,
+    ModelRouteAttemptOutcome,
+    ModelRoutingTrace,
+    ModelSensitivity,
     ModelUsage,
     TextBlock,
     ToolCall,
@@ -150,6 +154,7 @@ def _maximal_snapshot() -> OperationSnapshot:
                         provider_call_id="provider-prior-call",
                     ),
                 ),
+                provider_id="openai:gpt-prior",
                 provider_metadata={
                     "openai_replay_items": [
                         {
@@ -192,6 +197,13 @@ def _maximal_snapshot() -> OperationSnapshot:
                 input_schema={"type": "object"},
             ),
         ),
+        response_schema={
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
+        sensitivity=ModelSensitivity.RESTRICTED,
     )
     response_z = ModelResponse(
         finish_reason=FinishReason.TOOL_CALLS,
@@ -217,14 +229,35 @@ def _maximal_snapshot() -> OperationSnapshot:
             cache_write_tokens=13,
             estimated_cost_usd=Decimal("0.0012300"),
         ),
+        provider_id="anthropic:claude-roundtrip",
         provider_response_id="provider-response-z",
         provider_metadata=_rich_json("provider-response"),
+        routing=ModelRoutingTrace(
+            route_id="router:roundtrip",
+            primary_provider_id="openai:gpt-roundtrip",
+            attempts=(
+                ModelRouteAttempt(
+                    provider_id="openai:gpt-roundtrip",
+                    attempt=1,
+                    outcome=ModelRouteAttemptOutcome.FAILED,
+                    latency_ms=12,
+                    error_code="rate_limit_error",
+                ),
+                ModelRouteAttempt(
+                    provider_id="anthropic:claude-roundtrip",
+                    attempt=1,
+                    outcome=ModelRouteAttemptOutcome.SUCCEEDED,
+                    latency_ms=21,
+                ),
+            ),
+            selected_provider_id="anthropic:claude-roundtrip",
+        ),
     )
     model_call_z = ModelCall(
         id="model-call-z",
         operation_id=operation_id,
         turn_id=turn_z.id,
-        provider_id="mock:roundtrip",
+        provider_id="router:roundtrip",
         request=request_z,
         response=response_z,
         status=ModelCallStatus.COMPLETED,
@@ -483,6 +516,9 @@ async def test_maximal_snapshot_round_trips_through_lookups_and_reopen(
         assert await store.load_by_trigger(snapshot.trigger.id) == created.operation
         transcript = await store.load_session(snapshot.operation.agent_id, session_id)
         assert transcript is not None
+        session_facts = await store.load_session_operation(snapshot.operation.id)
+        assert session_facts is not None
+        assert session_facts.sensitivity is ModelSensitivity.RESTRICTED
         assistant = next(
             message
             for message in transcript.messages
@@ -506,6 +542,10 @@ async def test_maximal_snapshot_round_trips_through_lookups_and_reopen(
         response_data = json.loads(str(row[1]))
         request_calls = request_data["messages"][2]["tool_calls"]
         request_metadata = request_data["messages"][2]["provider_metadata"]
+        assert request_data["codec_version"] == 3
+        assert request_data["messages"][2]["provider_id"] == "openai:gpt-prior"
+        assert request_data["sensitivity"] == "restricted"
+        assert request_data["response_schema"]["required"] == ["answer"]
         response_calls = response_data["tool_calls"]
         assert request_calls[0]["provider_call_id"] == "provider-prior-call"
         assert request_metadata["openai_replay_items"][0] == {
@@ -515,6 +555,15 @@ async def test_maximal_snapshot_round_trips_through_lookups_and_reopen(
         }
         assert response_calls[0]["provider_call_id"] == "provider-call-z"
         assert "provider_call_id" not in response_calls[1]
+        assert response_data["codec_version"] == 2
+        assert response_data["provider_id"] == "anthropic:claude-roundtrip"
+        assert response_data["routing"]["selected_provider_id"] == (
+            "anthropic:claude-roundtrip"
+        )
+        assert [item["outcome"] for item in response_data["routing"]["attempts"]] == [
+            "failed",
+            "succeeded",
+        ]
     finally:
         connection.close()
 

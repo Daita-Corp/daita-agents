@@ -1,11 +1,13 @@
 # Daita autonomous agent v2 replacement
 
-This is the isolated replacement project for Daita 2.0. Through Phase 6 it is
+This is the isolated replacement project for Daita 2.0. Through Phase 8 it is
 a functional persistent local agent: the generic loop, governed execution,
 SQLite recovery, catalog-backed SQLite and sandboxed-file data paths,
 provenance-bearing context, session compression, scoped memory/learning,
-versioned procedural skills, durable monitors, and a foreground local host are
-implemented. Broader candidate integrations and cutover remain later phases.
+versioned procedural skills, durable monitors, a foreground local host,
+controlled approved SQLite writes, PostgreSQL reads, and retained-model
+routing are implemented. Replacement acceptance and cutover remain later
+phases.
 
 The governing plan is the local
 `../docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md` fingerprinted in
@@ -89,8 +91,25 @@ arbitrary mutation-SQL surface:
 
 ```bash
 daita --root /tmp/daita-next source attach atlas sqlite /absolute/path/orders.db \
-  --write-access --idempotency-key attach-orders-write-v1
+    --write-access --idempotency-key attach-orders-write-v1
 ```
+
+Phase 8 PostgreSQL support uses the same catalog, capability, runtime, and
+evidence path as SQLite, but its admission boundary is intentionally narrower.
+Only attached base tables whose columns use supported `pg_catalog` native types
+are advertised for queries; views, foreign tables, and tables containing
+custom/extension types are omitted. Generated SQL must use the exact
+schema-qualified `native_identity` returned by `catalog_inspect`; execution
+adds `ONLY` and a transaction-local `pg_catalog` search path. Credentials are
+resolved from secret references and are never stored as raw passwords.
+
+The PostgreSQL database and login role are trusted deployment inputs: use a
+least-privilege read-only role and do not attach a database whose row-security
+policies or server-owned type/operator code is untrusted. PostgreSQL reads are
+classified non-idempotent and non-replay-safe, so ambiguous interrupted calls
+fail into manual recovery instead of being repeated. Fake-driver coverage is
+deterministic Phase 8 evidence; actual asyncpg/database behavior remains a
+required credential-gated Phase 9 live gate.
 
 If inspection reports a waiting approval, the decision updates only the
 persisted approval and wakes the same operation through the host:

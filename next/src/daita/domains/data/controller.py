@@ -37,12 +37,15 @@ from .file_capabilities import (
 from .sql import (
     ResourceSchema,
     SQLiteUpdateRecipe,
+    validate_postgresql_read,
     validate_sqlite_read,
     validate_sqlite_update_recipe,
 )
 
 SQLITE_QUERY_CAPABILITY_ID = "data.sqlite.query"
 SQLITE_QUERY_EVIDENCE_KIND = "data.sqlite.query_result"
+POSTGRESQL_QUERY_CAPABILITY_ID = "data.postgresql.query"
+POSTGRESQL_QUERY_EVIDENCE_KIND = "data.postgresql.query_result"
 SQLITE_UPDATE_IMPACT_CAPABILITY_ID = "data.sqlite.update_impact"
 SQLITE_UPDATE_IMPACT_EVIDENCE_KIND = "data.sqlite.update_impact"
 SQLITE_UPDATE_IMPACT_TOOL_NAME = "data_preview_sqlite_update"
@@ -67,6 +70,12 @@ class CatalogSchemaReader(Protocol):
 
 class CatalogDataReader(CatalogSchemaReader, Protocol):
     """Catalog projection consumed by the complete data-domain controller."""
+
+    async def source_adapter_id(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> str | None: ...
 
     async def is_current_tabular_file(
         self,
@@ -98,6 +107,8 @@ class DataDomainController:
             raise TypeError("catalog must provide resource_schemas")
         if not callable(getattr(catalog, "is_current_tabular_file", None)):
             raise TypeError("catalog must provide is_current_tabular_file")
+        if not callable(getattr(catalog, "source_adapter_id", None)):
+            raise TypeError("catalog must provide source_adapter_id")
         if not callable(clock):
             raise TypeError("clock must be callable")
         self._registry = registry
@@ -164,8 +175,16 @@ class DataDomainController:
                     message="Catalog inspection requires one bounded resource ID.",
                 )
         validation_facts = ActionValidationFacts()
-        if capability.id == SQLITE_QUERY_CAPABILITY_ID:
-            rejection = await self._validate_sql(arguments, operation)
+        sql_dialect_by_capability = {
+            SQLITE_QUERY_CAPABILITY_ID: "sqlite",
+            POSTGRESQL_QUERY_CAPABILITY_ID: "postgresql",
+        }
+        if capability.id in sql_dialect_by_capability:
+            rejection = await self._validate_sql(
+                arguments,
+                operation,
+                dialect=sql_dialect_by_capability[capability.id],
+            )
             if rejection is not None:
                 return rejection
         if capability.id in {
@@ -204,6 +223,8 @@ class DataDomainController:
         self,
         arguments: Mapping[str, object],
         operation: OperationSnapshot,
+        *,
+        dialect: str,
     ) -> ActionRejection | None:
         source_id = arguments["source_id"]
         sql = arguments["sql"]
@@ -223,24 +244,43 @@ class DataDomainController:
         ):
             return ActionRejection(
                 code="data.sql.input_out_of_bounds",
-                message="SQLite SQL or parameters exceed the bounded input contract.",
+                message="SQL or parameters exceed the bounded input contract.",
                 details={
                     "maximum_parameters": 256,
                     "maximum_sql_characters": 100_000,
                 },
             )
         try:
+            adapter_id = await self._catalog.source_adapter_id(
+                operation.operation.agent_id,
+                source_id,
+            )
             resources = await self._catalog.resource_schemas(
                 operation.operation.agent_id,
                 source_id,
             )
-        except (KeyError, ValueError):
+        except (KeyError, TypeError, ValueError):
             return ActionRejection(
                 code="data.catalog_schema_unavailable",
                 message="No current catalog schema is available for that source.",
                 details={"source_id": source_id},
             )
-        result = validate_sqlite_read(
+        expected_adapter_id = "postgresql" if dialect == "postgresql" else "sqlite"
+        if adapter_id != expected_adapter_id:
+            return ActionRejection(
+                code="data.sql.source_adapter_mismatch",
+                message="The selected SQL tool does not match the attached source.",
+                details={
+                    "expected_adapter_id": expected_adapter_id,
+                    "source_id": source_id,
+                },
+            )
+        validator = (
+            validate_postgresql_read
+            if dialect == "postgresql"
+            else validate_sqlite_read
+        )
+        result = validator(
             sql,
             source_id=source_id,
             resources=resources,
@@ -452,7 +492,11 @@ class DataDomainController:
             if evidence.accepted
         }
         selected = tuple(evidence_by_id.get(item) for item in (left_id, right_id))
-        supported = {LOCAL_FILE_READ_EVIDENCE_KIND, SQLITE_QUERY_EVIDENCE_KIND}
+        supported = {
+            LOCAL_FILE_READ_EVIDENCE_KIND,
+            POSTGRESQL_QUERY_EVIDENCE_KIND,
+            SQLITE_QUERY_EVIDENCE_KIND,
+        }
         if any(
             evidence is None or evidence.kind not in supported for evidence in selected
         ):
@@ -524,7 +568,11 @@ class DataDomainController:
             for evidence in operation.evidence
             if evidence.accepted
             and evidence.kind
-            in {SQLITE_QUERY_EVIDENCE_KIND, LOCAL_FILE_READ_EVIDENCE_KIND}
+            in {
+                SQLITE_QUERY_EVIDENCE_KIND,
+                POSTGRESQL_QUERY_EVIDENCE_KIND,
+                LOCAL_FILE_READ_EVIDENCE_KIND,
+            }
         )
         accepted_comparisons = tuple(
             evidence
@@ -849,6 +897,8 @@ __all__ = [
     "DataDomainController",
     "SQLITE_QUERY_CAPABILITY_ID",
     "SQLITE_QUERY_EVIDENCE_KIND",
+    "POSTGRESQL_QUERY_CAPABILITY_ID",
+    "POSTGRESQL_QUERY_EVIDENCE_KIND",
     "SQLITE_UPDATE_CAPABILITY_ID",
     "SQLITE_UPDATE_EVIDENCE_KIND",
     "SQLITE_UPDATE_IMPACT_CAPABILITY_ID",

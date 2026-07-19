@@ -322,18 +322,27 @@ def _read_only_authorizer(
 
 
 def _unique_columns(values: tuple[str, ...]) -> tuple[str, ...]:
+    bases = tuple(
+        value.strip() if isinstance(value, str) and value.strip() else f"column_{index}"
+        for index, value in enumerate(values)
+    )
+    reserved = {base.casefold() for base in bases}
     result: list[str] = []
-    counts: dict[str, int] = {}
-    for index, value in enumerate(values):
-        base = (
-            value.strip()
-            if isinstance(value, str) and value.strip()
-            else f"column_{index}"
-        )
-        key = base.casefold()
-        count = counts.get(key, 0) + 1
-        counts[key] = count
-        result.append(base if count == 1 else f"{base}__{count}")
+    used: set[str] = set()
+    for base in bases:
+        candidate = base
+        suffix = 2
+        while candidate.casefold() in used:
+            candidate = f"{base}__{suffix}"
+            suffix += 1
+            while (
+                candidate.casefold() in reserved
+                and candidate.casefold() != base.casefold()
+            ):
+                candidate = f"{base}__{suffix}"
+                suffix += 1
+        used.add(candidate.casefold())
+        result.append(candidate)
     return tuple(result)
 
 

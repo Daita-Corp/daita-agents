@@ -1,15 +1,80 @@
 """Provider-neutral model contracts."""
 
-from .models import ModelProfile
+from .errors import ModelProviderError, ProviderErrorCode
+from .factory import create_llm_provider
+from .models import (
+    CanonicalMessage,
+    FinishReason,
+    MessageRole,
+    ModelProfile,
+    ModelRequest,
+    ModelResponse,
+    ModelRouteAttempt,
+    ModelRouteAttemptOutcome,
+    ModelRoutingTrace,
+    ModelSensitivity,
+    ModelStreamCompleted,
+    ModelStreamEvent,
+    ModelTextDelta,
+    ModelToolCallDelta,
+    ModelUsage,
+    TextBlock,
+    ToolCall,
+    ToolDefinition,
+    ToolResultBlock,
+)
 from .protocols import (
     ModelProfileConflictError,
     ModelProfileRepository,
     ModelProfileRepositoryError,
+    ModelProvider,
+    StreamingModelProvider,
 )
+from .providers import (
+    AnthropicProvider,
+    GeminiProvider,
+    GrokProvider,
+    OllamaProvider,
+    OpenAICompatibleProvider,
+    OpenAIProvider,
+)
+from .routing import ModelProviderRegistration, ModelRegistry, ModelRouter
 
 __all__ = [
+    "AnthropicProvider",
+    "CanonicalMessage",
+    "FinishReason",
+    "GeminiProvider",
+    "GrokProvider",
+    "MessageRole",
     "ModelProfile",
     "ModelProfileConflictError",
     "ModelProfileRepository",
     "ModelProfileRepositoryError",
+    "ModelProvider",
+    "ModelProviderError",
+    "ModelProviderRegistration",
+    "ModelRegistry",
+    "ModelRequest",
+    "ModelResponse",
+    "ModelRouteAttempt",
+    "ModelRouteAttemptOutcome",
+    "ModelRouter",
+    "ModelRoutingTrace",
+    "ModelSensitivity",
+    "ModelStreamCompleted",
+    "ModelStreamEvent",
+    "ModelTextDelta",
+    "ModelToolCallDelta",
+    "ModelUsage",
+    "OllamaProvider",
+    "OpenAICompatibleProvider",
+    "OpenAIProvider",
+    "ProviderErrorCode",
+    "StreamingModelProvider",
+    "TextBlock",
+    "ToolCall",
+    "ToolDefinition",
+    "ToolResultBlock",
+    "create_llm_provider",
 ]

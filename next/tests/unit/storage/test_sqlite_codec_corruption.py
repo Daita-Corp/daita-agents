@@ -248,6 +248,8 @@ async def test_model_request_context_selection_roundtrips_and_decodes_v1(
     def downgrade_to_v1(request: dict[str, object]) -> None:
         request["codec_version"] = 1
         request.pop("context_selection")
+        request.pop("response_schema")
+        request.pop("sensitivity")
 
     _edit_request_json(path, downgrade_to_v1)
     legacy_store = await SQLiteOperationStore.open(path)
@@ -283,7 +285,7 @@ async def test_load_rejects_corrupt_generic_json(
 
 
 def _set_unknown_request_codec(request: dict[str, object]) -> None:
-    request["codec_version"] = 3
+    request["codec_version"] = 4
 
 
 def _set_unknown_content_kind(request: dict[str, object]) -> None:

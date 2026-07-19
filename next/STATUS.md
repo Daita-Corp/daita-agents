@@ -5,16 +5,16 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 8 — PostgreSQL and multi-provider parity
-- **Active task:** P8-01 — Phase 8 owner and conformance inventory
-- **Last completed task:** P7-05 — consolidated Phase 7 gate
-- **Current checkpoint:** Phase 7 gate (this ledger's containing commit)
+- **Active phase:** Phase 9 — replacement acceptance
+- **Active task:** P9-01 — parity and public-surface reconciliation
+- **Last completed task:** P8-05 — consolidated Phase 8 gate
+- **Current checkpoint:** Phase 8 gate (this ledger's containing commit)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** re-read the Phase 8 provider/routing/PostgreSQL
-  requirements and map one shared adapter/provider conformance sequence onto
-  the existing catalog, data-domain, canonical-model, and runtime owners
+- **Exact next action:** re-read plan Sections 6 and 15, then reconcile every
+  remaining MVP/cutover parity claim against an existing executable anchor and
+  implement or explicitly reclassify the smallest missing public surfaces
 
 ## Development cadence
 
@@ -119,6 +119,18 @@ terminal writes never rerun; unknown write outcomes require manual recovery;
 and the controlled SQLite recipe must be explicitly write-enabled, bounded,
 parameterized, catalog-scoped, and evidenced without exposing a general SQL
 mutation surface.
+
+Before Phase 8 production edits, Sections 6 and 15 were re-read in full on
+2026-07-19 together with Sections 8.13-8.15, all of Section 9, Section 14,
+Phase 8, the Phase 9 live-gate boundary, Journey F, and ADRs 0006, 0008,
+0010-0011. The renewed constraints are that PostgreSQL implements the existing
+resource, catalog, capability, executor, evidence, and loop contracts without
+a second data runtime; provider wire formats end at adapters; only one model
+router may decide retry or fallback from normalized failures; canonical
+messages remain authoritative across provider switches; sensitive context is
+never sent to an unapproved fallback; optional SDKs remain lazy extras; secret
+values never enter persisted source configuration; and live external checks
+are consolidated at the Phase 8/9 gates rather than repeated per helper.
 
 ## Current architectural decisions
 
@@ -251,6 +263,38 @@ extended rather than rebuilt.
 | P7-03 | complete | P7-02 facts; catalog schemas; explicit SQLite source configuration; existing read backend pattern | One explicitly enabled, parameterized, single-row SQLite update recipe with runtime-executed impact preview and accepted result evidence | 10 controlled-domain and 15 adapter/source tests cover admission, unique key, TEXT affinity, stale scope/evidence, bounded impact, exact result, protected inodes, virtual/shadow objects, and commit ambiguity | P7-02 |
 | P7-04 | complete | P7-03 controlled write; existing `Agent`, host, approval wake, loop recovery, and inspection APIs | Public Journey E waits after impact validation, survives reopen, resumes the same operation, skips completed reads, commits one write, and exposes joined audit facts | Journey E passes with exact preview/write non-replay and approval/task/evidence joins; focused runtime/restart suites prove denial, races, unknown outcome, manual recovery, and generic host inspection/projection composition | P7-03 |
 | P7-05 | complete | Passing P7-02 through P7-04 slices | Consolidated dual-Python/static/architecture/root/distribution/review gate and one Phase 7 commit | 1,202 v2 tests on each interpreter, 77 architecture tests, 2,498 frozen-root tests, clean static/distribution gates, and the repaired targeted safety review are recorded in `QUALITY_GATES.md`; containing commit uses `chore(v2-phase-7): complete phase 7 gate` | P7-04 |
+
+## Ordered Phase 8 tasks
+
+Phase 8 uses three coherent implementation slices and one consolidated gate.
+Focused contract tests drive each slice; broad formatting, static,
+dual-interpreter, live, root-oracle, and packaging checks run once at P8-05.
+
+| ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
+| --- | --- | --- | --- | --- | --- |
+| P8-01 | complete | Phase 8 work/gate; Sections 6/8.13-8.15/9/14/15; current data, model, persistence, hosting, and v1 reference owners | Exact PostgreSQL, provider-adapter, router/policy, canonical-continuation, secret-reference, and conformance owner map | Read-only inventory selected existing adapter/catalog/capability/runtime and model-adapter/router seams, retained stable SQLite IDs, and found no need for another loop, runtime, catalog, or generic store | Phase 7 gate |
+| P8-02 | complete | P8-01 data map; existing SQLite resource/catalog/query contracts | PostgreSQL source discovery, inspection, health, and bounded read execution through the same catalog/capability/runtime path, with secret references only | Shared relational conformance and public Journey F pass; base-table/type/function/scope boundaries, cleanup, cancellation, diagnostic detachment, secret references, and non-replay-safe facts are covered without a loop branch | P8-01 |
+| P8-03 | complete | P8-01 model map; canonical model records; OpenAI adapter | Anthropic, Gemini, Grok, Ollama, and scoped OpenAI-compatible adapters with distinct wire translations, normalized errors/usage, lazy imports, and common conformance | Six advertised adapters pass shared fake-client text/tool/stream/usage/error/cancellation/lazy-extra conformance; provider tracebacks and raw diagnostics are detached | P8-01 |
+| P8-04 | complete | P8-03 adapters; persisted canonical requests/responses/profiles | One primary/fallback router with capability/context checks, bounded retries, explicit sensitivity allow policy, cost normalization, attempt telemetry, and portable continuation | Primary/fallback/nonretryable/timeout routes, denied sensitive fallback with zero I/O, missing estimate fail-closed, provider switch/reopen, canonical identity, usage/cost, and persisted route evidence pass | P8-03 |
+| P8-05 | complete | Passing P8-02 through P8-04 slices | Consolidated provider/database acceptance, dual-Python/static/architecture/root/distribution/security/review gate and one Phase 8 commit | 1,459 tests pass with 2 skips on each interpreter; static, architecture, root, clean-build/install, provider-security, and PostgreSQL reviews pass; live provider/database checks remain explicitly owned by Phase 9; containing commit uses `chore(v2-phase-8): complete phase 8 gate` | P8-02, P8-04 |
+
+## Ordered Phase 9 tasks
+
+Phase 9 uses seven coherent acceptance slices and one consolidated replacement
+gate. Focused tests drive each slice; broad formatting, typing, dual-Python,
+live, reliability, security, root-oracle, and packaging checks run once at
+P9-08. Phase 10 and cutover remain excluded.
+
+| ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
+| --- | --- | --- | --- | --- | --- |
+| P9-01 | pending | Phase 9 work/gate; Sections 6/15; parity/disposition inventories; current public API | Every MVP/cutover claim names a real executable anchor; missing public stream/detach/config/error/secret/extension/telemetry surfaces are implemented or explicitly reclassified without placeholder ports | Parity architecture test rejects missing anchors; focused public contract and absence/support assertions pass | Phase 8 gate |
+| P9-02 | pending | P9-01 surface; retained examples and release obligations | V2-native examples plus fresh-state, migration/export, breaking-change, support, operations, security, CLI, and client documentation | Executable example smoke tests and documentation-link/support-matrix checks pass | P9-01 |
+| P9-03 | pending | Phase 6 local protocol; external `daita-client`/`daita-cli` packages | One documented console-entry-point owner and client/CLI integration through the proven local protocol, with no runtime semantics in either client | External-package contract tests pass; sibling-repository edits require explicit user authorization before mutation | P9-01 |
+| P9-04 | pending | Candidate package metadata, extras, CI, and install lifecycle | Deterministic packaging contracts, coherent supported bundle extras, Python 3.11/3.12 candidate CI, and fresh install/init/run/stop/reopen/uninstall/state-retention proof | Artifact allowlist, version/entry point, optional-import, lifecycle, and clean-environment tests pass | P9-01, P9-02 |
+| P9-05 | pending | Retained provider adapters; real PostgreSQL adapter; available credentials/services | Live retained-provider and least-privilege PostgreSQL acceptance with no mock substitution | Each available live row records exact provider/database outcome; unavailable required rows remain NOT RUN and block the affected gate honestly | P9-04 |
+| P9-06 | pending | Persistent host/runtime; fault seams; representative workloads | Real process-kill/reopen recovery and compact reliability/performance baselines for loop, persistence, catalog, contention, and monitors | Bounded fault matrix and justified baseline ceilings pass without a parallel benchmark framework | P9-04 |
+| P9-07 | pending | Public/audit projections; extension loading; persisted and built artifacts | Prompt-injection, secret-literal, event-projection, extension-collision/loading, dependency, and artifact security closure | End-to-end adversarial and scan suite passes with no secret or untrusted diagnostic exposure | P9-01, P9-04 |
+| P9-08 | pending | Passing P9-01 through P9-07 slices | One consolidated deterministic/live/fault/performance/security/packaging/root replacement gate, final evidence, and one Phase 9 commit | All required gates pass; root remains frozen; containing commit uses `chore(v2-phase-9): complete phase 9 gate`; work pauses before Phase 10 | P9-03, P9-05, P9-06, P9-07 |
 
 ### Ordered P2-03 internal tasks
 

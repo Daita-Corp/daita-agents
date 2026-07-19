@@ -7,12 +7,15 @@ from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
+    ModelProfile,
     ModelRequest,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolDefinition,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.llm.routing import ModelProviderRegistration, ModelRouter
 from daita.loop.driver import AgentLoop
 from daita.loop.models import LoopExitKind, Readiness, Turn
 from daita.operations.checkpoints import ModelCallStatus, OperationSnapshot
@@ -49,6 +52,10 @@ class _TextContext:
                     content=(TextBlock("Fail with one normalized provider error."),),
                 ),
             ),
+            context_selection={
+                "schema_version": 1,
+                "estimated_input_tokens": 32,
+            },
         )
 
 
@@ -124,3 +131,56 @@ async def test_loop_persists_only_normalized_provider_error_code() -> None:
     assert "provider-specific transport detail" not in repr(snapshot)
     assert len(provider.requests) == 1
     provider.assert_consumed()
+
+
+async def test_loop_persists_bounded_router_attempt_trace_on_failure() -> None:
+    primary = MockModelProvider(
+        (ModelProviderError(ProviderErrorCode.TIMEOUT, "vendor detail"),),
+        provider_id="openai:primary",
+    )
+    registration = ModelProviderRegistration(
+        provider=primary,
+        profile=ModelProfile(
+            id=primary.provider_id,
+            context_window_tokens=8_192,
+            max_output_tokens=1_024,
+        ),
+        allowed_sensitivities=frozenset({ModelSensitivity.INTERNAL}),
+    )
+    router = ModelRouter(registration)
+    runtime = OperationRuntime(clock=lambda: NOW)
+    loop = AgentLoop(
+        runtime=runtime,
+        model=router,
+        context_builder=_TextContext(),
+        domain=_NoActionDomain(),
+    )
+
+    result = await loop.run(
+        AgentTrigger(
+            id="trigger-router-failure",
+            agent_id="agent-provider-error",
+            kind=TriggerKind.USER,
+            source_id="user-provider-error",
+            payload={"message": "fail"},
+            created_at=NOW,
+        )
+    )
+    snapshot = await runtime.inspect(result.operation_id)
+
+    assert result.kind is LoopExitKind.FAILED
+    failure = next(
+        event for event in snapshot.events if event.type == "model_call.failed"
+    )
+    routing = failure.payload["routing"]
+    assert isinstance(routing, FrozenJsonObject)
+    assert routing["route_id"] == router.provider_id
+    assert routing["terminal_error_code"] == ProviderErrorCode.TIMEOUT.value
+    attempts = routing["attempts"]
+    assert isinstance(attempts, tuple)
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert isinstance(attempt, FrozenJsonObject)
+    assert attempt["provider_id"] == primary.provider_id
+    assert attempt["error_code"] == ProviderErrorCode.TIMEOUT.value
+    assert "vendor detail" not in repr(snapshot)

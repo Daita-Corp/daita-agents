@@ -226,6 +226,7 @@ class AgentLoop:
                 operation_id,
                 model_call.id,
                 error.code.value,
+                routing=error.routing,
             )
         except Exception:
             return await self._runtime.record_model_failure(

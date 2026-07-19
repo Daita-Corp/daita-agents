@@ -27,6 +27,12 @@ from .local_files import (
 )
 from .sqlite import SQLiteResourceAdapter, SQLiteSource, SQLiteSourceError
 from .sqlite_query import SQLiteQueryBackend, SQLiteQueryError
+from .postgresql import (
+    PostgreSQLResourceAdapter,
+    PostgreSQLSource,
+    PostgreSQLSourceError,
+)
+from .postgresql_query import PostgreSQLQueryBackend, PostgreSQLQueryError
 
 __all__ = [
     "DiscoveryLimitError",
@@ -42,6 +48,11 @@ __all__ = [
     "ResourceSource",
     "ResourceRef",
     "ResourceSnapshot",
+    "PostgreSQLResourceAdapter",
+    "PostgreSQLQueryBackend",
+    "PostgreSQLQueryError",
+    "PostgreSQLSource",
+    "PostgreSQLSourceError",
     "SQLiteQueryBackend",
     "SQLiteQueryError",
     "SQLiteResourceAdapter",

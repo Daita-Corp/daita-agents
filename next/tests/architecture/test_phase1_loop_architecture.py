@@ -126,7 +126,10 @@ def test_production_contains_one_generic_agent_loop() -> None:
                 )
 
     assert agent_loop_classes == [("loop/driver.py", "AgentLoop")]
-    assert model_generation_callers == [("loop/driver.py", "self._model.generate")]
+    assert model_generation_callers == [
+        ("llm/routing.py", "registration.provider.generate"),
+        ("loop/driver.py", "self._model.generate"),
+    ]
 
 
 def test_startup_recovery_reuses_the_public_same_operation_resume_path() -> None:

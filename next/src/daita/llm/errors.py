@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from enum import Enum
 
+from .models import ModelRoutingTrace
+
 
 class ProviderErrorCode(str, Enum):
     """Canonical failures that every model adapter may expose to the runtime."""
@@ -27,6 +29,8 @@ class ModelProviderError(RuntimeError):
         self,
         code: ProviderErrorCode,
         message: str | None = None,
+        *,
+        routing: ModelRoutingTrace | None = None,
     ) -> None:
         if not isinstance(code, ProviderErrorCode):
             raise TypeError("code must be a ProviderErrorCode")
@@ -34,5 +38,30 @@ class ModelProviderError(RuntimeError):
             not isinstance(message, str) or not message.strip()
         ):
             raise ValueError("message must be a non-empty string when provided")
+        if routing is not None:
+            if not isinstance(routing, ModelRoutingTrace):
+                raise TypeError("routing must be a ModelRoutingTrace or None")
+            if routing.terminal_error_code != code.value:
+                raise ValueError("routing terminal error must match the provider code")
         self.code = code
+        self.routing = routing
         super().__init__(message or code.value)
+
+
+def detached_provider_error(error: ModelProviderError) -> ModelProviderError:
+    """Return a normalized error without retaining vendor diagnostics.
+
+    Adapter and router boundaries deliberately raise the returned exception only
+    after leaving their ``except`` blocks.  Clearing the existing traceback and
+    chain prevents raw SDK exceptions (and their frame locals) from surviving in
+    logs or uncaught-exception formatting while preserving the canonical code and
+    routing trace.
+    """
+
+    if not isinstance(error, ModelProviderError):
+        raise TypeError("error must be a ModelProviderError")
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    error.__suppress_context__ = True
+    return error

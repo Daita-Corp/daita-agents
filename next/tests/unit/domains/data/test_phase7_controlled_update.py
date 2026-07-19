@@ -397,6 +397,7 @@ async def test_catalog_projects_only_full_single_column_keys_and_write_access() 
         )
         is True
     )
+    assert await view.source_adapter_id("agent-atlas", registration.id) == "sqlite"
     store.registration = replace(
         registration,
         configuration={"path": "/tmp/orders.sqlite3", "write_access": False},
@@ -411,6 +412,9 @@ async def test_catalog_projects_only_full_single_column_keys_and_write_access() 
 
 
 class CatalogReader:
+    async def source_adapter_id(self, agent_id, source_id):
+        return "sqlite"
+
     async def resource_schemas(self, agent_id, source_id):
         if agent_id == "agent-atlas" and source_id == "source-orders":
             return (_resource(),)

@@ -1,4 +1,4 @@
-"""Provider-neutral SQLite SQL analysis and catalog-scope validation.
+"""Provider-neutral SQL analysis and catalog-scope validation.
 
 This module is deliberately pure: it parses and validates immutable inputs but
 does not open a source, invoke an executor, or persist runtime state.
@@ -9,11 +9,13 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 import hashlib
-from typing import Any
+from typing import Any, Literal
 
 from ..._json import FrozenJsonObject, canonical_json
 
 _SQLITE_INSTALL_HINT = "pip install 'daita-agents[sqlite]'"
+_POSTGRESQL_INSTALL_HINT = "pip install 'daita-agents[postgresql]'"
+_SqlDialect = Literal["sqlite", "postgresql"]
 _MAX_ISSUES = 32
 _MAX_CANDIDATES = 8
 _MAX_UPDATE_IDENTIFIER_CHARACTERS = 512
@@ -22,6 +24,106 @@ _MAX_UPDATE_VALUE_CHARACTERS = 4_096
 _ASCII_IDENTIFIER_CASE_TRANSLATION = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
     "abcdefghijklmnopqrstuvwxyz",
+)
+
+# PostgreSQL functions can perform external I/O even in a read-only
+# transaction.  Keep the directly callable surface deliberately smaller than
+# the server catalog, and retain a non-replay-safe capability declaration until
+# durable server-owned callable/operator/type provenance exists.
+_POSTGRESQL_BOUNDED_FUNCTIONS = frozenset(
+    {
+        "ABS",
+        "AVG",
+        "CAST",
+        "CEIL",
+        "CEILING",
+        "CHAR_LENGTH",
+        "COALESCE",
+        "CONCAT",
+        "CONCAT_WS",
+        "COUNT",
+        "EXTRACT",
+        "FLOOR",
+        "GREATEST",
+        "LENGTH",
+        "LEAST",
+        "LOWER",
+        "LTRIM",
+        "MAX",
+        "MIN",
+        "NULLIF",
+        "OCTET_LENGTH",
+        "REPLACE",
+        "ROW_NUMBER",
+        "ROUND",
+        "RTRIM",
+        "SIGN",
+        "SUBSTR",
+        "SUBSTRING",
+        "SUM",
+        "TRIM",
+        "UPPER",
+    }
+)
+_POSTGRESQL_NON_DISPATCH_EXPRESSIONS = frozenset(
+    {
+        "CAST",
+        "COALESCE",
+        "GREATEST",
+        "LEAST",
+        "NULLIF",
+    }
+)
+_VOLATILE_CONTEXT_EXPRESSIONS = frozenset(
+    {
+        "CURRENT_CATALOG",
+        "CURRENT_DATE",
+        "CURRENT_ROLE",
+        "CURRENT_SCHEMA",
+        "CURRENT_TIME",
+        "CURRENT_TIMESTAMP",
+        "CURRENT_USER",
+        "LOCALTIME",
+        "LOCALTIMESTAMP",
+        "SESSION_USER",
+        "SYSTEM_USER",
+        "USER",
+    }
+)
+_POSTGRESQL_SAFE_DATA_TYPES = frozenset(
+    {
+        "ARRAY",
+        "BIGINT",
+        "BINARY",
+        "BIT",
+        "BOOLEAN",
+        "BPCHAR",
+        "BYTEA",
+        "CHAR",
+        "CIDR",
+        "DATE",
+        "DECIMAL",
+        "DOUBLE",
+        "FLOAT",
+        "INET",
+        "INT",
+        "INTERVAL",
+        "JSON",
+        "JSONB",
+        "MACADDR",
+        "MONEY",
+        "REAL",
+        "SMALLINT",
+        "TEXT",
+        "TIME",
+        "TIMESTAMP",
+        "TIMESTAMPTZ",
+        "TIMETZ",
+        "TINYINT",
+        "UUID",
+        "VARBINARY",
+        "VARCHAR",
+    }
 )
 
 
@@ -39,6 +141,20 @@ def sqlite_identifier_key(value: str) -> str:
     """Match SQLite identifier case without folding distinct Unicode names."""
 
     return value.strip().strip('"`[]').translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
+
+
+def _dialect_identifier_key(
+    value: str,
+    *,
+    dialect: _SqlDialect,
+    quoted: bool = False,
+) -> str:
+    normalized = value.strip().strip('"`[]')
+    if dialect == "postgresql" and quoted:
+        return f"quoted:{normalized}"
+    if dialect == "postgresql":
+        return normalized.translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
+    return _identifier_key(normalized)
 
 
 def _short_identifier(value: str) -> str:
@@ -114,8 +230,8 @@ class ResourceSchema:
         columns = tuple(
             _required_text(item, "resource column") for item in self.columns
         )
-        if len({_identifier_key(item) for item in columns}) != len(columns):
-            raise ValueError("resource columns must be unique case-insensitively")
+        if len(set(columns)) != len(columns):
+            raise ValueError("resource columns must be unique")
         aliases = tuple(_required_text(item, "resource alias") for item in self.aliases)
         if self.revision is not None:
             revision = _required_text(self.revision, "resource revision")
@@ -153,16 +269,9 @@ class ResourceSchema:
             _required_text(item, "resource unique key column")
             for item in self.unique_key_columns
         )
-        if len({_identifier_key(item) for item in unique_key_columns}) != len(
-            unique_key_columns
-        ):
-            raise ValueError(
-                "resource unique key columns must be unique case-insensitively"
-            )
-        if any(
-            _identifier_key(item) not in {_identifier_key(column) for column in columns}
-            for item in unique_key_columns
-        ):
+        if len(set(unique_key_columns)) != len(unique_key_columns):
+            raise ValueError("resource unique key columns must be unique")
+        if any(item not in set(columns) for item in unique_key_columns):
             raise ValueError("resource unique key columns must exist in columns")
         if isinstance(self.column_declared_types, (str, bytes)):
             raise TypeError("resource column_declared_types must be a sequence")
@@ -177,28 +286,25 @@ class ResourceSchema:
         column_declared_types = tuple(
             (item[0], item[1]) for item in raw_column_declared_types
         )
-        declared_type_by_key: dict[str, str] = {}
+        declared_type_by_column: dict[str, str] = {}
         for column, declared_type in column_declared_types:
             canonical_column = _required_text(
                 column,
                 "resource declared type column",
             )
-            column_key = _identifier_key(canonical_column)
-            if column_key not in {_identifier_key(item) for item in columns}:
+            if canonical_column not in set(columns):
                 raise ValueError("resource declared type columns must exist in columns")
-            if column_key in declared_type_by_key:
-                raise ValueError(
-                    "resource declared type columns must be unique case-insensitively"
-                )
+            if canonical_column in declared_type_by_column:
+                raise ValueError("resource declared type columns must be unique")
             if not isinstance(declared_type, str) or len(declared_type) > 256:
                 raise ValueError(
                     "resource declared column types must be bounded strings"
                 )
-            declared_type_by_key[column_key] = declared_type
+            declared_type_by_column[canonical_column] = declared_type
         canonical_declared_types = tuple(
-            (column, declared_type_by_key[_identifier_key(column)])
+            (column, declared_type_by_column[column])
             for column in columns
-            if _identifier_key(column) in declared_type_by_key
+            if column in declared_type_by_column
         )
         object.__setattr__(self, "columns", columns)
         object.__setattr__(self, "aliases", aliases)
@@ -229,6 +335,8 @@ class SqlTableReference:
     qualified_name: str
     alias: str | None = None
     is_cte: bool = False
+    name_quoted: bool = False
+    qualified_parts: tuple[tuple[str, bool], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _required_text(self.name, "table name"))
@@ -241,6 +349,19 @@ class SqlTableReference:
             object.__setattr__(self, "alias", _required_text(self.alias, "table alias"))
         if not isinstance(self.is_cte, bool):
             raise TypeError("table is_cte must be a boolean")
+        if not isinstance(self.name_quoted, bool):
+            raise TypeError("table name_quoted must be a boolean")
+        parts = tuple(self.qualified_parts)
+        if any(
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not item[0].strip()
+            or not isinstance(item[1], bool)
+            for item in parts
+        ):
+            raise TypeError("table qualified_parts must contain name/quoted pairs")
+        object.__setattr__(self, "qualified_parts", parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +369,7 @@ class SqlColumnReference:
     name: str
     qualifier: str | None = None
     resource_name: str | None = None
+    name_quoted: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _required_text(self.name, "column name"))
@@ -259,6 +381,8 @@ class SqlColumnReference:
                     field_name,
                     _required_text(value, f"column {field_name}"),
                 )
+        if not isinstance(self.name_quoted, bool):
+            raise TypeError("column name_quoted must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +400,15 @@ class SqlAnalysis:
     selected_columns: tuple[str, ...]
     select_aliases: tuple[str, ...]
     positional_parameter_count: int
+    parameter_ordinals: tuple[int, ...] = ()
+    anonymous_parameter_count: int = 0
+    invalid_parameter_count: int = 0
+    function_names: tuple[str, ...] = ()
+    unresolved_function_names: tuple[str, ...] = ()
+    table_function_names: tuple[str, ...] = ()
+    cast_type_names: tuple[str, ...] = ()
+    unsafe_cast_type_names: tuple[str, ...] = ()
+    explicit_operator_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sql", _required_text(self.sql, "analysis sql"))
@@ -291,6 +424,36 @@ class SqlAnalysis:
             raise ValueError("analysis statement_count must be positive")
         if self.positional_parameter_count < 0:
             raise ValueError("positional_parameter_count must be non-negative")
+        if self.anonymous_parameter_count < 0:
+            raise ValueError("anonymous_parameter_count must be non-negative")
+        if self.invalid_parameter_count < 0:
+            raise ValueError("invalid_parameter_count must be non-negative")
+        ordinals = tuple(self.parameter_ordinals)
+        if any(
+            not isinstance(item, int) or isinstance(item, bool) or item < 1
+            for item in ordinals
+        ):
+            raise ValueError("parameter_ordinals must contain positive integers")
+        if ordinals != tuple(sorted(set(ordinals))):
+            raise ValueError("parameter_ordinals must be sorted and unique")
+        for field_name in (
+            "function_names",
+            "unresolved_function_names",
+            "table_function_names",
+            "cast_type_names",
+            "unsafe_cast_type_names",
+            "explicit_operator_names",
+        ):
+            values = tuple(getattr(self, field_name))
+            if values != tuple(sorted(set(values))):
+                raise ValueError(f"{field_name} must contain sorted unique names")
+            if any(
+                not isinstance(item, str) or not item or len(item) > 256
+                for item in values
+            ):
+                raise ValueError(f"{field_name} must contain bounded strings")
+            object.__setattr__(self, field_name, values)
+        object.__setattr__(self, "parameter_ordinals", ordinals)
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,11 +654,16 @@ class SQLiteUpdateValidationResult:
         return tuple(issue.code for issue in self.issues)
 
 
-def _load_sqlglot() -> tuple[Any, Any]:
+def _load_sqlglot(dialect: _SqlDialect = "sqlite") -> tuple[Any, Any]:
     try:
         import sqlglot
         from sqlglot import exp
     except ImportError as error:
+        if dialect == "postgresql":
+            raise ImportError(
+                "sqlglot is required for PostgreSQL SQL validation. "
+                f"Install with: {_POSTGRESQL_INSTALL_HINT}"
+            ) from error
         raise ImportError(
             "sqlglot is required for SQLite SQL validation. "
             f"Install with: {_SQLITE_INSTALL_HINT}"
@@ -518,44 +686,93 @@ def _explain_prefix(sql: str) -> tuple[str, str] | None:
 def analyze_sqlite_sql(sql: str) -> SqlAnalysis:
     """Parse SQLite SQL into immutable, source-independent semantic facts."""
 
+    return _analyze_sql(sql, dialect="sqlite")
+
+
+def analyze_postgresql_sql(sql: str) -> SqlAnalysis:
+    """Parse PostgreSQL SQL into immutable, source-independent semantic facts."""
+
+    return _analyze_sql(sql, dialect="postgresql")
+
+
+def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
+    display_name = "PostgreSQL" if dialect == "postgresql" else "SQLite"
+    sqlglot_dialect = "postgres" if dialect == "postgresql" else "sqlite"
+
     normalized = normalize_sql(sql)
     if not normalized:
         raise SqlAnalysisError("empty_sql", "SQL must not be empty.")
 
-    sqlglot, exp = _load_sqlglot()
+    sqlglot, exp = _load_sqlglot(dialect)
     explain = _explain_prefix(normalized)
     parse_sql = explain[1] if explain is not None else normalized
     try:
-        parsed = tuple(sqlglot.parse(parse_sql, read="sqlite"))
+        parsed = tuple(sqlglot.parse(parse_sql, read=sqlglot_dialect))
         expressions = tuple(item for item in parsed if item is not None)
     except Exception as error:
-        parse_error = getattr(getattr(sqlglot, "errors", None), "ParseError", ())
-        if parse_error and not isinstance(error, parse_error):
+        sqlglot_errors = getattr(sqlglot, "errors", None)
+        normalized_error_types = tuple(
+            error_type
+            for error_type in (
+                getattr(sqlglot_errors, "ParseError", None),
+                getattr(sqlglot_errors, "TokenError", None),
+            )
+            if isinstance(error_type, type)
+        )
+        if not normalized_error_types or not isinstance(error, normalized_error_types):
             raise
         raise SqlAnalysisError(
             "sql_parse_error",
-            "SQL could not be parsed for SQLite.",
+            f"SQL could not be parsed for {display_name}.",
         ) from error
     if not expressions:
         raise SqlAnalysisError("empty_sql", "SQL must not be empty.")
 
     root = expressions[0]
-    cte_names = {
-        _identifier_key(str(cte.alias_or_name))
-        for cte in root.find_all(exp.CTE)
-        if str(cte.alias_or_name).strip()
-    }
-    tables = _table_references(root, exp, cte_names)
-    alias_map: dict[str, str] = {}
-    for table in tables:
-        if table.is_cte:
-            continue
-        alias_map[_identifier_key(table.name)] = table.qualified_name
-        alias_map[_identifier_key(table.qualified_name)] = table.qualified_name
-        if table.alias:
-            alias_map[_identifier_key(table.alias)] = table.qualified_name
-
-    columns = _column_references(root, exp, alias_map, cte_names)
+    try:
+        cte_table_ids, column_resources = _lexical_scope_facts(
+            root,
+            exp,
+            dialect=dialect,
+        )
+    except Exception as error:
+        errors = getattr(sqlglot, "errors", None)
+        optimize_error = getattr(errors, "OptimizeError", None)
+        if optimize_error is None or not isinstance(error, optimize_error):
+            raise
+        raise SqlAnalysisError(
+            "sql_scope_error",
+            f"SQL scope could not be resolved safely for {display_name}.",
+        ) from error
+    tables = _table_references(
+        root,
+        exp,
+        cte_table_ids,
+        dialect=dialect,
+    )
+    columns = _column_references(
+        root,
+        exp,
+        column_resources,
+        dialect=dialect,
+    )
+    if dialect == "postgresql":
+        # PostgreSQL includes inheritance/partition descendants unless ONLY is
+        # present.  The catalog provenance names one exact relation, so execute
+        # the exact relation represented by that provenance.
+        for table in root.find_all(exp.Table):
+            if id(table) not in cte_table_ids and _table_identifier_parts(table):
+                table.set("only", True)
+    function_names, unresolved_functions, table_functions = _function_facts(
+        root,
+        exp,
+        dialect=dialect,
+    )
+    cast_types, unsafe_cast_types, explicit_operators = _expression_boundary_facts(
+        root,
+        exp,
+        dialect=dialect,
+    )
     mutation_types = _mutation_types(root, exp)
     read_roots = tuple(
         cls
@@ -569,7 +786,7 @@ def analyze_sqlite_sql(sql: str) -> SqlAnalysis:
     )
     is_read = isinstance(root, read_roots) and not mutation_types
     canonical_inner = "; ".join(
-        item.sql(dialect="sqlite", pretty=False) for item in expressions
+        item.sql(dialect=sqlglot_dialect, pretty=False) for item in expressions
     )
     if len(parsed) != len(expressions):
         # Preserve empty statements in the canonical value so repeated trailing
@@ -579,8 +796,34 @@ def analyze_sqlite_sql(sql: str) -> SqlAnalysis:
         f"{explain[0]} {canonical_inner}" if explain is not None else canonical_inner
     )
     fingerprint = "sha256:" + hashlib.sha256(canonical_sql.encode("utf-8")).hexdigest()
-    positional_parameter_count = sum(
+    placeholder_count = sum(
         1 for item in root.walk() if isinstance(item, exp.Placeholder)
+    )
+    parameter_nodes = tuple(
+        item for item in root.walk() if isinstance(item, exp.Parameter)
+    )
+    parameter_ordinals = tuple(
+        sorted(
+            {
+                int(item.name)
+                for item in parameter_nodes
+                if str(item.name).isascii()
+                and str(item.name).isdecimal()
+                and int(item.name) > 0
+            }
+        )
+    )
+    invalid_parameter_count = sum(
+        1
+        for item in parameter_nodes
+        if not str(item.name).isascii()
+        or not str(item.name).isdecimal()
+        or int(item.name) < 1
+    )
+    positional_parameter_count = (
+        max(parameter_ordinals, default=0)
+        if dialect == "postgresql"
+        else placeholder_count
     )
     selected_columns, select_aliases = _selection_facts(root, exp)
     return SqlAnalysis(
@@ -599,27 +842,63 @@ def analyze_sqlite_sql(sql: str) -> SqlAnalysis:
         selected_columns=selected_columns,
         select_aliases=select_aliases,
         positional_parameter_count=positional_parameter_count,
+        parameter_ordinals=parameter_ordinals,
+        anonymous_parameter_count=placeholder_count,
+        invalid_parameter_count=invalid_parameter_count,
+        function_names=function_names,
+        unresolved_function_names=unresolved_functions,
+        table_function_names=table_functions,
+        cast_type_names=cast_types,
+        unsafe_cast_type_names=unsafe_cast_types,
+        explicit_operator_names=explicit_operators,
     )
 
 
 def _table_references(
     root: Any,
     exp: Any,
-    cte_names: set[str],
+    cte_table_ids: set[int],
+    *,
+    dialect: _SqlDialect,
 ) -> tuple[SqlTableReference, ...]:
     references: list[SqlTableReference] = []
-    seen: set[tuple[str, str | None, bool]] = set()
+    seen: set[tuple[tuple[str, ...], str | None, bool]] = set()
     for table in root.find_all(exp.Table):
-        parts = tuple(str(part.name) for part in table.parts if str(part.name).strip())
+        part_records = tuple(
+            (str(part.name), bool(part.args.get("quoted", False)))
+            for part in table.parts
+            if str(part.name).strip()
+        )
+        parts = tuple(item[0] for item in part_records)
         name = str(table.name or "").strip()
         if not name:
             continue
         qualified = ".".join(parts) or name
         alias = str(table.alias or "").strip() or None
-        is_cte = _short_identifier(qualified) in cte_names
+        name_identifier = table.this
+        name_quoted = bool(getattr(name_identifier, "args", {}).get("quoted", False))
+        is_cte = id(table) in cte_table_ids
+        # PostgreSQL can expose both ``foo`` and the distinct quoted ``"Foo"``.
+        # Preserve each component's quote semantics while deduplicating so one
+        # scoped table can never hide another case-distinct table reference.
+        qualified_key = tuple(
+            _dialect_identifier_key(name, dialect=dialect, quoted=quoted)
+            for name, quoted in part_records
+        )
+        alias_node = table.args.get("alias")
+        alias_identifier = getattr(alias_node, "this", None)
+        alias_quoted = bool(getattr(alias_identifier, "args", {}).get("quoted", False))
         key = (
-            _identifier_key(qualified),
-            _identifier_key(alias) if alias else None,
+            qualified_key,
+            (
+                _dialect_identifier_key(
+                    alias,
+                    dialect=dialect,
+                    quoted=alias_quoted,
+                )
+                if alias
+                else None
+            ),
             is_cte,
         )
         if key in seen:
@@ -631,16 +910,256 @@ def _table_references(
                 qualified_name=qualified,
                 alias=alias,
                 is_cte=is_cte,
+                name_quoted=name_quoted,
+                qualified_parts=part_records,
             )
         )
     return tuple(references)
 
 
+def _table_identifier_parts(table: Any) -> tuple[tuple[str, bool], ...]:
+    return tuple(
+        (str(part.name), bool(part.args.get("quoted", False)))
+        for part in table.parts
+        if str(part.name).strip()
+    )
+
+
+def _lexical_scope_facts(
+    root: Any,
+    exp: Any,
+    *,
+    dialect: _SqlDialect,
+) -> tuple[set[int], dict[int, str]]:
+    """Resolve CTEs and qualified columns using sqlglot's lexical scopes."""
+
+    from sqlglot.optimizer.scope import traverse_scope
+
+    cte_table_ids: set[int] = set()
+    column_resources: dict[int, str] = {}
+    for scope in traverse_scope(root):
+        for _, (selected, source) in scope.selected_sources.items():
+            if isinstance(selected, exp.Table) and not isinstance(source, exp.Table):
+                cte_table_ids.add(id(selected))
+        for column in scope.columns:
+            qualifier = str(column.table or "").strip()
+            if not qualifier:
+                continue
+            resolved_source = scope.sources.get(qualifier)
+            if not isinstance(resolved_source, exp.Table):
+                continue
+            parts = _table_identifier_parts(resolved_source)
+            if parts:
+                column_resources[id(column)] = ".".join(item[0] for item in parts)
+    # sqlglot's scope graph intentionally omits some dialect-invalid shapes,
+    # including a mutation nested in a CTE.  Mutation detection must still see
+    # the CTE reference accurately, so fill only those unresolved identities
+    # from the AST's lexical WITH ancestry.
+    for table in root.find_all(exp.Table):
+        if id(table) not in cte_table_ids and _is_visible_cte_reference(
+            table,
+            exp,
+            dialect=dialect,
+        ):
+            cte_table_ids.add(id(table))
+    return cte_table_ids, column_resources
+
+
+def _is_visible_cte_reference(
+    table: Any,
+    exp: Any,
+    *,
+    dialect: _SqlDialect,
+) -> bool:
+    name = str(table.name or "").strip()
+    # A CTE reference is one unqualified identifier.  ``schema.name`` always
+    # denotes a base relation even when a visible CTE has the same short name.
+    if not name or len(_table_identifier_parts(table)) != 1:
+        return False
+    identifier = table.this
+    table_key = _dialect_identifier_key(
+        name,
+        dialect=dialect,
+        quoted=bool(getattr(identifier, "args", {}).get("quoted", False)),
+    )
+    ancestor = table.parent
+    while ancestor is not None:
+        with_clause = ancestor.args.get("with_")
+        if isinstance(with_clause, exp.With):
+            ctes = tuple(with_clause.expressions)
+            containing_index = next(
+                (index for index, cte in enumerate(ctes) if _is_ancestor(cte, table)),
+                None,
+            )
+            visible = (
+                ctes
+                if containing_index is None
+                else ctes[
+                    : containing_index
+                    + int(bool(with_clause.args.get("recursive", False)))
+                ]
+            )
+            if any(_cte_key(cte, dialect=dialect) == table_key for cte in visible):
+                return True
+        ancestor = ancestor.parent
+    return False
+
+
+def _is_ancestor(candidate: Any, node: Any) -> bool:
+    current = node.parent
+    while current is not None:
+        if current is candidate:
+            return True
+        current = current.parent
+    return False
+
+
+def _cte_key(cte: Any, *, dialect: _SqlDialect) -> str:
+    alias = cte.args.get("alias")
+    identifier = getattr(alias, "this", None)
+    return _dialect_identifier_key(
+        str(cte.alias_or_name),
+        dialect=dialect,
+        quoted=bool(getattr(identifier, "args", {}).get("quoted", False)),
+    )
+
+
+def _function_facts(
+    root: Any,
+    exp: Any,
+    *,
+    dialect: _SqlDialect,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    functions: set[str] = set()
+    unresolved: set[str] = set()
+    table_functions: set[str] = set()
+    anonymous_type = getattr(exp, "Anonymous", ())
+    for function in root.find_all(exp.Func):
+        is_anonymous = isinstance(function, anonymous_type)
+        raw_name = (
+            str(function.name or "") if is_anonymous else str(function.sql_name() or "")
+        )
+        name = (raw_name.strip() or type(function).__name__).upper()[:256]
+        # sqlglot also models structural SQL (CASE branches, EXISTS, CAST, and
+        # similar grammar nodes) as Func subclasses.  Parsed call tokens carry
+        # source metadata; structural nodes do not.  Record actual dispatch and
+        # context-sensitive keyword expressions, not every Func-shaped node.
+        if (
+            not is_anonymous
+            and not function.meta
+            and name not in _VOLATILE_CONTEXT_EXPRESSIONS
+            and name not in _POSTGRESQL_NON_DISPATCH_EXPRESSIONS
+        ):
+            continue
+        namespace = _function_namespace(function, exp)
+        if namespace is not None:
+            name = f"{namespace.upper()[:128]}.{name}"[:256]
+        functions.add(name)
+        if dialect == "postgresql":
+            # The PostgreSQL executor fixes search_path to pg_catalog and
+            # requires every data relation to be schema-qualified.  Therefore
+            # unqualified calls resolve only against pg_catalog; an explicit
+            # non-pg_catalog namespace is never admitted.
+            if namespace is not None and not name.startswith("PG_CATALOG."):
+                unresolved.add(name)
+        elif is_anonymous:
+            unresolved.add(name)
+        if _is_table_function(function, exp):
+            table_functions.add(name)
+    return (
+        tuple(sorted(functions)),
+        tuple(sorted(unresolved)),
+        tuple(sorted(table_functions)),
+    )
+
+
+def _function_namespace(function: Any, exp: Any) -> str | None:
+    parent = function.parent
+    if not isinstance(parent, exp.Dot) or parent.expression is not function:
+        return None
+    namespace = parent.this
+    if not isinstance(namespace, exp.Identifier):
+        return "invalid"
+    value = str(namespace.name or "").strip()
+    if not value:
+        return "invalid"
+    if bool(namespace.args.get("quoted", False)) and value != "pg_catalog":
+        return f"quoted:{value}"
+    return value
+
+
+def _expression_boundary_facts(
+    root: Any,
+    exp: Any,
+    *,
+    dialect: _SqlDialect,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    if dialect != "postgresql":
+        return (), (), ()
+
+    cast_types: set[str] = set()
+    unsafe_cast_types: set[str] = set()
+    for cast in root.find_all(exp.Cast):
+        target = cast.args.get("to")
+        if not isinstance(target, exp.DataType):
+            unsafe_cast_types.add("INVALID")
+            continue
+        rendered = target.sql(dialect="postgres")[:256].upper()
+        cast_types.add(rendered)
+        data_types = (target, *tuple(target.find_all(exp.DataType)))
+        for data_type in data_types:
+            raw_kind = getattr(data_type.this, "value", data_type.this)
+            if str(raw_kind).upper() not in _POSTGRESQL_SAFE_DATA_TYPES:
+                unsafe_cast_types.add(rendered)
+                break
+
+    operator_type = getattr(exp, "Operator", None)
+    explicit_operators = (
+        ()
+        if operator_type is None
+        else tuple(
+            sorted(
+                {
+                    str(operator.args.get("operator") or "invalid").upper()[:256]
+                    for operator in root.find_all(operator_type)
+                }
+            )
+        )
+    )
+    return (
+        tuple(sorted(cast_types)),
+        tuple(sorted(unsafe_cast_types)),
+        explicit_operators,
+    )
+
+
+def _is_table_function(function: Any, exp: Any) -> bool:
+    current = function.parent
+    while current is not None and not isinstance(current, exp.Select):
+        if isinstance(
+            current,
+            tuple(
+                item
+                for item in (
+                    getattr(exp, "From", None),
+                    getattr(exp, "Join", None),
+                    getattr(exp, "Lateral", None),
+                    getattr(exp, "Table", None),
+                )
+                if item is not None
+            ),
+        ):
+            return True
+        current = current.parent
+    return False
+
+
 def _column_references(
     root: Any,
     exp: Any,
-    alias_map: Mapping[str, str],
-    cte_names: set[str],
+    column_resources: Mapping[int, str],
+    *,
+    dialect: _SqlDialect,
 ) -> tuple[SqlColumnReference, ...]:
     references: list[SqlColumnReference] = []
     seen: set[tuple[str, str | None, str | None]] = set()
@@ -649,13 +1168,17 @@ def _column_references(
         if not name or name == "*":
             continue
         qualifier = str(column.table or "").strip() or None
-        resource_name = None
-        if qualifier and _identifier_key(qualifier) not in cte_names:
-            resource_name = alias_map.get(_identifier_key(qualifier), qualifier)
+        resource_name = column_resources.get(id(column))
+        name_identifier = column.this
+        name_quoted = bool(getattr(name_identifier, "args", {}).get("quoted", False))
         key = (
-            _identifier_key(name),
-            _identifier_key(qualifier) if qualifier else None,
-            _identifier_key(resource_name) if resource_name else None,
+            _dialect_identifier_key(name, dialect=dialect, quoted=name_quoted),
+            _dialect_identifier_key(qualifier, dialect=dialect) if qualifier else None,
+            (
+                _dialect_identifier_key(resource_name, dialect=dialect)
+                if resource_name
+                else None
+            ),
         )
         if key in seen:
             continue
@@ -665,6 +1188,7 @@ def _column_references(
                 name=name,
                 qualifier=qualifier,
                 resource_name=resource_name,
+                name_quoted=name_quoted,
             )
         )
     return tuple(references)
@@ -700,6 +1224,12 @@ def _mutation_types(root: Any, exp: Any) -> tuple[str, ...]:
             getattr(exp, "TruncateTable", None),
             getattr(exp, "Attach", None),
             getattr(exp, "Detach", None),
+            getattr(exp, "Into", None),
+            # PostgreSQL row-locking clauses are attached to otherwise read-shaped
+            # SELECT nodes.  Treat them as mutations so validation rejects them
+            # before opening a connector, even though the backend also runs a
+            # read-only transaction as defense in depth.
+            getattr(exp, "Lock", None),
         )
         if cls is not None
     )
@@ -724,9 +1254,54 @@ def validate_sqlite_read(
 ) -> SqlValidationResult:
     """Validate a single SQLite read against catalog-owned source scope."""
 
+    return _validate_sql_read(
+        sql,
+        source_id=source_id,
+        resources=resources,
+        parameters=parameters,
+        allowed_resource_ids=allowed_resource_ids,
+        dialect="sqlite",
+    )
+
+
+def validate_postgresql_read(
+    sql: str,
+    *,
+    source_id: str,
+    resources: Iterable[ResourceSchema],
+    parameters: Sequence[object] = (),
+    allowed_resource_ids: Iterable[str] | None = None,
+) -> SqlValidationResult:
+    """Validate a single PostgreSQL read against catalog-owned source scope."""
+
+    return _validate_sql_read(
+        sql,
+        source_id=source_id,
+        resources=resources,
+        parameters=parameters,
+        allowed_resource_ids=allowed_resource_ids,
+        dialect="postgresql",
+    )
+
+
+def _validate_sql_read(
+    sql: str,
+    *,
+    source_id: str,
+    resources: Iterable[ResourceSchema],
+    parameters: Sequence[object],
+    allowed_resource_ids: Iterable[str] | None,
+    dialect: _SqlDialect,
+) -> SqlValidationResult:
+    display_name = "PostgreSQL" if dialect == "postgresql" else "SQLite"
+
     source_id = _required_text(source_id, "source_id")
     try:
-        analysis = analyze_sqlite_sql(sql)
+        analysis = (
+            analyze_postgresql_sql(sql)
+            if dialect == "postgresql"
+            else analyze_sqlite_sql(sql)
+        )
     except SqlAnalysisError as error:
         return SqlValidationResult(
             valid=False,
@@ -754,7 +1329,7 @@ def validate_sqlite_read(
         issues.append(
             SqlValidationIssue(
                 "mutation_not_allowed",
-                "SQLite data queries must be read-only.",
+                f"{display_name} data queries must be read-only.",
                 {"mutation_types": list(analysis.mutation_types)},
             )
         )
@@ -762,11 +1337,92 @@ def validate_sqlite_read(
         issues.append(
             SqlValidationIssue(
                 "read_statement_required",
-                "SQLite data queries require a read statement.",
+                f"{display_name} data queries require a read statement.",
                 {"statement_type": analysis.statement_type},
             )
         )
-    if analysis.positional_parameter_count != len(parameters):
+    if dialect == "postgresql" and analysis.statement_type == "explain":
+        issues.append(
+            SqlValidationIssue(
+                "explain_not_allowed",
+                (
+                    "PostgreSQL EXPLAIN statements cannot use the bounded "
+                    "tabular execution path."
+                ),
+            )
+        )
+    if dialect == "postgresql":
+        function_names_not_admitted = {
+            name
+            for name in analysis.function_names
+            if (name.removeprefix("PG_CATALOG.") not in _POSTGRESQL_BOUNDED_FUNCTIONS)
+        }
+        denied_functions = tuple(
+            sorted(
+                set(analysis.unresolved_function_names)
+                | set(analysis.table_function_names)
+                | function_names_not_admitted
+            )
+        )
+    else:
+        denied_functions = ()
+    if denied_functions:
+        issues.append(
+            SqlValidationIssue(
+                "function_not_allowed",
+                (
+                    f"{display_name} data queries allow only the declared "
+                    "bounded function set."
+                ),
+                {"functions": denied_functions[:_MAX_CANDIDATES]},
+            )
+        )
+    if dialect == "postgresql" and analysis.unsafe_cast_type_names:
+        issues.append(
+            SqlValidationIssue(
+                "cast_type_not_allowed",
+                "PostgreSQL casts must target a declared built-in data type.",
+                {"types": analysis.unsafe_cast_type_names[:_MAX_CANDIDATES]},
+            )
+        )
+    unsafe_operators = tuple(
+        name
+        for name in analysis.explicit_operator_names
+        if not name.startswith("PG_CATALOG.")
+    )
+    if dialect == "postgresql" and unsafe_operators:
+        issues.append(
+            SqlValidationIssue(
+                "operator_not_allowed",
+                "Explicit PostgreSQL operators must resolve from pg_catalog.",
+                {"operators": unsafe_operators[:_MAX_CANDIDATES]},
+            )
+        )
+    if dialect == "postgresql" and analysis.anonymous_parameter_count:
+        issues.append(
+            SqlValidationIssue(
+                "parameter_style_invalid",
+                "PostgreSQL query parameters must use numbered $1 placeholders.",
+                {"anonymous_placeholders": analysis.anonymous_parameter_count},
+            )
+        )
+    expected_ordinals = tuple(range(1, len(parameters) + 1))
+    if dialect == "postgresql" and (
+        analysis.invalid_parameter_count
+        or analysis.parameter_ordinals != expected_ordinals
+    ):
+        issues.append(
+            SqlValidationIssue(
+                "parameter_index_mismatch",
+                "PostgreSQL parameter indexes must be contiguous and match the supplied values.",
+                {
+                    "expected": expected_ordinals,
+                    "received": analysis.parameter_ordinals,
+                    "invalid": analysis.invalid_parameter_count,
+                },
+            )
+        )
+    elif dialect == "sqlite" and analysis.positional_parameter_count != len(parameters):
         issues.append(
             SqlValidationIssue(
                 "parameter_count_mismatch",
@@ -796,7 +1452,22 @@ def validate_sqlite_read(
     for table in analysis.tables:
         if table.is_cte:
             continue
-        candidates = _resource_candidates(table.qualified_name, source_resources)
+        if dialect == "postgresql" and len(table.qualified_parts) < 2:
+            issues.append(
+                SqlValidationIssue(
+                    "schema_qualification_required",
+                    (
+                        "PostgreSQL resources must be schema-qualified so "
+                        "catalog provenance and server resolution agree."
+                    ),
+                    {"resource": table.qualified_name},
+                )
+            )
+        candidates = _resource_candidates(
+            table,
+            source_resources,
+            dialect=dialect,
+        )
         if not candidates:
             issues.append(
                 SqlValidationIssue(
@@ -835,13 +1506,32 @@ def validate_sqlite_read(
                 )
             )
             continue
+        if dialect == "postgresql" and resource.resource_kind != "table":
+            issues.append(
+                SqlValidationIssue(
+                    "resource_kind_not_allowed",
+                    (
+                        "PostgreSQL bounded reads require a cataloged base "
+                        "table, not a view or unknown relation kind."
+                    ),
+                    {
+                        "resource_id": resource.resource_id,
+                        "resource_kind": resource.resource_kind or "unknown",
+                    },
+                )
+            )
         for key in (table.qualified_name, table.name, table.alias or ""):
             if key:
-                resolved_by_table[_identifier_key(key)] = resource
+                resolved_by_table[_dialect_identifier_key(key, dialect=dialect)] = (
+                    resource
+                )
         if resource.resource_id not in resolved_ids:
             resolved_ids.append(resource.resource_id)
 
-    selected_aliases = {_identifier_key(item) for item in analysis.select_aliases}
+    selected_aliases = {
+        _dialect_identifier_key(item, dialect=dialect)
+        for item in analysis.select_aliases
+    }
     resolved_resources = tuple(
         resource
         for resource in source_resources
@@ -887,7 +1577,12 @@ def validate_sqlite_read(
         )
     for column in analysis.columns:
         if (
-            _identifier_key(column.name) in selected_aliases
+            _dialect_identifier_key(
+                column.name,
+                dialect=dialect,
+                quoted=column.name_quoted,
+            )
+            in selected_aliases
             and column.qualifier is None
         ):
             continue
@@ -896,6 +1591,7 @@ def validate_sqlite_read(
             resolved_by_table,
             resolved_resources,
             issues,
+            dialect=dialect,
         )
 
     bounded_issues = tuple(issues[:_MAX_ISSUES])
@@ -1214,16 +1910,54 @@ def _sqlite_update_fingerprint(
 
 
 def _resource_candidates(
-    table_name: str,
+    table: SqlTableReference,
     resources: tuple[ResourceSchema, ...],
+    *,
+    dialect: _SqlDialect,
 ) -> tuple[ResourceSchema, ...]:
-    key = _identifier_key(table_name)
-    short = _short_identifier(table_name)
+    if dialect == "postgresql":
+        return tuple(
+            resource
+            for resource in resources
+            if _postgresql_resource_matches(table, resource)
+        )
+    key = _identifier_key(table.qualified_name)
+    short = _short_identifier(table.qualified_name)
     return tuple(
         resource
         for resource in resources
         if key in resource.lookup_names or short in resource.lookup_names
     )
+
+
+def _postgresql_resource_matches(
+    table: SqlTableReference,
+    resource: ResourceSchema,
+) -> bool:
+    expected_name = (
+        table.name
+        if table.name_quoted
+        else table.name.translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
+    )
+    if resource.name != expected_name:
+        return False
+    if len(table.qualified_parts) < 2:
+        return True
+    expected_parts = tuple(
+        name if quoted else name.translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
+        for name, quoted in table.qualified_parts
+    )
+    return any(
+        _postgresql_alias_parts(alias) == expected_parts for alias in resource.aliases
+    )
+
+
+def _postgresql_alias_parts(alias: str) -> tuple[str, ...]:
+    # Attached schemas are safe single identifiers, while quoted PostgreSQL
+    # resource names may themselves contain dots.  The first separator is the
+    # catalog-owned schema/resource boundary.
+    schema, separator, resource_name = alias.partition(".")
+    return (schema, resource_name) if separator else (schema,)
 
 
 def _resource_name_candidates(
@@ -1246,22 +1980,27 @@ def _validate_column(
     resolved_by_table: Mapping[str, ResourceSchema],
     resolved_resources: tuple[ResourceSchema, ...],
     issues: list[SqlValidationIssue],
+    *,
+    dialect: _SqlDialect,
 ) -> None:
-    column_key = _identifier_key(column.name)
     if column.resource_name is not None:
-        resource = resolved_by_table.get(_identifier_key(column.resource_name))
+        resource = resolved_by_table.get(
+            _dialect_identifier_key(column.resource_name, dialect=dialect)
+        )
         if resource is None and column.qualifier is not None:
-            resource = resolved_by_table.get(_identifier_key(column.qualifier))
+            resource = resolved_by_table.get(
+                _dialect_identifier_key(column.qualifier, dialect=dialect)
+            )
         if resource is None:
             return
-        if column_key not in resource.column_keys:
+        if not _resource_has_column(resource, column, dialect=dialect):
             issues.append(_missing_column_issue(column, resource))
         return
 
     matches = tuple(
         resource
         for resource in resolved_resources
-        if column_key in resource.column_keys
+        if _resource_has_column(resource, column, dialect=dialect)
     )
     if len(resolved_resources) == 1 and not matches:
         issues.append(_missing_column_issue(column, resolved_resources[0]))
@@ -1286,6 +2025,22 @@ def _validate_column(
                 },
             )
         )
+
+
+def _resource_has_column(
+    resource: ResourceSchema,
+    column: SqlColumnReference,
+    *,
+    dialect: _SqlDialect,
+) -> bool:
+    if dialect == "postgresql":
+        expected = (
+            column.name
+            if column.name_quoted
+            else column.name.translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
+        )
+        return expected in resource.columns
+    return _identifier_key(column.name) in resource.column_keys
 
 
 def _missing_column_issue(

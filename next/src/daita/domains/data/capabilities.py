@@ -1,4 +1,4 @@
-"""SQLite query capability declaration over a source-specific read backend."""
+"""SQL query capability declarations over source-specific read backends."""
 
 from __future__ import annotations
 
@@ -17,7 +17,12 @@ from ...capabilities import (
     RiskLevel,
     ToolView,
 )
-from .controller import SQLITE_QUERY_CAPABILITY_ID, SQLITE_QUERY_EVIDENCE_KIND
+from .controller import (
+    POSTGRESQL_QUERY_CAPABILITY_ID,
+    POSTGRESQL_QUERY_EVIDENCE_KIND,
+    SQLITE_QUERY_CAPABILITY_ID,
+    SQLITE_QUERY_EVIDENCE_KIND,
+)
 from .controller import (
     SQLITE_UPDATE_CAPABILITY_ID,
     SQLITE_UPDATE_EVIDENCE_KIND,
@@ -31,12 +36,13 @@ from .sql import sqlite_identifier_key
 
 _MAX_EVIDENCE_RESOURCES = 1_000
 SQLITE_QUERY_EXECUTOR_ID = "data.sqlite.query.executor"
+POSTGRESQL_QUERY_EXECUTOR_ID = "data.postgresql.query.executor"
 SQLITE_UPDATE_IMPACT_EXECUTOR_ID = "data.sqlite.update_impact.executor"
 SQLITE_UPDATE_EXECUTOR_ID = "data.sqlite.update.executor"
 
 
 @dataclass(frozen=True, slots=True)
-class SQLiteReadResult:
+class SqlReadResult:
     source_id: str
     canonical_sql: str
     sql_fingerprint: str
@@ -125,6 +131,16 @@ class SQLiteReadResult:
                 "sql_fingerprint": self.sql_fingerprint,
             }
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SQLiteReadResult(SqlReadResult):
+    """Stable SQLite result name over the shared relational read shape."""
+
+
+@dataclass(frozen=True, slots=True)
+class PostgreSQLReadResult(SqlReadResult):
+    """PostgreSQL result over the shared relational read shape."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,7 +282,7 @@ def _validate_update_provenance(
         raise ValueError("key_column and target_column must be distinct")
 
 
-class SQLiteReadBackend(Protocol):
+class SqlReadBackend(Protocol):
     async def execute_read(
         self,
         *,
@@ -276,7 +292,15 @@ class SQLiteReadBackend(Protocol):
         parameters: tuple[object, ...],
         max_rows: int,
         max_bytes: int,
-    ) -> SQLiteReadResult: ...
+    ) -> SqlReadResult: ...
+
+
+class SQLiteReadBackend(SqlReadBackend, Protocol):
+    """Stable SQLite backend protocol name."""
+
+
+class PostgreSQLReadBackend(SqlReadBackend, Protocol):
+    """PostgreSQL backend protocol name."""
 
 
 class SQLiteUpdateKnownNoEffectError(RuntimeError):
@@ -331,19 +355,28 @@ class SQLiteQueryDeclarations:
 
 
 @dataclass(frozen=True, slots=True)
+class PostgreSQLQueryDeclarations:
+    capabilities: tuple[Capability, ...]
+    executors: tuple[Executor, ...]
+    tool_views: tuple[ToolView, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SQLiteUpdateDeclarations:
     capabilities: tuple[Capability, ...]
     executors: tuple[Executor, ...]
     tool_views: tuple[ToolView, ...]
 
 
-class SQLiteQueryExecutor:
-    executor_id = SQLITE_QUERY_EXECUTOR_ID
+class _SqlQueryExecutor:
+    executor_id: str
+    evidence_kind: str
+    backend_name: str
 
     def __init__(
         self,
         agent_id: str,
-        backend: SQLiteReadBackend,
+        backend: SqlReadBackend,
         *,
         max_rows: int = 100,
         max_bytes: int = 65_536,
@@ -376,12 +409,24 @@ class SQLiteQueryExecutor:
             max_bytes=self._max_bytes,
         )
         if result.source_id != source_id:
-            raise ValueError("SQLite backend returned a different source")
+            raise ValueError(f"{self.backend_name} backend returned a different source")
         return EvidenceCandidate(
-            kind=SQLITE_QUERY_EVIDENCE_KIND,
+            kind=self.evidence_kind,
             schema_version=1,
             payload=result.evidence_payload(),
         )
+
+
+class SQLiteQueryExecutor(_SqlQueryExecutor):
+    executor_id = SQLITE_QUERY_EXECUTOR_ID
+    evidence_kind = SQLITE_QUERY_EVIDENCE_KIND
+    backend_name = "SQLite"
+
+
+class PostgreSQLQueryExecutor(_SqlQueryExecutor):
+    executor_id = POSTGRESQL_QUERY_EXECUTOR_ID
+    evidence_kind = POSTGRESQL_QUERY_EVIDENCE_KIND
+    backend_name = "PostgreSQL"
 
 
 class SQLiteUpdateImpactExecutor:
@@ -508,13 +553,68 @@ def sqlite_query_declarations(
     )
 
 
+def postgresql_query_declarations(
+    agent_id: str,
+    backend: PostgreSQLReadBackend,
+) -> PostgreSQLQueryDeclarations:
+    executor = PostgreSQLQueryExecutor(agent_id, backend)
+    extension = postgresql_query_extension_declarations()
+    return PostgreSQLQueryDeclarations(
+        capabilities=extension.capabilities,
+        executors=(executor,),
+        tool_views=extension.tool_views,
+    )
+
+
 def sqlite_query_extension_declarations() -> ExtensionDeclarations:
     """Advertise the stable SQLite query contract independently of one source."""
 
+    return _query_extension_declarations(
+        capability_id=SQLITE_QUERY_CAPABILITY_ID,
+        evidence_kind=SQLITE_QUERY_EVIDENCE_KIND,
+        executor_id=SQLITE_QUERY_EXECUTOR_ID,
+        adapter_name="SQLite",
+        tool_name="data_query_sqlite",
+        idempotent=True,
+        replay_safe=True,
+    )
+
+
+def postgresql_query_extension_declarations() -> ExtensionDeclarations:
+    """Advertise the stable PostgreSQL contract independently of one source.
+
+    PostgreSQL base-table reads stay non-replay-safe until the durable catalog
+    records resolved callable, operator, policy, and type-support provenance.
+    A read-only transaction prevents database writes but cannot prove that
+    server-owned semantics have no external effect after an ambiguous attempt.
+    """
+
+    return _query_extension_declarations(
+        capability_id=POSTGRESQL_QUERY_CAPABILITY_ID,
+        evidence_kind=POSTGRESQL_QUERY_EVIDENCE_KIND,
+        executor_id=POSTGRESQL_QUERY_EXECUTOR_ID,
+        adapter_name="PostgreSQL",
+        tool_name="data_query_postgresql",
+        idempotent=False,
+        replay_safe=False,
+    )
+
+
+def _query_extension_declarations(
+    *,
+    capability_id: str,
+    evidence_kind: str,
+    executor_id: str,
+    adapter_name: str,
+    tool_name: str,
+    idempotent: bool,
+    replay_safe: bool,
+) -> ExtensionDeclarations:
+
     capability = Capability(
-        id=SQLITE_QUERY_CAPABILITY_ID,
+        id=capability_id,
         owner="data",
-        description="Run one validated, read-only, bounded SQLite query.",
+        description=f"Run one validated, read-only, bounded {adapter_name} query.",
         input_schema={
             "type": "object",
             "properties": {
@@ -525,24 +625,24 @@ def sqlite_query_extension_declarations() -> ExtensionDeclarations:
             "required": ["source_id", "sql"],
             "additionalProperties": False,
         },
-        output_evidence_kind=SQLITE_QUERY_EVIDENCE_KIND,
+        output_evidence_kind=evidence_kind,
         output_schema_version=1,
         output_schema=_query_output_schema(),
-        executor_id=SQLITE_QUERY_EXECUTOR_ID,
+        executor_id=executor_id,
         access_mode=AccessMode.READ,
         risk=RiskLevel.LOW,
         side_effecting=False,
-        idempotent=True,
-        replay_safe=True,
+        idempotent=idempotent,
+        replay_safe=replay_safe,
     )
     view = ToolView(
-        name="data_query_sqlite",
+        name=tool_name,
         capability_id=capability.id,
         description=capability.description,
     )
     return ExtensionDeclarations(
         capabilities=(capability,),
-        executor_ids=(SQLITE_QUERY_EXECUTOR_ID,),
+        executor_ids=(executor_id,),
         tool_views=(view,),
     )
 
@@ -715,6 +815,11 @@ def _query_output_schema() -> dict[str, object]:
 
 
 __all__ = [
+    "POSTGRESQL_QUERY_EXECUTOR_ID",
+    "PostgreSQLQueryDeclarations",
+    "PostgreSQLQueryExecutor",
+    "PostgreSQLReadBackend",
+    "PostgreSQLReadResult",
     "SQLITE_QUERY_EXECUTOR_ID",
     "SQLITE_UPDATE_EXECUTOR_ID",
     "SQLITE_UPDATE_IMPACT_EXECUTOR_ID",
@@ -729,6 +834,10 @@ __all__ = [
     "SQLiteUpdateImpactResult",
     "SQLiteUpdateKnownNoEffectError",
     "SQLiteUpdateResult",
+    "SqlReadBackend",
+    "SqlReadResult",
+    "postgresql_query_declarations",
+    "postgresql_query_extension_declarations",
     "sqlite_query_declarations",
     "sqlite_query_extension_declarations",
     "sqlite_update_declarations",

@@ -23,7 +23,10 @@ dependencies = []
 daita = "daita.cli:main"
 
 [project.optional-dependencies]
-openai = ["openai>=1.77.0"]
+anthropic = ["anthropic>=0.116.0"]
+google = ["google-genai>=1.73.1"]
+openai = ["openai>=1.99.9"]
+postgresql = ["asyncpg>=0.30.0", "sqlglot>=25.0.0"]
 sqlite = ["sqlglot>=25.0.0"]
 dev = [
     "black>=26.1.0",

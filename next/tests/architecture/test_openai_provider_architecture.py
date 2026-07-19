@@ -41,7 +41,7 @@ def test_openai_sdk_is_optional_and_never_a_core_dependency() -> None:
 
     assert configuration["project"]["dependencies"] == []
     assert configuration["project"]["optional-dependencies"]["openai"] == [
-        "openai>=1.77.0"
+        "openai>=1.99.9"
     ]
 
 

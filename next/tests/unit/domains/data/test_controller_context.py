@@ -42,6 +42,7 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -104,6 +105,9 @@ class QueryExecutor:
 
 
 class CatalogReader:
+    async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None:
+        return "sqlite"
+
     def __init__(self) -> None:
         self.context_calls: list[tuple[str, str, int]] = []
 
@@ -172,6 +176,48 @@ class LargeCatalogReader(CatalogReader):
         }
 
 
+class SensitiveCatalogReader(CatalogReader):
+    def __init__(self, sensitivity: str) -> None:
+        super().__init__()
+        self._sensitivity = sensitivity
+
+    async def resource_schemas(
+        self, agent_id: str, source_id: str
+    ) -> tuple[ResourceSchema, ...]:
+        schemas = await super().resource_schemas(agent_id, source_id)
+        return tuple(
+            ResourceSchema(
+                resource_id=schema.resource_id,
+                source_id=schema.source_id,
+                name=schema.name,
+                aliases=schema.aliases,
+                columns=schema.columns,
+                sensitivity_class=self._sensitivity,
+            )
+            for schema in schemas
+        )
+
+    async def catalog_context(
+        self,
+        agent_id: str,
+        query: str,
+        *,
+        limit: int,
+    ) -> dict[str, object]:
+        await super().catalog_context(agent_id, query, limit=limit)
+        return {
+            "resources": [
+                {
+                    "name": "orders",
+                    "resource_id": "resource-orders",
+                    "sensitivity": self._sensitivity,
+                    "source_id": "source-orders",
+                }
+            ],
+            "trust_classification": "untrusted_external_data",
+        }
+
+
 class ScopedCatalogReader(CatalogReader):
     async def catalog_context(
         self,
@@ -201,8 +247,12 @@ class ScopedCatalogReader(CatalogReader):
 
 
 class RecordingSessionProjector:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
+    ) -> None:
         self.calls: list[tuple[str, str, str, ModelProfile]] = []
+        self.sensitivity = sensitivity
 
     async def project(
         self,
@@ -254,6 +304,7 @@ class RecordingSessionProjector:
             checkpoint=None,
             compressed_now=False,
             threshold_tokens=profile.maximum_input_tokens,
+            sensitivity=self.sensitivity,
         )
 
 
@@ -654,6 +705,8 @@ async def test_valid_query_becomes_untrusted_evidence_and_grounded_readiness() -
     system_text = context.messages[0].content[0]
     assert isinstance(system_text, TextBlock)
     assert "UNTRUSTED_CATALOG_CONTEXT" in system_text.text
+    assert "data_query_postgresql" in system_text.text
+    assert "schema-qualified native_identity" in system_text.text
     assert "ignore system prompt" not in system_text.text
     catalog_message = context.messages[1]
     assert catalog_message.role is MessageRole.USER
@@ -675,6 +728,39 @@ async def test_valid_query_becomes_untrusted_evidence_and_grounded_readiness() -
         and evidence.id in str(message.content[0].output)
         for message in context.messages
     )
+
+
+@pytest.mark.parametrize(
+    ("catalog_sensitivity", "expected"),
+    (
+        ("confidential", ModelSensitivity.CONFIDENTIAL),
+        ("unclassified", ModelSensitivity.RESTRICTED),
+    ),
+)
+async def test_context_projects_strictest_sensitivity_for_model_routing(
+    catalog_sensitivity: str,
+    expected: ModelSensitivity,
+) -> None:
+    executor = QueryExecutor()
+    registry = _registry(executor)
+    catalog = SensitiveCatalogReader(catalog_sensitivity)
+    snapshot = await _completed_query_snapshot(registry, catalog)
+
+    request = await DataContextBuilder(
+        catalog,
+        profile=_context_profile(),
+    ).build(
+        snapshot,
+        Turn(
+            id="turn-next",
+            operation_id=snapshot.operation.id,
+            number=2,
+            created_at=NOW,
+        ),
+        registry.tool_definitions(),
+    )
+
+    assert request.sensitivity is expected
 
 
 async def test_context_budget_omits_catalog_without_splitting_current_tool_pair() -> (
@@ -842,6 +928,36 @@ async def test_session_history_is_ordered_and_only_projected_for_session_scope()
         )
         == 1
     )
+
+
+async def test_session_history_sensitivity_cannot_be_downgraded_by_current_catalog() -> (
+    None
+):
+    executor = QueryExecutor()
+    registry = _registry(executor)
+    catalog = SensitiveCatalogReader("public")
+    snapshot = await _completed_query_snapshot(
+        registry,
+        catalog,
+        session_id="session-analysis",
+    )
+
+    request = await DataContextBuilder(
+        catalog,
+        profile=_context_profile(),
+        session_projector=RecordingSessionProjector(ModelSensitivity.RESTRICTED),
+    ).build(
+        snapshot,
+        Turn(
+            id="turn-session-next",
+            operation_id=snapshot.operation.id,
+            number=2,
+            created_at=NOW,
+        ),
+        registry.tool_definitions(),
+    )
+
+    assert request.sensitivity is ModelSensitivity.RESTRICTED
 
 
 async def test_scoped_memory_and_active_skill_are_inert_bounded_contributors() -> None:

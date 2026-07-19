@@ -29,6 +29,7 @@ EXPECTED_TOOLS = (
     "catalog_search",
     "catalog_inspect",
     "data_query_sqlite",
+    "data_query_postgresql",
     "data_preview_sqlite_update",
     "data_update_sqlite",
     "data_read_file",

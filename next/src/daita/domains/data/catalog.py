@@ -132,6 +132,30 @@ class CatalogDataView:
             )
         return tuple(sorted(schemas, key=lambda item: (item.name, item.resource_id)))
 
+    async def source_adapter_id(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> str | None:
+        """Return the durable attached-source adapter identity, if current."""
+
+        load_source = getattr(self._store, "load_source", None)
+        if not callable(load_source):
+            return None
+        typed_load_source = cast(
+            Callable[[str, str], Awaitable[SourceRegistration | None]],
+            load_source,
+        )
+        registration = await typed_load_source(agent_id, source_id)
+        if (
+            registration is None
+            or registration.agent_id != agent_id
+            or registration.id != source_id
+            or not registration.active
+        ):
+            return None
+        return registration.adapter_id
+
     async def is_writable_sqlite_source(
         self,
         agent_id: str,

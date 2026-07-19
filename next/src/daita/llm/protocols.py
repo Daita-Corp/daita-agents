@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Protocol
 
-from .models import ModelProfile, ModelRequest, ModelResponse
+from .models import ModelProfile, ModelRequest, ModelResponse, ModelStreamEvent
 
 
 class ModelProfileRepositoryError(RuntimeError):
@@ -36,9 +37,16 @@ class ModelProvider(Protocol):
     async def generate(self, request: ModelRequest) -> ModelResponse: ...
 
 
+class StreamingModelProvider(ModelProvider, Protocol):
+    """Advertised provider contract for canonical incremental inference."""
+
+    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]: ...
+
+
 __all__ = [
     "ModelProfileConflictError",
     "ModelProfileRepository",
     "ModelProfileRepositoryError",
     "ModelProvider",
+    "StreamingModelProvider",
 ]

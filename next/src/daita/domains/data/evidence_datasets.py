@@ -22,13 +22,17 @@ from ...operations.models import Evidence, Task, TaskStatus
 from ...operations.store import OperationStore, VersionedOperation
 from ...storage.blobs import BlobMetadata, BlobStore
 from .comparison import TabularEvidenceDataset
-from .controller import SQLITE_QUERY_EVIDENCE_KIND
+from .controller import POSTGRESQL_QUERY_EVIDENCE_KIND, SQLITE_QUERY_EVIDENCE_KIND
 from .file_capabilities import LOCAL_FILE_READ_EVIDENCE_KIND
 
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z")
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SUPPORTED_KINDS = frozenset(
-    {LOCAL_FILE_READ_EVIDENCE_KIND, SQLITE_QUERY_EVIDENCE_KIND}
+    {
+        LOCAL_FILE_READ_EVIDENCE_KIND,
+        POSTGRESQL_QUERY_EVIDENCE_KIND,
+        SQLITE_QUERY_EVIDENCE_KIND,
+    }
 )
 _ARTIFACT_MEDIA_TYPE = "application/json"
 
@@ -333,11 +337,11 @@ class PersistedAcceptedEvidenceDatasetReader:
             or not source.active
         ):
             raise DataEvidenceDatasetError("source_inactive")
-        expected_adapter_id = (
-            "local-directory"
-            if parsed.evidence_kind == LOCAL_FILE_READ_EVIDENCE_KIND
-            else "sqlite"
-        )
+        expected_adapter_id = {
+            LOCAL_FILE_READ_EVIDENCE_KIND: "local-directory",
+            POSTGRESQL_QUERY_EVIDENCE_KIND: "postgresql",
+            SQLITE_QUERY_EVIDENCE_KIND: "sqlite",
+        }[parsed.evidence_kind]
         if source.adapter_id != expected_adapter_id:
             raise DataEvidenceDatasetError("source_adapter_mismatch")
 
@@ -371,7 +375,8 @@ class PersistedAcceptedEvidenceDatasetReader:
             ):
                 raise DataEvidenceDatasetError("catalog_source_stale")
             if (
-                parsed.evidence_kind == SQLITE_QUERY_EVIDENCE_KIND
+                parsed.evidence_kind
+                in {SQLITE_QUERY_EVIDENCE_KIND, POSTGRESQL_QUERY_EVIDENCE_KIND}
                 and sync.source_revision != parsed.source_revision
             ):
                 raise DataEvidenceDatasetError("catalog_source_stale")

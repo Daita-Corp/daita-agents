@@ -23,7 +23,7 @@ from ..capabilities import (
     ExecutorKnownNoEffectError,
 )
 from ..events.models import RuntimeEvent
-from ..llm.models import ModelRequest, ModelResponse, ToolCall
+from ..llm.models import ModelRequest, ModelResponse, ModelRoutingTrace, ToolCall
 from ..loop.models import (
     LoopBudgets,
     LoopExit,
@@ -419,17 +419,22 @@ class OperationRuntime:
                 + response.usage.estimated_cost_usd,
             )
             state.operation = replace(state.operation, updated_at=now)
+            response_payload: dict[str, object] = {
+                "finish_reason": response.finish_reason.value,
+                "model_call_id": model_call.id,
+                "total_tokens": response.usage.total_tokens,
+                "estimated_cost_usd": str(response.usage.estimated_cost_usd),
+            }
+            if response.provider_id is not None:
+                response_payload["selected_provider_id"] = response.provider_id
+            if response.routing is not None:
+                response_payload["routing"] = response.routing.to_payload()
             self._append_event(
                 state,
                 "model_response.recorded",
                 turn_id=model_call.turn_id,
                 model_call_id=model_call.id,
-                payload={
-                    "finish_reason": response.finish_reason.value,
-                    "model_call_id": model_call.id,
-                    "total_tokens": response.usage.total_tokens,
-                    "estimated_cost_usd": str(response.usage.estimated_cost_usd),
-                },
+                payload=response_payload,
             )
             await self._commit(state)
 
@@ -2240,9 +2245,18 @@ class OperationRuntime:
         operation_id: str,
         model_call_id: str,
         error_code: str,
+        *,
+        routing: ModelRoutingTrace | None = None,
     ) -> LoopExit:
         async with self._lock:
             _required_text(error_code, "model error_code")
+            if routing is not None:
+                if not isinstance(routing, ModelRoutingTrace):
+                    raise TypeError("routing must be a ModelRoutingTrace or None")
+                if routing.terminal_error_code != error_code:
+                    raise OperationStateError(
+                        "model routing terminal error does not match error_code"
+                    )
             state = await self._working_state(operation_id)
             call_index, model_call = self._model_call(state, model_call_id)
             if model_call.status is not ModelCallStatus.STARTED:
@@ -2254,12 +2268,18 @@ class OperationRuntime:
                 error_code=error_code,
                 updated_at=now,
             )
+            failure_payload: dict[str, object] = {
+                "error_code": error_code,
+                "model_call_id": model_call.id,
+            }
+            if routing is not None:
+                failure_payload["routing"] = routing.to_payload()
             self._append_event(
                 state,
                 "model_call.failed",
                 turn_id=model_call.turn_id,
                 model_call_id=model_call.id,
-                payload={"error_code": error_code, "model_call_id": model_call.id},
+                payload=failure_payload,
             )
             result = self._fail_locked(state, error_code)
             await self._commit(state)

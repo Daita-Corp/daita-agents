@@ -26,6 +26,8 @@ def test_generic_loop_has_no_local_file_or_source_specific_dependency() -> None:
         "csv",
         "file_capabilities",
         "pathlib",
+        "postgresql",
+        "asyncpg",
         "sqlite",
         "tabular.compare",
     }
@@ -81,6 +83,7 @@ def test_embedded_composition_binds_one_registry_and_one_blob_store() -> None:
     assert source.count('LocalBlobStore(home / "blobs")') == 1
     assert "local_file_read_declarations(" in source
     assert "tabular_comparison_declarations(" in source
+    assert "postgresql_query_declarations(" in source
     assert "PersistedAcceptedEvidenceDatasetReader(" in source
 
 
@@ -98,3 +101,4 @@ def test_public_surface_exports_the_sandboxed_source_not_its_backend() -> None:
     assert isinstance(exports, list)
     assert "LocalDirectorySource" in exports
     assert "LocalDirectoryReadBackend" not in exports
+    assert "PostgreSQLSource" in exports

@@ -22,6 +22,7 @@ new ADR explicitly documents the approved change.
 | [0012](0012-monitor-scheduling-defaults.md) | Monitor scheduling and missed-run defaults |
 | [0013](0013-retention-and-redaction-defaults.md) | Data retention and redaction defaults |
 | [0014](0014-licensing-boundary.md) | Local-core and premium-hosting licensing boundary |
+| [0015](0015-model-routing-and-provider-security.md) | Model routing, fallback, sensitivity, continuation, and endpoint security |
 
 ## Status vocabulary
 

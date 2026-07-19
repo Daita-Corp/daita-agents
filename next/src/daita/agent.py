@@ -58,6 +58,7 @@ from .skills.learning import (
     SkillChangeCandidate,
     SkillChangeProposalResult,
 )
+from .security import SecretProvider
 
 
 class Agent:
@@ -81,6 +82,7 @@ class Agent:
         budgets: LoopBudgets = LoopBudgets(),
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
+        secret_provider: SecretProvider | None = None,
     ) -> Self:
         embedded = await EmbeddedAgent.create(
             name,
@@ -94,6 +96,7 @@ class Agent:
             budgets=budgets,
             clock=clock,
             id_factory=id_factory,
+            secret_provider=secret_provider,
         )
         return cls(embedded)
 
@@ -112,6 +115,7 @@ class Agent:
         budgets: LoopBudgets = LoopBudgets(),
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
+        secret_provider: SecretProvider | None = None,
     ) -> Self:
         embedded = await EmbeddedAgent.open(
             name,
@@ -125,6 +129,7 @@ class Agent:
             budgets=budgets,
             clock=clock,
             id_factory=id_factory,
+            secret_provider=secret_provider,
         )
         return cls(embedded)
 

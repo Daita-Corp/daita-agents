@@ -15,6 +15,7 @@ from ..llm.models import (
     CanonicalMessage,
     MessageRole,
     ModelProfile,
+    ModelSensitivity,
     TextBlock,
     ToolResultBlock,
 )
@@ -43,6 +44,17 @@ _TERMINAL_OPERATION_STATUS_VALUES = frozenset(
         OperationStatus.INTERRUPTED.value,
     }
 )
+
+
+def _session_sensitivity(
+    facts: Mapping[str, SessionOperationFacts],
+    historical_operation_ids: tuple[str, ...],
+) -> ModelSensitivity:
+    return max(
+        (facts[operation_id].sensitivity for operation_id in historical_operation_ids),
+        default=ModelSensitivity.INTERNAL,
+        key=lambda sensitivity: sensitivity.routing_rank,
+    )
 
 
 def _required_text(value: str, field_name: str, *, maximum: int = 512) -> None:
@@ -114,6 +126,7 @@ class SessionOperationFacts:
     session_id: str
     revision: str
     status: str
+    sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
     evidence_ids: tuple[str, ...] = ()
     approval_ids: tuple[str, ...] = ()
     resource_ids: tuple[str, ...] = ()
@@ -132,6 +145,8 @@ class SessionOperationFacts:
             (self.status, "session operation status"),
         ):
             _required_text(value, field_name)
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("session operation sensitivity must be a ModelSensitivity")
         object.__setattr__(
             self,
             "evidence_ids",
@@ -251,6 +266,7 @@ class SessionContextProjection:
     checkpoint: SessionCompressionCheckpoint | None
     compressed_now: bool
     threshold_tokens: int
+    sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
 
     def __post_init__(self) -> None:
         for value, field_name in (
@@ -286,6 +302,8 @@ class SessionContextProjection:
             or self.threshold_tokens < 1
         ):
             raise ValueError("session projection threshold must be positive")
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("session projection sensitivity must be ModelSensitivity")
         object.__setattr__(self, "historical_operation_ids", historical)
         object.__setattr__(self, "blocks", blocks)
 
@@ -502,6 +520,7 @@ class SessionCompressionService:
             checkpoint=checkpoint,
             compressed_now=compressed_now,
             threshold_tokens=threshold,
+            sensitivity=_session_sensitivity(facts, historical_ids),
         )
 
     async def _load_facts(
@@ -823,7 +842,11 @@ def _rebound_groups(
             operation_id=current_operation_id,
             session_id=session_id,
             turn_id=None,
+            provider_id=None,
             provider_metadata={},
+            tool_calls=tuple(
+                replace(call, provider_call_id=None) for call in message.tool_calls
+            ),
         )
         for message in messages
     )
@@ -1212,6 +1235,7 @@ def _message_data(message: CanonicalMessage) -> dict[str, object]:
         "agent_id": message.agent_id,
         "content": content,
         "operation_id": message.operation_id,
+        "provider_id": message.provider_id,
         "provider_metadata": message.provider_metadata,
         "role": message.role.value,
         "session_id": message.session_id,

@@ -45,6 +45,9 @@ NOW = datetime(2026, 7, 19, 1, 0, tzinfo=timezone.utc)
 
 
 class CatalogReader:
+    async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None:
+        return "sqlite"
+
     async def resource_schemas(
         self,
         agent_id: str,

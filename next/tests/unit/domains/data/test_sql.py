@@ -108,6 +108,32 @@ def test_analysis_classifies_cte_hidden_mutation() -> None:
     assert any(item.name == "orders" and not item.is_cte for item in analysis.tables)
 
 
+def test_nested_cte_name_does_not_hide_unrelated_outer_sqlite_table() -> None:
+    allowed = ResourceSchema(
+        resource_id="resource:sqlite:allowed",
+        source_id="source:sqlite:test",
+        name="allowed",
+        columns=("id",),
+    )
+    result = validate_sqlite_read(
+        "SELECT allowed.id FROM secret JOIN allowed ON true "
+        "WHERE EXISTS (WITH secret AS (SELECT id FROM allowed) "
+        "SELECT id FROM secret)",
+        source_id="source:sqlite:test",
+        resources=(allowed,),
+    )
+
+    assert result.valid is False
+    assert "unknown_resource" in result.issue_codes
+    assert result.analysis is not None
+    assert any(
+        table.name == "secret" and not table.is_cte for table in result.analysis.tables
+    )
+    assert any(
+        table.name == "secret" and table.is_cte for table in result.analysis.tables
+    )
+
+
 def test_analysis_classifies_explain_by_its_inner_statement() -> None:
     read = analyze_sqlite_sql("EXPLAIN QUERY PLAN SELECT id FROM orders")
     mutation = analyze_sqlite_sql("EXPLAIN DELETE FROM orders WHERE id = 1")

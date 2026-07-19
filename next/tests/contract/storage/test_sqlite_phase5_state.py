@@ -25,7 +25,7 @@ from daita.learning import (
     LearningStoreConflictError,
 )
 from daita.loop.models import LoopBudgets, LoopPhase, LoopState
-from daita.llm.models import ModelProfile
+from daita.llm.models import ModelProfile, ModelSensitivity
 from daita.llm.protocols import ModelProfileConflictError
 from daita.memory.learning import (
     ExplicitCorrectionCommit,
@@ -287,6 +287,7 @@ async def test_migration_nine_and_session_compression_are_versioned_and_exact(
     assert facts is not None
     assert facts.session_id == SESSION_ID
     assert facts.revision == "1"
+    assert facts.sensitivity is ModelSensitivity.INTERNAL
 
     summary = canonical_json(
         {

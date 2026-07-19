@@ -7,11 +7,23 @@ import sqlite3
 import pytest
 
 from daita.adapters.models import SourceRegistration
-from daita.adapters.sqlite_query import SQLiteQueryBackend, SQLiteQueryError
+from daita.adapters.sqlite_query import (
+    SQLiteQueryBackend,
+    SQLiteQueryError,
+    _unique_columns,
+)
 from daita.domains.data import ResourceSchema
 
 NOW = datetime(2026, 7, 18, 21, 0, tzinfo=timezone.utc)
 RESOURCE_REVISION = "sha256:" + "a" * 64
+
+
+def test_sqlite_result_columns_never_collide_with_real_suffix_names() -> None:
+    assert _unique_columns(("id", "ID", "id__2")) == (
+        "id",
+        "ID__3",
+        "id__2",
+    )
 
 
 class Sources:
