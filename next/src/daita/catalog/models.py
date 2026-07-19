@@ -143,6 +143,7 @@ class Sensitivity(str, Enum):
 
 
 class FacetKind(str, Enum):
+    FILE = "file"
     TABULAR = "tabular"
 
 
@@ -335,6 +336,49 @@ class TabularFacet:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class FileFacet:
+    """Typed local-file facts with freshness kept outside structural identity."""
+
+    format: str
+    media_type: str
+    encoding: str
+    size_bytes: int
+    content_sha256: str
+    modified_at: datetime
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.format not in {"csv", "json"}:
+            raise ValueError("file format must be 'csv' or 'json'")
+        _required_text(self.media_type, "file media_type", maximum=256)
+        if self.encoding not in {"utf-8", "utf-8-sig"}:
+            raise ValueError("file encoding must be 'utf-8' or 'utf-8-sig'")
+        _non_negative_int(self.size_bytes, "file size_bytes")
+        _require_hash(self.content_sha256, "file content_sha256")
+        _aware(self.modified_at, "file modified_at")
+        _positive_int(self.schema_version, "file schema_version")
+
+    def structural_payload(self) -> dict[str, object]:
+        """Return facts whose changes create a new structural file revision."""
+
+        return {
+            "content_sha256": self.content_sha256,
+            "encoding": self.encoding,
+            "format": self.format,
+            "media_type": self.media_type,
+            "size_bytes": self.size_bytes,
+        }
+
+    def to_payload(self) -> dict[str, object]:
+        """Return the typed projection, including nonstructural freshness."""
+
+        return {
+            **self.structural_payload(),
+            "modified_at": self.modified_at.isoformat(),
+        }
+
+
 def catalog_facet_revision(
     kind: FacetKind,
     schema_version: int,
@@ -392,6 +436,31 @@ class CatalogFacet:
             schema_version=facet.schema_version,
             revision=catalog_facet_revision(
                 FacetKind.TABULAR,
+                facet.schema_version,
+                facet.structural_payload(),
+            ),
+            payload=facet.to_payload(),
+            observed_at=observed_at,
+        )
+
+    @classmethod
+    def from_file(
+        cls,
+        *,
+        resource_id: str,
+        sync_id: str,
+        observed_at: datetime,
+        facet: FileFacet,
+    ) -> CatalogFacet:
+        if not isinstance(facet, FileFacet):
+            raise TypeError("facet must be a FileFacet")
+        return cls(
+            resource_id=resource_id,
+            sync_id=sync_id,
+            kind=FacetKind.FILE,
+            schema_version=facet.schema_version,
+            revision=catalog_facet_revision(
+                FacetKind.FILE,
                 facet.schema_version,
                 facet.structural_payload(),
             ),
@@ -1194,6 +1263,7 @@ __all__ = [
     "CatalogTraversalRequest",
     "CatalogTraversalResult",
     "FacetKind",
+    "FileFacet",
     "RelationshipDirection",
     "RelationshipFieldPair",
     "RelationshipKind",

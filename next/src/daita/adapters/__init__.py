@@ -19,6 +19,12 @@ from .protocols import (
     SourceStore,
     StaleResourceError,
 )
+from .local_files import (
+    LocalDirectoryReadBackend,
+    LocalDirectoryResourceAdapter,
+    LocalDirectorySource,
+    LocalDirectorySourceError,
+)
 from .sqlite import SQLiteResourceAdapter, SQLiteSource, SQLiteSourceError
 from .sqlite_query import SQLiteQueryBackend, SQLiteQueryError
 
@@ -26,6 +32,10 @@ __all__ = [
     "DiscoveryLimitError",
     "DiscoveryRequest",
     "DiscoveryResult",
+    "LocalDirectoryReadBackend",
+    "LocalDirectoryResourceAdapter",
+    "LocalDirectorySource",
+    "LocalDirectorySourceError",
     "ResourceAdapter",
     "ResourceAdapterError",
     "ResourceNotFoundError",

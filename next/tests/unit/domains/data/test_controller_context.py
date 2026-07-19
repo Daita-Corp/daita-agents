@@ -76,6 +76,14 @@ class CatalogReader:
             ),
         )
 
+    async def is_current_tabular_file(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+    ) -> bool:
+        return False
+
     async def catalog_context(
         self,
         agent_id: str,

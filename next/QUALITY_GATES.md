@@ -513,6 +513,40 @@ No live provider or external database run was required for Phase 3: the
 production-model translation boundary was already proven in Phase 2, while
 the Phase 3 gate is the deterministic local SQLite data journey.
 
+## Phase 4 — non-database proof
+
+Status: **PASS. Phase 4 is complete and Phase 5 may begin.**
+
+The Phase 4 gate retained the lean phase-level cadence: focused tests inside
+the vertical, followed by one broad regression/static/package gate and one
+targeted security review.
+
+### Executed Phase 4 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P4-Q01 | plan, ADRs, current v2, and root v1 file references (read-only) | Re-read Sections 6/15 and Phase 4 supporting sections; inventory sandbox, adapter, catalog facet, evidence, comparison, context, and Journey B owners | PASS — one explicit canonical root, descriptor-relative I/O, FILE+TABULAR facets, containment-only relationships, evidence-ID comparison, strict bounded CSV/JSON, and explicit deferrals were locked without a new runtime or catalog owner |
+| P4-Q02 | `next/` | Focused local adapter/read, catalog facet, accepted-evidence, comparison, controller, and Journey B selections | PASS — the consolidated affected selection passed 120 tests; final typing repairs passed 25 focused tests without changing behavior |
+| P4-Q03 | `next/` | `tests/acceptance/test_local_file_comparison_journey.py` plus the existing public Phase 3 acceptance regressions | PASS — Journey B passes in 2.57s with newest-file selection, file/SQLite reads, strict discrepancies, artifact provenance, citations, reopen, and transcript assertions; 19 prior public regressions remain green |
+| P4-Q04 | `next/` | Complete isolated suite with `PYTHONPATH=src:<site-packages> <python> -S -m pytest -o addopts='' tests/ -m 'not requires_llm and not requires_db' -q --tb=short -p no:cacheprovider` on CPython 3.11.15 and 3.12.7 | PASS — 867 selected and 1 deselected in 14.39s/15.35s |
+| P4-Q05 | `next/` | `black --check src tests scripts`; byte compilation; `MYPYPATH=src mypy src/daita tests scripts/build_test_disposition.py`; pyright 1.1.411 | PASS after typed-boundary repair — Black reports 144 files unchanged; compilation clean; mypy reports no issues in 143 files; pyright reports 0 errors/warnings |
+| P4-Q06 | repository root and `next/` | Isolated architecture suite; generated test-disposition check; root-oracle diff from `99f5eb6`; symlink and diff scans | PASS — 65 architecture tests; disposition current; no root change, v2 symlink, or diff error; the sole production executor invocation remains in `operations/runtime.py` |
+| P4-Q07 | repository root | `.venv/bin/python -m pytest tests/ -m 'not requires_llm and not requires_db' -q --tb=short -p no:cacheprovider` | PASS — 2,498 passed and 221 deselected in 10.37s; the root oracle remains unchanged |
+| P4-Q08 | clean copies under `/private/tmp/daita-p4-packaging.NY0bRl` | Build v2/root sdist and wheel without isolation; inspect cross-inclusion; install the v2 wheel without dependencies into fresh CPython 3.11/3.12 environments; isolated import smoke | PASS — v2 wheel/sdist contain 57/77 entries at `2.0.0a0`; root remains 401/442 at `1.0.0`; no tests/scripts/nested `next/` cross the v2 distribution and no `next/` crosses root; both fresh environments import the public API and all 53 packaged modules from their own `site-packages` |
+| P4-Q09 | final Phase 4 boundary review and repair selection | Review local-root admission, evidence provenance, comparison readiness, and architectural ownership; run affected local-file/readiness/Journey B tests on both interpreters | PASS after root-cause repair — descriptor-relative root admission closes the ancestor-substitution race; negated partial claims no longer satisfy disclosure; reconciliation language requires comparison evidence; 23 affected tests pass in 2.94s/3.42s on Python 3.11/3.12; no accepted-evidence or ownership blocker remains |
+| P4-Q10 | final Phase 4 diff | Parity/ledger/scope review, configured hooks, and exact containing commit | PASS — every changed repository path is under `next/`; EXT-06 records the native CSV/JSON path; the containing commit is `chore(v2-phase-4): complete phase 4 gate` |
+
+The first consolidated static pass exposed genuine Phase 4 annotations at the
+new comparison and accepted-evidence boundaries. Explicit immutable-JSON
+narrowing, narrow protocol dependencies, and typed test fixtures repaired the
+diagnostics without production suppressions. The final targeted review then
+found the three security/readiness issues recorded in P4-Q09; each was fixed
+at its owning boundary with deterministic regressions rather than retries or
+special-case execution paths.
+
+No live provider or external database run was required for Phase 4. The gate
+uses only sandboxed test-owned local files and SQLite state.
+
 ## Live and external gates
 
 - Phase 0 requires no live provider or external database.

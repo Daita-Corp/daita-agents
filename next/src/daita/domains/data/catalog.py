@@ -31,7 +31,11 @@ class CatalogDataView:
         schemas: list[ResourceSchema] = []
         source_revision_by_sync: dict[str, str | None] = {}
         for resource in resources:
-            if resource.kind not in {ResourceKind.TABLE, ResourceKind.VIEW}:
+            if resource.kind not in {
+                ResourceKind.TABLE,
+                ResourceKind.VIEW,
+                ResourceKind.FILE,
+            }:
                 continue
             if resource.current_sync_id not in source_revision_by_sync:
                 sync = await self._store.load_sync(
@@ -80,6 +84,27 @@ class CatalogDataView:
                 )
             )
         return tuple(sorted(schemas, key=lambda item: (item.name, item.resource_id)))
+
+    async def is_current_tabular_file(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+    ) -> bool:
+        resource = await self._store.load_resource(agent_id, resource_id)
+        if (
+            resource is None
+            or resource.agent_id != agent_id
+            or resource.source_id != source_id
+            or resource.kind is not ResourceKind.FILE
+        ):
+            return False
+        facets = await self._store.load_facets(
+            agent_id,
+            resource.id,
+            resource.current_revision,
+        )
+        return any(facet.kind is FacetKind.TABULAR for facet in facets)
 
     async def catalog_context(
         self,

@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
+from ..adapters.local_files import LocalDirectoryReadBackend
 from ..adapters.sqlite_query import SQLiteQueryBackend
 from ..catalog.capabilities import catalog_declarations
 from ..catalog.models import CatalogSync, CatalogSyncStatus
@@ -25,7 +26,10 @@ from ..domains.data import (
     CatalogDataView,
     DataContextBuilder,
     DataDomainController,
+    PersistedAcceptedEvidenceDatasetReader,
+    local_file_read_declarations,
     sqlite_query_declarations,
+    tabular_comparison_declarations,
 )
 from ..identity import AgentIdentity
 from ..llm.protocols import ModelProvider
@@ -366,6 +370,7 @@ class EmbeddedAgent:
         resolved_context = context_builder
         resolved_domain = domain
         resolved_capabilities = capabilities
+        blob_store = LocalBlobStore(home / "blobs")
         if context_builder is None and domain is None and capabilities is None:
             catalog_service = CatalogService(store)
             data_view = CatalogDataView(store, catalog_service)
@@ -374,10 +379,37 @@ class EmbeddedAgent:
                 identity.id,
                 SQLiteQueryBackend(store, data_view),
             )
+            file_read = local_file_read_declarations(
+                identity.id,
+                LocalDirectoryReadBackend(store, store),
+            )
+            comparison = tabular_comparison_declarations(
+                PersistedAcceptedEvidenceDatasetReader(
+                    store,
+                    store,
+                    store,
+                    blob_store,
+                )
+            )
             resolved_capabilities = CapabilityRegistry(
-                capabilities=(*catalog.capabilities, *query.capabilities),
-                executors=(*catalog.executors, *query.executors),
-                tool_views=(*catalog.tool_views, *query.tool_views),
+                capabilities=(
+                    *catalog.capabilities,
+                    *query.capabilities,
+                    *file_read.capabilities,
+                    *comparison.capabilities,
+                ),
+                executors=(
+                    *catalog.executors,
+                    *query.executors,
+                    *file_read.executors,
+                    *comparison.executors,
+                ),
+                tool_views=(
+                    *catalog.tool_views,
+                    *query.tool_views,
+                    *file_read.tool_views,
+                    *comparison.tool_views,
+                ),
             )
             if model is not None:
                 resolved_context = DataContextBuilder(data_view)
@@ -392,7 +424,7 @@ class EmbeddedAgent:
             id_factory=id_factory,
             capabilities=active_capabilities,
             store=store,
-            blob_store=LocalBlobStore(home / "blobs"),
+            blob_store=blob_store,
             policy=policy,
         )
         loop = (

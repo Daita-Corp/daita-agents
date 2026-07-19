@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
+import re
 from typing import Protocol
 
 from ...capabilities import CapabilityInputError, CapabilityRegistry
@@ -19,6 +20,14 @@ from ...operations.models import (
     ActionRejection,
     Evidence,
     Observation,
+)
+from .comparison import (
+    TABULAR_COMPARE_CAPABILITY_ID,
+    TABULAR_COMPARE_EVIDENCE_KIND,
+)
+from .file_capabilities import (
+    LOCAL_FILE_READ_CAPABILITY_ID,
+    LOCAL_FILE_READ_EVIDENCE_KIND,
 )
 from .sql import ResourceSchema, validate_sqlite_read
 
@@ -40,13 +49,24 @@ class CatalogSchemaReader(Protocol):
     ) -> tuple[ResourceSchema, ...]: ...
 
 
+class CatalogDataReader(CatalogSchemaReader, Protocol):
+    """Catalog projection consumed by the complete data-domain controller."""
+
+    async def is_current_tabular_file(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+    ) -> bool: ...
+
+
 class DataDomainController:
     """Validate data actions and enforce evidence-grounded final answers."""
 
     def __init__(
         self,
         registry: CapabilityRegistry,
-        catalog: CatalogSchemaReader,
+        catalog: CatalogDataReader,
         *,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
@@ -54,6 +74,8 @@ class DataDomainController:
             raise TypeError("registry must be a CapabilityRegistry")
         if not callable(getattr(catalog, "resource_schemas", None)):
             raise TypeError("catalog must provide resource_schemas")
+        if not callable(getattr(catalog, "is_current_tabular_file", None)):
+            raise TypeError("catalog must provide is_current_tabular_file")
         if not callable(clock):
             raise TypeError("clock must be callable")
         self._registry = registry
@@ -121,6 +143,14 @@ class DataDomainController:
                 )
         if capability.id == SQLITE_QUERY_CAPABILITY_ID:
             rejection = await self._validate_sql(arguments, operation)
+            if rejection is not None:
+                return rejection
+        if capability.id == LOCAL_FILE_READ_CAPABILITY_ID:
+            rejection = await self._validate_file_read(arguments, operation)
+            if rejection is not None:
+                return rejection
+        if capability.id == TABULAR_COMPARE_CAPABILITY_ID:
+            rejection = self._validate_comparison(arguments, operation)
             if rejection is not None:
                 return rejection
 
@@ -193,6 +223,117 @@ class DataDomainController:
             },
         )
 
+    async def _validate_file_read(
+        self,
+        arguments: Mapping[str, object],
+        operation: OperationSnapshot,
+    ) -> ActionRejection | None:
+        source_id = arguments["source_id"]
+        resource_id = arguments["resource_id"]
+        assert isinstance(source_id, str)
+        assert isinstance(resource_id, str)
+        if (
+            not source_id.strip()
+            or not resource_id.strip()
+            or len(source_id) > 512
+            or len(resource_id) > 512
+        ):
+            return ActionRejection(
+                code="data.file.input_out_of_bounds",
+                message="File reads require bounded source and resource IDs.",
+            )
+        try:
+            current = await self._catalog.is_current_tabular_file(
+                operation.operation.agent_id,
+                source_id,
+                resource_id,
+            )
+        except (KeyError, ValueError):
+            current = False
+        if not current:
+            return ActionRejection(
+                code="data.file.catalog_resource_missing",
+                message=(
+                    "The requested file is not a current cataloged tabular resource "
+                    "for that source."
+                ),
+                details={"resource_id": resource_id, "source_id": source_id},
+            )
+        return None
+
+    def _validate_comparison(
+        self,
+        arguments: Mapping[str, object],
+        operation: OperationSnapshot,
+    ) -> ActionRejection | None:
+        left_id = arguments["left_evidence_id"]
+        right_id = arguments["right_evidence_id"]
+        key_columns = arguments["key_columns"]
+        compare_columns = arguments["compare_columns"]
+        assert isinstance(left_id, str)
+        assert isinstance(right_id, str)
+        assert isinstance(key_columns, tuple)
+        assert isinstance(compare_columns, tuple)
+        columns = (*key_columns, *compare_columns)
+        if (
+            not left_id.strip()
+            or not right_id.strip()
+            or left_id == right_id
+            or len(left_id) > 512
+            or len(right_id) > 512
+            or not key_columns
+            or not compare_columns
+            or len(key_columns) > 64
+            or len(compare_columns) > 64
+            or any(
+                not isinstance(column, str) or not column.strip() or len(column) > 256
+                for column in columns
+            )
+            or len(columns) != len(set(columns))
+        ):
+            return ActionRejection(
+                code="data.compare.input_out_of_bounds",
+                message=(
+                    "Comparison requires two distinct evidence IDs and bounded, "
+                    "non-overlapping key and value columns."
+                ),
+            )
+        evidence_by_id = {
+            evidence.id: evidence
+            for evidence in operation.evidence
+            if evidence.accepted
+        }
+        selected = tuple(evidence_by_id.get(item) for item in (left_id, right_id))
+        supported = {LOCAL_FILE_READ_EVIDENCE_KIND, SQLITE_QUERY_EVIDENCE_KIND}
+        if any(
+            evidence is None or evidence.kind not in supported for evidence in selected
+        ):
+            return ActionRejection(
+                code="data.compare.evidence_unavailable",
+                message=(
+                    "Comparison inputs must be accepted tabular read evidence from "
+                    "this operation."
+                ),
+            )
+        left_evidence, right_evidence = selected
+        assert left_evidence is not None
+        assert right_evidence is not None
+        sources = (
+            left_evidence.payload.get("source_id"),
+            right_evidence.payload.get("source_id"),
+        )
+        if any(not isinstance(source, str) or not source.strip() for source in sources):
+            return ActionRejection(
+                code="data.compare.provenance_missing",
+                message="Comparison input evidence lacks complete source provenance.",
+            )
+        if sources[0] == sources[1]:
+            return ActionRejection(
+                code="data.compare.sources_not_distinct",
+                message="Cross-source comparison requires two distinct sources.",
+            )
+        return None
+
     async def project_observation(self, evidence: Evidence) -> Observation:
         if not isinstance(evidence, Evidence):
             raise TypeError("evidence must be an Evidence record")
@@ -203,6 +344,11 @@ class DataDomainController:
             "evidence_kind": evidence.kind,
             "trust_classification": trust,
         }
+        if evidence.blob_id is not None:
+            payload["artifact"] = {
+                "blob_id": evidence.blob_id,
+                "content_hash": evidence.content_hash,
+            }
         truncated = evidence.payload.get("truncated", False)
         return Observation(
             operation_id=evidence.operation_id,
@@ -225,16 +371,45 @@ class DataDomainController:
         text: str,
         operation: OperationSnapshot,
     ) -> Readiness:
-        accepted = tuple(
+        accepted_reads = tuple(
             evidence
             for evidence in operation.evidence
-            if evidence.accepted and evidence.kind == SQLITE_QUERY_EVIDENCE_KIND
+            if evidence.accepted
+            and evidence.kind
+            in {SQLITE_QUERY_EVIDENCE_KIND, LOCAL_FILE_READ_EVIDENCE_KIND}
+        )
+        accepted_comparisons = tuple(
+            evidence
+            for evidence in operation.evidence
+            if evidence.accepted and evidence.kind == TABULAR_COMPARE_EVIDENCE_KIND
+        )
+        message = operation.trigger.payload.get("message")
+        normalized_message = message.casefold() if isinstance(message, str) else ""
+        comparison_requested = bool(accepted_comparisons) or _requests_comparison(
+            normalized_message
         )
         missing: list[str] = []
-        if not accepted:
-            missing.append("accepted current-operation SQLite query evidence")
-        elif not any(f"[evidence:{item.id}]" in text for item in accepted):
-            missing.append("an explicit [evidence:<id>] citation to query evidence")
+        if comparison_requested:
+            grounded = _grounded_comparisons(
+                accepted_comparisons,
+                accepted_reads,
+                text,
+            )
+            if not accepted_comparisons:
+                missing.append("accepted current-operation comparison evidence")
+            elif not grounded:
+                missing.append(
+                    "citations to one comparison and both accepted source inputs"
+                )
+            elif any(
+                bool(comparison.payload.get("truncated", False))
+                for comparison in grounded
+            ) and not _discloses_partial_coverage(text):
+                missing.append("an explicit partial or truncation disclosure")
+        elif not accepted_reads:
+            missing.append("accepted current-operation data evidence")
+        elif not any(f"[evidence:{item.id}]" in text for item in accepted_reads):
+            missing.append("an explicit [evidence:<id>] citation to data evidence")
         if missing:
             return Readiness(
                 allowed=False,
@@ -251,9 +426,78 @@ class DataDomainController:
         )
 
 
+def _grounded_comparisons(
+    comparisons: tuple[Evidence, ...],
+    reads: tuple[Evidence, ...],
+    text: str,
+) -> tuple[Evidence, ...]:
+    reads_by_id = {evidence.id: evidence for evidence in reads}
+    grounded: list[Evidence] = []
+    for comparison in comparisons:
+        left = comparison.payload.get("left")
+        right = comparison.payload.get("right")
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            continue
+        left_id = left.get("evidence_id")
+        right_id = right.get("evidence_id")
+        if not isinstance(left_id, str) or not isinstance(right_id, str):
+            continue
+        if (
+            left_id == right_id
+            or left_id not in reads_by_id
+            or right_id not in reads_by_id
+        ):
+            continue
+        left_source = reads_by_id[left_id].payload.get("source_id")
+        right_source = reads_by_id[right_id].payload.get("source_id")
+        if (
+            not isinstance(left_source, str)
+            or not isinstance(right_source, str)
+            or left_source == right_source
+            or left.get("source_id") != left_source
+            or right.get("source_id") != right_source
+        ):
+            continue
+        citations = (comparison.id, left_id, right_id)
+        if all(f"[evidence:{evidence_id}]" in text for evidence_id in citations):
+            grounded.append(comparison)
+    return tuple(grounded)
+
+
+def _discloses_partial_coverage(text: str) -> bool:
+    prose = re.sub(r"\[evidence:[^\]\r\n]{1,512}\]", "", text)
+    normalized = prose.casefold()
+    for match in re.finditer(
+        r"\b(?:partial(?:ly)?|truncat(?:ed|ion)|incomplete|limited coverage)\b",
+        normalized,
+    ):
+        prefix = normalized[max(0, match.start() - 64) : match.start()]
+        if re.search(
+            r"\b(?:no|not|never|without|isn['’]?t|aren['’]?t|wasn['’]?t|"
+            r"weren['’]?t)\b(?:\W+\w+){0,3}\W*$",
+            prefix,
+        ):
+            continue
+        return True
+    return False
+
+
+def _requests_comparison(message: str) -> bool:
+    return (
+        re.search(
+            r"\b(?:compar(?:e|ed|ing|ison)|differ(?:ence|ences|ent)?|"
+            r"discrepanc(?:y|ies)|reconcil(?:e|ed|ing|iation)|"
+            r"mismatch(?:es|ed)?|versus|against)\b|\bvs\.?\b",
+            message,
+        )
+        is not None
+    )
+
+
 __all__ = [
     "CATALOG_INSPECT_CAPABILITY_ID",
     "CATALOG_SEARCH_CAPABILITY_ID",
+    "CatalogDataReader",
     "CatalogSchemaReader",
     "DataDomainController",
     "SQLITE_QUERY_CAPABILITY_ID",

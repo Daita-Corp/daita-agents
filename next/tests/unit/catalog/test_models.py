@@ -20,6 +20,8 @@ from daita.catalog import (
     CatalogSyncStatus,
     CatalogTraversalRequest,
     CatalogTraversalResult,
+    FacetKind,
+    FileFacet,
     RelationshipDirection,
     RelationshipFieldPair,
     RelationshipKind,
@@ -241,6 +243,103 @@ def test_tabular_facet_is_order_stable_and_row_estimate_is_nonstructural() -> No
         column_names.append(column_payload["name"])
     assert column_names == ["id", "status"]
     assert first.payload["row_count_estimate"] == 10
+
+
+def test_file_facet_is_typed_and_modified_time_is_nonstructural() -> None:
+    resource_id = catalog_resource_id(
+        "source-1",
+        ResourceKind.FILE,
+        "exports/customers.csv",
+    )
+    facts = FileFacet(
+        format="csv",
+        media_type="text/csv",
+        encoding="utf-8",
+        size_bytes=128,
+        content_sha256="sha256:" + "1" * 64,
+        modified_at=NOW,
+    )
+    first = CatalogFacet.from_file(
+        resource_id=resource_id,
+        sync_id="sync-1",
+        observed_at=NOW,
+        facet=facts,
+    )
+    second = CatalogFacet.from_file(
+        resource_id=resource_id,
+        sync_id="sync-2",
+        observed_at=NOW + timedelta(days=1),
+        facet=replace(facts, modified_at=NOW + timedelta(days=1)),
+    )
+
+    assert first.kind is FacetKind.FILE
+    assert first.schema_version == 1
+    assert first.revision == second.revision
+    assert first.payload["modified_at"] == NOW.isoformat()
+    assert second.payload["modified_at"] == (NOW + timedelta(days=1)).isoformat()
+
+
+def test_file_facet_revision_changes_with_content_contract() -> None:
+    resource_id = catalog_resource_id(
+        "source-1",
+        ResourceKind.FILE,
+        "exports/customers.json",
+    )
+    facts = FileFacet(
+        format="json",
+        media_type="application/json",
+        encoding="utf-8-sig",
+        size_bytes=64,
+        content_sha256="sha256:" + "2" * 64,
+        modified_at=NOW,
+    )
+    first = CatalogFacet.from_file(
+        resource_id=resource_id,
+        sync_id="sync-1",
+        observed_at=NOW,
+        facet=facts,
+    )
+    changed = CatalogFacet.from_file(
+        resource_id=resource_id,
+        sync_id="sync-2",
+        observed_at=NOW,
+        facet=replace(
+            facts,
+            size_bytes=65,
+            content_sha256="sha256:" + "3" * 64,
+        ),
+    )
+
+    assert first.revision != changed.revision
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"format": "txt"}, "format"),
+        ({"encoding": "latin-1"}, "encoding"),
+        ({"size_bytes": -1}, "size_bytes"),
+        ({"content_sha256": "not-a-hash"}, "content_sha256"),
+        ({"modified_at": datetime(2026, 7, 18, 12, 0)}, "modified_at"),
+        ({"schema_version": 0}, "schema_version"),
+    ],
+)
+def test_file_facet_rejects_invalid_contract_facts(
+    changes: dict[str, object],
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "format": "csv",
+        "media_type": "text/csv",
+        "encoding": "utf-8",
+        "size_bytes": 1,
+        "content_sha256": "sha256:" + "4" * 64,
+        "modified_at": NOW,
+    }
+    values.update(changes)
+
+    with pytest.raises(ValueError, match=message):
+        FileFacet(**values)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

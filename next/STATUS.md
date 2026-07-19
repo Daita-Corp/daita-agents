@@ -5,15 +5,15 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 4 — non-database proof
-- **Active task:** P4-01 — local-file and cross-source contract inventory
-- **Last completed task:** P3-06 — consolidated Phase 3 gate
-- **Current checkpoint:** Phase 3 gate (this ledger's containing commit)
+- **Active phase:** Phase 5 — context, memory, skills, and learning
+- **Active task:** P5-01 — Phase 5 contract and owner inventory
+- **Last completed task:** P4-06 — consolidated Phase 4 gate
+- **Current checkpoint:** Phase 4 gate (this ledger's containing commit)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** re-read the Phase 4 security, adapter, file-facet,
-  comparison, and Journey B contracts; lock one lean local-file vertical plan
+- **Exact next action:** re-read the Phase 5 context compression, memory,
+  skills, learning, and Journey C contracts; lock one lean vertical plan
 
 ## Development cadence
 
@@ -82,6 +82,18 @@ discovery/inspection remain bounded catalog workflows; SQL is parsed and
 scope-validated before connector I/O; external schema/value text is bounded
 untrusted data; and no file, PostgreSQL, memory, monitor, telemetry-exporter,
 or broad extension work enters the SQLite-only Phase 3 slice.
+
+Before Phase 4 production edits, Sections 6 and 15 were re-read in full on
+2026-07-18 together with Sections 8.13, 8.15, 14.1-14.2, Journey B, the Phase
+4 work/gate, and ADRs 0006/0008/0010/0011/0013. The renewed constraints are
+that each local-directory source has one explicit canonical root; traversal
+and symlink escapes fail before content I/O; catalog owns file identity,
+facets, revisions, and connector-declared containment; bounded reads and
+comparison execute only through declared capabilities and the existing
+operation runtime; model-visible inputs use resource/evidence IDs rather than
+host paths or rows; and accepted current-operation evidence from both sources
+grounds every comparison answer. CSV/JSON inference, fuzzy matching, pandas,
+arbitrary flattening, and inferred file-to-table relationships remain deferred.
 
 ## Current architectural decisions
 
@@ -163,12 +175,12 @@ vertical, then one consolidated gate and commit.
 
 | ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
 | --- | --- | --- | --- | --- | --- |
-| P4-01 | active | Phase 4 work/gate and Journey B; Sections 6/15; file security, adapter, catalog, evidence, and projection contracts; Phase 3 owners | Exact sandbox/file/facet/read/comparison/relationship/context owner map and focused expected-red sequence | Read-only plan/current-tree inventory; explicit scope and deferrals; no production edit | Phase 3 gate |
-| P4-02 | pending | P4-01 contracts; resource adapter declarations and source store | Sandboxed local-directory adapter with explicit canonical roots, bounded deterministic discovery/inspection/health, and persisted lifecycle | Escape/symlink/special-file/limit/cancellation/reopen cases; declaration admission and no direct loop I/O | P4-01 |
-| P4-03 | pending | Local-file adapter; catalog models/store | CSV and JSON resource facets plus bounded reads through declared runtime capabilities and accepted evidence | Encoding/size/row/depth/key/value bounds; untrusted labeling; invalid paths reach no file I/O | P4-02 |
-| P4-04 | pending | SQLite and file evidence; catalog relationships | Tabular comparison capability/evidence, justified cross-source relationships, and bounded cross-source context | Key/duplicate/null/type/discrepancy/truncation cases; revisions and source provenance remain inspectable | P4-03 |
-| P4-05 | pending | Complete deterministic non-database vertical | Public Journey B: find newest allowed export, compare with SQLite customers, explain discrepancies, and retain evidence | Scripted `Agent.attach/run/inspect`, restart-safe evidence/transcript, forbidden-path and stale-input repair | P4-04 |
-| P4-06 | pending | Passing P4-02 through P4-05 slices | Consolidated dual-Python/static/architecture/root/distribution/review gate and one Phase 4 commit | Exact commands/results in `QUALITY_GATES.md`; no Phase 5 work in gate commit | P4-05 |
+| P4-01 | complete | Phase 4 work/gate and Journey B; Sections 6/15; file security, adapter, catalog, evidence, and projection contracts; Phase 3 owners | Exact sandbox/file/facet/read/comparison/relationship/context owner map and focused expected-red sequence | Read-only plan/current-tree/v1-leaf inventory complete; one-root source, descriptor-relative I/O, typed FILE+TABULAR facets, evidence-ID comparison, containment-only relationships, bounded projection, and explicit deferrals locked; no production edit | Phase 3 gate |
+| P4-02 | complete | P4-01 contracts; resource adapter declarations and source store | Sandboxed local-directory adapter with explicit canonical roots, bounded deterministic discovery/inspection/health, and persisted lifecycle | Descriptor-relative no-follow admission/traversal, symlink/special/limit/cancellation/inspect/health/declaration cases pass; no direct adapter execution API | P4-01 |
+| P4-03 | complete | Local-file adapter; catalog models/store | CSV and JSON resource facets plus bounded reads through declared runtime capabilities and accepted evidence | Strict UTF-8/BOM, byte/row/column/depth/node/key/string/cell/schema bounds; current revision revalidation; content-addressed row artifacts and untrusted projections pass | P4-02 |
+| P4-04 | complete | SQLite and file evidence; catalog relationships | Tabular comparison capability/evidence, justified cross-source relationships, and bounded cross-source context | Strict typed keys/values, null/missing/duplicate keys, deterministic discrepancies, partial disclosure, accepted-evidence/blob/provenance validation, and root-folder containment pass | P4-03 |
+| P4-05 | complete | Complete deterministic non-database vertical | Public Journey B: find newest allowed export, compare with SQLite customers, explain discrepancies, and retain evidence | Seven-task public trajectory selects inspected newest file, compares accepted file/SQLite evidence, persists blob/citations/transcript, rejects premature completion, and reopens identically | P4-04 |
+| P4-06 | complete | Passing P4-02 through P4-05 slices | Consolidated dual-Python/static/architecture/root/distribution/review gate and one Phase 4 commit | 867 selected tests pass on Python 3.11/3.12; 65 architecture and 2,498 root tests pass; static, distribution, fresh-import, scope, and repaired security review gates pass; containing commit uses `chore(v2-phase-4): complete phase 4 gate` | P4-05 |
 
 ### Ordered P2-03 internal tasks
 

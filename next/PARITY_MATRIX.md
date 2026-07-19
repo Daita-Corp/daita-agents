@@ -194,7 +194,7 @@ deferred integration available through v1 fallback.
 | EXT-03 | `postgresql` | Required replacement-candidate adapter through the same contracts | cutover | replace |
 | EXT-04 | `anthropic`, `google`, `llm-all` | Retained model adapters; `google` maps to Gemini | cutover | replace |
 | EXT-05 | `transformers` | V1 local Transformers model path is not the retained local-provider contract; Ollama/OpenAI-compatible is | post-MVP | defer (documented) |
-| EXT-06 | `data` | CSV/JSON required; XLSX optional if inexpensive; pandas/sqlglot remain optional implementation dependencies only where used | cutover | replace |
+| EXT-06 | `data` | Phase 4 completes the v2-native bounded, sandboxed CSV/JSON path without pandas; remaining cutover work is data-extra/API parity, with XLSX optional only if inexpensive | cutover | replace |
 | EXT-07 | `memory` | Memory is a core lifecycle using SQLite FTS; embedding/graph packages are not required semantics | MVP | replace |
 | EXT-08 | `sentence-transformers`, `voyage` | Optional embedding accelerators | post-MVP | defer (documented) |
 | EXT-09 | `data-quality`, `lineage` | Future capability providers, not alternate runtimes | post-MVP | defer (documented) |
