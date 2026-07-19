@@ -82,6 +82,16 @@ daita --root /tmp/daita-next operation inspect atlas <operation-id>
 daita --root /tmp/daita-next events read atlas --limit 100
 ```
 
+SQLite sources remain read-only unless write admission is explicit on their
+first attachment. `--write-access` enables only the catalog-validated impact
+preview and conditional single-row update capabilities; it does not expose an
+arbitrary mutation-SQL surface:
+
+```bash
+daita --root /tmp/daita-next source attach atlas sqlite /absolute/path/orders.db \
+  --write-access --idempotency-key attach-orders-write-v1
+```
+
 If inspection reports a waiting approval, the decision updates only the
 persisted approval and wakes the same operation through the host:
 

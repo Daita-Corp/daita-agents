@@ -44,7 +44,7 @@ MIGRATION_FOUR_NAME = "normalize_fenced_task_execution"
 MIGRATION_FIVE_NAME = "link_blob_backed_evidence"
 MIGRATION_SIX_NAME = "normalize_approval_lifecycle"
 MIGRATION_SEVEN_NAME = "add_agent_identity_and_sessions"
-MIGRATION_TWELVE_NAME = "bind_host_mutation_idempotency"
+MIGRATION_THIRTEEN_NAME = "persist_task_validation_facts"
 LEGACY_RECOVERY_REASON = "legacy_running_task_missing_lease"
 LEGACY_RECOVERY_EVENT_TYPE = "task.manual_recovery_required"
 
@@ -58,6 +58,17 @@ TASK_EXECUTION_COLUMNS = {
     "replay_safe": ("INTEGER", 1),
     "idempotency_key": ("TEXT", 0),
     "manual_recovery_reason": ("TEXT", 0),
+    "validation_schema_version": ("INTEGER", 1),
+    "validation_passed": ("INTEGER", 1),
+    "validation_in_scope": ("INTEGER", 1),
+    "validation_destructive": ("INTEGER", 1),
+    "validation_sensitivity_class": ("TEXT", 1),
+    "validation_source_id": ("TEXT", 0),
+    "validation_resource_ids_json": ("TEXT", 1),
+    "validation_resource_revisions_json": ("TEXT", 1),
+    "validation_source_revision": ("TEXT", 0),
+    "validation_impact_json": ("TEXT", 1),
+    "validation_evidence_ids_json": ("TEXT", 1),
 }
 TASK_DEPENDENCY_COLUMNS = (
     "operation_id",
@@ -469,7 +480,7 @@ async def test_public_schema_migrations_are_fixed_and_reopen_is_idempotent(
         (migration.version, migration.name, migration.checksum)
         for migration in sqlite_owner._MIGRATIONS
     )
-    assert _migration_rows(path)[-1][1] == MIGRATION_TWELVE_NAME
+    assert _migration_rows(path)[-1][1] == MIGRATION_THIRTEEN_NAME
     _assert_task_execution_schema(path)
     _assert_evidence_blob_schema(path)
     first_image = _logical_database_image(path)
@@ -502,7 +513,7 @@ async def test_version_four_upgrade_adds_nullable_evidence_blob_id(
     )
     assert "blob_id" not in _columns(backup_path, "evidence")
     _assert_evidence_blob_schema(path)
-    assert _migration_rows(path)[-1][1] == MIGRATION_TWELVE_NAME
+    assert _migration_rows(path)[-1][1] == MIGRATION_THIRTEEN_NAME
 
     connection = sqlite3.connect(path)
     try:
@@ -620,6 +631,8 @@ async def test_version_three_upgrade_backfills_fail_closed_and_is_reopen_safe(
         assert task.execution_facts.idempotent is False
         assert task.execution_facts.replay_safe is False
         assert task.execution_facts.idempotency_key is None
+        assert task.execution_facts.validation_facts.schema_version == 0
+        assert task.execution_facts.validation_facts.fingerprint is None
     recovery_event = loaded.snapshot.events[-1]
     assert recovery_event.type == LEGACY_RECOVERY_EVENT_TYPE
     assert recovery_event.task_id == recovered.id

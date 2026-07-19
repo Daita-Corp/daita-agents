@@ -9,6 +9,7 @@ from daita.loop.models import LoopPhase, LoopState
 from daita.operations.models import (
     ActionProposal,
     ActionRejection,
+    ActionValidationFacts,
     AgentTrigger,
     Observation,
     Operation,
@@ -146,6 +147,60 @@ def test_action_proposal_freezes_validated_arguments() -> None:
 
     assert isinstance(proposal.arguments, FrozenJsonObject)
     assert proposal.arguments.to_dict() == {"key": "alpha"}
+
+
+def test_explicit_action_validation_facts_freeze_scope_impact_and_evidence() -> None:
+    impact = {"affected_rows": 2, "bounded": True}
+    facts = ActionValidationFacts(
+        schema_version=1,
+        validation_passed=True,
+        in_scope=True,
+        destructive=False,
+        sensitivity_class="confidential",
+        source_id="source-sqlite",
+        resource_ids=("resource-orders",),
+        resource_revisions=(("resource-orders", "sha256:" + ("a" * 64)),),
+        source_revision="sqlite:data-version:7",
+        impact=impact,
+        evidence_ids=("evidence-impact",),
+    )
+    impact["affected_rows"] = 999
+
+    assert facts.fingerprint is not None
+    assert isinstance(facts.impact, FrozenJsonObject)
+    assert facts.impact.to_dict() == {"affected_rows": 2, "bounded": True}
+    assert facts.audit_projection()["validation_fingerprint"] == facts.fingerprint
+
+    proposal = ActionProposal(
+        operation_id="op-1",
+        turn_id="turn-1",
+        call_id="call-1",
+        capability_id="sqlite.update",
+        proposed_at=NOW,
+        arguments={"source_id": "source-sqlite"},
+        validation_facts=facts,
+    )
+    assert proposal.validation_facts is facts
+
+
+def test_legacy_validation_defaults_preserve_no_explicit_authority() -> None:
+    facts = ActionValidationFacts()
+    assert facts.schema_version == 0
+    assert facts.fingerprint is None
+
+    with pytest.raises(ValueError, match="legacy"):
+        ActionValidationFacts(schema_version=0, source_id="source-sqlite")
+    with pytest.raises(ValueError, match="source_id"):
+        ActionValidationFacts(schema_version=1)
+    with pytest.raises(ValueError, match="schema_version"):
+        ActionValidationFacts(schema_version=2, source_id="source-sqlite")
+    with pytest.raises(ValueError, match="cover every"):
+        ActionValidationFacts(
+            schema_version=1,
+            source_id="source-sqlite",
+            resource_ids=("resource-orders", "resource-users"),
+            resource_revisions=(("resource-orders", "sha256:" + ("a" * 64)),),
+        )
 
 
 def test_action_rejection_is_structured_immutable_and_bounded() -> None:

@@ -72,6 +72,7 @@ class GovernanceFacts:
     destructive: bool
     sensitivity_class: str
     actor_id: str
+    validation_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         for field_name, text_value in (
@@ -88,6 +89,11 @@ class GovernanceFacts:
             "capability_fingerprint",
         )
         _canonical_sha256(self.arguments_hash, "arguments_hash")
+        if self.validation_fingerprint is not None:
+            _canonical_sha256(
+                self.validation_fingerprint,
+                "validation_fingerprint",
+            )
         if not isinstance(self.access_mode, AccessMode):
             raise TypeError("access_mode must be an AccessMode")
         if not isinstance(self.risk, RiskLevel):
@@ -122,27 +128,30 @@ class GovernanceFacts:
 
     @property
     def task_fingerprint(self) -> str:
-        return _fingerprint(
-            {
-                "access_mode": self.access_mode.value,
-                "actor_id": self.actor_id,
-                "arguments_hash": self.arguments_hash,
-                "capability_fingerprint": self.capability_fingerprint,
-                "capability_id": self.capability_id,
-                "destructive": self.destructive,
-                "executor_id": self.executor_id,
-                "idempotency_key": self.idempotency_key,
-                "idempotent": self.idempotent,
-                "in_scope": self.in_scope,
-                "operation_id": self.operation_id,
-                "replay_safe": self.replay_safe,
-                "risk": self.risk.value,
-                "sensitivity_class": self.sensitivity_class,
-                "side_effecting": self.side_effecting,
-                "task_id": self.task_id,
-                "validation_passed": self.validation_passed,
-            }
-        )
+        material: dict[str, object] = {
+            "access_mode": self.access_mode.value,
+            "actor_id": self.actor_id,
+            "arguments_hash": self.arguments_hash,
+            "capability_fingerprint": self.capability_fingerprint,
+            "capability_id": self.capability_id,
+            "destructive": self.destructive,
+            "executor_id": self.executor_id,
+            "idempotency_key": self.idempotency_key,
+            "idempotent": self.idempotent,
+            "in_scope": self.in_scope,
+            "operation_id": self.operation_id,
+            "replay_safe": self.replay_safe,
+            "risk": self.risk.value,
+            "sensitivity_class": self.sensitivity_class,
+            "side_effecting": self.side_effecting,
+            "task_id": self.task_id,
+            "validation_passed": self.validation_passed,
+        }
+        # Schema-0 validation facts reproduce the exact Phase-2 fingerprint so
+        # approvals already pending in a v12 database remain resumable.
+        if self.validation_fingerprint is not None:
+            material["validation_fingerprint"] = self.validation_fingerprint
+        return _fingerprint(material)
 
 
 @dataclass(frozen=True, slots=True)

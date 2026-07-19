@@ -172,6 +172,7 @@ from ..operations.checkpoints import (
 from ..operations.governance import ApprovalRequest, ApprovalStatus
 from ..operations.leases import TaskClaimRequest, TaskLease, TaskLeaseGuard
 from ..operations.models import (
+    ActionValidationFacts,
     AgentTrigger,
     Evidence,
     Observation,
@@ -2405,6 +2406,93 @@ _HOST_MUTATION_ADMISSION_SCHEMA_SQL = (
 )
 
 
+_TASK_VALIDATION_SCHEMA_SQL = (
+    """
+    ALTER TABLE tasks ADD COLUMN validation_schema_version INTEGER NOT NULL
+        DEFAULT 0 CHECK (validation_schema_version IN (0, 1))
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_passed INTEGER NOT NULL DEFAULT 1
+        CHECK (validation_passed IN (0, 1))
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_in_scope INTEGER NOT NULL DEFAULT 1
+        CHECK (validation_in_scope IN (0, 1))
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_destructive INTEGER NOT NULL DEFAULT 0
+        CHECK (
+            validation_destructive IN (0, 1)
+            AND (
+                validation_destructive = 0
+                OR (access_mode = 'write' AND side_effecting = 1)
+            )
+        )
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_sensitivity_class TEXT NOT NULL
+        DEFAULT 'internal' CHECK (
+            length(trim(validation_sensitivity_class)) BETWEEN 1 AND 128
+            AND validation_sensitivity_class = trim(validation_sensitivity_class)
+        )
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_source_id TEXT CHECK (
+        (
+            validation_source_id IS NULL
+            AND validation_schema_version = 0
+        )
+        OR (
+            validation_source_id IS NOT NULL
+            AND length(trim(validation_source_id)) BETWEEN 1 AND 512
+            AND validation_source_id = trim(validation_source_id)
+            AND validation_schema_version >= 1
+        )
+    )
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_resource_ids_json TEXT NOT NULL
+        DEFAULT '[]'
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_resource_revisions_json TEXT NOT NULL
+        DEFAULT '[]'
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_source_revision TEXT CHECK (
+        validation_source_revision IS NULL
+        OR (
+            validation_schema_version >= 1
+            AND length(trim(validation_source_revision)) BETWEEN 1 AND 1024
+            AND validation_source_revision = trim(validation_source_revision)
+        )
+    )
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_impact_json TEXT NOT NULL DEFAULT '{}'
+        CHECK (length(validation_impact_json) <= 16384)
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_evidence_ids_json TEXT NOT NULL
+        DEFAULT '[]' CHECK (
+            validation_schema_version >= 1
+            OR (
+                validation_passed = 1
+                AND validation_in_scope = 1
+                AND validation_destructive = 0
+                AND validation_sensitivity_class = 'internal'
+                AND validation_source_id IS NULL
+                AND validation_resource_ids_json = '[]'
+                AND validation_resource_revisions_json = '[]'
+                AND validation_source_revision IS NULL
+                AND validation_impact_json = '{}'
+                AND validation_evidence_ids_json = '[]'
+            )
+        )
+    """.strip(),
+)
+
+
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
 # Migration 3 assigns one append-only committed-event sequence per agent.
@@ -2432,6 +2520,9 @@ _HOST_MUTATION_ADMISSION_SCHEMA_SQL = (
 # Migration 12 binds each local-control idempotency key to one canonical method
 # and parameter hash before dispatch. The admission ledger owns no execution or
 # result state; route owners remain responsible for replay-safe recovery.
+# Migration 13 persists validator-owned scope, sensitivity, impact, and accepted
+# prerequisite evidence on the immutable task record. Schema-zero defaults
+# preserve Phase-2 approval fingerprints for already-pending v12 operations.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -2492,6 +2583,11 @@ _MIGRATIONS = (
         version=12,
         name="bind_host_mutation_idempotency",
         statements=_HOST_MUTATION_ADMISSION_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=13,
+        name="persist_task_validation_facts",
+        statements=_TASK_VALIDATION_SCHEMA_SQL,
     ),
 )
 
@@ -12144,39 +12240,77 @@ def _insert_task(
     position: int,
     task: Task,
 ) -> None:
+    base_values = (
+        operation_id,
+        position,
+        task.id,
+        task.turn_id,
+        task.call_id,
+        task.capability_id,
+        task.executor_id,
+        task.status.value,
+        task.attempt,
+        canonical_json(task.arguments),
+        _encode_datetime(task.created_at),
+        _encode_datetime(task.updated_at),
+        task.error_code,
+        int(task.cancellation_requested),
+        task.execution_facts.capability_fingerprint,
+        task.execution_facts.arguments_hash,
+        task.execution_facts.access_mode.value,
+        task.execution_facts.risk.value,
+        int(task.execution_facts.side_effecting),
+        int(task.execution_facts.idempotent),
+        int(task.execution_facts.replay_safe),
+        task.execution_facts.idempotency_key,
+        task.manual_recovery_reason,
+    )
+    if _pragma_int(connection, "user_version") < 13:
+        if task.execution_facts.validation_facts.schema_version != 0:
+            raise ValueError(
+                "historical task schema cannot store explicit validation facts"
+            )
+        connection.execute(
+            "INSERT INTO tasks("
+            "operation_id, position, id, turn_id, call_id, capability_id, "
+            "executor_id, status, attempt, arguments_json, created_at, updated_at, "
+            "error_code, cancellation_requested, capability_fingerprint, "
+            "arguments_hash, access_mode, risk, side_effecting, idempotent, "
+            "replay_safe, idempotency_key, manual_recovery_reason"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?)",
+            base_values,
+        )
+        return
+
+    validation = task.execution_facts.validation_facts
     connection.execute(
         "INSERT INTO tasks("
         "operation_id, position, id, turn_id, call_id, capability_id, "
         "executor_id, status, attempt, arguments_json, created_at, updated_at, "
         "error_code, cancellation_requested, capability_fingerprint, "
         "arguments_hash, access_mode, risk, side_effecting, idempotent, "
-        "replay_safe, idempotency_key, manual_recovery_reason"
+        "replay_safe, idempotency_key, manual_recovery_reason, "
+        "validation_schema_version, validation_passed, validation_in_scope, "
+        "validation_destructive, validation_sensitivity_class, "
+        "validation_source_id, validation_resource_ids_json, "
+        "validation_resource_revisions_json, validation_source_revision, "
+        "validation_impact_json, validation_evidence_ids_json"
         ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-        "?, ?, ?, ?)",
+        "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            operation_id,
-            position,
-            task.id,
-            task.turn_id,
-            task.call_id,
-            task.capability_id,
-            task.executor_id,
-            task.status.value,
-            task.attempt,
-            canonical_json(task.arguments),
-            _encode_datetime(task.created_at),
-            _encode_datetime(task.updated_at),
-            task.error_code,
-            int(task.cancellation_requested),
-            task.execution_facts.capability_fingerprint,
-            task.execution_facts.arguments_hash,
-            task.execution_facts.access_mode.value,
-            task.execution_facts.risk.value,
-            int(task.execution_facts.side_effecting),
-            int(task.execution_facts.idempotent),
-            int(task.execution_facts.replay_safe),
-            task.execution_facts.idempotency_key,
-            task.manual_recovery_reason,
+            *base_values,
+            validation.schema_version,
+            int(validation.validation_passed),
+            int(validation.in_scope),
+            int(validation.destructive),
+            validation.sensitivity_class,
+            validation.source_id,
+            canonical_json(validation.resource_ids),
+            canonical_json(validation.resource_revisions),
+            validation.source_revision,
+            canonical_json(validation.impact),
+            canonical_json(validation.evidence_ids),
         ),
     )
 
@@ -12774,6 +12908,7 @@ def _decode_snapshot(
     evidence_rows = _operation_rows(connection, "evidence", operation_id)
     observation_rows = _operation_rows(connection, "observations", operation_id)
     event_rows = _operation_rows(connection, "runtime_events", operation_id)
+    has_task_validation = _pragma_int(connection, "user_version") >= 13
 
     turns = tuple(
         Turn(
@@ -12866,6 +13001,10 @@ def _decode_snapshot(
                 idempotent=_decode_bool(row["idempotent"]),
                 replay_safe=_decode_bool(row["replay_safe"]),
                 idempotency_key=_optional_text(row["idempotency_key"]),
+                validation_facts=_decode_task_validation_facts(
+                    row,
+                    enabled=has_task_validation,
+                ),
             ),
             evidence_ids=_load_task_evidence_ids(
                 connection,
@@ -13208,6 +13347,72 @@ def _decode_string_tuple(value: str) -> tuple[str, ...]:
     ):
         raise ValueError("persisted JSON value must be an array of strings")
     return tuple(decoded)
+
+
+def _decode_revision_pairs(value: str) -> tuple[tuple[str, str], ...]:
+    decoded = _decode_json(value)
+    if not isinstance(decoded, list):
+        raise ValueError("persisted revisions must be an array")
+    revisions: list[tuple[str, str]] = []
+    for item in decoded:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not all(isinstance(part, str) for part in item)
+        ):
+            raise ValueError(
+                "persisted revisions must contain identifier/revision pairs"
+            )
+        revisions.append((item[0], item[1]))
+    return tuple(revisions)
+
+
+def _decode_task_validation_facts(
+    row: sqlite3.Row,
+    *,
+    enabled: bool,
+) -> ActionValidationFacts:
+    if not enabled:
+        return ActionValidationFacts()
+    return ActionValidationFacts(
+        schema_version=_sqlite_int(
+            row["validation_schema_version"],
+            "task validation schema version",
+        ),
+        validation_passed=_decode_bool(row["validation_passed"]),
+        in_scope=_decode_bool(row["validation_in_scope"]),
+        destructive=_decode_bool(row["validation_destructive"]),
+        sensitivity_class=_sqlite_text(
+            row["validation_sensitivity_class"],
+            "task validation sensitivity class",
+        ),
+        source_id=_optional_text(row["validation_source_id"]),
+        resource_ids=_decode_string_tuple(
+            _sqlite_text(
+                row["validation_resource_ids_json"],
+                "task validation resource ids",
+            )
+        ),
+        resource_revisions=_decode_revision_pairs(
+            _sqlite_text(
+                row["validation_resource_revisions_json"],
+                "task validation resource revisions",
+            )
+        ),
+        source_revision=_optional_text(row["validation_source_revision"]),
+        impact=_decode_json_object(
+            _sqlite_text(
+                row["validation_impact_json"],
+                "task validation impact",
+            )
+        ),
+        evidence_ids=_decode_string_tuple(
+            _sqlite_text(
+                row["validation_evidence_ids_json"],
+                "task validation evidence ids",
+            )
+        ),
+    )
 
 
 def _expect_object(

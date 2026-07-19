@@ -17,6 +17,7 @@ from daita.capabilities import (
     EvidenceValidationError,
     ExecutionRequest,
     Executor,
+    ExecutorKnownNoEffectError,
     RiskLevel,
     ToolView,
 )
@@ -33,13 +34,16 @@ from daita.llm.models import (
 from daita.loop.models import LoopBudgets, LoopPhase, Readiness
 from daita.operations.models import (
     ActionProposal,
+    ActionValidationFacts,
     AgentTrigger,
     Observation,
+    TaskDependency,
     TaskStatus,
     TriggerKind,
 )
 from daita.operations.checkpoints import OperationSnapshot
 from daita.operations.governance import (
+    ApprovalStatus,
     DefaultPolicyEvaluator,
     GovernanceDecision,
     GovernanceFacts,
@@ -51,6 +55,7 @@ from daita.operations.runtime import (
     OperationStateError,
     OperationWallTimeExceeded,
     TaskExecutionTimeout,
+    TaskOutcomeUnknown,
 )
 from daita.operations.store import (
     CommitResult,
@@ -94,6 +99,21 @@ class CandidateExecutor:
     async def execute(self, request: ExecutionRequest) -> EvidenceCandidate:
         self.requests.append(request)
         return self.candidate
+
+
+class FailingExecutor(CandidateExecutor):
+    async def execute(self, request: ExecutionRequest) -> EvidenceCandidate:
+        self.requests.append(request)
+        raise RuntimeError("injected executor failure")
+
+
+class KnownNoEffectExecutor(CandidateExecutor):
+    async def execute(self, request: ExecutionRequest) -> EvidenceCandidate:
+        self.requests.append(request)
+        raise ExecutorKnownNoEffectError(
+            "precondition_changed",
+            "The write precondition changed before the transaction committed.",
+        )
 
 
 class HangingExecutor(CandidateExecutor):
@@ -352,6 +372,32 @@ def _registry(
     )
 
 
+def _unsafe_write_registry(executor: CandidateExecutor) -> CapabilityRegistry:
+    capability = replace(
+        _capability(
+            capability_id="fake.write",
+            executor_id=executor.executor_id,
+            evidence_kind="fake.write.result",
+        ),
+        access_mode=AccessMode.WRITE,
+        risk=RiskLevel.HIGH,
+        side_effecting=True,
+        idempotent=False,
+        replay_safe=False,
+    )
+    return CapabilityRegistry(
+        capabilities=(capability,),
+        executors=(executor,),
+        tool_views=(
+            ToolView(
+                name="write_fake",
+                capability_id=capability.id,
+                description="Exercise one non-replay-safe side effect.",
+            ),
+        ),
+    )
+
+
 async def _runtime_with_committed_tool_call(
     candidate: EvidenceCandidate,
     *,
@@ -365,6 +411,7 @@ async def _runtime_with_committed_tool_call(
     clock: Callable[[], datetime] = lambda: NOW,
     budgets: LoopBudgets | None = None,
     lease_duration_seconds: float = 60.0,
+    policy: DefaultPolicyEvaluator | None = None,
 ) -> tuple[OperationRuntime, CandidateExecutor, str, str]:
     executor = executor_override or CandidateExecutor("fake.read.executor", candidate)
     registry = registry_override or _registry(executor, include_other=include_other)
@@ -373,7 +420,7 @@ async def _runtime_with_committed_tool_call(
             capabilities=registry,
             clock=clock,
             store=store,
-            policy=ExecutionBoundaryTestPolicy(),
+            policy=policy or ExecutionBoundaryTestPolicy(),
             lease_duration_seconds=lease_duration_seconds,
         )
     else:
@@ -382,7 +429,7 @@ async def _runtime_with_committed_tool_call(
             clock=clock,
             id_factory=id_factory,
             store=store,
-            policy=ExecutionBoundaryTestPolicy(),
+            policy=policy or ExecutionBoundaryTestPolicy(),
             lease_duration_seconds=lease_duration_seconds,
         )
     started = await runtime.begin(
@@ -503,6 +550,392 @@ async def test_submit_executes_only_after_fenced_start_and_forwards_identity() -
         "evidence.accepted",
         "task.succeeded",
     ]
+
+
+async def test_materialization_binds_validation_evidence_and_task_dependency() -> None:
+    read_candidate = EvidenceCandidate(
+        kind="fake.read.result",
+        schema_version=1,
+        payload={"key": "alpha", "value": "BEFORE"},
+    )
+    write_candidate = EvidenceCandidate(
+        kind="fake.write.result",
+        schema_version=1,
+        payload={"key": "alpha", "value": "AFTER"},
+    )
+    read_executor = CandidateExecutor("fake.read.executor", read_candidate)
+    write_executor = CandidateExecutor("fake.write.executor", write_candidate)
+    read_capability = _capability()
+    write_capability = replace(
+        _capability(
+            capability_id="fake.write",
+            executor_id="fake.write.executor",
+            evidence_kind="fake.write.result",
+        ),
+        access_mode=AccessMode.WRITE,
+        risk=RiskLevel.HIGH,
+        side_effecting=True,
+        required_evidence_kinds=("fake.read.result",),
+    )
+    registry = CapabilityRegistry(
+        capabilities=(read_capability, write_capability),
+        executors=(read_executor, write_executor),
+        tool_views=(
+            ToolView(
+                name="read_fake",
+                capability_id=read_capability.id,
+                description="Read the current value.",
+            ),
+            ToolView(
+                name="write_fake",
+                capability_id=write_capability.id,
+                description="Write the validated value.",
+            ),
+        ),
+    )
+    runtime, _, operation_id, first_turn_id = await _runtime_with_committed_tool_call(
+        read_candidate,
+        executor_override=read_executor,
+        registry_override=registry,
+    )
+    impact_evidence = await runtime.submit(_proposal(operation_id, first_turn_id))
+    assert impact_evidence is not None
+
+    second_turn = await runtime.begin_turn(operation_id)
+    request = ModelRequest(
+        operation_id=operation_id,
+        turn_id=second_turn.id,
+        messages=(
+            CanonicalMessage(
+                agent_id="agent-1",
+                operation_id=operation_id,
+                turn_id=second_turn.id,
+                role=MessageRole.USER,
+                content=(TextBlock("Write alpha after validating impact."),),
+            ),
+        ),
+        tools=registry.tool_definitions(),
+    )
+    model_call = await runtime.begin_model_call(
+        operation_id,
+        second_turn.id,
+        "mock:scripted",
+        request,
+    )
+    await runtime.record_model_response(
+        operation_id,
+        model_call.id,
+        ModelResponse(
+            finish_reason=FinishReason.TOOL_CALLS,
+            tool_calls=(
+                ToolCall(
+                    id="call-write",
+                    name="write_fake",
+                    arguments={"key": "alpha"},
+                ),
+            ),
+        ),
+        next_phase=LoopPhase.VALIDATING_ACTION,
+    )
+    validation = ActionValidationFacts(
+        schema_version=1,
+        source_id="source-sqlite",
+        resource_ids=("resource-marker",),
+        resource_revisions=(("resource-marker", "sha256:" + ("a" * 64)),),
+        source_revision="sqlite:data-version:1",
+        impact={"affected_rows": 1, "bounded": True},
+        evidence_ids=(impact_evidence.id,),
+    )
+    result = await runtime.submit(
+        ActionProposal(
+            operation_id=operation_id,
+            turn_id=second_turn.id,
+            call_id="call-write",
+            capability_id="fake.write",
+            arguments={"key": "alpha"},
+            proposed_at=NOW,
+            validation_facts=validation,
+        )
+    )
+    assert result is not None
+
+    snapshot = await runtime.inspect(operation_id)
+    write_task = snapshot.tasks[-1]
+    assert write_task.execution_facts.validation_facts == validation
+    assert snapshot.task_dependencies[-1] == TaskDependency(
+        operation_id=operation_id,
+        task_id=write_task.id,
+        prerequisite_task_id=impact_evidence.task_id,
+    )
+    task_created = next(
+        event
+        for event in snapshot.events
+        if event.type == "task.created" and event.task_id == write_task.id
+    )
+    governance = task_created.payload["governance"]
+    assert isinstance(governance, Mapping)
+    assert governance["actor_id"] == "user:user-1"
+    validation_audit = governance["validation"]
+    assert isinstance(validation_audit, Mapping)
+    assert validation_audit["validation_fingerprint"] == validation.fingerprint
+    assert "arguments" not in governance
+
+
+async def test_materialization_rejects_missing_capability_required_evidence() -> None:
+    candidate = EvidenceCandidate(
+        kind="fake.write.result",
+        schema_version=1,
+        payload={"key": "alpha", "value": "AFTER"},
+    )
+    executor = CandidateExecutor("fake.write.executor", candidate)
+    capability = replace(
+        _capability(
+            capability_id="fake.write",
+            executor_id="fake.write.executor",
+            evidence_kind="fake.write.result",
+        ),
+        access_mode=AccessMode.WRITE,
+        risk=RiskLevel.HIGH,
+        side_effecting=True,
+        required_evidence_kinds=("fake.read.result",),
+    )
+    registry = CapabilityRegistry(
+        capabilities=(capability,),
+        executors=(executor,),
+        tool_views=(
+            ToolView(
+                name="write_fake",
+                capability_id=capability.id,
+                description="Write only after impact evidence.",
+            ),
+        ),
+    )
+    runtime, _, operation_id, turn_id = await _runtime_with_committed_tool_call(
+        candidate,
+        executor_override=executor,
+        registry_override=registry,
+        tool_calls=(
+            ToolCall(
+                id="call-1",
+                name="write_fake",
+                arguments={"key": "alpha"},
+            ),
+        ),
+    )
+    proposal = ActionProposal(
+        operation_id=operation_id,
+        turn_id=turn_id,
+        call_id="call-1",
+        capability_id=capability.id,
+        arguments={"key": "alpha"},
+        proposed_at=NOW,
+        validation_facts=ActionValidationFacts(
+            schema_version=1,
+            source_id="source-sqlite",
+            resource_ids=("resource-marker",),
+        ),
+    )
+
+    with pytest.raises(OperationStateError, match="required evidence"):
+        await runtime.submit(proposal)
+
+    snapshot = await runtime.inspect(operation_id)
+    assert snapshot.tasks == ()
+    assert executor.requests == []
+
+
+async def test_persisted_validation_failure_is_denied_without_executor_io() -> None:
+    candidate = EvidenceCandidate(
+        kind="fake.read.result",
+        schema_version=1,
+        payload={"key": "alpha", "value": "ALPHA"},
+    )
+    runtime, executor, operation_id, turn_id = await _runtime_with_committed_tool_call(
+        candidate,
+        policy=DefaultPolicyEvaluator(),
+    )
+    validation = ActionValidationFacts(
+        schema_version=1,
+        validation_passed=False,
+        source_id="source-sqlite",
+        resource_ids=("resource-marker",),
+    )
+
+    result = await runtime.submit(
+        replace(
+            _proposal(operation_id, turn_id),
+            validation_facts=validation,
+        )
+    )
+
+    assert result is None
+    assert executor.requests == []
+    snapshot = await runtime.inspect(operation_id)
+    assert snapshot.tasks[0].status is TaskStatus.FAILED
+    assert snapshot.tasks[0].error_code == "validation_failed"
+    denied = next(
+        event for event in snapshot.events if event.type == "governance.denied"
+    )
+    facts = denied.payload["facts"]
+    assert isinstance(facts, Mapping)
+    assert facts["actor_id"] == "user:user-1"
+    projected_validation = facts["validation"]
+    assert isinstance(projected_validation, Mapping)
+    assert projected_validation["validation_passed"] is False
+    assert projected_validation["validation_fingerprint"] == validation.fingerprint
+
+
+async def test_executor_known_no_effect_fails_and_releases_unsafe_write() -> None:
+    candidate = EvidenceCandidate(
+        kind="fake.write.result",
+        schema_version=1,
+        payload={"key": "alpha", "value": "UNCHANGED"},
+    )
+    executor = KnownNoEffectExecutor("fake.write.executor", candidate)
+    registry = _unsafe_write_registry(executor)
+    runtime, _, operation_id, turn_id = await _runtime_with_committed_tool_call(
+        candidate,
+        executor_override=executor,
+        registry_override=registry,
+        tool_calls=(
+            ToolCall(
+                id="call-1",
+                name="write_fake",
+                arguments={"key": "alpha"},
+            ),
+        ),
+    )
+
+    with pytest.raises(CapabilityExecutionError) as failure:
+        await runtime.submit(
+            _proposal(operation_id, turn_id, capability_id="fake.write")
+        )
+
+    assert not isinstance(failure.value, TaskOutcomeUnknown)
+    assert isinstance(failure.value.__cause__, ExecutorKnownNoEffectError)
+    snapshot = await runtime.inspect(operation_id)
+    task = snapshot.tasks[0]
+    lease = snapshot.task_leases[0]
+    assert task.status is TaskStatus.FAILED
+    assert task.error_code == "precondition_changed"
+    assert lease.released_at is not None
+    assert lease.release_reason == "precondition_changed"
+    assert not any(event.type == "task.outcome_unknown" for event in snapshot.events)
+
+
+async def test_unsafe_executor_failure_surfaces_outcome_unknown_on_submit() -> None:
+    candidate = EvidenceCandidate(
+        kind="fake.write.result",
+        schema_version=1,
+        payload={"key": "alpha", "value": "UNKNOWN"},
+    )
+    executor = FailingExecutor("fake.write.executor", candidate)
+    registry = _unsafe_write_registry(executor)
+    runtime, _, operation_id, turn_id = await _runtime_with_committed_tool_call(
+        candidate,
+        executor_override=executor,
+        registry_override=registry,
+        tool_calls=(
+            ToolCall(
+                id="call-1",
+                name="write_fake",
+                arguments={"key": "alpha"},
+            ),
+        ),
+    )
+
+    with pytest.raises(TaskOutcomeUnknown) as failure:
+        await runtime.submit(
+            _proposal(operation_id, turn_id, capability_id="fake.write")
+        )
+
+    snapshot = await runtime.inspect(operation_id)
+    assert failure.value.reason == "executor_failed"
+    assert snapshot.tasks[0].status is TaskStatus.RUNNING
+    assert snapshot.task_leases[0].released_at is None
+    assert snapshot.events[-1].type == "task.outcome_unknown"
+    assert snapshot.events[-1].payload["reason"] == "executor_failed"
+
+
+async def test_unsafe_executor_failure_surfaces_outcome_unknown_on_resume() -> None:
+    candidate = EvidenceCandidate(
+        kind="fake.write.result",
+        schema_version=1,
+        payload={"key": "alpha", "value": "UNKNOWN"},
+    )
+    executor = FailingExecutor("fake.write.executor", candidate)
+    registry = _unsafe_write_registry(executor)
+    runtime, _, operation_id, turn_id = await _runtime_with_committed_tool_call(
+        candidate,
+        executor_override=executor,
+        registry_override=registry,
+        policy=DefaultPolicyEvaluator(),
+        tool_calls=(
+            ToolCall(
+                id="call-1",
+                name="write_fake",
+                arguments={"key": "alpha"},
+            ),
+        ),
+    )
+    assert (
+        await runtime.submit(
+            _proposal(operation_id, turn_id, capability_id="fake.write")
+        )
+        is None
+    )
+    waiting = await runtime.inspect(operation_id)
+    task = waiting.tasks[0]
+    await runtime.decide_approval(
+        waiting.approvals[0].id,
+        status=ApprovalStatus.APPROVED,
+        decided_by="reviewer-1",
+        reason="Exercise ambiguous resume failure.",
+    )
+    assert await runtime.resume_approval(operation_id)
+
+    with pytest.raises(TaskOutcomeUnknown) as failure:
+        await runtime.resume_task(operation_id, task.id)
+
+    snapshot = await runtime.inspect(operation_id)
+    assert failure.value.task_id == task.id
+    assert failure.value.reason == "executor_failed"
+    assert snapshot.tasks[0].status is TaskStatus.RUNNING
+    assert snapshot.task_leases[0].released_at is None
+
+
+async def test_unsafe_rejected_evidence_surfaces_post_execution_unknown() -> None:
+    candidate = EvidenceCandidate(
+        kind="forged.kind",
+        schema_version=1,
+        payload={"key": "alpha", "value": "UNKNOWN"},
+    )
+    executor = CandidateExecutor("fake.write.executor", candidate)
+    registry = _unsafe_write_registry(executor)
+    runtime, _, operation_id, turn_id = await _runtime_with_committed_tool_call(
+        candidate,
+        executor_override=executor,
+        registry_override=registry,
+        tool_calls=(
+            ToolCall(
+                id="call-1",
+                name="write_fake",
+                arguments={"key": "alpha"},
+            ),
+        ),
+    )
+
+    with pytest.raises(TaskOutcomeUnknown) as failure:
+        await runtime.submit(
+            _proposal(operation_id, turn_id, capability_id="fake.write")
+        )
+
+    snapshot = await runtime.inspect(operation_id)
+    assert failure.value.reason == "evidence_rejected"
+    assert snapshot.tasks[0].status is TaskStatus.RUNNING
+    assert snapshot.evidence == ()
+    assert snapshot.events[-1].type == "task.outcome_unknown"
+    assert snapshot.events[-1].payload["reason"] == "evidence_rejected"
 
 
 async def test_wall_deadline_crossed_after_claim_blocks_executor_io() -> None:
@@ -666,7 +1099,8 @@ async def test_side_effect_timeout_preserves_recovery_classification(
         ),
     )
 
-    with pytest.raises(TaskExecutionTimeout):
+    expected_error = TaskExecutionTimeout if replay_safe else TaskOutcomeUnknown
+    with pytest.raises(expected_error) as failure:
         await runtime.submit(
             _proposal(
                 operation_id,
@@ -674,6 +1108,10 @@ async def test_side_effect_timeout_preserves_recovery_classification(
                 capability_id="fake.write",
             )
         )
+
+    if not replay_safe:
+        assert isinstance(failure.value, TaskOutcomeUnknown)
+        assert failure.value.reason == "task_timeout"
 
     snapshot = await runtime.inspect(operation_id)
     task = snapshot.tasks[0]
@@ -750,7 +1188,7 @@ async def test_expired_holder_cannot_annotate_unknown_side_effect_outcome() -> N
         ),
     )
 
-    with pytest.raises(TaskExecutionTimeout):
+    with pytest.raises(TaskOutcomeUnknown) as failure:
         await runtime.submit(
             _proposal(
                 operation_id,
@@ -758,6 +1196,8 @@ async def test_expired_holder_cannot_annotate_unknown_side_effect_outcome() -> N
                 capability_id="fake.write",
             )
         )
+
+    assert failure.value.reason == "task_timeout"
 
     assert executor.at_entry is not None
     assert await store.load(operation_id) == executor.at_entry
@@ -1320,7 +1760,7 @@ async def test_executor_identity_mutation_fails_the_committed_task() -> None:
     assert "evidence.accepted" not in event_types
 
 
-async def test_terminal_evidence_event_failure_leaves_task_running() -> None:
+async def test_terminal_evidence_event_failure_fails_read_task() -> None:
     execution_state = {"returned": False}
     counter = 0
     terminal_event_count = 0
@@ -1352,19 +1792,77 @@ async def test_terminal_evidence_event_failure_leaves_task_running() -> None:
         executor_override=executor,
     )
 
-    with pytest.raises(RuntimeError, match="evidence event commit failure"):
+    with pytest.raises(CapabilityExecutionError) as failure:
         await runtime.submit(_proposal(operation_id, turn_id))
 
+    assert isinstance(failure.value.__cause__, RuntimeError)
+    assert "evidence event commit failure" in str(failure.value.__cause__)
     snapshot = await runtime.inspect(operation_id)
     assert len(executor.requests) == 1
     assert len(snapshot.tasks) == 1
-    assert snapshot.tasks[0].status is TaskStatus.RUNNING
+    assert snapshot.tasks[0].status is TaskStatus.FAILED
+    assert snapshot.tasks[0].error_code == "evidence_commit_failed"
     assert snapshot.evidence == ()
     event_types = [event.type for event in snapshot.events]
-    assert event_types[-1] == "executor.started"
+    assert event_types[-2:] == ["task.failed", "executor.failed"]
     assert "executor.completed" not in event_types
     assert "evidence.accepted" not in event_types
     assert "task.succeeded" not in event_types
+
+
+async def test_unsafe_terminal_event_failure_surfaces_outcome_unknown() -> None:
+    execution_state = {"returned": False}
+    counter = 0
+    terminal_event_count = 0
+
+    class ReturnFlaggingExecutor(CandidateExecutor):
+        async def execute(self, request: ExecutionRequest) -> EvidenceCandidate:
+            self.requests.append(request)
+            execution_state["returned"] = True
+            return self.candidate
+
+    def fail_during_evidence_events(prefix: str) -> str:
+        nonlocal counter, terminal_event_count
+        counter += 1
+        if execution_state["returned"] and prefix == "event":
+            terminal_event_count += 1
+            if terminal_event_count == 2:
+                raise RuntimeError("injected evidence event commit failure")
+        return f"{prefix}-{counter}"
+
+    candidate = EvidenceCandidate(
+        kind="fake.write.result",
+        schema_version=1,
+        payload={"key": "alpha", "value": "UNKNOWN"},
+    )
+    executor = ReturnFlaggingExecutor("fake.write.executor", candidate)
+    registry = _unsafe_write_registry(executor)
+    runtime, _, operation_id, turn_id = await _runtime_with_committed_tool_call(
+        candidate,
+        id_factory=fail_during_evidence_events,
+        executor_override=executor,
+        registry_override=registry,
+        tool_calls=(
+            ToolCall(
+                id="call-1",
+                name="write_fake",
+                arguments={"key": "alpha"},
+            ),
+        ),
+    )
+
+    with pytest.raises(TaskOutcomeUnknown) as failure:
+        await runtime.submit(
+            _proposal(operation_id, turn_id, capability_id="fake.write")
+        )
+
+    snapshot = await runtime.inspect(operation_id)
+    assert failure.value.reason == "evidence_commit_failed"
+    assert snapshot.tasks[0].status is TaskStatus.RUNNING
+    assert snapshot.task_leases[0].released_at is None
+    assert snapshot.evidence == ()
+    assert snapshot.events[-1].type == "task.outcome_unknown"
+    assert snapshot.events[-1].payload["reason"] == "evidence_commit_failed"
 
 
 async def test_observation_event_failure_preserves_succeeded_task_and_evidence() -> (

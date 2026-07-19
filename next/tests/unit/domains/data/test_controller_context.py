@@ -131,6 +131,13 @@ class CatalogReader:
     ) -> bool:
         return False
 
+    async def is_writable_sqlite_source(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> bool:
+        return False
+
     async def catalog_context(
         self,
         agent_id: str,

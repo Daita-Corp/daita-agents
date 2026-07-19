@@ -32,7 +32,10 @@ from ..catalog.models import (
     catalog_resource_id,
 )
 from ..capabilities import ExtensionDeclarations
-from ..domains.data.capabilities import sqlite_query_extension_declarations
+from ..domains.data.capabilities import (
+    sqlite_query_extension_declarations,
+    sqlite_update_extension_declarations,
+)
 from .models import (
     DiscoveryRequest,
     DiscoveryResult,
@@ -59,6 +62,11 @@ class SQLiteSourceError(ResourceAdapterError):
 class SQLiteSource:
     path: str | Path
     name: str | None = None
+    allow_writes: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.allow_writes, bool):
+            raise TypeError("allow_writes must be a boolean")
 
     async def open(
         self,
@@ -67,14 +75,17 @@ class SQLiteSource:
         attached_at: datetime,
         clock: Callable[[], datetime],
     ) -> SQLiteResourceAdapter:
-        path = _safe_source_path(self.path)
+        path = _safe_source_path(self.path, require_writable=self.allow_writes)
         display_name = self.name or path.stem
+        configuration: dict[str, object] = {"path": str(path)}
+        if self.allow_writes:
+            configuration["write_access"] = True
         registration = SourceRegistration.build(
             agent_id=agent_id,
             adapter_id="sqlite",
             native_identity=str(path),
             display_name=display_name,
-            configuration={"path": str(path)},
+            configuration=configuration,
             attached_at=attached_at,
         )
         try:
@@ -112,7 +123,15 @@ class SQLiteResourceAdapter:
         return self._registration
 
     def declarations(self) -> ExtensionDeclarations:
-        return sqlite_query_extension_declarations()
+        query = sqlite_query_extension_declarations()
+        if self._registration.configuration.get("write_access") is not True:
+            return query
+        update = sqlite_update_extension_declarations()
+        return ExtensionDeclarations(
+            capabilities=(*query.capabilities, *update.capabilities),
+            executor_ids=(*query.executor_ids, *update.executor_ids),
+            tool_views=(*query.tool_views, *update.tool_views),
+        )
 
     async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
         self._require_request(request)
@@ -281,11 +300,16 @@ class _TableFacts:
     facet: CatalogFacet
 
 
-def _safe_source_path(value: str | Path) -> Path:
+def _safe_source_path(
+    value: str | Path,
+    *,
+    require_writable: bool = False,
+) -> Path:
     lexical = Path(os.path.abspath(os.fspath(value)))
     try:
         resolved = lexical.resolve(strict=True)
-        descriptor = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        access = os.O_RDWR if require_writable else os.O_RDONLY
+        descriptor = os.open(resolved, access | getattr(os, "O_NOFOLLOW", 0))
     except OSError as error:
         raise SQLiteSourceError(
             "sqlite_path_invalid",
@@ -341,24 +365,17 @@ def _discover(
     try:
         connection.execute("BEGIN")
         schema_version = int(connection.execute("PRAGMA schema_version").fetchone()[0])
-        rows = connection.execute(
-            "SELECT name, type, sql FROM sqlite_schema "
-            "WHERE type IN ('table', 'view') ORDER BY name"
-        ).fetchall()
-        virtual_names = {
-            str(row["name"])
-            for row in rows
-            if row["type"] == "table"
-            and isinstance(row["sql"], str)
-            and re.search(r"\bUSING\s+fts[345]\b", row["sql"], re.IGNORECASE)
-        }
+        rows = connection.execute("PRAGMA table_list").fetchall()
         visible = tuple(
-            row
-            for row in rows
-            if not str(row["name"]).startswith("sqlite_")
-            and not any(
-                str(row["name"]) == name or str(row["name"]).startswith(f"{name}_")
-                for name in virtual_names
+            sorted(
+                (
+                    row
+                    for row in rows
+                    if row["schema"] == "main"
+                    and row["type"] in {"table", "view"}
+                    and not str(row["name"]).startswith("sqlite_")
+                ),
+                key=lambda row: (str(row["name"]), str(row["type"])),
             )
         )
         if len(visible) > request.max_resources:

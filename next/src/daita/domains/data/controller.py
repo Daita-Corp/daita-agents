@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
+import hashlib
 import re
 from typing import Protocol
 
+from ..._json import canonical_json
 from ...capabilities import CapabilityInputError, CapabilityRegistry
 from ...catalog.capabilities import (
     CATALOG_INSPECT_CAPABILITY_ID,
@@ -18,8 +20,11 @@ from ...operations.checkpoints import OperationSnapshot
 from ...operations.models import (
     ActionProposal,
     ActionRejection,
+    ActionValidationFacts,
     Evidence,
     Observation,
+    Task,
+    TaskStatus,
 )
 from .comparison import (
     TABULAR_COMPARE_CAPABILITY_ID,
@@ -29,10 +34,21 @@ from .file_capabilities import (
     LOCAL_FILE_READ_CAPABILITY_ID,
     LOCAL_FILE_READ_EVIDENCE_KIND,
 )
-from .sql import ResourceSchema, validate_sqlite_read
+from .sql import (
+    ResourceSchema,
+    SQLiteUpdateRecipe,
+    validate_sqlite_read,
+    validate_sqlite_update_recipe,
+)
 
 SQLITE_QUERY_CAPABILITY_ID = "data.sqlite.query"
 SQLITE_QUERY_EVIDENCE_KIND = "data.sqlite.query_result"
+SQLITE_UPDATE_IMPACT_CAPABILITY_ID = "data.sqlite.update_impact"
+SQLITE_UPDATE_IMPACT_EVIDENCE_KIND = "data.sqlite.update_impact"
+SQLITE_UPDATE_IMPACT_TOOL_NAME = "data_preview_sqlite_update"
+SQLITE_UPDATE_CAPABILITY_ID = "data.sqlite.update"
+SQLITE_UPDATE_EVIDENCE_KIND = "data.sqlite.update_result"
+SQLITE_UPDATE_TOOL_NAME = "data_update_sqlite"
 
 
 def _utc_now() -> datetime:
@@ -57,6 +73,12 @@ class CatalogDataReader(CatalogSchemaReader, Protocol):
         agent_id: str,
         source_id: str,
         resource_id: str,
+    ) -> bool: ...
+
+    async def is_writable_sqlite_source(
+        self,
+        agent_id: str,
+        source_id: str,
     ) -> bool: ...
 
 
@@ -141,8 +163,20 @@ class DataDomainController:
                     code="catalog.invalid_resource_id",
                     message="Catalog inspection requires one bounded resource ID.",
                 )
+        validation_facts = ActionValidationFacts()
         if capability.id == SQLITE_QUERY_CAPABILITY_ID:
             rejection = await self._validate_sql(arguments, operation)
+            if rejection is not None:
+                return rejection
+        if capability.id in {
+            SQLITE_UPDATE_IMPACT_CAPABILITY_ID,
+            SQLITE_UPDATE_CAPABILITY_ID,
+        }:
+            rejection, validation_facts = await self._validate_sqlite_update(
+                arguments,
+                operation,
+                require_impact=capability.id == SQLITE_UPDATE_CAPABILITY_ID,
+            )
             if rejection is not None:
                 return rejection
         if capability.id == LOCAL_FILE_READ_CAPABILITY_ID:
@@ -163,6 +197,7 @@ class DataDomainController:
             capability_id=view.capability_id,
             arguments=arguments,
             proposed_at=self._clock(),
+            validation_facts=validation_facts,
         )
 
     async def _validate_sql(
@@ -221,6 +256,119 @@ class DataDomainController:
                 "issue_codes": list(result.issue_codes[:8]),
                 "source_id": source_id,
             },
+        )
+
+    async def _validate_sqlite_update(
+        self,
+        arguments: Mapping[str, object],
+        operation: OperationSnapshot,
+        *,
+        require_impact: bool,
+    ) -> tuple[ActionRejection | None, ActionValidationFacts]:
+        source_id = arguments["source_id"]
+        resource_id = arguments["resource_id"]
+        key_column = arguments["key_column"]
+        key_value = arguments["key_value"]
+        target_column = arguments["target_column"]
+        expected_value = arguments["expected_value"]
+        new_value = arguments["new_value"]
+        assert isinstance(source_id, str)
+        assert isinstance(resource_id, str)
+        assert isinstance(key_column, str)
+        assert isinstance(key_value, str)
+        assert isinstance(target_column, str)
+        assert isinstance(expected_value, str)
+        assert isinstance(new_value, str)
+        try:
+            resources = await self._catalog.resource_schemas(
+                operation.operation.agent_id,
+                source_id,
+            )
+            source_write_access = await self._catalog.is_writable_sqlite_source(
+                operation.operation.agent_id,
+                source_id,
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return (
+                ActionRejection(
+                    code="data.sqlite_update.catalog_scope_unavailable",
+                    message=(
+                        "Current catalog and source write-access facts are required "
+                        "for a controlled SQLite update."
+                    ),
+                    details={"source_id": source_id},
+                ),
+                ActionValidationFacts(),
+            )
+        result = validate_sqlite_update_recipe(
+            source_id=source_id,
+            resource_id=resource_id,
+            key_column=key_column,
+            key_value=key_value,
+            target_column=target_column,
+            expected_value=expected_value,
+            new_value=new_value,
+            resources=resources,
+            source_write_access=source_write_access,
+        )
+        if not result.valid:
+            primary = result.issues[0]
+            return (
+                ActionRejection(
+                    code=f"data.sqlite_update.{primary.code}",
+                    message=primary.message,
+                    details={
+                        "issue_codes": list(result.issue_codes[:8]),
+                        "source_id": source_id,
+                    },
+                ),
+                ActionValidationFacts(),
+            )
+        recipe = result.recipe
+        assert recipe is not None
+        if not require_impact:
+            return None, _sqlite_update_validation_facts(recipe)
+
+        impact_evidence_id = arguments.get("impact_evidence_id")
+        if not isinstance(impact_evidence_id, str) or not impact_evidence_id.strip():
+            return (
+                ActionRejection(
+                    code="data.sqlite_update.impact_evidence_unavailable",
+                    message=(
+                        "The controlled update requires accepted impact evidence "
+                        "from this operation."
+                    ),
+                ),
+                ActionValidationFacts(),
+            )
+        impact_evidence = next(
+            (
+                evidence
+                for evidence in operation.evidence
+                if evidence.id == impact_evidence_id
+                and evidence.operation_id == operation.operation.id
+                and evidence.accepted
+            ),
+            None,
+        )
+        if impact_evidence is None or not _matches_sqlite_update_impact(
+            impact_evidence,
+            recipe,
+        ):
+            return (
+                ActionRejection(
+                    code="data.sqlite_update.impact_evidence_invalid",
+                    message=(
+                        "Impact evidence must exactly match the current update "
+                        "recipe, catalog revisions, and single-row bound."
+                    ),
+                    details={"impact_evidence_id": impact_evidence_id},
+                ),
+                ActionValidationFacts(),
+            )
+        return None, _sqlite_update_validation_facts(
+            recipe,
+            impact_evidence=impact_evidence,
         )
 
     async def _validate_file_read(
@@ -383,11 +531,17 @@ class DataDomainController:
             for evidence in operation.evidence
             if evidence.accepted and evidence.kind == TABULAR_COMPARE_EVIDENCE_KIND
         )
+        accepted_updates = tuple(
+            evidence
+            for evidence in operation.evidence
+            if evidence.accepted and evidence.kind == SQLITE_UPDATE_EVIDENCE_KIND
+        )
         message = operation.trigger.payload.get("message")
         normalized_message = message.casefold() if isinstance(message, str) else ""
         comparison_requested = bool(accepted_comparisons) or _requests_comparison(
             normalized_message
         )
+        denied_updates = _denied_sqlite_updates(operation)
         missing: list[str] = []
         if comparison_requested:
             grounded = _grounded_comparisons(
@@ -406,9 +560,24 @@ class DataDomainController:
                 for comparison in grounded
             ) and not _discloses_partial_coverage(text):
                 missing.append("an explicit partial or truncation disclosure")
-        elif not accepted_reads:
+        elif denied_updates and not accepted_updates:
+            denied_impact = tuple(
+                evidence for _, evidence in denied_updates if evidence.accepted
+            )
+            if not _discloses_update_denial(text):
+                missing.append("an explicit statement that the update was not applied")
+            if not any(
+                f"[evidence:{evidence.id}]" in text for evidence in denied_impact
+            ):
+                missing.append(
+                    "a citation to the accepted impact evidence for the denied update"
+                )
+        elif not (*accepted_reads, *accepted_updates):
             missing.append("accepted current-operation data evidence")
-        elif not any(f"[evidence:{item.id}]" in text for item in accepted_reads):
+        elif not any(
+            f"[evidence:{item.id}]" in text
+            for item in (*accepted_reads, *accepted_updates)
+        ):
             missing.append("an explicit [evidence:<id>] citation to data evidence")
         if missing:
             return Readiness(
@@ -424,6 +593,184 @@ class DataDomainController:
             message="The data answer is grounded in cited accepted evidence.",
             evaluated_at=self._clock(),
         )
+
+
+def _sqlite_update_validation_facts(
+    recipe: SQLiteUpdateRecipe,
+    *,
+    impact_evidence: Evidence | None = None,
+) -> ActionValidationFacts:
+    impact: dict[str, object] = {
+        "maximum_rows": 1,
+        "recipe_fingerprint": recipe.recipe_fingerprint,
+        "rollback_available": False,
+    }
+    evidence_ids: tuple[str, ...] = ()
+    if impact_evidence is not None:
+        impact.update(
+            {
+                "eligible_rows": 1,
+                "estimated_rows": 1,
+                "evidence_content_hash": impact_evidence.content_hash,
+                "matched_rows": 1,
+            }
+        )
+        evidence_ids = (impact_evidence.id,)
+    return ActionValidationFacts(
+        schema_version=1,
+        validation_passed=True,
+        in_scope=True,
+        destructive=False,
+        sensitivity_class=recipe.sensitivity_class,
+        source_id=recipe.source_id,
+        resource_ids=(recipe.resource_id,),
+        resource_revisions=((recipe.resource_id, recipe.resource_revision),),
+        source_revision=recipe.source_revision,
+        impact=impact,
+        evidence_ids=evidence_ids,
+    )
+
+
+def _matches_sqlite_update_impact(
+    evidence: Evidence,
+    recipe: SQLiteUpdateRecipe,
+) -> bool:
+    expected_keys = {
+        "eligible_rows",
+        "key_column",
+        "matched_rows",
+        "maximum_rows",
+        "recipe_fingerprint",
+        "resource_id",
+        "resource_revision",
+        "source_id",
+        "source_revision",
+        "target_column",
+    }
+    payload = evidence.payload
+    expected_content_hash = (
+        "sha256:" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+    )
+    return (
+        evidence.kind == SQLITE_UPDATE_IMPACT_EVIDENCE_KIND
+        and evidence.capability_id == SQLITE_UPDATE_IMPACT_CAPABILITY_ID
+        and evidence.schema_version == 1
+        and evidence.blob_id is None
+        and evidence.content_hash == expected_content_hash
+        and set(payload) == expected_keys
+        and payload.get("source_id") == recipe.source_id
+        and payload.get("resource_id") == recipe.resource_id
+        and payload.get("resource_revision") == recipe.resource_revision
+        and payload.get("source_revision") == recipe.source_revision
+        and payload.get("key_column") == recipe.key_column
+        and payload.get("target_column") == recipe.target_column
+        and payload.get("recipe_fingerprint") == recipe.recipe_fingerprint
+        and type(payload.get("matched_rows")) is int
+        and payload.get("matched_rows") == 1
+        and type(payload.get("eligible_rows")) is int
+        and payload.get("eligible_rows") == 1
+        and type(payload.get("maximum_rows")) is int
+        and payload.get("maximum_rows") == 1
+    )
+
+
+def _denied_sqlite_updates(
+    operation: OperationSnapshot,
+) -> tuple[tuple[Task, Evidence], ...]:
+    evidence_by_id = {
+        evidence.id: evidence for evidence in operation.evidence if evidence.accepted
+    }
+    denied: list[tuple[Task, Evidence]] = []
+    for task in operation.tasks:
+        if (
+            task.capability_id != SQLITE_UPDATE_CAPABILITY_ID
+            or task.status is not TaskStatus.FAILED
+            or task.error_code
+            not in {
+                "approval_denied",
+                "destructive_denied",
+                "out_of_scope",
+                "validation_failed",
+            }
+            or not any(
+                observation.task_id == task.id
+                and not observation.success
+                and observation.code == task.error_code
+                for observation in operation.observations
+            )
+        ):
+            continue
+        validation = task.execution_facts.validation_facts
+        for evidence_id in validation.evidence_ids:
+            evidence = evidence_by_id.get(evidence_id)
+            if evidence is not None and _matches_denied_update_impact(
+                evidence,
+                task,
+            ):
+                denied.append((task, evidence))
+                break
+    return tuple(denied)
+
+
+def _matches_denied_update_impact(evidence: Evidence, task: Task) -> bool:
+    validation = task.execution_facts.validation_facts
+    revisions = dict(validation.resource_revisions)
+    resource_id = evidence.payload.get("resource_id")
+    expected_content_hash = (
+        "sha256:"
+        + hashlib.sha256(canonical_json(evidence.payload).encode("utf-8")).hexdigest()
+    )
+    expected_keys = {
+        "eligible_rows",
+        "key_column",
+        "matched_rows",
+        "maximum_rows",
+        "recipe_fingerprint",
+        "resource_id",
+        "resource_revision",
+        "source_id",
+        "source_revision",
+        "target_column",
+    }
+    return (
+        evidence.operation_id == task.operation_id
+        and evidence.kind == SQLITE_UPDATE_IMPACT_EVIDENCE_KIND
+        and evidence.capability_id == SQLITE_UPDATE_IMPACT_CAPABILITY_ID
+        and evidence.schema_version == 1
+        and evidence.blob_id is None
+        and evidence.content_hash == expected_content_hash
+        and validation.impact.get("evidence_content_hash") == evidence.content_hash
+        and set(evidence.payload) == expected_keys
+        and evidence.payload.get("source_id") == validation.source_id
+        and isinstance(resource_id, str)
+        and resource_id in validation.resource_ids
+        and evidence.payload.get("resource_revision") == revisions.get(resource_id)
+        and evidence.payload.get("source_revision") == validation.source_revision
+        and evidence.payload.get("recipe_fingerprint")
+        == validation.impact.get("recipe_fingerprint")
+        and type(evidence.payload.get("matched_rows")) is int
+        and evidence.payload.get("matched_rows") == 1
+        and type(evidence.payload.get("eligible_rows")) is int
+        and evidence.payload.get("eligible_rows") == 1
+        and type(evidence.payload.get("maximum_rows")) is int
+        and evidence.payload.get("maximum_rows") == 1
+    )
+
+
+def _discloses_update_denial(text: str) -> bool:
+    prose = re.sub(r"\[evidence:[^\]\r\n]{1,512}\]", "", text).casefold()
+    return (
+        re.search(
+            r"\b(?:update|write|change)\b.{0,48}\b(?:denied|rejected|declined|"
+            r"not approved|not applied|not executed|not performed)\b|"
+            r"\bno\b.{0,24}\b(?:update|write|change)\b.{0,24}"
+            r"\b(?:applied|executed|performed|made)\b|"
+            r"\bdid not\b.{0,24}\b(?:apply|execute|perform|make)\b.{0,24}"
+            r"\b(?:update|write|change)\b",
+            prose,
+        )
+        is not None
+    )
 
 
 def _grounded_comparisons(
@@ -502,4 +849,10 @@ __all__ = [
     "DataDomainController",
     "SQLITE_QUERY_CAPABILITY_ID",
     "SQLITE_QUERY_EVIDENCE_KIND",
+    "SQLITE_UPDATE_CAPABILITY_ID",
+    "SQLITE_UPDATE_EVIDENCE_KIND",
+    "SQLITE_UPDATE_IMPACT_CAPABILITY_ID",
+    "SQLITE_UPDATE_IMPACT_EVIDENCE_KIND",
+    "SQLITE_UPDATE_IMPACT_TOOL_NAME",
+    "SQLITE_UPDATE_TOOL_NAME",
 ]

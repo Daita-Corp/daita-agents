@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import os
 import sqlite3
 import threading
 import tomllib
 
 import pytest
 
-from daita import Agent
+from daita import Agent, SQLiteSource
 from daita.agent import (
     AgentHomeError,
     AgentIdentityMismatchError,
@@ -132,6 +133,24 @@ async def test_create_reopen_identity_manifest_and_default_v1_isolation(
     assert reopened.name == "atlas"
     await reopened.close()
     assert sentinel.read_text(encoding="utf-8") == "v1"
+
+
+async def test_writable_sources_cannot_alias_authoritative_agent_state(
+    tmp_path: Path,
+) -> None:
+    agent = await Agent.create("atlas", root=tmp_path, clock=lambda: NOW)
+    state_path = agent.home / "state.db"
+    hardlink = tmp_path / "state-hardlink.db"
+    os.link(state_path, hardlink)
+    try:
+        for candidate in (state_path, hardlink):
+            with pytest.raises(
+                AgentHomeError,
+                match="cannot target protected agent state",
+            ):
+                await agent.attach(SQLiteSource(candidate, allow_writes=True))
+    finally:
+        await agent.close()
 
 
 @pytest.mark.parametrize("name", ("../atlas", "a/b", ".", "", "atlas.toml"))

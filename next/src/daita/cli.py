@@ -270,7 +270,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     attach_source.add_argument("kind", choices=("sqlite", "local_files"))
     attach_source.add_argument("path")
-    _params(attach_source, "kind", "path")
+    attach_source.add_argument(
+        "--write-access",
+        action="store_true",
+        default=None,
+        help="explicitly enable controlled SQLite writes",
+    )
+    _params(attach_source, "kind", "path", "write_access")
 
     model = commands.add_parser("model", help="model configuration status")
     model_commands = model.add_subparsers(dest="_action", required=True)

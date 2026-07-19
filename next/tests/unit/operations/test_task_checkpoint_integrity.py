@@ -26,7 +26,9 @@ from daita.operations.checkpoints import (
 )
 from daita.operations.leases import TaskLease
 from daita.operations.models import (
+    ActionValidationFacts,
     AgentTrigger,
+    Evidence,
     Operation,
     OperationStatus,
     Task,
@@ -328,6 +330,57 @@ def test_dependencies_reject_cycles_across_the_operation_graph() -> None:
                 _dependency("task-c", "task-a"),
             ),
         )
+
+
+def test_validation_evidence_requires_accepted_snapshot_evidence_and_dependency() -> (
+    None
+):
+    base = _snapshot()
+    evidence = Evidence(
+        id="evidence-impact",
+        operation_id=base.operation.id,
+        task_id="task-b",
+        turn_id="turn-1",
+        capability_id="fake.read",
+        executor_id="fake.executor",
+        kind="fake.impact",
+        schema_version=1,
+        attempt=1,
+        accepted=True,
+        payload={"affected_rows": 1},
+        content_hash="sha256:" + ("a" * 64),
+        created_at=NOW,
+    )
+    source_task = replace(
+        base.tasks[1],
+        status=TaskStatus.SUCCEEDED,
+        evidence_ids=(evidence.id,),
+    )
+    validation = ActionValidationFacts(
+        schema_version=1,
+        source_id="source-sqlite",
+        impact={"affected_rows": 1},
+        evidence_ids=(evidence.id,),
+    )
+    target_task = replace(
+        base.tasks[0],
+        execution_facts=replace(
+            base.tasks[0].execution_facts,
+            validation_facts=validation,
+        ),
+    )
+    dependency = _dependency(target_task.id, source_task.id)
+
+    valid = replace(
+        base,
+        tasks=(target_task, source_task, base.tasks[2]),
+        task_dependencies=(dependency,),
+        evidence=(evidence,),
+    )
+    assert valid.tasks[0].execution_facts.validation_facts == validation
+
+    with pytest.raises(ValueError, match="prerequisite edge"):
+        replace(valid, task_dependencies=())
 
 
 def test_leases_must_bind_existing_tasks_in_the_same_operation() -> None:

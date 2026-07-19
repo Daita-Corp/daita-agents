@@ -143,6 +143,32 @@ async def test_sqlite_discovery_builds_complete_catalog_snapshot(
     }
 
 
+async def test_discovery_excludes_rtree_virtual_and_shadow_tables(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "rtree.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE places (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE VIRTUAL TABLE place_bounds USING rtree(
+                id,
+                min_x,
+                max_x,
+                min_y,
+                max_y
+            );
+            """)
+    adapter = await _open(database)
+
+    try:
+        result = await adapter.discover(_request(adapter))
+    finally:
+        await adapter.close()
+
+    assert tuple(resource.name for resource in result.snapshot.resources) == ("places",)
+    assert result.snapshot.sync.resource_count == 1
+
+
 async def test_discovery_keeps_ids_and_structural_revisions_stable(
     tmp_path: Path,
 ) -> None:

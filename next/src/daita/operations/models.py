@@ -12,6 +12,10 @@ import re
 from .._json import FrozenJsonObject, canonical_json
 from ..capabilities import AccessMode, RiskLevel
 
+_CANONICAL_SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_MAX_VALIDATION_ITEMS = 256
+_MAX_IMPACT_CHARACTERS = 16_384
+
 
 def _required_text(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
@@ -127,6 +131,200 @@ class Operation:
 
 
 @dataclass(frozen=True, slots=True)
+class ActionValidationFacts:
+    """Validator-owned authority bound to one proposed and materialized action."""
+
+    schema_version: int = 0
+    validation_passed: bool = True
+    in_scope: bool = True
+    destructive: bool = False
+    sensitivity_class: str = "internal"
+    source_id: str | None = None
+    resource_ids: tuple[str, ...] = ()
+    resource_revisions: tuple[tuple[str, str], ...] = ()
+    source_revision: str | None = None
+    impact: Mapping[str, object] = field(default_factory=dict)
+    evidence_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.schema_version, int)
+            or isinstance(self.schema_version, bool)
+            or self.schema_version not in {0, 1}
+        ):
+            raise ValueError("validation schema_version must be 0 or 1")
+        for field_name, value in (
+            ("validation_passed", self.validation_passed),
+            ("in_scope", self.in_scope),
+            ("destructive", self.destructive),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"validation {field_name} must be a boolean")
+
+        _required_text(self.sensitivity_class, "validation sensitivity_class")
+        if (
+            self.sensitivity_class != self.sensitivity_class.strip()
+            or len(self.sensitivity_class) > 128
+        ):
+            raise ValueError(
+                "validation sensitivity_class must be bounded text without "
+                "surrounding whitespace"
+            )
+        if self.source_id is not None:
+            _required_text(self.source_id, "validation source_id")
+            if self.source_id != self.source_id.strip() or len(self.source_id) > 512:
+                raise ValueError(
+                    "validation source_id must be bounded text without surrounding "
+                    "whitespace"
+                )
+        if self.source_revision is not None:
+            _required_text(self.source_revision, "validation source_revision")
+            if (
+                self.source_revision != self.source_revision.strip()
+                or len(self.source_revision) > 1_024
+            ):
+                raise ValueError(
+                    "validation source_revision must be bounded text without "
+                    "surrounding whitespace"
+                )
+
+        resource_ids = self._text_tuple(
+            self.resource_ids,
+            "resource_ids",
+            maximum=_MAX_VALIDATION_ITEMS,
+        )
+        evidence_ids = self._text_tuple(
+            self.evidence_ids,
+            "evidence_ids",
+            maximum=_MAX_VALIDATION_ITEMS,
+        )
+        if isinstance(self.resource_revisions, (str, bytes)):
+            raise TypeError("validation resource_revisions must be a sequence")
+        resource_revisions = tuple(tuple(item) for item in self.resource_revisions)
+        if len(resource_revisions) > _MAX_VALIDATION_ITEMS:
+            raise ValueError("validation resource_revisions exceed the item limit")
+        for item in resource_revisions:
+            if len(item) != 2:
+                raise ValueError(
+                    "validation resource_revisions must contain identifier/revision "
+                    "pairs"
+                )
+            resource_id, revision = item
+            _required_text(resource_id, "validation resource revision id")
+            if resource_id not in resource_ids:
+                raise ValueError(
+                    "validation resource revision references an unscoped resource"
+                )
+            if (
+                not isinstance(revision, str)
+                or _CANONICAL_SHA256.fullmatch(revision) is None
+            ):
+                raise ValueError(
+                    "validation resource revision must be a canonical lowercase "
+                    "sha256 hash"
+                )
+        resource_revisions = tuple(sorted(resource_revisions))
+        revision_ids = tuple(item[0] for item in resource_revisions)
+        if len(revision_ids) != len(set(revision_ids)):
+            raise ValueError("validation resource revisions must be unique")
+        if resource_revisions and set(revision_ids) != set(resource_ids):
+            raise ValueError(
+                "validation resource revisions must cover every scoped resource"
+            )
+
+        impact = FrozenJsonObject.from_mapping(self.impact)
+        if len(canonical_json(impact)) > _MAX_IMPACT_CHARACTERS:
+            raise ValueError("validation impact facts must be bounded")
+
+        object.__setattr__(self, "resource_ids", resource_ids)
+        object.__setattr__(self, "resource_revisions", resource_revisions)
+        object.__setattr__(self, "impact", impact)
+        object.__setattr__(self, "evidence_ids", evidence_ids)
+
+        if self.schema_version == 0:
+            if (
+                not self.validation_passed
+                or not self.in_scope
+                or self.destructive
+                or self.sensitivity_class != "internal"
+                or self.source_id is not None
+                or resource_ids
+                or resource_revisions
+                or self.source_revision is not None
+                or impact
+                or evidence_ids
+            ):
+                raise ValueError(
+                    "legacy validation facts cannot contain explicit authority"
+                )
+        elif self.source_id is None:
+            raise ValueError("explicit validation facts require source_id")
+
+    @staticmethod
+    def _text_tuple(
+        values: tuple[str, ...],
+        field_name: str,
+        *,
+        maximum: int,
+    ) -> tuple[str, ...]:
+        if isinstance(values, (str, bytes)):
+            raise TypeError(f"validation {field_name} must be a sequence of strings")
+        normalized = tuple(values)
+        if len(normalized) > maximum:
+            raise ValueError(f"validation {field_name} exceed the item limit")
+        for value in normalized:
+            _required_text(value, f"validation {field_name} item")
+            if value != value.strip() or len(value) > 512:
+                raise ValueError(
+                    f"validation {field_name} must contain bounded text without "
+                    "surrounding whitespace"
+                )
+        if len(normalized) != len(set(normalized)):
+            raise ValueError(f"validation {field_name} must be unique")
+        return normalized
+
+    @property
+    def fingerprint(self) -> str | None:
+        """Return no extra hash for legacy facts, preserving v12 approvals."""
+
+        if self.schema_version == 0:
+            return None
+        material = {
+            "destructive": self.destructive,
+            "evidence_ids": self.evidence_ids,
+            "impact": self.impact,
+            "in_scope": self.in_scope,
+            "resource_ids": self.resource_ids,
+            "resource_revisions": self.resource_revisions,
+            "schema_version": self.schema_version,
+            "sensitivity_class": self.sensitivity_class,
+            "source_id": self.source_id,
+            "source_revision": self.source_revision,
+            "validation_passed": self.validation_passed,
+        }
+        encoded = canonical_json(material).encode("utf-8")
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    def audit_projection(self) -> dict[str, object]:
+        """Return a bounded argument-free projection for audit and inspection."""
+
+        return {
+            "schema_version": self.schema_version,
+            "validation_passed": self.validation_passed,
+            "in_scope": self.in_scope,
+            "destructive": self.destructive,
+            "sensitivity_class": self.sensitivity_class,
+            "source_id": self.source_id,
+            "resource_ids": self.resource_ids,
+            "resource_revisions": self.resource_revisions,
+            "source_revision": self.source_revision,
+            "impact": self.impact,
+            "evidence_ids": self.evidence_ids,
+            "validation_fingerprint": self.fingerprint,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ActionProposal:
     operation_id: str
     turn_id: str
@@ -134,6 +332,9 @@ class ActionProposal:
     capability_id: str
     proposed_at: datetime
     arguments: Mapping[str, object] = field(default_factory=dict)
+    validation_facts: ActionValidationFacts = field(
+        default_factory=ActionValidationFacts
+    )
 
     def __post_init__(self) -> None:
         _required_text(self.operation_id, "proposal operation_id")
@@ -141,6 +342,10 @@ class ActionProposal:
         _required_text(self.call_id, "proposal call_id")
         _required_text(self.capability_id, "proposal capability_id")
         _aware(self.proposed_at, "proposal proposed_at")
+        if not isinstance(self.validation_facts, ActionValidationFacts):
+            raise TypeError(
+                "proposal validation_facts must be an ActionValidationFacts record"
+            )
         object.__setattr__(
             self, "arguments", FrozenJsonObject.from_mapping(self.arguments)
         )
@@ -202,7 +407,6 @@ class Observation:
         object.__setattr__(self, "payload", FrozenJsonObject.from_mapping(self.payload))
 
 
-_CANONICAL_SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _LEGACY_ZERO_HASH = "sha256:" + ("0" * 64)
 
 
@@ -218,6 +422,9 @@ class TaskExecutionFacts:
     idempotent: bool
     replay_safe: bool
     idempotency_key: str | None = None
+    validation_facts: ActionValidationFacts = field(
+        default_factory=ActionValidationFacts
+    )
 
     def __post_init__(self) -> None:
         for hash_name, hash_value in (
@@ -235,6 +442,8 @@ class TaskExecutionFacts:
             raise TypeError("access_mode must be an AccessMode")
         if not isinstance(self.risk, RiskLevel):
             raise TypeError("risk must be a RiskLevel")
+        if not isinstance(self.validation_facts, ActionValidationFacts):
+            raise TypeError("validation_facts must be an ActionValidationFacts record")
         for flag_name, flag_value in (
             ("side_effecting", self.side_effecting),
             ("idempotent", self.idempotent),
@@ -260,6 +469,12 @@ class TaskExecutionFacts:
                 )
         if self.side_effecting and self.replay_safe and self.idempotency_key is None:
             raise ValueError("replay-safe side effects require an idempotency_key")
+        if self.validation_facts.destructive and (
+            self.access_mode is not AccessMode.WRITE or not self.side_effecting
+        ):
+            raise ValueError(
+                "destructive validation facts require a side-effecting write"
+            )
 
 
 def _legacy_execution_facts() -> TaskExecutionFacts:

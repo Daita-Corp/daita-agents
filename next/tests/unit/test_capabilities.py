@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+import hashlib
+from typing import cast
 
 import pytest
 
-from daita._json import FrozenJsonObject
+from daita._json import FrozenJsonObject, canonical_json
 from daita.capabilities import (
     AccessMode,
     Capability,
@@ -13,6 +15,7 @@ from daita.capabilities import (
     CapabilityRegistry,
     EvidenceCandidate,
     ExecutionRequest,
+    ExecutorKnownNoEffectError,
     RiskLevel,
     ToolView,
 )
@@ -159,6 +162,51 @@ def test_capability_contract_fingerprint_is_stable_and_execution_sensitive() -> 
     )
 
 
+def test_required_evidence_kinds_are_typed_and_extend_only_opted_in_fingerprints() -> (
+    None
+):
+    capability = _capability()
+    legacy_material = {
+        "access_mode": capability.access_mode.value,
+        "executor_id": capability.executor_id,
+        "id": capability.id,
+        "idempotent": capability.idempotent,
+        "input_schema": capability.input_schema,
+        "output_evidence_kind": capability.output_evidence_kind,
+        "output_schema": capability.output_schema,
+        "output_schema_version": capability.output_schema_version,
+        "owner": capability.owner,
+        "replay_safe": capability.replay_safe,
+        "risk": capability.risk.value,
+        "side_effecting": capability.side_effecting,
+    }
+    legacy_fingerprint = (
+        "sha256:"
+        + hashlib.sha256(canonical_json(legacy_material).encode("utf-8")).hexdigest()
+    )
+
+    assert capability.required_evidence_kinds == ()
+    assert capability.contract_fingerprint == legacy_fingerprint
+    governed = replace(
+        capability,
+        required_evidence_kinds=("data.sqlite.update-impact.v1",),
+    )
+    assert governed.contract_fingerprint != legacy_fingerprint
+    assert governed.required_evidence_kinds == ("data.sqlite.update-impact.v1",)
+
+    with pytest.raises(TypeError, match="sequence"):
+        invalid_required_evidence: object = "not-a-sequence"
+        replace(
+            capability,
+            required_evidence_kinds=cast(
+                tuple[str, ...],
+                invalid_required_evidence,
+            ),
+        )
+    with pytest.raises(ValueError, match="unique"):
+        replace(capability, required_evidence_kinds=("impact", "impact"))
+
+
 def _execution_request(
     *,
     executor_id: str = "fake.read.executor",
@@ -208,3 +256,17 @@ def test_execution_request_rejects_invalid_committed_identity(
 def test_replay_safe_capability_must_also_be_idempotent() -> None:
     with pytest.raises(ValueError, match="replay-safe.*idempotent"):
         replace(_capability(), idempotent=False)
+
+
+def test_executor_known_no_effect_error_has_a_stable_bounded_code() -> None:
+    error = ExecutorKnownNoEffectError(
+        "write_precondition_changed",
+        "The checked write precondition changed before commit.",
+    )
+
+    assert error.code == "write_precondition_changed"
+    assert str(error) == "The checked write precondition changed before commit."
+    with pytest.raises(ValueError, match="lowercase identifier"):
+        ExecutorKnownNoEffectError("Write Failed", "No effect.")
+    with pytest.raises(ValueError, match="message.*bounded"):
+        ExecutorKnownNoEffectError("write_failed", "x" * 513)

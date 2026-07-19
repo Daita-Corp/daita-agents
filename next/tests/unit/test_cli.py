@@ -60,6 +60,25 @@ class RecordingRequest:
             {"kind": "sqlite", "path": "/data/sales.db"},
             "source-1",
         ),
+        (
+            [
+                "source",
+                "attach",
+                "atlas",
+                "sqlite",
+                "/data/sales.db",
+                "--write-access",
+                "--idempotency-key",
+                "source-write-1",
+            ],
+            "source.attach",
+            {
+                "kind": "sqlite",
+                "path": "/data/sales.db",
+                "write_access": True,
+            },
+            "source-write-1",
+        ),
         (["model", "status", "atlas"], "model.status", {}, None),
         (
             [

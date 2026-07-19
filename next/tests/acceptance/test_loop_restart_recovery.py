@@ -56,6 +56,7 @@ from daita.operations.models import (
 from daita.operations.runtime import OperationRuntime, OperationStateError
 from daita.operations.store import (
     CommitResult,
+    InMemoryOperationStore,
     TaskClaimResult,
     VersionedOperation,
 )
@@ -1355,6 +1356,69 @@ async def test_resume_expired_unsafe_task_waits_for_manual_recovery(
     assert domain.validation_calls == 0
     assert domain.projection_calls == 0
     assert resumed_executor.requests == []
+
+
+async def test_loop_keeps_ambiguous_write_nonterminal_until_manual_recovery() -> None:
+    clock = MutableClock(NOW)
+    capability = replace(
+        _capability(),
+        id="fake.write",
+        access_mode=AccessMode.WRITE,
+        risk=RiskLevel.HIGH,
+        side_effecting=True,
+        idempotent=False,
+        replay_safe=False,
+    )
+    executor = FailingExecutor()
+    registry = _registry(executor, capability)
+    store = InMemoryOperationStore(clock=clock)
+    runtime = OperationRuntime(
+        capabilities=registry,
+        store=store,
+        clock=clock,
+        lease_duration_seconds=1.0,
+    )
+    loop = AgentLoop(
+        runtime=runtime,
+        model=MockModelProvider((_tool_response(),)),
+        context_builder=CountingContextBuilder(),
+        domain=CountingDomain(registry),
+    )
+
+    approval_wait = await loop.run(_trigger())
+    waiting = await runtime.inspect(approval_wait.operation_id)
+    assert approval_wait.kind is LoopExitKind.WAITING
+    assert waiting.tasks[0].status is TaskStatus.WAITING_FOR_APPROVAL
+    await runtime.decide_approval(
+        waiting.approvals[0].id,
+        status=ApprovalStatus.APPROVED,
+        decided_by="reviewer-1",
+        reason="Exercise ambiguous write recovery.",
+    )
+
+    uncertain = await loop.resume(waiting.operation.id)
+    before_expiry = await runtime.inspect(waiting.operation.id)
+    assert uncertain.kind is LoopExitKind.WAITING
+    assert uncertain.reason == "task_outcome_unknown"
+    assert before_expiry.operation.status is OperationStatus.RUNNING
+    assert before_expiry.tasks[0].status is TaskStatus.RUNNING
+    assert before_expiry.task_leases[0].released_at is None
+    assert not any(event.type == "operation.failed" for event in before_expiry.events)
+
+    clock.current = before_expiry.task_leases[0].expires_at + timedelta(microseconds=1)
+    recovered = await loop.recover_startup("agent-restart")
+    after_expiry = await runtime.inspect(waiting.operation.id)
+
+    assert len(recovered) == 1
+    assert recovered[0].kind is LoopExitKind.WAITING
+    assert recovered[0].reason == "manual_recovery_required"
+    assert after_expiry.operation.status is OperationStatus.RUNNING
+    assert after_expiry.tasks[0].status is TaskStatus.MANUAL_RECOVERY_REQUIRED
+    assert after_expiry.tasks[0].manual_recovery_reason == (
+        "unknown_side_effect_outcome"
+    )
+    assert after_expiry.task_leases[0].release_reason == "expired_unknown_outcome"
+    assert len(executor.requests) == 1
 
 
 async def test_resume_attributes_aggregate_observation_budget_to_durable_frontier(

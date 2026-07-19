@@ -20,7 +20,9 @@ from .._json import canonical_json
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.local_files import LocalDirectoryReadBackend
+from ..adapters.sqlite import SQLiteSource
 from ..adapters.sqlite_query import SQLiteQueryBackend
+from ..adapters.sqlite_update import SQLiteUpdateBackend
 from ..catalog.capabilities import catalog_declarations
 from ..catalog.models import CatalogSync, CatalogSyncStatus
 from ..catalog.service import CatalogService
@@ -38,6 +40,7 @@ from ..domains.data import (
     PersistedAcceptedEvidenceDatasetReader,
     local_file_read_declarations,
     sqlite_query_declarations,
+    sqlite_update_declarations,
     tabular_comparison_declarations,
 )
 from ..events.models import CommittedEvent, EventCursor
@@ -129,6 +132,61 @@ def _source_sync_id(agent_id: str, idempotency_key: str) -> str:
         ).encode("utf-8")
     ).hexdigest()
     return f"catalog-sync-{digest}"
+
+
+def _reject_protected_writable_source(
+    registration: SourceRegistration,
+    *,
+    state_path: Path,
+) -> None:
+    """Keep controlled source writes outside the authoritative agent store."""
+
+    if (
+        registration.adapter_id != "sqlite"
+        or registration.configuration.get("write_access") is not True
+    ):
+        return
+    configured_path = registration.configuration.get("path")
+    if not isinstance(configured_path, str):
+        raise AgentHomeError("writable SQLite source path cannot be verified")
+    try:
+        source_stat = os.stat(configured_path, follow_symlinks=False)
+        state_stat = os.stat(state_path, follow_symlinks=False)
+    except OSError as error:
+        raise AgentHomeError(
+            "writable SQLite source path cannot be verified"
+        ) from error
+    if (source_stat.st_dev, source_stat.st_ino) == (
+        state_stat.st_dev,
+        state_stat.st_ino,
+    ):
+        raise AgentHomeError(
+            "writable SQLite source cannot target protected agent state"
+        )
+
+
+def _reject_protected_sqlite_source_config(
+    source: ResourceSource,
+    *,
+    state_path: Path,
+) -> None:
+    """Reject the built-in writable SQLite source before it opens a file."""
+
+    if not isinstance(source, SQLiteSource) or not source.allow_writes:
+        return
+    try:
+        source_stat = os.stat(source.path, follow_symlinks=False)
+        state_stat = os.stat(state_path, follow_symlinks=False)
+    except OSError:
+        # The adapter remains the owner of ordinary path-admission failures.
+        return
+    if (source_stat.st_dev, source_stat.st_ino) == (
+        state_stat.st_dev,
+        state_stat.st_ino,
+    ):
+        raise AgentHomeError(
+            "writable SQLite source cannot target protected agent state"
+        )
 
 
 def _validate_loop_configuration(
@@ -615,6 +673,15 @@ class EmbeddedAgent:
                 identity.id,
                 SQLiteQueryBackend(store, data_view),
             )
+            update = sqlite_update_declarations(
+                identity.id,
+                SQLiteUpdateBackend(
+                    store,
+                    data_view,
+                    store,
+                    protected_paths=(home / "state.db",),
+                ),
+            )
             file_read = local_file_read_declarations(
                 identity.id,
                 LocalDirectoryReadBackend(store, store),
@@ -631,18 +698,21 @@ class EmbeddedAgent:
                 capabilities=(
                     *catalog.capabilities,
                     *query.capabilities,
+                    *update.capabilities,
                     *file_read.capabilities,
                     *comparison.capabilities,
                 ),
                 executors=(
                     *catalog.executors,
                     *query.executors,
+                    *update.executors,
                     *file_read.executors,
                     *comparison.executors,
                 ),
                 tool_views=(
                     *catalog.tool_views,
                     *query.tool_views,
+                    *update.tool_views,
                     *file_read.tool_views,
                     *comparison.tool_views,
                 ),
@@ -799,6 +869,10 @@ class EmbeddedAgent:
         )
         async with self._mutation_lock:
             self._require_open()
+            _reject_protected_sqlite_source_config(
+                source,
+                state_path=self.home / "state.db",
+            )
             opened_at = self._clock()
             adapter = await source.open(
                 agent_id=self.identity.id,
@@ -807,14 +881,21 @@ class EmbeddedAgent:
             )
             if not isinstance(adapter, ResourceAdapter):
                 raise TypeError("source open() must return a ResourceAdapter")
+            registration = adapter.registration
             try:
+                _reject_protected_writable_source(
+                    registration,
+                    state_path=self.home / "state.db",
+                )
                 self._capabilities.validate_declarations(adapter.declarations())
+            except AgentHomeError:
+                await adapter.close()
+                raise
             except (TypeError, ValueError) as error:
                 await adapter.close()
                 raise AgentHomeError(
                     "source declarations do not match the configured runtime"
                 ) from error
-            registration = adapter.registration
             sync_id = (
                 self._id_factory("catalog-sync")
                 if stable_sync_id is None

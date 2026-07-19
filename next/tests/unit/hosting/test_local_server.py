@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import errno
+import hashlib
 import os
 from pathlib import Path
 import sqlite3
@@ -11,6 +12,8 @@ import tempfile
 from typing import cast
 
 import pytest
+from daita._json import canonical_json
+from daita.capabilities import AccessMode, RiskLevel
 from daita.hosting.host import AgentHost, AgentHostState
 from daita.hosting.local_protocol import (
     LocalAgentClient,
@@ -21,7 +24,11 @@ from daita.hosting.local_protocol import (
     encode_frame,
     encode_request,
 )
-from daita.hosting.local_server import LocalAgentServer
+from daita.hosting.local_server import (
+    LocalAgentServer,
+    _approval_projection,
+    _task_governance_projection,
+)
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -35,9 +42,79 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import Readiness, Turn
 from daita.operations.checkpoints import OperationSnapshot
-from daita.operations.models import ActionProposal, Evidence, Observation
+from daita.operations.governance import ApprovalRequest
+from daita.operations.models import (
+    ActionProposal,
+    ActionValidationFacts,
+    Evidence,
+    Observation,
+    Task,
+    TaskExecutionFacts,
+    TaskStatus,
+)
 
 NOW = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+
+
+def test_local_governance_projection_exposes_safe_facts_and_approval_hashes() -> None:
+    arguments = {"source_id": "source-sqlite", "value": "redacted"}
+    validation = ActionValidationFacts(
+        schema_version=1,
+        source_id="source-sqlite",
+        resource_ids=("resource-marker",),
+        resource_revisions=(("resource-marker", "sha256:" + ("a" * 64)),),
+        source_revision="sqlite:data-version:2",
+        impact={"affected_rows": 1, "bounded": True},
+        evidence_ids=("evidence-impact",),
+    )
+    task = Task(
+        id="task-write",
+        operation_id="operation-write",
+        turn_id="turn-write",
+        call_id="call-write",
+        capability_id="data.sqlite.update",
+        executor_id="data.sqlite.update.executor",
+        status=TaskStatus.WAITING_FOR_APPROVAL,
+        attempt=1,
+        arguments=arguments,
+        execution_facts=TaskExecutionFacts(
+            capability_fingerprint="sha256:" + ("b" * 64),
+            arguments_hash="sha256:"
+            + hashlib.sha256(canonical_json(arguments).encode("utf-8")).hexdigest(),
+            access_mode=AccessMode.WRITE,
+            risk=RiskLevel.HIGH,
+            side_effecting=True,
+            idempotent=True,
+            replay_safe=True,
+            idempotency_key="operation-write:task-write",
+            validation_facts=validation,
+        ),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+    governance = _task_governance_projection(task, actor_id="user:actor-local")
+
+    assert governance["actor_id"] == "user:actor-local"
+    assert governance["access_mode"] == "write"
+    assert governance["risk"] == "high"
+    projected_validation = governance["validation"]
+    assert isinstance(projected_validation, dict)
+    assert projected_validation["source_id"] == "source-sqlite"
+    assert projected_validation["validation_fingerprint"] == validation.fingerprint
+    assert "arguments" not in governance
+    assert "redacted" not in str(governance)
+
+    approval = ApprovalRequest(
+        id="approval-write",
+        operation_id=task.operation_id,
+        task_id=task.id,
+        task_fingerprint="sha256:" + ("c" * 64),
+        policy_fingerprint="sha256:" + ("d" * 64),
+        requested_at=NOW,
+    )
+    projected_approval = _approval_projection(approval)
+    assert projected_approval["task_fingerprint"] == approval.task_fingerprint
+    assert projected_approval["policy_fingerprint"] == approval.policy_fingerprint
 
 
 @pytest.fixture
@@ -417,6 +494,68 @@ async def test_source_attach_uses_default_host_capability_owners(short_root) -> 
             assert connection.execute(
                 "SELECT COUNT(*) FROM catalog_syncs"
             ).fetchone() == (1,)
+    finally:
+        await server.stop(drain=True)
+
+
+async def test_source_attach_persists_explicit_sqlite_write_admission(
+    short_root,
+) -> None:
+    database = short_root / "controlled-write.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE records (id TEXT PRIMARY KEY, status TEXT NOT NULL)"
+        )
+    host = await AgentHost.create(
+        "source-write-admission",
+        root=short_root,
+        cadence_seconds=3_600,
+        clock=_Clock(),
+    )
+    server = LocalAgentServer(host)
+    await host.start()
+    try:
+        attached = await _request(
+            server,
+            "source-write-1",
+            "source.attach",
+            params={
+                "kind": "sqlite",
+                "path": str(database),
+                "write_access": True,
+            },
+            idempotency_key="source-write-1",
+        )
+        assert isinstance(attached, LocalSuccessResponse)
+        projection = _result_object(attached)
+        assert projection["adapter_id"] == "sqlite"
+        assert projection["write_access"] is True
+
+        source_id = projection["id"]
+        assert isinstance(source_id, str)
+        with sqlite3.connect(host.home / "state.db") as connection:
+            row = connection.execute(
+                "SELECT configuration_json FROM attached_sources WHERE id = ?",
+                (source_id,),
+            ).fetchone()
+        assert row is not None
+        assert '"write_access":true' in str(row[0])
+
+        directory = short_root / "not-writable-source"
+        directory.mkdir()
+        rejected = await _request(
+            server,
+            "source-write-invalid",
+            "source.attach",
+            params={
+                "kind": "local_files",
+                "path": str(directory),
+                "write_access": True,
+            },
+            idempotency_key="source-write-invalid",
+        )
+        assert isinstance(rejected, LocalErrorResponse)
+        assert rejected.error.code == "invalid_params"
     finally:
         await server.stop(drain=True)
 

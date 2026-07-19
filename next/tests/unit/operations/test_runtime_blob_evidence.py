@@ -585,10 +585,15 @@ async def test_terminal_fenced_failure_after_put_leaves_a_durable_orphan(
         store=operation_store,
     )
 
-    with pytest.raises(OperationStateError, match="fenced") as caught:
+    with pytest.raises(
+        CapabilityExecutionError,
+        match="evidence commit failed",
+    ) as caught:
         await case.runtime.submit(_proposal(case))
 
-    assert isinstance(caught.value.__cause__, InvalidOperationCheckpointError)
+    publication_error = caught.value.__cause__
+    assert isinstance(publication_error, OperationStateError)
+    assert isinstance(publication_error.__cause__, InvalidOperationCheckpointError)
     assert len(blob_store.requests) == 1
     request, content = blob_store.requests[0]
     orphan = await _assert_durable_blob(blob_store.root, request, content)
@@ -596,8 +601,16 @@ async def test_terminal_fenced_failure_after_put_leaves_a_durable_orphan(
 
     assert operation_store.before_rejection is not None
     after_rejection = await operation_store.load(case.operation_id)
-    assert after_rejection == operation_store.before_rejection
-    _assert_no_terminal_evidence(after_rejection.snapshot)
+    assert after_rejection != operation_store.before_rejection
+    snapshot = after_rejection.snapshot
+    assert snapshot.evidence == ()
+    assert snapshot.tasks[0].evidence_ids == ()
+    assert snapshot.tasks[0].status is TaskStatus.FAILED
+    assert snapshot.tasks[0].error_code == "evidence_commit_failed"
+    assert snapshot.task_leases[0].released_at is not None
+    assert snapshot.task_leases[0].release_reason == "evidence_commit_failed"
+    terminal_types = {"executor.completed", "evidence.accepted", "task.succeeded"}
+    assert not terminal_types.intersection(event.type for event in snapshot.events)
 
 
 async def test_stale_fence_after_put_cannot_accept_blob_evidence(

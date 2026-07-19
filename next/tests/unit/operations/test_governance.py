@@ -94,6 +94,25 @@ def test_governance_facts_bind_every_authoritative_input_in_one_fingerprint() ->
         facts.actor_id = "actor-other"  # type: ignore[misc]
 
 
+def test_explicit_validation_fingerprint_extends_without_changing_legacy_hash() -> None:
+    legacy = _facts()
+    explicit = replace(
+        legacy,
+        validation_fingerprint="sha256:" + ("c" * 64),
+    )
+
+    assert legacy.validation_fingerprint is None
+    assert explicit.task_fingerprint != legacy.task_fingerprint
+    assert (
+        replace(
+            explicit, validation_fingerprint="sha256:" + ("d" * 64)
+        ).task_fingerprint
+        != explicit.task_fingerprint
+    )
+    with pytest.raises(ValueError, match="validation_fingerprint"):
+        replace(legacy, validation_fingerprint="sha256:bad")
+
+
 @pytest.mark.parametrize(
     ("changes", "match"),
     (

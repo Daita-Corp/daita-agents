@@ -5,16 +5,16 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 7 — governance, write proof, and approval resume
-- **Active task:** P7-01 — Phase 7 scope and owner inventory
-- **Last completed task:** P6-06 — consolidated Phase 6 gate
-- **Current checkpoint:** Phase 6 gate (this ledger's containing commit)
+- **Active phase:** Phase 8 — PostgreSQL and multi-provider parity
+- **Active task:** P8-01 — Phase 8 owner and conformance inventory
+- **Last completed task:** P7-05 — consolidated Phase 7 gate
+- **Current checkpoint:** Phase 7 gate (this ledger's containing commit)
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** after the Phase 6 gate commit, re-read the Phase 7
-  governance/write requirements and map the smallest controlled-write slice
-  onto the existing capability, policy, approval, evidence, and runtime owners
+- **Exact next action:** re-read the Phase 8 provider/routing/PostgreSQL
+  requirements and map one shared adapter/provider conformance sequence onto
+  the existing catalog, data-domain, canonical-model, and runtime owners
 
 ## Development cadence
 
@@ -107,6 +107,18 @@ explicit corrections or completed facts but never learns failed/blocked work;
 skills are bounded procedures that reference registered capability IDs and
 can neither declare executors nor alter policy; and SQLite remains the one
 local composition without becoming a generic state-store abstraction.
+
+Before Phase 7 production edits, Sections 6 and 15 were re-read in full on
+2026-07-19 together with Sections 8.5-8.8, 8.13-8.15, 11.1-11.2, 12.3-12.4,
+14.1-14.6, 17.2-17.4, Journey E, the Phase 7 work/gate, and ADRs 0004-0006,
+0008, 0010-0011, and 0013. The renewed constraints are that the current
+operation runtime remains the sole executor/governance/recovery owner; a real
+write must depend on persisted validator-owned scope and impact facts; approval
+mutates state only and resumes the same operation; completed impact reads and
+terminal writes never rerun; unknown write outcomes require manual recovery;
+and the controlled SQLite recipe must be explicitly write-enabled, bounded,
+parameterized, catalog-scoped, and evidenced without exposing a general SQL
+mutation surface.
 
 ## Current architectural decisions
 
@@ -225,6 +237,20 @@ remain the only progression and execution owners.
 | P6-04 | complete | Embedded composition; scheduler; event subscription; recovery and approval/cancel APIs | Foreground local `AgentHost` owns lock, migrations, durable inbox, scheduling cadence, wakeups, health, streaming, recovery, and graceful shutdown | Migration 11 plus 15 focused hosting cases; inbox/restart replay, approval wake, user/monitor cancellation without cadence loss, tracked recovery, multi-batch drain, failure-safe shutdown, lock release, and zero hidden idle tasks are covered | P6-03 |
 | P6-05 | complete | Host contracts and public facades | Public monitor/control/event surfaces plus bounded Unix-socket local client/server and development CLI journey | Migration 12 durably binds control mutation keys; the final repaired focused selection passes 147 tests covering framing, permissions, replay/conflict semantics, bootstrap, source/chat/inspect/approval/monitor routes, deadline-bounded connections, and restart behavior | P6-04 |
 | P6-06 | complete | Passing P6-02 through P6-05 slices | Consolidated dual-Python/static/architecture/root/distribution/review gate and one Phase 6 commit | 1,154 tests per Python version, 77 architecture, 2,498 root, mypy/pyright/compile, clean wheel installs, repaired independent safety review, and the unrestricted real AF_UNIX lifecycle/health smoke pass; containing commit uses `chore(v2-phase-6): complete phase 6 gate` | P6-05 |
+
+## Ordered Phase 7 tasks
+
+Phase 7 uses two implementation slices, one public Journey E slice, and one
+consolidated gate. Phase 2's policy, approval, lease, and recovery owners are
+extended rather than rebuilt.
+
+| ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
+| --- | --- | --- | --- | --- | --- |
+| P7-01 | complete | Phase 7 work/gate; Sections 6/15 and governance/data-safety sections; current runtime, SQLite data, host, and v1 controlled-write owners | Exact durable-fact, controlled-recipe, approval/resume, audit, and deferral map | Read-only inventory confirms the generic Phase 2 machinery is retained and isolates the missing real SQLite write vertical | Phase 6 gate |
+| P7-02 | complete | Domain validation output; task execution facts; policy/approval fingerprints; SQLite Migration 13 | Validator-owned source/resource scope, validation evidence, impact, destructive, sensitivity, and actor facts survive restart and appear in approval/denial audit without changing the sole executor boundary | Schema-versioned validation facts, prerequisite-evidence dependencies, policy denial without executor I/O, migration/reopen, fingerprint, checkpoint-integrity, and audit-projection tests pass | P7-01 |
+| P7-03 | complete | P7-02 facts; catalog schemas; explicit SQLite source configuration; existing read backend pattern | One explicitly enabled, parameterized, single-row SQLite update recipe with runtime-executed impact preview and accepted result evidence | 10 controlled-domain and 15 adapter/source tests cover admission, unique key, TEXT affinity, stale scope/evidence, bounded impact, exact result, protected inodes, virtual/shadow objects, and commit ambiguity | P7-02 |
+| P7-04 | complete | P7-03 controlled write; existing `Agent`, host, approval wake, loop recovery, and inspection APIs | Public Journey E waits after impact validation, survives reopen, resumes the same operation, skips completed reads, commits one write, and exposes joined audit facts | Journey E passes with exact preview/write non-replay and approval/task/evidence joins; focused runtime/restart suites prove denial, races, unknown outcome, manual recovery, and generic host inspection/projection composition | P7-03 |
+| P7-05 | complete | Passing P7-02 through P7-04 slices | Consolidated dual-Python/static/architecture/root/distribution/review gate and one Phase 7 commit | 1,202 v2 tests on each interpreter, 77 architecture tests, 2,498 frozen-root tests, clean static/distribution gates, and the repaired targeted safety review are recorded in `QUALITY_GATES.md`; containing commit uses `chore(v2-phase-7): complete phase 7 gate` | P7-04 |
 
 ### Ordered P2-03 internal tasks
 

@@ -36,6 +36,34 @@ class CapabilityExecutionError(RuntimeError):
     """Raised after a capability task records an execution failure."""
 
 
+class ExecutorKnownNoEffectError(RuntimeError):
+    """Executor failure for which the adapter knows no external effect remains."""
+
+    def __init__(self, code: str, message: str) -> None:
+        _required_text(code, "known-no-effect code")
+        _required_text(message, "known-no-effect message")
+        if (
+            len(code) > 128
+            or code != code.strip()
+            or not ("a" <= code[0] <= "z")
+            or any(
+                not (
+                    "a" <= character <= "z"
+                    or "0" <= character <= "9"
+                    or character in "_.-"
+                )
+                for character in code
+            )
+        ):
+            raise ValueError(
+                "known-no-effect code must be a bounded lowercase identifier"
+            )
+        if len(message) > 512:
+            raise ValueError("known-no-effect message must be bounded")
+        self.code = code
+        super().__init__(message)
+
+
 class EvidenceValidationError(RuntimeError):
     """Raised after executor output fails the declared evidence contract."""
 
@@ -55,6 +83,7 @@ class Capability:
     side_effecting: bool
     idempotent: bool
     replay_safe: bool
+    required_evidence_kinds: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _required_text(self.id, "capability id")
@@ -83,6 +112,21 @@ class Capability:
             raise ValueError("read capabilities cannot declare side effects")
         if self.replay_safe and not self.idempotent:
             raise ValueError("replay-safe capabilities must be idempotent")
+        if isinstance(self.required_evidence_kinds, (str, bytes)):
+            raise TypeError(
+                "capability required_evidence_kinds must be a sequence of strings"
+            )
+        required_evidence_kinds = tuple(self.required_evidence_kinds)
+        if len(required_evidence_kinds) > 32:
+            raise ValueError("capability required_evidence_kinds exceed 32 items")
+        for evidence_kind in required_evidence_kinds:
+            _required_text(evidence_kind, "capability required evidence kind")
+            if len(evidence_kind) > 256:
+                raise ValueError(
+                    "capability required evidence kinds must be bounded text"
+                )
+        if len(required_evidence_kinds) != len(set(required_evidence_kinds)):
+            raise ValueError("capability required_evidence_kinds must be unique")
 
         input_schema = FrozenJsonObject.from_mapping(self.input_schema)
         output_schema = FrozenJsonObject.from_mapping(self.output_schema)
@@ -90,27 +134,36 @@ class Capability:
         _validate_supported_object_schema(output_schema, "output")
         object.__setattr__(self, "input_schema", input_schema)
         object.__setattr__(self, "output_schema", output_schema)
+        object.__setattr__(
+            self,
+            "required_evidence_kinds",
+            required_evidence_kinds,
+        )
 
     @property
     def contract_fingerprint(self) -> str:
         """Return the stable hash of this capability's execution contract."""
 
-        encoded = canonical_json(
-            {
-                "access_mode": self.access_mode.value,
-                "executor_id": self.executor_id,
-                "id": self.id,
-                "idempotent": self.idempotent,
-                "input_schema": self.input_schema,
-                "output_evidence_kind": self.output_evidence_kind,
-                "output_schema": self.output_schema,
-                "output_schema_version": self.output_schema_version,
-                "owner": self.owner,
-                "replay_safe": self.replay_safe,
-                "risk": self.risk.value,
-                "side_effecting": self.side_effecting,
-            }
-        ).encode("utf-8")
+        material: dict[str, object] = {
+            "access_mode": self.access_mode.value,
+            "executor_id": self.executor_id,
+            "id": self.id,
+            "idempotent": self.idempotent,
+            "input_schema": self.input_schema,
+            "output_evidence_kind": self.output_evidence_kind,
+            "output_schema": self.output_schema,
+            "output_schema_version": self.output_schema_version,
+            "owner": self.owner,
+            "replay_safe": self.replay_safe,
+            "risk": self.risk.value,
+            "side_effecting": self.side_effecting,
+        }
+        # Preserve all pre-Phase-7 contract identities byte-for-byte. A
+        # capability opts into the new contract material only when it declares
+        # prerequisite evidence.
+        if self.required_evidence_kinds:
+            material["required_evidence_kinds"] = self.required_evidence_kinds
+        encoded = canonical_json(material).encode("utf-8")
         return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
@@ -226,7 +279,10 @@ class Executor(Protocol):
     @property
     def executor_id(self) -> str: ...
 
-    async def execute(self, request: ExecutionRequest) -> EvidenceCandidate: ...
+    async def execute(self, request: ExecutionRequest) -> EvidenceCandidate:
+        """Execute once; use ExecutorKnownNoEffectError only for proven no-effect."""
+
+        ...
 
 
 @dataclass(frozen=True, slots=True)

@@ -608,6 +608,33 @@ No live model or external database was required for Phase 6. The real socket
 smoke used only a test-owned agent home and mock/no-model health request; it
 required no credential and performed no external network I/O.
 
+## Phase 7 — governance, write proof, and approval resume
+
+Status: **PASS. Phase 7 is complete and Phase 8 may begin.**
+
+Phase 7 used one durable-governance slice, one controlled SQLite-write slice,
+one public Journey E slice, and one consolidated gate. The existing operation
+runtime remains the sole executor, policy, lease, evidence, and recovery owner.
+
+### Executed Phase 7 evidence
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| P7-Q01 | plan, ADRs, current v2, and retained v1 references (read-only) | Re-read Sections 6/15, governance/data-safety/recovery sections, Phase 7, Journey E, and current runtime/catalog/SQLite/host owners | PASS — one persisted validator-fact contract, one semantic SQLite update recipe, the existing approval/resume path, and manual recovery for unknown outcomes were locked without another runtime or mutation-SQL surface |
+| P7-Q02 | `next/` | Focused task/governance/store/migration/checkpoint, controlled-data, SQLite adapter/source, host projection, approval, loop, and restart selections | PASS — validator facts and prerequisite evidence survive restart; policy denial invokes no executor; 10 controlled-domain and 15 adapter/source tests pass; focused runtime/restart suites cover confirmed-no-effect, ambiguous execution/evidence/timeout, and manual recovery |
+| P7-Q03 | `next/` | `tests/acceptance/test_sqlite_update_approval_journey.py` plus protected-agent-state public admission | PASS — validation and one-row impact precede approval; reopen resumes the same operation; preview/read tasks and evidence are not replayed; one write/result is committed; repeated resume is an exact no-op; approver, task, facts, and evidence IDs join durably; own state DB and hard links are rejected |
+| P7-Q04 | `next/` | Complete isolated suite with `PYTHONPATH=src:<site-packages> <python> -S -m pytest -o addopts='' tests/ -m 'not requires_llm and not requires_db' -q --tb=short -p no:cacheprovider` on CPython 3.11.15 and 3.12.7 | PASS — 1,202 passed, 1 skipped, and 1 deselected in 40.37s/43.89s; the skip remains only the sandbox-forbidden real AF_UNIX bind |
+| P7-Q05 | `next/` | One Black formatting pass and final check; byte compilation; `MYPYPATH=src mypy src/daita tests scripts/build_test_disposition.py`; pyright 1.1.411 | PASS after explicit narrowing — Black reports 214 files unchanged; compilation clean; mypy reports no issues in 213 files; pyright reports 0 errors/warnings |
+| P7-Q06 | `next/` | Isolated architecture suite; generated disposition check; import/symlink/sole-executor/diff scans | PASS — 77 architecture tests and the generated disposition pass; the loop has no adapter branch, runtime remains the only executor caller, and the controlled backend is composition-owned |
+| P7-Q07 | repository root | `.venv/bin/python -m pytest -o addopts='' tests/ -m 'not requires_llm and not requires_db' -q --tb=short -p no:cacheprovider` | PASS — 2,498 passed and 221 deselected in 10.40s; the frozen v1 oracle remains unchanged |
+| P7-Q08 | clean copy under `/private/tmp/daita-v2-p7-gate.E3vASU` | Build v2 sdist/wheel without isolation; inspect boundaries; install wheel without dependencies in fresh CPython 3.11/3.12 environments; import every packaged module and run installed `daita --help` | PASS — wheel/sdist contain 85/109 entries; no tests/scripts/nested `next/` are packaged; both environments import all 80 modules from `site-packages` and start the CLI without optional SDKs |
+| P7-Q09 | final controlled-write and recovery safety review | Test protected file identities, descriptor/connect swaps, virtual/shadow/view objects, same-version schema replacement, SQLite Unicode identifier semantics, affinity/no-op behavior, foreign-key cascades, rollback certainty, and commit-loss ambiguity | PASS after root-cause repair — every reviewed issue has an owning guard and deterministic regression; confirmed rollback fails/releases while commit ambiguity waits and expires into manual recovery |
+| P7-Q10 | final Phase 7 diff | Parity/ledger/README/scope review, configured hooks, and exact containing commit | PASS — every changed repository path remains under `next/`; no arbitrary mutation SQL or public backend surface was added; the containing commit is `chore(v2-phase-7): complete phase 7 gate` |
+
+No live model or external database was required for Phase 7. The controlled
+source and durable marker are test-owned local SQLite files; production-model
+translation was proven in Phase 2, and PostgreSQL belongs to Phase 8.
+
 ## Live and external gates
 
 - Phase 0 requires no live provider or external database.

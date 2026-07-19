@@ -8,7 +8,7 @@ import sqlite3
 
 import pytest
 
-from daita._json import canonical_json
+from daita._json import FrozenJsonObject, canonical_json
 from daita.capabilities import AccessMode, RiskLevel
 from daita.events.models import RuntimeEvent
 from daita.llm.models import (
@@ -29,6 +29,7 @@ from daita.operations.checkpoints import (
 )
 from daita.operations.leases import TaskLease
 from daita.operations.models import (
+    ActionValidationFacts,
     AgentTrigger,
     Operation,
     OperationStatus,
@@ -66,6 +67,7 @@ def _task(
     idempotent: bool = True,
     replay_safe: bool = True,
     idempotency_key: str | None = None,
+    validation_facts: ActionValidationFacts | None = None,
     manual_recovery_reason: str | None = None,
     timestamp: datetime = NOW + timedelta(seconds=1),
 ) -> Task:
@@ -93,6 +95,7 @@ def _task(
             idempotent=idempotent,
             replay_safe=replay_safe,
             idempotency_key=idempotency_key,
+            validation_facts=validation_facts or ActionValidationFacts(),
         ),
         created_at=timestamp,
         updated_at=timestamp,
@@ -204,6 +207,18 @@ def _snapshot() -> OperationSnapshot:
         side_effecting=True,
         idempotent=False,
         replay_safe=False,
+        validation_facts=ActionValidationFacts(
+            schema_version=1,
+            validation_passed=True,
+            in_scope=True,
+            destructive=False,
+            sensitivity_class="confidential",
+            source_id="source-sqlite",
+            resource_ids=("resource-marker",),
+            resource_revisions=(("resource-marker", "sha256:" + ("d" * 64)),),
+            source_revision="sqlite:data-version:4",
+            impact={"affected_rows": 1, "bounded": True},
+        ),
         manual_recovery_reason="unknown_side_effect_outcome",
         timestamp=NOW + timedelta(seconds=30),
     )
@@ -401,6 +416,16 @@ async def test_task_projection_round_trips_exactly_across_reopen_and_global_orde
     assert loaded.snapshot.tasks[2].manual_recovery_reason == (
         "unknown_side_effect_outcome"
     )
+    validation = loaded.snapshot.tasks[2].execution_facts.validation_facts
+    assert validation.schema_version == 1
+    assert validation.source_id == "source-sqlite"
+    assert validation.resource_ids == ("resource-marker",)
+    assert isinstance(validation.impact, FrozenJsonObject)
+    assert validation.impact.to_dict() == {
+        "affected_rows": 1,
+        "bounded": True,
+    }
+    assert validation.fingerprint is not None
     assert _raw_rows(
         path,
         "task_dependencies",
@@ -822,6 +847,20 @@ async def test_task_projection_rejects_corrupt_enums(
         path,
         f"UPDATE tasks SET {column} = ? WHERE id = ?",
         (corrupt_value, "task-active"),
+    )
+
+    await _assert_corrupt_load(path)
+
+
+async def test_task_projection_rejects_unknown_validation_schema_version(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    await _create_and_close(path)
+    _mutate(
+        path,
+        "UPDATE tasks SET validation_schema_version = 2 WHERE id = ?",
+        ("task-manual",),
     )
 
     await _assert_corrupt_load(path)

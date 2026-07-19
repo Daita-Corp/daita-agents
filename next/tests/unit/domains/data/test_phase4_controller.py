@@ -82,6 +82,13 @@ class CatalogReader:
         assert agent_id == "agent-atlas"
         return source_id == "source-files" and resource_id == "resource-export"
 
+    async def is_writable_sqlite_source(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> bool:
+        return False
+
 
 class CandidateExecutor:
     def __init__(

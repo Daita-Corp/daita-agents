@@ -11,11 +11,18 @@ from dataclasses import dataclass, field
 import hashlib
 from typing import Any
 
-from ..._json import FrozenJsonObject
+from ..._json import FrozenJsonObject, canonical_json
 
 _SQLITE_INSTALL_HINT = "pip install 'daita-agents[sqlite]'"
 _MAX_ISSUES = 32
 _MAX_CANDIDATES = 8
+_MAX_UPDATE_IDENTIFIER_CHARACTERS = 512
+_MAX_UPDATE_COLUMN_CHARACTERS = 256
+_MAX_UPDATE_VALUE_CHARACTERS = 4_096
+_ASCII_IDENTIFIER_CASE_TRANSLATION = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "abcdefghijklmnopqrstuvwxyz",
+)
 
 
 def _required_text(value: str, field_name: str) -> str:
@@ -28,8 +35,31 @@ def _identifier_key(value: str) -> str:
     return value.strip().strip('"`[]').casefold()
 
 
+def sqlite_identifier_key(value: str) -> str:
+    """Match SQLite identifier case without folding distinct Unicode names."""
+
+    return value.strip().strip('"`[]').translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
+
+
 def _short_identifier(value: str) -> str:
     return _identifier_key(value).rsplit(".", 1)[-1]
+
+
+def sqlite_declared_type_affinity(declared_type: str) -> str:
+    """Return SQLite's canonical affinity for one declared column type."""
+
+    if not isinstance(declared_type, str):
+        raise TypeError("declared_type must be a string")
+    normalized = declared_type.strip().upper()
+    if "INT" in normalized:
+        return "integer"
+    if any(token in normalized for token in ("CHAR", "CLOB", "TEXT")):
+        return "text"
+    if not normalized or "BLOB" in normalized:
+        return "blob"
+    if any(token in normalized for token in ("REAL", "FLOA", "DOUB")):
+        return "real"
+    return "numeric"
 
 
 def normalize_sql(sql: str) -> str:
@@ -64,6 +94,14 @@ class ResourceSchema:
     aliases: tuple[str, ...] = ()
     revision: str | None = field(default=None, compare=False)
     source_revision: str | None = field(default=None, compare=False)
+    resource_kind: str | None = field(default=None, compare=False)
+    sensitivity_class: str = field(default="unknown", compare=False)
+    writable: bool = field(default=False, compare=False)
+    unique_key_columns: tuple[str, ...] = field(default=(), compare=False)
+    column_declared_types: tuple[tuple[str, str], ...] = field(
+        default=(),
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -95,8 +133,82 @@ class ResourceSchema:
             )
             if len(source_revision) > 1_024:
                 raise ValueError("resource source_revision exceeds 1024 characters")
+        if self.resource_kind is not None:
+            resource_kind = _required_text(
+                self.resource_kind,
+                "resource resource_kind",
+            )
+            if len(resource_kind) > 128:
+                raise ValueError("resource resource_kind exceeds 128 characters")
+            object.__setattr__(self, "resource_kind", resource_kind.casefold())
+        sensitivity_class = _required_text(
+            self.sensitivity_class,
+            "resource sensitivity_class",
+        )
+        if len(sensitivity_class) > 128:
+            raise ValueError("resource sensitivity_class exceeds 128 characters")
+        if not isinstance(self.writable, bool):
+            raise TypeError("resource writable must be a boolean")
+        unique_key_columns = tuple(
+            _required_text(item, "resource unique key column")
+            for item in self.unique_key_columns
+        )
+        if len({_identifier_key(item) for item in unique_key_columns}) != len(
+            unique_key_columns
+        ):
+            raise ValueError(
+                "resource unique key columns must be unique case-insensitively"
+            )
+        if any(
+            _identifier_key(item) not in {_identifier_key(column) for column in columns}
+            for item in unique_key_columns
+        ):
+            raise ValueError("resource unique key columns must exist in columns")
+        if isinstance(self.column_declared_types, (str, bytes)):
+            raise TypeError("resource column_declared_types must be a sequence")
+        raw_column_declared_types = tuple(self.column_declared_types)
+        if any(
+            not isinstance(item, (tuple, list)) or len(item) != 2
+            for item in raw_column_declared_types
+        ):
+            raise ValueError(
+                "resource column_declared_types must contain column/type pairs"
+            )
+        column_declared_types = tuple(
+            (item[0], item[1]) for item in raw_column_declared_types
+        )
+        declared_type_by_key: dict[str, str] = {}
+        for column, declared_type in column_declared_types:
+            canonical_column = _required_text(
+                column,
+                "resource declared type column",
+            )
+            column_key = _identifier_key(canonical_column)
+            if column_key not in {_identifier_key(item) for item in columns}:
+                raise ValueError("resource declared type columns must exist in columns")
+            if column_key in declared_type_by_key:
+                raise ValueError(
+                    "resource declared type columns must be unique case-insensitively"
+                )
+            if not isinstance(declared_type, str) or len(declared_type) > 256:
+                raise ValueError(
+                    "resource declared column types must be bounded strings"
+                )
+            declared_type_by_key[column_key] = declared_type
+        canonical_declared_types = tuple(
+            (column, declared_type_by_key[_identifier_key(column)])
+            for column in columns
+            if _identifier_key(column) in declared_type_by_key
+        )
         object.__setattr__(self, "columns", columns)
         object.__setattr__(self, "aliases", aliases)
+        object.__setattr__(self, "sensitivity_class", sensitivity_class.casefold())
+        object.__setattr__(self, "unique_key_columns", unique_key_columns)
+        object.__setattr__(
+            self,
+            "column_declared_types",
+            canonical_declared_types,
+        )
 
     @property
     def lookup_names(self) -> frozenset[str]:
@@ -246,6 +358,133 @@ class SqlValidationResult:
         object.__setattr__(self, "resource_ids", resource_ids)
         object.__setattr__(self, "resource_revisions", resource_revisions)
         object.__setattr__(self, "issues", tuple(self.issues))
+
+    @property
+    def issue_codes(self) -> tuple[str, ...]:
+        return tuple(issue.code for issue in self.issues)
+
+
+@dataclass(frozen=True, slots=True)
+class SQLiteUpdateRecipe:
+    """One catalog-grounded, single-row conditional SQLite update recipe."""
+
+    source_id: str
+    resource_id: str
+    resource_revision: str
+    source_revision: str
+    table_name: str
+    key_column: str
+    target_column: str
+    key_value: str
+    expected_value: str
+    new_value: str
+    sensitivity_class: str
+    recipe_fingerprint: str
+
+    def __post_init__(self) -> None:
+        for value, field_name, maximum in (
+            (self.source_id, "recipe source_id", _MAX_UPDATE_IDENTIFIER_CHARACTERS),
+            (
+                self.resource_id,
+                "recipe resource_id",
+                _MAX_UPDATE_IDENTIFIER_CHARACTERS,
+            ),
+            (self.table_name, "recipe table_name", _MAX_UPDATE_COLUMN_CHARACTERS),
+            (self.key_column, "recipe key_column", _MAX_UPDATE_COLUMN_CHARACTERS),
+            (
+                self.target_column,
+                "recipe target_column",
+                _MAX_UPDATE_COLUMN_CHARACTERS,
+            ),
+            (
+                self.sensitivity_class,
+                "recipe sensitivity_class",
+                128,
+            ),
+        ):
+            normalized = _required_text(value, field_name)
+            if len(normalized) > maximum:
+                raise ValueError(f"{field_name} exceeds {maximum} characters")
+        for value, field_name in (
+            (self.key_value, "recipe key_value"),
+            (self.expected_value, "recipe expected_value"),
+            (self.new_value, "recipe new_value"),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"{field_name} must be a string")
+            if len(value) > _MAX_UPDATE_VALUE_CHARACTERS:
+                raise ValueError(
+                    f"{field_name} exceeds {_MAX_UPDATE_VALUE_CHARACTERS} characters"
+                )
+        for value, field_name in (
+            (self.resource_revision, "recipe resource_revision"),
+            (self.recipe_fingerprint, "recipe recipe_fingerprint"),
+        ):
+            digest = value.removeprefix("sha256:") if isinstance(value, str) else ""
+            if (
+                not isinstance(value, str)
+                or not value.startswith("sha256:")
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError(f"{field_name} must be a canonical sha256 hash")
+        source_revision = _required_text(
+            self.source_revision,
+            "recipe source_revision",
+        )
+        if len(source_revision) > 1_024:
+            raise ValueError("recipe source_revision exceeds 1024 characters")
+        if sqlite_identifier_key(self.key_column) == sqlite_identifier_key(
+            self.target_column
+        ):
+            raise ValueError("recipe key and target columns must be distinct")
+        if self.expected_value == self.new_value:
+            raise ValueError("recipe update must not be a no-op")
+        expected_fingerprint = _sqlite_update_fingerprint(
+            source_id=self.source_id,
+            resource_id=self.resource_id,
+            resource_revision=self.resource_revision,
+            source_revision=self.source_revision,
+            table_name=self.table_name,
+            key_column=self.key_column,
+            target_column=self.target_column,
+            key_value=self.key_value,
+            expected_value=self.expected_value,
+            new_value=self.new_value,
+        )
+        if self.recipe_fingerprint != expected_fingerprint:
+            raise ValueError("recipe_fingerprint does not match the update recipe")
+
+
+@dataclass(frozen=True, slots=True)
+class SQLiteUpdateValidationResult:
+    valid: bool
+    source_id: str
+    recipe: SQLiteUpdateRecipe | None
+    issues: tuple[SqlValidationIssue, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.valid, bool):
+            raise TypeError("update validation valid must be a boolean")
+        object.__setattr__(
+            self,
+            "source_id",
+            _required_text(self.source_id, "update validation source_id"),
+        )
+        if self.recipe is not None and not isinstance(self.recipe, SQLiteUpdateRecipe):
+            raise TypeError(
+                "update validation recipe must be SQLiteUpdateRecipe or None"
+            )
+        issues = tuple(self.issues)
+        if any(not isinstance(issue, SqlValidationIssue) for issue in issues):
+            raise TypeError(
+                "update validation issues must contain SqlValidationIssue records"
+            )
+        if self.valid != (self.recipe is not None and not issues):
+            raise ValueError(
+                "update validation validity must agree with recipe and issues"
+            )
+        object.__setattr__(self, "issues", issues)
 
     @property
     def issue_codes(self) -> tuple[str, ...]:
@@ -674,6 +913,304 @@ def validate_sqlite_read(
         ),
         issues=bounded_issues,
     )
+
+
+def validate_sqlite_update_recipe(
+    *,
+    source_id: str,
+    resource_id: str,
+    key_column: str,
+    key_value: str,
+    target_column: str,
+    expected_value: str,
+    new_value: str,
+    resources: Iterable[ResourceSchema],
+    source_write_access: bool,
+) -> SQLiteUpdateValidationResult:
+    """Validate a semantic, conditional, single-row SQLite update recipe."""
+
+    source_id = _required_text(source_id, "source_id")
+    issues: list[SqlValidationIssue] = []
+    if not isinstance(source_write_access, bool):
+        raise TypeError("source_write_access must be a boolean")
+    if not source_write_access:
+        issues.append(
+            SqlValidationIssue(
+                "source_write_access_required",
+                "The SQLite source was not explicitly attached with write access.",
+                {"source_id": source_id},
+            )
+        )
+
+    identifiers: dict[str, str] = {}
+    for value, field_name, maximum in (
+        (source_id, "source_id", _MAX_UPDATE_IDENTIFIER_CHARACTERS),
+        (resource_id, "resource_id", _MAX_UPDATE_IDENTIFIER_CHARACTERS),
+        (key_column, "key_column", _MAX_UPDATE_COLUMN_CHARACTERS),
+        (target_column, "target_column", _MAX_UPDATE_COLUMN_CHARACTERS),
+    ):
+        if (
+            not isinstance(value, str)
+            or not value.strip()
+            or len(value.strip()) > maximum
+        ):
+            issues.append(
+                SqlValidationIssue(
+                    "input_out_of_bounds",
+                    "SQLite update identifiers must be bounded non-empty strings.",
+                    {"field": field_name, "maximum_characters": maximum},
+                )
+            )
+            continue
+        identifiers[field_name] = value.strip()
+
+    values: dict[str, str] = {}
+    for value, field_name in (
+        (key_value, "key_value"),
+        (expected_value, "expected_value"),
+        (new_value, "new_value"),
+    ):
+        if not isinstance(value, str) or len(value) > _MAX_UPDATE_VALUE_CHARACTERS:
+            issues.append(
+                SqlValidationIssue(
+                    "input_out_of_bounds",
+                    "SQLite update values must be bounded strings.",
+                    {
+                        "field": field_name,
+                        "maximum_characters": _MAX_UPDATE_VALUE_CHARACTERS,
+                    },
+                )
+            )
+            continue
+        values[field_name] = value
+
+    source_resources = tuple(
+        resource
+        for resource in resources
+        if isinstance(resource, ResourceSchema) and resource.source_id == source_id
+    )
+    selected_resource_id = identifiers.get("resource_id")
+    matches = tuple(
+        resource
+        for resource in source_resources
+        if resource.resource_id == selected_resource_id
+    )
+    resource = matches[0] if len(matches) == 1 else None
+    if resource is None:
+        issues.append(
+            SqlValidationIssue(
+                "catalog_resource_missing",
+                "The update resource is absent from the current catalog scope.",
+                {
+                    "resource_id": selected_resource_id or "invalid",
+                    "source_id": source_id,
+                },
+            )
+        )
+    else:
+        if resource.resource_kind != "table" or not resource.writable:
+            issues.append(
+                SqlValidationIssue(
+                    "resource_not_writable_table",
+                    "Controlled SQLite updates require a cataloged writable table.",
+                    {
+                        "resource_id": resource.resource_id,
+                        "resource_kind": resource.resource_kind or "unknown",
+                    },
+                )
+            )
+        if resource.revision is None or resource.source_revision is None:
+            issues.append(
+                SqlValidationIssue(
+                    "catalog_revision_scope_incomplete",
+                    "Controlled SQLite updates require current resource and source revisions.",
+                    {"resource_id": resource.resource_id},
+                )
+            )
+
+        column_by_key = {
+            sqlite_identifier_key(column): column for column in resource.columns
+        }
+        canonical_key = column_by_key.get(
+            sqlite_identifier_key(identifiers.get("key_column", ""))
+        )
+        canonical_target = column_by_key.get(
+            sqlite_identifier_key(identifiers.get("target_column", ""))
+        )
+        if canonical_key is None:
+            issues.append(
+                SqlValidationIssue(
+                    "unknown_key_column",
+                    "The update key column is absent from the current catalog schema.",
+                    {"resource_id": resource.resource_id},
+                )
+            )
+        elif sqlite_identifier_key(canonical_key) not in {
+            sqlite_identifier_key(column) for column in resource.unique_key_columns
+        }:
+            issues.append(
+                SqlValidationIssue(
+                    "key_not_unique",
+                    "The update key must be one complete single-column unique or primary key.",
+                    {
+                        "key_column": canonical_key,
+                        "resource_id": resource.resource_id,
+                    },
+                )
+            )
+        if canonical_target is None:
+            issues.append(
+                SqlValidationIssue(
+                    "unknown_target_column",
+                    "The update target column is absent from the current catalog schema.",
+                    {"resource_id": resource.resource_id},
+                )
+            )
+        else:
+            declared_type_by_key = {
+                sqlite_identifier_key(column): declared_type
+                for column, declared_type in resource.column_declared_types
+            }
+            target_declared_type = declared_type_by_key.get(
+                sqlite_identifier_key(canonical_target)
+            )
+            if target_declared_type is None:
+                issues.append(
+                    SqlValidationIssue(
+                        "catalog_column_type_scope_incomplete",
+                        "The current catalog lacks the update target declared type.",
+                        {
+                            "resource_id": resource.resource_id,
+                            "target_column": canonical_target,
+                        },
+                    )
+                )
+            else:
+                target_affinity = sqlite_declared_type_affinity(target_declared_type)
+                if target_affinity != "text":
+                    issues.append(
+                        SqlValidationIssue(
+                            "target_column_affinity_not_supported",
+                            "Controlled SQLite updates currently require a TEXT-affinity target column.",
+                            {
+                                "resource_id": resource.resource_id,
+                                "target_affinity": target_affinity,
+                                "target_column": canonical_target,
+                            },
+                        )
+                    )
+        if (
+            canonical_key is not None
+            and canonical_target is not None
+            and sqlite_identifier_key(canonical_key)
+            == sqlite_identifier_key(canonical_target)
+        ):
+            issues.append(
+                SqlValidationIssue(
+                    "key_target_conflict",
+                    "The update key and target columns must be distinct.",
+                    {"resource_id": resource.resource_id},
+                )
+            )
+
+    if (
+        "expected_value" in values
+        and "new_value" in values
+        and values["expected_value"] == values["new_value"]
+    ):
+        issues.append(
+            SqlValidationIssue(
+                "no_op_update",
+                "The expected and replacement values must be different.",
+            )
+        )
+
+    bounded_issues = tuple(issues[:_MAX_ISSUES])
+    if bounded_issues or resource is None:
+        return SQLiteUpdateValidationResult(
+            valid=False,
+            source_id=source_id,
+            recipe=None,
+            issues=bounded_issues,
+        )
+
+    canonical_key = next(
+        column
+        for column in resource.columns
+        if sqlite_identifier_key(column)
+        == sqlite_identifier_key(identifiers["key_column"])
+    )
+    canonical_target = next(
+        column
+        for column in resource.columns
+        if sqlite_identifier_key(column)
+        == sqlite_identifier_key(identifiers["target_column"])
+    )
+    assert resource.revision is not None
+    assert resource.source_revision is not None
+    recipe_fingerprint = _sqlite_update_fingerprint(
+        source_id=resource.source_id,
+        resource_id=resource.resource_id,
+        resource_revision=resource.revision,
+        source_revision=resource.source_revision,
+        table_name=resource.name,
+        key_column=canonical_key,
+        target_column=canonical_target,
+        key_value=values["key_value"],
+        expected_value=values["expected_value"],
+        new_value=values["new_value"],
+    )
+    return SQLiteUpdateValidationResult(
+        valid=True,
+        source_id=source_id,
+        recipe=SQLiteUpdateRecipe(
+            source_id=resource.source_id,
+            resource_id=resource.resource_id,
+            resource_revision=resource.revision,
+            source_revision=resource.source_revision,
+            table_name=resource.name,
+            key_column=canonical_key,
+            target_column=canonical_target,
+            key_value=values["key_value"],
+            expected_value=values["expected_value"],
+            new_value=values["new_value"],
+            sensitivity_class=resource.sensitivity_class,
+            recipe_fingerprint=recipe_fingerprint,
+        ),
+        issues=(),
+    )
+
+
+def _sqlite_update_fingerprint(
+    *,
+    source_id: str,
+    resource_id: str,
+    resource_revision: str,
+    source_revision: str,
+    table_name: str,
+    key_column: str,
+    target_column: str,
+    key_value: str,
+    expected_value: str,
+    new_value: str,
+) -> str:
+    encoded = canonical_json(
+        {
+            "expected_value": expected_value,
+            "key_column": key_column,
+            "key_value": key_value,
+            "new_value": new_value,
+            "recipe": "data.sqlite.update",
+            "resource_id": resource_id,
+            "resource_revision": resource_revision,
+            "schema_version": 1,
+            "source_id": source_id,
+            "source_revision": source_revision,
+            "table_name": table_name,
+            "target_column": target_column,
+        }
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _resource_candidates(

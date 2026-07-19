@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable
+from typing import cast
 
 from ..._json import FrozenJsonObject
+from ...adapters.models import SourceRegistration
 from ...catalog.models import FacetKind, ResourceKind
 from ...catalog.protocols import CatalogStore
 from ...catalog.service import CatalogService
@@ -61,12 +63,52 @@ class CatalogDataView:
             raw_columns = tabular.payload.get("columns", ())
             if not isinstance(raw_columns, tuple):
                 continue
-            columns = tuple(
+            columns: tuple[str, ...] = tuple(
                 name
                 for column in raw_columns
-                if isinstance(column, Mapping)
+                if isinstance(column, FrozenJsonObject)
                 and isinstance((name := column.get("name")), str)
             )
+            column_declared_types: tuple[tuple[str, str], ...] = tuple(
+                (name, native_type)
+                for column in raw_columns
+                if isinstance(column, FrozenJsonObject)
+                and isinstance((name := column.get("name")), str)
+                and isinstance((native_type := column.get("native_type")), str)
+            )
+            primary_key_columns: tuple[tuple[int, str], ...] = tuple(
+                (ordinal, name)
+                for column in raw_columns
+                if isinstance(column, FrozenJsonObject)
+                and isinstance((name := column.get("name")), str)
+                and isinstance(
+                    (ordinal := column.get("primary_key_ordinal")),
+                    int,
+                )
+                and not isinstance(ordinal, bool)
+                and ordinal > 0
+            )
+            unique_key_columns: list[str] = []
+            if len(primary_key_columns) == 1 and primary_key_columns[0][0] == 1:
+                unique_key_columns.append(primary_key_columns[0][1])
+            raw_indexes = tabular.payload.get("indexes", ())
+            if isinstance(raw_indexes, tuple):
+                for index in raw_indexes:
+                    if (
+                        not isinstance(index, FrozenJsonObject)
+                        or index.get("unique") is not True
+                        or index.get("predicate") is not None
+                    ):
+                        continue
+                    index_columns = index.get("columns")
+                    if (
+                        isinstance(index_columns, tuple)
+                        and len(index_columns) == 1
+                        and isinstance(index_columns[0], str)
+                        and index_columns[0] in columns
+                        and index_columns[0] not in unique_key_columns
+                    ):
+                        unique_key_columns.append(index_columns[0])
             aliases = (
                 ()
                 if resource.native_identity == resource.name
@@ -81,9 +123,38 @@ class CatalogDataView:
                     aliases=aliases,
                     revision=resource.current_revision,
                     source_revision=source_revision_by_sync[resource.current_sync_id],
+                    resource_kind=resource.kind.value,
+                    sensitivity_class=resource.sensitivity.value,
+                    writable=resource.kind is ResourceKind.TABLE,
+                    unique_key_columns=tuple(unique_key_columns),
+                    column_declared_types=column_declared_types,
                 )
             )
         return tuple(sorted(schemas, key=lambda item: (item.name, item.resource_id)))
+
+    async def is_writable_sqlite_source(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> bool:
+        """Project explicit write admission from the durable source registration."""
+
+        load_source = getattr(self._store, "load_source", None)
+        if not callable(load_source):
+            return False
+        typed_load_source = cast(
+            Callable[[str, str], Awaitable[SourceRegistration | None]],
+            load_source,
+        )
+        registration = await typed_load_source(agent_id, source_id)
+        return bool(
+            registration is not None
+            and registration.agent_id == agent_id
+            and registration.id == source_id
+            and registration.active
+            and registration.adapter_id == "sqlite"
+            and registration.configuration.get("write_access") is True
+        )
 
     async def is_current_tabular_file(
         self,

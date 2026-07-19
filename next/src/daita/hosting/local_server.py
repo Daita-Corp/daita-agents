@@ -51,6 +51,7 @@ from ..monitors.store import (
 )
 from ..operations.checkpoints import OperationSnapshot
 from ..operations.governance import ApprovalRequest
+from ..operations.models import Task
 from ..operations.runtime import OperationStateError
 from ..operations.store import OperationNotFoundError
 from .embedded import AgentNotConfiguredError
@@ -712,11 +713,32 @@ def _approval_projection(approval: ApprovalRequest) -> dict[str, object]:
         "id": approval.id,
         "operation_id": approval.operation_id,
         "task_id": approval.task_id,
+        "task_fingerprint": approval.task_fingerprint,
+        "policy_fingerprint": approval.policy_fingerprint,
         "status": approval.status.value,
         "requested_at": _timestamp(approval.requested_at),
         "decided_at": _timestamp(approval.decided_at),
         "decided_by": approval.decided_by,
         "decision_reason": approval.decision_reason,
+    }
+
+
+def _task_governance_projection(
+    task: Task,
+    *,
+    actor_id: str,
+) -> dict[str, object]:
+    facts = task.execution_facts
+    return {
+        "actor_id": actor_id,
+        "access_mode": facts.access_mode.value,
+        "risk": facts.risk.value,
+        "side_effecting": facts.side_effecting,
+        "idempotent": facts.idempotent,
+        "replay_safe": facts.replay_safe,
+        "capability_fingerprint": facts.capability_fingerprint,
+        "arguments_hash": facts.arguments_hash,
+        "validation": facts.validation_facts.audit_projection(),
     }
 
 
@@ -758,6 +780,13 @@ def _operation_projection(snapshot: OperationSnapshot) -> dict[str, object]:
                 "capability_id": value.capability_id,
                 "executor_id": value.executor_id,
                 "attempt": value.attempt,
+                "governance": _task_governance_projection(
+                    value,
+                    actor_id=(
+                        f"{snapshot.trigger.kind.value}:"
+                        f"{snapshot.trigger.source_id}"
+                    ),
+                ),
                 "evidence_ids": list(value.evidence_ids),
                 "error_code": value.error_code,
                 "cancellation_requested": value.cancellation_requested,
@@ -831,6 +860,7 @@ def _source_projection(value: SourceRegistration) -> dict[str, object]:
         "attached_at": _timestamp(value.attached_at),
         "detached_at": _timestamp(value.detached_at),
         "active": value.active,
+        "write_access": value.configuration.get("write_access") is True,
     }
 
 
@@ -1217,12 +1247,25 @@ class LocalAgentServer:
             values = _shape(
                 params,
                 required=frozenset({"kind", "path"}),
+                optional=frozenset({"write_access"}),
             )
             kind = _text(values["kind"], "kind", maximum_bytes=32)
             path = _text(values["path"], "path", maximum_bytes=2_048)
+            write_access = _boolean(
+                values.get("write_access", False),
+                "write_access",
+            )
             if kind == "sqlite":
-                source: ResourceSource = SQLiteSource(path)
+                source: ResourceSource = SQLiteSource(
+                    path,
+                    allow_writes=write_access,
+                )
             elif kind == "local_files":
+                if write_access:
+                    raise _RequestError(
+                        "invalid_params",
+                        "write_access is supported only for SQLite sources",
+                    )
                 source = LocalDirectorySource(path)
             else:
                 raise _RequestError(

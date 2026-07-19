@@ -24,6 +24,7 @@ from ..operations.runtime import (
     OperationRuntime,
     OperationStateError,
     TaskExecutionTimeout,
+    TaskOutcomeUnknown,
 )
 from .models import LoopBudgets, LoopExit, LoopExitKind, LoopPhase, Readiness, Turn
 
@@ -551,13 +552,32 @@ class AgentLoop:
                         validation,
                         timeout_seconds=remaining_wall_time,
                     )
+                except TaskOutcomeUnknown as error:
+                    current = await self._runtime.inspect(operation_id)
+                    return await self._task_checkpoint_exit(
+                        current,
+                        error.task_id,
+                        outcome_unknown=True,
+                    )
                 except OperationWallTimeExceeded as error:
+                    current = await self._runtime.inspect(operation_id)
+                    task = next(
+                        task for task in current.tasks if task.id == error.task_id
+                    )
+                    if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+                        return await self._task_checkpoint_exit(current, task.id)
                     return await self._fail_wall_time(
                         operation_id,
                         call_id=call.id,
                         task_id=error.task_id,
                     )
                 except TaskExecutionTimeout as error:
+                    current = await self._runtime.inspect(operation_id)
+                    task = next(
+                        task for task in current.tasks if task.id == error.task_id
+                    )
+                    if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+                        return await self._task_checkpoint_exit(current, task.id)
                     return await self._runtime.fail_budget(
                         operation_id,
                         "task_timeout",
@@ -569,6 +589,25 @@ class AgentLoop:
                         task_id=error.task_id,
                     )
                 except Exception:
+                    current = await self._runtime.inspect(operation_id)
+                    checkpoint_task = next(
+                        (
+                            task
+                            for task in current.tasks
+                            if task.turn_id == model_call.turn_id
+                            and task.call_id == call.id
+                        ),
+                        None,
+                    )
+                    if checkpoint_task is not None and checkpoint_task.status in {
+                        TaskStatus.CLAIMED,
+                        TaskStatus.RUNNING,
+                        TaskStatus.MANUAL_RECOVERY_REQUIRED,
+                    }:
+                        return await self._task_checkpoint_exit(
+                            current,
+                            checkpoint_task.id,
+                        )
                     return await self._runtime.fail(
                         operation_id,
                         "action_processing_failed",
@@ -593,13 +632,32 @@ class AgentLoop:
                         operation_id,
                         existing_task.id,
                     )
+                except TaskOutcomeUnknown as error:
+                    current = await self._runtime.inspect(operation_id)
+                    return await self._task_checkpoint_exit(
+                        current,
+                        error.task_id,
+                        outcome_unknown=True,
+                    )
                 except OperationWallTimeExceeded as error:
+                    current = await self._runtime.inspect(operation_id)
+                    task = next(
+                        task for task in current.tasks if task.id == error.task_id
+                    )
+                    if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+                        return await self._task_checkpoint_exit(current, task.id)
                     return await self._fail_wall_time(
                         operation_id,
                         call_id=call.id,
                         task_id=error.task_id,
                     )
                 except TaskExecutionTimeout as error:
+                    current = await self._runtime.inspect(operation_id)
+                    task = next(
+                        task for task in current.tasks if task.id == error.task_id
+                    )
+                    if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+                        return await self._task_checkpoint_exit(current, task.id)
                     return await self._runtime.fail_budget(
                         operation_id,
                         "task_timeout",
@@ -617,6 +675,19 @@ class AgentLoop:
                         existing_task.id,
                     )
                 except Exception:
+                    current = await self._runtime.inspect(operation_id)
+                    current_task = next(
+                        task for task in current.tasks if task.id == existing_task.id
+                    )
+                    if current_task.status in {
+                        TaskStatus.CLAIMED,
+                        TaskStatus.RUNNING,
+                        TaskStatus.MANUAL_RECOVERY_REQUIRED,
+                    }:
+                        return await self._task_checkpoint_exit(
+                            current,
+                            current_task.id,
+                        )
                     return await self._runtime.fail(
                         operation_id,
                         "action_processing_failed",
@@ -751,6 +822,8 @@ class AgentLoop:
         self,
         snapshot: OperationSnapshot,
         task_id: str,
+        *,
+        outcome_unknown: bool = False,
     ) -> LoopExit:
         task = next(task for task in snapshot.tasks if task.id == task_id)
         if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
@@ -763,10 +836,16 @@ class AgentLoop:
                     snapshot.operation.id,
                     "checkpoint_recovery_failed",
                 )
+            outcome_unknown = outcome_unknown or any(
+                event.type == "task.outcome_unknown" and event.task_id == task.id
+                for event in snapshot.events
+            )
             return LoopExit(
                 operation_id=snapshot.operation.id,
                 kind=LoopExitKind.WAITING,
-                reason="task_lease_active",
+                reason=(
+                    "task_outcome_unknown" if outcome_unknown else "task_lease_active"
+                ),
                 created_at=snapshot.operation.updated_at,
             )
         waiting_reason = {

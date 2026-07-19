@@ -20,6 +20,7 @@ from ..capabilities import (
     EvidenceValidationError,
     ExecutionRequest,
     Executor,
+    ExecutorKnownNoEffectError,
 )
 from ..events.models import RuntimeEvent
 from ..llm.models import ModelRequest, ModelResponse, ToolCall
@@ -84,6 +85,15 @@ class TaskExecutionTimeout(CapabilityExecutionError):
         self.task_id = task_id
         self.timeout_seconds = timeout_seconds
         super().__init__(f"task {task_id} exceeded {timeout_seconds:g} seconds")
+
+
+class TaskOutcomeUnknown(CapabilityExecutionError):
+    """Raised when executor I/O may have changed external state without evidence."""
+
+    def __init__(self, task_id: str, reason: str) -> None:
+        self.task_id = task_id
+        self.reason = reason
+        super().__init__(f"task {task_id} external outcome is unknown: {reason}")
 
 
 class OperationWallTimeExceeded(CapabilityExecutionError):
@@ -760,6 +770,7 @@ class OperationRuntime:
             }
             payload = {
                 "code": decision.code,
+                "facts": self._governance_audit_projection(state, task),
                 "policy_fingerprint": decision.policy_fingerprint,
                 "task_fingerprint": decision.task_fingerprint,
             }
@@ -822,6 +833,7 @@ class OperationRuntime:
                     approval_id=approval.id,
                     payload={
                         "approval_id": approval.id,
+                        "facts": self._governance_audit_projection(state, task),
                         "policy_fingerprint": decision.policy_fingerprint,
                         "task_fingerprint": decision.task_fingerprint,
                     },
@@ -1307,6 +1319,31 @@ class OperationRuntime:
                 raise OperationStateError(
                     f"tool call already materialized: {proposal.call_id}"
                 )
+            validation_evidence: list[Evidence] = []
+            for evidence_id in proposal.validation_facts.evidence_ids:
+                evidence = next(
+                    (
+                        item
+                        for item in state.evidence
+                        if item.id == evidence_id
+                        and item.operation_id == proposal.operation_id
+                        and item.accepted
+                    ),
+                    None,
+                )
+                if evidence is None:
+                    raise OperationStateError(
+                        "validation facts reference unavailable accepted evidence"
+                    )
+                validation_evidence.append(evidence)
+            selected_evidence_kinds = tuple(
+                sorted(evidence.kind for evidence in validation_evidence)
+            )
+            required_evidence_kinds = tuple(sorted(capability.required_evidence_kinds))
+            if selected_evidence_kinds != required_evidence_kinds:
+                raise OperationStateError(
+                    "validation facts do not match capability-required evidence"
+                )
             now = self._clock()
             task_id = self._id_factory("task")
             idempotency_key = (
@@ -1340,9 +1377,22 @@ class OperationRuntime:
                     idempotent=capability.idempotent,
                     replay_safe=capability.replay_safe,
                     idempotency_key=idempotency_key,
+                    validation_facts=proposal.validation_facts,
                 ),
             )
             state.tasks.append(task)
+            prerequisite_task_ids: list[str] = []
+            for evidence in validation_evidence:
+                if evidence.task_id in prerequisite_task_ids:
+                    continue
+                prerequisite_task_ids.append(evidence.task_id)
+                state.task_dependencies.append(
+                    TaskDependency(
+                        operation_id=proposal.operation_id,
+                        task_id=task.id,
+                        prerequisite_task_id=evidence.task_id,
+                    )
+                )
             state.loop_state = replace(
                 state.loop_state,
                 phase=LoopPhase.AWAITING_EXECUTION,
@@ -1362,6 +1412,7 @@ class OperationRuntime:
                     "task_id": task.id,
                     "capability_id": task.capability_id,
                     "executor_id": task.executor_id,
+                    "governance": self._governance_audit_projection(state, task),
                 },
             )
             await self._commit(state)
@@ -1555,6 +1606,19 @@ class OperationRuntime:
                 candidate = await executor.execute(request)
         except asyncio.CancelledError:
             raise
+        except ExecutorKnownNoEffectError as error:
+            outcome_unknown = await self._record_execution_failure(
+                task.operation_id,
+                task.id,
+                guard,
+                error.code,
+                known_no_effect=True,
+            )
+            if outcome_unknown and not task.execution_facts.replay_safe:
+                raise TaskOutcomeUnknown(task.id, error.code) from error
+            raise CapabilityExecutionError(
+                f"executor reported no external effect for task {task.id}"
+            ) from error
         except Exception as error:
             current_task = asyncio.current_task()
             if current_task is not None and current_task.cancelling():
@@ -1562,12 +1626,14 @@ class OperationRuntime:
             if timeout.expired():
                 deadline_cause = error
             else:
-                await self._record_execution_failure(
+                outcome_unknown = await self._record_execution_failure(
                     task.operation_id,
                     task.id,
                     guard,
                     "executor_failed",
                 )
+                if outcome_unknown and not task.execution_facts.replay_safe:
+                    raise TaskOutcomeUnknown(task.id, "executor_failed") from error
                 raise CapabilityExecutionError(
                     f"executor failed for task {task.id}"
                 ) from error
@@ -1576,12 +1642,14 @@ class OperationRuntime:
         if current_task is not None and current_task.cancelling():
             raise asyncio.CancelledError
         if timeout.expired():
-            await self._record_execution_failure(
+            outcome_unknown = await self._record_execution_failure(
                 task.operation_id,
                 task.id,
                 guard,
                 "task_timeout",
             )
+            if outcome_unknown and not task.execution_facts.replay_safe:
+                raise TaskOutcomeUnknown(task.id, "task_timeout") from deadline_cause
             if timeout_is_wall:
                 raise OperationWallTimeExceeded(task.id) from deadline_cause
             raise TaskExecutionTimeout(
@@ -1592,12 +1660,14 @@ class OperationRuntime:
         if deadline_cause is not None:
             # ``timeout.expired()`` is stable once the context has exited, so
             # this branch is defensive against an invalid timeout lifecycle.
-            await self._record_execution_failure(
+            outcome_unknown = await self._record_execution_failure(
                 task.operation_id,
                 task.id,
                 guard,
                 "executor_failed",
             )
+            if outcome_unknown and not task.execution_facts.replay_safe:
+                raise TaskOutcomeUnknown(task.id, "executor_failed") from deadline_cause
             raise CapabilityExecutionError(
                 f"executor failed for task {task.id}"
             ) from deadline_cause
@@ -1607,6 +1677,7 @@ class OperationRuntime:
         validation_error: EvidenceValidationError | None = None
         evidence_id: str | None = None
         blob_request: BlobPut | None = None
+        publication_error: Exception | None = None
         async with self._lock:
             state = await self._working_state(task.operation_id)
             _, committed_task = self._task(state, task.id)
@@ -1653,22 +1724,32 @@ class OperationRuntime:
                     )
 
         if execution_identity_error is not None:
-            await self._record_execution_failure(
+            outcome_unknown = await self._record_execution_failure(
                 task.operation_id,
                 task.id,
                 guard,
                 "execution_identity_changed",
             )
+            if outcome_unknown and not task.execution_facts.replay_safe:
+                raise TaskOutcomeUnknown(
+                    task.id,
+                    "execution_identity_changed",
+                ) from execution_identity_error
             raise CapabilityExecutionError(
                 f"executor identity changed for task {task.id}"
             ) from execution_identity_error
         if validation_error is not None:
-            await self._record_execution_failure(
+            outcome_unknown = await self._record_execution_failure(
                 task.operation_id,
                 task.id,
                 guard,
                 "evidence_rejected",
             )
+            if outcome_unknown and not task.execution_facts.replay_safe:
+                raise TaskOutcomeUnknown(
+                    task.id,
+                    "evidence_rejected",
+                ) from validation_error
             raise validation_error
 
         assert accepted_candidate is not None
@@ -1716,12 +1797,17 @@ class OperationRuntime:
                 current_task = asyncio.current_task()
                 if current_task is not None and current_task.cancelling():
                     raise asyncio.CancelledError from error
-                await self._record_execution_failure(
+                outcome_unknown = await self._record_execution_failure(
                     task.operation_id,
                     task.id,
                     guard,
                     "evidence_blob_failed",
                 )
+                if outcome_unknown and not task.execution_facts.replay_safe:
+                    raise TaskOutcomeUnknown(
+                        task.id,
+                        "evidence_blob_failed",
+                    ) from error
                 raise CapabilityExecutionError(
                     f"artifact persistence failed for task {task.id}"
                 ) from error
@@ -1788,51 +1874,89 @@ class OperationRuntime:
                     released_at=release_placeholder,
                     release_reason="completed",
                 )
-                self._append_event(
-                    state,
-                    "executor.completed",
-                    turn_id=task.turn_id,
-                    model_call_id=model_call.id,
-                    call_id=task.call_id,
-                    task_id=task.id,
-                    capability_id=task.capability_id,
-                    executor_id=task.executor_id,
-                    payload={"task_id": task.id, "executor_id": task.executor_id},
-                )
-                self._append_event(
-                    state,
-                    "evidence.accepted",
-                    turn_id=task.turn_id,
-                    model_call_id=model_call.id,
-                    call_id=task.call_id,
-                    task_id=task.id,
-                    evidence_id=evidence.id,
-                    capability_id=task.capability_id,
-                    executor_id=task.executor_id,
-                    payload={"task_id": task.id, "evidence_id": evidence.id},
-                )
-                self._append_event(
-                    state,
-                    "task.succeeded",
-                    turn_id=task.turn_id,
-                    model_call_id=model_call.id,
-                    call_id=task.call_id,
-                    task_id=task.id,
-                    evidence_id=evidence.id,
-                    capability_id=task.capability_id,
-                    executor_id=task.executor_id,
-                    payload={"task_id": task.id},
-                )
-                committed_state = await self._commit_fenced(state, guard)
-                return self._accepted_evidence(committed_state, evidence.id)
+                try:
+                    self._append_event(
+                        state,
+                        "executor.completed",
+                        turn_id=task.turn_id,
+                        model_call_id=model_call.id,
+                        call_id=task.call_id,
+                        task_id=task.id,
+                        capability_id=task.capability_id,
+                        executor_id=task.executor_id,
+                        payload={
+                            "task_id": task.id,
+                            "executor_id": task.executor_id,
+                        },
+                    )
+                    self._append_event(
+                        state,
+                        "evidence.accepted",
+                        turn_id=task.turn_id,
+                        model_call_id=model_call.id,
+                        call_id=task.call_id,
+                        task_id=task.id,
+                        evidence_id=evidence.id,
+                        capability_id=task.capability_id,
+                        executor_id=task.executor_id,
+                        payload={"task_id": task.id, "evidence_id": evidence.id},
+                    )
+                    self._append_event(
+                        state,
+                        "task.succeeded",
+                        turn_id=task.turn_id,
+                        model_call_id=model_call.id,
+                        call_id=task.call_id,
+                        task_id=task.id,
+                        evidence_id=evidence.id,
+                        capability_id=task.capability_id,
+                        executor_id=task.executor_id,
+                        payload={"task_id": task.id},
+                    )
+                    committed_state = await self._commit_fenced(state, guard)
+                except Exception as error:
+                    publication_error = error
+                else:
+                    return self._accepted_evidence(committed_state, evidence.id)
+
+        if publication_error is not None:
+            if isinstance(publication_error, OperationStateError) and isinstance(
+                publication_error.__cause__,
+                (ExpiredTaskLeaseError, StaleTaskFenceError),
+            ):
+                if not task.execution_facts.replay_safe:
+                    raise TaskOutcomeUnknown(
+                        task.id,
+                        "evidence_commit_failed",
+                    ) from publication_error
+                raise publication_error
+            outcome_unknown = await self._record_execution_failure(
+                task.operation_id,
+                task.id,
+                guard,
+                "evidence_commit_failed",
+            )
+            if outcome_unknown and not task.execution_facts.replay_safe:
+                raise TaskOutcomeUnknown(
+                    task.id,
+                    "evidence_commit_failed",
+                ) from publication_error
+            raise CapabilityExecutionError(
+                f"evidence commit failed for task {task.id}"
+            ) from publication_error
 
         if execution_identity_error is not None:
-            await self._record_execution_failure(
+            outcome_unknown = await self._record_execution_failure(
                 task.operation_id,
                 task.id,
                 guard,
                 "execution_identity_changed",
             )
+            if outcome_unknown and not task.execution_facts.replay_safe:
+                raise TaskOutcomeUnknown(
+                    task.id,
+                    "execution_identity_changed",
+                ) from execution_identity_error
             raise CapabilityExecutionError(
                 f"executor identity changed for task {task.id}"
             ) from execution_identity_error
@@ -2391,6 +2515,7 @@ class OperationRuntime:
         task: Task,
     ) -> GovernanceFacts:
         facts = task.execution_facts
+        validation = facts.validation_facts
         return GovernanceFacts(
             operation_id=task.operation_id,
             task_id=task.id,
@@ -2404,12 +2529,33 @@ class OperationRuntime:
             idempotent=facts.idempotent,
             replay_safe=facts.replay_safe,
             idempotency_key=facts.idempotency_key,
-            validation_passed=True,
-            in_scope=True,
-            destructive=False,
-            sensitivity_class="internal",
+            validation_passed=validation.validation_passed,
+            in_scope=validation.in_scope,
+            destructive=validation.destructive,
+            sensitivity_class=validation.sensitivity_class,
             actor_id=f"{state.trigger.kind.value}:{state.trigger.source_id}",
+            validation_fingerprint=validation.fingerprint,
         )
+
+    @staticmethod
+    def _governance_audit_projection(
+        state: _OperationState,
+        task: Task,
+    ) -> dict[str, object]:
+        """Project bounded authority facts without model arguments or row data."""
+
+        facts = task.execution_facts
+        return {
+            "actor_id": f"{state.trigger.kind.value}:{state.trigger.source_id}",
+            "access_mode": facts.access_mode.value,
+            "risk": facts.risk.value,
+            "side_effecting": facts.side_effecting,
+            "idempotent": facts.idempotent,
+            "replay_safe": facts.replay_safe,
+            "capability_fingerprint": facts.capability_fingerprint,
+            "arguments_hash": facts.arguments_hash,
+            "validation": facts.validation_facts.audit_projection(),
+        }
 
     @staticmethod
     def _lease(
@@ -2455,6 +2601,7 @@ class OperationRuntime:
             idempotent=capability.idempotent,
             replay_safe=capability.replay_safe,
             idempotency_key=expected_idempotency_key,
+            validation_facts=task.execution_facts.validation_facts,
         )
         if (
             task.executor_id != capability.executor_id
@@ -2478,10 +2625,13 @@ class OperationRuntime:
         task_id: str,
         guard: TaskLeaseGuard,
         error_code: str,
-    ) -> None:
-        """Fail safe I/O, but retain side-effect uncertainty for recovery."""
+        *,
+        known_no_effect: bool = False,
+    ) -> bool:
+        """Record failure and report whether external outcome remains unknown."""
 
         fail_known_safe = False
+        outcome_unknown = False
         async with self._lock:
             state = await self._working_state(operation_id)
             task_index, task = self._task(state, task_id)
@@ -2490,12 +2640,12 @@ class OperationRuntime:
             _, active_lease = self._lease(state, guard)
             if active_lease.released_at is not None or task.attempt != guard.attempt:
                 raise OperationStateError("task execution lease is no longer active")
-            if not task.execution_facts.side_effecting:
+            if known_no_effect or not task.execution_facts.side_effecting:
                 fail_known_safe = True
             elif task.cancellation_requested:
-                return
+                outcome_unknown = True
             else:
-                fail_known_safe = False
+                outcome_unknown = True
                 now = self._clock()
                 if now.tzinfo is None or now.utcoffset() is None:
                     raise ValueError(
@@ -2536,10 +2686,11 @@ class OperationRuntime:
                     ):
                         # The durable start already proves an uncertain external
                         # outcome. A stale holder must not annotate it.
-                        return
+                        return True
                     raise
         if fail_known_safe:
             await self._fail_task(operation_id, task_id, guard, error_code)
+        return outcome_unknown
 
     async def _fail_task(
         self,

@@ -211,6 +211,10 @@ class OperationSnapshot:
         task_by_id = {task.id: task for task in self.tasks}
         approval_by_id = {approval.id: approval for approval in self.approvals}
         evidence_by_id = {item.id: item for item in self.evidence}
+        dependency_edges = {
+            (dependency.task_id, dependency.prerequisite_task_id)
+            for dependency in self.task_dependencies
+        }
         tool_call_ids_by_turn: dict[str, set[str]] = {}
         for model_call_record in self.model_calls:
             if model_call_record.response is None:
@@ -274,6 +278,21 @@ class OperationSnapshot:
                     or linked_evidence.turn_id != task_record.turn_id
                 ):
                     raise ValueError("task evidence belongs to a different task")
+            for (
+                evidence_id
+            ) in task_record.execution_facts.validation_facts.evidence_ids:
+                validation_evidence = evidence_by_id.get(evidence_id)
+                if validation_evidence is None or not validation_evidence.accepted:
+                    raise ValueError(
+                        "task validation evidence is not accepted in the snapshot"
+                    )
+                if (
+                    task_record.id,
+                    validation_evidence.task_id,
+                ) not in dependency_edges:
+                    raise ValueError(
+                        "task validation evidence requires a prerequisite edge"
+                    )
 
         self._validate_task_dependencies(task_by_id)
         self._validate_task_leases(task_by_id)

@@ -112,9 +112,40 @@ def test_task_execution_facts_are_typed_frozen_materialization_facts() -> None:
     assert facts.idempotent is True
     assert facts.replay_safe is True
     assert facts.idempotency_key is None
+    assert facts.validation_facts.schema_version == 0
+    assert facts.validation_facts.fingerprint is None
 
     with pytest.raises(FrozenInstanceError):
         setattr(facts, "replay_safe", False)
+
+
+def test_task_execution_facts_persist_explicit_validator_authority() -> None:
+    validation = _model_type("ActionValidationFacts")(
+        schema_version=1,
+        validation_passed=True,
+        in_scope=True,
+        destructive=False,
+        sensitivity_class="internal",
+        source_id="source-sqlite",
+        resource_ids=("resource-marker",),
+        resource_revisions=(("resource-marker", "sha256:" + ("c" * 64)),),
+        source_revision="sqlite:data-version:3",
+        impact={"affected_rows": 1},
+        evidence_ids=("evidence-impact",),
+    )
+    facts = _facts(validation_facts=validation)
+
+    assert facts.validation_facts is validation
+    assert facts.validation_facts.fingerprint is not None
+
+    with pytest.raises(ValueError, match="side-effecting write"):
+        _facts(
+            validation_facts=_model_type("ActionValidationFacts")(
+                schema_version=1,
+                destructive=True,
+                source_id="source-sqlite",
+            )
+        )
 
 
 @pytest.mark.parametrize("field_name", ["capability_fingerprint", "arguments_hash"])
