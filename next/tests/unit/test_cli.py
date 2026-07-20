@@ -44,6 +44,12 @@ class RecordingRequest:
             {},
             "init-1",
         ),
+        (
+            ["agent", "create", "atlas", "--idempotency-key", "create-1"],
+            "agent.create",
+            {},
+            "create-1",
+        ),
         (["host", "status", "atlas"], "host.status", {}, None),
         (["host", "health", "atlas"], "host.health", {}, None),
         (
@@ -80,6 +86,27 @@ class RecordingRequest:
             "source-write-1",
         ),
         (["model", "status", "atlas"], "model.status", {}, None),
+        (["model", "show", "atlas"], "model.show", {}, None),
+        (
+            [
+                "model",
+                "set",
+                "atlas",
+                "ollama:qwen-test",
+                "--allow-sensitivity",
+                "public",
+                "--idempotency-key",
+                "model-1",
+            ],
+            "model.set",
+            {
+                "model_id": "ollama:qwen-test",
+                "context_window_tokens": 128_000,
+                "max_output_tokens": 4_096,
+                "allowed_sensitivities": ["public"],
+            },
+            "model-1",
+        ),
         (
             [
                 "chat",
@@ -99,6 +126,12 @@ class RecordingRequest:
             ["operation", "inspect", "atlas", "operation-1"],
             "operation.inspect",
             {"operation_id": "operation-1"},
+            None,
+        ),
+        (
+            ["operation", "list", "atlas", "--status", "succeeded", "--limit", "5"],
+            "operation.list",
+            {"statuses": ["succeeded"], "limit": 5},
             None,
         ),
         (
@@ -155,6 +188,93 @@ class RecordingRequest:
             "decision-2",
         ),
         (
+            ["approval", "list", "atlas", "--status", "pending", "--limit", "5"],
+            "approval.list",
+            {"statuses": ["pending"], "limit": 5},
+            None,
+        ),
+        (
+            ["approval", "inspect", "atlas", "approval-1"],
+            "approval.inspect",
+            {"approval_id": "approval-1"},
+            None,
+        ),
+        (
+            ["source", "list", "atlas", "--include-detached"],
+            "source.list",
+            {"include_detached": True},
+            None,
+        ),
+        (
+            [
+                "source",
+                "detach",
+                "atlas",
+                "source-1",
+                "--idempotency-key",
+                "detach-1",
+            ],
+            "source.detach",
+            {"source_id": "source-1"},
+            "detach-1",
+        ),
+        (
+            ["source", "health", "atlas", "source-1"],
+            "source.health",
+            {"source_id": "source-1"},
+            None,
+        ),
+        (
+            [
+                "catalog",
+                "search",
+                "atlas",
+                "customers",
+                "--source-id",
+                "source-1",
+                "--kind",
+                "table",
+            ],
+            "catalog.search",
+            {
+                "query": "customers",
+                "source_ids": ["source-1"],
+                "resource_kinds": ["table"],
+                "limit": 20,
+            },
+            None,
+        ),
+        (
+            ["catalog", "show", "atlas", "resource-1"],
+            "catalog.show",
+            {"resource_id": "resource-1"},
+            None,
+        ),
+        (
+            ["memory", "list", "atlas", "--source-id", "source-1", "--limit", "5"],
+            "memory.list",
+            {
+                "source_id": "source-1",
+                "include_superseded": False,
+                "include_rejected": False,
+                "limit": 5,
+            },
+            None,
+        ),
+        (
+            ["memory", "inspect", "atlas", "memory-1"],
+            "memory.inspect",
+            {"memory_id": "memory-1"},
+            None,
+        ),
+        (["skill", "list", "atlas"], "skill.list", {}, None),
+        (
+            ["skill", "inspect", "atlas", "skill-1"],
+            "skill.inspect",
+            {"skill_id": "skill-1"},
+            None,
+        ),
+        (
             ["events", "read", "atlas", "--after", "7", "--limit", "25"],
             "events.read",
             {"after": 7, "limit": 25},
@@ -163,7 +283,7 @@ class RecordingRequest:
         (
             ["events", "follow", "atlas", "--after", "7"],
             "events.follow",
-            {"after": 7},
+            {"after": 7, "limit": 100, "poll_seconds": 0.1},
             None,
         ),
         (
@@ -189,6 +309,23 @@ class RecordingRequest:
                 "source_operation_id": "operation-1",
             },
             "proposal-1",
+        ),
+        (
+            [
+                "monitor",
+                "propose-natural",
+                "atlas",
+                "daily-sales",
+                "Every 5 minutes, Count sales for source source-1 when rows.0.total > 10",
+                "--idempotency-key",
+                "natural-1",
+            ],
+            "monitor.propose_natural",
+            {
+                "monitor_id": "daily-sales",
+                "request": "Every 5 minutes, Count sales for source source-1 when rows.0.total > 10",
+            },
+            "natural-1",
         ),
         (
             [
@@ -529,6 +666,102 @@ def test_default_agent_init_bootstraps_without_a_socket_and_is_replay_safe(
     assert replay == {**created, "created": False}
 
 
+def test_default_first_run_configures_model_and_source_before_serve(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    create = [
+        "--root",
+        str(tmp_path),
+        "agent",
+        "create",
+        "atlas",
+        "--idempotency-key",
+        "create-1",
+    ]
+    assert main(create) == EXIT_OK
+    capsys.readouterr()
+
+    source_root = tmp_path / "exports"
+    source_root.mkdir()
+    (source_root / "customers.csv").write_text("id\n1\n", encoding="utf-8")
+    add_source = [
+        "--root",
+        str(tmp_path),
+        "source",
+        "add",
+        "atlas",
+        "local_files",
+        str(source_root),
+        "--idempotency-key",
+        "source-1",
+    ]
+    assert main(add_source) == EXIT_OK
+    attached = json.loads(capsys.readouterr().out)
+    assert attached["active"] is True
+
+    set_model = [
+        "--root",
+        str(tmp_path),
+        "model",
+        "set",
+        "atlas",
+        "ollama:qwen-test",
+        "--idempotency-key",
+        "model-1",
+    ]
+    assert main(set_model) == EXIT_OK
+    configured = json.loads(capsys.readouterr().out)
+    assert configured["changed"] is True
+    assert configured["revision"] == 1
+
+    assert main(set_model) == EXIT_OK
+    replay = json.loads(capsys.readouterr().out)
+    assert replay == {**configured, "changed": False}
+
+    assert main(["--root", str(tmp_path), "model", "show", "atlas"]) == EXIT_OK
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["route"]["revision"] == 1
+    assert shown["route"]["candidates"][0]["provider_id"] == "ollama:qwen-test"
+    assert shown["route"]["candidates"][0]["secret_reference"] is None
+
+    from daita.hosting import local_server
+
+    class OneShotServer:
+        def __init__(self, host) -> None:
+            self.host = host
+            self.socket_path = host.home / "run" / "agent.sock"
+
+        async def start(self) -> None:
+            await self.host.start()
+
+        async def serve_forever(self) -> None:
+            return None
+
+        async def stop(self, *, drain: bool) -> None:
+            await self.host.stop(drain=drain)
+
+    monkeypatch.setattr(local_server, "LocalAgentServer", OneShotServer)
+    assert main(["--root", str(tmp_path), "serve", "atlas"]) == EXIT_OK
+    served = json.loads(capsys.readouterr().out)
+    assert served["model_profile_id"] == "ollama:qwen-test"
+    assert served["state"] == "running"
+
+
+def test_chat_agent_shorthand_selects_line_oriented_interactive_mode(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = RecordingRequest()
+
+    assert main(["chat", "atlas"], request=request) == EXIT_OK
+
+    assert request.calls == [
+        ("chat.interactive", {"poll_seconds": 0.1}, None),
+    ]
+    assert json.loads(capsys.readouterr().out) == {"accepted": True}
+
+
 def test_serve_uses_foreground_host_and_local_server(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -541,6 +774,7 @@ def test_serve_uses_foreground_host_and_local_server(
 
     class FakeHost:
         id = "agent-atlas"
+        model_profile = type("Profile", (), {"id": "openai:gpt-test"})()
 
     async def open_host(cls, name, **kwargs):
         observed["name"] = name
@@ -586,3 +820,12 @@ def test_serve_uses_foreground_host_and_local_server(
     output = json.loads(capsys.readouterr().out)
     assert output["agent_id"] == "agent-atlas"
     assert output["model_profile_id"] == "openai:gpt-test"
+
+    observed.clear()
+    assert main(["--root", str(tmp_path), "serve", "atlas"]) == EXIT_OK
+    open_arguments = observed["open"]
+    assert isinstance(open_arguments, dict)
+    assert open_arguments["model"] is None
+    assert open_arguments["model_profile"] is None
+    assert observed["served"] is True
+    capsys.readouterr()

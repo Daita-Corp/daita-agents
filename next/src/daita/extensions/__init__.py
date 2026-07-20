@@ -1,7 +1,12 @@
 """Narrow extension manifests, admission, and local capability declarations."""
 
 from .local import LocalCapability, tool
-from .manifest import ExtensionKind, ExtensionManifest
+from .manifest import (
+    ExtensionBinding,
+    ExtensionBindingConflictError,
+    ExtensionKind,
+    ExtensionManifest,
+)
 from .registry import (
     ConfiguredExtension,
     ExtensionLoadError,
@@ -12,6 +17,8 @@ from .registry import (
 
 __all__ = [
     "ConfiguredExtension",
+    "ExtensionBinding",
+    "ExtensionBindingConflictError",
     "ExtensionKind",
     "ExtensionLoadError",
     "ExtensionManifest",

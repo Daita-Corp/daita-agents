@@ -10,10 +10,17 @@ import re
 from uuid import uuid4
 
 from ..events.models import RuntimeEvent
+
+# Proposal admission validates canonical budget restrictions without running a loop.
+from ..loop.models import LoopBudgets
+from ..operations.governance import DefaultPolicyProfile
 from .models import (
+    IntervalSchedule,
     Monitor,
     MonitorConfirmation,
     MonitorConfirmationDecision,
+    MonitorCondition,
+    MonitorConditionKind,
     MonitorDefinition,
     MonitorInspection,
     MonitorLifecycleAction,
@@ -24,6 +31,7 @@ from .models import (
     MonitorRun,
     MonitorRunStatus,
     MonitorScheduleState,
+    MonitorScope,
     MonitorStatus,
     MonitorTickLease,
     MonitorVersion,
@@ -42,10 +50,35 @@ from .store import (
     MonitorProposalNotFoundError,
     MonitorStore,
 )
+from .scheduler import monitor_execution_settings
 
 _IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _MAX_LIST_LIMIT = 1_000
 _MAX_LEASE_SECONDS = 300.0
+_NATURAL_MONITOR = re.compile(
+    r"every\s+(?P<count>[1-9][0-9]{0,5})\s+"
+    r"(?P<unit>seconds?|minutes?|hours?)\s*[,;:]\s*"
+    r"(?P<objective>.+?)\s+for\s+source\s+"
+    r"(?P<source>[A-Za-z0-9][A-Za-z0-9._:-]{0,255})"
+    r"(?:\s+when\s+(?P<path>[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*)\s+"
+    r"(?P<operator>>=|<=|==|!=|>|<|gte|lte|gt|lt|eq|ne)\s+"
+    r"(?P<value>-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)))?\.?\Z",
+    re.IGNORECASE,
+)
+_NATURAL_OPERATOR = {
+    ">": "gt",
+    ">=": "gte",
+    "<": "lt",
+    "<=": "lte",
+    "==": "eq",
+    "!=": "ne",
+    "gt": "gt",
+    "gte": "gte",
+    "lt": "lt",
+    "lte": "lte",
+    "eq": "eq",
+    "ne": "ne",
+}
 
 
 def _utc_now() -> datetime:
@@ -100,6 +133,8 @@ class MonitorService:
         *,
         agent_id: str,
         store: MonitorStore,
+        default_budgets: LoopBudgets = LoopBudgets(),
+        default_policy: DefaultPolicyProfile = DefaultPolicyProfile(),
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[str], str] = _new_id,
     ) -> None:
@@ -122,7 +157,13 @@ class MonitorService:
             raise TypeError("monitor clock must be callable")
         if not callable(id_factory):
             raise TypeError("monitor id_factory must be callable")
+        if not isinstance(default_budgets, LoopBudgets):
+            raise TypeError("default_budgets must be LoopBudgets")
+        if not isinstance(default_policy, DefaultPolicyProfile):
+            raise TypeError("default_policy must be DefaultPolicyProfile")
         self._store = store
+        self._default_budgets = default_budgets
+        self._default_policy = default_policy
         self._clock = clock
         self._id_factory = id_factory
 
@@ -147,6 +188,11 @@ class MonitorService:
         )
         if not isinstance(definition, MonitorDefinition):
             raise TypeError("definition must be a MonitorDefinition")
+        monitor_execution_settings(
+            definition,
+            default_budgets=self._default_budgets,
+            default_policy=self._default_policy,
+        )
         now = self._now()
         proposal = MonitorProposal(
             id=self._id("monitor-proposal"),
@@ -174,6 +220,69 @@ class MonitorService:
         )
         self._validate_proposal_replay(proposal, stored)
         return stored
+
+    async def propose_natural(
+        self,
+        monitor_id: str,
+        request: str,
+        *,
+        idempotency_key: str,
+        source_operation_id: str | None = None,
+    ) -> MonitorProposal:
+        """Parse one bounded safe monitor sentence into an inert proposal."""
+
+        if (
+            not isinstance(request, str)
+            or request != request.strip()
+            or not request
+            or len(request.encode("utf-8")) > 4_096
+        ):
+            raise ValueError("natural monitor request must be bounded trimmed text")
+        match = _NATURAL_MONITOR.fullmatch(request)
+        if match is None:
+            raise ValueError(
+                "natural monitor request must use: Every <n> seconds|minutes|hours, "
+                "<objective> for source <source-id> [when <path> <operator> <number>]"
+            )
+        count = int(match.group("count"))
+        unit = match.group("unit").casefold().rstrip("s")
+        multiplier = {"second": 1, "minute": 60, "hour": 3_600}[unit]
+        interval_seconds = count * multiplier
+        if interval_seconds > 366 * 24 * 60 * 60:
+            raise ValueError("natural monitor interval exceeds one year")
+        objective = match.group("objective").strip()
+        if not objective or len(objective) > 4_000:
+            raise ValueError("natural monitor objective must be bounded text")
+        path = match.group("path")
+        if path is None:
+            condition = MonitorCondition()
+        else:
+            raw_value = match.group("value")
+            assert raw_value is not None
+            numeric_value = float(raw_value) if "." in raw_value else int(raw_value)
+            condition = MonitorCondition(
+                kind=MonitorConditionKind.THRESHOLD,
+                expression=path.casefold(),
+                configuration={
+                    "operator": _NATURAL_OPERATOR[match.group("operator").casefold()],
+                    "value": numeric_value,
+                },
+            )
+        return await self.propose(
+            monitor_id,
+            MonitorDefinition(
+                name=monitor_id.replace("-", " ").strip().title(),
+                objective=objective,
+                scope=MonitorScope(source_ids=(match.group("source"),)),
+                schedule=IntervalSchedule(
+                    interval_seconds=interval_seconds,
+                    anchor_at=self._now(),
+                ),
+                condition=condition,
+            ),
+            idempotency_key=idempotency_key,
+            source_operation_id=source_operation_id,
+        )
 
     async def confirm(
         self,

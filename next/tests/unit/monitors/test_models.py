@@ -60,8 +60,8 @@ def _definition(**changes: object) -> MonitorDefinition:
         "schedule": CronSchedule("0 8 * * 1-5"),
         "condition": MonitorCondition(
             kind=MonitorConditionKind.THRESHOLD,
-            expression="discrepancy_percent > threshold",
-            configuration={"threshold": 2},
+            expression="rows.0.discrepancy_percent",
+            configuration={"operator": "gt", "value": 2},
         ),
         "budget_overrides": MonitorBudgetOverrides(
             max_turns=4,
@@ -157,7 +157,7 @@ def test_catch_up_once_advances_from_completion_instead_of_replaying_backlog() -
         ),
         (
             lambda: MonitorCondition(kind=MonitorConditionKind.EXPRESSION),
-            "require text",
+            "unsupported",
         ),
         (lambda: MonitorBudgetOverrides(max_turns=0), "max_turns"),
         (lambda: _definition(name="bad/name"), "human-readable"),

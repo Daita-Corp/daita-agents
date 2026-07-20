@@ -11,8 +11,10 @@ from hashlib import sha256
 import math
 from time import monotonic_ns
 from typing import cast
+from urllib.parse import urlsplit
 
 from .._json import canonical_json
+from ..security.secrets import SecretReference
 from .errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from .models import (
     CanonicalMessage,
@@ -137,6 +139,140 @@ class ModelProviderRegistration:
                 "allowed_sensitivities must contain ModelSensitivity values"
             )
         object.__setattr__(self, "allowed_sensitivities", allowed)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRouteCandidate:
+    """Persistable provider/profile binding without a resolved secret value."""
+
+    profile: ModelProfile
+    allowed_sensitivities: frozenset[ModelSensitivity]
+    base_url: str | None = None
+    secret_reference: SecretReference | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profile, ModelProfile):
+            raise TypeError("route candidate profile must be ModelProfile")
+        if isinstance(self.allowed_sensitivities, (str, bytes)):
+            raise TypeError("route candidate sensitivities must be a set")
+        allowed = frozenset(self.allowed_sensitivities)
+        if not allowed or any(
+            not isinstance(item, ModelSensitivity) for item in allowed
+        ):
+            raise ValueError(
+                "route candidate requires explicit model sensitivity grants"
+            )
+        if self.base_url is not None:
+            if (
+                not isinstance(self.base_url, str)
+                or self.base_url != self.base_url.strip()
+                or not self.base_url
+                or len(self.base_url) > 2_048
+            ):
+                raise ValueError("route candidate base_url must be bounded text")
+            endpoint = urlsplit(self.base_url)
+            if (
+                endpoint.scheme not in {"http", "https"}
+                or not endpoint.hostname
+                or endpoint.username is not None
+                or endpoint.password is not None
+                or endpoint.query
+                or endpoint.fragment
+            ):
+                raise ValueError(
+                    "route candidate base_url must be an HTTP endpoint without "
+                    "credentials, a query, or a fragment"
+                )
+        if self.secret_reference is not None and not isinstance(
+            self.secret_reference,
+            SecretReference,
+        ):
+            raise TypeError(
+                "route candidate secret_reference must be SecretReference or None"
+            )
+        object.__setattr__(self, "allowed_sensitivities", allowed)
+
+    @property
+    def provider_id(self) -> str:
+        return self.profile.id
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRoute:
+    """Versioned provider-neutral route reconstructed by the existing router."""
+
+    candidates: tuple[ModelRouteCandidate, ...]
+    retry_policy: RetryPolicy = RetryPolicy()
+    schema_version: int = 1
+    revision: int = 1
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("model route schema_version must be 1")
+        if (
+            not isinstance(self.revision, int)
+            or isinstance(self.revision, bool)
+            or self.revision < 1
+        ):
+            raise ValueError("model route revision must be a positive integer")
+        if isinstance(self.candidates, (str, bytes)):
+            raise TypeError("model route candidates must be a sequence")
+        candidates = tuple(self.candidates)
+        if not candidates or len(candidates) > 8:
+            raise ValueError("model route requires from one through eight candidates")
+        if any(not isinstance(item, ModelRouteCandidate) for item in candidates):
+            raise TypeError(
+                "model route candidates must be ModelRouteCandidate records"
+            )
+        provider_ids = tuple(item.provider_id for item in candidates)
+        if len(provider_ids) != len(set(provider_ids)):
+            raise ValueError("model route candidates must have unique provider IDs")
+        if not isinstance(self.retry_policy, RetryPolicy):
+            raise TypeError("model route retry_policy must be RetryPolicy")
+        object.__setattr__(self, "candidates", candidates)
+
+    @property
+    def fingerprint(self) -> str:
+        encoded = canonical_json(
+            {
+                "candidates": [
+                    {
+                        "allowed_sensitivities": sorted(
+                            item.value for item in candidate.allowed_sensitivities
+                        ),
+                        "base_url": candidate.base_url,
+                        "profile": _profile_data(candidate.profile),
+                        "secret_reference": (
+                            None
+                            if candidate.secret_reference is None
+                            else candidate.secret_reference.to_uri()
+                        ),
+                    }
+                    for candidate in self.candidates
+                ],
+                "retry_policy": _retry_policy_data(self.retry_policy),
+                "revision": self.revision,
+                "schema_version": self.schema_version,
+            }
+        ).encode("utf-8")
+        return "sha256:" + sha256(encoded).hexdigest()
+
+    @property
+    def model_profile(self) -> ModelProfile:
+        primary = self.candidates[0].profile
+        if len(self.candidates) == 1 and self.retry_policy == RetryPolicy():
+            return primary
+        route_id = _route_fingerprint_from_configuration(
+            self.candidates,
+            retry_policy=self.retry_policy,
+        )
+        return replace(
+            primary,
+            id=f"router:{route_id}",
+            input_cost_per_million_usd=None,
+            output_cost_per_million_usd=None,
+            data_routing_classification="explicit_route_policy",
+        )
 
 
 class ModelRegistry:
@@ -667,20 +803,45 @@ def _route_fingerprint(
                 }
                 for registration in candidates
             ],
-            "retry_policy": {
-                "base_delay_seconds": retry_policy.base_delay_seconds,
-                "max_attempts_per_provider": (retry_policy.max_attempts_per_provider),
-                "max_delay_seconds": retry_policy.max_delay_seconds,
-                "retryable_codes": sorted(
-                    item.value for item in retry_policy.retryable_codes
-                ),
-                "schema_version": retry_policy.schema_version,
-                "strategy": retry_policy.strategy.value,
-            },
+            "retry_policy": _retry_policy_data(retry_policy),
             "schema_version": 1,
         }
     ).encode("utf-8")
     return sha256(encoded).hexdigest()
+
+
+def _route_fingerprint_from_configuration(
+    candidates: tuple[ModelRouteCandidate, ...],
+    *,
+    retry_policy: RetryPolicy,
+) -> str:
+    encoded = canonical_json(
+        {
+            "candidates": [
+                {
+                    "allowed_sensitivities": sorted(
+                        item.value for item in candidate.allowed_sensitivities
+                    ),
+                    "profile": _profile_data(candidate.profile),
+                }
+                for candidate in candidates
+            ],
+            "retry_policy": _retry_policy_data(retry_policy),
+            "schema_version": 1,
+        }
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _retry_policy_data(policy: RetryPolicy) -> dict[str, object]:
+    return {
+        "base_delay_seconds": policy.base_delay_seconds,
+        "max_attempts_per_provider": policy.max_attempts_per_provider,
+        "max_delay_seconds": policy.max_delay_seconds,
+        "retryable_codes": sorted(item.value for item in policy.retryable_codes),
+        "schema_version": policy.schema_version,
+        "strategy": policy.strategy.value,
+    }
 
 
 def _profile_data(profile: ModelProfile) -> dict[str, object]:
@@ -714,6 +875,8 @@ def _profile_data(profile: ModelProfile) -> dict[str, object]:
 
 
 __all__ = [
+    "ModelRoute",
+    "ModelRouteCandidate",
     "ModelProviderRegistration",
     "ModelRegistry",
     "ModelRouter",

@@ -16,15 +16,25 @@ from uuid import uuid4
 from .._json import canonical_json
 from ..adapters.models import SourceRegistration
 from ..adapters.protocols import ResourceSource
+from .._json import FrozenJsonObject
+from ..catalog.models import CatalogResource, CatalogSearchRequest, CatalogSearchResult
 from ..capabilities import CapabilityRegistry
 from ..config import AgentConfig
+from ..domains.data import DataMonitorOutcomeProjector
 from ..events.models import CommittedEvent, EventCursor
+from ..extensions import ConfiguredExtension, ExtensionBinding
 from ..llm.models import ModelProfile
 from ..llm.protocols import ModelProvider
+from ..llm.routing import ModelRoute
 from ..loop.driver import ContextBuilder, DomainController
 from ..loop.models import LoopBudgets, LoopExit
+from ..memory.models import (
+    MemoryInspection,
+    MemoryInspectionRequest,
+    MemoryListRequest,
+    MemoryListResult,
+)
 from ..monitors.scheduler import (
-    MonitorOutcomeProjection,
     MonitorOutcomeProjector,
     MonitorScheduler,
     MonitorSchedulerResult,
@@ -44,6 +54,9 @@ from ..operations.governance import (
     DefaultPolicyEvaluator,
 )
 from ..operations.models import AgentTrigger, TriggerKind
+from ..operations.models import OperationStatus
+from ..security import SecretProvider
+from ..skills.models import SkillIndex, SkillInspection
 from .embedded import EmbeddedAgent
 from .inbox import (
     HostInboxItem,
@@ -135,17 +148,6 @@ class AgentHostStateError(RuntimeError):
     """Raised when a host command is invalid for its lifecycle state."""
 
 
-class _NoFindingProjector:
-    async def project(
-        self,
-        *,
-        definition: object,
-        operation: OperationSnapshot,
-        checkpoint: object,
-    ) -> MonitorOutcomeProjection:
-        return MonitorOutcomeProjection(matched=False)
-
-
 class _HostTriggerRunner:
     def __init__(self, host: AgentHost) -> None:
         self._host = host
@@ -207,8 +209,10 @@ class AgentHost:
             store=self._store,
             operations=self._store,
             runner=_HostTriggerRunner(self),
-            projector=monitor_projector or _NoFindingProjector(),
+            projector=monitor_projector or DataMonitorOutcomeProjector(),
             holder_id=self._holder_id,
+            default_budgets=embedded.runtime_defaults.budgets,
+            default_policy=embedded.runtime_defaults.policy_profile,
             lease_seconds=monitor_lease_seconds,
             clock=clock,
             id_factory=id_factory,
@@ -233,6 +237,8 @@ class AgentHost:
         monitor_lease_seconds: float = 300.0,
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
+        secret_provider: SecretProvider | None = None,
+        extensions: tuple[ConfiguredExtension, ...] = (),
     ) -> Self:
         resolved_clock = clock or _utc_now
         resolved_ids = id_factory or _new_id
@@ -249,6 +255,8 @@ class AgentHost:
             budgets=budgets,
             clock=resolved_clock,
             id_factory=resolved_ids,
+            secret_provider=secret_provider,
+            extensions=extensions,
         )
         try:
             return cls(
@@ -282,6 +290,8 @@ class AgentHost:
         monitor_lease_seconds: float = 300.0,
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
+        secret_provider: SecretProvider | None = None,
+        extensions: tuple[ConfiguredExtension, ...] = (),
     ) -> Self:
         resolved_clock = clock or _utc_now
         resolved_ids = id_factory or _new_id
@@ -298,6 +308,8 @@ class AgentHost:
             budgets=budgets,
             clock=resolved_clock,
             id_factory=resolved_ids,
+            secret_provider=secret_provider,
+            extensions=extensions,
         )
         try:
             return cls(
@@ -333,8 +345,31 @@ class AgentHost:
         return self._embedded.model_profile
 
     @property
+    def model_route(self) -> ModelRoute | None:
+        return self._embedded.model_route
+
+    @property
+    def extension_bindings(self) -> tuple[ExtensionBinding, ...]:
+        return self._embedded.extension_bindings
+
+    @property
     def configured(self) -> bool:
         return self._embedded._loop is not None
+
+    async def configure_model_route(
+        self,
+        route: ModelRoute,
+        *,
+        expected_revision: int,
+    ) -> ModelRoute:
+        """Persist a route while stopped; a subsequent start reopens it exactly."""
+
+        if self._state is not AgentHostState.OPEN:
+            raise AgentHostStateError("model route changes require a stopped host")
+        return await self._embedded.configure_model_route(
+            route,
+            expected_revision=expected_revision,
+        )
 
     async def start(self) -> None:
         """Recover durable work, then explicitly start one cadence task."""
@@ -406,9 +441,84 @@ class AgentHost:
                 idempotency_key=idempotency_key,
             )
 
+    async def detach(
+        self,
+        source_id: str,
+        *,
+        idempotency_key: str,
+    ) -> SourceRegistration:
+        self._require_running()
+        _required_text(idempotency_key, "idempotency_key")
+        async with self._execution_lock:
+            return await self._embedded.detach(source_id)
+
+    async def list_sources(self) -> tuple[SourceRegistration, ...]:
+        self._require_running()
+        return await self._embedded.list_sources()
+
+    async def list_catalog_resources(
+        self,
+        *,
+        source_id: str | None = None,
+    ) -> tuple[CatalogResource, ...]:
+        self._require_running()
+        return await self._embedded.list_catalog_resources(source_id=source_id)
+
+    async def search_catalog(
+        self,
+        request: CatalogSearchRequest,
+    ) -> CatalogSearchResult:
+        self._require_running()
+        return await self._embedded.search_catalog(request)
+
+    async def inspect_catalog_resource(self, resource_id: str) -> FrozenJsonObject:
+        self._require_running()
+        return await self._embedded.inspect_catalog_resource(resource_id)
+
     async def inspect_operation(self, operation_id: str) -> OperationSnapshot:
         self._require_running()
         return await self._embedded.inspect(operation_id)
+
+    async def list_operations(
+        self,
+        *,
+        statuses: tuple[OperationStatus, ...] | None = None,
+        limit: int = 100,
+    ) -> tuple[OperationSnapshot, ...]:
+        self._require_running()
+        return await self._embedded.list_operations(statuses=statuses, limit=limit)
+
+    async def inspect_approval(self, approval_id: str) -> ApprovalRequest:
+        self._require_running()
+        return await self._embedded.inspect_approval(approval_id)
+
+    async def list_approvals(
+        self,
+        *,
+        statuses: tuple[ApprovalStatus, ...] | None = None,
+        limit: int = 100,
+    ) -> tuple[ApprovalRequest, ...]:
+        self._require_running()
+        return await self._embedded.list_approvals(statuses=statuses, limit=limit)
+
+    async def list_memories(self, request: MemoryListRequest) -> MemoryListResult:
+        self._require_running()
+        return await self._embedded.list_memories(request)
+
+    async def inspect_memory(
+        self,
+        request: MemoryInspectionRequest,
+    ) -> MemoryInspection:
+        self._require_running()
+        return await self._embedded.inspect_memory(request)
+
+    async def list_skills(self) -> tuple[SkillIndex, ...]:
+        self._require_running()
+        return await self._embedded.list_skills()
+
+    async def inspect_skill(self, skill_id: str) -> SkillInspection:
+        self._require_running()
+        return await self._embedded.inspect_skill(skill_id)
 
     async def submit(
         self,
@@ -552,6 +662,22 @@ class AgentHost:
         return await self._embedded.propose_monitor(
             monitor_id,
             definition,
+            idempotency_key=idempotency_key,
+            source_operation_id=source_operation_id,
+        )
+
+    async def propose_monitor_natural(
+        self,
+        monitor_id: str,
+        request: str,
+        *,
+        idempotency_key: str,
+        source_operation_id: str | None = None,
+    ) -> MonitorProposal:
+        self._require_running()
+        return await self._embedded.propose_monitor_natural(
+            monitor_id,
+            request,
             idempotency_key=idempotency_key,
             source_operation_id=source_operation_id,
         )

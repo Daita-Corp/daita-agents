@@ -217,6 +217,7 @@ def _snapshot() -> OperationSnapshot:
             resource_ids=("resource-marker",),
             resource_revisions=(("resource-marker", "sha256:" + ("d" * 64)),),
             source_revision="sqlite:data-version:4",
+            freshness_state="current",
             impact={"affected_rows": 1, "bounded": True},
         ),
         manual_recovery_reason="unknown_side_effect_outcome",
@@ -419,6 +420,9 @@ async def test_task_projection_round_trips_exactly_across_reopen_and_global_orde
     validation = loaded.snapshot.tasks[2].execution_facts.validation_facts
     assert validation.schema_version == 1
     assert validation.source_id == "source-sqlite"
+    assert validation.source_ids == ("source-sqlite",)
+    assert validation.source_revisions == (("source-sqlite", "sqlite:data-version:4"),)
+    assert validation.freshness_state == "current"
     assert validation.resource_ids == ("resource-marker",)
     assert isinstance(validation.impact, FrozenJsonObject)
     assert validation.impact.to_dict() == {
@@ -442,6 +446,72 @@ async def test_task_projection_round_trips_exactly_across_reopen_and_global_orde
         (lease.task_id, lease.attempt, lease.fencing_token)
         for lease in snapshot.task_leases
     )
+
+
+async def test_task_projection_round_trips_exact_multi_source_authority(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    snapshot = _snapshot()
+    validation = ActionValidationFacts(
+        schema_version=1,
+        validation_passed=True,
+        in_scope=True,
+        destructive=False,
+        sensitivity_class="confidential",
+        source_ids=("source-file", "source-sqlite"),
+        source_revisions=(
+            ("source-file", "sha256:" + ("1" * 64)),
+            ("source-sqlite", "sqlite:data-version:4"),
+        ),
+        resource_ids=("resource-file", "resource-sqlite"),
+        resource_revisions=(
+            ("resource-file", "sha256:" + ("2" * 64)),
+            ("resource-sqlite", "sha256:" + ("3" * 64)),
+        ),
+        freshness_state="current",
+    )
+    comparison = _task(
+        "task-appended",
+        "call-appended",
+        fingerprint_character="d",
+        status=TaskStatus.PENDING,
+        attempt=1,
+        validation_facts=validation,
+        timestamp=NOW + timedelta(seconds=50),
+    )
+    candidate = replace(
+        snapshot,
+        operation=replace(
+            snapshot.operation,
+            updated_at=NOW + timedelta(seconds=50),
+        ),
+        loop_state=replace(snapshot.loop_state, action_count=5),
+        tasks=(*snapshot.tasks, comparison),
+    )
+
+    store = await SQLiteOperationStore.open(path)
+    try:
+        await store.create(candidate)
+    finally:
+        await store.close()
+
+    reopened = await SQLiteOperationStore.open(path)
+    try:
+        loaded = await reopened.load(OPERATION_ID)
+    finally:
+        await reopened.close()
+
+    loaded_validation = loaded.snapshot.tasks[-1].execution_facts.validation_facts
+    assert loaded_validation == validation
+    assert loaded_validation.source_id is None
+    assert _raw_rows(
+        path,
+        "tasks",
+        "validation_source_id",
+    )[
+        -1
+    ] == ("source-file",)
 
 
 async def test_generic_task_and_dependency_suffixes_persist_when_still_pending(
@@ -861,6 +931,33 @@ async def test_task_projection_rejects_unknown_validation_schema_version(
         path,
         "UPDATE tasks SET validation_schema_version = 2 WHERE id = ?",
         ("task-manual",),
+    )
+
+    await _assert_corrupt_load(path)
+
+
+@pytest.mark.parametrize(
+    ("column", "corrupt_value"),
+    (
+        ("validation_source_ids_json", '["source-other"]'),
+        ("validation_resource_ids_json", '["resource-other"]'),
+        (
+            "validation_source_revisions_json",
+            '[["source-sqlite","sqlite:data-version:other"]]',
+        ),
+    ),
+)
+async def test_task_projection_rejects_tampered_read_authority(
+    tmp_path: Path,
+    column: str,
+    corrupt_value: str,
+) -> None:
+    path = tmp_path / "state.db"
+    await _create_and_close(path)
+    _mutate(
+        path,
+        f"UPDATE tasks SET {column} = ? WHERE id = ?",
+        (corrupt_value, "task-manual"),
     )
 
     await _assert_corrupt_load(path)

@@ -258,6 +258,14 @@ class OperationStore(Protocol):
         agent_id: str,
     ) -> tuple[VersionedOperation, ...]: ...
 
+    async def list_operations(
+        self,
+        agent_id: str,
+        *,
+        statuses: tuple[OperationStatus, ...] | None = None,
+        limit: int = 100,
+    ) -> tuple[VersionedOperation, ...]: ...
+
     async def load_by_trigger(
         self,
         trigger_id: str,
@@ -404,6 +412,39 @@ class InMemoryOperationStore:
                         item.snapshot.operation.id,
                     ),
                 )
+            )
+
+    async def list_operations(
+        self,
+        agent_id: str,
+        *,
+        statuses: tuple[OperationStatus, ...] | None = None,
+        limit: int = 100,
+    ) -> tuple[VersionedOperation, ...]:
+        """List bounded newest-first checkpoints for one agent."""
+
+        _require_identity(agent_id, "agent_id")
+        selected_statuses = _operation_status_filter(statuses)
+        _operation_list_limit(limit)
+        async with self._lock:
+            selected = tuple(
+                item
+                for item in self._operations.values()
+                if item.snapshot.operation.agent_id == agent_id
+                and (
+                    selected_statuses is None
+                    or item.snapshot.operation.status in selected_statuses
+                )
+            )
+            return tuple(
+                sorted(
+                    selected,
+                    key=lambda item: (
+                        item.snapshot.operation.updated_at.astimezone(timezone.utc),
+                        item.snapshot.operation.id,
+                    ),
+                    reverse=True,
+                )[:limit]
             )
 
     async def load_by_trigger(self, trigger_id: str) -> VersionedOperation | None:
@@ -1276,17 +1317,27 @@ def _prepare_fenced_task_commit(
                 current.operation.id,
                 "fenced outcome annotation cannot manufacture cancellation intent",
             )
-        if new_evidence:
+        if new_evidence and (len(new_evidence) != 1 or new_evidence[0].accepted):
             raise InvalidOperationCheckpointError(
                 current.operation.id,
-                "fenced outcome annotation cannot append evidence",
+                "fenced outcome annotation may append only one rejected evidence",
             )
-        if len(suffix) != 1 or suffix[0].type != "task.outcome_unknown":
+        expected_annotation_events = (
+            ("evidence.rejected", "task.outcome_unknown")
+            if new_evidence
+            else ("task.outcome_unknown",)
+        )
+        if tuple(event.type for event in suffix) != expected_annotation_events:
             raise InvalidOperationCheckpointError(
                 current.operation.id,
-                "running task annotation requires one task.outcome_unknown event",
+                "running task annotation has invalid evidence/outcome events",
             )
-        reason = suffix[0].payload.get("reason")
+        if new_evidence and suffix[0].evidence_id != new_evidence[0].id:
+            raise InvalidOperationCheckpointError(
+                current.operation.id,
+                "evidence.rejected event does not match rejected evidence",
+            )
+        reason = suffix[-1].payload.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             raise InvalidOperationCheckpointError(
                 current.operation.id,
@@ -1365,12 +1416,16 @@ def _prepare_fenced_task_commit(
                     current.operation.id,
                     "task.failed cannot manufacture cancellation intent",
                 )
-            if new_evidence:
+            if new_evidence and (len(new_evidence) != 1 or new_evidence[0].accepted):
                 raise InvalidOperationCheckpointError(
                     current.operation.id,
-                    "task.failed cannot append evidence",
+                    "task.failed may append only one rejected evidence",
                 )
-            expected_event_types = ("task.failed", "executor.failed")
+            expected_event_types = (
+                ("evidence.rejected", "task.failed", "executor.failed")
+                if new_evidence
+                else ("task.failed", "executor.failed")
+            )
             assert after_task.error_code is not None
             release_reason = after_task.error_code
         else:
@@ -1394,6 +1449,15 @@ def _prepare_fenced_task_commit(
             raise InvalidOperationCheckpointError(
                 current.operation.id,
                 f"{after_task.status.value} task requires events: {expected_events}",
+            )
+        if (
+            new_evidence
+            and not new_evidence[0].accepted
+            and suffix[0].evidence_id != new_evidence[0].id
+        ):
+            raise InvalidOperationCheckpointError(
+                current.operation.id,
+                "evidence.rejected event does not match rejected evidence",
             )
         if any(event.task_id != guard.task_id for event in suffix):
             raise InvalidOperationCheckpointError(
@@ -1436,6 +1500,12 @@ def _prepare_fenced_task_commit(
             return {
                 "task_id": committed_task.id,
                 "evidence_id": event.evidence_id,
+            }
+        if event.type == "evidence.rejected":
+            return {
+                "task_id": committed_task.id,
+                "evidence_id": event.evidence_id,
+                "reason": event.payload["reason"],
             }
         if event.type == "task.succeeded":
             return {"task_id": committed_task.id}
@@ -1598,6 +1668,26 @@ def _require_identity(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a non-empty string")
 
 
+def _operation_status_filter(
+    statuses: tuple[OperationStatus, ...] | None,
+) -> frozenset[OperationStatus] | None:
+    if statuses is None:
+        return None
+    if isinstance(statuses, (str, bytes)):
+        raise TypeError("operation statuses must be a sequence")
+    values = tuple(statuses)
+    if not values or any(not isinstance(value, OperationStatus) for value in values):
+        raise ValueError("operation statuses must contain OperationStatus values")
+    if len(values) != len(set(values)):
+        raise ValueError("operation statuses must be unique")
+    return frozenset(values)
+
+
+def _operation_list_limit(limit: int) -> None:
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1_000:
+        raise ValueError("operation list limit must be from one through 1000")
+
+
 def _require_revision(revision: int) -> None:
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
         raise ValueError("expected_revision must be a non-negative integer")
@@ -1687,6 +1777,10 @@ def _validate_stable_identity(
         or candidate_operation.trigger_id != current_operation.trigger_id
         or candidate_operation.session_id != current_operation.session_id
         or candidate_operation.created_at != current_operation.created_at
+        or candidate_operation.model_route_revision
+        != current_operation.model_route_revision
+        or candidate_operation.model_route_fingerprint
+        != current_operation.model_route_fingerprint
     ):
         raise InvalidOperationCheckpointError(
             candidate_operation.id,

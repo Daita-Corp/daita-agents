@@ -77,10 +77,12 @@ def test_every_socket_mutation_requires_an_idempotency_key() -> None:
         (
             "chat.submit",
             "source.attach",
+            "source.detach",
             "operation.cancel",
             "approval.approve",
             "approval.reject",
             "monitor.propose",
+            "monitor.propose_natural",
             "monitor.confirm",
             "monitor.pause",
             "monitor.resume",

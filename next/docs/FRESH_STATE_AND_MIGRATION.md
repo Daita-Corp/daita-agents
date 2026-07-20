@@ -27,6 +27,28 @@ runs only ordered v2 migrations, with a SQLite backup before a schema change.
 Uninstalling the Python package does not remove an agent root. State deletion
 is a separate, explicit operator action and is not performed by v2 tooling.
 
+## Current v2 schema upgrades
+
+Existing v2 Agent Homes upgrade only through the ordered package-owned SQLite
+migrations, with a verified backup before the first pending migration. Phase
+9.5 adds exact task/evidence read authority, reconstructable model routes, and
+configured extension bindings. Legacy rows remain readable where safe, but no
+migration invents authority, a route, a secret, or an extension configuration:
+
+- pre-authority tasks/evidence retain schema-zero facts and fail closed when a
+  current safety decision requires exact source/resource revisions;
+- profile-only homes remain inspection-only until an operator explicitly sets
+  a reconstructable route;
+- homes without an extension binding gain no implicit configured extensions;
+  and
+- resolved secret values are never migration input or output.
+
+Migration 15's multi-source columns are authoritative for comparisons. The
+older migration-13 singular source column remains only a verified SQLite
+compatibility projection when two source IDs are stored; it is removed during
+record decoding and never narrows or replaces the exact multi-source facts.
+Migration/reopen and cross-source comparison regressions pass in P9.5-Q08.
+
 ## No implicit migration
 
 There is no general v1-to-v2 state migration command. The lifecycle models and

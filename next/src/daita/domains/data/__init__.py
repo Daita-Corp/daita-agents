@@ -75,6 +75,7 @@ from .file_capabilities import (
     local_file_read_declarations,
     local_file_read_extension_declarations,
 )
+from .monitoring import DataMonitorOutcomeProjector
 from .evidence_datasets import (
     DataEvidenceDatasetError,
     PersistedAcceptedEvidenceDatasetReader,
@@ -111,6 +112,7 @@ __all__ = [
     "CatalogSchemaReader",
     "DataContextBuilder",
     "DataDomainController",
+    "DataMonitorOutcomeProjector",
     "DataEvidenceDatasetError",
     "LOCAL_FILE_READ_CAPABILITY_ID",
     "LOCAL_FILE_READ_EVIDENCE_KIND",

@@ -385,11 +385,46 @@ class CapabilityRegistry:
         self._executors = executor_by_id
         self._tool_views = view_by_name
 
+    @classmethod
+    def compose(
+        cls,
+        *registries: CapabilityRegistry,
+    ) -> CapabilityRegistry:
+        """Atomically combine complete registries under the same identity rules."""
+
+        if any(not isinstance(registry, CapabilityRegistry) for registry in registries):
+            raise TypeError("composed registries must be CapabilityRegistry records")
+        return cls(
+            capabilities=(
+                registration.capability
+                for registry in registries
+                for registration in registry._registrations.values()
+            ),
+            executors=(
+                executor
+                for registry in registries
+                for executor in registry._executors.values()
+            ),
+            tool_views=(
+                view
+                for registry in registries
+                for view in registry._tool_views.values()
+            ),
+        )
+
     @property
     def capability_ids(self) -> frozenset[str]:
         """Return the immutable semantic IDs available to bounded selectors."""
 
         return frozenset(self._registrations)
+
+    @property
+    def executor_ids(self) -> frozenset[str]:
+        return frozenset(self._executors)
+
+    @property
+    def tool_names(self) -> frozenset[str]:
+        return frozenset(self._tool_views)
 
     def capability(self, capability_id: str) -> Capability:
         try:

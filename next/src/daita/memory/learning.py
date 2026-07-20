@@ -1,13 +1,12 @@
-"""Explicit user-correction learning into versioned resource-alias memory.
+"""Explicit user learning into versioned memory and inert fact proposals.
 
-This service intentionally supports one conservative trigger form only::
+The precise canonical resource-alias form remains supported::
 
     Remember resource alias correction: <canonical JSON record>
 
-The JSON record must contain exactly ``source_id``, ``resource_id``,
-``resource_revision``, ``field``, ``business_term``, and ``stored_value``.
-Learning proposal safety remains owned by :mod:`daita.learning`; catalog and
-operation records remain the source of structural and provenance truth.
+Ordinary ``Remember that ...`` and correction messages use the same proposal,
+safety, provenance, revision, and atomic-memory owners. Evidence-backed facts
+remain visible proposals rather than silently becoming durable memory.
 """
 
 from __future__ import annotations
@@ -21,6 +20,7 @@ import re
 from typing import Protocol, cast, runtime_checkable
 
 from .._json import FrozenJsonObject, canonical_json
+from ..capabilities import AccessMode
 from ..catalog.models import CatalogResource, Sensitivity
 from ..learning import (
     LearningCandidateCategory,
@@ -29,12 +29,13 @@ from ..learning import (
     LearningProposalKind,
     LearningProposalState,
     LearningProvenance,
+    LearningRejectionCategory,
     LearningSourceOutcome,
     resolve_learning_proposal,
 )
 from ..loop.models import LoopPhase
 from ..operations.checkpoints import OperationSnapshot
-from ..operations.models import OperationStatus, TriggerKind
+from ..operations.models import Evidence, OperationStatus, TaskStatus, TriggerKind
 from .models import (
     MemoryCreator,
     MemoryHistory,
@@ -51,6 +52,12 @@ from .models import (
 )
 
 RESOURCE_ALIAS_CORRECTION_PREFIX = "Remember resource alias correction: "
+NATURAL_REMEMBER_PREFIXES = (
+    "remember that ",
+    "please remember that ",
+    "correction: ",
+    "actually, ",
+)
 
 _CORRECTION_KEYS = frozenset(
     {
@@ -64,6 +71,18 @@ _CORRECTION_KEYS = frozenset(
 )
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _MAX_TRIGGER_CHARACTERS = 4_096
+_NATURAL_ALIAS = re.compile(
+    r"(?is)^(?P<business>.+?)\s+(?P<field>[A-Za-z_][A-Za-z0-9_]*)\s+"
+    r"is\s+stored\s+as\s+(?P<stored>.+)$"
+)
+_NATURAL_ALIAS_MEANS = re.compile(
+    r"(?is)^(?P<business>.+?)\s+means\s+"
+    r"(?P<field>[A-Za-z_][A-Za-z0-9_]*)\s*(?:=|is)\s*(?P<stored>.+)$"
+)
+_EVIDENCE_FACT = re.compile(
+    r"(?is)^(?:please\s+)?(?:propose|learn)\s+(?:a\s+)?fact\s+from\s+"
+    r"(?:the\s+|this\s+)?evidence(?:\s+that)?\s*[: ]\s*(?P<content>.+)$"
+)
 
 
 def _utc_now() -> datetime:
@@ -187,8 +206,11 @@ class ExplicitCorrectionCommit:
         resolve_learning_proposal(self.proposal, self.decision)
 
         snapshot = self.intended_memory
-        if snapshot.record.kind is not MemoryKind.RESOURCE_ALIAS:
-            raise ValueError("correction memory must be a RESOURCE_ALIAS")
+        if snapshot.record.kind not in {
+            MemoryKind.RESOURCE_ALIAS,
+            MemoryKind.SEMANTIC_FACT,
+        }:
+            raise ValueError("explicit learning requires an allowed memory kind")
         if snapshot.record.state is not MemoryState.ACTIVE:
             raise ValueError("correction memory must remain active")
         if snapshot.version.creator is not MemoryCreator.LEARNING_SERVICE:
@@ -237,8 +259,11 @@ class ExplicitCorrectionResult:
             return
         if not isinstance(self.memory, MemoryHistory):
             raise TypeError("committed correction requires MemoryHistory")
-        if self.memory.record.kind is not MemoryKind.RESOURCE_ALIAS:
-            raise ValueError("committed correction must return a RESOURCE_ALIAS")
+        if self.memory.record.kind not in {
+            MemoryKind.RESOURCE_ALIAS,
+            MemoryKind.SEMANTIC_FACT,
+        }:
+            raise ValueError("committed learning returned an unsupported memory kind")
         if self.memory.record.state is not MemoryState.ACTIVE:
             raise ValueError("committed correction memory must remain active")
         if self.proposal.result_memory_id != self.memory.record.id:
@@ -286,6 +311,13 @@ class ExplicitCorrectionStore(Protocol):
         logical_key: str,
     ) -> MemoryHistory | None: ...
 
+    async def load_learning_memory(
+        self,
+        scope: MemoryScope,
+        kind: MemoryKind,
+        logical_key: str,
+    ) -> MemoryHistory | None: ...
+
     async def load_proposal(
         self,
         agent_id: str,
@@ -296,6 +328,11 @@ class ExplicitCorrectionStore(Protocol):
         self,
         request: ExplicitCorrectionCommit,
     ) -> ExplicitCorrectionResult: ...
+
+    async def create_proposal(
+        self,
+        proposal: LearningProposal,
+    ) -> LearningProposal: ...
 
 
 class ExplicitCorrectionLearningService:
@@ -322,7 +359,7 @@ class ExplicitCorrectionLearningService:
         self,
         snapshot: OperationSnapshot,
     ) -> ExplicitCorrectionResult:
-        """Consume only the original trigger of one completed successful snapshot."""
+        """Commit one safe canonical or natural explicit user statement."""
 
         if not isinstance(snapshot, OperationSnapshot):
             raise TypeError("explicit correction requires an OperationSnapshot")
@@ -332,18 +369,7 @@ class ExplicitCorrectionLearningService:
             raise ExplicitCorrectionFormatError(
                 "user trigger must contain a string message"
             )
-        candidate = _parse_trigger_candidate(message)
-        source_id = _candidate_text(candidate, "source_id", maximum=512)
-        resource_id = _candidate_text(candidate, "resource_id", maximum=512)
-        resource_revision = _candidate_text(
-            candidate,
-            "resource_revision",
-            maximum=512,
-        )
-        if _SHA256.fullmatch(resource_revision) is None:
-            raise ExplicitCorrectionFormatError(
-                "resource_revision must be a canonical sha256 hash"
-            )
+        candidate = _parse_trigger_candidate(message, snapshot=snapshot)
 
         now = self._now()
         source_hash = _hash_text(message)
@@ -370,49 +396,86 @@ class ExplicitCorrectionLearningService:
         if replay is not None:
             return replay
 
-        resource = await self._catalog.load_resource(
-            snapshot.operation.agent_id,
-            resource_id,
-        )
-        _validate_catalog_binding(
-            resource,
-            agent_id=snapshot.operation.agent_id,
-            source_id=source_id,
-            resource_id=resource_id,
-            resource_revision=resource_revision,
-        )
-        assert resource is not None
         if proposal.state is LearningProposalState.REJECTED:
             request = ExplicitCorrectionCommit(proposal=proposal)
             result = await self._store.commit_explicit_correction(request)
             return _validate_store_result(request, result)
 
-        correction = _safe_correction(candidate)
-        scope = MemoryScope(
-            agent_id=snapshot.operation.agent_id,
-            source_id=resource.source_id,
-            resource_id=resource.id,
-        )
-        logical_key = normalize_memory_logical_key(
-            f"{correction.field}:{correction.business_term}"
-        )
-        existing = await self._store.load_resource_alias(scope, logical_key)
-        _validate_existing_alias(existing, scope=scope, logical_key=logical_key)
-        intended, expected_version = _intended_memory(
-            correction,
-            resource=resource,
-            scope=scope,
-            logical_key=logical_key,
-            existing=existing,
-            provenance=MemoryProvenance(
-                kind=MemoryProvenanceKind.USER_STATEMENT,
-                content_hash=source_hash,
-                operation_id=snapshot.operation.id,
-                trigger_id=snapshot.trigger.id,
-                session_id=snapshot.operation.session_id,
-            ),
-            created_at=now,
-        )
+        if frozenset(candidate) == _CORRECTION_KEYS:
+            correction = _safe_correction(candidate)
+            source_id = correction.source_id
+            resource_id = correction.resource_id
+            resource_revision = correction.resource_revision
+            resource = await self._catalog.load_resource(
+                snapshot.operation.agent_id,
+                resource_id,
+            )
+            _validate_catalog_binding(
+                resource,
+                agent_id=snapshot.operation.agent_id,
+                source_id=source_id,
+                resource_id=resource_id,
+                resource_revision=resource_revision,
+            )
+            assert resource is not None
+            scope = MemoryScope(
+                agent_id=snapshot.operation.agent_id,
+                source_id=resource.source_id,
+                resource_id=resource.id,
+            )
+            logical_key = normalize_memory_logical_key(
+                f"{correction.field}:{correction.business_term}"
+            )
+            existing = await self._store.load_learning_memory(
+                scope,
+                MemoryKind.RESOURCE_ALIAS,
+                logical_key,
+            )
+            _validate_existing_memory(
+                existing,
+                scope=scope,
+                kind=MemoryKind.RESOURCE_ALIAS,
+                logical_key=logical_key,
+            )
+            intended, expected_version = _intended_memory(
+                correction,
+                resource=resource,
+                scope=scope,
+                logical_key=logical_key,
+                existing=existing,
+                provenance=_user_statement_provenance(
+                    snapshot,
+                    source_hash=source_hash,
+                ),
+                created_at=now,
+            )
+        else:
+            content = _safe_semantic_fact(candidate)
+            scope = MemoryScope(agent_id=snapshot.operation.agent_id)
+            logical_key = normalize_memory_logical_key(content)
+            existing = await self._store.load_learning_memory(
+                scope,
+                MemoryKind.SEMANTIC_FACT,
+                logical_key,
+            )
+            _validate_existing_memory(
+                existing,
+                scope=scope,
+                kind=MemoryKind.SEMANTIC_FACT,
+                logical_key=logical_key,
+            )
+            intended, expected_version = _intended_semantic_memory(
+                content,
+                scope=scope,
+                logical_key=logical_key,
+                existing=existing,
+                provenance=_user_statement_provenance(
+                    snapshot,
+                    source_hash=source_hash,
+                ),
+                created_at=now,
+            )
+
         decision = LearningDecision(
             proposal_id=proposal.id,
             idempotency_key=proposal.idempotency_key,
@@ -430,6 +493,88 @@ class ExplicitCorrectionLearningService:
         )
         result = await self._store.commit_explicit_correction(request)
         return _validate_store_result(request, result)
+
+    async def propose_evidence_fact(
+        self,
+        snapshot: OperationSnapshot,
+    ) -> LearningProposal | None:
+        """Persist a visible fact proposal only from accepted governed evidence."""
+
+        if not isinstance(snapshot, OperationSnapshot):
+            raise TypeError("evidence fact requires an OperationSnapshot")
+        _validate_completed_user_operation(snapshot)
+        message = snapshot.trigger.payload.get("message")
+        if not isinstance(message, str):
+            return None
+        match = _EVIDENCE_FACT.fullmatch(message.strip())
+        if match is None:
+            return None
+        content = _normalized_statement(match.group("content"))
+        evidence = _eligible_fact_evidence(snapshot)
+        candidate: dict[str, object] = {
+            "content": content,
+            "kind": MemoryKind.SEMANTIC_FACT.value,
+        }
+        if evidence is not None:
+            facts = evidence.validation_facts
+            candidate.update(
+                {
+                    "resource_ids": facts.resource_ids,
+                    "resource_revisions": tuple(
+                        {"resource_id": resource_id, "revision": revision}
+                        for resource_id, revision in facts.resource_revisions
+                    ),
+                    "source_ids": facts.source_ids,
+                    "source_revisions": tuple(
+                        {"revision": revision, "source_id": source_id}
+                        for source_id, revision in facts.source_revisions
+                    ),
+                }
+            )
+        source_hash = _hash_text(message) if evidence is None else evidence.content_hash
+        provenance = LearningProvenance(
+            agent_id=snapshot.operation.agent_id,
+            operation_id=snapshot.operation.id,
+            trigger_id=snapshot.trigger.id,
+            source_outcome=LearningSourceOutcome.SUCCEEDED,
+            source_hash=source_hash,
+            evidence_id=None if evidence is None else evidence.id,
+            evidence_accepted=evidence is not None,
+        )
+        proposal_id = _proposal_id(
+            snapshot,
+            _hash_text(f"evidence-fact:{message}"),
+        )
+        if evidence is None:
+            proposal = LearningProposal.reject(
+                proposal_id=proposal_id,
+                kind=LearningProposalKind.MEMORY,
+                category=LearningCandidateCategory.EVIDENCE_BACKED_FACT,
+                provenance=provenance,
+                candidate=candidate,
+                created_at=self._now(),
+                rejection_category=LearningRejectionCategory.INELIGIBLE_SOURCE,
+                rejection_reason="accepted_current_read_evidence_required",
+            )
+        else:
+            proposal = LearningProposal.create(
+                proposal_id=proposal_id,
+                kind=LearningProposalKind.MEMORY,
+                category=LearningCandidateCategory.EVIDENCE_BACKED_FACT,
+                provenance=provenance,
+                candidate=candidate,
+                created_at=self._now(),
+            )
+        stored = await self._store.create_proposal(proposal)
+        if not isinstance(stored, LearningProposal) or (
+            stored.idempotency_key != proposal.idempotency_key
+            or stored.candidate_hash != proposal.candidate_hash
+            or stored.provenance != proposal.provenance
+        ):
+            raise ExplicitCorrectionStoreContractError(
+                "store returned another evidence-backed fact proposal"
+            )
+        return stored
 
     def _now(self) -> datetime:
         value = self._clock()
@@ -500,17 +645,17 @@ async def _load_replayed_correction(
             "stored committed correction payload differs from its safety result"
         )
 
-    correction = _safe_correction(candidate)
-    scope = MemoryScope(
+    scope, kind, logical_key = _candidate_memory_identity(
+        candidate,
         agent_id=proposal.provenance.agent_id,
-        source_id=correction.source_id,
-        resource_id=correction.resource_id,
     )
-    logical_key = normalize_memory_logical_key(
-        f"{correction.field}:{correction.business_term}"
+    history = await store.load_learning_memory(scope, kind, logical_key)
+    _validate_existing_memory(
+        history,
+        scope=scope,
+        kind=kind,
+        logical_key=logical_key,
     )
-    history = await store.load_resource_alias(scope, logical_key)
-    _validate_existing_alias(history, scope=scope, logical_key=logical_key)
     if history is None:
         raise ExplicitCorrectionStoreContractError(
             "committed correction is missing its memory history"
@@ -520,12 +665,12 @@ async def _load_replayed_correction(
         memory=history,
         replayed=True,
     )
-    _validate_loaded_replay(correction, result)
+    _validate_loaded_replay(candidate, result)
     return result
 
 
 def _validate_loaded_replay(
-    correction: ResourceAliasCorrection,
+    candidate: Mapping[str, object],
     result: ExplicitCorrectionResult,
 ) -> None:
     assert result.memory is not None
@@ -534,22 +679,33 @@ def _validate_loaded_replay(
     version = next(
         item for item in result.memory.versions if item.version == result_version
     )
-    expected_attributes = FrozenJsonObject.from_mapping(
-        {
-            "business_term": correction.business_term,
-            "field": correction.field,
-            "stored_value": correction.stored_value,
-        }
-    )
-    expected_content = "Resource alias " + canonical_json(expected_attributes)
+    if frozenset(candidate) == _CORRECTION_KEYS:
+        correction = _safe_correction(candidate)
+        expected_attributes = FrozenJsonObject.from_mapping(
+            {
+                "business_term": correction.business_term,
+                "field": correction.field,
+                "stored_value": correction.stored_value,
+            }
+        )
+        expected_content = "Resource alias " + canonical_json(expected_attributes)
+        expected_kind = MemoryKind.RESOURCE_ALIAS
+        expected_revision: str | None = correction.resource_revision
+    else:
+        content = _safe_semantic_fact(candidate)
+        expected_attributes = FrozenJsonObject.from_mapping({"statement": content})
+        expected_content = content
+        expected_kind = MemoryKind.SEMANTIC_FACT
+        expected_revision = None
     provenance = version.provenance
     proposal_provenance = result.proposal.provenance
     if (
-        version.content != expected_content
+        result.memory.record.kind is not expected_kind
+        or version.content != expected_content
         or version.attributes != expected_attributes
         or version.creator is not MemoryCreator.LEARNING_SERVICE
         or version.confidence != 1.0
-        or version.resource_revision != correction.resource_revision
+        or version.resource_revision != expected_revision
         or version.expires_at is not None
         or provenance.kind is not MemoryProvenanceKind.USER_STATEMENT
         or provenance.content_hash != proposal_provenance.source_hash
@@ -581,16 +737,51 @@ def _validate_completed_user_operation(snapshot: OperationSnapshot) -> None:
         )
 
 
-def _parse_trigger_candidate(message: str) -> dict[str, object]:
+def is_explicit_learning_message(message: object) -> bool:
+    """Whether a user message requests direct, governed memory learning."""
+
+    if not isinstance(message, str):
+        return False
+    lowered = message.casefold()
+    return message.startswith(RESOURCE_ALIAS_CORRECTION_PREFIX) or any(
+        lowered.startswith(prefix) for prefix in NATURAL_REMEMBER_PREFIXES
+    )
+
+
+def _parse_trigger_candidate(
+    message: str,
+    *,
+    snapshot: OperationSnapshot,
+) -> dict[str, object]:
     _required_text(
         message,
         "explicit correction trigger message",
         maximum=_MAX_TRIGGER_CHARACTERS,
     )
     if not message.startswith(RESOURCE_ALIAS_CORRECTION_PREFIX):
-        raise ExplicitCorrectionFormatError(
-            "trigger does not use the supported resource-alias correction pattern"
-        )
+        content = _natural_statement(message)
+        alias = _natural_alias_parts(content)
+        binding = _natural_resource_binding(snapshot)
+        if alias is not None:
+            if binding is None:
+                raise ExplicitCorrectionNotEligibleError(
+                    "natural resource alias requires one accepted current read binding"
+                )
+            business_term, field, stored_value = alias
+            source_id, resource_id, resource_revision = binding
+            return ResourceAliasCorrection(
+                source_id=source_id,
+                resource_id=resource_id,
+                resource_revision=resource_revision,
+                field=field,
+                business_term=business_term,
+                stored_value=stored_value,
+            ).candidate.to_dict()
+        normalized = _normalized_statement(content)
+        return {
+            "content": normalized,
+            "kind": MemoryKind.SEMANTIC_FACT.value,
+        }
     encoded = message.removeprefix(RESOURCE_ALIAS_CORRECTION_PREFIX)
     try:
         parsed = json.loads(
@@ -617,6 +808,83 @@ def _parse_trigger_candidate(message: str) -> dict[str, object]:
             "resource-alias correction JSON must use canonical encoding"
         )
     return cast(dict[str, object], parsed)
+
+
+def _natural_statement(message: str) -> str:
+    lowered = message.casefold()
+    prefix = next(
+        (
+            candidate
+            for candidate in NATURAL_REMEMBER_PREFIXES
+            if lowered.startswith(candidate)
+        ),
+        None,
+    )
+    if prefix is None:
+        raise ExplicitCorrectionFormatError(
+            "trigger does not use a supported explicit learning phrase"
+        )
+    content = message[len(prefix) :].strip()
+    _required_text(content, "natural learning statement", maximum=3_900)
+    return content
+
+
+def _normalized_statement(value: str) -> str:
+    normalized = " ".join(value.strip().split())
+    normalized = normalized.rstrip(".! ")
+    _required_text(normalized, "natural learning statement", maximum=3_900)
+    return normalized[:1].upper() + normalized[1:] + "."
+
+
+def _natural_alias_parts(value: str) -> tuple[str, str, str] | None:
+    normalized = " ".join(value.strip().rstrip(".").split())
+    match = _NATURAL_ALIAS.fullmatch(normalized) or _NATURAL_ALIAS_MEANS.fullmatch(
+        normalized
+    )
+    if match is None:
+        return None
+    values = tuple(
+        _unquoted(match.group(name)) for name in ("business", "field", "stored")
+    )
+    if any(not value for value in values):
+        return None
+    return cast(tuple[str, str, str], values)
+
+
+def _unquoted(value: str) -> str:
+    normalized = value.strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0]
+        in {
+            '"',
+            "'",
+        }
+    ):
+        normalized = normalized[1:-1].strip()
+    return normalized
+
+
+def _natural_resource_binding(
+    snapshot: OperationSnapshot,
+) -> tuple[str, str, str] | None:
+    bindings = {
+        (
+            evidence.validation_facts.source_ids[0],
+            evidence.validation_facts.resource_ids[0],
+            evidence.validation_facts.resource_revisions[0][1],
+        )
+        for evidence in _governed_read_evidence(snapshot)
+        if len(evidence.validation_facts.source_ids) == 1
+        and len(evidence.validation_facts.resource_ids) == 1
+        and len(evidence.validation_facts.resource_revisions) == 1
+        and evidence.validation_facts.resource_revisions[0][0]
+        == evidence.validation_facts.resource_ids[0]
+    }
+    if len(bindings) != 1:
+        return None
+    return next(iter(bindings))
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -681,6 +949,95 @@ def _safe_correction(candidate: Mapping[str, object]) -> ResourceAliasCorrection
         ) from error
 
 
+def _safe_semantic_fact(candidate: Mapping[str, object]) -> str:
+    if (
+        frozenset(candidate) != {"content", "kind"}
+        or candidate.get("kind") != MemoryKind.SEMANTIC_FACT.value
+    ):
+        raise ExplicitCorrectionFormatError(
+            "natural memory must contain one semantic fact"
+        )
+    content = candidate.get("content")
+    try:
+        _required_text(content, "semantic fact content", maximum=3_900)
+    except (TypeError, ValueError) as error:
+        raise ExplicitCorrectionFormatError(
+            "semantic fact content must be bounded normalized text"
+        ) from error
+    assert isinstance(content, str)
+    return content
+
+
+def _candidate_memory_identity(
+    candidate: Mapping[str, object],
+    *,
+    agent_id: str,
+) -> tuple[MemoryScope, MemoryKind, str]:
+    if frozenset(candidate) == _CORRECTION_KEYS:
+        correction = _safe_correction(candidate)
+        scope = MemoryScope(
+            agent_id=agent_id,
+            source_id=correction.source_id,
+            resource_id=correction.resource_id,
+        )
+        return (
+            scope,
+            MemoryKind.RESOURCE_ALIAS,
+            normalize_memory_logical_key(
+                f"{correction.field}:{correction.business_term}"
+            ),
+        )
+    content = _safe_semantic_fact(candidate)
+    return (
+        MemoryScope(agent_id=agent_id),
+        MemoryKind.SEMANTIC_FACT,
+        normalize_memory_logical_key(content),
+    )
+
+
+def _user_statement_provenance(
+    snapshot: OperationSnapshot,
+    *,
+    source_hash: str,
+) -> MemoryProvenance:
+    return MemoryProvenance(
+        kind=MemoryProvenanceKind.USER_STATEMENT,
+        content_hash=source_hash,
+        operation_id=snapshot.operation.id,
+        trigger_id=snapshot.trigger.id,
+        session_id=snapshot.operation.session_id,
+    )
+
+
+def _governed_read_evidence(snapshot: OperationSnapshot) -> tuple[Evidence, ...]:
+    tasks = {task.id: task for task in snapshot.tasks}
+    return tuple(
+        evidence
+        for evidence in snapshot.evidence
+        if (
+            evidence.operation_id == snapshot.operation.id
+            and evidence.accepted
+            and evidence.applicable
+            and evidence.metadata_schema_version == 1
+            and evidence.applicability_reason == "current_operation"
+            and evidence.validation_facts.schema_version == 1
+            and evidence.validation_facts.validation_passed
+            and evidence.validation_facts.in_scope
+            and not evidence.validation_facts.destructive
+            and evidence.validation_facts.freshness_state == "current"
+            and evidence.task_id in tasks
+            and tasks[evidence.task_id].status is TaskStatus.SUCCEEDED
+            and tasks[evidence.task_id].execution_facts.access_mode is AccessMode.READ
+            and not tasks[evidence.task_id].execution_facts.side_effecting
+        )
+    )
+
+
+def _eligible_fact_evidence(snapshot: OperationSnapshot) -> Evidence | None:
+    eligible = _governed_read_evidence(snapshot)
+    return None if not eligible else eligible[-1]
+
+
 def _validate_catalog_binding(
     resource: CatalogResource | None,
     *,
@@ -717,6 +1074,21 @@ def _validate_existing_alias(
     scope: MemoryScope,
     logical_key: str,
 ) -> None:
+    _validate_existing_memory(
+        existing,
+        scope=scope,
+        kind=MemoryKind.RESOURCE_ALIAS,
+        logical_key=logical_key,
+    )
+
+
+def _validate_existing_memory(
+    existing: MemoryHistory | None,
+    *,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    logical_key: str,
+) -> None:
     if existing is None:
         return
     if not isinstance(existing, MemoryHistory):
@@ -725,15 +1097,15 @@ def _validate_existing_alias(
         )
     if (
         existing.record.scope != scope
-        or existing.record.kind is not MemoryKind.RESOURCE_ALIAS
+        or existing.record.kind is not kind
         or existing.record.logical_key != logical_key
     ):
         raise ExplicitCorrectionStoreContractError(
-            "store returned another logical resource alias"
+            "store returned another logical memory identity"
         )
     if existing.record.state is not MemoryState.ACTIVE:
         raise ExplicitCorrectionNotEligibleError(
-            "only an active resource alias can receive a correction"
+            "only active memory can receive explicit learning"
         )
 
 
@@ -792,6 +1164,58 @@ def _intended_memory(
             "stored_value": correction.stored_value,
         },
         resource_revision=resource.current_revision,
+        supersedes_version=expected_version,
+        created_at=created_at,
+    )
+    return MemorySnapshot(record, version), expected_version
+
+
+def _intended_semantic_memory(
+    content: str,
+    *,
+    scope: MemoryScope,
+    logical_key: str,
+    existing: MemoryHistory | None,
+    provenance: MemoryProvenance,
+    created_at: datetime,
+) -> tuple[MemorySnapshot, int | None]:
+    if existing is None:
+        memory_id = _memory_id(
+            scope,
+            logical_key,
+            kind=MemoryKind.SEMANTIC_FACT,
+        )
+        version_number = 1
+        expected_version = None
+        record = MemoryRecord(
+            id=memory_id,
+            scope=scope,
+            kind=MemoryKind.SEMANTIC_FACT,
+            logical_key=logical_key,
+            current_version=version_number,
+            state=MemoryState.ACTIVE,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    else:
+        expected_version = existing.record.current_version
+        version_number = expected_version + 1
+        if created_at < existing.record.updated_at:
+            raise ValueError("explicit learning clock precedes memory history")
+        record = replace(
+            existing.record,
+            current_version=version_number,
+            updated_at=created_at,
+        )
+    version = MemoryVersion(
+        memory_id=record.id,
+        version=version_number,
+        content=content,
+        creator=MemoryCreator.LEARNING_SERVICE,
+        confidence=1.0,
+        sensitivity=MemorySensitivity.INTERNAL,
+        provenance=provenance,
+        attributes={"statement": content},
         supersedes_version=expected_version,
         created_at=created_at,
     )
@@ -902,17 +1326,22 @@ def _proposal_id(snapshot: OperationSnapshot, source_hash: str) -> str:
     return f"learning-proposal:{digest}"
 
 
-def _memory_id(scope: MemoryScope, logical_key: str) -> str:
+def _memory_id(
+    scope: MemoryScope,
+    logical_key: str,
+    *,
+    kind: MemoryKind = MemoryKind.RESOURCE_ALIAS,
+) -> str:
     digest = sha256(
         canonical_json(
             {
-                "kind": MemoryKind.RESOURCE_ALIAS.value,
+                "kind": kind.value,
                 "logical_key": logical_key,
                 "scope": scope.fingerprint,
             }
         ).encode("utf-8")
     ).hexdigest()
-    return f"memory-resource-alias:{digest}"
+    return f"memory-{kind.value.replace('_', '-')}:{digest}"
 
 
 def _hash_text(value: str) -> str:
@@ -937,6 +1366,7 @@ def _positive_integer(value: int, field_name: str) -> None:
 
 
 __all__ = [
+    "NATURAL_REMEMBER_PREFIXES",
     "RESOURCE_ALIAS_CORRECTION_PREFIX",
     "ExplicitCorrectionCatalogReader",
     "ExplicitCorrectionCommit",
@@ -949,4 +1379,5 @@ __all__ = [
     "ExplicitCorrectionStoreConflictError",
     "ExplicitCorrectionStoreContractError",
     "ResourceAliasCorrection",
+    "is_explicit_learning_message",
 ]

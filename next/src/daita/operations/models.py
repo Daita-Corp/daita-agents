@@ -101,6 +101,8 @@ class Operation:
     session_id: str | None = None
     final_text: str | None = None
     terminal_reason: str | None = None
+    model_route_revision: int | None = None
+    model_route_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.id, "operation id")
@@ -118,6 +120,26 @@ class Operation:
             _required_text(self.final_text, "operation final text")
         if self.terminal_reason is not None:
             _required_text(self.terminal_reason, "operation terminal reason")
+        if (self.model_route_revision is None) != (
+            self.model_route_fingerprint is None
+        ):
+            raise ValueError(
+                "operation model route revision and fingerprint must be paired"
+            )
+        if self.model_route_revision is not None:
+            if (
+                not isinstance(self.model_route_revision, int)
+                or isinstance(self.model_route_revision, bool)
+                or self.model_route_revision < 1
+            ):
+                raise ValueError(
+                    "operation model_route_revision must be a positive integer"
+                )
+            assert self.model_route_fingerprint is not None
+            if _CANONICAL_SHA256.fullmatch(self.model_route_fingerprint) is None:
+                raise ValueError(
+                    "operation model_route_fingerprint must be canonical sha256"
+                )
 
         is_terminal = self.status in _TERMINAL_STATUSES
         if is_terminal and self.terminal_reason is None:
@@ -143,6 +165,9 @@ class ActionValidationFacts:
     resource_ids: tuple[str, ...] = ()
     resource_revisions: tuple[tuple[str, str], ...] = ()
     source_revision: str | None = None
+    source_ids: tuple[str, ...] = ()
+    source_revisions: tuple[tuple[str, str], ...] = ()
+    freshness_state: str | None = None
     impact: Mapping[str, object] = field(default_factory=dict)
     evidence_ids: tuple[str, ...] = ()
 
@@ -193,6 +218,20 @@ class ActionValidationFacts:
             "resource_ids",
             maximum=_MAX_VALIDATION_ITEMS,
         )
+        source_ids = self._text_tuple(
+            self.source_ids,
+            "source_ids",
+            maximum=_MAX_VALIDATION_ITEMS,
+        )
+        if self.source_id is not None:
+            if source_ids and source_ids != (self.source_id,):
+                raise ValueError(
+                    "validation source_id and source_ids must describe one scope"
+                )
+            source_ids = (self.source_id,)
+        elif len(source_ids) == 1:
+            object.__setattr__(self, "source_id", source_ids[0])
+
         evidence_ids = self._text_tuple(
             self.evidence_ids,
             "evidence_ids",
@@ -232,12 +271,71 @@ class ActionValidationFacts:
                 "validation resource revisions must cover every scoped resource"
             )
 
+        if isinstance(self.source_revisions, (str, bytes)):
+            raise TypeError("validation source_revisions must be a sequence")
+        source_revisions = tuple(sorted(tuple(item) for item in self.source_revisions))
+        if len(source_revisions) > _MAX_VALIDATION_ITEMS:
+            raise ValueError("validation source_revisions exceed the item limit")
+        for item in source_revisions:
+            if len(item) != 2:
+                raise ValueError(
+                    "validation source_revisions must contain identifier/revision pairs"
+                )
+            scoped_source_id, revision = item
+            _required_text(scoped_source_id, "validation source revision id")
+            _required_text(revision, "validation source revision")
+            if scoped_source_id not in source_ids:
+                raise ValueError(
+                    "validation source revision references an unscoped source"
+                )
+            if revision != revision.strip() or len(revision) > 1_024:
+                raise ValueError(
+                    "validation source revisions must contain bounded text without "
+                    "surrounding whitespace"
+                )
+        source_revision_ids = tuple(item[0] for item in source_revisions)
+        if len(source_revision_ids) != len(set(source_revision_ids)):
+            raise ValueError("validation source revisions must be unique")
+        if source_revisions and set(source_revision_ids) != set(source_ids):
+            raise ValueError(
+                "validation source revisions must cover every scoped source"
+            )
+        if self.source_revision is not None:
+            if len(source_ids) != 1:
+                raise ValueError(
+                    "validation source_revision requires one scoped source"
+                )
+            compatibility_revision = ((source_ids[0], self.source_revision),)
+            if source_revisions and source_revisions != compatibility_revision:
+                raise ValueError(
+                    "validation source_revision and source_revisions disagree"
+                )
+            source_revisions = compatibility_revision
+        elif len(source_revisions) == 1 and len(source_ids) == 1:
+            object.__setattr__(self, "source_revision", source_revisions[0][1])
+        source_revision_ids = tuple(item[0] for item in source_revisions)
+
+        if self.freshness_state not in {None, "current"}:
+            raise ValueError("validation freshness_state must be 'current' or None")
+        if self.freshness_state == "current" and (
+            not source_ids
+            or not resource_ids
+            or set(source_revision_ids) != set(source_ids)
+            or set(revision_ids) != set(resource_ids)
+        ):
+            raise ValueError(
+                "current validation freshness requires exact source and resource "
+                "revisions"
+            )
+
         impact = FrozenJsonObject.from_mapping(self.impact)
         if len(canonical_json(impact)) > _MAX_IMPACT_CHARACTERS:
             raise ValueError("validation impact facts must be bounded")
 
         object.__setattr__(self, "resource_ids", resource_ids)
         object.__setattr__(self, "resource_revisions", resource_revisions)
+        object.__setattr__(self, "source_ids", source_ids)
+        object.__setattr__(self, "source_revisions", source_revisions)
         object.__setattr__(self, "impact", impact)
         object.__setattr__(self, "evidence_ids", evidence_ids)
 
@@ -248,6 +346,9 @@ class ActionValidationFacts:
                 or self.destructive
                 or self.sensitivity_class != "internal"
                 or self.source_id is not None
+                or source_ids
+                or source_revisions
+                or self.freshness_state is not None
                 or resource_ids
                 or resource_revisions
                 or self.source_revision is not None
@@ -257,8 +358,10 @@ class ActionValidationFacts:
                 raise ValueError(
                     "legacy validation facts cannot contain explicit authority"
                 )
-        elif self.source_id is None:
-            raise ValueError("explicit validation facts require source_id")
+        elif not source_ids:
+            raise ValueError(
+                "explicit validation facts require source_id/source_ids authority"
+            )
 
     @staticmethod
     def _text_tuple(
@@ -302,6 +405,17 @@ class ActionValidationFacts:
             "source_revision": self.source_revision,
             "validation_passed": self.validation_passed,
         }
+        if self.source_ids != ((self.source_id,) if self.source_id is not None else ()):
+            material["source_ids"] = self.source_ids
+        compatibility_source_revisions = (
+            ()
+            if self.source_id is None or self.source_revision is None
+            else ((self.source_id, self.source_revision),)
+        )
+        if self.source_revisions != compatibility_source_revisions:
+            material["source_revisions"] = self.source_revisions
+        if self.freshness_state is not None:
+            material["freshness_state"] = self.freshness_state
         encoded = canonical_json(material).encode("utf-8")
         return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
@@ -315,9 +429,12 @@ class ActionValidationFacts:
             "destructive": self.destructive,
             "sensitivity_class": self.sensitivity_class,
             "source_id": self.source_id,
+            "source_ids": self.source_ids,
+            "source_revisions": self.source_revisions,
             "resource_ids": self.resource_ids,
             "resource_revisions": self.resource_revisions,
             "source_revision": self.source_revision,
+            "freshness_state": self.freshness_state,
             "impact": self.impact,
             "evidence_ids": self.evidence_ids,
             "validation_fingerprint": self.fingerprint,
@@ -614,6 +731,16 @@ class Evidence:
     content_hash: str
     created_at: datetime
     blob_id: str | None = None
+    metadata_schema_version: int = 0
+    acceptance_reason: str | None = None
+    rejection_reason: str | None = None
+    applicable: bool = False
+    applicability_reason: str | None = None
+    validation_facts: ActionValidationFacts = field(
+        default_factory=ActionValidationFacts
+    )
+    projection_metadata: Mapping[str, object] = field(default_factory=dict)
+    redaction_metadata: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _required_text(self.id, "evidence id")
@@ -637,10 +764,89 @@ class Evidence:
             raise ValueError("evidence attempt must be a positive integer")
         if not isinstance(self.accepted, bool):
             raise TypeError("evidence accepted must be a boolean")
+        if self.metadata_schema_version not in {0, 1}:
+            raise ValueError("evidence metadata_schema_version must be 0 or 1")
+        if not isinstance(self.applicable, bool):
+            raise TypeError("evidence applicable must be a boolean")
+        if not isinstance(self.validation_facts, ActionValidationFacts):
+            raise TypeError(
+                "evidence validation_facts must be an ActionValidationFacts record"
+            )
         _required_text(self.content_hash, "evidence content_hash")
         if not self.content_hash.startswith("sha256:"):
             raise ValueError("evidence content_hash must use sha256")
         if self.blob_id is not None:
             _required_text(self.blob_id, "evidence blob_id")
         _aware(self.created_at, "evidence created_at")
-        object.__setattr__(self, "payload", FrozenJsonObject.from_mapping(self.payload))
+        payload = FrozenJsonObject.from_mapping(self.payload)
+        projection = FrozenJsonObject.from_mapping(self.projection_metadata)
+        redaction = FrozenJsonObject.from_mapping(self.redaction_metadata)
+        if len(canonical_json(projection)) > 4_096:
+            raise ValueError("evidence projection metadata must be bounded")
+        if len(canonical_json(redaction)) > 4_096:
+            raise ValueError("evidence redaction metadata must be bounded")
+        object.__setattr__(self, "payload", payload)
+        object.__setattr__(self, "projection_metadata", projection)
+        object.__setattr__(self, "redaction_metadata", redaction)
+
+        if self.metadata_schema_version == 0:
+            if (
+                self.acceptance_reason is not None
+                or self.rejection_reason is not None
+                or self.applicable
+                or self.applicability_reason is not None
+                or self.validation_facts.schema_version != 0
+                or projection
+                or redaction
+            ):
+                raise ValueError(
+                    "legacy evidence metadata cannot contain canonical disposition"
+                )
+            return
+
+        if self.accepted:
+            if self.acceptance_reason != "schema_validated":
+                raise ValueError(
+                    "accepted evidence requires canonical acceptance_reason"
+                )
+            if self.rejection_reason is not None:
+                raise ValueError("accepted evidence cannot contain rejection_reason")
+        else:
+            if self.acceptance_reason is not None:
+                raise ValueError("rejected evidence cannot contain acceptance_reason")
+            if self.rejection_reason != "schema_validation_failed":
+                raise ValueError(
+                    "rejected evidence requires canonical rejection_reason"
+                )
+        if self.applicability_reason not in {
+            "current_operation",
+            "rejected_before_acceptance",
+        }:
+            raise ValueError(
+                "evidence applicability_reason must be a canonical disposition"
+            )
+        if self.accepted != self.applicable:
+            raise ValueError(
+                "accepted evidence must be applicable and rejected evidence must not be"
+            )
+        if not self.accepted and (payload or self.blob_id is not None):
+            raise ValueError(
+                "rejected evidence cannot retain payload or artifact content"
+            )
+        expected_projection = {
+            "audit": "bounded_metadata",
+            "model": "bounded_observation" if self.accepted else "omitted",
+            "public": "bounded_projection" if self.accepted else "omitted",
+        }
+        if dict(projection) != expected_projection:
+            raise ValueError("evidence projection metadata is not canonical")
+        expected_redaction = (
+            {
+                "artifact": "retained" if self.blob_id is not None else "none",
+                "payload": "retained_bounded",
+            }
+            if self.accepted
+            else {"artifact": "discarded", "payload": "discarded"}
+        )
+        if dict(redaction) != expected_redaction:
+            raise ValueError("evidence redaction metadata is not canonical")

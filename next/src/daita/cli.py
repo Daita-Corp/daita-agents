@@ -158,7 +158,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = commands.add_parser("serve", help="run one foreground local host")
     serve.add_argument("agent", type=_agent_name)
-    serve.add_argument("--openai-model", required=True)
+    serve.add_argument(
+        "--openai-model",
+        help="legacy one-shot provider override; omit after `model set`",
+    )
     serve.add_argument(
         "--context-window-tokens",
         type=_positive_int,
@@ -189,9 +192,16 @@ def build_parser() -> argparse.ArgumentParser:
     agent_commands = agent.add_subparsers(dest="_action", required=True)
     _leaf(
         agent_commands,
+        "create",
+        method="agent.create",
+        help_text="create an agent home through AgentHost",
+        mutation=True,
+    )
+    _leaf(
+        agent_commands,
         "init",
         method="agent.init",
-        help_text="initialize an agent home through the bootstrap request",
+        help_text="compatibility alias for agent create",
         mutation=True,
     )
 
@@ -222,6 +232,15 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("message")
     submit.add_argument("--session-id")
     _params(submit, "message", "session_id")
+    interactive = _leaf(
+        chat_commands,
+        "interactive",
+        method="chat.interactive",
+        help_text="read messages from stdin and stream committed events",
+    )
+    interactive.add_argument("--session-id")
+    interactive.add_argument("--poll-seconds", type=_positive_float, default=0.1)
+    _params(interactive, "session_id", "poll_seconds")
 
     operation = commands.add_parser("operation", help="operation controls")
     operation_commands = operation.add_subparsers(dest="_action", required=True)
@@ -233,6 +252,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     inspect_operation.add_argument("operation_id")
     _params(inspect_operation, "operation_id")
+    list_operations = _leaf(
+        operation_commands,
+        "list",
+        method="operation.list",
+        help_text="list bounded durable operations",
+    )
+    list_operations.add_argument("--status", action="append", dest="statuses")
+    list_operations.add_argument("--limit", type=_positive_int, default=100)
+    _params(list_operations, "statuses", "limit")
     cancel_operation = _leaf(
         operation_commands,
         "cancel",
@@ -258,25 +286,68 @@ def build_parser() -> argparse.ArgumentParser:
         decision.add_argument("--actor", required=True, dest="actor_id")
         decision.add_argument("--reason", required=True)
         _params(decision, "approval_id", "actor_id", "reason")
+    list_approvals = _leaf(
+        approval_commands,
+        "list",
+        method="approval.list",
+        help_text="list bounded durable approvals",
+    )
+    list_approvals.add_argument("--status", action="append", dest="statuses")
+    list_approvals.add_argument("--limit", type=_positive_int, default=100)
+    _params(list_approvals, "statuses", "limit")
+    inspect_approval = _leaf(
+        approval_commands,
+        "inspect",
+        method="approval.inspect",
+        help_text="inspect one durable approval",
+    )
+    inspect_approval.add_argument("approval_id")
+    _params(inspect_approval, "approval_id")
 
     source = commands.add_parser("source", help="source attachment")
     source_commands = source.add_subparsers(dest="_action", required=True)
-    attach_source = _leaf(
+    for action in ("add", "attach"):
+        attach_source = _leaf(
+            source_commands,
+            action,
+            method="source.attach",
+            help_text="attach and discover one local source",
+            mutation=True,
+        )
+        attach_source.add_argument("kind", choices=("sqlite", "local_files"))
+        attach_source.add_argument("path")
+        attach_source.add_argument(
+            "--write-access",
+            action="store_true",
+            default=None,
+            help="explicitly enable controlled SQLite writes",
+        )
+        _params(attach_source, "kind", "path", "write_access")
+    list_sources = _leaf(
         source_commands,
-        "attach",
-        method="source.attach",
-        help_text="attach and discover one local source",
+        "list",
+        method="source.list",
+        help_text="list attached sources",
+    )
+    list_sources.add_argument("--include-detached", action="store_true")
+    _params(list_sources, "include_detached")
+    detach_source = _leaf(
+        source_commands,
+        "detach",
+        method="source.detach",
+        help_text="detach one source",
         mutation=True,
     )
-    attach_source.add_argument("kind", choices=("sqlite", "local_files"))
-    attach_source.add_argument("path")
-    attach_source.add_argument(
-        "--write-access",
-        action="store_true",
-        default=None,
-        help="explicitly enable controlled SQLite writes",
+    detach_source.add_argument("source_id")
+    _params(detach_source, "source_id")
+    source_health = _leaf(
+        source_commands,
+        "health",
+        method="source.health",
+        help_text="inspect source and catalog readiness",
     )
-    _params(attach_source, "kind", "path", "write_access")
+    source_health.add_argument("source_id", nargs="?")
+    _params(source_health, "source_id")
 
     model = commands.add_parser("model", help="model configuration status")
     model_commands = model.add_subparsers(dest="_action", required=True)
@@ -286,6 +357,118 @@ def build_parser() -> argparse.ArgumentParser:
         method="model.status",
         help_text="inspect the active model profile",
     )
+    _leaf(
+        model_commands,
+        "show",
+        method="model.show",
+        help_text="show the non-secret retained model route",
+    )
+    set_model = _leaf(
+        model_commands,
+        "set",
+        method="model.set",
+        help_text="persist a retained future-operation model route",
+        mutation=True,
+    )
+    set_model.add_argument("model_id", nargs="?")
+    set_model.add_argument("--provider")
+    set_model.add_argument("--model")
+    set_model.add_argument("--secret")
+    set_model.add_argument(
+        "--context-window-tokens", type=_positive_int, default=128_000
+    )
+    set_model.add_argument("--max-output-tokens", type=_positive_int, default=4_096)
+    set_model.add_argument("--base-url")
+    set_model.add_argument("--secret-env")
+    set_model.add_argument(
+        "--allow-sensitivity",
+        action="append",
+        dest="allowed_sensitivities",
+        choices=("public", "internal", "confidential", "restricted"),
+    )
+    _params(
+        set_model,
+        "model_id",
+        "provider",
+        "model",
+        "secret",
+        "context_window_tokens",
+        "max_output_tokens",
+        "base_url",
+        "secret_env",
+        "allowed_sensitivities",
+    )
+
+    catalog = commands.add_parser("catalog", help="catalog inspection")
+    catalog_commands = catalog.add_subparsers(dest="_action", required=True)
+    search_catalog = _leaf(
+        catalog_commands,
+        "search",
+        method="catalog.search",
+        help_text="search current catalog resources",
+    )
+    search_catalog.add_argument("query")
+    search_catalog.add_argument("--source-id", action="append", dest="source_ids")
+    search_catalog.add_argument("--kind", action="append", dest="resource_kinds")
+    search_catalog.add_argument("--limit", type=_positive_int, default=20)
+    _params(search_catalog, "query", "source_ids", "resource_kinds", "limit")
+    show_catalog = _leaf(
+        catalog_commands,
+        "show",
+        method="catalog.show",
+        help_text="show one current catalog resource",
+    )
+    show_catalog.add_argument("resource_id")
+    _params(show_catalog, "resource_id")
+
+    memory = commands.add_parser("memory", help="memory inspection")
+    memory_commands = memory.add_subparsers(dest="_action", required=True)
+    list_memory = _leaf(
+        memory_commands,
+        "list",
+        method="memory.list",
+        help_text="list governed memory",
+    )
+    for name in ("user_id", "session_id", "source_id", "resource_id"):
+        list_memory.add_argument(f"--{name.replace('_', '-')}")
+    list_memory.add_argument("--include-superseded", action="store_true")
+    list_memory.add_argument("--include-rejected", action="store_true")
+    list_memory.add_argument("--limit", type=_positive_int, default=100)
+    _params(
+        list_memory,
+        "user_id",
+        "session_id",
+        "source_id",
+        "resource_id",
+        "include_superseded",
+        "include_rejected",
+        "limit",
+    )
+    inspect_memory = _leaf(
+        memory_commands,
+        "inspect",
+        method="memory.inspect",
+        help_text="inspect one memory history",
+    )
+    inspect_memory.add_argument("memory_id")
+    _params(inspect_memory, "memory_id")
+
+    skill = commands.add_parser("skill", help="skill inspection")
+    skill_commands = skill.add_subparsers(dest="_action", required=True)
+    _leaf(
+        skill_commands,
+        "list",
+        method="skill.list",
+        help_text="list indexed skills",
+    )
+    inspect_skill = _leaf(
+        skill_commands,
+        "inspect",
+        method="skill.inspect",
+        help_text="inspect one skill history",
+    )
+    inspect_skill.add_argument("skill_id")
+    _params(inspect_skill, "skill_id")
 
     events = commands.add_parser("events", help="committed event log")
     event_commands = events.add_subparsers(dest="_action", required=True)
@@ -305,7 +488,10 @@ def build_parser() -> argparse.ArgumentParser:
         help_text="follow committed events from a durable cursor",
     )
     follow_events.add_argument("--after", type=_positive_int)
-    _params(follow_events, "after")
+    follow_events.add_argument("--limit", type=_positive_int, default=100)
+    follow_events.add_argument("--poll-seconds", type=_positive_float, default=0.1)
+    follow_events.add_argument("--max-events", type=_positive_int)
+    _params(follow_events, "after", "limit", "poll_seconds", "max_events")
 
     monitor = commands.add_parser("monitor", help="monitor lifecycle")
     monitor_commands = monitor.add_subparsers(dest="_action", required=True)
@@ -323,6 +509,22 @@ def build_parser() -> argparse.ArgumentParser:
         propose_monitor,
         "monitor_id",
         "definition",
+        "source_operation_id",
+    )
+    propose_natural = _leaf(
+        monitor_commands,
+        "propose-natural",
+        method="monitor.propose_natural",
+        help_text="parse a safe natural interval monitor proposal",
+        mutation=True,
+    )
+    propose_natural.add_argument("monitor_id")
+    propose_natural.add_argument("request")
+    propose_natural.add_argument("--source-operation-id")
+    _params(
+        propose_natural,
+        "monitor_id",
+        "request",
         "source_operation_id",
     )
 
@@ -425,6 +627,7 @@ def _write_json(value: object, *, stream: TextIO | None = None) -> None:
             sort_keys=True,
         ),
         file=destination,
+        flush=True,
     )
 
 
@@ -467,7 +670,275 @@ def _default_request(namespace: argparse.Namespace) -> CliRequest:
         LocalSocketSecurityError,
     )
 
-    client = LocalAgentClient(_agent_home(namespace))
+    async def request_once(
+        method: str,
+        params: Mapping[str, object],
+        *,
+        idempotency_key: str | None = None,
+    ) -> object:
+        client = LocalAgentClient(_agent_home(namespace))
+        response = await client.request(
+            LocalRequest.create(
+                request_id=f"cli-{uuid4().hex}",
+                method=method,
+                params=params,
+                idempotency_key=idempotency_key,
+            )
+        )
+        if isinstance(response, LocalErrorResponse):
+            raise CliRequestError(response.error.code, response.error.message)
+        return response.result
+
+    async def transient_request(
+        method: str,
+        params: Mapping[str, object],
+        *,
+        idempotency_key: str | None,
+    ) -> object:
+        from .hosting.embedded import HostActiveError
+        from .hosting.host import AgentHost
+        from .hosting.local_server import LocalAgentServer
+
+        try:
+            host = await AgentHost.open(
+                namespace.agent,
+                root=_state_root(namespace),
+            )
+        except HostActiveError as error:
+            raise CliRequestError("host_unavailable", str(error)) from error
+        try:
+            await host.start()
+            response = await LocalAgentServer(host).dispatch(
+                LocalRequest.create(
+                    request_id=f"cli-{uuid4().hex}",
+                    method=method,
+                    params=params,
+                    idempotency_key=idempotency_key,
+                )
+            )
+            if isinstance(response, LocalErrorResponse):
+                raise CliRequestError(response.error.code, response.error.message)
+            return response.result
+        finally:
+            await host.stop(drain=True)
+
+    async def set_model(params: Mapping[str, object]) -> object:
+        from .hosting.embedded import HostActiveError
+        from .hosting.host import AgentHost
+        from .llm.models import ModelProfile, ModelSensitivity
+        from .llm.routing import ModelRoute, ModelRouteCandidate
+        from .security import SecretReference
+
+        model_id = params.get("model_id")
+        provider_option = params.get("provider")
+        model_option = params.get("model")
+        if model_id is None:
+            if not isinstance(provider_option, str) or not isinstance(
+                model_option, str
+            ):
+                raise CliUsageError(
+                    "model set requires provider:model or both --provider and --model"
+                )
+            model_id = f"{provider_option}:{model_option}"
+        elif provider_option is not None or model_option is not None:
+            raise CliUsageError(
+                "model set cannot combine provider:model with --provider/--model"
+            )
+        context_window_tokens = params["context_window_tokens"]
+        max_output_tokens = params["max_output_tokens"]
+        if not isinstance(model_id, str):
+            raise CliUsageError("model_id must be canonical provider:model text")
+        if not isinstance(context_window_tokens, int) or not isinstance(
+            max_output_tokens, int
+        ):
+            raise CliUsageError("model token limits must be integers")
+        profile = ModelProfile(
+            id=model_id,
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_output_tokens,
+            supports_tools=True,
+            supports_parallel_tools=True,
+            supports_streaming=True,
+        )
+        provider_name = model_id.partition(":")[0]
+        base_url = params.get("base_url")
+        if base_url is not None and not isinstance(base_url, str):
+            raise CliUsageError("base_url must be text")
+        if provider_name == "ollama" and base_url is None:
+            base_url = "http://127.0.0.1:11434/v1"
+        if provider_name in {"openai", "anthropic", "gemini", "grok"}:
+            if base_url is not None:
+                raise CliUsageError(f"{provider_name} uses its fixed endpoint")
+        elif provider_name != "ollama" and base_url is None:
+            raise CliUsageError(
+                "an explicit --base-url is required for compatible providers"
+            )
+        secret_env = params.get("secret_env")
+        secret_reference = params.get("secret")
+        if secret_reference is not None:
+            if secret_env is not None:
+                raise CliUsageError("use only one of --secret and --secret-env")
+            if not isinstance(secret_reference, str) or not secret_reference.startswith(
+                "env:"
+            ):
+                raise CliUsageError("--secret currently supports only env:NAME")
+            secret_env = secret_reference.removeprefix("env:")
+        if secret_env is None:
+            secret_env = {
+                "openai": "OPENAI_API_KEY",
+                "anthropic": "ANTHROPIC_API_KEY",
+                "gemini": "GEMINI_API_KEY",
+                "grok": "XAI_API_KEY",
+            }.get(provider_name)
+        if secret_env is not None and not isinstance(secret_env, str):
+            raise CliUsageError("secret_env must be text")
+        raw_sensitivities = params.get("allowed_sensitivities", ["public", "internal"])
+        if not isinstance(raw_sensitivities, list):
+            raise CliUsageError("allowed_sensitivities must be a list")
+        allowed = frozenset(ModelSensitivity(value) for value in raw_sensitivities)
+        candidate = ModelRouteCandidate(
+            profile=profile,
+            allowed_sensitivities=allowed,
+            base_url=base_url,
+            secret_reference=(
+                None if secret_env is None else SecretReference.environment(secret_env)
+            ),
+        )
+        try:
+            host = await AgentHost.open(
+                namespace.agent,
+                root=_state_root(namespace),
+            )
+        except HostActiveError as error:
+            raise CliRequestError(
+                "host_active",
+                "stop the active host before changing its model route",
+            ) from error
+        try:
+            current = host.model_route
+            if current is not None and current.candidates == (candidate,):
+                stored = current
+                changed = False
+            else:
+                expected_revision = 0 if current is None else current.revision
+                stored = await host.configure_model_route(
+                    ModelRoute(
+                        candidates=(candidate,),
+                        revision=expected_revision + 1,
+                    ),
+                    expected_revision=expected_revision,
+                )
+                changed = True
+            return {
+                "agent_id": host.id,
+                "changed": changed,
+                "configured": True,
+                "fingerprint": stored.fingerprint,
+                "model_profile_id": stored.model_profile.id,
+                "revision": stored.revision,
+            }
+        finally:
+            await host.stop(drain=False)
+
+    async def follow_events(params: Mapping[str, object]):
+        after = params.get("after")
+        limit = params.get("limit", 100)
+        poll_seconds = params.get("poll_seconds", 0.1)
+        maximum = params.get("max_events")
+        if after is not None and not isinstance(after, int):
+            raise CliUsageError("after must be an integer")
+        if not isinstance(limit, int) or not isinstance(poll_seconds, (int, float)):
+            raise CliUsageError("event follow bounds are invalid")
+        if maximum is not None and not isinstance(maximum, int):
+            raise CliUsageError("max_events must be an integer")
+        emitted = 0
+        while maximum is None or emitted < maximum:
+            try:
+                result = await request_once(
+                    "events.read",
+                    (
+                        {"after": after, "limit": limit}
+                        if after is not None
+                        else {"limit": limit}
+                    ),
+                )
+            except (ConnectionError, LocalSocketSecurityError, OSError):
+                await asyncio.sleep(float(poll_seconds))
+                continue
+            projected = _json_projection(result)
+            if not isinstance(projected, dict):
+                raise CliRequestError("invalid_response", "event page is invalid")
+            events = projected.get("events")
+            if not isinstance(events, list):
+                raise CliRequestError("invalid_response", "event page is invalid")
+            for event in events:
+                if not isinstance(event, dict) or not isinstance(
+                    event.get("sequence"), int
+                ):
+                    raise CliRequestError("invalid_response", "event is invalid")
+                after = event["sequence"]
+                yield event
+                emitted += 1
+                if maximum is not None and emitted >= maximum:
+                    return
+            if not events:
+                await asyncio.sleep(float(poll_seconds))
+
+    async def event_tail() -> int | None:
+        after = None
+        while True:
+            page = await request_once(
+                "events.read",
+                {"limit": 1_000, **({} if after is None else {"after": after})},
+            )
+            projected = _json_projection(page)
+            if not isinstance(projected, dict) or not isinstance(
+                projected.get("events"), list
+            ):
+                raise CliRequestError("invalid_response", "event page is invalid")
+            events = projected["events"]
+            if not events:
+                return after
+            last = events[-1]
+            if not isinstance(last, dict) or not isinstance(last.get("sequence"), int):
+                raise CliRequestError("invalid_response", "event is invalid")
+            after = last["sequence"]
+            if len(events) < 1_000:
+                return after
+
+    async def interactive_chat(params: Mapping[str, object]):
+        session_id = params.get("session_id")
+        poll_seconds = params.get("poll_seconds", 0.1)
+        while True:
+            line = await asyncio.to_thread(sys.stdin.readline)
+            if line == "":
+                return
+            message = line.strip()
+            if not message:
+                continue
+            after = await event_tail()
+            result = await request_once(
+                "chat.submit",
+                {
+                    "message": message,
+                    **({} if session_id is None else {"session_id": session_id}),
+                },
+                idempotency_key=f"chat-{uuid4().hex}",
+            )
+            final_after = await event_tail()
+            if final_after is not None and final_after != after:
+                async for event in follow_events(
+                    {
+                        "after": after,
+                        "limit": 100,
+                        "poll_seconds": poll_seconds,
+                        "max_events": (
+                            final_after if after is None else final_after - after
+                        ),
+                    }
+                ):
+                    yield {"kind": "event", "event": event}
+            yield {"kind": "result", "result": result}
 
     async def send(
         method: str,
@@ -475,7 +946,7 @@ def _default_request(namespace: argparse.Namespace) -> CliRequest:
         *,
         idempotency_key: str | None,
     ) -> object:
-        if method == "agent.init":
+        if method in {"agent.create", "agent.init"}:
             from .hosting.embedded import AgentAlreadyExistsError, HostActiveError
             from .hosting.host import AgentHost
 
@@ -505,22 +976,35 @@ def _default_request(namespace: argparse.Namespace) -> CliRequest:
                 }
             finally:
                 await host.stop(drain=False)
+        if method == "model.set":
+            return await set_model(params)
+        if method == "events.follow":
+            return follow_events(params)
+        if method == "chat.interactive":
+            return interactive_chat(params)
         try:
-            response = await client.request(
-                LocalRequest.create(
-                    request_id=f"cli-{uuid4().hex}",
-                    method=method,
-                    params=params,
-                    idempotency_key=idempotency_key,
-                )
+            return await request_once(
+                method,
+                params,
+                idempotency_key=idempotency_key,
             )
         except LocalProtocolError as error:
             raise CliRequestError(error.code, error.message) from error
-        except LocalSocketSecurityError as error:
+        except (ConnectionError, LocalSocketSecurityError, OSError) as error:
+            if method in {
+                "model.show",
+                "model.status",
+                "source.attach",
+                "source.detach",
+                "source.health",
+                "source.list",
+            }:
+                return await transient_request(
+                    method,
+                    params,
+                    idempotency_key=idempotency_key,
+                )
             raise CliRequestError("host_unavailable", str(error)) from error
-        if isinstance(response, LocalErrorResponse):
-            raise CliRequestError(response.error.code, response.error.message)
-        return response.result
 
     return send
 
@@ -536,15 +1020,18 @@ async def _serve_local(namespace: argparse.Namespace) -> int:
     from .llm.models import ModelProfile
     from .llm.providers.openai import OpenAIResponsesProvider
 
-    provider = OpenAIResponsesProvider(namespace.openai_model)
-    profile = ModelProfile(
-        id=provider.provider_id,
-        context_window_tokens=namespace.context_window_tokens,
-        max_output_tokens=namespace.max_output_tokens,
-        supports_tools=True,
-        supports_parallel_tools=True,
-        supports_reasoning=True,
-    )
+    provider = None
+    profile = None
+    if namespace.openai_model is not None:
+        provider = OpenAIResponsesProvider(namespace.openai_model)
+        profile = ModelProfile(
+            id=provider.provider_id,
+            context_window_tokens=namespace.context_window_tokens,
+            max_output_tokens=namespace.max_output_tokens,
+            supports_tools=True,
+            supports_parallel_tools=True,
+            supports_reasoning=True,
+        )
     try:
         host = await AgentHost.open(
             namespace.agent,
@@ -561,7 +1048,9 @@ async def _serve_local(namespace: argparse.Namespace) -> int:
         _write_json(
             {
                 "agent_id": host.id,
-                "model_profile_id": profile.id,
+                "model_profile_id": (
+                    None if host.model_profile is None else host.model_profile.id
+                ),
                 "socket": str(server.socket_path),
                 "state": "running",
             }
@@ -581,7 +1070,15 @@ def main(
 
     parser = build_parser()
     try:
-        namespace = parser.parse_args(argv)
+        arguments = list(sys.argv[1:] if argv is None else argv)
+        if "chat" in arguments:
+            chat_index = arguments.index("chat")
+            if chat_index + 1 < len(arguments) and arguments[chat_index + 1] not in {
+                "submit",
+                "interactive",
+            }:
+                arguments.insert(chat_index + 1, "interactive")
+        namespace = parser.parse_args(arguments)
         if getattr(namespace, "_local_serve", False) and request is None:
             return asyncio.run(_serve_local(namespace))
         selected_request = request or _default_request(namespace)

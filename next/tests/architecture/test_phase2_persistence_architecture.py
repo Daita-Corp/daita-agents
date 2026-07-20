@@ -172,6 +172,7 @@ def test_operation_store_is_a_narrow_async_optimistic_contract() -> None:
         "create",
         "load",
         "load_nonterminal",
+        "list_operations",
         "load_by_trigger",
         "load_by_approval",
         "commit",
@@ -201,6 +202,7 @@ def test_operation_store_is_a_narrow_async_optimistic_contract() -> None:
             and not node.name.startswith("_")
         }
         assert isinstance(methods.get("load_nonterminal"), ast.AsyncFunctionDef)
+        assert isinstance(methods.get("list_operations"), ast.AsyncFunctionDef)
 
     assert _class_locations(
         "OperationStore",
@@ -266,13 +268,16 @@ def test_sqlite_adapter_imports_only_canonical_records_and_standard_library() ->
         "decimal",
         "events.models",
         "events.protocols",
+        "extensions.manifest",
         "hashlib",
         "hosting.inbox",
         "identity",
         "json",
         "learning",
         "llm.models",
+        "llm.errors",
         "llm.protocols",
+        "llm.routing",
         "loop.models",
         "memory.learning",
         "memory.models",
@@ -286,6 +291,7 @@ def test_sqlite_adapter_imports_only_canonical_records_and_standard_library() ->
         "operations.store",
         "pathlib",
         "re",
+        "security.secrets",
         "sessions",
         "sqlite3",
         "skills.learning",

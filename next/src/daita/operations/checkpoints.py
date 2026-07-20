@@ -360,6 +360,12 @@ class OperationSnapshot:
                 evidence_record.id in linked_task.evidence_ids
             ):
                 raise ValueError("task evidence acceptance linkage is not symmetric")
+            if (
+                evidence_record.metadata_schema_version >= 1
+                and evidence_record.validation_facts
+                != linked_task.execution_facts.validation_facts
+            ):
+                raise ValueError("evidence validator authority does not match its task")
 
         for observation in self.observations:
             if observation.operation_id != operation_id:

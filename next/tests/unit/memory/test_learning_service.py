@@ -16,6 +16,7 @@ from daita.catalog import (
     catalog_resource_id,
 )
 from daita.learning import (
+    LearningCandidateCategory,
     LearningProposal,
     LearningProposalState,
     LearningRejectionCategory,
@@ -65,14 +66,19 @@ class FakeCatalogReader:
 
 class FakeExplicitCorrectionStore:
     def __init__(self) -> None:
-        self.histories: dict[tuple[str, str], MemoryHistory] = {}
+        self.histories: dict[tuple[str, MemoryKind, str], MemoryHistory] = {}
         self.results: dict[str, ExplicitCorrectionResult] = {}
+        self.proposals: dict[str, LearningProposal] = {}
         self.requests: list[ExplicitCorrectionCommit] = []
         self.applied_count = 0
 
     @staticmethod
-    def _key(scope: MemoryScope, logical_key: str) -> tuple[str, str]:
-        return scope.fingerprint, logical_key
+    def _key(
+        scope: MemoryScope,
+        logical_key: str,
+        kind: MemoryKind = MemoryKind.RESOURCE_ALIAS,
+    ) -> tuple[str, MemoryKind, str]:
+        return scope.fingerprint, kind, logical_key
 
     async def load_resource_alias(
         self,
@@ -81,11 +87,32 @@ class FakeExplicitCorrectionStore:
     ) -> MemoryHistory | None:
         return self.histories.get(self._key(scope, logical_key))
 
+    async def load_learning_memory(
+        self,
+        scope: MemoryScope,
+        kind: MemoryKind,
+        logical_key: str,
+    ) -> MemoryHistory | None:
+        return self.histories.get(self._key(scope, logical_key, kind))
+
+    async def create_proposal(
+        self,
+        proposal: LearningProposal,
+    ) -> LearningProposal:
+        existing = self.proposals.get(proposal.idempotency_key)
+        if existing is not None:
+            return existing
+        self.proposals[proposal.idempotency_key] = proposal
+        return proposal
+
     async def load_proposal(
         self,
         agent_id: str,
         proposal_id: str,
     ) -> LearningProposal | None:
+        for proposal in self.proposals.values():
+            if proposal.provenance.agent_id == agent_id and proposal.id == proposal_id:
+                return proposal
         for result in self.results.values():
             proposal = result.proposal
             if proposal.provenance.agent_id == agent_id and proposal.id == proposal_id:
@@ -106,6 +133,7 @@ class FakeExplicitCorrectionStore:
                 self._key(
                     request.intended_memory.record.scope,
                     request.intended_memory.record.logical_key,
+                    request.intended_memory.record.kind,
                 )
             ]
             return ExplicitCorrectionResult(
@@ -123,7 +151,11 @@ class FakeExplicitCorrectionStore:
             assert request.intended_memory is not None
             assert request.decision is not None
             intended = request.intended_memory
-            key = self._key(intended.record.scope, intended.record.logical_key)
+            key = self._key(
+                intended.record.scope,
+                intended.record.logical_key,
+                intended.record.kind,
+            )
             current_head = self.histories.get(key)
             actual_version = (
                 None if current_head is None else current_head.record.current_version
@@ -309,9 +341,7 @@ async def test_original_user_trigger_requires_the_one_canonical_record_pattern()
     correction = _correction(resource)
 
     with pytest.raises(ExplicitCorrectionFormatError, match="supported"):
-        await service.learn(
-            _snapshot("Actually, completed means the stored value complete.")
-        )
+        await service.learn(_snapshot("Store this hidden memory."))
     noncanonical = RESOURCE_ALIAS_CORRECTION_PREFIX + canonical_json(
         correction.candidate
     ).replace(":", ": ", 1)
@@ -327,6 +357,66 @@ async def test_original_user_trigger_requires_the_one_canonical_record_pattern()
 
     assert catalog.calls == []
     assert store.requests == []
+
+
+async def test_natural_remember_commits_safe_agent_scoped_semantic_fact() -> None:
+    service, catalog, store = _service(None)
+    snapshot = _snapshot("Remember that fiscal weeks start on Monday.")
+
+    result = await service.learn(snapshot)
+
+    assert result.proposal.state is LearningProposalState.COMMITTED
+    assert result.memory is not None
+    assert result.memory.record.kind is MemoryKind.SEMANTIC_FACT
+    assert result.memory.record.scope == MemoryScope(agent_id="agent-1")
+    assert result.memory.current.content == "Fiscal weeks start on Monday."
+    assert result.memory.current.attributes["statement"] == (
+        "Fiscal weeks start on Monday."
+    )
+    assert result.memory.current.provenance.kind is (
+        MemoryProvenanceKind.USER_STATEMENT
+    )
+    assert result.memory.current.provenance.operation_id == snapshot.operation.id
+    assert result.memory.current.resource_revision is None
+    assert catalog.calls == []
+    assert store.applied_count == 1
+
+
+async def test_natural_alias_shape_without_current_read_binding_fails_closed() -> None:
+    service, catalog, store = _service(None)
+
+    with pytest.raises(
+        ExplicitCorrectionNotEligibleError,
+        match="accepted current read binding",
+    ):
+        await service.learn(
+            _snapshot("Remember that completed status is stored as complete.")
+        )
+
+    assert catalog.calls == []
+    assert store.histories == {}
+    assert store.requests == []
+
+
+async def test_evidence_fact_without_accepted_current_read_is_redacted() -> None:
+    service, catalog, store = _service(None)
+    raw = "Every customer is active."
+
+    proposal = await service.propose_evidence_fact(
+        _snapshot(f"Propose a fact from the evidence: {raw}")
+    )
+
+    assert proposal is not None
+    assert proposal.category is LearningCandidateCategory.EVIDENCE_BACKED_FACT
+    assert proposal.state is LearningProposalState.REJECTED
+    assert proposal.rejection_category is LearningRejectionCategory.INELIGIBLE_SOURCE
+    assert proposal.rejection_reason == "accepted_current_read_evidence_required"
+    assert proposal.candidate_payload is None
+    assert raw not in repr(proposal)
+    assert proposal.provenance.evidence_id is None
+    assert proposal.provenance.evidence_accepted is False
+    assert catalog.calls == []
+    assert store.histories == {}
 
 
 @pytest.mark.parametrize("catalog_case", ["missing", "other_agent"])

@@ -12,7 +12,11 @@ from uuid import uuid4
 
 from .._json import FrozenJsonObject, canonical_json
 from ..events.models import RuntimeEvent
+
+# Canonical budget values are restricted here; loop execution remains host-owned.
+from ..loop.models import LoopBudgets
 from ..operations.checkpoints import OperationSnapshot
+from ..operations.governance import DefaultPolicyProfile
 from ..operations.models import AgentTrigger, OperationStatus, TriggerKind
 from ..operations.store import OperationStore
 from .models import (
@@ -47,6 +51,72 @@ from .store import (
 
 _MAX_LIMIT = 1_000
 _MAX_LEASE_SECONDS = 300
+
+
+def monitor_execution_settings(
+    definition: MonitorDefinition,
+    *,
+    default_budgets: LoopBudgets,
+    default_policy: DefaultPolicyProfile,
+) -> tuple[LoopBudgets, DefaultPolicyProfile]:
+    """Derive the restriction-only settings persisted on a monitor operation."""
+
+    if not isinstance(definition, MonitorDefinition):
+        raise TypeError("definition must be a MonitorDefinition")
+    if not isinstance(default_budgets, LoopBudgets):
+        raise TypeError("default_budgets must be LoopBudgets")
+    if not isinstance(default_policy, DefaultPolicyProfile):
+        raise TypeError("default_policy must be DefaultPolicyProfile")
+    policy_overrides = dict(definition.policy_overrides)
+    operation_template = dict(definition.operation_template)
+    if policy_overrides not in ({}, {"mode": "read_only"}):
+        raise ValueError("monitor policy overrides support only read_only mode")
+    if operation_template not in ({}, {"domain": "data"}):
+        raise ValueError("monitor operation template supports only the data domain")
+    overrides = definition.budget_overrides
+    requested = (
+        ("max_turns", overrides.max_turns, default_budgets.max_turns),
+        (
+            "max_capability_calls",
+            overrides.max_capability_calls,
+            default_budgets.max_actions,
+        ),
+        (
+            "max_wall_time_seconds",
+            overrides.max_wall_time_seconds,
+            default_budgets.max_wall_time_seconds,
+        ),
+    )
+    if any(value is not None and value > limit for _, value, limit in requested):
+        raised = next(
+            name
+            for name, value, limit in requested
+            if value is not None and value > limit
+        )
+        raise ValueError(f"monitor {raised} may only restrict the agent default")
+    budgets = replace(
+        default_budgets,
+        max_turns=(
+            default_budgets.max_turns
+            if overrides.max_turns is None
+            else overrides.max_turns
+        ),
+        max_actions=(
+            default_budgets.max_actions
+            if overrides.max_capability_calls is None
+            else overrides.max_capability_calls
+        ),
+        max_wall_time_seconds=(
+            default_budgets.max_wall_time_seconds
+            if overrides.max_wall_time_seconds is None
+            else float(overrides.max_wall_time_seconds)
+        ),
+    )
+    return budgets, DefaultPolicyProfile(
+        id=default_policy.id,
+        version=default_policy.version,
+        allow_destructive=False,
+    )
 
 
 def _utc_now() -> datetime:
@@ -146,6 +216,8 @@ class MonitorScheduler:
         runner: MonitorTriggerRunner,
         projector: MonitorOutcomeProjector,
         holder_id: str,
+        default_budgets: LoopBudgets = LoopBudgets(),
+        default_policy: DefaultPolicyProfile = DefaultPolicyProfile(),
         lease_seconds: float = 300.0,
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[str], str] = _new_id,
@@ -182,6 +254,12 @@ class MonitorScheduler:
         self._operations = operations
         self._runner = runner
         self._projector = projector
+        if not isinstance(default_budgets, LoopBudgets):
+            raise TypeError("default_budgets must be LoopBudgets")
+        if not isinstance(default_policy, DefaultPolicyProfile):
+            raise TypeError("default_policy must be DefaultPolicyProfile")
+        self._default_budgets = default_budgets
+        self._default_policy = default_policy
         self._lease_seconds = float(lease_seconds)
         self._clock = clock
         self._id_factory = id_factory
@@ -338,9 +416,13 @@ class MonitorScheduler:
         inspection: MonitorInspection,
         claim: MonitorClaimResult,
     ) -> MonitorSchedulerResult:
+        definition = self._definition_for_occurrence(
+            inspection,
+            claim.occurrence,
+        )
         checkpoint = self._checkpoint(inspection)
         trigger = self._trigger(
-            inspection.versions[-1].definition,
+            definition,
             claim.occurrence,
             checkpoint,
         )
@@ -353,12 +435,22 @@ class MonitorScheduler:
             raise MonitorSchedulerContractError(
                 "operation does not match monitor trigger"
             )
+        expected_budgets, _ = monitor_execution_settings(
+            definition,
+            default_budgets=self._default_budgets,
+            default_policy=self._default_policy,
+        )
+        if snapshot.budgets != expected_budgets:
+            raise MonitorSchedulerContractError(
+                "operation does not retain the effective monitor budgets"
+            )
         finished_at = _utc(self._clock(), "scheduler clock")
         commit = await self._outcome(
             inspection,
             claim,
             snapshot,
             checkpoint,
+            definition,
             finished_at,
         )
         outcome = await self._store.commit_monitor_outcome(
@@ -383,13 +475,14 @@ class MonitorScheduler:
         claim: MonitorClaimResult,
         snapshot: OperationSnapshot,
         checkpoint: MonitorCheckpoint | None,
+        definition: MonitorDefinition,
         finished_at: datetime,
     ) -> MonitorOutcomeCommit:
         operation_status = snapshot.operation.status
         projection: MonitorOutcomeProjection | None = None
         if operation_status is OperationStatus.SUCCEEDED:
             projection = await self._projector.project(
-                definition=inspection.versions[-1].definition,
+                definition=definition,
                 operation=snapshot,
                 checkpoint=checkpoint,
             )
@@ -582,6 +675,11 @@ class MonitorScheduler:
     ) -> AgentTrigger:
         condition = definition.condition
         budget = definition.budget_overrides
+        effective_budgets, effective_policy = monitor_execution_settings(
+            definition,
+            default_budgets=self._default_budgets,
+            default_policy=self._default_policy,
+        )
         return AgentTrigger(
             id=occurrence.trigger_id,
             agent_id=self._agent_id,
@@ -593,6 +691,7 @@ class MonitorScheduler:
                 "message": definition.objective,
                 "monitor_id": occurrence.monitor_id,
                 "monitor_version": occurrence.monitor_version,
+                "monitor_definition_hash": definition.content_hash,
                 "monitor_occurrence_id": occurrence.id,
                 "monitor_run_id": occurrence.run_id,
                 "monitor_kind": occurrence.kind.value,
@@ -610,6 +709,27 @@ class MonitorScheduler:
                     "max_turns": budget.max_turns,
                     "max_capability_calls": budget.max_capability_calls,
                     "max_wall_time_seconds": budget.max_wall_time_seconds,
+                },
+                "monitor_effective_budgets": {
+                    "max_actions": effective_budgets.max_actions,
+                    "max_estimated_cost_usd": (
+                        None
+                        if effective_budgets.max_estimated_cost_usd is None
+                        else str(effective_budgets.max_estimated_cost_usd)
+                    ),
+                    "max_identical_failures": effective_budgets.max_identical_failures,
+                    "max_observation_characters": effective_budgets.max_observation_characters,
+                    "max_repairs": effective_budgets.max_repairs,
+                    "max_total_tokens": effective_budgets.max_total_tokens,
+                    "max_turns": effective_budgets.max_turns,
+                    "max_wall_time_seconds": effective_budgets.max_wall_time_seconds,
+                    "task_timeout_seconds": effective_budgets.task_timeout_seconds,
+                },
+                "monitor_effective_policy": {
+                    "allow_destructive": effective_policy.allow_destructive,
+                    "fingerprint": effective_policy.fingerprint,
+                    "id": effective_policy.id,
+                    "version": effective_policy.version,
                 },
                 "monitor_policy_overrides": definition.policy_overrides,
                 "monitor_operation_template": definition.operation_template,
@@ -818,6 +938,26 @@ class MonitorScheduler:
             raise MonitorSchedulerContractError(
                 "claim does not match durable monitor state"
             )
+        self._definition_for_occurrence(inspection, claim.occurrence)
+
+    @staticmethod
+    def _definition_for_occurrence(
+        inspection: MonitorInspection,
+        occurrence: MonitorOccurrence,
+    ) -> MonitorDefinition:
+        version = next(
+            (
+                item
+                for item in inspection.versions
+                if item.version == occurrence.monitor_version
+            ),
+            None,
+        )
+        if version is None:
+            raise MonitorSchedulerContractError(
+                "monitor occurrence has no retained definition version"
+            )
+        return version.definition
 
     def _event(
         self,

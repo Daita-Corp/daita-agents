@@ -22,9 +22,18 @@ from ..adapters.local_files import LocalDirectorySource
 from ..adapters.models import SourceRegistration
 from ..adapters.protocols import ResourceSource
 from ..adapters.sqlite import SQLiteSource
+from ..catalog.models import CatalogSearchRequest, CatalogSearchResult, ResourceKind
 from ..events.models import CommittedEvent, EventCursor
 from ..events.projection import EventAudience, project_committed_event
 from ..loop.models import LoopExit
+from ..memory.models import (
+    MemoryInspection,
+    MemoryInspectionRequest,
+    MemoryListRequest,
+    MemoryListResult,
+    MemoryScope,
+    QualifiedMemory,
+)
 from ..monitors.models import (
     CatchUpPolicy,
     CronSchedule,
@@ -51,8 +60,9 @@ from ..monitors.store import (
     MonitorTickClaimConflictError,
 )
 from ..operations.checkpoints import OperationSnapshot
-from ..operations.governance import ApprovalRequest
-from ..operations.models import Task
+from ..operations.governance import ApprovalRequest, ApprovalStatus
+from ..operations.models import OperationStatus, Task
+from ..skills.models import SkillIndex, SkillInspection
 from ..operations.runtime import OperationStateError
 from ..operations.store import OperationNotFoundError
 from .embedded import AgentNotConfiguredError
@@ -90,7 +100,9 @@ _MUTATING_METHODS = frozenset(
         "approval.approve",
         "approval.reject",
         "source.attach",
+        "source.detach",
         "monitor.propose",
+        "monitor.propose_natural",
         "monitor.confirm",
         "monitor.pause",
         "monitor.resume",
@@ -865,6 +877,173 @@ def _source_projection(value: SourceRegistration) -> dict[str, object]:
     }
 
 
+def _operation_summary_projection(snapshot: OperationSnapshot) -> dict[str, object]:
+    operation = snapshot.operation
+    return {
+        "id": operation.id,
+        "session_id": operation.session_id,
+        "status": operation.status.value,
+        "created_at": _timestamp(operation.created_at),
+        "updated_at": _timestamp(operation.updated_at),
+        "final_text": operation.final_text,
+        "terminal_reason": operation.terminal_reason,
+        "approval_count": len(snapshot.approvals),
+        "evidence_count": len(snapshot.evidence),
+        "task_count": len(snapshot.tasks),
+    }
+
+
+def _catalog_search_projection(result: CatalogSearchResult) -> dict[str, object]:
+    return {
+        "hits": [
+            {
+                "resource_id": hit.resource_id,
+                "source_id": hit.source_id,
+                "kind": hit.kind.value,
+                "name": hit.name,
+                "revision": hit.revision,
+                "sensitivity": hit.sensitivity.value,
+                "score": hit.score,
+                "matched_fields": list(hit.matched_fields),
+                "match_reasons": list(hit.match_reasons),
+            }
+            for hit in result.hits
+        ],
+        "total_matches": result.total_matches,
+        "truncated": result.truncated,
+    }
+
+
+def _memory_snapshot_projection(value: QualifiedMemory) -> dict[str, object]:
+    snapshot = value.snapshot
+    record = snapshot.record
+    version = snapshot.version
+    scope = record.scope
+    return {
+        "id": record.id,
+        "kind": record.kind.value,
+        "logical_key": record.logical_key,
+        "state": record.state.value,
+        "current_version": record.current_version,
+        "scope": {
+            "user_id": scope.user_id,
+            "session_id": scope.session_id,
+            "source_id": scope.source_id,
+            "resource_id": scope.resource_id,
+        },
+        "content": version.content,
+        "creator": version.creator.value,
+        "confidence": version.confidence,
+        "sensitivity": version.sensitivity.value,
+        "qualification": value.qualification.value,
+        "resource_revision": version.resource_revision,
+        "updated_at": _timestamp(record.updated_at),
+    }
+
+
+def _memory_list_projection(result: MemoryListResult) -> dict[str, object]:
+    return {
+        "items": [_memory_snapshot_projection(value) for value in result.items],
+        "candidate_count": result.candidate_count,
+        "truncated": result.truncated,
+    }
+
+
+def _memory_inspection_projection(value: MemoryInspection) -> dict[str, object]:
+    history = value.history
+    versions = history.versions[-50:]
+    return {
+        "record": {
+            "id": history.record.id,
+            "kind": history.record.kind.value,
+            "logical_key": history.record.logical_key,
+            "state": history.record.state.value,
+            "current_version": history.record.current_version,
+            "created_at": _timestamp(history.record.created_at),
+            "updated_at": _timestamp(history.record.updated_at),
+        },
+        "qualification": value.qualification.value,
+        "versions": [
+            {
+                "version": version.version,
+                "content": version.content,
+                "creator": version.creator.value,
+                "confidence": version.confidence,
+                "sensitivity": version.sensitivity.value,
+                "created_at": _timestamp(version.created_at),
+                "expires_at": _timestamp(version.expires_at),
+                "resource_revision": version.resource_revision,
+                "supersedes_version": version.supersedes_version,
+                "provenance": {
+                    "kind": version.provenance.kind.value,
+                    "content_hash": version.provenance.content_hash,
+                    "operation_id": version.provenance.operation_id,
+                    "trigger_id": version.provenance.trigger_id,
+                    "evidence_id": version.provenance.evidence_id,
+                },
+            }
+            for version in versions
+        ],
+        "version_count": len(history.versions),
+        "history_truncated": len(history.versions) > len(versions),
+    }
+
+
+def _skill_index_projection(value: SkillIndex) -> dict[str, object]:
+    return {
+        "skill_id": value.skill_id,
+        "version_id": value.version_id,
+        "stable_name": value.stable_name,
+        "version": value.version,
+        "description": value.description,
+        "domains": list(value.domains),
+        "resource_kinds": list(value.resource_kinds),
+        "required_capability_ids": list(value.required_capability_ids),
+        "activation_mode": value.activation_mode.value,
+        "source": value.source.value,
+        "content_hash": value.content_hash,
+        "active_version_id": value.active_version_id,
+        "updated_at": _timestamp(value.updated_at),
+    }
+
+
+def _skill_inspection_projection(value: SkillInspection) -> dict[str, object]:
+    versions = value.versions[-50:]
+    current = next(
+        version for version in value.versions if version.id == value.index.version_id
+    )
+    return {
+        "index": _skill_index_projection(value.index),
+        "current_instructions": current.instructions,
+        "versions": [
+            {
+                "id": version.id,
+                "version": version.version,
+                "description": version.description,
+                "activation_mode": version.activation_mode.value,
+                "source": version.source.value,
+                "content_hash": version.content_hash,
+                "created_at": _timestamp(version.created_at),
+            }
+            for version in versions
+        ],
+        "activations": [
+            {
+                "id": activation.id,
+                "version_id": activation.version_id,
+                "actor_id": activation.actor_id,
+                "reason": activation.reason,
+                "activated_at": _timestamp(activation.activated_at),
+            }
+            for activation in value.activations[-50:]
+        ],
+        "version_count": len(value.versions),
+        "activation_count": len(value.activations),
+        "history_truncated": len(value.versions) > len(versions)
+        or len(value.activations) > 50,
+    }
+
+
 def _model_projection(host: AgentHost) -> dict[str, object]:
     profile = host.model_profile
     if profile is None:
@@ -1190,6 +1369,34 @@ class LocalAgentServer:
             )
             return _operation_projection(snapshot)
 
+        if method == "operation.list":
+            values = _shape(params, optional=frozenset({"statuses", "limit"}))
+            operation_statuses: tuple[OperationStatus, ...] | None = None
+            if "statuses" in values:
+                try:
+                    operation_statuses = tuple(
+                        OperationStatus(value)
+                        for value in _string_tuple(values["statuses"], "statuses")
+                    )
+                except ValueError as error:
+                    raise _RequestError(
+                        "invalid_params", "statuses contains an unsupported value"
+                    ) from error
+            operations = await self._host.list_operations(
+                statuses=operation_statuses,
+                limit=_integer(
+                    values.get("limit", 100),
+                    "limit",
+                    minimum=1,
+                    maximum=_MAX_LIST_LIMIT,
+                ),
+            )
+            return {
+                "operations": [
+                    _operation_summary_projection(value) for value in operations
+                ]
+            }
+
         if method == "operation.cancel":
             values = _shape(
                 params,
@@ -1229,6 +1436,37 @@ class LocalAgentServer:
             )
             return _approval_projection(decision)
 
+        if method == "approval.list":
+            values = _shape(params, optional=frozenset({"statuses", "limit"}))
+            approval_statuses: tuple[ApprovalStatus, ...] | None = None
+            if "statuses" in values:
+                try:
+                    approval_statuses = tuple(
+                        ApprovalStatus(value)
+                        for value in _string_tuple(values["statuses"], "statuses")
+                    )
+                except ValueError as error:
+                    raise _RequestError(
+                        "invalid_params", "statuses contains an unsupported value"
+                    ) from error
+            approvals = await self._host.list_approvals(
+                statuses=approval_statuses,
+                limit=_integer(
+                    values.get("limit", 100),
+                    "limit",
+                    minimum=1,
+                    maximum=_MAX_LIST_LIMIT,
+                ),
+            )
+            return {"approvals": [_approval_projection(value) for value in approvals]}
+
+        if method == "approval.inspect":
+            values = _shape(params, required=frozenset({"approval_id"}))
+            approval = await self._host.inspect_approval(
+                _text(values["approval_id"], "approval_id", maximum_bytes=256)
+            )
+            return _approval_projection(approval)
+
         if method == "source.attach":
             values = _shape(
                 params,
@@ -1242,7 +1480,7 @@ class LocalAgentServer:
                 "write_access",
             )
             if kind == "sqlite":
-                source: ResourceSource = SQLiteSource(
+                attach_source: ResourceSource = SQLiteSource(
                     path,
                     allow_writes=write_access,
                 )
@@ -1252,7 +1490,7 @@ class LocalAgentServer:
                         "invalid_params",
                         "write_access is supported only for SQLite sources",
                     )
-                source = LocalDirectorySource(path)
+                attach_source = LocalDirectorySource(path)
             else:
                 raise _RequestError(
                     "invalid_params",
@@ -1260,14 +1498,225 @@ class LocalAgentServer:
                 )
             assert key is not None
             registration = await self._host.attach(
-                source,
+                attach_source,
                 idempotency_key=key,
             )
             return _source_projection(registration)
 
-        if method == "model.status":
+        if method == "source.list":
+            values = _shape(params, optional=frozenset({"include_detached"}))
+            include_detached = _boolean(
+                values.get("include_detached", False),
+                "include_detached",
+            )
+            sources = await self._host.list_sources()
+            return {
+                "sources": [
+                    _source_projection(value)
+                    for value in sources
+                    if include_detached or value.active
+                ]
+            }
+
+        if method == "source.detach":
+            values = _shape(params, required=frozenset({"source_id"}))
+            assert key is not None
+            registration = await self._host.detach(
+                _text(values["source_id"], "source_id", maximum_bytes=256),
+                idempotency_key=key,
+            )
+            return _source_projection(registration)
+
+        if method == "source.health":
+            values = _shape(params, optional=frozenset({"source_id"}))
+            selected_id = _optional_text(
+                values.get("source_id"),
+                "source_id",
+                maximum_bytes=256,
+            )
+            sources = await self._host.list_sources()
+            if selected_id is not None:
+                sources = tuple(value for value in sources if value.id == selected_id)
+                if not sources:
+                    raise _RequestError("not_found", "requested source was not found")
+            health = []
+            for source_registration in sources:
+                resources = await self._host.list_catalog_resources(
+                    source_id=source_registration.id
+                )
+                health.append(
+                    {
+                        "source": _source_projection(source_registration),
+                        "healthy": source_registration.active and bool(resources),
+                        "catalog_resource_count": len(resources),
+                        "status": (
+                            "ready"
+                            if source_registration.active and resources
+                            else (
+                                "detached"
+                                if not source_registration.active
+                                else "empty"
+                            )
+                        ),
+                    }
+                )
+            return {"health": health}
+
+        if method == "catalog.search":
+            values = _shape(
+                params,
+                required=frozenset({"query"}),
+                optional=frozenset({"source_ids", "resource_kinds", "limit"}),
+            )
+            resource_kinds: tuple[ResourceKind, ...] = ()
+            if "resource_kinds" in values:
+                try:
+                    resource_kinds = tuple(
+                        ResourceKind(value)
+                        for value in _string_tuple(
+                            values["resource_kinds"], "resource_kinds"
+                        )
+                    )
+                except ValueError as error:
+                    raise _RequestError(
+                        "invalid_params",
+                        "resource_kinds contains an unsupported value",
+                    ) from error
+            catalog_result = await self._host.search_catalog(
+                CatalogSearchRequest(
+                    agent_id=self._host.id,
+                    query=_text(values["query"], "query", maximum_bytes=1_024),
+                    source_ids=(
+                        ()
+                        if "source_ids" not in values
+                        else _string_tuple(values["source_ids"], "source_ids")
+                    ),
+                    resource_kinds=resource_kinds,
+                    limit=_integer(
+                        values.get("limit", 20),
+                        "limit",
+                        minimum=1,
+                        maximum=50,
+                    ),
+                )
+            )
+            return _catalog_search_projection(catalog_result)
+
+        if method == "catalog.show":
+            values = _shape(params, required=frozenset({"resource_id"}))
+            catalog_projection = await self._host.inspect_catalog_resource(
+                _text(values["resource_id"], "resource_id", maximum_bytes=256)
+            )
+            return catalog_projection.to_dict()
+
+        if method == "memory.list":
+            values = _shape(
+                params,
+                optional=frozenset(
+                    {
+                        "user_id",
+                        "session_id",
+                        "source_id",
+                        "resource_id",
+                        "include_superseded",
+                        "include_rejected",
+                        "limit",
+                    }
+                ),
+            )
+            memory_result = await self._host.list_memories(
+                MemoryListRequest(
+                    scope=MemoryScope(
+                        agent_id=self._host.id,
+                        user_id=_optional_text(values.get("user_id"), "user_id"),
+                        session_id=_optional_text(
+                            values.get("session_id"), "session_id"
+                        ),
+                        source_id=_optional_text(values.get("source_id"), "source_id"),
+                        resource_id=_optional_text(
+                            values.get("resource_id"), "resource_id"
+                        ),
+                    ),
+                    include_superseded=_boolean(
+                        values.get("include_superseded", False),
+                        "include_superseded",
+                    ),
+                    include_rejected=_boolean(
+                        values.get("include_rejected", False),
+                        "include_rejected",
+                    ),
+                    limit=_integer(
+                        values.get("limit", 100),
+                        "limit",
+                        minimum=1,
+                        maximum=200,
+                    ),
+                )
+            )
+            return _memory_list_projection(memory_result)
+
+        if method == "memory.inspect":
+            values = _shape(params, required=frozenset({"memory_id"}))
+            memory_inspection = await self._host.inspect_memory(
+                MemoryInspectionRequest(
+                    agent_id=self._host.id,
+                    memory_id=_text(
+                        values["memory_id"], "memory_id", maximum_bytes=256
+                    ),
+                )
+            )
+            return _memory_inspection_projection(memory_inspection)
+
+        if method == "skill.list":
             _shape(params)
-            return _model_projection(self._host)
+            return {
+                "skills": [
+                    _skill_index_projection(value)
+                    for value in await self._host.list_skills()
+                ]
+            }
+
+        if method == "skill.inspect":
+            values = _shape(params, required=frozenset({"skill_id"}))
+            skill_inspection = await self._host.inspect_skill(
+                _text(values["skill_id"], "skill_id", maximum_bytes=256)
+            )
+            return _skill_inspection_projection(skill_inspection)
+
+        if method in {"model.show", "model.status"}:
+            _shape(params)
+            model_projection = _model_projection(self._host)
+            if method == "model.status":
+                return model_projection
+            route = self._host.model_route
+            return {
+                **model_projection,
+                "route": (
+                    None
+                    if route is None
+                    else {
+                        "schema_version": route.schema_version,
+                        "revision": route.revision,
+                        "fingerprint": route.fingerprint,
+                        "candidates": [
+                            {
+                                "provider_id": candidate.provider_id,
+                                "base_url": candidate.base_url,
+                                "secret_reference": (
+                                    None
+                                    if candidate.secret_reference is None
+                                    else candidate.secret_reference.to_uri()
+                                ),
+                                "allowed_sensitivities": sorted(
+                                    value.value
+                                    for value in candidate.allowed_sensitivities
+                                ),
+                            }
+                            for candidate in route.candidates
+                        ],
+                    }
+                ),
+            }
 
         if method in {"events.read", "events.follow"}:
             values = _shape(
@@ -1319,13 +1768,32 @@ class LocalAgentServer:
             )
             return _proposal_projection(proposal)
 
+        if method == "monitor.propose_natural":
+            values = _shape(
+                params,
+                required=frozenset({"monitor_id", "request"}),
+                optional=frozenset({"source_operation_id"}),
+            )
+            assert key is not None
+            proposal = await self._host.propose_monitor_natural(
+                _text(values["monitor_id"], "monitor_id", maximum_bytes=256),
+                _text(values["request"], "request", maximum_bytes=4_096),
+                idempotency_key=key,
+                source_operation_id=_optional_text(
+                    values.get("source_operation_id"),
+                    "source_operation_id",
+                    maximum_bytes=256,
+                ),
+            )
+            return _proposal_projection(proposal)
+
         if method == "monitor.list":
             values = _shape(
                 params,
                 optional=frozenset({"statuses", "include_deleted", "limit"}),
             )
             statuses_value = values.get("statuses")
-            statuses: tuple[MonitorStatus, ...] | None = None
+            monitor_statuses: tuple[MonitorStatus, ...] | None = None
             if statuses_value is not None:
                 raw_statuses = _string_tuple(statuses_value, "statuses")
                 if not raw_statuses:
@@ -1334,14 +1802,16 @@ class LocalAgentServer:
                         "statuses must not be empty",
                     )
                 try:
-                    statuses = tuple(MonitorStatus(value) for value in raw_statuses)
+                    monitor_statuses = tuple(
+                        MonitorStatus(value) for value in raw_statuses
+                    )
                 except ValueError as error:
                     raise _RequestError(
                         "invalid_params",
                         "statuses contains an unsupported value",
                     ) from error
             monitors = await self._host.list_monitors(
-                statuses=statuses,
+                statuses=monitor_statuses,
                 include_deleted=_boolean(
                     values.get("include_deleted", False),
                     "include_deleted",
@@ -1357,10 +1827,10 @@ class LocalAgentServer:
 
         if method == "monitor.inspect":
             values = _shape(params, required=frozenset({"monitor_id"}))
-            inspection = await self._host.inspect_monitor(
+            monitor_inspection = await self._host.inspect_monitor(
                 _text(values["monitor_id"], "monitor_id", maximum_bytes=256)
             )
-            return _inspection_projection(inspection)
+            return _inspection_projection(monitor_inspection)
 
         if method == "monitor.confirm":
             values = _shape(
@@ -1369,7 +1839,7 @@ class LocalAgentServer:
                     {"proposal_id", "candidate_hash", "actor_id", "reason"}
                 ),
             )
-            inspection = await self._host.confirm_monitor(
+            monitor_inspection = await self._host.confirm_monitor(
                 _text(values["proposal_id"], "proposal_id", maximum_bytes=256),
                 candidate_hash=_text(
                     values["candidate_hash"],
@@ -1379,7 +1849,7 @@ class LocalAgentServer:
                 actor_id=_text(values["actor_id"], "actor_id", maximum_bytes=256),
                 reason=_text(values["reason"], "reason", maximum_bytes=2_000),
             )
-            return _inspection_projection(inspection)
+            return _inspection_projection(monitor_inspection)
 
         if method in {"monitor.pause", "monitor.resume", "monitor.delete"}:
             values = _shape(
@@ -1393,7 +1863,7 @@ class LocalAgentServer:
                 "monitor.resume": self._host.resume_monitor,
                 "monitor.delete": self._host.delete_monitor,
             }[method]
-            inspection = await monitor_action(
+            monitor_inspection = await monitor_action(
                 _text(values["monitor_id"], "monitor_id", maximum_bytes=256),
                 actor_id=_text(values["actor_id"], "actor_id", maximum_bytes=256),
                 reason=_text(values["reason"], "reason", maximum_bytes=2_000),
@@ -1404,7 +1874,7 @@ class LocalAgentServer:
                     maximum_bytes=256,
                 ),
             )
-            return _inspection_projection(inspection)
+            return _inspection_projection(monitor_inspection)
 
         if method == "monitor.run_now":
             values = _shape(

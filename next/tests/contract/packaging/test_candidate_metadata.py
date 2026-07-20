@@ -119,9 +119,7 @@ def test_candidate_has_no_dependency_or_import_on_retired_cli_client_packages() 
     assert isinstance(dependencies, list)
     assert isinstance(extras, dict)
 
-    dependency_names = {
-        _distribution_name(requirement) for requirement in dependencies
-    }
+    dependency_names = {_distribution_name(requirement) for requirement in dependencies}
     dependency_names.update(
         _distribution_name(requirement)
         for requirements in extras.values()

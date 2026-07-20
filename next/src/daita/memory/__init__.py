@@ -1,6 +1,7 @@
 """Scoped, versioned, provenance-backed portable memory contracts."""
 
 from .learning import (
+    NATURAL_REMEMBER_PREFIXES,
     RESOURCE_ALIAS_CORRECTION_PREFIX,
     ExplicitCorrectionCatalogReader,
     ExplicitCorrectionCommit,
@@ -13,6 +14,7 @@ from .learning import (
     ExplicitCorrectionStoreConflictError,
     ExplicitCorrectionStoreContractError,
     ResourceAliasCorrection,
+    is_explicit_learning_message,
 )
 from .models import (
     MemoryCreator,
@@ -43,6 +45,7 @@ from .protocols import MemoryStore, MemoryStoreConflictError, MemoryStoreError
 from .service import MemoryNotFoundError, MemoryService, MemoryServiceContractError
 
 __all__ = [
+    "NATURAL_REMEMBER_PREFIXES",
     "RESOURCE_ALIAS_CORRECTION_PREFIX",
     "ExplicitCorrectionCatalogReader",
     "ExplicitCorrectionCommit",
@@ -83,5 +86,6 @@ __all__ = [
     "MemoryVersion",
     "QualifiedMemory",
     "ResourceAliasCorrection",
+    "is_explicit_learning_message",
     "normalize_memory_logical_key",
 ]

@@ -35,6 +35,7 @@ from daita.loop.models import LoopPhase
 from daita.operations.models import (
     ActionProposal,
     ActionRejection,
+    ActionValidationFacts,
     AgentTrigger,
     Evidence,
     TriggerKind,
@@ -42,11 +43,13 @@ from daita.operations.models import (
 from daita.operations.runtime import OperationRuntime
 
 NOW = datetime(2026, 7, 19, 1, 0, tzinfo=timezone.utc)
+FILE_REVISION = "sha256:" + ("a" * 64)
+DATABASE_REVISION = "sha256:" + ("b" * 64)
 
 
 class CatalogReader:
     async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None:
-        return "sqlite"
+        return "local-directory" if source_id == "source-files" else "sqlite"
 
     async def resource_schemas(
         self,
@@ -62,6 +65,9 @@ class CatalogReader:
                     name="customers.csv",
                     aliases=("customers.csv",),
                     columns=("id", "name", "status"),
+                    revision=FILE_REVISION,
+                    source_revision="directory-revision-1",
+                    sensitivity_class="internal",
                 ),
             )
         if source_id == "source-database":
@@ -72,6 +78,9 @@ class CatalogReader:
                     name="customers",
                     aliases=("main.customers",),
                     columns=("id", "name", "status"),
+                    revision=DATABASE_REVISION,
+                    source_revision="database-revision-1",
+                    sensitivity_class="confidential",
                 ),
             )
         return ()
@@ -349,14 +358,37 @@ async def _snapshot_with_reads(
     evidence: list[Evidence] = []
     for call in calls:
         _, capability = registry.resolve_tool(call.name)
-        proposal = ActionProposal(
-            operation_id=snapshot.operation.id,
-            turn_id=turn.id,
-            call_id=call.id,
-            capability_id=capability.id,
-            arguments=call.arguments,
-            proposed_at=NOW,
-        )
+        current = await runtime.inspect(snapshot.operation.id)
+        if capability.id == TABULAR_COMPARE_CAPABILITY_ID:
+            validated = await controller.validate_action(call, current)
+            assert isinstance(validated, ActionProposal)
+            proposal = validated
+        else:
+            source_id = call.arguments["source_id"]
+            assert isinstance(source_id, str)
+            is_file = capability.id == LOCAL_FILE_READ_CAPABILITY_ID
+            resource_id = "resource-export" if is_file else "resource-customers"
+            resource_revision = FILE_REVISION if is_file else DATABASE_REVISION
+            source_revision = (
+                "directory-revision-1" if is_file else "database-revision-1"
+            )
+            proposal = ActionProposal(
+                operation_id=snapshot.operation.id,
+                turn_id=turn.id,
+                call_id=call.id,
+                capability_id=capability.id,
+                arguments=call.arguments,
+                proposed_at=NOW,
+                validation_facts=ActionValidationFacts(
+                    schema_version=1,
+                    sensitivity_class="internal" if is_file else "confidential",
+                    source_id=source_id,
+                    resource_ids=(resource_id,),
+                    resource_revisions=((resource_id, resource_revision),),
+                    source_revision=source_revision,
+                    freshness_state="current",
+                ),
+            )
         accepted = await runtime.submit(proposal)
         assert accepted is not None
         evidence.append(accepted)
@@ -400,6 +432,32 @@ async def test_file_resource_scope_rejects_before_action_proposal() -> None:
     assert isinstance(result, ActionRejection)
     assert result.code == "data.file.catalog_resource_missing"
     assert len((await runtime.inspect(snapshot.operation.id)).tasks) == task_count
+
+
+async def test_current_file_read_carries_exact_catalog_authority() -> None:
+    controller, runtime, _ = await _snapshot_with_reads(label="file-authority")
+    snapshot = await runtime.inspect("operation-file-authority-1")
+    call = ToolCall(
+        id="call-file-authority",
+        name="data_read_file",
+        arguments={
+            "source_id": "source-files",
+            "resource_id": "resource-export",
+        },
+    )
+
+    result = await controller.validate_action(call, snapshot)
+
+    assert isinstance(result, ActionProposal)
+    assert result.validation_facts == ActionValidationFacts(
+        schema_version=1,
+        sensitivity_class="internal",
+        source_id="source-files",
+        resource_ids=("resource-export",),
+        resource_revisions=(("resource-export", FILE_REVISION),),
+        source_revision="directory-revision-1",
+        freshness_state="current",
+    )
 
 
 async def test_comparison_rejects_missing_foreign_and_same_source_evidence() -> None:
@@ -446,6 +504,24 @@ async def test_valid_distinct_source_evidence_becomes_comparison_proposal() -> N
     assert result.capability_id == TABULAR_COMPARE_CAPABILITY_ID
     assert result.arguments["left_evidence_id"] == evidence[0].id
     assert result.arguments["right_evidence_id"] == evidence[1].id
+    assert result.validation_facts.source_ids == (
+        "source-database",
+        "source-files",
+    )
+    assert result.validation_facts.source_revisions == (
+        ("source-database", "database-revision-1"),
+        ("source-files", "directory-revision-1"),
+    )
+    assert result.validation_facts.resource_ids == (
+        "resource-customers",
+        "resource-export",
+    )
+    assert result.validation_facts.evidence_ids == (
+        evidence[0].id,
+        evidence[1].id,
+    )
+    assert result.validation_facts.sensitivity_class == "confidential"
+    assert result.validation_facts.freshness_state == "current"
 
 
 async def test_readiness_requires_comparison_and_both_input_citations() -> None:

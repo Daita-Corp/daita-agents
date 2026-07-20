@@ -2,6 +2,8 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-16
+- **Superseded in part by:** ADR 0017 for replacement-readiness timing after
+  Phase 9
 
 ## Decision
 
@@ -31,8 +33,10 @@
   rich documents, arbitrary event triggers, vector acceleration, multi-agent
   delegation, and managed-cloud infrastructure are post-MVP unless the parity
   matrix records a required cutover disposition.
-- Phase 0 through Phase 9 produce a candidate. Phase 10 is a separate,
-  destructive cutover requiring explicit human approval.
+- Phase 0 through Phase 9 produce the hardened component candidate. ADR 0017
+  adds a mandatory Phase 9.5 joined-product gate before the candidate is
+  replacement-ready. Phase 10 remains a separate, destructive cutover
+  requiring explicit human approval.
 - Fake-driver conformance does not satisfy the PostgreSQL cutover blocker by
   itself. The actual asyncpg/base-table, codec, cancellation, wrapper-size, and
   trusted-role contract must pass the credential-gated Phase 9 live suite.

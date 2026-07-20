@@ -1,17 +1,23 @@
 # Daita autonomous agent v2 replacement
 
-This is the isolated replacement project for Daita 2.0. The Phase 9 candidate
-is a functional persistent local agent: the generic loop, governed execution,
-SQLite recovery, catalog-backed SQLite and sandboxed-file data paths,
-provenance-bearing context, session compression, scoped memory/learning,
-versioned procedural skills, durable monitors, a foreground local host,
-controlled approved SQLite writes, PostgreSQL reads, retained-model routing,
-packaging/lifecycle, live integrations, restart reliability, and security
-hardening are implemented. `daita-agents` owns the Python API and the one
-installed `daita` command; the separate `daita-cli` and `daita-client`
-packages remain legacy Daita 1.x products and are excluded from 2.0. The
-replacement candidate is complete, while cutover remains a separate Phase 10
-decision.
+This is the isolated replacement project for Daita 2.0. Phase 9 produced a
+functional, hardened persistent local-agent substrate: the generic loop,
+governed execution, SQLite recovery, catalog-backed SQLite and sandboxed-file
+data paths, provenance-bearing context, session compression, scoped
+memory/learning, versioned procedural skills, durable monitors, a foreground
+local host, controlled approved SQLite writes, PostgreSQL reads, retained-model
+routing, packaging/lifecycle, live integrations, restart reliability, and
+security hardening are implemented. `daita-agents` owns the Python API and the
+one installed `daita` command; the separate `daita-cli` and `daita-client`
+packages remain legacy Daita 1.x products and are excluded from 2.0.
+
+A post-gate plan-to-source audit opened mandatory Phase 9.5 work to join those
+components into the supported default product: exact persisted read authority,
+reconstructable model routing, operational default monitor outcomes, ordinary
+learning ingress, additive extensions, and the complete in-package CLI/host
+journey. That joined gate now passes. The candidate is replacement-ready and
+eligible for human Phase 10 review, but cutover remains a separately authorized
+Phase 10 decision.
 
 The governing plan is the local
 `../docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md` fingerprinted in
@@ -72,13 +78,17 @@ CLI/client and breaking-change documentation.
 
 ## Local development host
 
-The Phase 6 CLI is intentionally thin. Except for initial bootstrap, mutations
-travel over the private per-agent Unix socket to the foreground `AgentHost`,
-which remains the only local writer. Start with an isolated state root:
+The CLI is intentionally thin. Except for initial bootstrap, mutations travel
+over the private per-agent Unix socket to the foreground `AgentHost`, which
+remains the only local writer. Configure the retained route once, then start a
+model-free host with an isolated state root:
 
 ```bash
-daita --root /tmp/daita-next agent init atlas --idempotency-key init-atlas
-daita --root /tmp/daita-next serve atlas --openai-model gpt-4.1-mini
+daita --root /tmp/daita-next agent create atlas --idempotency-key create-atlas
+daita --root /tmp/daita-next model set atlas --provider openai \
+  --model gpt-4.1-mini --secret env:OPENAI_API_KEY \
+  --idempotency-key model-atlas-v1
+daita --root /tmp/daita-next serve atlas
 ```
 
 `serve` resolves `OPENAI_API_KEY` through the provider SDK at request time; the
@@ -86,12 +96,12 @@ secret is not stored in the agent home. In another terminal, attach a source,
 inspect the model/host, submit work, and inspect its durable operation:
 
 ```bash
-daita --root /tmp/daita-next source attach atlas sqlite /absolute/path/sales.db \
+daita --root /tmp/daita-next source add atlas sqlite /absolute/path/sales.db \
   --idempotency-key attach-sales-v1
+daita --root /tmp/daita-next model show atlas
 daita --root /tmp/daita-next model status atlas
 daita --root /tmp/daita-next host health atlas
-daita --root /tmp/daita-next chat submit atlas "Summarize today's sales" \
-  --session-id sales-chat --idempotency-key chat-sales-1
+daita --root /tmp/daita-next chat atlas --session-id sales-chat
 daita --root /tmp/daita-next operation inspect atlas <operation-id>
 daita --root /tmp/daita-next events read atlas --limit 100
 ```
@@ -102,7 +112,7 @@ preview and conditional single-row update capabilities; it does not expose an
 arbitrary mutation-SQL surface:
 
 ```bash
-daita --root /tmp/daita-next source attach atlas sqlite /absolute/path/orders.db \
+daita --root /tmp/daita-next source add atlas sqlite /absolute/path/orders.db \
     --write-access --idempotency-key attach-orders-write-v1
 ```
 
@@ -148,10 +158,12 @@ daita --root /tmp/daita-next monitor run-now atlas daily-sales \
   --idempotency-key run-daily-sales-1
 ```
 
-Every CLI response is one strict JSON object. `events read` and the current
-socket `events follow` response are bounded cursor pages; Python callers that
-need a live read-only stream use `AgentHost.subscribe_events()` while the host
-is running. OS-service installation and remote transports remain deferred.
+Every non-streaming CLI response is one strict JSON object. Interactive chat
+and `events follow` emit strict JSON Lines. Follow reconnects from its last
+durable event sequence and observes events committed after it starts; every
+underlying socket page remains bounded. Python callers can use
+`AgentHost.subscribe_events()` while the host is running. OS-service
+installation and remote transports remain deferred.
 
 ## Phase gates
 
@@ -159,13 +171,20 @@ The architecture MVP proves the generic loop, persistence/recovery, fake
 approval-controlled side effect, SQLite and sandboxed local-file data paths,
 catalog, memory/skills, local host/monitors, and mock plus OpenAI operation.
 
-The replacement-candidate gate additionally requires a controlled real write,
+The Phase 9 hardening gate additionally proved a controlled real write,
 PostgreSQL, every retained provider's conformance suite, public-feature
-dispositions, an explicit CLI/client compatibility decision, packaging, live
+dispositions, the in-package CLI/legacy-package decision, packaging, live
 checks, recovery and security hardening, and tested fresh-state behavior.
 
-Passing the replacement-candidate gate does not authorize Phase 10. Root
-`daita/` may be removed or replaced only after explicit human approval.
+P9.5-Q02 through P9.5-Q08 prove exact default-product read authority, cold
+configured model reconstruction, scoped evidence-linked monitor findings, safe
+natural memory/skill proposals, additive configured capability providers with
+exact reopen binding, the installed-console real-socket product journey, and a
+clean-wheel joined lifecycle on both supported Python versions. The affected
+real OpenAI/default-domain/SQLite path also passes across cold reopen.
+
+Even passing Phase 9.5 does not authorize Phase 10. Root `daita/` may be
+removed or replaced only after explicit human approval.
 
 ## Project records
 

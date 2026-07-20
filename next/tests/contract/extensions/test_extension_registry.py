@@ -8,7 +8,7 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 import daita
 
-from daita.capabilities import AccessMode, RiskLevel
+from daita.capabilities import AccessMode, CapabilityRegistry, RiskLevel
 from daita.extensions import (
     ConfiguredExtension,
     ExtensionKind,
@@ -106,6 +106,141 @@ def test_manifest_and_registry_are_immutable_validated_declarations() -> None:
         registration.manifest.version = "2.0.0"  # type: ignore[misc]
     with pytest.raises(KeyError, match="unknown extension"):
         registry.manifest("missing")
+
+
+def test_manifest_and_ordered_set_fingerprints_bind_runtime_declarations() -> None:
+    registration = _registration()
+    registry = ExtensionRegistry((registration,))
+    binding = registry.bindings[0]
+
+    assert binding.id == "example"
+    assert binding.version == "1.0.0"
+    assert binding.kind is ExtensionKind.CAPABILITY_PROVIDER
+    assert binding.declaration_fingerprint == (
+        registration.manifest.declaration_fingerprint
+    )
+    assert binding.manifest_fingerprint == registration.manifest.fingerprint
+    assert registry.fingerprint.startswith("sha256:")
+    assert len(registry.fingerprint) == 71
+
+    changed_version = ExtensionRegistry(
+        (
+            replace(
+                registration, manifest=replace(registration.manifest, version="2.0.0")
+            ),
+        )
+    )
+    changed_description = _registration()
+    changed_local = _local()
+    changed_manifest = replace(
+        changed_description.manifest,
+        declarations=replace(
+            changed_description.manifest.declarations,
+            tool_views=(
+                replace(changed_local.tool_view, description="Changed projection."),
+            ),
+        ),
+    )
+    changed_projection = ExtensionRegistry(
+        (
+            ExtensionRegistration(
+                manifest=changed_manifest,
+                executors=changed_description.executors,
+            ),
+        )
+    )
+
+    assert changed_version.fingerprint != registry.fingerprint
+    assert changed_projection.fingerprint != registry.fingerprint
+
+
+def test_extension_registry_rejects_more_than_64_manifests() -> None:
+    registrations = tuple(
+        ExtensionRegistration(
+            manifest=ExtensionManifest(
+                id=f"example.extension-{index}",
+                version="1.0.0",
+                kind=ExtensionKind.CAPABILITY_PROVIDER,
+            )
+        )
+        for index in range(65)
+    )
+
+    with pytest.raises(ValueError, match="exceeds 64 configured manifests"):
+        ExtensionRegistry(registrations)
+
+
+def test_extension_registry_composes_atomically_with_a_complete_base() -> None:
+    base_local = _local(
+        extension_id="builtin",
+        capability_id="builtin.read",
+        executor_id="builtin.read.executor",
+        tool_name="builtin_read",
+    )
+    base = CapabilityRegistry(
+        capabilities=(base_local.capability,),
+        executors=(base_local.executor,),
+        tool_views=(base_local.tool_view,),
+    )
+    registry = ExtensionRegistry((_registration(),))
+
+    composed = registry.compose_with(base)
+
+    assert composed.capability_ids == frozenset({"builtin.read", "example.read"})
+    assert composed.tool_names == frozenset({"builtin_read", "example_read"})
+
+    collision = ExtensionRegistry(
+        (
+            _registration(
+                extension_id="colliding",
+                capability_id="builtin.read",
+                executor_id="colliding.read.executor",
+                tool_name="colliding_read",
+            ),
+        )
+    )
+    with pytest.raises(ExtensionLoadError) as failure:
+        collision.compose_with(base)
+    assert failure.value.diagnostic.code == "extension.declaration_collision"
+    assert failure.value.diagnostic.declaration_kind == "capability"
+    assert base.capability_ids == frozenset({"builtin.read"})
+
+
+@pytest.mark.parametrize(
+    "kind",
+    (ExtensionKind.RESOURCE_ADAPTER, ExtensionKind.BACKEND_PROVIDER),
+)
+def test_unimplemented_manifest_categories_are_explicitly_post_mvp(
+    kind: ExtensionKind,
+) -> None:
+    registration = _registration()
+
+    with pytest.raises(ExtensionLoadError) as failure:
+        ExtensionRegistry(
+            (replace(registration, manifest=replace(registration.manifest, kind=kind)),)
+        )
+
+    assert failure.value.diagnostic.code == "extension.kind_unsupported"
+
+
+def test_durable_binding_requires_the_exact_configured_manifest_set() -> None:
+    registry = ExtensionRegistry((_registration(),))
+    registry.validate_binding(registry.bindings)
+
+    with pytest.raises(ExtensionLoadError) as missing:
+        ExtensionRegistry().validate_binding(registry.bindings)
+    assert missing.value.diagnostic.code == "extension.configuration_missing"
+
+    with pytest.raises(ExtensionLoadError) as drift:
+        ExtensionRegistry(
+            (
+                replace(
+                    _registration(),
+                    manifest=replace(_registration().manifest, version="2.0.0"),
+                ),
+            )
+        ).validate_binding(registry.bindings)
+    assert drift.value.diagnostic.code == "extension.configuration_drift"
 
 
 @pytest.mark.parametrize("extension_id", ("", "Example", "bad/id", "bad id"))

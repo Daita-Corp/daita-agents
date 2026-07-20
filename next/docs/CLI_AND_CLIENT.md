@@ -15,6 +15,25 @@ The Phase 6 protocol covers agent bootstrap, health/status, chat submission,
 operation inspection/cancellation, approval decisions, source lifecycle,
 model status, committed events, and monitor lifecycle.
 
+## Phase 9.5 closure status
+
+P9.5-07 proves the supported local first-run path through the installed
+`daita` entry point and a real private Unix socket. The bundled surface now
+includes `agent create`; `model set/show/status`; model-free `serve`; source
+add/list/detach/health; line-oriented `chat`; operation and approval
+list/inspection; catalog search/show; memory and skill list/inspection;
+monitor list/inspection and natural proposal/confirmation; and reconnecting
+cursor-based `events follow`.
+
+Non-streaming responses are one strict JSON object. Interactive chat emits one
+JSON object per committed event followed by one result object for each input
+line. Event follow emits one committed event per line, advances only after a
+durable sequence, reconnects after transport loss, and bounds each page. The
+CLI never writes state directly or creates runtime background work; all
+mutations remain idempotent `AgentHost` operations through the private local
+protocol. P9.5-08 also passes the clean-wheel joined lifecycle on CPython 3.11
+and 3.12, including cold model-free host reopen and a second grounded run.
+
 The separate `daita-cli` and `daita-client` repositories are preserved legacy
 Daita 1.x repositories. They are unsupported and excluded from Daita 2.0 and
 must not be installed as candidate dependencies or used as HTTP compatibility
@@ -50,7 +69,10 @@ protocol has a concrete consumer and compatibility contract.
 
 Protocol requests are strict, bounded JSON frames over a private Unix socket.
 Every mutation is tied to one method/parameter hash and durable idempotency key;
-reusing a key for different input is an error. Event following replays from a
-durable cursor and treats in-process notifications only as wake hints.
+reusing a key for different input is an error. Committed-event pagination
+replays from a durable cursor. The Phase 9.5 follow loop advances only from
+those durable pages and treats in-process notifications only as wake hints.
 
 This decision is recorded in ADR 0016.
+The mandatory product-contract closure before replacement readiness is
+recorded in ADR 0017.

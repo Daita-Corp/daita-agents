@@ -127,6 +127,9 @@ def test_production_contains_one_generic_agent_loop() -> None:
 
     assert agent_loop_classes == [("loop/driver.py", "AgentLoop")]
     assert model_generation_callers == [
+        # The persisted-route adapter resolves its secret lazily and delegates
+        # to one retained provider; it owns no loop state or model routing.
+        ("llm/factory.py", "self._provider.generate"),
         ("llm/routing.py", "registration.provider.generate"),
         ("loop/driver.py", "self._model.generate"),
     ]

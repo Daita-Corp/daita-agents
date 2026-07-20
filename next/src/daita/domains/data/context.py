@@ -31,6 +31,7 @@ from ...llm.models import (
 )
 from ...loop.models import Turn
 from ...operations.checkpoints import OperationSnapshot
+from ...operations.models import TriggerKind
 
 _SYSTEM_INSTRUCTIONS = (
     "Use catalog_search and catalog_inspect to identify current resources before "
@@ -55,6 +56,8 @@ class CatalogContextReader(Protocol):
         query: str,
         *,
         limit: int,
+        source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] = (),
     ) -> Mapping[str, object]: ...
 
 
@@ -131,11 +134,43 @@ class DataContextBuilder:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("data context requires a non-empty trigger message")
 
-        catalog = await self._catalog.catalog_context(
-            operation.operation.agent_id,
-            message,
-            limit=self._catalog_limit,
-        )
+        source_scope: tuple[str, ...] = ()
+        resource_scope: tuple[str, ...] = ()
+        if operation.trigger.kind is TriggerKind.MONITOR:
+            raw_scope = operation.trigger.payload.get("monitor_scope")
+            if not isinstance(raw_scope, Mapping) or set(raw_scope) != {
+                "resource_ids",
+                "source_ids",
+            }:
+                raise ValueError("monitor context requires exact source scope")
+            raw_sources = raw_scope.get("source_ids")
+            raw_resources = raw_scope.get("resource_ids")
+            if (
+                not isinstance(raw_sources, tuple)
+                or not isinstance(raw_resources, tuple)
+                or not raw_sources
+                or any(not isinstance(value, str) for value in raw_sources)
+                or any(not isinstance(value, str) for value in raw_resources)
+                or raw_sources != tuple(sorted(set(raw_sources)))
+                or raw_resources != tuple(sorted(set(raw_resources)))
+            ):
+                raise ValueError("monitor context scope is invalid")
+            source_scope = raw_sources
+            resource_scope = raw_resources
+        if operation.trigger.kind is TriggerKind.MONITOR:
+            catalog = await self._catalog.catalog_context(
+                operation.operation.agent_id,
+                message,
+                limit=self._catalog_limit,
+                source_ids=source_scope,
+                resource_ids=resource_scope,
+            )
+        else:
+            catalog = await self._catalog.catalog_context(
+                operation.operation.agent_id,
+                message,
+                limit=self._catalog_limit,
+            )
         catalog_text = _bounded(
             canonical_json(catalog),
             self._max_catalog_characters,

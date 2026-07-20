@@ -9,7 +9,7 @@ import re
 from typing import Protocol
 
 from ..._json import canonical_json
-from ...capabilities import CapabilityInputError, CapabilityRegistry
+from ...capabilities import AccessMode, CapabilityInputError, CapabilityRegistry
 from ...catalog.capabilities import (
     CATALOG_INSPECT_CAPABILITY_ID,
     CATALOG_SEARCH_CAPABILITY_ID,
@@ -25,6 +25,7 @@ from ...operations.models import (
     Observation,
     Task,
     TaskStatus,
+    TriggerKind,
 )
 from .comparison import (
     TABULAR_COMPARE_CAPABILITY_ID,
@@ -121,7 +122,21 @@ class DataDomainController:
     ) -> tuple[ToolDefinition, ...]:
         if not isinstance(operation, OperationSnapshot):
             raise TypeError("operation must be an OperationSnapshot")
-        return self._registry.tool_definitions()
+        definitions = self._registry.tool_definitions()
+        if operation.trigger.kind is not TriggerKind.MONITOR:
+            return definitions
+        scoped_monitor_capabilities = {
+            LOCAL_FILE_READ_CAPABILITY_ID,
+            POSTGRESQL_QUERY_CAPABILITY_ID,
+            SQLITE_QUERY_CAPABILITY_ID,
+            TABULAR_COMPARE_CAPABILITY_ID,
+        }
+        monitor_definitions: list[ToolDefinition] = []
+        for definition in definitions:
+            _, capability = self._registry.resolve_tool(definition.name)
+            if capability.id in scoped_monitor_capabilities:
+                monitor_definitions.append(definition)
+        return tuple(monitor_definitions)
 
     async def validate_action(
         self,
@@ -152,6 +167,49 @@ class DataDomainController:
                 details={"tool_name": call.name},
             )
 
+        monitor_scope = _monitor_scope(operation)
+        if monitor_scope is not None and (
+            capability.access_mode is not AccessMode.READ
+            or capability.id
+            in {CATALOG_SEARCH_CAPABILITY_ID, CATALOG_INSPECT_CAPABILITY_ID}
+        ):
+            return ActionRejection(
+                code="monitor.read_only_scope_required",
+                message=(
+                    "Monitor operations may use only scoped data-read capabilities."
+                ),
+                details={"capability_id": capability.id},
+            )
+
+        if monitor_scope is not None and capability.id in {
+            SQLITE_QUERY_CAPABILITY_ID,
+            POSTGRESQL_QUERY_CAPABILITY_ID,
+            LOCAL_FILE_READ_CAPABILITY_ID,
+        }:
+            source_scope, resource_scope = monitor_scope
+            requested_source_id = arguments.get("source_id")
+            requested_resource_id = arguments.get("resource_id")
+            resource_outside_scope = (
+                capability.id == LOCAL_FILE_READ_CAPABILITY_ID
+                and bool(resource_scope)
+                and (
+                    not isinstance(requested_resource_id, str)
+                    or requested_resource_id not in resource_scope
+                )
+            )
+            if (
+                not isinstance(requested_source_id, str)
+                or requested_source_id not in source_scope
+                or resource_outside_scope
+            ):
+                return ActionRejection(
+                    code="monitor.out_of_scope",
+                    message=(
+                        "The requested read is outside the confirmed monitor scope."
+                    ),
+                    details={"capability_id": capability.id},
+                )
+
         if capability.id == CATALOG_SEARCH_CAPABILITY_ID:
             query = arguments["query"]
             limit = arguments.get("limit", 12)
@@ -180,7 +238,7 @@ class DataDomainController:
             POSTGRESQL_QUERY_CAPABILITY_ID: "postgresql",
         }
         if capability.id in sql_dialect_by_capability:
-            rejection = await self._validate_sql(
+            rejection, validation_facts = await self._validate_sql(
                 arguments,
                 operation,
                 dialect=sql_dialect_by_capability[capability.id],
@@ -199,13 +257,42 @@ class DataDomainController:
             if rejection is not None:
                 return rejection
         if capability.id == LOCAL_FILE_READ_CAPABILITY_ID:
-            rejection = await self._validate_file_read(arguments, operation)
+            rejection, validation_facts = await self._validate_file_read(
+                arguments,
+                operation,
+            )
             if rejection is not None:
                 return rejection
         if capability.id == TABULAR_COMPARE_CAPABILITY_ID:
-            rejection = self._validate_comparison(arguments, operation)
+            rejection, validation_facts = self._validate_comparison(
+                arguments,
+                operation,
+            )
             if rejection is not None:
                 return rejection
+
+        if monitor_scope is not None and capability.id in {
+            SQLITE_QUERY_CAPABILITY_ID,
+            POSTGRESQL_QUERY_CAPABILITY_ID,
+            LOCAL_FILE_READ_CAPABILITY_ID,
+            TABULAR_COMPARE_CAPABILITY_ID,
+        }:
+            source_scope, resource_scope = monitor_scope
+            fact_sources = set(validation_facts.source_ids)
+            fact_resources = set(validation_facts.resource_ids)
+            if (
+                validation_facts.schema_version != 1
+                or not fact_sources
+                or not fact_sources <= set(source_scope)
+                or (resource_scope and not fact_resources <= set(resource_scope))
+            ):
+                return ActionRejection(
+                    code="monitor.out_of_scope",
+                    message=(
+                        "The validated read is outside the confirmed monitor scope."
+                    ),
+                    details={"capability_id": capability.id},
+                )
 
         if not operation.turns:
             raise ValueError("action validation requires a committed turn")
@@ -225,7 +312,7 @@ class DataDomainController:
         operation: OperationSnapshot,
         *,
         dialect: str,
-    ) -> ActionRejection | None:
+    ) -> tuple[ActionRejection | None, ActionValidationFacts]:
         source_id = arguments["source_id"]
         sql = arguments["sql"]
         parameters = arguments.get("parameters", ())
@@ -242,13 +329,16 @@ class DataDomainController:
                 for value in parameters
             )
         ):
-            return ActionRejection(
-                code="data.sql.input_out_of_bounds",
-                message="SQL or parameters exceed the bounded input contract.",
-                details={
-                    "maximum_parameters": 256,
-                    "maximum_sql_characters": 100_000,
-                },
+            return (
+                ActionRejection(
+                    code="data.sql.input_out_of_bounds",
+                    message="SQL or parameters exceed the bounded input contract.",
+                    details={
+                        "maximum_parameters": 256,
+                        "maximum_sql_characters": 100_000,
+                    },
+                ),
+                ActionValidationFacts(),
             )
         try:
             adapter_id = await self._catalog.source_adapter_id(
@@ -260,20 +350,26 @@ class DataDomainController:
                 source_id,
             )
         except (KeyError, TypeError, ValueError):
-            return ActionRejection(
-                code="data.catalog_schema_unavailable",
-                message="No current catalog schema is available for that source.",
-                details={"source_id": source_id},
+            return (
+                ActionRejection(
+                    code="data.catalog_schema_unavailable",
+                    message="No current catalog schema is available for that source.",
+                    details={"source_id": source_id},
+                ),
+                ActionValidationFacts(),
             )
         expected_adapter_id = "postgresql" if dialect == "postgresql" else "sqlite"
         if adapter_id != expected_adapter_id:
-            return ActionRejection(
-                code="data.sql.source_adapter_mismatch",
-                message="The selected SQL tool does not match the attached source.",
-                details={
-                    "expected_adapter_id": expected_adapter_id,
-                    "source_id": source_id,
-                },
+            return (
+                ActionRejection(
+                    code="data.sql.source_adapter_mismatch",
+                    message="The selected SQL tool does not match the attached source.",
+                    details={
+                        "expected_adapter_id": expected_adapter_id,
+                        "source_id": source_id,
+                    },
+                ),
+                ActionValidationFacts(),
             )
         validator = (
             validate_postgresql_read
@@ -286,16 +382,58 @@ class DataDomainController:
             resources=resources,
             parameters=parameters,
         )
-        if result.valid:
-            return None
-        primary = result.issues[0]
-        return ActionRejection(
-            code=f"data.sql.{primary.code}",
-            message=primary.message,
-            details={
-                "issue_codes": list(result.issue_codes[:8]),
-                "source_id": source_id,
-            },
+        if not result.valid:
+            primary = result.issues[0]
+            return (
+                ActionRejection(
+                    code=f"data.sql.{primary.code}",
+                    message=primary.message,
+                    details={
+                        "issue_codes": list(result.issue_codes[:8]),
+                        "source_id": source_id,
+                    },
+                ),
+                ActionValidationFacts(),
+            )
+        resolved = tuple(
+            resource
+            for resource in resources
+            if resource.resource_id in set(result.resource_ids)
+        )
+        sensitivity = _strictest_sensitivity(resolved)
+        if (
+            not result.resource_ids
+            or set(resource.resource_id for resource in resolved)
+            != set(result.resource_ids)
+            or not result.resource_revisions
+            or result.source_revision is None
+            or sensitivity is None
+        ):
+            return (
+                ActionRejection(
+                    code="data.sql.read_authority_unavailable",
+                    message=(
+                        "Current source, resource, revision, freshness, and "
+                        "sensitivity authority is required before SQL I/O."
+                    ),
+                    details={"source_id": source_id},
+                ),
+                ActionValidationFacts(),
+            )
+        return (
+            None,
+            ActionValidationFacts(
+                schema_version=1,
+                validation_passed=True,
+                in_scope=True,
+                destructive=False,
+                sensitivity_class=sensitivity,
+                source_id=result.source_id,
+                resource_ids=result.resource_ids,
+                resource_revisions=result.resource_revisions,
+                source_revision=result.source_revision,
+                freshness_state="current",
+            ),
         )
 
     async def _validate_sqlite_update(
@@ -415,7 +553,7 @@ class DataDomainController:
         self,
         arguments: Mapping[str, object],
         operation: OperationSnapshot,
-    ) -> ActionRejection | None:
+    ) -> tuple[ActionRejection | None, ActionValidationFacts]:
         source_id = arguments["source_id"]
         resource_id = arguments["resource_id"]
         assert isinstance(source_id, str)
@@ -426,34 +564,85 @@ class DataDomainController:
             or len(source_id) > 512
             or len(resource_id) > 512
         ):
-            return ActionRejection(
-                code="data.file.input_out_of_bounds",
-                message="File reads require bounded source and resource IDs.",
+            return (
+                ActionRejection(
+                    code="data.file.input_out_of_bounds",
+                    message="File reads require bounded source and resource IDs.",
+                ),
+                ActionValidationFacts(),
             )
         try:
+            adapter_id = await self._catalog.source_adapter_id(
+                operation.operation.agent_id,
+                source_id,
+            )
             current = await self._catalog.is_current_tabular_file(
                 operation.operation.agent_id,
                 source_id,
                 resource_id,
             )
-        except (KeyError, ValueError):
-            current = False
-        if not current:
-            return ActionRejection(
-                code="data.file.catalog_resource_missing",
-                message=(
-                    "The requested file is not a current cataloged tabular resource "
-                    "for that source."
-                ),
-                details={"resource_id": resource_id, "source_id": source_id},
+            resources = await self._catalog.resource_schemas(
+                operation.operation.agent_id,
+                source_id,
             )
-        return None
+        except (KeyError, TypeError, ValueError):
+            adapter_id = None
+            current = False
+            resources = ()
+        resource = next(
+            (item for item in resources if item.resource_id == resource_id),
+            None,
+        )
+        if not current or adapter_id != "local-directory" or resource is None:
+            return (
+                ActionRejection(
+                    code="data.file.catalog_resource_missing",
+                    message=(
+                        "The requested file is not a current cataloged tabular "
+                        "resource for that source."
+                    ),
+                    details={"resource_id": resource_id, "source_id": source_id},
+                ),
+                ActionValidationFacts(),
+            )
+        sensitivity = _strictest_sensitivity((resource,))
+        if (
+            resource.revision is None
+            or resource.source_revision is None
+            or sensitivity is None
+        ):
+            return (
+                ActionRejection(
+                    code="data.file.read_authority_unavailable",
+                    message=(
+                        "Current source, resource, revision, freshness, and "
+                        "sensitivity authority is required before file I/O."
+                    ),
+                    details={"resource_id": resource_id, "source_id": source_id},
+                ),
+                ActionValidationFacts(),
+            )
+        return (
+            None,
+            ActionValidationFacts(
+                schema_version=1,
+                validation_passed=True,
+                in_scope=True,
+                destructive=False,
+                sensitivity_class=sensitivity,
+                source_id=source_id,
+                resource_ids=(resource_id,),
+                resource_revisions=((resource_id, resource.revision),),
+                source_revision=resource.source_revision,
+                freshness_state="current",
+            ),
+        )
 
     def _validate_comparison(
         self,
         arguments: Mapping[str, object],
         operation: OperationSnapshot,
-    ) -> ActionRejection | None:
+    ) -> tuple[ActionRejection | None, ActionValidationFacts]:
         left_id = arguments["left_evidence_id"]
         right_id = arguments["right_evidence_id"]
         key_columns = arguments["key_columns"]
@@ -479,12 +668,15 @@ class DataDomainController:
             )
             or len(columns) != len(set(columns))
         ):
-            return ActionRejection(
-                code="data.compare.input_out_of_bounds",
-                message=(
-                    "Comparison requires two distinct evidence IDs and bounded, "
-                    "non-overlapping key and value columns."
+            return (
+                ActionRejection(
+                    code="data.compare.input_out_of_bounds",
+                    message=(
+                        "Comparison requires two distinct evidence IDs and bounded, "
+                        "non-overlapping key and value columns."
+                    ),
                 ),
+                ActionValidationFacts(),
             )
         evidence_by_id = {
             evidence.id: evidence
@@ -500,31 +692,110 @@ class DataDomainController:
         if any(
             evidence is None or evidence.kind not in supported for evidence in selected
         ):
-            return ActionRejection(
-                code="data.compare.evidence_unavailable",
-                message=(
-                    "Comparison inputs must be accepted tabular read evidence from "
-                    "this operation."
+            return (
+                ActionRejection(
+                    code="data.compare.evidence_unavailable",
+                    message=(
+                        "Comparison inputs must be accepted tabular read evidence "
+                        "from this operation."
+                    ),
                 ),
+                ActionValidationFacts(),
             )
         left_evidence, right_evidence = selected
         assert left_evidence is not None
         assert right_evidence is not None
-        sources = (
-            left_evidence.payload.get("source_id"),
-            right_evidence.payload.get("source_id"),
+        authorities = (
+            left_evidence.validation_facts,
+            right_evidence.validation_facts,
         )
-        if any(not isinstance(source, str) or not source.strip() for source in sources):
-            return ActionRejection(
-                code="data.compare.provenance_missing",
-                message="Comparison input evidence lacks complete source provenance.",
+        if any(
+            authority.schema_version == 0
+            or authority.freshness_state != "current"
+            or not authority.validation_passed
+            or not authority.in_scope
+            for authority in authorities
+        ):
+            return (
+                ActionRejection(
+                    code="data.compare.read_authority_unavailable",
+                    message=(
+                        "Comparison inputs require accepted current evidence with "
+                        "exact validator-owned authority."
+                    ),
+                ),
+                ActionValidationFacts(),
             )
-        if sources[0] == sources[1]:
-            return ActionRejection(
-                code="data.compare.sources_not_distinct",
-                message="Cross-source comparison requires two distinct sources.",
+        source_ids = tuple(
+            sorted({item for authority in authorities for item in authority.source_ids})
+        )
+        source_revisions = tuple(
+            sorted(
+                {
+                    item
+                    for authority in authorities
+                    for item in authority.source_revisions
+                }
             )
-        return None
+        )
+        resource_ids = tuple(
+            sorted(
+                {item for authority in authorities for item in authority.resource_ids}
+            )
+        )
+        resource_revisions = tuple(
+            sorted(
+                {
+                    item
+                    for authority in authorities
+                    for item in authority.resource_revisions
+                }
+            )
+        )
+        sensitivity = _strictest_sensitivity_classes(
+            tuple(authority.sensitivity_class for authority in authorities)
+        )
+        if len(source_ids) == 1:
+            return (
+                ActionRejection(
+                    code="data.compare.sources_not_distinct",
+                    message="Cross-source comparison requires two distinct sources.",
+                ),
+                ActionValidationFacts(),
+            )
+        if (
+            len(source_ids) != 2
+            or len(source_revisions) != 2
+            or not resource_ids
+            or len(resource_revisions) != len(resource_ids)
+            or sensitivity is None
+        ):
+            return (
+                ActionRejection(
+                    code="data.compare.read_authority_unavailable",
+                    message=(
+                        "Comparison inputs require complete non-conflicting source "
+                        "and resource authority."
+                    ),
+                ),
+                ActionValidationFacts(),
+            )
+        return (
+            None,
+            ActionValidationFacts(
+                schema_version=1,
+                validation_passed=True,
+                in_scope=True,
+                destructive=False,
+                sensitivity_class=sensitivity,
+                source_ids=source_ids,
+                source_revisions=source_revisions,
+                resource_ids=resource_ids,
+                resource_revisions=resource_revisions,
+                freshness_state="current",
+                evidence_ids=(left_id, right_id),
+            ),
+        )
 
     async def project_observation(self, evidence: Evidence) -> Observation:
         if not isinstance(evidence, Evidence):
@@ -676,6 +947,35 @@ def _sqlite_update_validation_facts(
         source_revision=recipe.source_revision,
         impact=impact,
         evidence_ids=evidence_ids,
+    )
+
+
+_SENSITIVITY_RANK = {
+    "public": 0,
+    "internal": 1,
+    "confidential": 2,
+    "restricted": 3,
+}
+
+
+def _strictest_sensitivity(
+    resources: tuple[ResourceSchema, ...],
+) -> str | None:
+    return _strictest_sensitivity_classes(
+        tuple(resource.sensitivity_class for resource in resources)
+    )
+
+
+def _strictest_sensitivity_classes(values: tuple[str, ...]) -> str | None:
+    normalized = tuple(value.casefold() for value in values)
+    if not normalized:
+        return None
+    return max(
+        normalized,
+        key=lambda value: _SENSITIVITY_RANK.get(
+            value,
+            _SENSITIVITY_RANK["restricted"],
+        ),
     )
 
 
@@ -887,6 +1187,29 @@ def _requests_comparison(message: str) -> bool:
         )
         is not None
     )
+
+
+def _monitor_scope(
+    operation: OperationSnapshot,
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    if operation.trigger.kind is not TriggerKind.MONITOR:
+        return None
+    raw = operation.trigger.payload.get("monitor_scope")
+    if not isinstance(raw, Mapping) or set(raw) != {"resource_ids", "source_ids"}:
+        raise ValueError("monitor trigger has no exact scope binding")
+    source_ids = raw.get("source_ids")
+    resource_ids = raw.get("resource_ids")
+    if not isinstance(source_ids, tuple) or not isinstance(resource_ids, tuple):
+        raise ValueError("monitor trigger scope must contain canonical ID sequences")
+    if (
+        not source_ids
+        or any(not isinstance(item, str) or not item for item in source_ids)
+        or any(not isinstance(item, str) or not item for item in resource_ids)
+        or source_ids != tuple(sorted(set(source_ids)))
+        or resource_ids != tuple(sorted(set(resource_ids)))
+    ):
+        raise ValueError("monitor trigger scope is invalid or unbounded")
+    return source_ids, resource_ids
 
 
 __all__ = [

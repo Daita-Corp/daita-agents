@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from daita.loop.models import LoopBudgets
 from daita.monitors import (
     IntervalSchedule,
     Monitor,
@@ -207,6 +208,7 @@ class FakeSnapshot:
     trigger: AgentTrigger
     operation: Operation
     evidence: tuple[Evidence, ...]
+    budgets: LoopBudgets
 
 
 @dataclass
@@ -284,7 +286,7 @@ class FakeRunner:
                 ),
             )
         self.operations.by_trigger[trigger.id] = FakeVersionedOperation(
-            FakeSnapshot(trigger, operation, evidence)
+            FakeSnapshot(trigger, operation, evidence, LoopBudgets())
         )
 
 

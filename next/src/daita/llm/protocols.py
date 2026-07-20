@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Protocol
+from typing import Protocol, TYPE_CHECKING
 
 from .models import ModelProfile, ModelRequest, ModelResponse, ModelStreamEvent
+
+if TYPE_CHECKING:
+    from .routing import ModelRoute
 
 
 class ModelProfileRepositoryError(RuntimeError):
@@ -14,6 +17,14 @@ class ModelProfileRepositoryError(RuntimeError):
 
 class ModelProfileConflictError(ModelProfileRepositoryError):
     """Raised when a different profile is proposed for an already-bound agent."""
+
+
+class ModelRouteRepositoryError(RuntimeError):
+    """Base failure for versioned model-route persistence."""
+
+
+class ModelRouteConflictError(ModelRouteRepositoryError):
+    """Raised when model-route compare-and-set or active-operation checks fail."""
 
 
 class ModelProfileRepository(Protocol):
@@ -26,6 +37,20 @@ class ModelProfileRepository(Protocol):
     ) -> ModelProfile: ...
 
     async def load_model_profile(self, agent_id: str) -> ModelProfile | None: ...
+
+
+class ModelRouteRepository(Protocol):
+    """Persist and load the active versioned provider-neutral model route."""
+
+    async def set_model_route(
+        self,
+        agent_id: str,
+        route: ModelRoute,
+        *,
+        expected_revision: int,
+    ) -> ModelRoute: ...
+
+    async def load_model_route(self, agent_id: str) -> ModelRoute | None: ...
 
 
 class ModelProvider(Protocol):
@@ -47,6 +72,9 @@ __all__ = [
     "ModelProfileConflictError",
     "ModelProfileRepository",
     "ModelProfileRepositoryError",
+    "ModelRouteConflictError",
+    "ModelRouteRepository",
+    "ModelRouteRepositoryError",
     "ModelProvider",
     "StreamingModelProvider",
 ]

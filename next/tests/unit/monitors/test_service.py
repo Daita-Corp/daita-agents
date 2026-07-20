@@ -9,8 +9,10 @@ import pytest
 from daita.monitors import (
     IntervalSchedule,
     MonitorClaimResult,
+    MonitorBudgetOverrides,
     MonitorConfirmation,
     MonitorConfirmationCommit,
+    MonitorConditionKind,
     MonitorDefinition,
     MonitorInspection,
     MonitorLifecycleCommit,
@@ -275,6 +277,84 @@ async def test_proposal_is_inert_correlated_and_store_idempotent() -> None:
     assert event.operation_id is None
     assert event.payload["source_operation_id"] == "operation-create-orders"
     assert event.payload["candidate_hash"] == definition.content_hash
+
+
+async def test_natural_monitor_request_creates_only_safe_typed_definition() -> None:
+    store = FakeMonitorStore()
+    service = _service(store, MutableClock())
+
+    proposal = await service.propose_natural(
+        "orders-threshold",
+        "Every 5 minutes, Count open orders for source source-orders "
+        "when rows.0.total > 10",
+        idempotency_key="natural-orders-1",
+    )
+
+    definition = proposal.candidate
+    assert definition.objective == "Count open orders"
+    assert definition.scope.source_ids == ("source-orders",)
+    assert isinstance(definition.schedule, IntervalSchedule)
+    assert definition.schedule.interval_seconds == 300
+    assert definition.schedule.anchor_at == NOW
+    assert definition.condition.kind is MonitorConditionKind.THRESHOLD
+    assert definition.condition.expression == "rows.0.total"
+    assert dict(definition.condition.configuration) == {
+        "operator": "gt",
+        "value": 10,
+    }
+    assert store.inspections == {}
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "SELECT * FROM orders",
+        "Every 5 minutes, run os.system for source source-orders when x eval 1",
+        "Every 999999 hours, Count orders for source source-orders",
+    ),
+)
+async def test_natural_monitor_request_rejects_unsupported_or_unbounded_text(
+    message: str,
+) -> None:
+    store = FakeMonitorStore()
+    service = _service(store, MutableClock())
+
+    with pytest.raises(ValueError):
+        await service.propose_natural(
+            "orders-threshold",
+            message,
+            idempotency_key="natural-orders-invalid",
+        )
+
+    assert store.proposals == {}
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        replace(
+            _definition(),
+            budget_overrides=MonitorBudgetOverrides(max_turns=9),
+        ),
+        replace(_definition(), policy_overrides={"allow_destructive": True}),
+        replace(_definition(), operation_template={"domain": "custom"}),
+    ],
+)
+async def test_proposal_rejects_settings_that_expand_agent_authority(
+    definition: MonitorDefinition,
+) -> None:
+    store = FakeMonitorStore()
+    service = _service(store, MutableClock())
+
+    with pytest.raises(ValueError, match="monitor"):
+        await service.propose(
+            "orders-backlog",
+            definition,
+            idempotency_key="request-invalid-monitor",
+        )
+
+    assert store.proposals == {}
+    assert store.proposal_events == []
 
 
 async def test_confirmation_requires_exact_candidate_hash_and_activates_once() -> None:

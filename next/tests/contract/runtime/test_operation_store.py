@@ -126,14 +126,69 @@ async def test_create_commits_the_initial_checkpoint_and_both_event_records() ->
     assert await store.load_by_trigger(snapshot.trigger.id) == result.operation
 
 
+async def test_list_operations_is_agent_scoped_filtered_bounded_and_newest_first() -> (
+    None
+):
+    store = InMemoryOperationStore()
+    first = _initial_snapshot(operation_id="operation-1", trigger_id="trigger-1")
+    second = _initial_snapshot(operation_id="operation-2", trigger_id="trigger-2")
+    other = _initial_snapshot(
+        operation_id="operation-other",
+        trigger_id="trigger-other",
+        agent_id="agent-other",
+    )
+    await store.create(first)
+    await store.create(second)
+    await store.create(other)
+    succeeded = replace(
+        first,
+        operation=replace(
+            first.operation,
+            status=OperationStatus.SUCCEEDED,
+            updated_at=LATER,
+            final_text="done",
+            terminal_reason="completed",
+        ),
+        loop_state=replace(first.loop_state, phase=LoopPhase.TERMINAL),
+        events=(
+            *first.events,
+            _event(
+                "operation-1-event-3",
+                "operation.succeeded",
+                operation_id="operation-1",
+                created_at=LATER,
+            ),
+        ),
+    )
+    await store.commit(succeeded, expected_revision=1)
+
+    assert tuple(
+        value.snapshot.operation.id for value in await store.list_operations("agent-1")
+    ) == ("operation-1", "operation-2")
+    assert tuple(
+        value.snapshot.operation.id
+        for value in await store.list_operations(
+            "agent-1",
+            statuses=(OperationStatus.RUNNING,),
+            limit=1,
+        )
+    ) == ("operation-2",)
+    assert await store.list_operations("agent-missing") == ()
+
+    with pytest.raises(ValueError, match="statuses"):
+        await store.list_operations("agent-1", statuses=())
+    with pytest.raises(ValueError, match="limit"):
+        await store.list_operations("agent-1", limit=1_001)
+
+
 async def test_missing_operation_is_typed_and_trigger_lookup_is_optional() -> None:
     store = InMemoryOperationStore()
 
     with pytest.raises(OperationNotFoundError) as operation_error:
         await store.load("operation-missing")
 
-    assert isinstance(operation_error.value, OperationStoreError)
     assert operation_error.value.operation_id == "operation-missing"
+    assert issubclass(type(operation_error.value), OperationStoreError)
     assert await store.load_by_trigger("trigger-missing") is None
 
 
@@ -156,11 +211,11 @@ async def test_operation_and_trigger_identity_are_claimed_atomically() -> None:
     with pytest.raises(TriggerAlreadyClaimedError) as trigger_error:
         await store.create(same_trigger)
 
-    assert isinstance(operation_error.value, OperationStoreError)
-    assert isinstance(trigger_error.value, OperationStoreError)
     assert operation_error.value.operation_id == original.operation.id
     assert trigger_error.value.trigger_id == original.trigger.id
     assert trigger_error.value.operation_id == original.operation.id
+    assert issubclass(type(operation_error.value), OperationStoreError)
+    assert issubclass(type(trigger_error.value), OperationStoreError)
     assert await store.load(original.operation.id) == created.operation
     assert await store.load_by_trigger(original.trigger.id) == created.operation
     with pytest.raises(OperationNotFoundError):
@@ -201,10 +256,10 @@ async def test_revision_conflict_commits_no_state_or_events() -> None:
     with pytest.raises(OperationRevisionConflict) as conflict:
         await store.commit(advanced, expected_revision=0)
 
-    assert isinstance(conflict.value, OperationStoreError)
     assert conflict.value.operation_id == initial.operation.id
     assert conflict.value.expected_revision == 0
     assert conflict.value.actual_revision == 1
+    assert issubclass(type(conflict.value), OperationStoreError)
     assert await store.load(initial.operation.id) == created.operation
     assert await store.load_by_trigger(initial.trigger.id) == created.operation
 
@@ -261,9 +316,9 @@ async def test_event_history_must_be_an_exact_append_only_prefix() -> None:
     for invalid in invalid_checkpoints:
         with pytest.raises(InvalidOperationCheckpointError) as error:
             await store.commit(invalid, expected_revision=1)
-        assert isinstance(error.value, OperationStoreError)
         assert error.value.operation_id == initial.operation.id
         assert error.value.reason
+        assert issubclass(type(error.value), OperationStoreError)
         assert await store.load(initial.operation.id) == created.operation
 
 
@@ -289,9 +344,9 @@ async def test_checkpoint_identity_mismatch_is_rejected_atomically() -> None:
     with pytest.raises(InvalidOperationCheckpointError) as error:
         await store.commit(mismatched, expected_revision=1)
 
-    assert isinstance(error.value, OperationStoreError)
     assert error.value.operation_id == initial.operation.id
     assert error.value.reason
+    assert issubclass(type(error.value), OperationStoreError)
     assert await store.load(initial.operation.id) == created.operation
     assert await store.load_by_trigger(initial.trigger.id) == created.operation
 
@@ -303,7 +358,7 @@ async def test_commit_of_unknown_operation_does_not_claim_its_trigger() -> None:
     with pytest.raises(OperationNotFoundError) as error:
         await store.commit(unknown, expected_revision=1)
 
-    assert isinstance(error.value, OperationStoreError)
+    assert issubclass(type(error.value), OperationStoreError)
     with pytest.raises(OperationNotFoundError):
         await store.load(unknown.operation.id)
     assert await store.load_by_trigger(unknown.trigger.id) is None

@@ -8,10 +8,17 @@ import re
 
 from ..capabilities import CapabilityRegistry, Executor
 from ..errors import ErrorRetryability, PluginError
-from .manifest import ExtensionManifest, _validate_extension_id
+from .manifest import (
+    ExtensionBinding,
+    ExtensionKind,
+    ExtensionManifest,
+    _validate_extension_id,
+    extension_set_fingerprint,
+)
 
 _DECLARATION_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:[._-][A-Za-z0-9]+)*$")
 _MAX_DECLARATION_ID_BYTES = 128
+_MAX_CONFIGURED_EXTENSIONS = 64
 
 
 def _validate_declaration_id(value: object, field_name: str) -> str:
@@ -112,6 +119,8 @@ class ExtensionRegistry:
         registrations: Iterable[ExtensionRegistration] = (),
     ) -> None:
         values = tuple(registrations)
+        if len(values) > _MAX_CONFIGURED_EXTENSIONS:
+            raise ValueError("extension registry exceeds 64 configured manifests")
         for registration in values:
             if not isinstance(registration, ExtensionRegistration):
                 raise TypeError(
@@ -139,6 +148,13 @@ class ExtensionRegistry:
                     manifest.id,
                 )
             extension_ids.add(manifest.id)
+            if manifest.kind is not ExtensionKind.CAPABILITY_PROVIDER:
+                raise _load_error(
+                    "extension.kind_unsupported",
+                    manifest.id,
+                    "manifest",
+                    manifest.id,
+                )
             diagnostics.append(
                 RegistryDiagnostic(
                     code="extension.loaded",
@@ -308,6 +324,82 @@ class ExtensionRegistry:
     @property
     def diagnostics(self) -> tuple[RegistryDiagnostic, ...]:
         return self._diagnostics
+
+    @property
+    def bindings(self) -> tuple[ExtensionBinding, ...]:
+        return tuple(manifest.binding for manifest in self.manifests)
+
+    @property
+    def fingerprint(self) -> str:
+        return extension_set_fingerprint(self.bindings)
+
+    def compose_with(self, base: CapabilityRegistry) -> CapabilityRegistry:
+        """Add declarations to a complete base registry without partial exposure."""
+
+        if not isinstance(base, CapabilityRegistry):
+            raise TypeError("base must be a CapabilityRegistry")
+        for registration in self._registrations:
+            manifest = registration.manifest
+            for capability in manifest.declarations.capabilities:
+                if capability.id in base.capability_ids:
+                    raise _load_error(
+                        "extension.declaration_collision",
+                        manifest.id,
+                        "capability",
+                        capability.id,
+                    )
+            for executor_id in manifest.declarations.executor_ids:
+                if executor_id in base.executor_ids:
+                    raise _load_error(
+                        "extension.declaration_collision",
+                        manifest.id,
+                        "executor",
+                        executor_id,
+                    )
+            for view in manifest.declarations.tool_views:
+                if view.name in base.tool_names:
+                    raise _load_error(
+                        "extension.declaration_collision",
+                        manifest.id,
+                        "tool_view",
+                        view.name,
+                    )
+        return CapabilityRegistry.compose(base, self._capability_registry)
+
+    def validate_binding(
+        self,
+        stored: tuple[ExtensionBinding, ...] | None,
+    ) -> None:
+        """Fail closed when an existing Agent Home lacks this exact manifest set."""
+
+        requested = self.bindings
+        if stored is None:
+            if not requested:
+                return
+            raise _load_error(
+                "extension.binding_absent",
+                requested[0].id,
+                "manifest",
+                requested[0].id,
+            )
+        if stored == requested:
+            return
+        stored_by_id = {binding.id: binding for binding in stored}
+        requested_by_id = {binding.id: binding for binding in requested}
+        changed_id = next(
+            (
+                extension_id
+                for extension_id in (*stored_by_id, *requested_by_id)
+                if stored_by_id.get(extension_id) != requested_by_id.get(extension_id)
+            ),
+            "registry",
+        )
+        code = (
+            "extension.configuration_missing"
+            if changed_id in stored_by_id and changed_id not in requested_by_id
+            else "extension.configuration_drift"
+        )
+        raise _load_error(code, changed_id, "manifest", changed_id)
 
     def manifest(self, extension_id: str) -> ExtensionManifest:
         try:

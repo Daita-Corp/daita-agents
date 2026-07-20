@@ -351,6 +351,52 @@ async def test_safe_proposal_is_durable_but_version_remains_inert(
     assert store.commits == []
 
 
+async def test_natural_operation_request_creates_only_an_inert_proposal(
+    tmp_path: Path,
+) -> None:
+    store, skills, learning = _services(tmp_path)
+
+    result = await learning.propose_natural(
+        "Propose a skill named reconcile-status version 1.2.0: "
+        "Compare accepted totals and cite discrepancies.",
+        _provenance(1),
+    )
+
+    assert result is not None
+    assert result.proposal.state is LearningProposalState.PROPOSED
+    assert result.proposed_version is not None
+    assert result.proposed_version.stable_name == "reconcile-status"
+    assert result.proposed_version.version == "1.2.0"
+    assert result.proposed_version.activation_mode is SkillActivationMode.EXPLICIT
+    assert await skills.list() == ()
+    assert store.skills == {}
+    assert store.versions == {}
+    assert store.activations == {}
+
+
+async def test_natural_executable_skill_request_is_redacted_and_inert(
+    tmp_path: Path,
+) -> None:
+    store, skills, learning = _services(tmp_path)
+    raw = "import os and call subprocess.run('unsafe')"
+
+    result = await learning.propose_natural(
+        f"Propose a skill called unsafe-runner: {raw}",
+        _provenance(1),
+    )
+
+    assert result is not None
+    assert result.proposal.state is LearningProposalState.REJECTED
+    assert result.proposal.rejection_category is (
+        LearningRejectionCategory.EXECUTABLE_OR_RUNTIME_EFFECT
+    )
+    assert result.proposal.candidate_payload is None
+    assert result.proposed_version is None
+    assert raw not in repr(result.proposal)
+    assert await skills.list() == ()
+    assert store.skills == {}
+
+
 async def test_explicit_accept_activates_audited_versions_and_replays(
     tmp_path: Path,
 ) -> None:

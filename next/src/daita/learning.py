@@ -503,6 +503,56 @@ class LearningProposal:
             created_at=created_at,
         )
 
+    @classmethod
+    def reject(
+        cls,
+        *,
+        proposal_id: str,
+        kind: LearningProposalKind,
+        category: LearningCandidateCategory,
+        provenance: LearningProvenance,
+        candidate: Mapping[str, object],
+        created_at: datetime,
+        rejection_category: LearningRejectionCategory,
+        rejection_reason: str,
+    ) -> LearningProposal:
+        """Build one redacted rejection for a contextually ineligible candidate."""
+
+        if not isinstance(kind, LearningProposalKind):
+            raise TypeError("kind must be a LearningProposalKind")
+        if not isinstance(category, LearningCandidateCategory):
+            raise TypeError("category must be a LearningCandidateCategory")
+        if not isinstance(provenance, LearningProvenance):
+            raise TypeError("provenance must be LearningProvenance")
+        if not isinstance(rejection_category, LearningRejectionCategory):
+            raise TypeError("rejection_category must be LearningRejectionCategory")
+        _required_text(rejection_reason, "learning rejection_reason")
+        safety = validate_learning_candidate(candidate)
+        resolved_category = (
+            rejection_category if safety.allowed else safety.rejection_category
+        )
+        resolved_reason = (
+            rejection_reason if safety.allowed else safety.rejection_reason
+        )
+        assert resolved_category is not None
+        assert resolved_reason is not None
+        return _rejected_proposal(
+            proposal_id=proposal_id,
+            kind=kind,
+            category=category,
+            provenance=provenance,
+            candidate_hash=safety.candidate_hash,
+            idempotency_key=learning_idempotency_key(
+                kind,
+                category,
+                provenance,
+                safety.candidate_hash,
+            ),
+            created_at=created_at,
+            rejection_category=resolved_category,
+            rejection_reason=resolved_reason,
+        )
+
 
 class LearningTransitionError(RuntimeError):
     """Raised when a resolution conflicts with durable proposal state."""

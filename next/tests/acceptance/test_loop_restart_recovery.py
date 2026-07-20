@@ -178,6 +178,19 @@ class CrashAfterCommittedEventStore:
     ) -> tuple[VersionedOperation, ...]:
         return await self.delegate.load_nonterminal(agent_id)
 
+    async def list_operations(
+        self,
+        agent_id: str,
+        *,
+        statuses: tuple[OperationStatus, ...] | None = None,
+        limit: int = 100,
+    ) -> tuple[VersionedOperation, ...]:
+        return await self.delegate.list_operations(
+            agent_id,
+            statuses=statuses,
+            limit=limit,
+        )
+
     async def load_by_trigger(
         self,
         trigger_id: str,

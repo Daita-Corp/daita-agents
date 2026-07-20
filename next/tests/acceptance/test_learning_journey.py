@@ -279,14 +279,7 @@ async def test_public_exact_correction_learning_and_revision_journey(
         source_id=source_id,
         resource_id=resource_id,
     )
-    first_message = ResourceAliasCorrection(
-        source_id=source_id,
-        resource_id=resource_id,
-        resource_revision=old_revision,
-        field="status",
-        business_term="completed",
-        stored_value="complete",
-    ).to_trigger_message()
+    first_message = "Remember that completed status is stored as complete."
     first_correction = await agent.run(
         first_message,
         session_id="session-first-correction",

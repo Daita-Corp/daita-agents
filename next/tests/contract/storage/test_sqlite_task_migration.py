@@ -46,6 +46,7 @@ MIGRATION_SIX_NAME = "normalize_approval_lifecycle"
 MIGRATION_SEVEN_NAME = "add_agent_identity_and_sessions"
 MIGRATION_THIRTEEN_NAME = "persist_task_validation_facts"
 MIGRATION_FOURTEEN_NAME = "bind_agent_runtime_defaults"
+LATEST_MIGRATION_NAME = "bind_configured_extensions"
 LEGACY_RECOVERY_REASON = "legacy_running_task_missing_lease"
 LEGACY_RECOVERY_EVENT_TYPE = "task.manual_recovery_required"
 
@@ -70,6 +71,9 @@ TASK_EXECUTION_COLUMNS = {
     "validation_source_revision": ("TEXT", 0),
     "validation_impact_json": ("TEXT", 1),
     "validation_evidence_ids_json": ("TEXT", 1),
+    "validation_source_ids_json": ("TEXT", 1),
+    "validation_source_revisions_json": ("TEXT", 1),
+    "validation_freshness_state": ("TEXT", 0),
 }
 TASK_DEPENDENCY_COLUMNS = (
     "operation_id",
@@ -481,7 +485,7 @@ async def test_public_schema_migrations_are_fixed_and_reopen_is_idempotent(
         (migration.version, migration.name, migration.checksum)
         for migration in sqlite_owner._MIGRATIONS
     )
-    assert _migration_rows(path)[-1][1] == MIGRATION_FOURTEEN_NAME
+    assert _migration_rows(path)[-1][1] == LATEST_MIGRATION_NAME
     _assert_task_execution_schema(path)
     _assert_evidence_blob_schema(path)
     first_image = _logical_database_image(path)
@@ -514,16 +518,35 @@ async def test_version_four_upgrade_adds_nullable_evidence_blob_id(
     )
     assert "blob_id" not in _columns(backup_path, "evidence")
     _assert_evidence_blob_schema(path)
-    assert _migration_rows(path)[-1][1] == MIGRATION_FOURTEEN_NAME
+    assert _migration_rows(path)[-1][1] == LATEST_MIGRATION_NAME
 
     connection = sqlite3.connect(path)
     try:
         assert connection.execute(
-            "SELECT blob_id FROM evidence WHERE operation_id = ? AND id = ?",
+            "SELECT blob_id, metadata_schema_version, acceptance_reason, "
+            "rejection_reason, "
+            "applicable, applicability_reason, validation_facts_json, "
+            "projection_metadata_json, redaction_metadata_json "
+            "FROM evidence WHERE operation_id = ? AND id = ?",
             (legacy.operation.id, evidence_id),
-        ).fetchone() == (None,)
+        ).fetchone() == (None, 0, None, None, 0, None, "{}", "{}", "{}")
     finally:
         connection.close()
+
+    verifier = await SQLiteOperationStore.open(path)
+    try:
+        loaded = await verifier.load(legacy.operation.id)
+    finally:
+        await verifier.close()
+    persisted = next(
+        item for item in loaded.snapshot.evidence if item.id == evidence_id
+    )
+    assert persisted.metadata_schema_version == 0
+    assert persisted.validation_facts.schema_version == 0
+    assert persisted.acceptance_reason is None
+    assert persisted.rejection_reason is None
+    assert persisted.applicability_reason is None
+    assert persisted.applicable is False
 
     upgraded_image = _logical_database_image(path)
     reopened = await SQLiteOperationStore.open(path)

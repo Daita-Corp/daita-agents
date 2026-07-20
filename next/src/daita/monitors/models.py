@@ -16,6 +16,10 @@ from .._json import FrozenJsonObject, canonical_json
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,127}\Z")
 _HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_THRESHOLD_PATH = re.compile(
+    r"(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+)" r"(?:\.(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+))*\Z"
+)
+_THRESHOLD_OPERATORS = frozenset({"eq", "gt", "gte", "lt", "lte", "ne"})
 _MAX_OBJECTIVE_CHARS = 16_000
 _MAX_SCOPE_IDS = 128
 _MAX_CRON_SEARCH_MINUTES = 5 * 366 * 24 * 60
@@ -325,23 +329,49 @@ class MonitorCondition:
         if not isinstance(self.kind, MonitorConditionKind):
             raise TypeError("monitor condition kind must be MonitorConditionKind")
         expression = self.expression
+        configuration = FrozenJsonObject.from_mapping(self.configuration)
         if self.kind is MonitorConditionKind.ALWAYS:
-            if expression is not None or self.configuration:
+            if expression is not None or configuration:
                 raise ValueError("always conditions cannot contain expression data")
-        else:
-            if expression is None:
-                raise ValueError("expression and threshold conditions require text")
-            expression = _required_text(
-                expression,
-                "monitor condition expression",
-                maximum=4_000,
+        elif self.kind is MonitorConditionKind.EXPRESSION:
+            raise ValueError(
+                "expression monitor conditions are unsupported; use a typed threshold"
             )
+        else:
+            expression = _required_text(
+                expression or "",
+                "monitor threshold path",
+                maximum=512,
+            )
+            if _THRESHOLD_PATH.fullmatch(expression) is None:
+                raise ValueError("monitor threshold path must be canonical dotted text")
+            if set(configuration) not in (
+                {"operator", "value"},
+                {"evidence_kind", "operator", "value"},
+            ):
+                raise ValueError(
+                    "monitor threshold configuration requires operator/value and "
+                    "an optional evidence_kind"
+                )
+            operator = configuration.get("operator")
+            value = configuration.get("value")
+            evidence_kind = configuration.get("evidence_kind")
+            if operator not in _THRESHOLD_OPERATORS:
+                raise ValueError("monitor threshold operator is unsupported")
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError("monitor threshold value must be a finite number")
+            if evidence_kind is not None:
+                if not isinstance(evidence_kind, str):
+                    raise ValueError(
+                        "monitor threshold evidence_kind must be a stable identifier"
+                    )
+                _required_id(evidence_kind, "monitor threshold evidence_kind")
         object.__setattr__(self, "expression", expression)
-        object.__setattr__(
-            self,
-            "configuration",
-            FrozenJsonObject.from_mapping(self.configuration),
-        )
+        object.__setattr__(self, "configuration", configuration)
 
 
 @dataclass(frozen=True, slots=True)

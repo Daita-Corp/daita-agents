@@ -23,6 +23,7 @@ from .errors import (
 from .events import EventAudience, project_committed_event
 from .extensions import (
     ConfiguredExtension,
+    ExtensionBinding,
     ExtensionKind,
     ExtensionLoadError,
     ExtensionManifest,
@@ -33,7 +34,14 @@ from .extensions import (
     tool,
 )
 from .hosting import AgentHost
-from .llm import RetryPolicy, RetryStrategy, create_llm_provider
+from .learning import LearningProposal, LearningProposalState
+from .llm import (
+    ModelRoute,
+    ModelRouteCandidate,
+    RetryPolicy,
+    RetryStrategy,
+    create_llm_provider,
+)
 from .security import (
     CompositeSecretProvider,
     EmptySecretProvider,
@@ -68,6 +76,7 @@ __all__ = [
     "ErrorRetryability",
     "EventAudience",
     "ExtensionKind",
+    "ExtensionBinding",
     "ExtensionLoadError",
     "ExtensionManifest",
     "ExtensionRegistration",
@@ -75,8 +84,12 @@ __all__ = [
     "FocusDSLError",
     "KeychainSecretProvider",
     "LLMError",
+    "LearningProposal",
+    "LearningProposalState",
     "LocalCapability",
     "LocalDirectorySource",
+    "ModelRoute",
+    "ModelRouteCandidate",
     "PermanentError",
     "PluginError",
     "PostgreSQLSource",

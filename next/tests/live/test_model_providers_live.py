@@ -104,6 +104,7 @@ def _first_environment_value(*names: str) -> str:
         if value:
             return value
     pytest.skip(f"requires one of these environment variables: {', '.join(names)}")
+    raise AssertionError("pytest.skip returned unexpectedly")
 
 
 def _provider(case: _LiveProviderCase) -> StreamingModelProvider:

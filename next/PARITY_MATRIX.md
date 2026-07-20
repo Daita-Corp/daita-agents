@@ -20,14 +20,15 @@ The classifications are intentionally separate:
   approval-controlled side effect, SQLite plus sandboxed CSV/JSON, catalog,
   sessions/events/evidence/recovery, basic memory/skills/monitor, and mock plus
   OpenAI. It proves the architecture but is not removable-v1 parity.
-- **cutover** means the replacement-candidate gate in Section 19.2, completed
-  by Phase 9: PostgreSQL, a controlled real write, every retained provider,
-  public-surface and external-package compatibility decisions, packaging,
-  live/reliability/security gates, and tested fresh-start or migration
-  behavior. It still does not authorize Phase 10.
-- **post-MVP** means deliberately deferred beyond the Phase 9 replacement
-  candidate. The surface must be documented as unavailable; it cannot be
-  hidden by calling v1.
+- **cutover** means the replacement-candidate gate definition in Section 19.2.
+  Phase 9 proves PostgreSQL, a controlled real write, every retained provider,
+  public-surface and legacy-package decisions, packaging, live/reliability/
+  security gates, and tested fresh-start behavior. Phase 9.5 additionally
+  proves the joined default-product contracts listed below. Both gates pass;
+  this does not authorize Phase 10.
+- **post-MVP** means deliberately deferred beyond the Phase 9 plus Phase 9.5
+  replacement candidate. The surface must be documented as unavailable; it
+  cannot be hidden by calling v1.
 
 Final dispositions use only these values:
 
@@ -39,6 +40,22 @@ Final dispositions use only these values:
   in migration/release documentation, with no fallback;
 - **proposed removal requiring Phase 10 approval** -- not part of the target
   API and not removable until explicit human approval at Phase 10.
+
+### Phase 9.5 replacement-readiness overlay
+
+The stable rows below remain fully dispositioned, their Phase 9 component
+evidence remains valid, and every cross-row join now passes through the
+supported default composition. The candidate is eligible for human Phase 10
+review, but this matrix does not authorize Phase 10.
+
+| Closure ID | Affected stable rows | Existing owner retained | Required joined proof | Status |
+| --- | --- | --- | --- | --- |
+| P95-READ | MB-RR-05, MB-LG-03, MB-LG-07, MB-LG-08, MB-SP-01, MB-SP-06, API-DB-06 | Data validators, operation runtime, evidence repository, source adapters, router | Exact validator-owned source/resource/revision/sensitivity facts persist before read I/O, govern scope/routing, survive reopen, and appear in canonical acceptance/rejection metadata while adapters still revalidate | complete P9.5-02 |
+| P95-MODEL | MB-SP-01 through MB-SP-05, API-ROOT-13, API-ROOT-17, API-DB-07, API-LLM-01/03 | Agent configuration, model registry/router/factory, secret provider | Persisted provider-neutral primary/fallback route reconstructs after a cold `Agent.open`/host start with secret references only and binds each operation to its route revision | complete P9.5-03 |
+| P95-MONITOR | MB-MO-01 through MB-MO-07, API-DB-09 | Monitor service/scheduler, host, data-domain evidence/readiness projection | Default host enforces confirmed scope and restriction-only effective settings, evaluates every admitted condition, and records zero/one evidence-linked finding across restart/replay | complete P9.5-04 |
+| P95-LEARN | MB-ML-01 through MB-ML-07, API-ROOT-11, API-DB-08 | Learning, memory, provenance, and skill services | Ordinary correction/remember and accepted-evidence inputs enter the governed learning lifecycle; later behavior changes safely; a skill proposal remains inactive until accepted | complete P9.5-05 |
+| P95-EXT | MB-EX-01, API-ROOT-04, API-ROOT-08/10, SURF-05/06 | Extension and capability registries plus normal Agent/host composition | Complete — one explicit capability-provider extension composes atomically with built-ins, projects through normal context, and executes only through the sole runtime; exact durable set binding and missing/drift/collision fail-closed behavior pass in `next/tests/acceptance/test_phase_9_5_extension_composition.py`; resource-adapter/backend-provider extension categories are post-MVP | P9.5-06 complete |
+| P95-UX | API-ROOT-01/03/13, API-DB-05/09, EXT-16/17, SURF-03/05/07 | Agent facade, AgentHost, private local protocol, bundled CLI | Complete — installed first-run, durable model setup, model-free serve, interactive chat, inspection, natural monitor proposal, reconnecting committed-event follow, and the clean-wheel dual-Python cold-reopen lifecycle pass through the real socket | P9.5-07 and P9.5-08 complete |
 
 ## Mandatory behavior-preservation inventory
 
@@ -148,7 +165,7 @@ architecture assigns a coherent owner.
 | API-ROOT-05 | `configure_tracing`, `get_trace_manager`, `set_trace_context` | Event-to-telemetry projection and optional exporter registration | `next/tests/contract/telemetry/test_event_projection.py` | cutover | replace |
 | API-ROOT-06 | `postgresql`, `sqlite` | Built-in resource adapters and declared executors | `next/tests/contract/domains/data/test_relational_read_conformance.py`; `next/tests/acceptance/test_postgresql_catalog_journey.py`; `next/tests/live/test_postgresql_live.py::test_live_postgresql_catalog_and_bounded_read_are_least_privileged` | cutover | replace |
 | API-ROOT-07 | `mysql`, `mongodb`, `rest`, `s3`, `slack`, `elasticsearch`, `redis_messaging` | Future explicit resource/capability adapters; absent from candidate runtime | Phase 9 absence/install-hint and support-matrix checks | post-MVP | defer (documented) |
-| API-ROOT-08 | `BasePlugin`, `ConnectorPlugin`, `DomainServicePlugin`, `ObservabilityPlugin`, `RuntimeExtensionPlugin`, `SkillPlugin`, `WorkerProviderPlugin` | Narrow resource-adapter, capability-provider, backend-provider, manifest, and observer protocols | `next/tests/architecture/test_phase1_loop_architecture.py::test_generic_loop_imports_contracts_not_domain_or_provider_implementations`; Phase 9 extension-boundary assertions | cutover | proposed removal requiring Phase 10 approval |
+| API-ROOT-08 | `BasePlugin`, `ConnectorPlugin`, `DomainServicePlugin`, `ObservabilityPlugin`, `RuntimeExtensionPlugin`, `SkillPlugin`, `WorkerProviderPlugin` | Narrow capability-provider manifest protocol in the MVP; resource adapters, backend providers, and observers remain explicit post-MVP categories | `next/tests/contract/extensions/test_extension_registry.py`; `next/tests/acceptance/test_phase_9_5_extension_composition.py`; `next/tests/architecture/test_phase1_loop_architecture.py::test_generic_loop_imports_contracts_not_domain_or_provider_implementations` | cutover | proposed removal requiring Phase 10 approval |
 | API-ROOT-09 | `EmptySecretProvider`, `SecretProvider` | Injectable secret-provider protocol plus explicit empty/env/keychain implementations | `next/tests/contract/security/test_secret_provider.py` | cutover | replace |
 | API-ROOT-10 | `PluginContext`, `PluginKind`, `PluginManifest`, `ServiceRegistry`, `ExtensionRegistry`, `RegistryDiagnostic` | Validated narrow extension manifest/registry and diagnostics | `next/tests/contract/extensions/test_extension_registry.py` | cutover | replace |
 | API-ROOT-11 | `BaseSkill`, `Skill`, `SkillActivation`, `SkillActivationRules`, `SkillDiscovery`, `SkillResolver`, `SkillResolution` | Versioned `SKILL.md` index, selection, activation, and service records | `next/tests/unit/skills/test_skill_service.py`; `next/tests/acceptance/test_skill_change_lifecycle.py::test_public_skill_change_propose_accept_reopen_lifecycle` | MVP | replace |
@@ -240,6 +257,8 @@ Counted names: `dev`; `sqlite`; `postgresql`; `anthropic`; `google`;
   defer (documented); no external-integration disposition remains.
 - Test-file-level classification is maintained separately in
   `TEST_DISPOSITION.csv` and validated against Git-tracked root tests.
-- The Phase 9 gate resolves every port/replace row to an executable passing v2
-  anchor. Deferred rows are named in candidate support and breaking-change
-  documentation and have no v1 fallback.
+- The Phase 9 gate resolves every individual port/replace row to an executable
+  passing v2 anchor. The Phase 9.5 overlay now records passing joined default-
+  composition evidence, so those rows collectively establish replacement
+  readiness. Deferred rows remain named in support and breaking-change
+  documentation and have no v1 fallback. Phase 10 remains separately gated.

@@ -27,6 +27,7 @@ from daita.operations.models import (
 from daita.operations.runtime import OperationRuntime
 
 NOW = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+RESOURCE_REVISION = "sha256:" + ("a" * 64)
 
 
 class Backend:
@@ -68,7 +69,10 @@ class Catalog:
                 name="orders",
                 aliases=("public.orders",),
                 columns=("id", "status"),
+                revision=RESOURCE_REVISION,
+                source_revision="postgresql-revision-1",
                 resource_kind="table",
+                sensitivity_class="confidential",
                 column_declared_types=(("id", "integer"), ("status", "text")),
             ),
         )
@@ -171,6 +175,15 @@ async def test_controller_routes_postgresql_proposals_to_postgresql_validation()
     valid = await controller.validate_action(valid_call, snapshot)
 
     assert isinstance(valid, ActionProposal)
+    assert valid.validation_facts.source_ids == ("source-postgres",)
+    assert valid.validation_facts.source_revisions == (
+        ("source-postgres", "postgresql-revision-1"),
+    )
+    assert valid.validation_facts.resource_revisions == (
+        ("resource-orders", RESOURCE_REVISION),
+    )
+    assert valid.validation_facts.sensitivity_class == "confidential"
+    assert valid.validation_facts.freshness_state == "current"
 
     invalid_call = ToolCall(
         id="invalid",

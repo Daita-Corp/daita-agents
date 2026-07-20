@@ -398,8 +398,17 @@ async def test_invalid_candidate_is_rejected_before_any_blob_put(
     snapshot = await case.runtime.inspect(case.operation_id)
     assert len(case.executor.requests) == 1
     assert blob_store.requests == []
-    assert snapshot.evidence == ()
+    assert len(snapshot.evidence) == 1
+    rejected = snapshot.evidence[0]
+    assert rejected.accepted is rejected.applicable is False
+    assert not rejected.payload
+    assert rejected.blob_id is None
+    assert dict(rejected.redaction_metadata) == {
+        "artifact": "discarded",
+        "payload": "discarded",
+    }
     assert snapshot.tasks[0].evidence_ids == ()
+    assert any(event.type == "evidence.rejected" for event in snapshot.events)
     assert not any(event.type == "evidence.accepted" for event in snapshot.events)
 
 

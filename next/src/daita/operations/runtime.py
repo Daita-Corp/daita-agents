@@ -39,6 +39,7 @@ from .governance import (
     ApprovalRequest,
     ApprovalStatus,
     DefaultPolicyEvaluator,
+    DefaultPolicyProfile,
     GovernanceDecision,
     GovernanceFacts,
     PolicyEffect,
@@ -185,6 +186,8 @@ class OperationRuntime:
         store: TaskExecutionStore | None = None,
         blob_store: BlobStore | None = None,
         policy: DefaultPolicyEvaluator | None = None,
+        model_route_revision: int | None = None,
+        model_route_fingerprint: str | None = None,
         lease_holder_id: str | None = None,
         lease_duration_seconds: float = 60.0,
     ) -> None:
@@ -206,8 +209,43 @@ class OperationRuntime:
         )
         self._blob_store = blob_store
         self._policy = policy or DefaultPolicyEvaluator()
+        if (model_route_revision is None) != (model_route_fingerprint is None):
+            raise ValueError(
+                "model route revision and fingerprint must be configured together"
+            )
+        self._model_route_revision = model_route_revision
+        self._model_route_fingerprint = model_route_fingerprint
         self._lease_holder_id = lease_holder_id or _random_id("runtime-holder")
         self._lease_duration_seconds = float(lease_duration_seconds)
+
+    def _policy_for_trigger(self, trigger: AgentTrigger) -> DefaultPolicyEvaluator:
+        raw = trigger.payload.get("monitor_effective_policy")
+        if raw is None:
+            return self._policy
+        if trigger.kind is not TriggerKind.MONITOR or not isinstance(raw, Mapping):
+            raise OperationStateError("effective monitor policy has invalid ownership")
+        if set(raw) != {"allow_destructive", "fingerprint", "id", "version"}:
+            raise OperationStateError("effective monitor policy binding is incomplete")
+        try:
+            profile = DefaultPolicyProfile(
+                id=raw["id"],
+                version=raw["version"],
+                allow_destructive=raw["allow_destructive"],
+            )
+        except (TypeError, ValueError) as error:
+            raise OperationStateError(
+                "effective monitor policy binding is invalid"
+            ) from error
+        expected = DefaultPolicyProfile(
+            id=self._policy.profile.id,
+            version=self._policy.profile.version,
+            allow_destructive=False,
+        )
+        if profile != expected or raw["fingerprint"] != profile.fingerprint:
+            raise OperationStateError(
+                "effective monitor policy must be exact and read-only"
+            )
+        return DefaultPolicyEvaluator(profile)
 
     async def begin(
         self,
@@ -221,6 +259,7 @@ class OperationRuntime:
                 raise TypeError("budgets must be a LoopBudgets record")
             if trigger.kind is TriggerKind.EVENT:
                 raise ValueError("event triggers are reserved for a later phase")
+            self._policy_for_trigger(trigger)
 
             now = self._clock()
             operation_id = self._id_factory("operation")
@@ -232,6 +271,8 @@ class OperationRuntime:
                 status=OperationStatus.RUNNING,
                 created_at=now,
                 updated_at=now,
+                model_route_revision=self._model_route_revision,
+                model_route_fingerprint=self._model_route_fingerprint,
             )
             state = _OperationState(
                 revision=0,
@@ -251,7 +292,18 @@ class OperationRuntime:
                 events=[],
             )
             self._append_event(state, "trigger.received")
-            self._append_event(state, "operation.created")
+            self._append_event(
+                state,
+                "operation.created",
+                payload=(
+                    {}
+                    if self._model_route_revision is None
+                    else {
+                        "model_route_fingerprint": self._model_route_fingerprint,
+                        "model_route_revision": self._model_route_revision,
+                    }
+                ),
+            )
             try:
                 committed, cancellation_requested = await _await_store_write(
                     self._store.create(self._snapshot(state))
@@ -763,7 +815,10 @@ class OperationRuntime:
             self._resolve_task_execution(task)
             facts = self._governance_facts(state, task)
             now = self._clock()
-            decision = self._policy.evaluate(facts, evaluated_at=now)
+            decision = self._policy_for_trigger(state.trigger).evaluate(
+                facts,
+                evaluated_at=now,
+            )
             model_call = self._completed_model_call_for_turn(state, task.turn_id)
             event_fields = {
                 "turn_id": task.turn_id,
@@ -991,7 +1046,7 @@ class OperationRuntime:
                     raise OperationStateError("approval task is not waiting")
                 self._resolve_task_execution(task)
                 facts = self._governance_facts(state, task)
-                current_decision = self._policy.evaluate(
+                current_decision = self._policy_for_trigger(state.trigger).evaluate(
                     facts,
                     evaluated_at=self._clock(),
                 )
@@ -1345,7 +1400,9 @@ class OperationRuntime:
                 sorted(evidence.kind for evidence in validation_evidence)
             )
             required_evidence_kinds = tuple(sorted(capability.required_evidence_kinds))
-            if selected_evidence_kinds != required_evidence_kinds:
+            if required_evidence_kinds and (
+                selected_evidence_kinds != required_evidence_kinds
+            ):
                 raise OperationStateError(
                     "validation facts do not match capability-required evidence"
                 )
@@ -1744,11 +1801,48 @@ class OperationRuntime:
                 f"executor identity changed for task {task.id}"
             ) from execution_identity_error
         if validation_error is not None:
+            capability = self._capabilities.capability(task.capability_id)
+            rejected_payload: dict[str, object] = {}
+            rejected_evidence = Evidence(
+                id=self._id_factory("evidence"),
+                operation_id=task.operation_id,
+                task_id=task.id,
+                turn_id=task.turn_id,
+                capability_id=task.capability_id,
+                executor_id=task.executor_id,
+                kind=capability.output_evidence_kind,
+                schema_version=capability.output_schema_version,
+                attempt=task.attempt,
+                accepted=False,
+                payload=rejected_payload,
+                content_hash=(
+                    "sha256:"
+                    + hashlib.sha256(
+                        canonical_json(rejected_payload).encode("utf-8")
+                    ).hexdigest()
+                ),
+                created_at=task.updated_at,
+                metadata_schema_version=1,
+                rejection_reason="schema_validation_failed",
+                applicable=False,
+                applicability_reason="rejected_before_acceptance",
+                validation_facts=task.execution_facts.validation_facts,
+                projection_metadata={
+                    "audit": "bounded_metadata",
+                    "model": "omitted",
+                    "public": "omitted",
+                },
+                redaction_metadata={
+                    "artifact": "discarded",
+                    "payload": "discarded",
+                },
+            )
             outcome_unknown = await self._record_execution_failure(
                 task.operation_id,
                 task.id,
                 guard,
                 "evidence_rejected",
+                rejected_evidence=rejected_evidence,
             )
             if outcome_unknown and not task.execution_facts.replay_safe:
                 raise TaskOutcomeUnknown(
@@ -1856,6 +1950,22 @@ class OperationRuntime:
                     ),
                     created_at=placeholder_time,
                     blob_id=(None if blob_metadata is None else blob_metadata.blob_id),
+                    metadata_schema_version=1,
+                    acceptance_reason="schema_validated",
+                    applicable=True,
+                    applicability_reason="current_operation",
+                    validation_facts=(committed_task.execution_facts.validation_facts),
+                    projection_metadata={
+                        "audit": "bounded_metadata",
+                        "model": "bounded_observation",
+                        "public": "bounded_projection",
+                    },
+                    redaction_metadata={
+                        "artifact": (
+                            "retained" if blob_metadata is not None else "none"
+                        ),
+                        "payload": "retained_bounded",
+                    },
                 )
                 state.evidence.append(evidence)
                 state.tasks[task_index] = replace(
@@ -2647,6 +2757,7 @@ class OperationRuntime:
         error_code: str,
         *,
         known_no_effect: bool = False,
+        rejected_evidence: Evidence | None = None,
     ) -> bool:
         """Record failure and report whether external outcome remains unknown."""
 
@@ -2681,6 +2792,32 @@ class OperationRuntime:
                     state,
                     task.turn_id,
                 )
+                if rejected_evidence is not None:
+                    if (
+                        rejected_evidence.task_id != task.id
+                        or rejected_evidence.operation_id != task.operation_id
+                        or rejected_evidence.accepted
+                    ):
+                        raise OperationStateError(
+                            "rejected evidence does not match its running task"
+                        )
+                    state.evidence.append(rejected_evidence)
+                    self._append_event(
+                        state,
+                        "evidence.rejected",
+                        turn_id=task.turn_id,
+                        model_call_id=model_call.id,
+                        call_id=task.call_id,
+                        task_id=task.id,
+                        evidence_id=rejected_evidence.id,
+                        capability_id=task.capability_id,
+                        executor_id=task.executor_id,
+                        payload={
+                            "evidence_id": rejected_evidence.id,
+                            "reason": rejected_evidence.rejection_reason,
+                            "task_id": task.id,
+                        },
+                    )
                 self._append_event(
                     state,
                     "task.outcome_unknown",
@@ -2709,7 +2846,13 @@ class OperationRuntime:
                         return True
                     raise
         if fail_known_safe:
-            await self._fail_task(operation_id, task_id, guard, error_code)
+            await self._fail_task(
+                operation_id,
+                task_id,
+                guard,
+                error_code,
+                rejected_evidence=rejected_evidence,
+            )
         return outcome_unknown
 
     async def _fail_task(
@@ -2718,6 +2861,8 @@ class OperationRuntime:
         task_id: str,
         guard: TaskLeaseGuard,
         error_code: str,
+        *,
+        rejected_evidence: Evidence | None = None,
     ) -> None:
         async with self._lock:
             state = await self._working_state(operation_id)
@@ -2747,6 +2892,32 @@ class OperationRuntime:
                 released_at=release_placeholder,
                 release_reason=error_code,
             )
+            if rejected_evidence is not None:
+                if (
+                    rejected_evidence.task_id != task.id
+                    or rejected_evidence.operation_id != task.operation_id
+                    or rejected_evidence.accepted
+                ):
+                    raise OperationStateError(
+                        "rejected evidence does not match its running task"
+                    )
+                state.evidence.append(rejected_evidence)
+                self._append_event(
+                    state,
+                    "evidence.rejected",
+                    turn_id=task.turn_id,
+                    model_call_id=model_call.id,
+                    call_id=task.call_id,
+                    task_id=task.id,
+                    evidence_id=rejected_evidence.id,
+                    capability_id=task.capability_id,
+                    executor_id=task.executor_id,
+                    payload={
+                        "evidence_id": rejected_evidence.id,
+                        "reason": rejected_evidence.rejection_reason,
+                        "task_id": task.id,
+                    },
+                )
             self._append_event(
                 state,
                 "task.failed",

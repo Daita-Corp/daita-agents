@@ -40,6 +40,12 @@ def test_monitor_package_has_no_alternate_execution_or_provider_path() -> None:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for module in _modules(tree):
             normalized = module.lstrip(".")
+            if path.name in {"scheduler.py", "service.py"} and normalized == (
+                "loop.models"
+            ):
+                # Monitors restrict the canonical LoopBudgets value only; the
+                # host remains the runner and sole background-work owner.
+                continue
             if any(
                 normalized == forbidden or normalized.startswith(forbidden + ".")
                 for forbidden in forbidden_imports

@@ -64,6 +64,12 @@ from ..events.protocols import (
     EventCursorMismatchError,
     EventCursorNotFoundError,
 )
+from ..extensions.manifest import (
+    ExtensionBinding,
+    ExtensionBindingConflictError,
+    ExtensionKind,
+    extension_set_fingerprint,
+)
 from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..hosting.inbox import (
     HostInboxEnqueueConflictError,
@@ -105,7 +111,14 @@ from ..llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from ..llm.protocols import ModelProfileConflictError
+from ..llm.errors import ProviderErrorCode
+from ..llm.protocols import ModelProfileConflictError, ModelRouteConflictError
+from ..llm.routing import (
+    ModelRoute,
+    ModelRouteCandidate,
+    RetryPolicy,
+    RetryStrategy,
+)
 from ..loop.models import LoopBudgets, LoopPhase, LoopState, Readiness, Turn
 from ..memory.models import (
     MemoryCreator,
@@ -196,6 +209,7 @@ from ..operations.models import (
     TaskStatus,
     TriggerKind,
 )
+from ..security.secrets import SecretReference
 from ..operations.store import (
     CommitResult,
     InvalidOperationCheckpointError,
@@ -213,6 +227,8 @@ from ..operations.store import (
     _prepare_fenced_task_commit,
     _prepare_task_claim,
     _prepare_task_lease_renewal,
+    _operation_list_limit,
+    _operation_status_filter,
     _require_bounded_lease_duration,
     _require_lease_duration,
     _require_revision,
@@ -2559,6 +2575,289 @@ _AGENT_RUNTIME_DEFAULTS_SCHEMA_SQL = (
 )
 
 
+_TRUSTED_READ_EVIDENCE_SCHEMA_SQL = (
+    """
+    ALTER TABLE tasks ADD COLUMN validation_source_ids_json TEXT NOT NULL
+        DEFAULT '[]'
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_source_revisions_json TEXT NOT NULL
+        DEFAULT '[]'
+    """.strip(),
+    """
+    ALTER TABLE tasks ADD COLUMN validation_freshness_state TEXT CHECK (
+        validation_freshness_state IS NULL
+        OR validation_freshness_state = 'current'
+    )
+    """.strip(),
+    """
+    ALTER TABLE evidence ADD COLUMN metadata_schema_version INTEGER NOT NULL
+        DEFAULT 0 CHECK (metadata_schema_version IN (0, 1))
+    """.strip(),
+    """
+    ALTER TABLE evidence ADD COLUMN acceptance_reason TEXT CHECK (
+        acceptance_reason IS NULL
+        OR length(trim(acceptance_reason)) BETWEEN 1 AND 256
+    )
+    """.strip(),
+    """
+    ALTER TABLE evidence ADD COLUMN rejection_reason TEXT CHECK (
+        rejection_reason IS NULL
+        OR length(trim(rejection_reason)) BETWEEN 1 AND 256
+    )
+    """.strip(),
+    """
+    ALTER TABLE evidence ADD COLUMN applicable INTEGER NOT NULL DEFAULT 0
+        CHECK (applicable IN (0, 1))
+    """.strip(),
+    """
+    ALTER TABLE evidence ADD COLUMN applicability_reason TEXT CHECK (
+        applicability_reason IS NULL
+        OR length(trim(applicability_reason)) BETWEEN 1 AND 256
+    )
+    """.strip(),
+    """
+    ALTER TABLE evidence ADD COLUMN validation_facts_json TEXT NOT NULL DEFAULT '{}'
+    """.strip(),
+    """
+    ALTER TABLE evidence ADD COLUMN projection_metadata_json TEXT NOT NULL DEFAULT '{}'
+    """.strip(),
+    """
+    ALTER TABLE evidence ADD COLUMN redaction_metadata_json TEXT NOT NULL DEFAULT '{}'
+        CHECK (
+            metadata_schema_version = 1
+            OR (
+                acceptance_reason IS NULL
+                AND rejection_reason IS NULL
+                AND applicable = 0
+                AND applicability_reason IS NULL
+                AND validation_facts_json = '{}'
+                AND projection_metadata_json = '{}'
+                AND redaction_metadata_json = '{}'
+            )
+        )
+    """.strip(),
+)
+
+
+_MODEL_ROUTE_SCHEMA_SQL = (
+    """
+    CREATE TABLE agent_model_routes (
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        fingerprint TEXT NOT NULL CHECK (
+            length(fingerprint) = 71 AND fingerprint GLOB 'sha256:[0-9a-f]*'
+        ),
+        retry_schema_version INTEGER NOT NULL CHECK (retry_schema_version = 1),
+        retry_max_attempts INTEGER NOT NULL CHECK (
+            retry_max_attempts BETWEEN 1 AND 4
+        ),
+        retry_strategy TEXT NOT NULL CHECK (
+            retry_strategy IN ('fixed', 'exponential', 'linear')
+        ),
+        retry_base_delay_seconds REAL NOT NULL CHECK (
+            retry_base_delay_seconds >= 0
+        ),
+        retry_max_delay_seconds REAL NOT NULL CHECK (
+            retry_max_delay_seconds >= retry_base_delay_seconds
+        ),
+        retryable_codes_json TEXT NOT NULL,
+        configured_at TEXT NOT NULL,
+        PRIMARY KEY (agent_id, revision)
+    ) WITHOUT ROWID
+    """.strip(),
+    """
+    CREATE TABLE agent_model_route_candidates (
+        agent_id TEXT NOT NULL,
+        route_revision INTEGER NOT NULL,
+        position INTEGER NOT NULL CHECK (position >= 0 AND position < 8),
+        profile_id TEXT NOT NULL,
+        context_window_tokens INTEGER NOT NULL CHECK (context_window_tokens > 0),
+        max_output_tokens INTEGER NOT NULL CHECK (
+            max_output_tokens > 0 AND max_output_tokens < context_window_tokens
+        ),
+        supports_tools INTEGER NOT NULL CHECK (supports_tools IN (0, 1)),
+        supports_parallel_tools INTEGER NOT NULL CHECK (
+            supports_parallel_tools IN (0, 1)
+        ),
+        supports_structured_output INTEGER NOT NULL CHECK (
+            supports_structured_output IN (0, 1)
+        ),
+        supports_streaming INTEGER NOT NULL CHECK (supports_streaming IN (0, 1)),
+        supports_reasoning INTEGER NOT NULL CHECK (supports_reasoning IN (0, 1)),
+        supports_vision INTEGER NOT NULL CHECK (supports_vision IN (0, 1)),
+        supports_documents INTEGER NOT NULL CHECK (supports_documents IN (0, 1)),
+        supports_prompt_caching INTEGER NOT NULL CHECK (
+            supports_prompt_caching IN (0, 1)
+        ),
+        supports_native_continuation INTEGER NOT NULL CHECK (
+            supports_native_continuation IN (0, 1)
+        ),
+        input_cost_per_million_usd TEXT,
+        output_cost_per_million_usd TEXT,
+        data_routing_classification TEXT NOT NULL,
+        available INTEGER NOT NULL CHECK (available IN (0, 1)),
+        healthy INTEGER NOT NULL CHECK (healthy IN (0, 1)),
+        allowed_sensitivities_json TEXT NOT NULL,
+        base_url TEXT,
+        secret_scheme TEXT CHECK (
+            secret_scheme IS NULL OR secret_scheme IN ('env', 'keychain')
+        ),
+        secret_name TEXT,
+        PRIMARY KEY (agent_id, route_revision, position),
+        UNIQUE (agent_id, route_revision, profile_id),
+        FOREIGN KEY (agent_id, route_revision)
+            REFERENCES agent_model_routes(agent_id, revision),
+        CHECK (supports_parallel_tools = 0 OR supports_tools = 1),
+        CHECK ((secret_scheme IS NULL) = (secret_name IS NULL))
+    ) WITHOUT ROWID
+    """.strip(),
+    """
+    CREATE TABLE agent_model_route_heads (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        fingerprint TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (agent_id, revision)
+            REFERENCES agent_model_routes(agent_id, revision)
+    ) WITHOUT ROWID
+    """.strip(),
+    """
+    CREATE TRIGGER agent_model_routes_reject_update
+    BEFORE UPDATE ON agent_model_routes
+    BEGIN
+        SELECT RAISE(ABORT, 'agent model routes are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER agent_model_routes_reject_delete
+    BEFORE DELETE ON agent_model_routes
+    BEGIN
+        SELECT RAISE(ABORT, 'agent model routes are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER agent_model_route_candidates_reject_update
+    BEFORE UPDATE ON agent_model_route_candidates
+    BEGIN
+        SELECT RAISE(ABORT, 'agent model route candidates are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER agent_model_route_candidates_reject_delete
+    BEFORE DELETE ON agent_model_route_candidates
+    BEGIN
+        SELECT RAISE(ABORT, 'agent model route candidates are append-only');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER agent_model_route_heads_validate_update
+    BEFORE UPDATE ON agent_model_route_heads
+    BEGIN
+        SELECT CASE
+            WHEN NEW.agent_id != OLD.agent_id
+                OR NEW.revision != OLD.revision + 1
+                OR NOT EXISTS (
+                    SELECT 1 FROM agent_model_routes AS route
+                    WHERE route.agent_id = NEW.agent_id
+                        AND route.revision = NEW.revision
+                        AND route.fingerprint = NEW.fingerprint
+                )
+            THEN RAISE(ABORT, 'invalid model route head transition')
+        END;
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER agent_model_route_heads_reject_delete
+    BEFORE DELETE ON agent_model_route_heads
+    BEGIN
+        SELECT RAISE(ABORT, 'agent model route head cannot be deleted');
+    END
+    """.strip(),
+    """
+    ALTER TABLE operations ADD COLUMN model_route_revision INTEGER CHECK (
+        model_route_revision IS NULL OR model_route_revision >= 1
+    )
+    """.strip(),
+    """
+    ALTER TABLE operations ADD COLUMN model_route_fingerprint TEXT CHECK (
+        (model_route_revision IS NULL AND model_route_fingerprint IS NULL)
+        OR (
+            model_route_revision IS NOT NULL
+            AND length(model_route_fingerprint) = 71
+            AND model_route_fingerprint GLOB 'sha256:[0-9a-f]*'
+        )
+    )
+    """.strip(),
+)
+
+
+_EXTENSION_BINDING_SCHEMA_SQL = (
+    """
+    CREATE TABLE agent_extension_sets (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        fingerprint TEXT NOT NULL CHECK (
+            length(fingerprint) = 71 AND fingerprint GLOB 'sha256:[0-9a-f]*'
+        ),
+        extension_count INTEGER NOT NULL CHECK (
+            extension_count BETWEEN 0 AND 64
+        ),
+        configured_at TEXT NOT NULL
+    ) WITHOUT ROWID
+    """.strip(),
+    """
+    CREATE TABLE agent_extensions (
+        agent_id TEXT NOT NULL,
+        position INTEGER NOT NULL CHECK (position BETWEEN 0 AND 63),
+        extension_id TEXT NOT NULL,
+        version TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind = 'capability_provider'),
+        declaration_fingerprint TEXT NOT NULL CHECK (
+            length(declaration_fingerprint) = 71
+            AND declaration_fingerprint GLOB 'sha256:[0-9a-f]*'
+        ),
+        manifest_fingerprint TEXT NOT NULL CHECK (
+            length(manifest_fingerprint) = 71
+            AND manifest_fingerprint GLOB 'sha256:[0-9a-f]*'
+        ),
+        PRIMARY KEY (agent_id, position),
+        UNIQUE (agent_id, extension_id),
+        FOREIGN KEY (agent_id) REFERENCES agent_extension_sets(agent_id)
+    ) WITHOUT ROWID
+    """.strip(),
+    """
+    CREATE TRIGGER agent_extension_sets_reject_update
+    BEFORE UPDATE ON agent_extension_sets
+    BEGIN
+        SELECT RAISE(ABORT, 'agent extension set is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER agent_extension_sets_reject_delete
+    BEFORE DELETE ON agent_extension_sets
+    BEGIN
+        SELECT RAISE(ABORT, 'agent extension set cannot be deleted');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER agent_extensions_reject_update
+    BEFORE UPDATE ON agent_extensions
+    BEGIN
+        SELECT RAISE(ABORT, 'agent extension bindings are immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER agent_extensions_reject_delete
+    BEFORE DELETE ON agent_extensions
+    BEGIN
+        SELECT RAISE(ABORT, 'agent extension bindings cannot be deleted');
+    END
+    """.strip(),
+)
+
+
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
 # Migration 3 assigns one append-only committed-event sequence per agent.
@@ -2592,6 +2891,14 @@ _AGENT_RUNTIME_DEFAULTS_SCHEMA_SQL = (
 # Migration 14 binds future-operation budgets and default policy once per agent.
 # Model and retry-route configuration remains in the immutable model-profile
 # binding, whose router identity includes the complete retry-policy fingerprint.
+# Migration 15 carries multi-source/freshness validation facts and canonical
+# evidence acceptance/applicability/projection/redaction metadata. Existing rows
+# retain schema-zero evidence metadata and gain no invented read authority.
+# Migration 16 adds append-only provider-neutral route revisions, one CAS head,
+# and immutable per-operation route binding. Legacy profile-only homes and
+# operations remain unconfigured/nullable rather than gaining invented routes.
+# Migration 17 binds the exact ordered configured capability-extension set.
+# Legacy Agent Homes gain no invented binding and remain valid with no extension.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -2662,6 +2969,21 @@ _MIGRATIONS = (
         version=14,
         name="bind_agent_runtime_defaults",
         statements=_AGENT_RUNTIME_DEFAULTS_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=15,
+        name="persist_trusted_read_and_evidence_metadata",
+        statements=_TRUSTED_READ_EVIDENCE_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=16,
+        name="persist_reconstructable_model_routes",
+        statements=_MODEL_ROUTE_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=17,
+        name="bind_configured_extensions",
+        statements=_EXTENSION_BINDING_SCHEMA_SQL,
     ),
 )
 
@@ -2882,6 +3204,74 @@ class SQLiteOperationStore:
             lambda connection: _load_agent_model_profile(connection, agent_id)
         )
 
+    async def set_model_route(
+        self,
+        agent_id: str,
+        route: ModelRoute,
+        *,
+        expected_revision: int,
+    ) -> ModelRoute:
+        """Append and activate one exact route revision by compare-and-set."""
+
+        _require_identity(agent_id, "agent_id")
+        if not isinstance(route, ModelRoute):
+            raise TypeError("route must be a ModelRoute")
+        if (
+            not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 0
+        ):
+            raise ValueError("expected_revision must be a non-negative integer")
+        configured_at = self._clock()
+        return await self._run_connection(
+            lambda connection: _set_agent_model_route(
+                connection,
+                agent_id,
+                route,
+                expected_revision=expected_revision,
+                configured_at=configured_at,
+            )
+        )
+
+    async def load_model_route(self, agent_id: str) -> ModelRoute | None:
+        """Load the active provider-neutral route, if one is configured."""
+
+        _require_identity(agent_id, "agent_id")
+        return await self._run_connection(
+            lambda connection: _load_agent_model_route(connection, agent_id)
+        )
+
+    async def bind_extension_bindings(
+        self,
+        agent_id: str,
+        bindings: tuple[ExtensionBinding, ...],
+    ) -> tuple[ExtensionBinding, ...]:
+        """Bind or verify one immutable explicitly configured extension set."""
+
+        _require_identity(agent_id, "agent_id")
+        values = tuple(bindings)
+        extension_set_fingerprint(values)
+        configured_at = self._clock()
+        return await self._run_connection(
+            lambda connection: _bind_agent_extension_set(
+                connection,
+                agent_id,
+                values,
+                configured_at=configured_at,
+            )
+        )
+
+    async def load_extension_bindings(
+        self,
+        agent_id: str,
+    ) -> tuple[ExtensionBinding, ...] | None:
+        """Load the exact retained extension set without executable factories."""
+
+        _require_identity(agent_id, "agent_id")
+        return await self._run_connection(
+            lambda connection: _load_agent_extension_set(connection, agent_id)
+        )
+
     async def create_session(self, session: Session) -> Session:
         """Persist one stable session identity before its first operation."""
 
@@ -3097,6 +3487,28 @@ class SQLiteOperationStore:
             lambda connection: _load_resource_alias(
                 connection,
                 scope,
+                logical_key,
+            )
+        )
+
+    async def load_learning_memory(
+        self,
+        scope: MemoryScope,
+        kind: MemoryKind,
+        logical_key: str,
+    ) -> MemoryHistory | None:
+        """Load one exact learning-owned memory identity."""
+
+        if not isinstance(scope, MemoryScope):
+            raise TypeError("scope must be a MemoryScope")
+        if kind not in {MemoryKind.RESOURCE_ALIAS, MemoryKind.SEMANTIC_FACT}:
+            raise ValueError("learning memory kind is unsupported")
+        _require_identity(logical_key, "logical_key")
+        return await self._run_connection(
+            lambda connection: _load_learning_memory_in_transaction(
+                connection,
+                scope,
+                kind,
                 logical_key,
             )
         )
@@ -3770,6 +4182,27 @@ class SQLiteOperationStore:
         _require_identity(agent_id, "agent_id")
         return await self._run_connection(
             lambda connection: _load_nonterminal_operations(connection, agent_id)
+        )
+
+    async def list_operations(
+        self,
+        agent_id: str,
+        *,
+        statuses: tuple[OperationStatus, ...] | None = None,
+        limit: int = 100,
+    ) -> tuple[VersionedOperation, ...]:
+        """List bounded newest-first checkpoints for one agent."""
+
+        _require_identity(agent_id, "agent_id")
+        selected_statuses = _operation_status_filter(statuses)
+        _operation_list_limit(limit)
+        return await self._run_connection(
+            lambda connection: _list_operations(
+                connection,
+                agent_id,
+                statuses=selected_statuses,
+                limit=limit,
+            )
         )
 
     async def load_by_trigger(
@@ -4923,46 +5356,462 @@ def _load_agent_model_profile(
         )
     row = rows[0]
     try:
-        input_cost = row["input_cost_per_million_usd"]
-        output_cost = row["output_cost_per_million_usd"]
-        return ModelProfile(
-            id=_sqlite_text(row["profile_id"], "model-profile id"),
-            context_window_tokens=_sqlite_int(
-                row["context_window_tokens"],
-                "model-profile context_window_tokens",
-            ),
-            max_output_tokens=_sqlite_int(
-                row["max_output_tokens"],
-                "model-profile max_output_tokens",
-            ),
-            supports_tools=_decode_bool(row["supports_tools"]),
-            supports_parallel_tools=_decode_bool(row["supports_parallel_tools"]),
-            supports_structured_output=_decode_bool(row["supports_structured_output"]),
-            supports_streaming=_decode_bool(row["supports_streaming"]),
-            supports_reasoning=_decode_bool(row["supports_reasoning"]),
-            supports_vision=_decode_bool(row["supports_vision"]),
-            supports_documents=_decode_bool(row["supports_documents"]),
-            supports_prompt_caching=_decode_bool(row["supports_prompt_caching"]),
-            supports_native_continuation=_decode_bool(
-                row["supports_native_continuation"]
-            ),
-            input_cost_per_million_usd=(
-                None if input_cost is None else _decode_decimal(input_cost)
-            ),
-            output_cost_per_million_usd=(
-                None if output_cost is None else _decode_decimal(output_cost)
-            ),
-            data_routing_classification=_sqlite_text(
-                row["data_routing_classification"],
-                "model-profile data_routing_classification",
-            ),
-            available=_decode_bool(row["available"]),
-            healthy=_decode_bool(row["healthy"]),
-        )
+        return _decode_model_profile_row(row)
     except (InvalidOperation, TypeError, ValueError) as error:
         raise SQLiteCorruptionError(
             "cannot reconstruct authoritative agent model profile"
         ) from error
+
+
+def _set_agent_model_route(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    route: ModelRoute,
+    *,
+    expected_revision: int,
+    configured_at: datetime,
+) -> ModelRoute:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != agent_id:
+            raise ModelRouteConflictError(
+                "model route belongs to another or uninitialized agent"
+            )
+        current = _load_agent_model_route(connection, agent_id)
+        if current == route and expected_revision in {
+            route.revision - 1,
+            route.revision,
+        }:
+            connection.execute("COMMIT")
+            return route
+        current_revision = 0 if current is None else current.revision
+        if expected_revision != current_revision:
+            raise ModelRouteConflictError(
+                "model route revision changed before compare-and-set"
+            )
+        if route.revision != current_revision + 1:
+            raise ModelRouteConflictError(
+                "model route revision must advance exactly once"
+            )
+        nonterminal = connection.execute(
+            "SELECT id FROM operations WHERE agent_id = ? AND status IN ("
+            + ", ".join("?" for _ in _NONTERMINAL_OPERATION_STATUSES)
+            + ") LIMIT 1",
+            (
+                agent_id,
+                *(status.value for status in _NONTERMINAL_OPERATION_STATUSES),
+            ),
+        ).fetchone()
+        if nonterminal is not None:
+            raise ModelRouteConflictError(
+                "model route cannot change while an operation is nonterminal"
+            )
+        retry = route.retry_policy
+        connection.execute(
+            "INSERT INTO agent_model_routes("
+            "agent_id, revision, schema_version, fingerprint, "
+            "retry_schema_version, retry_max_attempts, retry_strategy, "
+            "retry_base_delay_seconds, retry_max_delay_seconds, "
+            "retryable_codes_json, configured_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                agent_id,
+                route.revision,
+                route.schema_version,
+                route.fingerprint,
+                retry.schema_version,
+                retry.max_attempts_per_provider,
+                retry.strategy.value,
+                retry.base_delay_seconds,
+                retry.max_delay_seconds,
+                canonical_json(sorted(item.value for item in retry.retryable_codes)),
+                _encode_datetime(configured_at),
+            ),
+        )
+        for position, candidate in enumerate(route.candidates):
+            profile = candidate.profile
+            secret = candidate.secret_reference
+            values = (
+                agent_id,
+                route.revision,
+                position,
+                profile.id,
+                profile.context_window_tokens,
+                profile.max_output_tokens,
+                int(profile.supports_tools),
+                int(profile.supports_parallel_tools),
+                int(profile.supports_structured_output),
+                int(profile.supports_streaming),
+                int(profile.supports_reasoning),
+                int(profile.supports_vision),
+                int(profile.supports_documents),
+                int(profile.supports_prompt_caching),
+                int(profile.supports_native_continuation),
+                (
+                    None
+                    if profile.input_cost_per_million_usd is None
+                    else _encode_decimal(profile.input_cost_per_million_usd)
+                ),
+                (
+                    None
+                    if profile.output_cost_per_million_usd is None
+                    else _encode_decimal(profile.output_cost_per_million_usd)
+                ),
+                profile.data_routing_classification,
+                int(profile.available),
+                int(profile.healthy),
+                canonical_json(
+                    sorted(item.value for item in candidate.allowed_sensitivities)
+                ),
+                candidate.base_url,
+                None if secret is None else secret.scheme,
+                None if secret is None else secret.name,
+            )
+            connection.execute(
+                "INSERT INTO agent_model_route_candidates("
+                "agent_id, route_revision, position, profile_id, "
+                "context_window_tokens, max_output_tokens, supports_tools, "
+                "supports_parallel_tools, supports_structured_output, "
+                "supports_streaming, supports_reasoning, supports_vision, "
+                "supports_documents, supports_prompt_caching, "
+                "supports_native_continuation, input_cost_per_million_usd, "
+                "output_cost_per_million_usd, data_routing_classification, "
+                "available, healthy, allowed_sensitivities_json, base_url, "
+                "secret_scheme, secret_name"
+                ") VALUES (" + ", ".join("?" for _ in values) + ")",
+                values,
+            )
+        if current is None:
+            connection.execute(
+                "INSERT INTO agent_model_route_heads("
+                "agent_id, revision, fingerprint, updated_at"
+                ") VALUES (?, ?, ?, ?)",
+                (
+                    agent_id,
+                    route.revision,
+                    route.fingerprint,
+                    _encode_datetime(configured_at),
+                ),
+            )
+        else:
+            updated = connection.execute(
+                "UPDATE agent_model_route_heads SET revision = ?, "
+                "fingerprint = ?, updated_at = ? WHERE agent_id = ? "
+                "AND revision = ? AND fingerprint = ?",
+                (
+                    route.revision,
+                    route.fingerprint,
+                    _encode_datetime(configured_at),
+                    agent_id,
+                    current.revision,
+                    current.fingerprint,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ModelRouteConflictError(
+                    "model route head changed before compare-and-set"
+                )
+        connection.execute("COMMIT")
+        return route
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_agent_model_route(
+    connection: sqlite3.Connection,
+    agent_id: str,
+) -> ModelRoute | None:
+    try:
+        heads = connection.execute(
+            "SELECT revision, fingerprint FROM agent_model_route_heads "
+            "WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchall()
+        if not heads:
+            return None
+        if len(heads) != 1:
+            raise ValueError("agent database contains duplicate model-route heads")
+        head = heads[0]
+        revision = _sqlite_int(head["revision"], "model-route head revision")
+        fingerprint = _sqlite_text(
+            head["fingerprint"],
+            "model-route head fingerprint",
+        )
+        rows = connection.execute(
+            "SELECT * FROM agent_model_routes WHERE agent_id = ? AND revision = ?",
+            (agent_id, revision),
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError("active model-route record is missing or duplicated")
+        row = rows[0]
+        candidate_rows = connection.execute(
+            "SELECT * FROM agent_model_route_candidates "
+            "WHERE agent_id = ? AND route_revision = ? ORDER BY position",
+            (agent_id, revision),
+        ).fetchall()
+        if tuple(
+            _sqlite_int(item["position"], "model-route candidate position")
+            for item in candidate_rows
+        ) != tuple(range(len(candidate_rows))):
+            raise ValueError("model-route candidate positions are not contiguous")
+        retryable_codes = frozenset(
+            ProviderErrorCode(item)
+            for item in _decode_string_tuple(
+                _sqlite_text(
+                    row["retryable_codes_json"],
+                    "model-route retryable codes",
+                )
+            )
+        )
+        candidates = tuple(
+            ModelRouteCandidate(
+                profile=_decode_model_profile_row(item),
+                allowed_sensitivities=frozenset(
+                    ModelSensitivity(value)
+                    for value in _decode_string_tuple(
+                        _sqlite_text(
+                            item["allowed_sensitivities_json"],
+                            "model-route allowed sensitivities",
+                        )
+                    )
+                ),
+                base_url=_optional_text(item["base_url"]),
+                secret_reference=(
+                    None
+                    if item["secret_scheme"] is None
+                    else SecretReference(
+                        scheme=_sqlite_text(
+                            item["secret_scheme"],
+                            "model-route secret scheme",
+                        ),
+                        name=_sqlite_text(
+                            item["secret_name"],
+                            "model-route secret name",
+                        ),
+                    )
+                ),
+            )
+            for item in candidate_rows
+        )
+        route = ModelRoute(
+            candidates=candidates,
+            retry_policy=RetryPolicy(
+                schema_version=_sqlite_int(
+                    row["retry_schema_version"],
+                    "model-route retry schema version",
+                ),
+                max_attempts_per_provider=_sqlite_int(
+                    row["retry_max_attempts"],
+                    "model-route retry maximum attempts",
+                ),
+                strategy=RetryStrategy(
+                    _sqlite_text(
+                        row["retry_strategy"],
+                        "model-route retry strategy",
+                    )
+                ),
+                base_delay_seconds=_sqlite_real(
+                    row["retry_base_delay_seconds"],
+                    "model-route retry base delay",
+                ),
+                max_delay_seconds=_sqlite_real(
+                    row["retry_max_delay_seconds"],
+                    "model-route retry maximum delay",
+                ),
+                retryable_codes=retryable_codes,
+            ),
+            schema_version=_sqlite_int(
+                row["schema_version"],
+                "model-route schema version",
+            ),
+            revision=revision,
+        )
+        persisted_fingerprint = _sqlite_text(
+            row["fingerprint"],
+            "model-route fingerprint",
+        )
+        _decode_datetime(
+            _sqlite_text(row["configured_at"], "model-route configured_at")
+        )
+        if persisted_fingerprint != fingerprint or route.fingerprint != fingerprint:
+            raise ValueError("model-route fingerprint does not match its fields")
+        return route
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError(
+            "cannot reconstruct authoritative agent model route"
+        ) from error
+
+
+def _bind_agent_extension_set(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    bindings: tuple[ExtensionBinding, ...],
+    *,
+    configured_at: datetime,
+) -> tuple[ExtensionBinding, ...]:
+    fingerprint = extension_set_fingerprint(bindings)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != agent_id:
+            raise AgentIdentityConflictError(
+                "extension binding agent does not match database identity"
+            )
+        current = _load_agent_extension_set(connection, agent_id)
+        if current is not None:
+            if current != bindings:
+                raise ExtensionBindingConflictError(
+                    "agent is already bound to another extension set"
+                )
+            connection.execute("COMMIT")
+            return current
+        connection.execute(
+            "INSERT INTO agent_extension_sets("
+            "agent_id, schema_version, fingerprint, extension_count, configured_at"
+            ") VALUES (?, 1, ?, ?, ?)",
+            (
+                agent_id,
+                fingerprint,
+                len(bindings),
+                _encode_datetime(configured_at),
+            ),
+        )
+        for position, binding in enumerate(bindings):
+            connection.execute(
+                "INSERT INTO agent_extensions("
+                "agent_id, position, extension_id, version, kind, "
+                "declaration_fingerprint, manifest_fingerprint"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    agent_id,
+                    position,
+                    binding.id,
+                    binding.version,
+                    binding.kind.value,
+                    binding.declaration_fingerprint,
+                    binding.manifest_fingerprint,
+                ),
+            )
+        stored = _load_agent_extension_set(connection, agent_id)
+        if stored is None or stored != bindings:
+            raise ExtensionBindingConflictError(
+                "stored extension set differs from its requested binding"
+            )
+        connection.execute("COMMIT")
+        return stored
+    except sqlite3.IntegrityError as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise ExtensionBindingConflictError(
+            "extension set conflicts with durable identity"
+        ) from error
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_agent_extension_set(
+    connection: sqlite3.Connection,
+    agent_id: str,
+) -> tuple[ExtensionBinding, ...] | None:
+    try:
+        rows = connection.execute(
+            "SELECT * FROM agent_extension_sets WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise ValueError("agent database contains duplicate extension sets")
+        row = rows[0]
+        if _sqlite_int(row["schema_version"], "extension set schema version") != 1:
+            raise ValueError("extension set schema version is unsupported")
+        configured_at = _decode_datetime(
+            _sqlite_text(row["configured_at"], "extension set configured_at")
+        )
+        del configured_at
+        item_rows = connection.execute(
+            "SELECT * FROM agent_extensions WHERE agent_id = ? ORDER BY position",
+            (agent_id,),
+        ).fetchall()
+        positions = tuple(
+            _sqlite_int(item["position"], "extension binding position")
+            for item in item_rows
+        )
+        if positions != tuple(range(len(item_rows))):
+            raise ValueError("extension binding positions are not contiguous")
+        bindings = tuple(
+            ExtensionBinding(
+                id=_sqlite_text(item["extension_id"], "extension binding id"),
+                version=_sqlite_text(item["version"], "extension binding version"),
+                kind=ExtensionKind(
+                    _sqlite_text(item["kind"], "extension binding kind")
+                ),
+                declaration_fingerprint=_sqlite_text(
+                    item["declaration_fingerprint"],
+                    "extension declaration fingerprint",
+                ),
+                manifest_fingerprint=_sqlite_text(
+                    item["manifest_fingerprint"],
+                    "extension manifest fingerprint",
+                ),
+            )
+            for item in item_rows
+        )
+        if _sqlite_int(row["extension_count"], "extension set count") != len(bindings):
+            raise ValueError("extension set count does not match its bindings")
+        fingerprint = _sqlite_text(
+            row["fingerprint"],
+            "extension set fingerprint",
+        )
+        if extension_set_fingerprint(bindings) != fingerprint:
+            raise ValueError("extension set fingerprint does not match its bindings")
+        return bindings
+    except (TypeError, ValueError) as error:
+        raise SQLiteCorruptionError(
+            "cannot reconstruct authoritative agent extension set"
+        ) from error
+
+
+def _decode_model_profile_row(row: sqlite3.Row) -> ModelProfile:
+    input_cost = row["input_cost_per_million_usd"]
+    output_cost = row["output_cost_per_million_usd"]
+    return ModelProfile(
+        id=_sqlite_text(row["profile_id"], "model-profile id"),
+        context_window_tokens=_sqlite_int(
+            row["context_window_tokens"],
+            "model-profile context_window_tokens",
+        ),
+        max_output_tokens=_sqlite_int(
+            row["max_output_tokens"],
+            "model-profile max_output_tokens",
+        ),
+        supports_tools=_decode_bool(row["supports_tools"]),
+        supports_parallel_tools=_decode_bool(row["supports_parallel_tools"]),
+        supports_structured_output=_decode_bool(row["supports_structured_output"]),
+        supports_streaming=_decode_bool(row["supports_streaming"]),
+        supports_reasoning=_decode_bool(row["supports_reasoning"]),
+        supports_vision=_decode_bool(row["supports_vision"]),
+        supports_documents=_decode_bool(row["supports_documents"]),
+        supports_prompt_caching=_decode_bool(row["supports_prompt_caching"]),
+        supports_native_continuation=_decode_bool(row["supports_native_continuation"]),
+        input_cost_per_million_usd=(
+            None if input_cost is None else _decode_decimal(input_cost)
+        ),
+        output_cost_per_million_usd=(
+            None if output_cost is None else _decode_decimal(output_cost)
+        ),
+        data_routing_classification=_sqlite_text(
+            row["data_routing_classification"],
+            "model-profile data_routing_classification",
+        ),
+        available=_decode_bool(row["available"]),
+        healthy=_decode_bool(row["healthy"]),
+    )
 
 
 def _decode_source_registration_row(row: sqlite3.Row) -> SourceRegistration:
@@ -7370,13 +8219,27 @@ def _load_resource_alias_in_transaction(
     scope: MemoryScope,
     logical_key: str,
 ) -> MemoryHistory | None:
+    return _load_learning_memory_in_transaction(
+        connection,
+        scope,
+        MemoryKind.RESOURCE_ALIAS,
+        logical_key,
+    )
+
+
+def _load_learning_memory_in_transaction(
+    connection: sqlite3.Connection,
+    scope: MemoryScope,
+    kind: MemoryKind,
+    logical_key: str,
+) -> MemoryHistory | None:
     row = connection.execute(
         "SELECT id FROM memory_records WHERE agent_id = ? "
         "AND scope_fingerprint = ? AND kind = ? AND logical_key = ?",
         (
             scope.agent_id,
             scope.fingerprint,
-            MemoryKind.RESOURCE_ALIAS.value,
+            kind.value,
             logical_key,
         ),
     ).fetchone()
@@ -7385,7 +8248,7 @@ def _load_resource_alias_in_transaction(
     return _load_memory_history_in_transaction(
         connection,
         scope.agent_id,
-        _sqlite_text(row[0], "resource alias memory id"),
+        _sqlite_text(row[0], "learning memory id"),
     )
 
 
@@ -7546,7 +8409,8 @@ def _commit_explicit_correction(
             ) from error
         if (
             intended.record.scope.agent_id != agent_id
-            or intended.record.kind is not MemoryKind.RESOURCE_ALIAS
+            or intended.record.kind
+            not in {MemoryKind.RESOURCE_ALIAS, MemoryKind.SEMANTIC_FACT}
             or intended.record.state is not MemoryState.ACTIVE
             or resolved.result_memory_id != intended.record.id
             or resolved.result_memory_version != intended.version.version
@@ -7559,15 +8423,16 @@ def _commit_explicit_correction(
             intended.record,
             intended.version,
         )
-        existing = _load_resource_alias_in_transaction(
+        existing = _load_learning_memory_in_transaction(
             connection,
             intended.record.scope,
+            intended.record.kind,
             intended.record.logical_key,
         )
         if request.expected_memory_version is None:
             if existing is not None:
                 raise ExplicitCorrectionStoreConflictError(
-                    "resource alias was created before correction commit"
+                    "learning memory was created before correction commit"
                 )
             if intended.record.current_version != 1 or intended.version.version != 1:
                 raise ExplicitCorrectionStoreConflictError(
@@ -7584,7 +8449,7 @@ def _commit_explicit_correction(
                 or existing.record.current_version != expected
             ):
                 raise ExplicitCorrectionStoreConflictError(
-                    "resource alias head changed before correction commit"
+                    "learning memory head changed before correction commit"
                 )
             if (
                 intended.record.id != existing.record.id
@@ -7616,7 +8481,7 @@ def _commit_explicit_correction(
             assert changed_row is not None
             if _sqlite_int(changed_row[0], "correction memory changes") != 1:
                 raise ExplicitCorrectionStoreConflictError(
-                    "resource alias head changed during correction commit"
+                    "learning memory head changed during correction commit"
                 )
             _replace_memory_search(connection, intended.record, intended.version)
         _insert_learning_proposal_row(connection, resolved)
@@ -7690,7 +8555,8 @@ def _validate_learning_runtime_references(
         )
     if proposal.provenance.evidence_id is not None:
         evidence = connection.execute(
-            "SELECT operation_id, accepted FROM evidence WHERE id = ?",
+            "SELECT operation_id, accepted, metadata_schema_version, applicable, "
+            "applicability_reason FROM evidence WHERE id = ?",
             (proposal.provenance.evidence_id,),
         ).fetchone()
         if (
@@ -7701,9 +8567,12 @@ def _validate_learning_runtime_references(
             )
             != proposal.provenance.operation_id
             or _sqlite_int(evidence["accepted"], "learning evidence accepted") != 1
+            or evidence["metadata_schema_version"] != 1
+            or evidence["applicable"] != 1
+            or _optional_text(evidence["applicability_reason"]) != "current_operation"
         ):
             raise LearningStoreConflictError(
-                "learning provenance evidence is not accepted by its operation"
+                "learning provenance evidence is not accepted and current for its operation"
             )
 
 
@@ -12271,24 +13140,43 @@ def _insert_snapshot(
             trigger.session_id,
         ),
     )
-    connection.execute(
-        "INSERT INTO operations("
-        "id, revision, agent_id, trigger_id, status, created_at, updated_at, "
-        "session_id, final_text, terminal_reason"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            operation.id,
-            revision,
-            operation.agent_id,
-            operation.trigger_id,
-            operation.status.value,
-            _encode_datetime(operation.created_at),
-            _encode_datetime(operation.updated_at),
-            operation.session_id,
-            operation.final_text,
-            operation.terminal_reason,
-        ),
+    operation_values = (
+        operation.id,
+        revision,
+        operation.agent_id,
+        operation.trigger_id,
+        operation.status.value,
+        _encode_datetime(operation.created_at),
+        _encode_datetime(operation.updated_at),
+        operation.session_id,
+        operation.final_text,
+        operation.terminal_reason,
     )
+    if _pragma_int(connection, "user_version") < 16:
+        if operation.model_route_revision is not None:
+            raise ValueError(
+                "historical operation schema cannot store model-route binding"
+            )
+        connection.execute(
+            "INSERT INTO operations("
+            "id, revision, agent_id, trigger_id, status, created_at, updated_at, "
+            "session_id, final_text, terminal_reason"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            operation_values,
+        )
+    else:
+        connection.execute(
+            "INSERT INTO operations("
+            "id, revision, agent_id, trigger_id, status, created_at, updated_at, "
+            "session_id, final_text, terminal_reason, model_route_revision, "
+            "model_route_fingerprint"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                *operation_values,
+                operation.model_route_revision,
+                operation.model_route_fingerprint,
+            ),
+        )
     connection.execute(
         "INSERT INTO loop_state("
         "operation_id, phase, turn_count, action_count, repair_count, "
@@ -12579,6 +13467,67 @@ def _insert_task(
         return
 
     validation = task.execution_facts.validation_facts
+    schema_version = _pragma_int(connection, "user_version")
+    # Migration 15 added the authoritative multi-source columns, but SQLite
+    # cannot relax the validation_source_id CHECK installed by migration 13
+    # with ALTER TABLE. Keep that legacy scalar populated as a deterministic
+    # compatibility projection while the v15 columns remain the sole exact
+    # source authority. The decoder verifies and removes this projection.
+    persisted_source_id = validation.source_id
+    if (
+        schema_version >= 15
+        and persisted_source_id is None
+        and len(validation.source_ids) > 1
+    ):
+        persisted_source_id = validation.source_ids[0]
+    validation_values = (
+        validation.schema_version,
+        int(validation.validation_passed),
+        int(validation.in_scope),
+        int(validation.destructive),
+        validation.sensitivity_class,
+        persisted_source_id,
+        canonical_json(validation.resource_ids),
+        canonical_json(validation.resource_revisions),
+        validation.source_revision,
+        canonical_json(validation.impact),
+        canonical_json(validation.evidence_ids),
+    )
+    if schema_version < 15:
+        compatibility_source_ids = (
+            () if validation.source_id is None else (validation.source_id,)
+        )
+        compatibility_source_revisions = (
+            ()
+            if validation.source_id is None or validation.source_revision is None
+            else ((validation.source_id, validation.source_revision),)
+        )
+        if (
+            validation.source_ids != compatibility_source_ids
+            or validation.source_revisions != compatibility_source_revisions
+            or validation.freshness_state is not None
+        ):
+            raise ValueError(
+                "historical task schema cannot store multi-source or freshness facts"
+            )
+        connection.execute(
+            "INSERT INTO tasks("
+            "operation_id, position, id, turn_id, call_id, capability_id, "
+            "executor_id, status, attempt, arguments_json, created_at, updated_at, "
+            "error_code, cancellation_requested, capability_fingerprint, "
+            "arguments_hash, access_mode, risk, side_effecting, idempotent, "
+            "replay_safe, idempotency_key, manual_recovery_reason, "
+            "validation_schema_version, validation_passed, validation_in_scope, "
+            "validation_destructive, validation_sensitivity_class, "
+            "validation_source_id, validation_resource_ids_json, "
+            "validation_resource_revisions_json, validation_source_revision, "
+            "validation_impact_json, validation_evidence_ids_json"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (*base_values, *validation_values),
+        )
+        return
+
     connection.execute(
         "INSERT INTO tasks("
         "operation_id, position, id, turn_id, call_id, capability_id, "
@@ -12590,22 +13539,16 @@ def _insert_task(
         "validation_destructive, validation_sensitivity_class, "
         "validation_source_id, validation_resource_ids_json, "
         "validation_resource_revisions_json, validation_source_revision, "
-        "validation_impact_json, validation_evidence_ids_json"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-        "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "validation_impact_json, validation_evidence_ids_json, "
+        "validation_source_ids_json, validation_source_revisions_json, "
+        "validation_freshness_state"
+        ") VALUES (" + ", ".join("?" for _ in range(37)) + ")",
         (
             *base_values,
-            validation.schema_version,
-            int(validation.validation_passed),
-            int(validation.in_scope),
-            int(validation.destructive),
-            validation.sensitivity_class,
-            validation.source_id,
-            canonical_json(validation.resource_ids),
-            canonical_json(validation.resource_revisions),
-            validation.source_revision,
-            canonical_json(validation.impact),
-            canonical_json(validation.evidence_ids),
+            *validation_values,
+            canonical_json(validation.source_ids),
+            canonical_json(validation.source_revisions),
+            validation.freshness_state,
         ),
     )
 
@@ -12692,12 +13635,47 @@ def _insert_evidence(
     position: int,
     evidence: Evidence,
 ) -> None:
+    if _pragma_int(connection, "user_version") < 15:
+        if evidence.metadata_schema_version != 0:
+            raise ValueError(
+                "historical evidence schema cannot store canonical metadata"
+            )
+        connection.execute(
+            "INSERT INTO evidence("
+            "operation_id, position, id, task_id, turn_id, capability_id, "
+            "executor_id, kind, schema_version, attempt, accepted, payload_json, "
+            "content_hash, created_at, blob_id"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                operation_id,
+                position,
+                evidence.id,
+                evidence.task_id,
+                evidence.turn_id,
+                evidence.capability_id,
+                evidence.executor_id,
+                evidence.kind,
+                evidence.schema_version,
+                evidence.attempt,
+                int(evidence.accepted),
+                canonical_json(evidence.payload),
+                evidence.content_hash,
+                _encode_datetime(evidence.created_at),
+                evidence.blob_id,
+            ),
+        )
+        return
+
     connection.execute(
         "INSERT INTO evidence("
         "operation_id, position, id, task_id, turn_id, capability_id, "
         "executor_id, kind, schema_version, attempt, accepted, payload_json, "
-        "content_hash, created_at, blob_id"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "content_hash, created_at, blob_id, metadata_schema_version, "
+        "acceptance_reason, rejection_reason, applicable, applicability_reason, "
+        "validation_facts_json, projection_metadata_json, "
+        "redaction_metadata_json"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "?, ?, ?)",
         (
             operation_id,
             position,
@@ -12714,6 +13692,14 @@ def _insert_evidence(
             evidence.content_hash,
             _encode_datetime(evidence.created_at),
             evidence.blob_id,
+            evidence.metadata_schema_version,
+            evidence.acceptance_reason,
+            evidence.rejection_reason,
+            int(evidence.applicable),
+            evidence.applicability_reason,
+            canonical_json(_validation_facts_to_data(evidence.validation_facts)),
+            canonical_json(evidence.projection_metadata),
+            canonical_json(evidence.redaction_metadata),
         ),
     )
 
@@ -13081,6 +14067,50 @@ def _load_nonterminal_operations(
         raise
 
 
+def _list_operations(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    statuses: frozenset[OperationStatus] | None,
+    limit: int,
+) -> tuple[VersionedOperation, ...]:
+    connection.execute("BEGIN")
+    try:
+        status_values = (
+            ()
+            if statuses is None
+            else tuple(sorted(status.value for status in statuses))
+        )
+        status_clause = (
+            ""
+            if not status_values
+            else " AND status IN (" + ",".join("?" for _ in status_values) + ")"
+        )
+        rows = connection.execute(
+            "SELECT id, status FROM operations WHERE agent_id = ?" + status_clause + " "
+            "ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (agent_id, *status_values, limit),
+        ).fetchall()
+        result: list[VersionedOperation] = []
+        for row in rows:
+            operation_id = _sqlite_text(row[0], "operation id")
+            try:
+                status = OperationStatus(_sqlite_text(row[1], "operation status"))
+            except ValueError as error:
+                raise SQLiteCorruptionError(
+                    "cannot classify agent-scoped operation status"
+                ) from error
+            result.append(
+                _load_versioned_operation_in_transaction(connection, operation_id)
+            )
+        connection.execute("COMMIT")
+        return tuple(result)
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _load_versioned_operation_in_transaction(
     connection: sqlite3.Connection,
     operation_id: str,
@@ -13134,6 +14164,7 @@ def _decode_snapshot(
         ),
         session_id=_optional_text(trigger_row["session_id"]),
     )
+    has_model_route_binding = _pragma_int(connection, "user_version") >= 16
     operation = Operation(
         id=operation_id,
         agent_id=_sqlite_text(operation_row["agent_id"], "operation agent id"),
@@ -13150,7 +14181,38 @@ def _decode_snapshot(
         session_id=_optional_text(operation_row["session_id"]),
         final_text=_optional_text(operation_row["final_text"]),
         terminal_reason=_optional_text(operation_row["terminal_reason"]),
+        model_route_revision=(
+            None
+            if not has_model_route_binding
+            or operation_row["model_route_revision"] is None
+            else _sqlite_int(
+                operation_row["model_route_revision"],
+                "operation model-route revision",
+            )
+        ),
+        model_route_fingerprint=(
+            _optional_text(operation_row["model_route_fingerprint"])
+            if has_model_route_binding
+            else None
+        ),
     )
+    if operation.model_route_revision is not None:
+        route_row = connection.execute(
+            "SELECT fingerprint FROM agent_model_routes "
+            "WHERE agent_id = ? AND revision = ?",
+            (operation.agent_id, operation.model_route_revision),
+        ).fetchone()
+        if (
+            route_row is None
+            or _sqlite_text(
+                route_row["fingerprint"],
+                "operation-bound model-route fingerprint",
+            )
+            != operation.model_route_fingerprint
+        ):
+            raise SQLiteCorruptionError(
+                "operation model-route binding does not match a retained revision"
+            )
     loop_state = LoopState(
         phase=LoopPhase(_sqlite_text(loop_row["phase"], "loop phase")),
         turn_count=_sqlite_int(loop_row["turn_count"], "loop turn count"),
@@ -13220,7 +14282,9 @@ def _decode_snapshot(
     evidence_rows = _operation_rows(connection, "evidence", operation_id)
     observation_rows = _operation_rows(connection, "observations", operation_id)
     event_rows = _operation_rows(connection, "runtime_events", operation_id)
-    has_task_validation = _pragma_int(connection, "user_version") >= 13
+    persisted_schema_version = _pragma_int(connection, "user_version")
+    has_task_validation = persisted_schema_version >= 13
+    has_trusted_read_metadata = persisted_schema_version >= 15
 
     turns = tuple(
         Turn(
@@ -13316,6 +14380,7 @@ def _decode_snapshot(
                 validation_facts=_decode_task_validation_facts(
                     row,
                     enabled=has_task_validation,
+                    trusted_read_enabled=has_trusted_read_metadata,
                 ),
             ),
             evidence_ids=_load_task_evidence_ids(
@@ -13420,6 +14485,62 @@ def _decode_snapshot(
                 _sqlite_text(row["created_at"], "evidence created_at")
             ),
             blob_id=_optional_text(row["blob_id"]),
+            metadata_schema_version=(
+                _sqlite_int(
+                    row["metadata_schema_version"],
+                    "evidence metadata schema version",
+                )
+                if has_trusted_read_metadata
+                else 0
+            ),
+            acceptance_reason=(
+                _optional_text(row["acceptance_reason"])
+                if has_trusted_read_metadata
+                else None
+            ),
+            rejection_reason=(
+                _optional_text(row["rejection_reason"])
+                if has_trusted_read_metadata
+                else None
+            ),
+            applicable=(
+                _decode_bool(row["applicable"]) if has_trusted_read_metadata else False
+            ),
+            applicability_reason=(
+                _optional_text(row["applicability_reason"])
+                if has_trusted_read_metadata
+                else None
+            ),
+            validation_facts=(
+                _decode_validation_facts_json(
+                    _sqlite_text(
+                        row["validation_facts_json"],
+                        "evidence validation facts",
+                    )
+                )
+                if has_trusted_read_metadata
+                else ActionValidationFacts()
+            ),
+            projection_metadata=(
+                _decode_json_object(
+                    _sqlite_text(
+                        row["projection_metadata_json"],
+                        "evidence projection metadata",
+                    )
+                )
+                if has_trusted_read_metadata
+                else {}
+            ),
+            redaction_metadata=(
+                _decode_json_object(
+                    _sqlite_text(
+                        row["redaction_metadata_json"],
+                        "evidence redaction metadata",
+                    )
+                )
+                if has_trusted_read_metadata
+                else {}
+            ),
         )
         for row in evidence_rows
     )
@@ -13683,9 +14804,29 @@ def _decode_task_validation_facts(
     row: sqlite3.Row,
     *,
     enabled: bool,
+    trusted_read_enabled: bool,
 ) -> ActionValidationFacts:
     if not enabled:
         return ActionValidationFacts()
+    source_ids = (
+        _decode_string_tuple(
+            _sqlite_text(
+                row["validation_source_ids_json"],
+                "task validation source ids",
+            )
+        )
+        if trusted_read_enabled
+        else ()
+    )
+    persisted_source_id = _optional_text(row["validation_source_id"])
+    source_id = persisted_source_id
+    if trusted_read_enabled and len(source_ids) > 1:
+        if persisted_source_id != source_ids[0]:
+            raise ValueError(
+                "persisted multi-source validation compatibility projection "
+                "does not match its source authority"
+            )
+        source_id = None
     return ActionValidationFacts(
         schema_version=_sqlite_int(
             row["validation_schema_version"],
@@ -13698,7 +14839,7 @@ def _decode_task_validation_facts(
             row["validation_sensitivity_class"],
             "task validation sensitivity class",
         ),
-        source_id=_optional_text(row["validation_source_id"]),
+        source_id=source_id,
         resource_ids=_decode_string_tuple(
             _sqlite_text(
                 row["validation_resource_ids_json"],
@@ -13712,6 +14853,22 @@ def _decode_task_validation_facts(
             )
         ),
         source_revision=_optional_text(row["validation_source_revision"]),
+        source_ids=source_ids,
+        source_revisions=(
+            _decode_revision_pairs(
+                _sqlite_text(
+                    row["validation_source_revisions_json"],
+                    "task validation source revisions",
+                )
+            )
+            if trusted_read_enabled
+            else ()
+        ),
+        freshness_state=(
+            _optional_text(row["validation_freshness_state"])
+            if trusted_read_enabled
+            else None
+        ),
         impact=_decode_json_object(
             _sqlite_text(
                 row["validation_impact_json"],
@@ -13723,6 +14880,113 @@ def _decode_task_validation_facts(
                 row["validation_evidence_ids_json"],
                 "task validation evidence ids",
             )
+        ),
+    )
+
+
+def _validation_facts_to_data(
+    facts: ActionValidationFacts,
+) -> dict[str, object]:
+    if facts.schema_version == 0:
+        return {}
+    return {
+        "destructive": facts.destructive,
+        "evidence_ids": facts.evidence_ids,
+        "freshness_state": facts.freshness_state,
+        "impact": facts.impact,
+        "in_scope": facts.in_scope,
+        "resource_ids": facts.resource_ids,
+        "resource_revisions": facts.resource_revisions,
+        "schema_version": facts.schema_version,
+        "sensitivity_class": facts.sensitivity_class,
+        "source_id": facts.source_id,
+        "source_ids": facts.source_ids,
+        "source_revision": facts.source_revision,
+        "source_revisions": facts.source_revisions,
+        "validation_passed": facts.validation_passed,
+    }
+
+
+def _decode_validation_facts_json(value: str) -> ActionValidationFacts:
+    decoded = _decode_json_object(value)
+    if not decoded:
+        return ActionValidationFacts()
+    data = _expect_object(
+        decoded,
+        keys={
+            "destructive",
+            "evidence_ids",
+            "freshness_state",
+            "impact",
+            "in_scope",
+            "resource_ids",
+            "resource_revisions",
+            "schema_version",
+            "sensitivity_class",
+            "source_id",
+            "source_ids",
+            "source_revision",
+            "source_revisions",
+            "validation_passed",
+        },
+        label="evidence validation facts",
+    )
+    return ActionValidationFacts(
+        schema_version=_expect_int(
+            data["schema_version"],
+            "evidence validation schema version",
+        ),
+        validation_passed=_expect_bool(
+            data["validation_passed"],
+            "evidence validation passed",
+        ),
+        in_scope=_expect_bool(
+            data["in_scope"],
+            "evidence validation in scope",
+        ),
+        destructive=_expect_bool(
+            data["destructive"],
+            "evidence validation destructive",
+        ),
+        sensitivity_class=_expect_text(
+            data["sensitivity_class"],
+            "evidence validation sensitivity class",
+        ),
+        source_id=_expect_optional_text(
+            data["source_id"],
+            "evidence validation source id",
+        ),
+        source_ids=_decode_data_string_tuple(
+            data["source_ids"],
+            "evidence validation source ids",
+        ),
+        source_revision=_expect_optional_text(
+            data["source_revision"],
+            "evidence validation source revision",
+        ),
+        source_revisions=_decode_data_revision_pairs(
+            data["source_revisions"],
+            "evidence validation source revisions",
+        ),
+        resource_ids=_decode_data_string_tuple(
+            data["resource_ids"],
+            "evidence validation resource ids",
+        ),
+        resource_revisions=_decode_data_revision_pairs(
+            data["resource_revisions"],
+            "evidence validation resource revisions",
+        ),
+        freshness_state=_expect_optional_text(
+            data["freshness_state"],
+            "evidence validation freshness state",
+        ),
+        impact=_expect_object_mapping(
+            data["impact"],
+            "evidence validation impact",
+        ),
+        evidence_ids=_decode_data_string_tuple(
+            data["evidence_ids"],
+            "evidence validation evidence ids",
         ),
     )
 
@@ -13768,6 +15032,34 @@ def _expect_int(value: object, label: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"{label} must be a JSON integer")
     return value
+
+
+def _expect_object_mapping(value: object, label: str) -> Mapping[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _decode_data_string_tuple(value: object, label: str) -> tuple[str, ...]:
+    items = _expect_list(value, label)
+    return tuple(_expect_text(item, f"{label} item") for item in items)
+
+
+def _decode_data_revision_pairs(
+    value: object,
+    label: str,
+) -> tuple[tuple[str, str], ...]:
+    items = _expect_list(value, label)
+    revisions: list[tuple[str, str]] = []
+    for item in items:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not all(isinstance(part, str) for part in item)
+        ):
+            raise ValueError(f"{label} must contain identifier/revision pairs")
+        revisions.append((item[0], item[1]))
+    return tuple(revisions)
 
 
 def _tool_call_to_data(call: ToolCall) -> dict[str, object]:

@@ -142,6 +142,302 @@ async def main() -> None:
 asyncio.run(main())
 """
 
+_JOINED_PROBE = r"""
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+from pathlib import Path
+import re
+import selectors
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+
+
+def run(command, *, stdin=None, timeout=30):
+    completed = subprocess.run(
+        command,
+        input=stdin,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"command failed ({completed.returncode}): {command!r}\n"
+            f"stdout:\n{completed.stdout[-4096:]}\n"
+            f"stderr:\n{completed.stderr[-4096:]}"
+        )
+    return [
+        json.loads(line)
+        for line in completed.stdout.splitlines()
+        if line.strip()
+    ]
+
+
+def one(command):
+    lines = run(command)
+    if len(lines) != 1 or not isinstance(lines[0], dict):
+        raise AssertionError(f"expected one JSON object: {lines!r}")
+    return lines[0]
+
+
+class ProviderHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    source_id = None
+    request_count = 0
+
+    def log_message(self, format, *args):
+        return None
+
+    def do_POST(self):
+        if self.path != "/v1/chat/completions":
+            self.send_error(404)
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        request = json.loads(self.rfile.read(length))
+        messages = request.get("messages", [])
+        ProviderHandler.request_count += 1
+        response_id = f"chatcmpl-p95-{ProviderHandler.request_count}"
+        tool_content = "\n".join(
+            str(message.get("content", ""))
+            for message in messages
+            if message.get("role") == "tool"
+        )
+        evidence = re.findall(r"evidence-[A-Za-z0-9-]+", tool_content)
+        if evidence:
+            message = {
+                "role": "assistant",
+                "content": (
+                    "There is one customer. "
+                    f"[evidence:{evidence[-1]}]"
+                ),
+            }
+            finish_reason = "stop"
+        else:
+            if ProviderHandler.source_id is None:
+                raise AssertionError("source must be configured before model I/O")
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"provider-call-{ProviderHandler.request_count}",
+                        "type": "function",
+                        "function": {
+                            "name": "data_query_sqlite",
+                            "arguments": json.dumps(
+                                {
+                                    "source_id": ProviderHandler.source_id,
+                                    "sql": "SELECT COUNT(*) AS total FROM customers",
+                                },
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                        },
+                    }
+                ],
+            }
+            finish_reason = "tool_calls"
+        payload = json.dumps(
+            {
+                "id": response_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "p95-local",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": message,
+                        "finish_reason": finish_reason,
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def start_host(command):
+    process = subprocess.Popen(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    ready = selector.select(timeout=15)
+    selector.close()
+    if not ready:
+        process.kill()
+        output, error = process.communicate(timeout=5)
+        raise AssertionError(f"host did not start: {output!r} {error!r}")
+    line = process.stdout.readline()
+    if not line:
+        output, error = process.communicate(timeout=5)
+        raise AssertionError(f"host exited before startup: {output!r} {error!r}")
+    startup = json.loads(line)
+    if startup.get("state") != "running":
+        raise AssertionError(f"unexpected host startup: {startup!r}")
+    return process, startup
+
+
+def stop_host(process):
+    process.send_signal(signal.SIGINT)
+    try:
+        output, error = process.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, error = process.communicate(timeout=5)
+        raise AssertionError(f"host did not stop cleanly: {output!r} {error!r}")
+    if process.returncode != 0:
+        raise AssertionError(
+            f"host stopped with {process.returncode}: {output!r} {error!r}"
+        )
+
+
+def chat_and_inspect(base, state_root, *, label):
+    events = one([*base, "events", "read", "atlas"])
+    after = events.get("next_after")
+    follow_command = [*base, "events", "follow", "atlas", "--max-events", "1"]
+    if isinstance(after, int):
+        follow_command.extend(("--after", str(after)))
+    follower = subprocess.Popen(
+        follow_command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    time.sleep(0.1)
+    lines = run(
+        [*base, "chat", "atlas"],
+        stdin=f"Count customers for the {label} run.\n",
+        timeout=45,
+    )
+    result_line = next(item for item in lines if item.get("kind") == "result")
+    operation_id = result_line["result"]["operation_id"]
+    followed, follow_error = follower.communicate(timeout=15)
+    if follower.returncode != 0 or not followed.strip():
+        raise AssertionError(f"event follow failed: {followed!r} {follow_error!r}")
+    followed_event = json.loads(followed.strip())
+    if isinstance(after, int) and followed_event["sequence"] <= after:
+        raise AssertionError("event follow did not observe a newly committed event")
+    inspection = one([*base, "operation", "inspect", "atlas", operation_id])
+    operation = inspection["operation"]
+    evidence = inspection["evidence"]
+    if operation["status"] != "succeeded":
+        raise AssertionError(f"chat operation failed: {operation!r}")
+    if not evidence or not all(item["accepted"] for item in evidence):
+        raise AssertionError(f"accepted evidence was not inspectable: {evidence!r}")
+    return operation_id, len(evidence)
+
+
+def main():
+    state_root = Path(sys.argv[1]).resolve()
+    cli = str(Path(sys.argv[2]).resolve())
+    database = state_root.parent / f"{state_root.name}-customers.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL);"
+            "INSERT INTO customers (name) VALUES ('Ada');"
+        )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    base = [cli, "--root", str(state_root)]
+    host = None
+    try:
+        model = one(
+            [
+                *base,
+                "model",
+                "set",
+                "atlas",
+                "compatible:p95-local",
+                "--base-url",
+                f"http://127.0.0.1:{server.server_port}/v1",
+                "--secret",
+                "env:DAITA_P95_LOCAL_KEY",
+                "--idempotency-key",
+                "model-p95-joined",
+            ]
+        )
+        if model.get("configured") is not True:
+            raise AssertionError(f"model route was not configured: {model!r}")
+        source = one(
+            [
+                *base,
+                "source",
+                "add",
+                "atlas",
+                "sqlite",
+                str(database),
+                "--idempotency-key",
+                "source-p95-joined",
+            ]
+        )
+        ProviderHandler.source_id = source["id"]
+
+        serve_command = [*base, "serve", "atlas", "--cadence-seconds", "3600"]
+        host, first_start = start_host(serve_command)
+        first_operation, first_evidence = chat_and_inspect(
+            base, state_root, label="first"
+        )
+        stop_host(host)
+        host = None
+
+        host, second_start = start_host(serve_command)
+        second_operation, second_evidence = chat_and_inspect(
+            base, state_root, label="cold-reopen"
+        )
+        stop_host(host)
+        host = None
+    finally:
+        if host is not None and host.poll() is None:
+            host.kill()
+            host.communicate(timeout=5)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    print(
+        json.dumps(
+            {
+                "cold_reopen_without_model_injection": (
+                    first_start["model_profile_id"]
+                    == second_start["model_profile_id"]
+                    == "compatible:p95-local"
+                ),
+                "first_evidence": first_evidence,
+                "first_operation_id": first_operation,
+                "provider_calls": ProviderHandler.request_count,
+                "reopened_evidence": second_evidence,
+                "reopened_operation_id": second_operation,
+                "reopened_status": "succeeded",
+            },
+            sort_keys=True,
+        )
+    )
+
+
+main()
+"""
+
 _IGNORED_COPY_NAMES = (
     ".git",
     ".mypy_cache",
@@ -178,6 +474,14 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
         help="Python 3.11/3.12 executable to verify; repeat for each interpreter",
+    )
+    parser.add_argument(
+        "--phase-9-5-joined",
+        action="store_true",
+        help=(
+            "install provider/source extras and run the joined real-socket "
+            "configured-host lifecycle"
+        ),
     )
     return parser
 
@@ -317,6 +621,7 @@ def _verify_interpreter(
     wheel: Path,
     workspace: Path,
     environment: dict[str, str],
+    joined_phase_9_5: bool,
 ) -> dict[str, object]:
     environment_root = workspace / f"venv-{index}"
     state_root = (workspace / f"state-{index}").resolve()
@@ -327,8 +632,13 @@ def _verify_interpreter(
     )
     python = _venv_python(environment_root)
     cli = _venv_cli(environment_root)
+    install_target = f"{wheel}[openai,sqlite]" if joined_phase_9_5 else str(wheel)
+    install_command = [str(python), "-m", "pip", "install"]
+    if not joined_phase_9_5:
+        install_command.append("--no-deps")
+    install_command.append(install_target)
     _run(
-        [str(python), "-m", "pip", "install", "--no-deps", str(wheel)],
+        install_command,
         cwd=workspace,
         environment=environment,
     )
@@ -354,8 +664,18 @@ def _verify_interpreter(
         cwd=workspace,
         environment=environment,
     )
+    probe_command = [
+        str(python),
+        "-I",
+        "-c",
+        _JOINED_PROBE if joined_phase_9_5 else _PROBE,
+        str(state_root),
+    ]
+    if joined_phase_9_5:
+        environment["DAITA_P95_LOCAL_KEY"] = "local-test-key"
+        probe_command.append(str(cli))
     probe = _run(
-        [str(python), "-I", "-c", _PROBE, str(state_root)],
+        probe_command,
         cwd=workspace,
         environment=environment,
     )
@@ -382,6 +702,7 @@ def _verify_interpreter(
         environment=environment,
     )
     return {
+        "joined_phase_9_5": joined_phase_9_5,
         "operation_status": probe_result["reopened_status"],
         "python": version,
         "state_retained_after_uninstall": True,
@@ -391,7 +712,8 @@ def _verify_interpreter(
 def main() -> int:
     arguments = _parser().parse_args()
     candidate_root = arguments.candidate_root.resolve(strict=True)
-    with TemporaryDirectory(prefix="daita-v2-candidate-lifecycle-") as temporary:
+    # Keep the real Unix-socket path below macOS's short ``sun_path`` limit.
+    with TemporaryDirectory(prefix="d2-", dir="/tmp") as temporary:
         workspace = Path(temporary).resolve()
         clean_home = workspace / "home"
         clean_home.mkdir(mode=0o700)
@@ -411,6 +733,7 @@ def main() -> int:
                     wheel=wheel,
                     workspace=workspace,
                     environment=environment,
+                    joined_phase_9_5=arguments.phase_9_5_joined,
                 )
                 for index, interpreter in enumerate(arguments.interpreters)
             ],

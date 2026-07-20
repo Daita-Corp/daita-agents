@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import errno
 from hashlib import sha256
 import os
@@ -25,7 +26,13 @@ from ..adapters.sqlite_query import SQLiteQueryBackend
 from ..adapters.postgresql_query import PostgreSQLQueryBackend
 from ..adapters.sqlite_update import SQLiteUpdateBackend
 from ..catalog.capabilities import catalog_declarations
-from ..catalog.models import CatalogSync, CatalogSyncStatus
+from ..catalog.models import (
+    CatalogResource,
+    CatalogSearchRequest,
+    CatalogSearchResult,
+    CatalogSync,
+    CatalogSyncStatus,
+)
 from ..catalog.service import CatalogService
 from ..capabilities import CapabilityRegistry
 from ..config import (
@@ -54,17 +61,29 @@ from ..domains.data import (
 from ..events.models import CommittedEvent, EventCursor
 from ..events.projection import EventAudience, project_committed_event
 from ..errors import AgentError, ConfigError
+from ..extensions import ConfiguredExtension, ExtensionBinding, ExtensionRegistry
 from ..identity import AgentIdentity
-from ..learning import LearningProvenance, LearningSourceOutcome
+from ..learning import (
+    LearningProposal,
+    LearningProposalState,
+    LearningProvenance,
+    LearningSourceOutcome,
+)
 from ..llm.models import ModelProfile
-from ..llm.protocols import ModelProfileConflictError, ModelProvider
+from ..llm.factory import create_model_route_provider, model_route_from_provider
+from ..llm.protocols import (
+    ModelProfileConflictError,
+    ModelProvider,
+    ModelRouteConflictError,
+)
+from ..llm.routing import ModelRoute
 from ..loop.driver import AgentLoop, ContextBuilder, DomainController
 from ..loop.models import LoopBudgets, LoopExit, LoopExitKind, LoopPhase
 from ..memory.learning import (
-    RESOURCE_ALIAS_CORRECTION_PREFIX,
     ExplicitCorrectionLearningError,
     ExplicitCorrectionLearningService,
     ExplicitCorrectionResult,
+    is_explicit_learning_message,
 )
 from ..memory.models import (
     MemoryInspection,
@@ -262,6 +281,91 @@ def _validate_loop_configuration(
         )
 
 
+def _resolve_model_route_input(
+    config: AgentConfig | None,
+    model: ModelProvider | None,
+    model_profile: ModelProfile | None,
+    *,
+    secret_provider: SecretProvider | None,
+) -> tuple[ModelProvider | None, ModelProfile | None, ModelRoute | None]:
+    explicit_route = None if config is None else config.model_route
+    if explicit_route is not None:
+        if model is not None:
+            raise AgentNotConfiguredError(
+                "an explicit model route reconstructs its provider; do not inject one"
+            )
+        if model_profile is not None and model_profile != explicit_route.model_profile:
+            raise AgentNotConfiguredError(
+                "configured model profile differs from the explicit model route"
+            )
+        return (
+            create_model_route_provider(
+                explicit_route,
+                secret_provider=secret_provider,
+            ),
+            explicit_route.model_profile,
+            explicit_route,
+        )
+    if model is None or model_profile is None:
+        return model, model_profile, None
+    if model.provider_id != model_profile.id:
+        raise AgentNotConfiguredError(
+            "model_profile id must match the configured model provider_id"
+        )
+    route = model_route_from_provider(model, model_profile)
+    return model, model_profile, route
+
+
+def _monitor_budgets_from_trigger(
+    trigger: AgentTrigger,
+    *,
+    defaults: LoopBudgets,
+) -> LoopBudgets:
+    raw = trigger.payload.get("monitor_effective_budgets")
+    expected_keys = {
+        "max_actions",
+        "max_estimated_cost_usd",
+        "max_identical_failures",
+        "max_observation_characters",
+        "max_repairs",
+        "max_total_tokens",
+        "max_turns",
+        "max_wall_time_seconds",
+        "task_timeout_seconds",
+    }
+    if not isinstance(raw, Mapping) or set(raw) != expected_keys:
+        raise ValueError("monitor trigger has no exact effective budget binding")
+    cost_raw = raw["max_estimated_cost_usd"]
+    try:
+        cost = None if cost_raw is None else Decimal(str(cost_raw))
+        budgets = LoopBudgets(
+            max_turns=raw["max_turns"],
+            max_actions=raw["max_actions"],
+            max_repairs=raw["max_repairs"],
+            max_identical_failures=raw["max_identical_failures"],
+            max_observation_characters=raw["max_observation_characters"],
+            max_total_tokens=raw["max_total_tokens"],
+            max_wall_time_seconds=raw["max_wall_time_seconds"],
+            task_timeout_seconds=raw["task_timeout_seconds"],
+            max_estimated_cost_usd=cost,
+        )
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError("monitor trigger effective budgets are invalid") from error
+    if (
+        budgets.max_turns > defaults.max_turns
+        or budgets.max_actions > defaults.max_actions
+        or budgets.max_wall_time_seconds > defaults.max_wall_time_seconds
+        or budgets.max_repairs != defaults.max_repairs
+        or budgets.max_identical_failures != defaults.max_identical_failures
+        or budgets.max_observation_characters != defaults.max_observation_characters
+        or budgets.max_total_tokens != defaults.max_total_tokens
+        or budgets.task_timeout_seconds != defaults.task_timeout_seconds
+        or budgets.max_estimated_cost_usd != defaults.max_estimated_cost_usd
+    ):
+        raise ValueError("monitor effective budgets may only restrict agent defaults")
+    return budgets
+
+
 async def _bind_or_load_runtime_defaults(
     store: SQLiteOperationStore,
     agent_id: str,
@@ -433,12 +537,15 @@ class EmbeddedAgent:
         loop: AgentLoop | None,
         capabilities: CapabilityRegistry,
         model_profile: ModelProfile | None,
+        model_route: ModelRoute | None,
         runtime_defaults: AgentRuntimeDefaults,
+        catalog_service: CatalogService,
         memory_service: MemoryService,
         monitor_service: MonitorService,
         skill_service: SkillService,
         learning_service: ExplicitCorrectionLearningService,
         skill_change_service: SkillChangeLearningService,
+        extension_registry: ExtensionRegistry,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
     ) -> None:
@@ -450,16 +557,48 @@ class EmbeddedAgent:
         self._loop = loop
         self._capabilities = capabilities
         self.model_profile = model_profile
+        self.model_route = model_route
         self.runtime_defaults = runtime_defaults
+        self._catalog_service = catalog_service
         self._memory_service = memory_service
         self._monitor_service = monitor_service
         self._skill_service = skill_service
         self._learning_service = learning_service
         self._skill_change_service = skill_change_service
+        self._extension_registry = extension_registry
         self._clock = clock
         self._id_factory = id_factory
         self._mutation_lock = asyncio.Lock()
         self._closed = False
+
+    @property
+    def extension_bindings(self) -> tuple[ExtensionBinding, ...]:
+        return self._extension_registry.bindings
+
+    async def configure_model_route(
+        self,
+        route: ModelRoute,
+        *,
+        expected_revision: int,
+    ) -> ModelRoute:
+        """Bind a future-operation route; this composition must reopen to run."""
+
+        if not isinstance(route, ModelRoute):
+            raise TypeError("route must be a ModelRoute")
+        async with self._mutation_lock:
+            self._require_open()
+            stored = await self._store.set_model_route(
+                self.identity.id,
+                route,
+                expected_revision=expected_revision,
+            )
+            self.model_route = stored
+            self.model_profile = stored.model_profile
+            # Runtime and loop bind route identity at composition. Deliberately
+            # disable this in-memory composition until a normal reopen rebuilds
+            # them from the durable route.
+            self._loop = None
+            return stored
 
     @classmethod
     async def create(
@@ -478,13 +617,27 @@ class EmbeddedAgent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        extensions: tuple[ConfiguredExtension, ...] = (),
     ) -> Self:
+        extension_registry = ExtensionRegistry.load(extensions)
+        if extension_registry.extension_ids and any(
+            value is not None for value in (context_builder, domain, capabilities)
+        ):
+            raise AgentNotConfiguredError(
+                "configured extensions require the default data composition"
+            )
         model_profile, policy, budgets = resolve_agent_configuration(
             config,
             model=model,
             model_profile=model_profile,
             policy=policy,
             budgets=budgets,
+        )
+        model, model_profile, requested_route = _resolve_model_route_input(
+            config,
+            model,
+            model_profile,
+            secret_provider=secret_provider,
         )
         _validate_loop_configuration(
             model,
@@ -528,10 +681,30 @@ class EmbeddedAgent:
                 clock=resolved_clock,
             )
             await store.initialize_identity(identity)
+            await store.bind_extension_bindings(
+                identity.id,
+                extension_registry.bindings,
+            )
             resolved_profile = (
                 model_profile if model is not None and context_builder is None else None
             )
-            if resolved_profile is not None:
+            resolved_route = (
+                requested_route
+                if resolved_profile is not None and context_builder is None
+                else None
+            )
+            if resolved_route is not None:
+                try:
+                    resolved_route = await store.set_model_route(
+                        identity.id,
+                        resolved_route,
+                        expected_revision=0,
+                    )
+                except ModelRouteConflictError as error:
+                    raise AgentNotConfiguredError(
+                        "agent model route changed during creation"
+                    ) from error
+            elif resolved_profile is not None:
                 try:
                     resolved_profile = await store.bind_model_profile(
                         identity.id,
@@ -547,19 +720,14 @@ class EmbeddedAgent:
                 policy=policy,
                 budgets=budgets,
             )
-            _, manifest_cancelled = await _await_sync_completion(
-                lambda: _write_manifest(home, identity)
-            )
-            bootstrap_published = True
-            if manifest_cancelled:
-                raise asyncio.CancelledError
-            return cls._compose(
+            embedded = cls._compose(
                 identity=identity,
                 home=home,
                 writer_lock=writer_lock,
                 store=store,
                 model=model,
                 model_profile=resolved_profile,
+                model_route=resolved_route,
                 context_builder=context_builder,
                 domain=domain,
                 capabilities=capabilities,
@@ -569,7 +737,15 @@ class EmbeddedAgent:
                 clock=resolved_clock,
                 id_factory=resolved_id_factory,
                 secret_provider=secret_provider,
+                extension_registry=extension_registry,
             )
+            _, manifest_cancelled = await _await_sync_completion(
+                lambda: _write_manifest(home, identity)
+            )
+            bootstrap_published = True
+            if manifest_cancelled:
+                raise asyncio.CancelledError
+            return embedded
         except BaseException:
             try:
                 if store is not None:
@@ -601,13 +777,27 @@ class EmbeddedAgent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        extensions: tuple[ConfiguredExtension, ...] = (),
     ) -> Self:
+        extension_registry = ExtensionRegistry.load(extensions)
+        if extension_registry.extension_ids and any(
+            value is not None for value in (context_builder, domain, capabilities)
+        ):
+            raise AgentNotConfiguredError(
+                "configured extensions require the default data composition"
+            )
         model_profile, policy, budgets = resolve_agent_configuration(
             config,
             model=model,
             model_profile=model_profile,
             policy=policy,
             budgets=budgets,
+        )
+        model, model_profile, requested_route = _resolve_model_route_input(
+            config,
+            model,
+            model_profile,
+            secret_provider=secret_provider,
         )
         _validate_loop_configuration(
             model,
@@ -643,9 +833,73 @@ class EmbeddedAgent:
                 raise AgentIdentityMismatchError(
                     "agent.toml does not match authoritative state.db identity"
                 )
+            extension_registry.validate_binding(
+                await store.load_extension_bindings(identity.id)
+            )
+            stored_route = await store.load_model_route(identity.id)
             stored_profile = await store.load_model_profile(identity.id)
             resolved_profile: ModelProfile | None
-            if model is None:
+            resolved_route: ModelRoute | None = None
+            if stored_route is not None:
+                if context_builder is not None or domain is not None:
+                    raise AgentNotConfiguredError(
+                        "a persisted model route requires the default data composition"
+                    )
+                if requested_route is not None and requested_route != stored_route:
+                    try:
+                        stored_route = await store.set_model_route(
+                            identity.id,
+                            requested_route,
+                            expected_revision=stored_route.revision,
+                        )
+                    except ModelRouteConflictError as error:
+                        raise AgentNotConfiguredError(
+                            "configured model route conflicts with durable state"
+                        ) from error
+                resolved_route = stored_route
+                resolved_profile = stored_route.model_profile
+                if model_profile is not None and model_profile != resolved_profile:
+                    raise AgentNotConfiguredError(
+                        "configured model profile differs from the stored route"
+                    )
+                if requested_route is None:
+                    if model is None:
+                        model = create_model_route_provider(
+                            stored_route,
+                            secret_provider=secret_provider,
+                        )
+                    else:
+                        proposed = model_route_from_provider(
+                            model,
+                            resolved_profile,
+                            revision=stored_route.revision,
+                        )
+                        if proposed != stored_route:
+                            raise AgentNotConfiguredError(
+                                "configured model provider differs from the stored route"
+                            )
+                else:
+                    model = create_model_route_provider(
+                        stored_route,
+                        secret_provider=secret_provider,
+                    )
+            elif requested_route is not None:
+                try:
+                    resolved_route = await store.set_model_route(
+                        identity.id,
+                        requested_route,
+                        expected_revision=0,
+                    )
+                except ModelRouteConflictError as error:
+                    raise AgentNotConfiguredError(
+                        "configured model route conflicts with durable state"
+                    ) from error
+                resolved_profile = resolved_route.model_profile
+                model = create_model_route_provider(
+                    resolved_route,
+                    secret_provider=secret_provider,
+                )
+            elif model is None:
                 resolved_profile = stored_profile
             elif context_builder is not None:
                 if (
@@ -703,6 +957,7 @@ class EmbeddedAgent:
                 store=store,
                 model=model,
                 model_profile=resolved_profile,
+                model_route=resolved_route,
                 context_builder=context_builder,
                 domain=domain,
                 capabilities=capabilities,
@@ -712,6 +967,7 @@ class EmbeddedAgent:
                 clock=resolved_clock,
                 id_factory=resolved_id_factory,
                 secret_provider=secret_provider,
+                extension_registry=extension_registry,
             )
         except BaseException:
             try:
@@ -731,6 +987,7 @@ class EmbeddedAgent:
         store: SQLiteOperationStore,
         model: ModelProvider | None,
         model_profile: ModelProfile | None,
+        model_route: ModelRoute | None,
         context_builder: ContextBuilder | None,
         domain: DomainController | None,
         capabilities: CapabilityRegistry | None,
@@ -740,6 +997,7 @@ class EmbeddedAgent:
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
         secret_provider: SecretProvider | None,
+        extension_registry: ExtensionRegistry,
     ) -> Self:
         resolved_context = context_builder
         resolved_domain = domain
@@ -750,6 +1008,8 @@ class EmbeddedAgent:
         monitor_service = MonitorService(
             agent_id=identity.id,
             store=store,
+            default_budgets=runtime_defaults.budgets,
+            default_policy=runtime_defaults.policy_profile,
             clock=clock,
             id_factory=id_factory,
         )
@@ -791,7 +1051,7 @@ class EmbeddedAgent:
                     blob_store,
                 )
             )
-            resolved_capabilities = CapabilityRegistry(
+            built_in_capabilities = CapabilityRegistry(
                 capabilities=(
                     *catalog.capabilities,
                     *sqlite_query.capabilities,
@@ -816,6 +1076,9 @@ class EmbeddedAgent:
                     *file_read.tool_views,
                     *comparison.tool_views,
                 ),
+            )
+            resolved_capabilities = extension_registry.compose_with(
+                built_in_capabilities
             )
         active_capabilities = resolved_capabilities or CapabilityRegistry()
         skills_root = _ensure_agent_directory(home, "skills")
@@ -879,6 +1142,12 @@ class EmbeddedAgent:
             store=store,
             blob_store=blob_store,
             policy=policy,
+            model_route_revision=(
+                None if model_route is None else model_route.revision
+            ),
+            model_route_fingerprint=(
+                None if model_route is None else model_route.fingerprint
+            ),
         )
         loop = (
             None
@@ -900,12 +1169,15 @@ class EmbeddedAgent:
             loop=loop,
             capabilities=active_capabilities,
             model_profile=resolved_profile,
+            model_route=model_route,
             runtime_defaults=runtime_defaults,
+            catalog_service=catalog_service,
             memory_service=memory_service,
             monitor_service=monitor_service,
             skill_service=skill_service,
             learning_service=learning_service,
             skill_change_service=skill_change_service,
+            extension_registry=extension_registry,
             clock=clock,
             id_factory=id_factory,
         )
@@ -1040,7 +1312,15 @@ class EmbeddedAgent:
                         raise ValueError(
                             "trigger identity already owns different durable input"
                         )
-            result = await loop.run(trigger)
+            effective_budgets = (
+                self.runtime_defaults.budgets
+                if trigger.kind is not TriggerKind.MONITOR
+                else _monitor_budgets_from_trigger(
+                    trigger,
+                    defaults=self.runtime_defaults.budgets,
+                )
+            )
+            result = await loop.run(trigger, budgets=effective_budgets)
             return await self._with_post_operation_learning(result)
 
     async def attach(
@@ -1207,9 +1487,101 @@ class EmbeddedAgent:
                 self._clock(),
             )
 
+    async def list_sources(self) -> tuple[SourceRegistration, ...]:
+        self._require_open()
+        return await self._store.list_sources(self.identity.id)
+
+    async def list_catalog_resources(
+        self,
+        *,
+        source_id: str | None = None,
+    ) -> tuple[CatalogResource, ...]:
+        self._require_open()
+        return await self._store.list_resources(self.identity.id, source_id)
+
+    async def search_catalog(
+        self,
+        request: CatalogSearchRequest,
+    ) -> CatalogSearchResult:
+        self._require_open()
+        if not isinstance(request, CatalogSearchRequest):
+            raise TypeError("request must be a CatalogSearchRequest")
+        if request.agent_id != self.identity.id:
+            raise ValueError("catalog search belongs to another agent")
+        return await self._catalog_service.search(request)
+
+    async def inspect_catalog_resource(self, resource_id: str) -> FrozenJsonObject:
+        self._require_open()
+        return await self._catalog_service.inspect_resource(
+            self.identity.id,
+            resource_id,
+        )
+
     async def inspect(self, operation_id: str) -> OperationSnapshot:
         self._require_open()
         return (await self._store.load(operation_id)).snapshot
+
+    async def list_operations(
+        self,
+        *,
+        statuses: tuple[OperationStatus, ...] | None = None,
+        limit: int = 100,
+    ) -> tuple[OperationSnapshot, ...]:
+        self._require_open()
+        operations = await self._store.list_operations(
+            self.identity.id,
+            statuses=statuses,
+            limit=limit,
+        )
+        return tuple(operation.snapshot for operation in operations)
+
+    async def inspect_approval(self, approval_id: str) -> ApprovalRequest:
+        self._require_open()
+        operation = await self._store.load_by_approval(approval_id)
+        if (
+            operation is None
+            or operation.snapshot.operation.agent_id != self.identity.id
+        ):
+            raise KeyError(f"unknown approval: {approval_id}")
+        return next(
+            approval
+            for approval in operation.snapshot.approvals
+            if approval.id == approval_id
+        )
+
+    async def list_approvals(
+        self,
+        *,
+        statuses: tuple[ApprovalStatus, ...] | None = None,
+        limit: int = 100,
+    ) -> tuple[ApprovalRequest, ...]:
+        self._require_open()
+        if statuses is not None:
+            statuses = tuple(statuses)
+            if not statuses or any(
+                not isinstance(status, ApprovalStatus) for status in statuses
+            ):
+                raise ValueError("approval statuses must contain ApprovalStatus values")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 1_000
+        ):
+            raise ValueError("approval list limit must be from one through 1000")
+        operations = await self._store.list_operations(self.identity.id, limit=1_000)
+        approvals = tuple(
+            approval
+            for operation in operations
+            for approval in operation.snapshot.approvals
+            if statuses is None or approval.status in statuses
+        )
+        return tuple(
+            sorted(
+                approvals,
+                key=lambda approval: (approval.requested_at, approval.id),
+                reverse=True,
+            )[:limit]
+        )
 
     async def resume(self, operation_id: str) -> LoopExit:
         loop = self._require_loop()
@@ -1292,9 +1664,26 @@ class EmbeddedAgent:
     ) -> MonitorProposal:
         async with self._mutation_lock:
             self._require_open()
-            return await self._monitor_service.propose(
+        return await self._monitor_service.propose(
+            monitor_id,
+            definition,
+            idempotency_key=idempotency_key,
+            source_operation_id=source_operation_id,
+        )
+
+    async def propose_monitor_natural(
+        self,
+        monitor_id: str,
+        request: str,
+        *,
+        idempotency_key: str,
+        source_operation_id: str | None = None,
+    ) -> MonitorProposal:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._monitor_service.propose_natural(
                 monitor_id,
-                definition,
+                request,
                 idempotency_key=idempotency_key,
                 source_operation_id=source_operation_id,
             )
@@ -1501,6 +1890,27 @@ class EmbeddedAgent:
         self._require_open()
         return await self._skill_service.list()
 
+    async def list_learning_proposals(
+        self,
+        *,
+        operation_id: str | None = None,
+        states: tuple[LearningProposalState, ...] = (
+            LearningProposalState.PROPOSED,
+            LearningProposalState.COMMITTED,
+            LearningProposalState.REJECTED,
+        ),
+        limit: int = 100,
+    ) -> tuple[LearningProposal, ...]:
+        """List visible durable learning decisions in this agent's scope."""
+
+        self._require_open()
+        return await self._store.list_proposals(
+            self.identity.id,
+            operation_id=operation_id,
+            states=states,
+            limit=limit,
+        )
+
     async def inspect_skill(self, skill_id: str) -> SkillInspection:
         self._require_open()
         return await self._skill_service.inspect(skill_id)
@@ -1593,29 +2003,69 @@ class EmbeddedAgent:
             snapshot = (await self._store.load(operation_id)).snapshot
             return await self._learning_service.learn(snapshot)
 
-    async def _learn_completed_correction(self, result: LoopExit) -> str | None:
+    async def _learn_completed_operation(self, result: LoopExit) -> tuple[str, ...]:
         if result.kind is not LoopExitKind.COMPLETED:
-            return None
-        snapshot = (await self._store.load(result.operation_id)).snapshot
-        message = snapshot.trigger.payload.get("message")
-        if not isinstance(message, str) or not message.startswith(
-            RESOURCE_ALIAS_CORRECTION_PREFIX
-        ):
-            return None
+            return ()
         try:
-            await self._learning_service.learn(snapshot)
-        except ExplicitCorrectionLearningError:
-            return "learning.correction_failed"
+            snapshot = (await self._store.load(result.operation_id)).snapshot
         except Exception:
-            return "learning.post_operation_unavailable"
-        return None
+            return ("learning.post_operation_unavailable",)
+        message = snapshot.trigger.payload.get("message")
+        if is_explicit_learning_message(message):
+            try:
+                await self._learning_service.learn(snapshot)
+            except ExplicitCorrectionLearningError:
+                return ("learning.correction_failed",)
+            except Exception:
+                return ("learning.post_operation_unavailable",)
+            return ()
+
+        notices: list[str] = []
+        try:
+            fact = await self._learning_service.propose_evidence_fact(snapshot)
+            if fact is not None:
+                notices.append(f"learning.fact_{fact.state.value}")
+        except Exception:
+            notices.append("learning.post_operation_unavailable")
+        try:
+            if (
+                not isinstance(message, str)
+                or snapshot.trigger.kind is not TriggerKind.USER
+            ):
+                skill = None
+            else:
+                source_hash = (
+                    "sha256:"
+                    + sha256(
+                        canonical_json(snapshot.trigger.payload).encode("utf-8")
+                    ).hexdigest()
+                )
+                skill = await self._skill_change_service.propose_natural(
+                    message,
+                    LearningProvenance(
+                        agent_id=self.identity.id,
+                        operation_id=snapshot.operation.id,
+                        trigger_id=snapshot.trigger.id,
+                        source_outcome=LearningSourceOutcome.SUCCEEDED,
+                        source_hash=source_hash,
+                    ),
+                )
+            if skill is not None:
+                notices.append(f"learning.skill_{skill.proposal.state.value}")
+        except Exception:
+            if "learning.post_operation_unavailable" not in notices:
+                notices.append("learning.post_operation_unavailable")
+        return tuple(notices)
 
     async def _with_post_operation_learning(self, result: LoopExit) -> LoopExit:
-        notice = await self._learn_completed_correction(result)
+        notices = await self._learn_completed_operation(result)
         return (
             result
-            if notice is None
-            else replace(result, post_operation_notices=(notice,))
+            if not notices
+            else replace(
+                result,
+                post_operation_notices=(*result.post_operation_notices, *notices),
+            )
         )
 
     def _require_memory_agent(self, agent_id: str) -> None:

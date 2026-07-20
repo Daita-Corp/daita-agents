@@ -536,6 +536,13 @@ async def test_submit_executes_only_after_fenced_start_and_forwards_identity() -
     final = await runtime.inspect(operation_id)
     assert final.tasks[0].status is TaskStatus.SUCCEEDED
     assert final.tasks[0].evidence_ids == (evidence.id,)
+    assert evidence.metadata_schema_version == 1
+    assert evidence.acceptance_reason == "schema_validated"
+    assert evidence.accepted is evidence.applicable is True
+    assert evidence.applicability_reason == "current_operation"
+    assert evidence.validation_facts == final.tasks[0].execution_facts.validation_facts
+    with pytest.raises(ValueError, match="projection metadata is not canonical"):
+        replace(evidence, projection_metadata={"model": "full_payload"})
     assert final.task_leases[0].released_at is not None
     assert final.task_leases[0].release_reason == "completed"
     assert [
@@ -933,7 +940,22 @@ async def test_unsafe_rejected_evidence_surfaces_post_execution_unknown() -> Non
     snapshot = await runtime.inspect(operation_id)
     assert failure.value.reason == "evidence_rejected"
     assert snapshot.tasks[0].status is TaskStatus.RUNNING
-    assert snapshot.evidence == ()
+    assert len(snapshot.evidence) == 1
+    rejected = snapshot.evidence[0]
+    assert rejected.accepted is rejected.applicable is False
+    assert rejected.metadata_schema_version == 1
+    assert rejected.acceptance_reason is None
+    assert rejected.rejection_reason == "schema_validation_failed"
+    assert not rejected.payload
+    assert rejected.blob_id is None
+    assert dict(rejected.redaction_metadata) == {
+        "artifact": "discarded",
+        "payload": "discarded",
+    }
+    assert "UNKNOWN" not in repr(rejected)
+    with pytest.raises(ValueError, match="canonical rejection_reason"):
+        replace(rejected, rejection_reason="executor_payload_invalid")
+    assert snapshot.events[-2].type == "evidence.rejected"
     assert snapshot.events[-1].type == "task.outcome_unknown"
     assert snapshot.events[-1].payload["reason"] == "evidence_rejected"
 
@@ -2052,9 +2074,17 @@ async def test_invalid_evidence_fails_task_without_accepting_evidence(
     assert len(snapshot.tasks) == 1
     assert snapshot.tasks[0].status is TaskStatus.FAILED
     assert snapshot.tasks[0].error_code == "evidence_rejected"
-    assert snapshot.evidence == ()
+    assert len(snapshot.evidence) == 1
+    rejected = snapshot.evidence[0]
+    assert rejected.accepted is rejected.applicable is False
+    assert rejected.metadata_schema_version == 1
+    assert rejected.acceptance_reason is None
+    assert rejected.rejection_reason == "schema_validation_failed"
+    assert not rejected.payload
+    assert rejected.blob_id is None
     event_types = [event.type for event in snapshot.events]
     assert "task.failed" in event_types
     assert "executor.failed" in event_types
+    assert "evidence.rejected" in event_types
     assert "evidence.accepted" not in event_types
     assert "task.succeeded" not in event_types

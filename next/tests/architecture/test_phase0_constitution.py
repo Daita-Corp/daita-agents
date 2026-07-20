@@ -36,7 +36,7 @@ def test_phase0_decisions_are_complete_and_accepted() -> None:
     decisions = sorted((NEXT_ROOT / "decisions").glob("[0-9][0-9][0-9][0-9]-*.md"))
 
     assert [path.name[:4] for path in decisions] == [
-        f"{number:04d}" for number in range(1, 17)
+        f"{number:04d}" for number in range(1, 18)
     ]
     assert all(
         "**Status:** Accepted" in path.read_text(encoding="utf-8") for path in decisions

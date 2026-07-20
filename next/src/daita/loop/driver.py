@@ -87,8 +87,16 @@ class AgentLoop:
         self._domain = domain
         self._budgets = budgets
 
-    async def run(self, trigger: AgentTrigger) -> LoopExit:
-        operation = await self._runtime.begin(trigger, budgets=self._budgets)
+    async def run(
+        self,
+        trigger: AgentTrigger,
+        *,
+        budgets: LoopBudgets | None = None,
+    ) -> LoopExit:
+        effective_budgets = self._budgets if budgets is None else budgets
+        if not isinstance(effective_budgets, LoopBudgets):
+            raise TypeError("budgets must be a LoopBudgets record or None")
+        operation = await self._runtime.begin(trigger, budgets=effective_budgets)
         return await self._continue_operation(operation.operation.id)
 
     async def resume(self, operation_id: str) -> LoopExit:

@@ -501,8 +501,8 @@ async def test_commit_not_found_and_stale_conflict_are_typed_and_atomic(
     try:
         with pytest.raises(OperationNotFoundError) as missing:
             await store.commit(unknown, expected_revision=1)
-        assert isinstance(missing.value, OperationStoreError)
         assert missing.value.operation_id == unknown.operation.id
+        assert issubclass(type(missing.value), OperationStoreError)
         assert await store.load_by_trigger(unknown.trigger.id) is None
 
         created = await store.create(initial)
@@ -516,10 +516,10 @@ async def test_commit_not_found_and_stale_conflict_are_typed_and_atomic(
         with pytest.raises(OperationRevisionConflict) as conflict:
             await store.commit(candidate, expected_revision=0)
 
-        assert isinstance(conflict.value, OperationStoreError)
         assert conflict.value.operation_id == initial.operation.id
         assert conflict.value.expected_revision == 0
         assert conflict.value.actual_revision == 1
+        assert issubclass(type(conflict.value), OperationStoreError)
         assert await store.load(initial.operation.id) == created.operation
         assert _normalized_rows(path) == baseline
         assert _revision(path, initial.operation.id) == 1
@@ -600,8 +600,8 @@ async def test_immutable_and_append_only_history_rejections_change_no_raw_rows(
             )
             with pytest.raises(InvalidOperationCheckpointError) as invalid:
                 await store.commit(candidate, expected_revision=1)
-            assert isinstance(invalid.value, OperationStoreError)
             assert invalid.value.operation_id == initial.operation.id
+            assert issubclass(type(invalid.value), OperationStoreError)
             assert await store.load(initial.operation.id) == created.operation
             assert _normalized_rows(path) == baseline
             assert _revision(path, initial.operation.id) == 1

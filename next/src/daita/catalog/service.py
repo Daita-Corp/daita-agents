@@ -50,14 +50,22 @@ class CatalogService:
         query: str,
         *,
         limit: int,
+        source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] = (),
     ) -> FrozenJsonObject:
         result = await self.search(
             CatalogSearchRequest(
                 agent_id=agent_id,
                 query=query,
-                limit=min(limit, 50),
+                source_ids=source_ids,
+                limit=(50 if resource_ids else min(limit, 50)),
             )
         )
+        hits = tuple(
+            hit
+            for hit in result.hits
+            if not resource_ids or hit.resource_id in resource_ids
+        )[:limit]
         return FrozenJsonObject.from_mapping(
             {
                 "resources": [
@@ -69,9 +77,9 @@ class CatalogService:
                         "sensitivity": hit.sensitivity.value,
                         "source_id": hit.source_id,
                     }
-                    for hit in result.hits
+                    for hit in hits
                 ],
-                "total_matches": result.total_matches,
+                "total_matches": len(hits),
                 "truncated": result.truncated,
                 "trust_classification": "untrusted_external_data",
             }

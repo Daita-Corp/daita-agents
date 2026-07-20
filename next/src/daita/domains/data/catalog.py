@@ -207,11 +207,15 @@ class CatalogDataView:
         query: str,
         *,
         limit: int,
+        source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] = (),
     ) -> FrozenJsonObject:
         return await self._service.catalog_context(
             agent_id,
             query,
             limit=limit,
+            source_ids=source_ids,
+            resource_ids=resource_ids,
         )
 
 

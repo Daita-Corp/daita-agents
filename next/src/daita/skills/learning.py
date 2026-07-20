@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import re
 from typing import Protocol
 from uuid import uuid4
 
@@ -48,6 +49,13 @@ _CANDIDATE_KEYS = frozenset(
         "stable_name",
         "version",
     }
+)
+_NATURAL_SKILL = re.compile(
+    r"(?is)^(?:(?:please\s+)?propose\s+(?:a\s+)?skill(?:\s+(?:named|called))?"
+    r"|remember\s+this\s+procedure\s+as\s+(?:a\s+)?skill)\s+"
+    r"(?P<name>[a-z0-9][a-z0-9-]{0,63})"
+    r"(?:\s+version\s+(?P<version>[0-9]+\.[0-9]+\.[0-9]+))?\s*:\s*"
+    r"(?P<instructions>.+)$"
 )
 
 
@@ -337,6 +345,33 @@ class SkillChangeLearningService:
             created_at=stored.created_at,
         )
         return SkillChangeProposalResult(stored, stored_preview)
+
+    async def propose_natural(
+        self,
+        message: str,
+        provenance: LearningProvenance,
+    ) -> SkillChangeProposalResult | None:
+        """Parse one bounded natural request into an inert skill proposal."""
+
+        if not isinstance(message, str):
+            raise TypeError("natural skill-change message must be a string")
+        if not isinstance(provenance, LearningProvenance):
+            raise TypeError("provenance must be LearningProvenance")
+        if provenance.agent_id != self._agent_id:
+            raise ValueError("skill-change provenance belongs to another agent")
+        match = _NATURAL_SKILL.fullmatch(message.strip())
+        if match is None:
+            return None
+        instructions = " ".join(match.group("instructions").strip().split())
+        candidate = SkillChangeCandidate(
+            stable_name=match.group("name").casefold(),
+            version=match.group("version") or "0.1.0",
+            description=f"Proposed learned procedure for {match.group('name')}.",
+            instructions=instructions,
+            activation_mode=SkillActivationMode.EXPLICIT,
+            domains=("data",),
+        )
+        return await self.propose(candidate, provenance)
 
     async def accept(
         self,

@@ -332,6 +332,23 @@ async def test_local_dispatch_journey_is_durable_strict_and_bounded(
         assert operation["status"] == "succeeded"
         assert operation["final_text"] == "chat complete"
 
+        operations = await _request(server, "operations-1", "operation.list")
+        assert isinstance(operations, LocalSuccessResponse)
+        listed_operations = _object_list(_result_object(operations)["operations"])
+        assert [value["id"] for value in listed_operations] == [operation_id]
+
+        approvals = await _request(server, "approvals-1", "approval.list")
+        assert isinstance(approvals, LocalSuccessResponse)
+        assert _result_object(approvals)["approvals"] == []
+
+        memories = await _request(server, "memories-1", "memory.list")
+        assert isinstance(memories, LocalSuccessResponse)
+        assert _result_object(memories)["items"] == []
+
+        skills = await _request(server, "skills-1", "skill.list")
+        assert isinstance(skills, LocalSuccessResponse)
+        assert _result_object(skills)["skills"] == []
+
         definition = {
             "name": "Backlog check",
             "objective": "Inspect the current backlog.",
@@ -466,7 +483,62 @@ async def test_source_attach_uses_default_host_capability_owners(short_root) -> 
             idempotency_key="source-1",
         )
         assert isinstance(source, LocalSuccessResponse)
-        assert _result_object(source)["adapter_id"] == "local-directory"
+        source_projection = _result_object(source)
+        assert source_projection["adapter_id"] == "local-directory"
+        source_id = source_projection["id"]
+        assert isinstance(source_id, str)
+
+        listed = await _request(server, "source-list", "source.list")
+        assert isinstance(listed, LocalSuccessResponse)
+        assert [
+            item["id"] for item in _object_list(_result_object(listed)["sources"])
+        ] == [source_id]
+
+        health = await _request(
+            server,
+            "source-health",
+            "source.health",
+            params={"source_id": source_id},
+        )
+        assert isinstance(health, LocalSuccessResponse)
+        health_items = _object_list(_result_object(health)["health"])
+        assert health_items[0]["healthy"] is True
+        catalog_resource_count = health_items[0]["catalog_resource_count"]
+        assert isinstance(catalog_resource_count, int)
+        assert catalog_resource_count >= 1
+
+        searched = await _request(
+            server,
+            "catalog-search",
+            "catalog.search",
+            params={"query": "rows", "source_ids": [source_id]},
+        )
+        assert isinstance(searched, LocalSuccessResponse)
+        hits = _object_list(_result_object(searched)["hits"])
+        assert hits
+        shown = await _request(
+            server,
+            "catalog-show",
+            "catalog.show",
+            params={"resource_id": hits[0]["resource_id"]},
+        )
+        assert isinstance(shown, LocalSuccessResponse)
+        assert _object(_result_object(shown)["resource"])["source_id"] == source_id
+
+        natural = await _request(
+            server,
+            "natural-monitor",
+            "monitor.propose_natural",
+            params={
+                "monitor_id": "rows-check",
+                "request": f"Every 5 minutes, Inspect rows for source {source_id}",
+            },
+            idempotency_key="natural-monitor-1",
+        )
+        assert isinstance(natural, LocalSuccessResponse)
+        natural_projection = _result_object(natural)
+        candidate = _object(natural_projection["candidate"])
+        assert _object(candidate["scope"])["source_ids"] == [source_id]
 
         replay = await _request(
             server,
@@ -494,6 +566,16 @@ async def test_source_attach_uses_default_host_capability_owners(short_root) -> 
             assert connection.execute(
                 "SELECT COUNT(*) FROM catalog_syncs"
             ).fetchone() == (1,)
+
+        detached = await _request(
+            server,
+            "source-detach",
+            "source.detach",
+            params={"source_id": source_id},
+            idempotency_key="source-detach-1",
+        )
+        assert isinstance(detached, LocalSuccessResponse)
+        assert _result_object(detached)["active"] is False
     finally:
         await server.stop(drain=True)
 

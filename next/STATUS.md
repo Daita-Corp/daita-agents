@@ -5,17 +5,16 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 9 complete — paused before Phase 10
-- **Active task:** none; Phase 10 requires explicit human authorization
-- **Last completed task:** P9-08 — replacement-candidate gate
-- **Current checkpoint:** complete Phase 9 candidate; the containing gate
-  commit uses `chore(v2-phase-9): complete phase 9 gate`
+- **Active phase:** Phase 9.5 complete; Phase 10 excluded
+- **Active task:** none — awaiting separate human Phase 10 authorization
+- **Last completed task:** P9.5-08 — joined replacement-readiness gate
+- **Current checkpoint:** the Phase 9.5 candidate is replacement-ready and
+  eligible for human Phase 10 review; no cutover work is authorized
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
-  `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** stop. Await explicit human review and authorization
-  before performing any Phase 10 cutover, push, publication, PR, or release
-  action
+  `e54f43dd0bfc0fa8478b496e7d2a89e53439d7fe9f5c8cf58f5c947f7682364b`
+- **Exact next action:** stop and await separate human authorization; do not
+  begin Phase 10, modify root v1, push, publish, open a PR, or create a release
 
 ## Development cadence
 
@@ -143,6 +142,19 @@ projection is narrower than canonical retained state; optional integrations
 remain lazy; and deterministic, live, fault, performance, security, frozen-v1,
 and clean-install evidence is consolidated once at P9-08.
 
+Before Phase 9.5 production edits, re-read full plan Sections 6 and 15 together
+with Sections 8.5-8.8, 8.10-8.11, 8.13-8.15, 9, 10, 12.3-12.5, Phase 9.5,
+Journeys A/C/D/G, the replacement definition of done, and ADR 0017. The
+binding constraints are that this phase closes missing joins through existing
+owners: validators own read authority, the router owns model reconstruction,
+the data domain owns monitor outcome semantics, learning owns memory/skill
+proposals, the extension registry owns additive declarations, and the host
+owns local mutation. No new loop, executor boundary, catalog, policy engine,
+state store, legacy-package fallback, raw-secret persistence, or implicit
+extension discovery is permitted. Focused red/green tests drive each coherent
+slice; broad formatting, static, dual-interpreter, root-oracle, packaging, and
+affected live checks run once at P9.5-08.
+
 ## Current architectural decisions
 
 - Build the replacement only under `next/`, using `next/src/daita/` as the
@@ -160,8 +172,9 @@ and clean-install evidence is consolidated once at P9-08.
 - Make `daita-agents` the sole Daita 2.0 distribution and `daita` entry-point
   owner; preserve `daita-cli` and `daita-client` only as unsupported legacy v1
   repositories, with no dependency, co-install promise, or runtime fallback.
-- Phase 0 through Phase 9 are authorized. Phase 10, root-package replacement,
-  pushing, publishing, PR creation, and release work are excluded.
+- Phase 0 through Phase 9.5 are complete. The candidate is eligible for human
+  Phase 10 review, but Phase 10, root-package replacement, pushing, publishing,
+  PR creation, and release work remain excluded.
 
 The binding rationale and consequences are recorded in `next/decisions/`.
 
@@ -310,6 +323,28 @@ P9-08. Phase 10 and cutover remain excluded.
 | P9-07 | complete | Public/audit projections; extension loading; persisted and built artifacts | Prompt-injection, secret-literal, event-projection, extension-collision/loading, dependency, and artifact security closure | 50 composed security cases pass; the exact adversarial journey plus complete secret-provider contract pass 9/9 after repairing double secret-provider composition | P9-01, P9-04 |
 | P9-08 | complete | Passing P9-01 through P9-07 slices | One consolidated deterministic/live/fault/performance/security/packaging/root replacement gate, final evidence, and one Phase 9 commit | All broad, live, lifecycle, fault, performance, security, focused retirement, disposition, and frozen-root gates pass; containing commit uses `chore(v2-phase-9): complete phase 9 gate`; work pauses before Phase 10 | P9-03, P9-05, P9-06, P9-07 |
 
+## Ordered Phase 9.5 tasks
+
+Phase 9.5 closes six audited product-contract joins without reopening the
+single loop, operation runtime, catalog, learning service, extension registry,
+or local-host architecture. Phase 9's executed evidence remains historical
+PASS evidence. Each implementation slice uses focused red/green tests; broad
+formatting, static, dual-interpreter, root-oracle, distribution, security, and
+affected live checks run once at P9.5-08. The intended phase-level checkpoint
+is `chore(v2-phase-9-5): complete phase 9.5 gate`; no per-helper checkpoint is
+required.
+
+| ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
+| --- | --- | --- | --- | --- | --- |
+| P9.5-01 | complete | Post-Phase 9 plan-to-source audit; Phase 9.5 work/gate; Sections 6/15 and affected ownership sections; ADR 0017; current support/parity claims | Reconciled owner/blocker/deferral map plus representative expected-red black-box contracts for cold reopen, trusted reads, default monitors, natural learning, additive extensions, and the real CLI/host journey; no production edit | Six public/acceptance anchors fail at the intended schema-zero authority, cold reopen, default no-finding, natural-learning, additive-composition, and real CLI create seams; no fixture/environment drift remains | P9-08 |
+| P9.5-02 | complete | Existing data-domain validators, `ActionValidationFacts`, operation runtime, evidence records, SQLite/file/PostgreSQL adapters, and migrations | Schema-versioned exact source/resource/revision/freshness/sensitivity facts for reads and comparisons; runtime-owned evidence acceptance/rejection/applicability/projection metadata; governance and routing consume trusted facts; adapters retain pre-I/O revalidation; legacy rows never gain invented authority | 520-case focused compatibility sweep; real SQLite acceptance/reopen/tamper anchor; migration-4 legacy evidence remains schema-zero; source/resource/revision/sensitivity tamper fails closed; stale/cross-scope adapter and disallowed-provider zero-I/O tests pass; rejected content is discarded | P9.5-01 |
+| P9.5-03 | complete | Canonical model profiles/router, agent configuration, provider factory, secret providers, Agent/host open paths, local protocol | Versioned persisted primary/fallback route with provider/model identity, endpoint references, sensitivity grants, retry/output policy, secret references, and operation-bound route revision; configured `Agent.open().run()` and model-free host start reconstruct providers lazily; safe model set/status mutation | 52-case focused config/storage/host/provider sweep; nine route-specific cases prove exact normalized reopen, v15 no-invention migration, cold default-domain run and second reopen, router-owned retry/fallback, CAS replay/stale/nonterminal behavior, immutable operation binding, missing-secret/extra zero-I/O failure, tamper detection, and resolved-secret absence | P9.5-01 |
+| P9.5-04 | complete | Confirmed monitor definitions, scheduler/occurrences, P9.5-02 authority, P9.5-03 reconstructable host, data-domain readiness/evidence owners | Typed confirmed definition snapshot bound to each occurrence/operation; source/resource scope enforced before I/O; read-only restriction-only effective budget/policy persisted; unsupported conditions rejected at confirmation; default data outcome projector creates at most one evidence-linked finding | 551-case monitor/data/catalog/host/runtime compatibility sweep with 550 pass and one sandbox-only Unix-socket skip; default `AgentHost` matched/unmatched/out-of-scope/tight-budget/restart/missed-run/dedupe cases use the production projector; typed-condition, unsupported-condition, restriction-only proposal, exact scope/context, and approval-wake resume owner tests pass | P9.5-02, P9.5-03 |
+| P9.5-05 | complete | Existing provenance/revision/sensitivity memory, learning eligibility, skill proposal/versioning, P9.5-02 trusted evidence | Ordinary explicit correction/`remember that` ingress plus governed evidence-backed fact proposals and ordinary-loop skill-change proposals; existing precise alias path remains a lower-level compatibility route; no skill self-activation | 91-case focused learning/memory/skill/storage/public sweep; natural alias changes a later grounded action and becomes stale on resource revision; accepted-current read evidence binds visible fact proposals; ungrounded/PII/credential/policy/code candidates redact or reject; close/reopen retains proposals and memory audit; skill stays absent until explicit acceptance | P9.5-02 |
+| P9.5-06 | complete | Built-in composition, `ExtensionRegistry`, `CapabilityRegistry`, manifests, context/domain projections, Agent/host configuration | Explicit configured capability-provider extensions compose atomically and additively with built-ins; tool/context declarations are visible through normal composition; extension ID/version/declaration fingerprints bind reopen; resource-adapter/backend-provider manifest categories are explicitly reclassified post-MVP | 415-case focused composition/hosting/storage/architecture sweep with 414 pass and one sandbox-only Unix-socket skip; built-in plus extension `Agent.run` and `AgentHost` journeys use persisted tasks/evidence through the sole runtime; missing/drifted/colliding extension fails before provider/executor I/O or partial Agent Home publication; focused Black/compile/mypy/Pyright checks pass | P9.5-01 |
+| P9.5-07 | complete | P9.5-03 through P9.5-06 services; public Agent/host reads; Phase 6 private socket protocol; bundled CLI | Complete in-package first-run surface: agent create, model set/show/status, model-free serve, source add/list/detach/health, line-oriented streamed chat, operation/approval/catalog/memory/skill/monitor inspection, natural monitor proposal/confirmation, and reconnecting cursor-based event follow; CLI remains presentation only | 117-case focused CLI/host/monitor/store/architecture sweep with 116 pass and one sandbox-only socket skip; separate real-socket source-tree and isolated installed-console subprocess journeys pass. The installed journey covers a non-empty durable approval, grounded SQLite chat/evidence, live post-cursor event observation, and source detach. Focused Black, mypy, and Pyright pass | P9.5-03, P9.5-04, P9.5-05, P9.5-06 |
+| P9.5-08 | complete | Passing P9.5-01 through P9.5-07 slices and retained unchanged Phase 9 evidence | Joined default-composition acceptance, affected live provider/database proof, fault/restart/security/migration/install evidence, reconciled support/parity/release docs, and one consolidated Phase 9.5 gate commit | Clean wheel creates/configures/serves/chats/follows/inspects/stops/reopens/runs on CPython 3.11/3.12; live OpenAI plus real SQLite crosses cold reopen; default monitor, natural learning, and additive extension journeys pass; full dual-Python/static/architecture/root/distribution/security gate passes; unchanged Phase 9 provider/PostgreSQL rows are cited | P9.5-07 |
+
 ### Ordered P2-03 internal tasks
 
 | ID | Status | Smallest output | Required proof before advancing |
@@ -360,6 +395,13 @@ P9-08. Phase 10 and cutover remain excluded.
 
 ## Files/components being changed or planned
 
+- P9.5-01 through P9.5-05 have extended the existing authority/evidence,
+  model-route, monitor/data-domain, learning/memory/skill, SQLite, Agent, and
+  host owners. The governing plan, ledgers, ADR 0017, and focused behavioral
+  tests record those joined contracts; no parallel subsystem was introduced.
+- Phase 9.5 completed through the existing extension/capability registries,
+  public Agent/host facades, private local protocol, bundled CLI, and existing
+  persistence/runtime owners. No parallel subsystem owner was introduced.
 - Phase 0 artifacts are complete at `720adc8`.
 - P1-01 completed production owners: the narrow shared JSON-value utility
   `next/src/daita/_json.py`, `next/src/daita/loop/models.py`,
@@ -648,6 +690,7 @@ Environment: repository `.venv`, Python 3.11.15, pytest 9.1.1.
 
 | Command | Result |
 | --- | --- |
+| `../.venv/bin/python -m pytest tests/architecture/test_import_firewall.py tests/architecture/test_phase0_constitution.py tests/architecture/test_release_documentation.py tests/architecture/test_parity_matrix.py -q` (cwd `next/`) | PASS — 24 passed; the first run had one documentation-contract failure because revised parity wording omitted the exact phrase `does not authorize Phase 10`; restoring that explicit boundary made the unchanged check pass |
 | `.venv/bin/python -m pytest --collect-only -q tests/ -m 'not requires_llm and not requires_db'` | PASS — 2,719 collected; 221 deselected; 2,498 selected; no collection errors (read-only P0-01 audit) |
 | `set -e;` count 14 numbered ADRs; count 14 accepted statuses; assert baseline, sole executor boundary, and Phase 10 exclusion text | PASS — exit 0 (P0-02 completeness smoke) |
 | `PYTHONPATH=src:../.venv/lib/python3.11/site-packages ../.venv/bin/python -S -m pytest tests/architecture/test_import_firewall.py -q` (cwd `next/`) | PASS — 6 passed; `-S` prevents processing the root editable-install path |
@@ -1230,6 +1273,117 @@ re-read and an updated ordered ledger.
       uninstall guidance, sole-entry-point/no-legacy-fallback contracts, and
       25 passing focused architecture/packaging cases. The containing commit
       uses `chore(v2-phase-9): complete phase 9 gate`; no Phase 10 work began.
+
+## Phase 9.5 current record
+
+### P9.5-01 owner and deferral rebaseline
+
+| Missing joined contract | Existing owner extended in place | Confirmed blocker | Preserved deferral/non-goal |
+| --- | --- | --- | --- |
+| Trusted SQL/file/comparison read authority | Data-domain validators produce `ActionValidationFacts`; `OperationRuntime`, evidence records/repositories, and adapters persist, govern, project, and revalidate those facts | Read proposals still use schema-zero defaults outside the controlled-write path, and evidence lacks one canonical acceptance/applicability/projection/redaction authority record | No second validator, policy engine, evidence store, or adapter execution path; no new source family |
+| Cold configured model reopen | Canonical model profiles, `ModelRouter`, agent configuration, provider adapters/factory, secret providers, and Agent/host composition | Agent Home retains a profile/fingerprint but not a reconstructable versioned primary/fallback route; `Agent.open(...).run()` still needs a caller model | No provider-family expansion, raw-secret persistence, second retry owner, or legacy fallback |
+| Operational default monitors | Monitor service/scheduler/store plus the data domain's accepted-evidence semantics and `AgentHost` composition | The default host installs `_NoFindingProjector`; confirmed definition scope, effective budget/policy, typed conditions, and operation/finding joins are not yet one enforced contract | Read-only MVP monitors; no arbitrary expression/SQL/code evaluation or outbound notification system |
+| Natural learning and skill proposals | Existing explicit-correction learning, memory/provenance/revision services, and skill-change proposal/version owners | The only automatic correction ingress requires caller-authored canonical resource-alias JSON; ordinary remember/correction and ordinary-operation skill-proposal ingress are absent | Precise alias input remains compatible; no hidden memory commit, policy/secret learning, executable skills, or self-activation |
+| Additive extension composition | `ExtensionRegistry`, `CapabilityRegistry`, manifests, built-in composition, context/domain projections, and Agent/host configuration | Explicit extension registries validate in isolation but the normal composition replaces rather than atomically combines declarations with built-ins and binds no durable manifest set | No scanning, auto-installation, hot reload, arbitrary hooks, alternate loop, or executor bypass |
+| Real in-package CLI/host journey | `Agent`, `AgentHost`, private local protocol/server, and bundled `daita` CLI | Safe request primitives exist, but durable model set/show, complete source/inspection commands, interactive streamed chat, natural monitor proposal, and reconnecting event-follow are not one installed subprocess journey | No revived `daita-cli`/`daita-client`, public remote protocol, rich desktop UI, or CLI-owned runtime semantics |
+
+All six blockers are joins between current owners. None requires a new loop,
+operation runtime, catalog, policy engine, state/learning store, extension
+framework, retry owner, or recovery path.
+
+- [x] The post-Phase 9 review was checked against production code and tests;
+      the six retained findings are narrowed, evidence-backed product-contract
+      gaps rather than missing foundational subsystems.
+- [x] The governing plan now defines Phase 9.5 work, explicit non-goals, joined
+      gates, and updated acceptance/replacement/cutover boundaries. ADR 0017
+      records why Phase 9 remains historical PASS evidence while replacement-
+      readiness sign-off is reopened.
+- [x] P9.5-01 through P9.5-08 are ordered above with exact inputs, outputs,
+      proof, and dependencies. The cadence uses focused slice tests and one
+      consolidated broad gate at P9.5-08.
+- [x] P9.5-01 completed after the mandatory architecture re-read: the owner and
+      deferral map above reconciles all six gaps, and the six expected-red
+      public/acceptance anchors fail at their intended missing product contract
+      rather than fixture, credential, or environment drift.
+- [x] P9.5-02 completed by extending the existing validation, runtime evidence,
+      checkpoint, and SQLite owners. SQL/file/comparison reads now bind current
+      source/resource revisions, freshness, and effective sensitivity before
+      I/O; comparisons depend on accepted evidence authority rather than
+      executor payload claims; schema-15 reopen retains exact facts while
+      legacy rows gain no authority; canonical accepted/rejected evidence has
+      mutually exclusive disposition plus fixed projection/redaction metadata;
+      rejected content is discarded; governance, adapter revalidation, and
+      sensitivity routing fail closed in the focused 520-case sweep.
+- [x] P9.5-03 completed by extending the canonical route/router, configuration,
+      provider factory, SQLite, operation, Agent, and host owners. Migration 16
+      persists append-only normalized routes with an optimistic CAS head and
+      binds immutable route revision/fingerprint facts to each new operation.
+      Providers and secret references reconstruct lazily after a cold open;
+      profile-only v15 homes gain no invented route; retry/fallback remains
+      router-owned; missing secrets/extras, unsafe endpoints, drift, and tamper
+      reach no provider I/O; resolved secret values never enter Agent Home.
+- [x] P9.5-04 completed by extending the existing monitor definition/service/
+      scheduler, data-domain controller/context, operation runtime, and host
+      composition owners. Occurrences resolve their immutable confirmed version;
+      operation triggers retain its version, hash, exact scope/condition, and
+      restriction-only effective policy; operation checkpoints retain restricted
+      budgets. Default-host monitors expose only scoped reads, reject an
+      out-of-scope source before catalog or executor I/O, evaluate typed
+      `always`/numeric-threshold conditions over accepted current-operation
+      evidence, and atomically retain zero or one evidence-linked finding.
+      Default-host matched/unmatched, tight-budget, and missed-run/restart/
+      deduplication journeys pass without an injected positive projector; the
+      existing approval-wake reclaim resumes the same retained trigger and
+      operation, while new MVP monitor work cannot request write approval.
+- [x] P9.5-05 completed by extending the existing learning, memory, skill,
+      SQLite, and Agent composition owners. Successful ordinary `remember that`
+      interactions create provenance-backed semantic memory; alias-shaped
+      statements require one accepted current read resource binding and retain
+      revision staleness behavior; the canonical JSON alias route remains
+      compatible. Evidence-backed facts are visible proposed/rejected records
+      bound to exact accepted applicable evidence and never silently commit.
+      Natural skill requests create redaction-safe inert proposals, survive
+      reopen, and enter `list_skills()` only after explicit audited acceptance.
+      The focused 91-case gate plus Black, compilation, mypy, Pyright, and the
+      skill dependency boundary pass.
+- [x] P9.5-06 completed by extending the existing capability/extension
+      registries, Agent/host composition, and SQLite identity store. Explicit
+      capability-provider manifests compose additively with built-ins and
+      retain an ordered immutable version/declaration/manifest fingerprint set
+      across reopen. Missing, drifted, oversized, or colliding configuration
+      fails before provider/executor I/O; create-time collisions publish no
+      partial Agent Home. Extension and built-in actions still become ordinary
+      persisted tasks/evidence through the sole operation runtime. Monitor
+      projection remains restricted to scoped built-in read capabilities.
+      Resource-adapter/backend-provider extension kinds are now truthful
+      post-MVP rejections rather than advertised-but-inert paths. The focused
+      415-case gate, Black, compilation, mypy, Pyright, and architecture
+      boundaries pass with one sandbox-only socket skip.
+- [x] P9.5-07 completed by extending the existing Agent, AgentHost, operation
+      repository, monitor service, private socket dispatcher, and bundled CLI.
+      Mutations remain host-owned and idempotent; the CLI only parses, invokes
+      the transport, and renders strict JSON/JSONL. A real Unix-socket journey
+      passed both from the source tree and through an isolated installed
+      `daita` console entry point, covering model-free configured serve,
+      source/catalog lifecycle, grounded interactive chat, operation and
+      non-empty approval inspection, memory/skill/monitor inspection, natural
+      proposal plus explicit confirmation, and reconnecting event follow that
+      observed a later monitor event. The focused 117-case gate, Black, mypy,
+      Pyright, and Phase 6 task-ownership architecture boundary pass.
+- [x] P9.5-08 completed the joined gate. A clean 106-entry wheel and 133-entry
+      sdist installed with the declared OpenAI/SQLite extras on CPython
+      3.11.15 and 3.12.7; each created/configured/served/chatted/followed/
+      inspected/stopped/cold-reopened/ran/uninstalled while retaining state.
+      The affected real OpenAI/default-data-domain/SQLite journey passed across
+      close/reopen without model injection. Default monitor, natural learning,
+      and additive extension acceptance passed together. The final
+      deterministic suites pass 1,631 cases with two sandbox-only socket skips
+      and nine live deselections on both interpreters; architecture, static,
+      migration/recovery/cancellation/lease/security, frozen-root/oracle,
+      source-socket, packaging, and root distribution gates all pass. Phase 9
+      provider and least-privilege PostgreSQL live rows remain cited unchanged.
+- [x] Phase 10 remains excluded even after Phase 9.5 passes unless a human
+      separately authorizes destructive cutover work.
 
 ## Credentials and external dependencies
 

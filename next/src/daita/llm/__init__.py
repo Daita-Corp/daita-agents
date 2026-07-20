@@ -1,7 +1,7 @@
 """Provider-neutral model contracts."""
 
 from .errors import ModelProviderError, ProviderErrorCode
-from .factory import create_llm_provider
+from .factory import create_llm_provider, create_model_route_provider
 from .models import (
     CanonicalMessage,
     FinishReason,
@@ -28,6 +28,9 @@ from .protocols import (
     ModelProfileRepository,
     ModelProfileRepositoryError,
     ModelProvider,
+    ModelRouteConflictError,
+    ModelRouteRepository,
+    ModelRouteRepositoryError,
     StreamingModelProvider,
 )
 from .providers import (
@@ -41,6 +44,8 @@ from .providers import (
 from .routing import (
     ModelProviderRegistration,
     ModelRegistry,
+    ModelRoute,
+    ModelRouteCandidate,
     ModelRouter,
     RetryPolicy,
     RetryStrategy,
@@ -60,6 +65,11 @@ __all__ = [
     "ModelProvider",
     "ModelProviderError",
     "ModelProviderRegistration",
+    "ModelRoute",
+    "ModelRouteCandidate",
+    "ModelRouteConflictError",
+    "ModelRouteRepository",
+    "ModelRouteRepositoryError",
     "ModelRegistry",
     "ModelRequest",
     "ModelResponse",
@@ -85,4 +95,5 @@ __all__ = [
     "ToolDefinition",
     "ToolResultBlock",
     "create_llm_provider",
+    "create_model_route_provider",
 ]

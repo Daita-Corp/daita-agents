@@ -10,10 +10,12 @@ from typing import Self
 from .adapters.models import SourceRegistration
 from .adapters.protocols import ResourceSource
 from ._json import FrozenJsonObject
+from .catalog.models import CatalogResource, CatalogSearchRequest, CatalogSearchResult
 from .capabilities import CapabilityRegistry
 from .config import AgentConfig
 from .events.models import CommittedEvent, EventCursor
 from .events.projection import EventAudience, project_committed_event
+from .extensions import ConfiguredExtension, ExtensionBinding
 from .hosting.embedded import (
     AgentAlreadyExistsError,
     AgentHomeError,
@@ -27,6 +29,8 @@ from .hosting.embedded import (
 )
 from .llm.models import ModelProfile
 from .llm.protocols import ModelProvider
+from .llm.routing import ModelRoute
+from .learning import LearningProposal, LearningProposalState
 from .loop.driver import ContextBuilder, DomainController
 from .loop.models import LoopBudgets, LoopExit
 from .monitors.models import (
@@ -43,6 +47,7 @@ from .operations.governance import (
     ApprovalStatus,
     DefaultPolicyEvaluator,
 )
+from .operations.models import OperationStatus
 from .sessions import SessionTranscript
 from .memory.learning import ExplicitCorrectionResult
 from .memory.models import (
@@ -87,6 +92,7 @@ class Agent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        extensions: tuple[ConfiguredExtension, ...] = (),
     ) -> Self:
         embedded = await EmbeddedAgent.create(
             name,
@@ -102,6 +108,7 @@ class Agent:
             clock=clock,
             id_factory=id_factory,
             secret_provider=secret_provider,
+            extensions=extensions,
         )
         return cls(embedded)
 
@@ -122,6 +129,7 @@ class Agent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        extensions: tuple[ConfiguredExtension, ...] = (),
     ) -> Self:
         embedded = await EmbeddedAgent.open(
             name,
@@ -137,6 +145,7 @@ class Agent:
             clock=clock,
             id_factory=id_factory,
             secret_provider=secret_provider,
+            extensions=extensions,
         )
         return cls(embedded)
 
@@ -156,6 +165,14 @@ class Agent:
     def model_profile(self) -> ModelProfile | None:
         return self._embedded.model_profile
 
+    @property
+    def model_route(self) -> ModelRoute | None:
+        return self._embedded.model_route
+
+    @property
+    def extension_bindings(self) -> tuple[ExtensionBinding, ...]:
+        return self._embedded.extension_bindings
+
     async def run(self, message: str, *, session_id: str | None = None) -> LoopExit:
         return await self._embedded.run(message, session_id=session_id)
 
@@ -173,8 +190,46 @@ class Agent:
     async def detach(self, source_id: str) -> SourceRegistration:
         return await self._embedded.detach(source_id)
 
+    async def list_sources(self) -> tuple[SourceRegistration, ...]:
+        return await self._embedded.list_sources()
+
+    async def list_catalog_resources(
+        self,
+        *,
+        source_id: str | None = None,
+    ) -> tuple[CatalogResource, ...]:
+        return await self._embedded.list_catalog_resources(source_id=source_id)
+
+    async def search_catalog(
+        self,
+        request: CatalogSearchRequest,
+    ) -> CatalogSearchResult:
+        return await self._embedded.search_catalog(request)
+
+    async def inspect_catalog_resource(self, resource_id: str) -> FrozenJsonObject:
+        return await self._embedded.inspect_catalog_resource(resource_id)
+
     async def inspect(self, operation_id: str) -> OperationSnapshot:
         return await self._embedded.inspect(operation_id)
+
+    async def list_operations(
+        self,
+        *,
+        statuses: tuple[OperationStatus, ...] | None = None,
+        limit: int = 100,
+    ) -> tuple[OperationSnapshot, ...]:
+        return await self._embedded.list_operations(statuses=statuses, limit=limit)
+
+    async def inspect_approval(self, approval_id: str) -> ApprovalRequest:
+        return await self._embedded.inspect_approval(approval_id)
+
+    async def list_approvals(
+        self,
+        *,
+        statuses: tuple[ApprovalStatus, ...] | None = None,
+        limit: int = 100,
+    ) -> tuple[ApprovalRequest, ...]:
+        return await self._embedded.list_approvals(statuses=statuses, limit=limit)
 
     async def resume(self, operation_id: str) -> LoopExit:
         return await self._embedded.resume(operation_id)
@@ -244,6 +299,21 @@ class Agent:
         return await self._embedded.propose_monitor(
             monitor_id,
             definition,
+            idempotency_key=idempotency_key,
+            source_operation_id=source_operation_id,
+        )
+
+    async def propose_monitor_natural(
+        self,
+        monitor_id: str,
+        request: str,
+        *,
+        idempotency_key: str,
+        source_operation_id: str | None = None,
+    ) -> MonitorProposal:
+        return await self._embedded.propose_monitor_natural(
+            monitor_id,
+            request,
             idempotency_key=idempotency_key,
             source_operation_id=source_operation_id,
         )
@@ -390,6 +460,23 @@ class Agent:
 
     async def list_skills(self) -> tuple[SkillIndex, ...]:
         return await self._embedded.list_skills()
+
+    async def list_learning_proposals(
+        self,
+        *,
+        operation_id: str | None = None,
+        states: tuple[LearningProposalState, ...] = (
+            LearningProposalState.PROPOSED,
+            LearningProposalState.COMMITTED,
+            LearningProposalState.REJECTED,
+        ),
+        limit: int = 100,
+    ) -> tuple[LearningProposal, ...]:
+        return await self._embedded.list_learning_proposals(
+            operation_id=operation_id,
+            states=states,
+            limit=limit,
+        )
 
     async def inspect_skill(self, skill_id: str) -> SkillInspection:
         return await self._embedded.inspect_skill(skill_id)

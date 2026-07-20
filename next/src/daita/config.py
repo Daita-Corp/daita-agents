@@ -9,7 +9,7 @@ from ._json import canonical_json
 from .errors import ConfigError
 from .llm.models import ModelProfile
 from .llm.protocols import ModelProvider
-from .llm.routing import ModelRouter, RetryPolicy
+from .llm.routing import ModelRoute, ModelRouter, RetryPolicy
 from .loop.models import LoopBudgets
 from .operations.governance import DefaultPolicyEvaluator, DefaultPolicyProfile
 
@@ -87,6 +87,7 @@ class AgentConfig:
     """
 
     schema_version: int = 1
+    model_route: ModelRoute | None = None
     model_profile: ModelProfile | None = None
     budgets: LoopBudgets = LoopBudgets()
     retry_policy: RetryPolicy = RetryPolicy()
@@ -95,6 +96,11 @@ class AgentConfig:
     def __post_init__(self) -> None:
         if self.schema_version != 1:
             raise ValueError("agent configuration schema_version must be 1")
+        if self.model_route is not None and not isinstance(
+            self.model_route,
+            ModelRoute,
+        ):
+            raise TypeError("model_route must be a ModelRoute or None")
         if self.model_profile is not None and not isinstance(
             self.model_profile,
             ModelProfile,
@@ -106,6 +112,17 @@ class AgentConfig:
             raise TypeError("retry_policy must be a RetryPolicy")
         if not isinstance(self.policy_profile, DefaultPolicyProfile):
             raise TypeError("policy_profile must be a DefaultPolicyProfile")
+        if self.model_route is not None:
+            if (
+                self.model_profile is not None
+                and self.model_profile != self.model_route.model_profile
+            ):
+                raise ValueError("model_profile must match model_route.model_profile")
+            if self.retry_policy not in {
+                RetryPolicy(),
+                self.model_route.retry_policy,
+            }:
+                raise ValueError("retry_policy must match model_route.retry_policy")
 
     @property
     def runtime_defaults(self) -> AgentRuntimeDefaults:
@@ -137,10 +154,15 @@ def resolve_agent_configuration(
         raise TypeError("budgets must be a LoopBudgets record or None")
     if config is None:
         return model_profile, policy, budgets
+    configured_profile = (
+        config.model_route.model_profile
+        if config.model_route is not None
+        else config.model_profile
+    )
     if (
         model_profile is not None
-        and config.model_profile is not None
-        and model_profile != config.model_profile
+        and configured_profile is not None
+        and model_profile != configured_profile
     ):
         raise ConfigError(
             "AgentConfig model profile conflicts with model_profile.",
@@ -159,7 +181,17 @@ def resolve_agent_configuration(
             section="policy",
             error_code="config_conflict",
         )
-    if isinstance(model, ModelRouter):
+    if config.model_route is not None:
+        if config.retry_policy not in {
+            RetryPolicy(),
+            config.model_route.retry_policy,
+        }:
+            raise ConfigError(
+                "AgentConfig retry policy conflicts with the model route.",
+                section="model.retry",
+                error_code="config_conflict",
+            )
+    elif isinstance(model, ModelRouter):
         if model.retry_policy != config.retry_policy:
             raise ConfigError(
                 "AgentConfig retry policy conflicts with the model router.",
@@ -173,7 +205,7 @@ def resolve_agent_configuration(
             error_code="config_owner_required",
         )
     return (
-        model_profile if model_profile is not None else config.model_profile,
+        model_profile if model_profile is not None else configured_profile,
         policy or DefaultPolicyEvaluator(config.policy_profile),
         config.budgets,
     )

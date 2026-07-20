@@ -165,7 +165,7 @@ async def test_migration_fourteen_upgrades_v13_without_inventing_defaults(
         await upgraded.close()
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (14,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (17,)
         assert connection.execute(
             "SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1"
-        ).fetchone() == (14, "bind_agent_runtime_defaults")
+        ).fetchone() == (17, "bind_configured_extensions")
