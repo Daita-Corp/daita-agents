@@ -55,6 +55,10 @@ from ..context.session import (
     SessionOperationFacts,
     SessionResourceScopeFact,
 )
+from ..config import (
+    AgentRuntimeDefaults,
+    AgentRuntimeDefaultsConflictError,
+)
 from ..events.models import CommittedEvent, EventCursor, RuntimeEvent
 from ..events.protocols import (
     EventCursorMismatchError,
@@ -173,7 +177,11 @@ from ..operations.checkpoints import (
     ModelCallStatus,
     OperationSnapshot,
 )
-from ..operations.governance import ApprovalRequest, ApprovalStatus
+from ..operations.governance import (
+    ApprovalRequest,
+    ApprovalStatus,
+    DefaultPolicyProfile,
+)
 from ..operations.leases import TaskClaimRequest, TaskLease, TaskLeaseGuard
 from ..operations.models import (
     ActionValidationFacts,
@@ -2497,6 +2505,60 @@ _TASK_VALIDATION_SCHEMA_SQL = (
 )
 
 
+_AGENT_RUNTIME_DEFAULTS_SCHEMA_SQL = (
+    """
+    CREATE TABLE agent_runtime_defaults (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        revision INTEGER NOT NULL CHECK (revision = 1),
+        fingerprint TEXT NOT NULL CHECK (
+            length(fingerprint) = 64
+            AND fingerprint NOT GLOB '*[^0-9a-f]*'
+        ),
+        budget_max_turns INTEGER NOT NULL CHECK (budget_max_turns > 0),
+        budget_max_actions INTEGER NOT NULL CHECK (budget_max_actions > 0),
+        budget_max_repairs INTEGER NOT NULL CHECK (budget_max_repairs > 0),
+        budget_max_identical_failures INTEGER NOT NULL CHECK (
+            budget_max_identical_failures > 0
+        ),
+        budget_max_observation_characters INTEGER NOT NULL CHECK (
+            budget_max_observation_characters > 0
+        ),
+        budget_max_total_tokens INTEGER NOT NULL CHECK (
+            budget_max_total_tokens > 0
+        ),
+        budget_max_wall_time_seconds REAL NOT NULL CHECK (
+            budget_max_wall_time_seconds > 0
+        ),
+        budget_task_timeout_seconds REAL NOT NULL CHECK (
+            budget_task_timeout_seconds > 0
+        ),
+        budget_max_estimated_cost_usd TEXT,
+        policy_id TEXT NOT NULL CHECK (length(trim(policy_id)) > 0),
+        policy_version TEXT NOT NULL CHECK (length(trim(policy_version)) > 0),
+        policy_allow_destructive INTEGER NOT NULL CHECK (
+            policy_allow_destructive IN (0, 1)
+        ),
+        bound_at TEXT NOT NULL
+    )
+    """.strip(),
+    """
+    CREATE TRIGGER agent_runtime_defaults_reject_update
+    BEFORE UPDATE ON agent_runtime_defaults
+    BEGIN
+        SELECT RAISE(ABORT, 'agent runtime-default binding is immutable');
+    END
+    """.strip(),
+    """
+    CREATE TRIGGER agent_runtime_defaults_reject_delete
+    BEFORE DELETE ON agent_runtime_defaults
+    BEGIN
+        SELECT RAISE(ABORT, 'agent runtime-default binding is immutable');
+    END
+    """.strip(),
+)
+
+
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
 # Migration 3 assigns one append-only committed-event sequence per agent.
@@ -2527,6 +2589,9 @@ _TASK_VALIDATION_SCHEMA_SQL = (
 # Migration 13 persists validator-owned scope, sensitivity, impact, and accepted
 # prerequisite evidence on the immutable task record. Schema-zero defaults
 # preserve Phase-2 approval fingerprints for already-pending v12 operations.
+# Migration 14 binds future-operation budgets and default policy once per agent.
+# Model and retry-route configuration remains in the immutable model-profile
+# binding, whose router identity includes the complete retry-policy fingerprint.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -2592,6 +2657,11 @@ _MIGRATIONS = (
         version=13,
         name="persist_task_validation_facts",
         statements=_TASK_VALIDATION_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=14,
+        name="bind_agent_runtime_defaults",
+        statements=_AGENT_RUNTIME_DEFAULTS_SCHEMA_SQL,
     ),
 )
 
@@ -2692,6 +2762,37 @@ class SQLiteOperationStore:
         """Load the authoritative database identity, if initialized."""
 
         return await self._run_connection(_load_agent_identity)
+
+    async def bind_runtime_defaults(
+        self,
+        agent_id: str,
+        defaults: AgentRuntimeDefaults,
+    ) -> AgentRuntimeDefaults:
+        """Bind or verify the agent's immutable future-operation defaults."""
+
+        _require_identity(agent_id, "agent_id")
+        if not isinstance(defaults, AgentRuntimeDefaults):
+            raise TypeError("defaults must be AgentRuntimeDefaults")
+        bound_at = self._clock()
+        return await self._run_connection(
+            lambda connection: _bind_agent_runtime_defaults(
+                connection,
+                agent_id,
+                defaults,
+                bound_at=bound_at,
+            )
+        )
+
+    async def load_runtime_defaults(
+        self,
+        agent_id: str,
+    ) -> AgentRuntimeDefaults | None:
+        """Load the exact immutable future-operation defaults, if bound."""
+
+        _require_identity(agent_id, "agent_id")
+        return await self._run_connection(
+            lambda connection: _load_agent_runtime_defaults(connection, agent_id)
+        )
 
     async def admit_host_mutation(
         self,
@@ -3722,6 +3823,17 @@ class SQLiteOperationStore:
             )
         )
 
+    async def latest_cursor(self, agent_id: str) -> EventCursor | None:
+        """Return the current durable tail without replaying event history."""
+
+        _require_identity(agent_id, "agent_id")
+        return await self._run_connection(
+            lambda connection: _latest_committed_event_cursor(
+                connection,
+                agent_id,
+            )
+        )
+
     def subscribe(
         self,
         agent_id: str,
@@ -4561,6 +4673,165 @@ def _load_agent_identity(connection: sqlite3.Connection) -> AgentIdentity | None
     except (TypeError, ValueError) as error:
         raise SQLiteCorruptionError(
             "cannot reconstruct authoritative agent identity"
+        ) from error
+
+
+def _bind_agent_runtime_defaults(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    defaults: AgentRuntimeDefaults,
+    *,
+    bound_at: datetime,
+) -> AgentRuntimeDefaults:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        identity = _load_agent_identity(connection)
+        if identity is None or identity.id != agent_id:
+            raise AgentRuntimeDefaultsConflictError(
+                "runtime defaults belong to another or uninitialized agent"
+            )
+        current = _load_agent_runtime_defaults(connection, agent_id)
+        if current is None:
+            budgets = defaults.budgets
+            policy = defaults.policy_profile
+            connection.execute(
+                "INSERT INTO agent_runtime_defaults("
+                "agent_id, schema_version, revision, fingerprint, "
+                "budget_max_turns, budget_max_actions, budget_max_repairs, "
+                "budget_max_identical_failures, "
+                "budget_max_observation_characters, budget_max_total_tokens, "
+                "budget_max_wall_time_seconds, budget_task_timeout_seconds, "
+                "budget_max_estimated_cost_usd, policy_id, policy_version, "
+                "policy_allow_destructive, bound_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    agent_id,
+                    defaults.schema_version,
+                    defaults.revision,
+                    defaults.fingerprint,
+                    budgets.max_turns,
+                    budgets.max_actions,
+                    budgets.max_repairs,
+                    budgets.max_identical_failures,
+                    budgets.max_observation_characters,
+                    budgets.max_total_tokens,
+                    budgets.max_wall_time_seconds,
+                    budgets.task_timeout_seconds,
+                    (
+                        None
+                        if budgets.max_estimated_cost_usd is None
+                        else _encode_decimal(budgets.max_estimated_cost_usd)
+                    ),
+                    policy.id,
+                    policy.version,
+                    int(policy.allow_destructive),
+                    _encode_datetime(bound_at),
+                ),
+            )
+            current = defaults
+        elif current != defaults:
+            raise AgentRuntimeDefaultsConflictError(
+                "agent is already bound to different runtime defaults"
+            )
+        connection.execute("COMMIT")
+        return current
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _load_agent_runtime_defaults(
+    connection: sqlite3.Connection,
+    agent_id: str,
+) -> AgentRuntimeDefaults | None:
+    rows = connection.execute(
+        "SELECT schema_version, revision, fingerprint, budget_max_turns, "
+        "budget_max_actions, budget_max_repairs, "
+        "budget_max_identical_failures, budget_max_observation_characters, "
+        "budget_max_total_tokens, budget_max_wall_time_seconds, "
+        "budget_task_timeout_seconds, budget_max_estimated_cost_usd, "
+        "policy_id, policy_version, policy_allow_destructive, bound_at "
+        "FROM agent_runtime_defaults WHERE agent_id = ?",
+        (agent_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise SQLiteCorruptionError(
+            "agent database must contain at most one runtime-default binding"
+        )
+    row = rows[0]
+    try:
+        cost = row["budget_max_estimated_cost_usd"]
+        defaults = AgentRuntimeDefaults(
+            schema_version=_sqlite_int(
+                row["schema_version"],
+                "runtime-default schema_version",
+            ),
+            revision=_sqlite_int(row["revision"], "runtime-default revision"),
+            budgets=LoopBudgets(
+                max_turns=_sqlite_int(
+                    row["budget_max_turns"],
+                    "runtime-default max_turns",
+                ),
+                max_actions=_sqlite_int(
+                    row["budget_max_actions"],
+                    "runtime-default max_actions",
+                ),
+                max_repairs=_sqlite_int(
+                    row["budget_max_repairs"],
+                    "runtime-default max_repairs",
+                ),
+                max_identical_failures=_sqlite_int(
+                    row["budget_max_identical_failures"],
+                    "runtime-default max_identical_failures",
+                ),
+                max_observation_characters=_sqlite_int(
+                    row["budget_max_observation_characters"],
+                    "runtime-default max_observation_characters",
+                ),
+                max_total_tokens=_sqlite_int(
+                    row["budget_max_total_tokens"],
+                    "runtime-default max_total_tokens",
+                ),
+                max_wall_time_seconds=_sqlite_real(
+                    row["budget_max_wall_time_seconds"],
+                    "runtime-default max_wall_time_seconds",
+                ),
+                task_timeout_seconds=_sqlite_real(
+                    row["budget_task_timeout_seconds"],
+                    "runtime-default task_timeout_seconds",
+                ),
+                max_estimated_cost_usd=(
+                    None if cost is None else _decode_decimal(cost)
+                ),
+            ),
+            policy_profile=DefaultPolicyProfile(
+                id=_sqlite_text(row["policy_id"], "runtime-default policy_id"),
+                version=_sqlite_text(
+                    row["policy_version"],
+                    "runtime-default policy_version",
+                ),
+                allow_destructive=bool(
+                    _sqlite_int(
+                        row["policy_allow_destructive"],
+                        "runtime-default policy_allow_destructive",
+                    )
+                ),
+            ),
+        )
+        fingerprint = _sqlite_text(
+            row["fingerprint"],
+            "runtime-default fingerprint",
+        )
+        _decode_datetime(_sqlite_text(row["bound_at"], "runtime-default bound_at"))
+        if fingerprint != defaults.fingerprint:
+            raise ValueError("runtime-default fingerprint does not match its fields")
+        return defaults
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise SQLiteCorruptionError(
+            "cannot reconstruct authoritative agent runtime defaults"
         ) from error
 
 
@@ -12657,6 +12928,23 @@ def _read_committed_events(
         if connection.in_transaction:
             connection.execute("ROLLBACK")
         raise
+
+
+def _latest_committed_event_cursor(
+    connection: sqlite3.Connection,
+    agent_id: str,
+) -> EventCursor | None:
+    row = connection.execute(
+        "SELECT MAX(agent_sequence) AS sequence FROM runtime_events "
+        "WHERE agent_id = ?",
+        (agent_id,),
+    ).fetchone()
+    if row is None or row["sequence"] is None:
+        return None
+    return EventCursor(
+        agent_id=agent_id,
+        sequence=_sqlite_int(row["sequence"], "latest event agent sequence"),
+    )
 
 
 def _decode_runtime_event_row(row: sqlite3.Row) -> RuntimeEvent:

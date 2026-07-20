@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from ..capabilities import ExtensionDeclarations
+from ..errors import PluginError
 from .models import (
     DiscoveryRequest,
     DiscoveryResult,
@@ -22,7 +23,7 @@ def _text(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a non-empty string")
 
 
-class ResourceAdapterError(RuntimeError):
+class ResourceAdapterError(PluginError):
     """Normalized resource-adapter failure safe for control-plane handling."""
 
     def __init__(self, source_id: str, code: str, message: str) -> None:
@@ -31,7 +32,7 @@ class ResourceAdapterError(RuntimeError):
         _text(message, "adapter error message")
         self.source_id = source_id
         self.code = code
-        super().__init__(message)
+        super().__init__(message, error_code=code)
 
 
 class SourceClosedError(ResourceAdapterError):

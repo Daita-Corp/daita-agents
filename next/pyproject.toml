@@ -25,9 +25,48 @@ daita = "daita.cli:main"
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.116.0"]
 google = ["google-genai>=1.73.1"]
+keychain = ["keyring>=25.0.0"]
 openai = ["openai>=1.99.9"]
 postgresql = ["asyncpg>=0.30.0", "sqlglot>=25.0.0"]
 sqlite = ["sqlglot>=25.0.0"]
+
+# Supported runtime bundles. Local CLI, memory, and production-host behavior
+# use only the dependency-free core; their extras remain explicit feature
+# markers without pulling deferred v1 integrations back into the candidate.
+llm-all = [
+    "openai>=1.99.9",
+    "anthropic>=0.116.0",
+    "google-genai>=1.73.1",
+]
+data = [
+    "asyncpg>=0.30.0",
+    "sqlglot>=25.0.0",
+]
+cli = []
+memory = []
+production = []
+recommended = [
+    "openai>=1.99.9",
+    "sqlglot>=25.0.0",
+    "keyring>=25.0.0",
+]
+complete = [
+    "openai>=1.99.9",
+    "anthropic>=0.116.0",
+    "google-genai>=1.73.1",
+    "asyncpg>=0.30.0",
+    "sqlglot>=25.0.0",
+    "keyring>=25.0.0",
+]
+all = [
+    "openai>=1.99.9",
+    "anthropic>=0.116.0",
+    "google-genai>=1.73.1",
+    "asyncpg>=0.30.0",
+    "sqlglot>=25.0.0",
+    "keyring>=25.0.0",
+]
+
 dev = [
     "black>=26.1.0",
     "build>=1.2.2",

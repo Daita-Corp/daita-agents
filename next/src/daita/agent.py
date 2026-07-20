@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Self
 
 from .adapters.models import SourceRegistration
 from .adapters.protocols import ResourceSource
+from ._json import FrozenJsonObject
 from .capabilities import CapabilityRegistry
+from .config import AgentConfig
 from .events.models import CommittedEvent, EventCursor
+from .events.projection import EventAudience, project_committed_event
 from .hosting.embedded import (
     AgentAlreadyExistsError,
     AgentHomeError,
@@ -73,13 +76,14 @@ class Agent:
         name: str,
         *,
         root: str | Path | None = None,
+        config: AgentConfig | None = None,
         model: ModelProvider | None = None,
         model_profile: ModelProfile | None = None,
         context_builder: ContextBuilder | None = None,
         domain: DomainController | None = None,
         capabilities: CapabilityRegistry | None = None,
         policy: DefaultPolicyEvaluator | None = None,
-        budgets: LoopBudgets = LoopBudgets(),
+        budgets: LoopBudgets | None = None,
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
@@ -87,6 +91,7 @@ class Agent:
         embedded = await EmbeddedAgent.create(
             name,
             root=root,
+            config=config,
             model=model,
             model_profile=model_profile,
             context_builder=context_builder,
@@ -106,13 +111,14 @@ class Agent:
         name: str,
         *,
         root: str | Path | None = None,
+        config: AgentConfig | None = None,
         model: ModelProvider | None = None,
         model_profile: ModelProfile | None = None,
         context_builder: ContextBuilder | None = None,
         domain: DomainController | None = None,
         capabilities: CapabilityRegistry | None = None,
         policy: DefaultPolicyEvaluator | None = None,
-        budgets: LoopBudgets = LoopBudgets(),
+        budgets: LoopBudgets | None = None,
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
@@ -120,6 +126,7 @@ class Agent:
         embedded = await EmbeddedAgent.open(
             name,
             root=root,
+            config=config,
             model=model,
             model_profile=model_profile,
             context_builder=context_builder,
@@ -152,8 +159,19 @@ class Agent:
     async def run(self, message: str, *, session_id: str | None = None) -> LoopExit:
         return await self._embedded.run(message, session_id=session_id)
 
+    def stream(
+        self,
+        message: str,
+        *,
+        session_id: str | None = None,
+    ) -> AsyncGenerator[FrozenJsonObject, None]:
+        return self._embedded.stream(message, session_id=session_id)
+
     async def attach(self, source: ResourceSource) -> SourceRegistration:
         return await self._embedded.attach(source)
+
+    async def detach(self, source_id: str) -> SourceRegistration:
+        return await self._embedded.detach(source_id)
 
     async def inspect(self, operation_id: str) -> OperationSnapshot:
         return await self._embedded.inspect(operation_id)
@@ -202,14 +220,18 @@ class Agent:
         cursor: EventCursor | None = None,
         *,
         limit: int = 100,
-    ) -> tuple[CommittedEvent, ...]:
-        return await self._embedded.read_events(cursor, limit=limit)
+    ) -> tuple[FrozenJsonObject, ...]:
+        committed = await self._embedded.read_events(cursor, limit=limit)
+        return tuple(
+            project_committed_event(event, audience=EventAudience.PUBLIC)
+            for event in committed
+        )
 
     def subscribe_events(
         self,
         cursor: EventCursor | None = None,
-    ) -> AsyncIterator[CommittedEvent]:
-        return self._embedded.subscribe_events(cursor)
+    ) -> AsyncGenerator[FrozenJsonObject, None]:
+        return _project_public_events(self._embedded.subscribe_events(cursor))
 
     async def propose_monitor(
         self,
@@ -428,6 +450,16 @@ class Agent:
 
     async def __aexit__(self, *args: object) -> None:
         await self.close()
+
+
+async def _project_public_events(
+    committed: AsyncGenerator[CommittedEvent, None],
+) -> AsyncGenerator[FrozenJsonObject, None]:
+    try:
+        async for event in committed:
+            yield project_committed_event(event, audience=EventAudience.PUBLIC)
+    finally:
+        await committed.aclose()
 
 
 __all__ = [

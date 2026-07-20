@@ -1,17 +1,21 @@
 # Daita autonomous agent v2 replacement
 
-This is the isolated replacement project for Daita 2.0. Through Phase 8 it is
-a functional persistent local agent: the generic loop, governed execution,
+This is the isolated replacement project for Daita 2.0. The Phase 9 candidate
+is a functional persistent local agent: the generic loop, governed execution,
 SQLite recovery, catalog-backed SQLite and sandboxed-file data paths,
 provenance-bearing context, session compression, scoped memory/learning,
 versioned procedural skills, durable monitors, a foreground local host,
-controlled approved SQLite writes, PostgreSQL reads, and retained-model
-routing are implemented. Replacement acceptance and cutover remain later
-phases.
+controlled approved SQLite writes, PostgreSQL reads, retained-model routing,
+packaging/lifecycle, live integrations, restart reliability, and security
+hardening are implemented. `daita-agents` owns the Python API and the one
+installed `daita` command; the separate `daita-cli` and `daita-client`
+packages remain legacy Daita 1.x products and are excluded from 2.0. The
+replacement candidate is complete, while cutover remains a separate Phase 10
+decision.
 
 The governing plan is the local
 `../docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md` fingerprinted in
-[`STATUS.md`](STATUS.md). Root `../daita/` is a frozen behavioral oracle, not a
+`STATUS.md`. Root `../daita/` is a frozen behavioral oracle, not a
 dependency. Phase 10 cutover is explicitly outside the authorized work.
 
 ## Architectural promise
@@ -29,6 +33,10 @@ The replacement is built around:
 
 The model chooses semantics. Deterministic runtime code validates authority,
 scope, policy, persistence, execution, evidence, readiness facts, and recovery.
+
+Candidate operations, migration, support, security, CLI/client, and breaking-
+change guidance is indexed in the source-tree `docs/README.md`. Those detailed
+project records are intentionally excluded from the runtime distribution.
 
 ## Isolation rules
 
@@ -57,6 +65,10 @@ python3.11 -m venv .venv
 
 Python 3.11 and 3.12 are the tested candidate versions. Optional source and
 provider SDKs will be added only to matching extras and imported lazily.
+
+Do not co-install legacy `daita-cli` with Daita 2.0: both distributions claim
+the `daita` console script. Upgrade guidance is included in the candidate's
+CLI/client and breaking-change documentation.
 
 ## Local development host
 
@@ -108,8 +120,8 @@ least-privilege read-only role and do not attach a database whose row-security
 policies or server-owned type/operator code is untrusted. PostgreSQL reads are
 classified non-idempotent and non-replay-safe, so ambiguous interrupted calls
 fail into manual recovery instead of being repeated. Fake-driver coverage is
-deterministic Phase 8 evidence; actual asyncpg/database behavior remains a
-required credential-gated Phase 9 live gate.
+deterministic Phase 8 evidence. Phase 9 also passed the real asyncpg path
+against a throwaway PostgreSQL 16 service using an ordinary SELECT-only role.
 
 If inspection reports a waiting approval, the decision updates only the
 persisted approval and wakes the same operation through the host:
@@ -149,20 +161,20 @@ catalog, memory/skills, local host/monitors, and mock plus OpenAI operation.
 
 The replacement-candidate gate additionally requires a controlled real write,
 PostgreSQL, every retained provider's conformance suite, public-feature
-dispositions, CLI/client integration, packaging, live checks, recovery and
-security hardening, and tested fresh-state behavior.
+dispositions, an explicit CLI/client compatibility decision, packaging, live
+checks, recovery and security hardening, and tested fresh-state behavior.
 
 Passing the replacement-candidate gate does not authorize Phase 10. Root
 `daita/` may be removed or replaced only after explicit human approval.
 
 ## Project records
 
-- [`STATUS.md`](STATUS.md) — active task ledger and exact resume action
-- [`PARITY_MATRIX.md`](PARITY_MATRIX.md) — v1 feature and behavior dispositions
+- `STATUS.md` — active task ledger and exact resume action
+- `PARITY_MATRIX.md` — v1 feature and behavior dispositions
   (created in P0-04)
-- [`QUALITY_GATES.md`](QUALITY_GATES.md) — commands, environments, and results
+- `QUALITY_GATES.md` — commands, environments, and results
   (created in P0-06 and maintained thereafter)
-- [`decisions/`](decisions/) — accepted numbered architecture decisions
+- `decisions/` — accepted numbered architecture decisions
 
 Later phases add a module only when a working vertical slice requires its
 owner. The target tree in the plan is not a scaffolding checklist.

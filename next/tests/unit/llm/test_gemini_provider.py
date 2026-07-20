@@ -143,7 +143,7 @@ def _stream_chunk(
 
 
 async def test_gemini_native_text_shape_and_usage_are_normalized() -> None:
-    client = FakeClient(_response(SimpleNamespace(text="done")))
+    client = FakeClient(_response(SimpleNamespace(text="done", thought=None)))
     provider = GeminiProvider("gemini-test", client=client)
 
     response = await provider.generate(
@@ -333,7 +333,7 @@ async def test_gemini_stream_normalizes_text_and_terminal_usage() -> None:
     )
     client = FakeClient(
         FakeAsyncStream(
-            _stream_chunk(SimpleNamespace(text="Hello")),
+            _stream_chunk(SimpleNamespace(text="Hello", thought=None)),
             _stream_chunk(SimpleNamespace(text=" ")),
             _stream_chunk(
                 SimpleNamespace(text="world"),

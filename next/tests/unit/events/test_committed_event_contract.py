@@ -85,10 +85,14 @@ def test_committed_event_reader_is_bounded_read_only_and_subscribable() -> None:
         name for name in CommittedEventReader.__dict__ if not name.startswith("_")
     }
 
-    assert public_names == {"read_after", "subscribe"}
+    assert public_names == {"latest_cursor", "read_after", "subscribe"}
     assert not hasattr(CommittedEventReader, "append")
+    assert inspect.iscoroutinefunction(CommittedEventReader.latest_cursor)
     assert inspect.iscoroutinefunction(CommittedEventReader.read_after)
     assert not inspect.iscoroutinefunction(CommittedEventReader.subscribe)
+
+    latest_signature = inspect.signature(CommittedEventReader.latest_cursor)
+    assert tuple(latest_signature.parameters) == ("self", "agent_id")
 
     read_signature = inspect.signature(CommittedEventReader.read_after)
     assert tuple(read_signature.parameters) == (

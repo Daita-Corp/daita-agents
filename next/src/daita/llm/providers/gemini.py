@@ -279,6 +279,8 @@ class GeminiProvider:
                     if signature is not None:
                         provider_part["thought_signature"] = signature
                     thought = _field(part, "thought", False)
+                    if thought is None:
+                        thought = False
                     if thought is not False and thought is not True:
                         raise ValueError("stream thought flag must be boolean")
                     if thought:
@@ -490,6 +492,8 @@ class GeminiProvider:
                 has_signature = True
                 recognized = True
             thought = _field(part, "thought", False)
+            if thought is None:
+                thought = False
             if thought is not False and thought is not True:
                 raise ValueError("part thought flag must be a boolean")
             if thought:

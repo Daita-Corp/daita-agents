@@ -1,5 +1,12 @@
-"""Canonical committed runtime-event records."""
+"""Canonical committed runtime-event records and audience projections."""
 
-from .models import RuntimeEvent
+from .models import CommittedEvent, EventCursor, RuntimeEvent
+from .projection import EventAudience, project_committed_event
 
-__all__ = ["RuntimeEvent"]
+__all__ = [
+    "CommittedEvent",
+    "EventAudience",
+    "EventCursor",
+    "RuntimeEvent",
+    "project_committed_event",
+]

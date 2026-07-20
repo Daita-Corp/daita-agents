@@ -14,9 +14,10 @@
 - V1 exports are dispositions to assess, not signatures to reproduce through a
   fallback. Breaking changes must be explicit in the parity matrix and release
   documentation.
-- `next/` provides a thin development CLI by Phase 6 against `AgentHost`
-  contracts. Production integration of external `daita-cli` and `daita-client`
-  is a Phase 9 gate; neither package may become the local runtime owner.
+- `next/` provides a thin CLI against `AgentHost` contracts. ADR 0016
+  supersedes the original external-integration clause: `daita-agents` owns the
+  Daita 2.0 console entry point, while `daita-cli` and `daita-client` remain
+  excluded legacy packages. Neither package may become the local runtime owner.
 - Persist secret references only. Resolution supports an injected in-process
   provider, an OS keychain where available, then environment variables.
 - No encrypted local secret fallback is added without a separate security
@@ -26,4 +27,5 @@
 ## Consequences
 
 The parity matrix is the authoritative migration surface. Host/SDK behavior is
-stable even if command parsing later moves to an external package.
+stable across internal CLI organization; distribution and entry-point
+ownership are fixed by ADR 0016.

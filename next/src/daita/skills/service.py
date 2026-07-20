@@ -15,6 +15,7 @@ import tomllib
 from typing import Protocol
 from uuid import uuid4
 
+from ..errors import SkillError as PublicSkillError
 from .models import (
     Skill,
     SkillActivation,
@@ -83,7 +84,7 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
-class SkillError(RuntimeError):
+class SkillError(PublicSkillError):
     """Base class for portable skill-service failures."""
 
 

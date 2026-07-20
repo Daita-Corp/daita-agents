@@ -14,7 +14,6 @@ ALLOWED_DISPOSITIONS = {
     "port",
     "replace",
     "defer (documented)",
-    "external integration",
     "proposed removal requiring Phase 10 approval",
 }
 
@@ -39,6 +38,23 @@ def _matrix_rows() -> list[list[str]]:
             continue
         rows.append([part.strip() for part in line.strip().strip("|").split("|")])
     return rows
+
+
+def _referenced_next_test_anchors() -> tuple[tuple[str, str | None], ...]:
+    matrix = MATRIX_PATH.read_text(encoding="utf-8")
+    anchors = set(
+        re.findall(
+            r"`(next/tests/[^`]+?\.py)(?:::([A-Za-z0-9_]+))?`",
+            matrix,
+        )
+    )
+    return tuple(
+        (path, test_name or None)
+        for path, test_name in sorted(
+            anchors,
+            key=lambda item: (item[0], item[1]),
+        )
+    )
 
 
 def test_mandatory_inventory_has_all_51_unique_section_17_6_rows() -> None:
@@ -102,3 +118,60 @@ def test_mvp_cutover_and_post_mvp_are_documented_separately() -> None:
     assert "**cutover** means the replacement-candidate gate" in matrix
     assert "**post-MVP** means deliberately deferred" in matrix
     assert "does not authorize Phase 10" in matrix
+
+
+def test_every_declared_v2_test_anchor_exists() -> None:
+    anchors = _referenced_next_test_anchors()
+    missing = [
+        path
+        for path in sorted({path for path, _ in anchors})
+        if not (REPOSITORY_ROOT / path).is_file()
+    ]
+    missing_tests: list[str] = []
+    for path, test_name in anchors:
+        if test_name is None or path in missing:
+            continue
+        tree = ast.parse(
+            (REPOSITORY_ROOT / path).read_text(encoding="utf-8"),
+            filename=path,
+        )
+        declared = {
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        if test_name not in declared:
+            missing_tests.append(f"{path}::{test_name}")
+
+    assert not missing and not missing_tests, {
+        "missing_paths": missing,
+        "missing_tests": missing_tests,
+    }
+
+
+def test_every_active_replacement_claim_has_an_executable_v2_anchor() -> None:
+    unanchored = [
+        row[0]
+        for row in _matrix_rows()
+        if row[-2] in {"MVP", "cutover"}
+        and not re.search(r"`next/tests/[^`]+\.py", row[-3])
+    ]
+
+    assert unanchored == [], unanchored
+
+
+def test_live_provider_and_postgresql_claims_name_real_service_anchors() -> None:
+    rows = {row[0]: row for row in _matrix_rows()}
+    provider_anchor = (
+        "`next/tests/live/test_model_providers_live.py::"
+        "test_retained_provider_live_text_conformance`"
+    )
+    postgresql_anchor = (
+        "`next/tests/live/test_postgresql_live.py::"
+        "test_live_postgresql_catalog_and_bounded_read_are_least_privileged`"
+    )
+
+    for stable_id in ("MB-SP-03", "API-LLM-03", "EXT-04"):
+        assert provider_anchor in rows[stable_id][-3]
+    for stable_id in ("API-ROOT-06", "API-DB-01", "EXT-03"):
+        assert postgresql_anchor in rows[stable_id][-3]

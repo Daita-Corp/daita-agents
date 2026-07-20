@@ -23,6 +23,7 @@ from ..adapters.models import SourceRegistration
 from ..adapters.protocols import ResourceSource
 from ..adapters.sqlite import SQLiteSource
 from ..events.models import CommittedEvent, EventCursor
+from ..events.projection import EventAudience, project_committed_event
 from ..loop.models import LoopExit
 from ..monitors.models import (
     CatchUpPolicy,
@@ -918,25 +919,10 @@ def _scheduler_projection(value: MonitorSchedulerResult) -> dict[str, object]:
 
 
 def _event_projection(value: CommittedEvent) -> dict[str, object]:
-    event = value.event
-    return {
-        "sequence": value.cursor.sequence,
-        "id": event.id,
-        "type": event.type,
-        "created_at": _timestamp(event.created_at),
-        "operation_id": event.operation_id,
-        "session_id": event.session_id,
-        "turn_id": event.turn_id,
-        "model_call_id": event.model_call_id,
-        "call_id": event.call_id,
-        "task_id": event.task_id,
-        "evidence_id": event.evidence_id,
-        "approval_id": event.approval_id,
-        "monitor_id": event.monitor_id,
-        "capability_id": event.capability_id,
-        "executor_id": event.executor_id,
-        "payload": _thaw_object(event.payload),
-    }
+    return project_committed_event(
+        value,
+        audience=EventAudience.PUBLIC,
+    ).to_dict()
 
 
 def _verify_removable_socket(

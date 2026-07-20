@@ -45,6 +45,7 @@ MIGRATION_FIVE_NAME = "link_blob_backed_evidence"
 MIGRATION_SIX_NAME = "normalize_approval_lifecycle"
 MIGRATION_SEVEN_NAME = "add_agent_identity_and_sessions"
 MIGRATION_THIRTEEN_NAME = "persist_task_validation_facts"
+MIGRATION_FOURTEEN_NAME = "bind_agent_runtime_defaults"
 LEGACY_RECOVERY_REASON = "legacy_running_task_missing_lease"
 LEGACY_RECOVERY_EVENT_TYPE = "task.manual_recovery_required"
 
@@ -480,7 +481,7 @@ async def test_public_schema_migrations_are_fixed_and_reopen_is_idempotent(
         (migration.version, migration.name, migration.checksum)
         for migration in sqlite_owner._MIGRATIONS
     )
-    assert _migration_rows(path)[-1][1] == MIGRATION_THIRTEEN_NAME
+    assert _migration_rows(path)[-1][1] == MIGRATION_FOURTEEN_NAME
     _assert_task_execution_schema(path)
     _assert_evidence_blob_schema(path)
     first_image = _logical_database_image(path)
@@ -513,7 +514,7 @@ async def test_version_four_upgrade_adds_nullable_evidence_blob_id(
     )
     assert "blob_id" not in _columns(backup_path, "evidence")
     _assert_evidence_blob_schema(path)
-    assert _migration_rows(path)[-1][1] == MIGRATION_THIRTEEN_NAME
+    assert _migration_rows(path)[-1][1] == MIGRATION_FOURTEEN_NAME
 
     connection = sqlite3.connect(path)
     try:

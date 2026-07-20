@@ -5,16 +5,17 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 9 — replacement acceptance
-- **Active task:** P9-01 — parity and public-surface reconciliation
-- **Last completed task:** P8-05 — consolidated Phase 8 gate
-- **Current checkpoint:** Phase 8 gate (this ledger's containing commit)
+- **Active phase:** Phase 9 complete — paused before Phase 10
+- **Active task:** none; Phase 10 requires explicit human authorization
+- **Last completed task:** P9-08 — replacement-candidate gate
+- **Current checkpoint:** complete Phase 9 candidate; the containing gate
+  commit uses `chore(v2-phase-9): complete phase 9 gate`
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `403ad8c3030a126375759b57af4ebe767c6066352b2db158488669a28cc3f935`
-- **Exact next action:** re-read plan Sections 6 and 15, then reconcile every
-  remaining MVP/cutover parity claim against an existing executable anchor and
-  implement or explicitly reclassify the smallest missing public surfaces
+- **Exact next action:** stop. Await explicit human review and authorization
+  before performing any Phase 10 cutover, push, publication, PR, or release
+  action
 
 ## Development cadence
 
@@ -132,6 +133,16 @@ never sent to an unapproved fallback; optional SDKs remain lazy extras; secret
 values never enter persisted source configuration; and live external checks
 are consolidated at the Phase 8/9 gates rather than repeated per helper.
 
+Before Phase 9 production edits, Sections 6 and 15 were re-read in full on
+2026-07-19 together with the Phase 9 work/gate and replacement definition of
+done. The renewed constraints are that hardening closes declared public and
+operational contracts without adding a second semantic planner, executor,
+catalog, state store, or compatibility fallback; all public claims require
+real executable anchors; external content remains untrusted; public/audit
+projection is narrower than canonical retained state; optional integrations
+remain lazy; and deterministic, live, fault, performance, security, frozen-v1,
+and clean-install evidence is consolidated once at P9-08.
+
 ## Current architectural decisions
 
 - Build the replacement only under `next/`, using `next/src/daita/` as the
@@ -146,6 +157,9 @@ are consolidated at the Phase 8/9 gates rather than repeated per helper.
   never open v1 state implicitly.
 - Prefer a documented fresh-state v2 start unless Phase 9 evidence establishes
   a concrete migration requirement.
+- Make `daita-agents` the sole Daita 2.0 distribution and `daita` entry-point
+  owner; preserve `daita-cli` and `daita-client` only as unsupported legacy v1
+  repositories, with no dependency, co-install promise, or runtime fallback.
 - Phase 0 through Phase 9 are authorized. Phase 10, root-package replacement,
   pushing, publishing, PR creation, and release work are excluded.
 
@@ -287,14 +301,14 @@ P9-08. Phase 10 and cutover remain excluded.
 
 | ID | Status | Inputs | Expected output | Tests/evidence | Dependencies |
 | --- | --- | --- | --- | --- | --- |
-| P9-01 | pending | Phase 9 work/gate; Sections 6/15; parity/disposition inventories; current public API | Every MVP/cutover claim names a real executable anchor; missing public stream/detach/config/error/secret/extension/telemetry surfaces are implemented or explicitly reclassified without placeholder ports | Parity architecture test rejects missing anchors; focused public contract and absence/support assertions pass | Phase 8 gate |
-| P9-02 | pending | P9-01 surface; retained examples and release obligations | V2-native examples plus fresh-state, migration/export, breaking-change, support, operations, security, CLI, and client documentation | Executable example smoke tests and documentation-link/support-matrix checks pass | P9-01 |
-| P9-03 | pending | Phase 6 local protocol; external `daita-client`/`daita-cli` packages | One documented console-entry-point owner and client/CLI integration through the proven local protocol, with no runtime semantics in either client | External-package contract tests pass; sibling-repository edits require explicit user authorization before mutation | P9-01 |
-| P9-04 | pending | Candidate package metadata, extras, CI, and install lifecycle | Deterministic packaging contracts, coherent supported bundle extras, Python 3.11/3.12 candidate CI, and fresh install/init/run/stop/reopen/uninstall/state-retention proof | Artifact allowlist, version/entry point, optional-import, lifecycle, and clean-environment tests pass | P9-01, P9-02 |
-| P9-05 | pending | Retained provider adapters; real PostgreSQL adapter; available credentials/services | Live retained-provider and least-privilege PostgreSQL acceptance with no mock substitution | Each available live row records exact provider/database outcome; unavailable required rows remain NOT RUN and block the affected gate honestly | P9-04 |
-| P9-06 | pending | Persistent host/runtime; fault seams; representative workloads | Real process-kill/reopen recovery and compact reliability/performance baselines for loop, persistence, catalog, contention, and monitors | Bounded fault matrix and justified baseline ceilings pass without a parallel benchmark framework | P9-04 |
-| P9-07 | pending | Public/audit projections; extension loading; persisted and built artifacts | Prompt-injection, secret-literal, event-projection, extension-collision/loading, dependency, and artifact security closure | End-to-end adversarial and scan suite passes with no secret or untrusted diagnostic exposure | P9-01, P9-04 |
-| P9-08 | pending | Passing P9-01 through P9-07 slices | One consolidated deterministic/live/fault/performance/security/packaging/root replacement gate, final evidence, and one Phase 9 commit | All required gates pass; root remains frozen; containing commit uses `chore(v2-phase-9): complete phase 9 gate`; work pauses before Phase 10 | P9-03, P9-05, P9-06, P9-07 |
+| P9-01 | complete | Phase 9 work/gate; Sections 6/15; parity/disposition inventories; current public API | Every MVP/cutover claim names a real executable anchor; missing public stream/detach/config/error/secret/extension/telemetry surfaces are implemented or explicitly reclassified without placeholder ports | Every parity module path and every explicitly named test resolves; public stream/detach/config/error/secret/extension/telemetry contracts pass in the 84-case focused Phase 9 surface selection | Phase 8 gate |
+| P9-02 | complete | P9-01 surface; retained examples and release obligations | V2-native examples plus fresh-state, migration/export, breaking-change, support, operations, security, CLI, and client documentation | 16 example/documentation tests pass; all nine retained examples execute offline and the production-shaped host dry-run passes | P9-01 |
+| P9-03 | complete | Phase 6 local protocol; external `daita-client`/`daita-cli` compatibility decision | `daita-agents` is the sole Daita 2.0 local product, Python API, host/client, and `daita` console owner; both external packages are retired from the 2.0 support surface and remain unchanged legacy repositories | Explicit product decision recorded; existing candidate CLI, host/client, and real Unix-socket lifecycle evidence applies. No sibling mutation or external co-install test was required or run | P9-01 |
+| P9-04 | complete | Candidate package metadata, extras, CI, and install lifecycle | Deterministic packaging contracts, coherent supported bundle extras, staged Python 3.11/3.12 candidate CI, and fresh install/init/run/stop/reopen/uninstall/state-retention proof | 10 packaging/CI contracts pass; clean wheel/sdist allowlists and full offline lifecycle pass on CPython 3.11.15/3.12.7 with retained state after uninstall | P9-01, P9-02 |
+| P9-05 | complete | Retained provider adapters; real PostgreSQL adapter; available credentials/services | Live retained-provider and least-privilege PostgreSQL acceptance with no mock substitution | OpenAI/Anthropic/Gemini/Grok/Ollama/generic-compatible and real SELECT-only PostgreSQL all pass; test-owned containers/images were removed | P9-04 |
+| P9-06 | complete | Persistent host/runtime; fault seams; representative workloads | Real process-kill/reopen recovery and compact reliability/performance baselines for loop, persistence, catalog, contention, and monitors | 5 focused tests pass: SIGKILL/reopen/same-checkpoint recovery plus bounded loop/token/observation/SQLite/WAL/blob/catalog/contention/monitor measurements | P9-04 |
+| P9-07 | complete | Public/audit projections; extension loading; persisted and built artifacts | Prompt-injection, secret-literal, event-projection, extension-collision/loading, dependency, and artifact security closure | 50 composed security cases pass; the exact adversarial journey plus complete secret-provider contract pass 9/9 after repairing double secret-provider composition | P9-01, P9-04 |
+| P9-08 | complete | Passing P9-01 through P9-07 slices | One consolidated deterministic/live/fault/performance/security/packaging/root replacement gate, final evidence, and one Phase 9 commit | All broad, live, lifecycle, fault, performance, security, focused retirement, disposition, and frozen-root gates pass; containing commit uses `chore(v2-phase-9): complete phase 9 gate`; work pauses before Phase 10 | P9-03, P9-05, P9-06, P9-07 |
 
 ### Ordered P2-03 internal tasks
 
@@ -802,6 +816,27 @@ re-read and an updated ordered ledger.
 
 ## Known failures and baselines
 
+- The first P9 clean-lifecycle probe reached an honest `failed` exit because it
+  asked the default evidence-grounded data domain to accept an ungrounded text
+  answer. The installed-wheel probe now supplies the existing explicit
+  text-only context/domain contracts; no production readiness bypass was added,
+  and the dual-interpreter lifecycle passes.
+- The first real Gemini P9 row returned normalized `malformed_response` because
+  google-genai exposes an absent thought flag as `None`. The adapter now treats
+  nullable absence as false while still rejecting non-booleans; 87 focused
+  regressions and the repeated real endpoint call pass.
+- Targeted P9 security review found injected `EmptySecretProvider` could be
+  wrapped twice and regain an outer environment/keychain fallback. Embedded
+  composition now passes the raw provider to the one backend composition owner;
+  the expected no-fallback and compose-once regressions pass.
+- The external package decision retires `daita-cli` and `daita-client` from the
+  Daita 2.0 support surface. Their sibling repositories remain unchanged; no
+  external co-install result is implied by the candidate's local protocol
+  evidence.
+- The first focused retirement-documentation run exposed three wording and
+  line-wrapping assertion mismatches. The upgrade guide now states the no-
+  fallback rule directly, and the tests compare normalized prose; all 25
+  focused architecture/packaging cases pass on rerun.
 - No failures were observed during safe-suite collection.
 - P0-03 red/repair history: the first root-cwd `PYTHONPATH=next/src` smoke loaded
   v1 because the current directory precedes `PYTHONPATH`; the permanent test
@@ -1113,13 +1148,104 @@ re-read and an updated ordered ledger.
       `chore(v2-phase-2): complete phase 2 gate`.
 - [x] Phase 3 was not started.
 
+## Phase 9 current record
+
+- [x] Every MVP/cutover row in `PARITY_MATRIX.md` now names an existing
+      executable test module, and every explicitly named test function exists;
+      all 164 retained v1 test modules have one explicit
+      preserve/port/retire/defer disposition.
+- [x] The public facade now has durable stream/detach behavior, immutable
+      versioned configuration, a normalized error hierarchy, explicit secret
+      providers, narrow extension declarations/loading, audience-specific
+      committed-event projections, and a failure-isolated telemetry observer.
+- [x] Review found that budgets and the default governance policy could change
+      silently when a different process reopened an agent. Migration 14 now
+      binds one canonical runtime-default record in `state.db`; omitted reopen
+      arguments load it and explicit drift fails closed across both `Agent`
+      and `AgentHost`. The focused config/host/migration selection passes 38/38.
+- [x] Retained examples 00/01/02/03/04/06/07/09/10 and the production-shaped
+      local-host deployment are v2-native, offline-smokeable, and never import
+      v1 or auto-approve governed work. Examples 05/08 remain documented
+      post-MVP scope.
+- [x] Candidate documentation covers fresh state, no implicit v1 migration,
+      v1 export, breaking changes, support, operations, security, and CLI/client
+      ownership. Concrete OTLP transport remains explicitly deferred while the
+      generic redacted observer boundary is retained.
+- [x] Candidate metadata has an empty core dependency set, one `daita`
+      entry-point owner, exact lazy atomic extras, supported bundle unions, and
+      no deferred integration extras.
+- [x] Focused P9-01/P9-02/P9-04 contracts were run from `next/` with
+      `../.venv/bin/python -m pytest` over parity/disposition/release docs,
+      config/security/errors/extensions/telemetry/packaging, and public stream
+      tests: 84 passed. A separate examples/docs selection passed 16 tests.
+- [x] P9-03 records the explicit compatibility decision: `daita-agents` owns
+      the Daita 2.0 local CLI and Python/local-client surfaces; `daita-cli` and
+      `daita-client` are retired from the 2.0 support surface. The legacy
+      sibling repositories were intentionally not modified, and no external
+      co-install test is claimed.
+- [x] P9-04 builds a clean 105-entry wheel and 132-entry sdist, installs the
+      wheel without dependencies, initializes/runs/stops/reopens an offline
+      agent, uninstalls the package, and retains state on CPython 3.11.15 and
+      3.12.7. The candidate CI file is staged under `next/.github/`; it cannot
+      become an active root workflow before the excluded Phase 10 cutover.
+- [x] P9-06 sends SIGKILL to a real child after `model_call.started` is durable,
+      then public open/inspect/resume completes the same operation with one
+      model-call identity and a clean WAL database. Four compact performance
+      cases cover loop/tokens/observation/state growth, blob deduplication,
+      1,000-resource catalog and four-connection contention, and 12 monitor
+      executions plus exact replay. All five pass in 1.81 seconds against
+      conservative documented CI tripwires.
+- [x] P9-05 live rows pass for OpenAI Responses, Anthropic Messages, Gemini,
+      Grok/xAI, a distinct generic OpenAI-compatible Chat Completions endpoint,
+      and a throwaway PostgreSQL 16 instance with an ordinary SELECT-only role.
+      The real Gemini SDK exposed a clean adapter defect (`Part.thought` is
+      nullable); normalizing `None` to false repaired both nonstreaming and
+      streaming decoding, 87 provider regressions pass, and the real rerun
+      passes. A first real Ollama run with a 135M model correctly ended at the
+      16-token limit; the required row then passed unchanged with the official
+      Qwen 2.5 0.5B instruction model.
+- [x] P9-07 treats malicious source display text, table/file identifiers,
+      file/row content, forged paths, fake policy/capability calls, and connector
+      errors as bounded untrusted data. A unique resolved secret is absent from
+      SQLite/WAL/blobs/events/config/reprs/errors/protocol/CLI, public/audit/
+      telemetry projections remain separated, and extension/dependency/artifact
+      owners pass. Targeted review found one real double-composition bug that
+      could re-enable fallback after `EmptySecretProvider`; embedded composition
+      now passes the raw injection to the single backend composition owner, and
+      the regression passes.
+- [x] Targeted release review also found that broad subsystem errors advertised
+      retryability too optimistically and normalized provider failures were not
+      catchable through the exported rate-limit/authentication categories.
+      Broad errors now fail closed as unknown, provider-specific categories
+      preserve their public identities and bounded provider facts, and the
+      91-case error/router/provider regression slice plus direct public-fact
+      contract pass.
+- [x] The independent P9-08 gate passes on both supported interpreters: 1,555
+      deterministic tests pass with one sandbox-only socket skip and eight live
+      rows deselected on each; mypy is clean across 269 files, Pyright reports
+      zero errors/warnings, all 281 Python files are formatted and compile, the
+      dual-interpreter install lifecycle passes, and root v1 remains frozen with
+      2,498 safe tests passing.
+- [x] Final P9-08 reconciliation adds ADR 0016, actionable legacy-package
+      uninstall guidance, sole-entry-point/no-legacy-fallback contracts, and
+      25 passing focused architecture/packaging cases. The containing commit
+      uses `chore(v2-phase-9): complete phase 9 gate`; no Phase 10 work began.
+
 ## Credentials and external dependencies
 
+- Phase 9 used configured OpenAI, Anthropic, Google, and xAI credentials only
+  at lazy live adapter boundaries; no value was printed or persisted. The real
+  native/compatible rows above pass.
+- A no-volume PostgreSQL 16 container with a test-owned two-row table and
+  SELECT-only ordinary login passed catalog/search/read/privilege/secret scans,
+  then stopped and auto-removed. It contained no recoverable user data.
+- A temporary Ollama container and official Qwen 2.5 0.5B instruction model
+  passed the real OpenAI-compatible adapter row. The test-owned container and
+  newly pulled runtime image were removed afterward; no Ollama service remains.
 - The P2-09 OpenAI live gate passed on 2026-07-18 using a repository-configured
   key and explicit `gpt-4.1-mini`; no credential value was logged or persisted.
-- PostgreSQL and other external database/provider gates remain later-phase
-  requirements; unavailable credentials will be recorded without substituting
-  mock results.
+- All required Phase 9 database/provider rows passed against real credential-
+  or service-backed boundaries; no unavailable row was replaced with a mock.
 - Phase 0 is designed to complete with deterministic local tests only.
 - The architecture plan is intentionally local and ignored by the root
   `.gitignore`; its fingerprint above anchors the governing version.

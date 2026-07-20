@@ -52,6 +52,8 @@ class EventCursorNotFoundError(EventReadError):
 class CommittedEventReader(Protocol):
     """Replay and follow committed events without exposing an append API."""
 
+    async def latest_cursor(self, agent_id: str) -> EventCursor | None: ...
+
     async def read_after(
         self,
         agent_id: str,

@@ -160,12 +160,12 @@ async def test_exact_trigger_replay_reuses_session_operation_and_committed_event
         try:
             first_streamed = await anext(stream)
         finally:
-            await stream.aclose()  # type: ignore[attr-defined]
+            await stream.aclose()
 
         assert replay == first
         assert len(provider.requests) == 1
         assert first_streamed == events[0]
-        assert events[-1].event.type == "operation.succeeded"
+        assert events[-1]["type"] == "operation.succeeded"
     finally:
         await agent.close()
 

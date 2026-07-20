@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from daita._json import FrozenJsonObject
+from daita.errors import AuthenticationError, LLMError, RateLimitError
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     CanonicalMessage,
@@ -30,6 +31,27 @@ from daita.operations.models import (
 from daita.operations.runtime import OperationRuntime
 
 NOW = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+
+
+def test_provider_authentication_and_rate_limit_keep_public_safe_facts() -> None:
+    authentication = ModelProviderError(
+        ProviderErrorCode.AUTHENTICATION_ERROR,
+        provider_id="openai:primary",
+    )
+    rate_limited = ModelProviderError(
+        ProviderErrorCode.RATE_LIMIT_ERROR,
+        provider_id="anthropic:primary",
+        retry_after_seconds=2.25,
+    )
+
+    for error in (authentication, rate_limited):
+        assert isinstance(error, ModelProviderError)
+        assert isinstance(error, LLMError)
+    assert isinstance(authentication, AuthenticationError)
+    assert authentication.provider_id == "openai:primary"
+    assert isinstance(rate_limited, RateLimitError)
+    assert rate_limited.provider_id == "anthropic:primary"
+    assert rate_limited.retry_after_seconds == 2.25
 
 
 class _TextContext:

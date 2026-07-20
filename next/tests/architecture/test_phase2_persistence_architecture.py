@@ -259,6 +259,7 @@ def test_sqlite_adapter_imports_only_canonical_records_and_standard_library() ->
         "catalog.protocols",
         "collections",
         "collections.abc",
+        "config",
         "context.session",
         "dataclasses",
         "datetime",

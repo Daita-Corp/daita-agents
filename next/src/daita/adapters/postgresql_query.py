@@ -18,7 +18,7 @@ from ..domains.data.capabilities import PostgreSQLReadResult
 from ..domains.data.controller import CatalogSchemaReader
 from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_postgresql_read
-from ..security import EnvironmentSecretProvider, SecretProvider
+from ..security import SecretProvider, default_secret_provider
 from .postgresql import (
     _DEFAULT_MAX_COLUMNS,
     _DEFAULT_MAX_INDEXES,
@@ -66,7 +66,7 @@ class PostgreSQLQueryBackend:
             raise TypeError("sources must implement SourceStore")
         if not callable(getattr(catalog, "resource_schemas", None)):
             raise TypeError("catalog must provide resource_schemas")
-        provider = secret_provider or EnvironmentSecretProvider()
+        provider = default_secret_provider(secret_provider)
         if not isinstance(provider, SecretProvider):
             raise TypeError("secret_provider must implement SecretProvider")
         if (

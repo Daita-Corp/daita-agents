@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import replace
 from datetime import datetime, timezone
 import errno
@@ -16,7 +16,7 @@ import tomllib
 from typing import Self, TypeVar
 from uuid import uuid4
 
-from .._json import canonical_json
+from .._json import FrozenJsonObject, canonical_json
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.local_files import LocalDirectoryReadBackend
@@ -28,6 +28,12 @@ from ..catalog.capabilities import catalog_declarations
 from ..catalog.models import CatalogSync, CatalogSyncStatus
 from ..catalog.service import CatalogService
 from ..capabilities import CapabilityRegistry
+from ..config import (
+    AgentConfig,
+    AgentRuntimeDefaults,
+    AgentRuntimeDefaultsConflictError,
+    resolve_agent_configuration,
+)
 from ..context import (
     MemoryContextProjector,
     SessionCompressionPolicy,
@@ -46,6 +52,8 @@ from ..domains.data import (
     tabular_comparison_declarations,
 )
 from ..events.models import CommittedEvent, EventCursor
+from ..events.projection import EventAudience, project_committed_event
+from ..errors import AgentError, ConfigError
 from ..identity import AgentIdentity
 from ..learning import LearningProvenance, LearningSourceOutcome
 from ..llm.models import ModelProfile
@@ -98,7 +106,7 @@ from ..skills.learning import (
 from ..skills.service import SkillService
 from ..storage.blobs import LocalBlobStore
 from ..storage.sqlite import SQLiteOperationStore
-from ..security import EnvironmentSecretProvider, SecretProvider
+from ..security import SecretProvider
 
 _AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _T = TypeVar("_T")
@@ -254,6 +262,46 @@ def _validate_loop_configuration(
         )
 
 
+async def _bind_or_load_runtime_defaults(
+    store: SQLiteOperationStore,
+    agent_id: str,
+    *,
+    policy: DefaultPolicyEvaluator | None,
+    budgets: LoopBudgets | None,
+) -> tuple[AgentRuntimeDefaults, DefaultPolicyEvaluator]:
+    """Resolve future-operation defaults from the authoritative state store."""
+
+    current = await store.load_runtime_defaults(agent_id)
+    if current is None:
+        active_policy = policy or DefaultPolicyEvaluator()
+        proposed = AgentRuntimeDefaults(
+            budgets=budgets or LoopBudgets(),
+            policy_profile=active_policy.profile,
+        )
+        try:
+            current = await store.bind_runtime_defaults(agent_id, proposed)
+        except AgentRuntimeDefaultsConflictError as error:
+            raise ConfigError(
+                "Agent runtime defaults changed while they were being bound.",
+                section="runtime_defaults",
+                error_code="config_conflict",
+            ) from error
+        return current, active_policy
+    if budgets is not None and budgets != current.budgets:
+        raise ConfigError(
+            "Configured budgets differ from the stored agent defaults.",
+            section="budgets",
+            error_code="config_conflict",
+        )
+    if policy is not None and policy.profile != current.policy_profile:
+        raise ConfigError(
+            "Configured policy differs from the stored agent defaults.",
+            section="policy",
+            error_code="config_conflict",
+        )
+    return current, policy or DefaultPolicyEvaluator(current.policy_profile)
+
+
 async def _await_sync_completion(callback: Callable[[], _T]) -> tuple[_T, bool]:
     """Finish one filesystem transaction before propagating cancellation."""
 
@@ -276,7 +324,7 @@ async def _await_sync_completion(callback: Callable[[], _T]) -> tuple[_T, bool]:
     return result, cancellation_requested
 
 
-class AgentHomeError(RuntimeError):
+class AgentHomeError(AgentError):
     """Base failure for isolated local agent-home admission."""
 
 
@@ -385,6 +433,7 @@ class EmbeddedAgent:
         loop: AgentLoop | None,
         capabilities: CapabilityRegistry,
         model_profile: ModelProfile | None,
+        runtime_defaults: AgentRuntimeDefaults,
         memory_service: MemoryService,
         monitor_service: MonitorService,
         skill_service: SkillService,
@@ -401,6 +450,7 @@ class EmbeddedAgent:
         self._loop = loop
         self._capabilities = capabilities
         self.model_profile = model_profile
+        self.runtime_defaults = runtime_defaults
         self._memory_service = memory_service
         self._monitor_service = monitor_service
         self._skill_service = skill_service
@@ -417,17 +467,25 @@ class EmbeddedAgent:
         name: str,
         *,
         root: str | Path | None = None,
+        config: AgentConfig | None = None,
         model: ModelProvider | None = None,
         model_profile: ModelProfile | None = None,
         context_builder: ContextBuilder | None = None,
         domain: DomainController | None = None,
         capabilities: CapabilityRegistry | None = None,
         policy: DefaultPolicyEvaluator | None = None,
-        budgets: LoopBudgets = LoopBudgets(),
+        budgets: LoopBudgets | None = None,
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
     ) -> Self:
+        model_profile, policy, budgets = resolve_agent_configuration(
+            config,
+            model=model,
+            model_profile=model_profile,
+            policy=policy,
+            budgets=budgets,
+        )
         _validate_loop_configuration(
             model,
             model_profile,
@@ -483,6 +541,12 @@ class EmbeddedAgent:
                     raise AgentNotConfiguredError(
                         "agent model profile changed during creation"
                     ) from error
+            runtime_defaults, active_policy = await _bind_or_load_runtime_defaults(
+                store,
+                identity.id,
+                policy=policy,
+                budgets=budgets,
+            )
             _, manifest_cancelled = await _await_sync_completion(
                 lambda: _write_manifest(home, identity)
             )
@@ -499,8 +563,9 @@ class EmbeddedAgent:
                 context_builder=context_builder,
                 domain=domain,
                 capabilities=capabilities,
-                policy=policy,
-                budgets=budgets,
+                policy=active_policy,
+                budgets=runtime_defaults.budgets,
+                runtime_defaults=runtime_defaults,
                 clock=resolved_clock,
                 id_factory=resolved_id_factory,
                 secret_provider=secret_provider,
@@ -525,17 +590,25 @@ class EmbeddedAgent:
         name: str,
         *,
         root: str | Path | None = None,
+        config: AgentConfig | None = None,
         model: ModelProvider | None = None,
         model_profile: ModelProfile | None = None,
         context_builder: ContextBuilder | None = None,
         domain: DomainController | None = None,
         capabilities: CapabilityRegistry | None = None,
         policy: DefaultPolicyEvaluator | None = None,
-        budgets: LoopBudgets = LoopBudgets(),
+        budgets: LoopBudgets | None = None,
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
     ) -> Self:
+        model_profile, policy, budgets = resolve_agent_configuration(
+            config,
+            model=model,
+            model_profile=model_profile,
+            policy=policy,
+            budgets=budgets,
+        )
         _validate_loop_configuration(
             model,
             model_profile,
@@ -617,6 +690,12 @@ class EmbeddedAgent:
                     capabilities,
                     require_default_profile=True,
                 )
+            runtime_defaults, active_policy = await _bind_or_load_runtime_defaults(
+                store,
+                identity.id,
+                policy=policy,
+                budgets=budgets,
+            )
             return cls._compose(
                 identity=identity,
                 home=home,
@@ -627,8 +706,9 @@ class EmbeddedAgent:
                 context_builder=context_builder,
                 domain=domain,
                 capabilities=capabilities,
-                policy=policy,
-                budgets=budgets,
+                policy=active_policy,
+                budgets=runtime_defaults.budgets,
+                runtime_defaults=runtime_defaults,
                 clock=resolved_clock,
                 id_factory=resolved_id_factory,
                 secret_provider=secret_provider,
@@ -656,6 +736,7 @@ class EmbeddedAgent:
         capabilities: CapabilityRegistry | None,
         policy: DefaultPolicyEvaluator | None,
         budgets: LoopBudgets,
+        runtime_defaults: AgentRuntimeDefaults,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
         secret_provider: SecretProvider | None,
@@ -673,9 +754,6 @@ class EmbeddedAgent:
             id_factory=id_factory,
         )
         resolved_profile = model_profile
-        resolved_secret_provider = secret_provider or EnvironmentSecretProvider()
-        if not isinstance(resolved_secret_provider, SecretProvider):
-            raise TypeError("secret_provider must implement SecretProvider")
         data_view: CatalogDataView | None = None
         if context_builder is None and domain is None and capabilities is None:
             data_view = CatalogDataView(store, catalog_service)
@@ -689,7 +767,7 @@ class EmbeddedAgent:
                 PostgreSQLQueryBackend(
                     store,
                     data_view,
-                    resolved_secret_provider,
+                    secret_provider,
                 ),
             )
             update = sqlite_update_declarations(
@@ -822,6 +900,7 @@ class EmbeddedAgent:
             loop=loop,
             capabilities=active_capabilities,
             model_profile=resolved_profile,
+            runtime_defaults=runtime_defaults,
             memory_service=memory_service,
             monitor_service=monitor_service,
             skill_service=skill_service,
@@ -846,6 +925,96 @@ class EmbeddedAgent:
                 created_at=self._clock(),
             )
         )
+
+    async def stream(
+        self,
+        message: str,
+        *,
+        session_id: str | None = None,
+    ) -> AsyncGenerator[FrozenJsonObject, None]:
+        """Run one user trigger and yield its public committed-event views."""
+
+        self._require_loop()
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("message must be a non-empty string")
+        trigger_id = self._id_factory("trigger")
+        trigger = AgentTrigger(
+            id=trigger_id,
+            agent_id=self.identity.id,
+            kind=TriggerKind.USER,
+            source_id=f"user:{session_id or trigger_id}",
+            session_id=session_id,
+            payload={"message": message},
+            created_at=self._clock(),
+        )
+        cursor = await self._store.latest_cursor(self.identity.id)
+        subscription = self._store.subscribe(self.identity.id, cursor)
+        run_task = asyncio.create_task(
+            self.run_trigger(trigger),
+            name=f"daita-agent-stream:{trigger_id}",
+        )
+        next_event_task: asyncio.Task[CommittedEvent] | None = None
+        operation_id: str | None = None
+        target_event_id: str | None = None
+        last_yielded_event_id: str | None = None
+        try:
+            while True:
+                if next_event_task is None:
+                    next_event_task = asyncio.create_task(anext(subscription))
+                waiters: set[asyncio.Task[object]] = {next_event_task}
+                if target_event_id is None:
+                    waiters.add(run_task)
+                completed, _ = await asyncio.wait(
+                    waiters,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if run_task in completed and target_event_id is None:
+                    result = run_task.result()
+                    operation_id = result.operation_id
+                    snapshot = (await self._store.load(operation_id)).snapshot
+                    if not snapshot.events:
+                        raise AgentHomeError(
+                            "streamed operation has no committed runtime events"
+                        )
+                    target_event_id = snapshot.events[-1].id
+                    if last_yielded_event_id == target_event_id:
+                        return
+                if next_event_task not in completed:
+                    continue
+                committed = next_event_task.result()
+                next_event_task = None
+                if operation_id is None:
+                    claimed = await self._store.load_by_trigger(trigger.id)
+                    if claimed is not None:
+                        operation_id = claimed.snapshot.operation.id
+                if committed.event.operation_id != operation_id:
+                    continue
+                last_yielded_event_id = committed.event.id
+                yield project_committed_event(
+                    committed,
+                    audience=EventAudience.PUBLIC,
+                )
+                if last_yielded_event_id == target_event_id:
+                    return
+        finally:
+            if next_event_task is not None and not next_event_task.done():
+                next_event_task.cancel()
+                try:
+                    await next_event_task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+            await subscription.aclose()
+            if not run_task.done():
+                run_task.cancel()
+                try:
+                    await run_task
+                except asyncio.CancelledError:
+                    pass
+            else:
+                try:
+                    run_task.exception()
+                except asyncio.CancelledError:
+                    pass
 
     async def run_trigger(self, trigger: AgentTrigger) -> LoopExit:
         """Run one exact durable trigger through the single canonical loop."""
@@ -1027,6 +1196,17 @@ class EmbeddedAgent:
             finally:
                 await adapter.close()
 
+    async def detach(self, source_id: str) -> SourceRegistration:
+        """Persist the source store's one-way detach transition."""
+
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._store.detach_source(
+                self.identity.id,
+                source_id,
+                self._clock(),
+            )
+
     async def inspect(self, operation_id: str) -> OperationSnapshot:
         self._require_open()
         return (await self._store.load(operation_id)).snapshot
@@ -1098,7 +1278,7 @@ class EmbeddedAgent:
     def subscribe_events(
         self,
         cursor: EventCursor | None = None,
-    ) -> AsyncIterator[CommittedEvent]:
+    ) -> AsyncGenerator[CommittedEvent, None]:
         self._require_open()
         return self._store.subscribe(self.identity.id, cursor)
 

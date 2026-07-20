@@ -17,12 +17,13 @@ new ADR explicitly documents the approved change.
 | [0007](0007-memory-learning-and-skills.md) | Memory, learning, and skill safety |
 | [0008](0008-extension-and-provider-boundaries.md) | Extension categories and provider boundaries |
 | [0009](0009-local-state-hosting-and-migration.md) | Local state, writer ownership, and migration posture |
-| [0010](0010-public-api-cli-and-secrets.md) | Public API, CLI ownership, and secrets |
+| [0010](0010-public-api-cli-and-secrets.md) | Public API and secrets; external CLI/client integration superseded by ADR 0016 |
 | [0011](0011-support-matrix-and-phase-boundaries.md) | Supported platforms/providers and phase boundaries |
 | [0012](0012-monitor-scheduling-defaults.md) | Monitor scheduling and missed-run defaults |
 | [0013](0013-retention-and-redaction-defaults.md) | Data retention and redaction defaults |
 | [0014](0014-licensing-boundary.md) | Local-core and premium-hosting licensing boundary |
 | [0015](0015-model-routing-and-provider-security.md) | Model routing, fallback, sensitivity, continuation, and endpoint security |
+| [0016](0016-daita-2-distribution-and-cli-ownership.md) | Sole Daita 2.0 distribution and console-entry-point ownership |
 
 ## Status vocabulary
 

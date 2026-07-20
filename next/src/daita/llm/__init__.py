@@ -38,7 +38,13 @@ from .providers import (
     OpenAICompatibleProvider,
     OpenAIProvider,
 )
-from .routing import ModelProviderRegistration, ModelRegistry, ModelRouter
+from .routing import (
+    ModelProviderRegistration,
+    ModelRegistry,
+    ModelRouter,
+    RetryPolicy,
+    RetryStrategy,
+)
 
 __all__ = [
     "AnthropicProvider",
@@ -71,6 +77,8 @@ __all__ = [
     "OpenAICompatibleProvider",
     "OpenAIProvider",
     "ProviderErrorCode",
+    "RetryPolicy",
+    "RetryStrategy",
     "StreamingModelProvider",
     "TextBlock",
     "ToolCall",

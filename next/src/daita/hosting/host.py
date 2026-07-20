@@ -17,6 +17,7 @@ from .._json import canonical_json
 from ..adapters.models import SourceRegistration
 from ..adapters.protocols import ResourceSource
 from ..capabilities import CapabilityRegistry
+from ..config import AgentConfig
 from ..events.models import CommittedEvent, EventCursor
 from ..llm.models import ModelProfile
 from ..llm.protocols import ModelProvider
@@ -219,13 +220,14 @@ class AgentHost:
         name: str,
         *,
         root: str | Path | None = None,
+        config: AgentConfig | None = None,
         model: ModelProvider | None = None,
         model_profile: ModelProfile | None = None,
         context_builder: ContextBuilder | None = None,
         domain: DomainController | None = None,
         capabilities: CapabilityRegistry | None = None,
         policy: DefaultPolicyEvaluator | None = None,
-        budgets: LoopBudgets = LoopBudgets(),
+        budgets: LoopBudgets | None = None,
         monitor_projector: MonitorOutcomeProjector | None = None,
         cadence_seconds: float = 1.0,
         monitor_lease_seconds: float = 300.0,
@@ -237,6 +239,7 @@ class AgentHost:
         embedded = await EmbeddedAgent.create(
             name,
             root=root,
+            config=config,
             model=model,
             model_profile=model_profile,
             context_builder=context_builder,
@@ -266,13 +269,14 @@ class AgentHost:
         name: str,
         *,
         root: str | Path | None = None,
+        config: AgentConfig | None = None,
         model: ModelProvider | None = None,
         model_profile: ModelProfile | None = None,
         context_builder: ContextBuilder | None = None,
         domain: DomainController | None = None,
         capabilities: CapabilityRegistry | None = None,
         policy: DefaultPolicyEvaluator | None = None,
-        budgets: LoopBudgets = LoopBudgets(),
+        budgets: LoopBudgets | None = None,
         monitor_projector: MonitorOutcomeProjector | None = None,
         cadence_seconds: float = 1.0,
         monitor_lease_seconds: float = 300.0,
@@ -284,6 +288,7 @@ class AgentHost:
         embedded = await EmbeddedAgent.open(
             name,
             root=root,
+            config=config,
             model=model,
             model_profile=model_profile,
             context_builder=context_builder,

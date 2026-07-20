@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from daita import Agent, AgentConfig, ConfigError
 from daita.hosting import AgentHost, AgentHostState
 from daita.hosting.embedded import HostActiveError
 from daita.hosting.inbox import (
@@ -24,14 +25,18 @@ from daita.llm.models import (
     ToolDefinition,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import LoopExitKind, Readiness, Turn
+from daita.loop.models import LoopBudgets, LoopExitKind, Readiness, Turn
 from daita.monitors import (
     IntervalSchedule,
     MonitorDefinition,
     MonitorRunStatus,
     MonitorScope,
 )
-from daita.operations.governance import ApprovalRequest, ApprovalStatus
+from daita.operations.governance import (
+    ApprovalRequest,
+    ApprovalStatus,
+    DefaultPolicyProfile,
+)
 from daita.operations.checkpoints import OperationSnapshot
 from daita.operations.models import (
     ActionProposal,
@@ -232,6 +237,38 @@ async def test_create_open_are_inert_and_start_owns_one_cadence_and_writer(
         assert _background_tasks() == before
     finally:
         await reopened.stop()
+
+
+async def test_host_and_agent_share_the_persisted_runtime_default_binding(
+    tmp_path,
+) -> None:
+    config = AgentConfig(
+        budgets=LoopBudgets(max_turns=4, max_actions=7),
+        policy_profile=DefaultPolicyProfile(version="host-2"),
+    )
+    host = await AgentHost.create("shared-config", root=tmp_path, config=config)
+    try:
+        assert host._embedded.runtime_defaults == config.runtime_defaults
+    finally:
+        await host.stop()
+
+    agent = await Agent.open("shared-config", root=tmp_path)
+    try:
+        assert agent._embedded.runtime_defaults == config.runtime_defaults
+    finally:
+        await agent.close()
+
+    with pytest.raises(ConfigError) as captured:
+        await AgentHost.open(
+            "shared-config",
+            root=tmp_path,
+            config=AgentConfig(
+                budgets=LoopBudgets(max_turns=5, max_actions=7),
+                policy_profile=config.policy_profile,
+            ),
+        )
+    assert captured.value.error_code == "config_conflict"
+    assert captured.value.section == "budgets"
 
 
 async def test_submit_is_durable_idempotent_and_replays_across_restart(

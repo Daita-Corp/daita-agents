@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from enum import Enum
+import math
+from typing import cast
 
+from ..errors import (
+    AuthenticationError,
+    ErrorRetryability,
+    LLMError,
+    RateLimitError,
+)
 from .models import ModelRoutingTrace
 
 
@@ -22,8 +30,26 @@ class ProviderErrorCode(str, Enum):
     MALFORMED_RESPONSE = "malformed_response"
 
 
-class ModelProviderError(RuntimeError):
+class ModelProviderError(LLMError):
     """One adapter failure already normalized at the provider boundary."""
+
+    def __new__(
+        cls,
+        code: ProviderErrorCode,
+        message: str | None = None,
+        *,
+        routing: ModelRoutingTrace | None = None,
+        provider_id: str | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> ModelProviderError:
+        del message, routing, provider_id, retry_after_seconds
+        concrete: type[ModelProviderError] = cls
+        if cls is ModelProviderError:
+            if code is ProviderErrorCode.RATE_LIMIT_ERROR:
+                concrete = _ProviderRateLimitError
+            elif code is ProviderErrorCode.AUTHENTICATION_ERROR:
+                concrete = _ProviderAuthenticationError
+        return cast(ModelProviderError, BaseException.__new__(concrete))
 
     def __init__(
         self,
@@ -31,6 +57,8 @@ class ModelProviderError(RuntimeError):
         message: str | None = None,
         *,
         routing: ModelRoutingTrace | None = None,
+        provider_id: str | None = None,
+        retry_after_seconds: float | None = None,
     ) -> None:
         if not isinstance(code, ProviderErrorCode):
             raise TypeError("code must be a ProviderErrorCode")
@@ -45,7 +73,44 @@ class ModelProviderError(RuntimeError):
                 raise ValueError("routing terminal error must match the provider code")
         self.code = code
         self.routing = routing
-        super().__init__(message or code.value)
+        if retry_after_seconds is not None:
+            if code is not ProviderErrorCode.RATE_LIMIT_ERROR:
+                raise ValueError(
+                    "retry_after_seconds is valid only for a rate-limit error"
+                )
+            if (
+                not isinstance(retry_after_seconds, (int, float))
+                or isinstance(retry_after_seconds, bool)
+                or not math.isfinite(retry_after_seconds)
+                or retry_after_seconds < 0
+            ):
+                raise ValueError("retry_after_seconds must be finite and non-negative")
+            retry_after_seconds = float(retry_after_seconds)
+        self.retry_after_seconds: float | None = retry_after_seconds
+        retryability = (
+            ErrorRetryability.TRANSIENT
+            if code
+            in {
+                ProviderErrorCode.RATE_LIMIT_ERROR,
+                ProviderErrorCode.PROVIDER_UNAVAILABLE,
+                ProviderErrorCode.TIMEOUT,
+            }
+            else ErrorRetryability.PERMANENT
+        )
+        super().__init__(
+            message or code.value,
+            provider_id=provider_id,
+            error_code=code.value,
+            retryability=retryability,
+        )
+
+
+class _ProviderRateLimitError(ModelProviderError, RateLimitError):
+    """Normalized provider rate limit catchable through both public types."""
+
+
+class _ProviderAuthenticationError(ModelProviderError, AuthenticationError):
+    """Normalized provider authentication failure with both public types."""
 
 
 def detached_provider_error(error: ModelProviderError) -> ModelProviderError:

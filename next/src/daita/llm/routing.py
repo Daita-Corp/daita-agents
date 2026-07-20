@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
+from enum import Enum
 from hashlib import sha256
+import math
 from time import monotonic_ns
 from typing import cast
 
@@ -38,6 +40,75 @@ _DEFAULT_RETRYABLE_CODES = frozenset(
         ProviderErrorCode.TIMEOUT,
     }
 )
+
+
+class RetryStrategy(str, Enum):
+    """Deterministic delay strategy for same-provider retries."""
+
+    FIXED = "fixed"
+    EXPONENTIAL = "exponential"
+    LINEAR = "linear"
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """Versioned bounded retry policy applied only by ``ModelRouter``."""
+
+    schema_version: int = 1
+    max_attempts_per_provider: int = 1
+    strategy: RetryStrategy = RetryStrategy.FIXED
+    base_delay_seconds: float = 0.0
+    max_delay_seconds: float = 0.0
+    retryable_codes: frozenset[ProviderErrorCode] = _DEFAULT_RETRYABLE_CODES
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("retry policy schema_version must be 1")
+        if (
+            not isinstance(self.max_attempts_per_provider, int)
+            or isinstance(self.max_attempts_per_provider, bool)
+            or not 1 <= self.max_attempts_per_provider <= 4
+        ):
+            raise ValueError("max_attempts_per_provider must be from one through four")
+        if not isinstance(self.strategy, RetryStrategy):
+            raise TypeError("retry strategy must be a RetryStrategy")
+        for value, field_name in (
+            (self.base_delay_seconds, "base_delay_seconds"),
+            (self.max_delay_seconds, "max_delay_seconds"),
+        ):
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"{field_name} must be finite and non-negative")
+            object.__setattr__(self, field_name, float(value))
+        if self.max_delay_seconds < self.base_delay_seconds:
+            raise ValueError("max_delay_seconds cannot be less than base_delay_seconds")
+        if not isinstance(self.retryable_codes, frozenset) or any(
+            not isinstance(item, ProviderErrorCode) for item in self.retryable_codes
+        ):
+            raise TypeError("retryable_codes must be a frozenset of ProviderErrorCode")
+        if not self.retryable_codes <= _DEFAULT_RETRYABLE_CODES:
+            raise ValueError("retry policy cannot make terminal failures retryable")
+
+    def delay_after(self, failed_attempt: int) -> float:
+        """Return the deterministic delay after a numbered failed attempt."""
+
+        if (
+            not isinstance(failed_attempt, int)
+            or isinstance(failed_attempt, bool)
+            or failed_attempt < 1
+        ):
+            raise ValueError("failed_attempt must be a positive integer")
+        if self.strategy is RetryStrategy.FIXED:
+            delay = self.base_delay_seconds
+        elif self.strategy is RetryStrategy.LINEAR:
+            delay = self.base_delay_seconds * failed_attempt
+        else:
+            delay = self.base_delay_seconds * (2 ** (failed_attempt - 1))
+        return min(delay, self.max_delay_seconds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,9 +177,11 @@ class ModelRouter:
         primary: ModelProviderRegistration,
         fallbacks: Iterable[ModelProviderRegistration] = (),
         *,
-        max_attempts_per_provider: int = 1,
-        retryable_codes: frozenset[ProviderErrorCode] = _DEFAULT_RETRYABLE_CODES,
+        retry_policy: RetryPolicy | None = None,
+        max_attempts_per_provider: int | None = None,
+        retryable_codes: frozenset[ProviderErrorCode] | None = None,
         monotonic_clock: Callable[[], int] = monotonic_ns,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if not isinstance(primary, ModelProviderRegistration):
             raise TypeError("primary must be a ModelProviderRegistration")
@@ -122,31 +195,44 @@ class ModelRouter:
         ids = tuple(item.profile.id for item in candidates)
         if len(ids) != len(set(ids)):
             raise ValueError("model route candidates must have unique provider IDs")
-        if (
-            not isinstance(max_attempts_per_provider, int)
-            or isinstance(max_attempts_per_provider, bool)
-            or not 1 <= max_attempts_per_provider <= 4
+        if retry_policy is not None and (
+            max_attempts_per_provider is not None or retryable_codes is not None
         ):
-            raise ValueError("max_attempts_per_provider must be from one through four")
-        if not isinstance(retryable_codes, frozenset) or any(
-            not isinstance(item, ProviderErrorCode) for item in retryable_codes
-        ):
-            raise TypeError("retryable_codes must be a frozenset of ProviderErrorCode")
-        if not retryable_codes <= _DEFAULT_RETRYABLE_CODES:
             raise ValueError(
-                "model route cannot make terminal provider failures retryable"
+                "retry_policy cannot be combined with legacy retry arguments"
             )
+        if retry_policy is None:
+            retry_policy = RetryPolicy(
+                max_attempts_per_provider=(
+                    1
+                    if max_attempts_per_provider is None
+                    else max_attempts_per_provider
+                ),
+                strategy=RetryStrategy.FIXED,
+                base_delay_seconds=0.0,
+                max_delay_seconds=0.0,
+                retryable_codes=(
+                    _DEFAULT_RETRYABLE_CODES
+                    if retryable_codes is None
+                    else retryable_codes
+                ),
+            )
+        elif not isinstance(retry_policy, RetryPolicy):
+            raise TypeError("retry_policy must be a RetryPolicy or None")
         if not callable(monotonic_clock):
             raise TypeError("monotonic_clock must be callable")
+        if not callable(sleep):
+            raise TypeError("sleep must be callable")
 
         self._candidates = candidates
-        self._max_attempts = max_attempts_per_provider
-        self._retryable_codes = retryable_codes
+        self._retry_policy = retry_policy
+        self._max_attempts = retry_policy.max_attempts_per_provider
+        self._retryable_codes = retry_policy.retryable_codes
         self._monotonic_clock = monotonic_clock
+        self._sleep = sleep
         fingerprint = _route_fingerprint(
             candidates,
-            max_attempts=max_attempts_per_provider,
-            retryable_codes=retryable_codes,
+            retry_policy=retry_policy,
         )
         self._provider_id = f"router:{fingerprint}"
         self._profile = replace(
@@ -168,6 +254,10 @@ class ModelRouter:
     @property
     def candidates(self) -> tuple[ModelProviderRegistration, ...]:
         return self._candidates
+
+    @property
+    def retry_policy(self) -> RetryPolicy:
+        return self._retry_policy
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
@@ -221,6 +311,7 @@ class ModelRouter:
                     break_or_retry = attempt_number >= self._max_attempts
                     if break_or_retry:
                         break
+                    await self._wait_before_retry(attempt_number)
                     continue
                 except Exception as error:
                     latency = self._elapsed_ms(started)
@@ -419,6 +510,7 @@ class ModelRouter:
                     if emitted or error.code not in self._retryable_codes:
                         raise self._terminal_error(error.code, attempts) from error
                     if attempt_number < self._max_attempts:
+                        await self._wait_before_retry(attempt_number)
                         continue
                     break
                 except Exception as error:
@@ -473,6 +565,11 @@ class ModelRouter:
     def _elapsed_ms(self, started: int) -> int:
         finished = self._read_clock()
         return max(0, finished - started) // 1_000_000
+
+    async def _wait_before_retry(self, failed_attempt: int) -> None:
+        delay = self._retry_policy.delay_after(failed_attempt)
+        if delay > 0:
+            await self._sleep(delay)
 
 
 def _candidate_is_eligible(
@@ -557,8 +654,7 @@ def _usage_with_profile_cost(
 def _route_fingerprint(
     candidates: tuple[ModelProviderRegistration, ...],
     *,
-    max_attempts: int,
-    retryable_codes: frozenset[ProviderErrorCode],
+    retry_policy: RetryPolicy,
 ) -> str:
     encoded = canonical_json(
         {
@@ -571,8 +667,16 @@ def _route_fingerprint(
                 }
                 for registration in candidates
             ],
-            "max_attempts_per_provider": max_attempts,
-            "retryable_codes": sorted(item.value for item in retryable_codes),
+            "retry_policy": {
+                "base_delay_seconds": retry_policy.base_delay_seconds,
+                "max_attempts_per_provider": (retry_policy.max_attempts_per_provider),
+                "max_delay_seconds": retry_policy.max_delay_seconds,
+                "retryable_codes": sorted(
+                    item.value for item in retry_policy.retryable_codes
+                ),
+                "schema_version": retry_policy.schema_version,
+                "strategy": retry_policy.strategy.value,
+            },
             "schema_version": 1,
         }
     ).encode("utf-8")
@@ -613,4 +717,6 @@ __all__ = [
     "ModelProviderRegistration",
     "ModelRegistry",
     "ModelRouter",
+    "RetryPolicy",
+    "RetryStrategy",
 ]

@@ -34,9 +34,9 @@ from ..catalog.models import (
 )
 from ..domains.data.capabilities import postgresql_query_extension_declarations
 from ..security import (
-    EnvironmentSecretProvider,
     SecretProvider,
     SecretReference,
+    default_secret_provider,
 )
 from .models import (
     DiscoveryRequest,
@@ -233,7 +233,7 @@ class PostgreSQLSource:
     ssl_mode: str = "require"
     name: str | None = None
     secret_provider: SecretProvider = field(
-        default_factory=EnvironmentSecretProvider,
+        default_factory=default_secret_provider,
         repr=False,
         compare=False,
     )
