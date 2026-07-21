@@ -133,7 +133,7 @@ class SingleTurnContextBuilder:
 
 
 class TextOnlyDomain:
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:
@@ -165,6 +165,9 @@ class BlockingProvider:
         self.finished = asyncio.Event()
         self.operation_id: str | None = None
         self.requests: list[ModelRequest] = []
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
@@ -205,7 +208,7 @@ class FakeReadDomain:
         self.projection_started = asyncio.Event()
         self.projection_finished = asyncio.Event()
 
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:

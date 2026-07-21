@@ -320,3 +320,105 @@ async def test_fail_budget_state_and_events_commit_atomically() -> None:
         )
 
     assert await runtime.inspect(started.operation.id) == before
+
+
+async def test_fail_required_context_commits_exact_safe_facts_and_terminal_state() -> (
+    None
+):
+    runtime = OperationRuntime(clock=lambda: NOW)
+    started = await runtime.begin(_trigger("context-overflow"))
+    turn = await runtime.begin_turn(started.operation.id)
+
+    result = await runtime.fail_required_context(
+        started.operation.id,
+        profile_id="mock:context-overflow",
+        input_limit_tokens=100,
+        output_reserve_tokens=20,
+        tool_tokens=10,
+        required_system_tokens=10,
+        required_routing_tokens=5,
+        required_intent_tokens=5,
+        current_operation_envelope_tokens=20,
+        current_operation_body_tokens=10,
+        minimum_session_tokens=20,
+        projected_session_tokens=30,
+        required_tokens=70,
+        available_tokens=60,
+        total_required_tokens=80,
+        optional_omitted_tokens=40,
+    )
+
+    snapshot = await runtime.inspect(started.operation.id)
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "context.required_overflow"
+    assert snapshot.operation.status is OperationStatus.FAILED
+    assert snapshot.operation.terminal_reason == "context.required_overflow"
+    assert [event.type for event in snapshot.events[-2:]] == [
+        "context.required_overflow",
+        "operation.failed",
+    ]
+    overflow = snapshot.events[-2]
+    assert overflow.turn_id == turn.id
+    assert dict(overflow.payload) == {
+        "available_tokens": 60,
+        "code": "context.required_overflow",
+        "current_operation_body_tokens": 10,
+        "current_operation_envelope_tokens": 20,
+        "input_limit_tokens": 100,
+        "minimum_session_tokens": 20,
+        "optional_omitted_tokens": 40,
+        "output_reserve_tokens": 20,
+        "profile_id": "mock:context-overflow",
+        "projected_session_tokens": 30,
+        "required_intent_tokens": 5,
+        "required_routing_tokens": 5,
+        "required_system_tokens": 10,
+        "required_tokens": 70,
+        "schema_version": 1,
+        "tool_tokens": 10,
+        "total_required_tokens": 80,
+    }
+    assert dict(snapshot.events[-1].payload) == {"reason": "context.required_overflow"}
+
+
+async def test_fail_required_context_state_and_events_commit_atomically() -> None:
+    sequence = 0
+    terminal_event_count = 0
+    inject_failure = False
+
+    def fail_operation_event(prefix: str) -> str:
+        nonlocal sequence, terminal_event_count
+        sequence += 1
+        if inject_failure and prefix == "event":
+            terminal_event_count += 1
+            if terminal_event_count == 2:
+                raise RuntimeError("injected context terminal event failure")
+        return f"{prefix}-{sequence}"
+
+    runtime = OperationRuntime(clock=lambda: NOW, id_factory=fail_operation_event)
+    started = await runtime.begin(_trigger("context-overflow-atomicity"))
+    await runtime.begin_turn(started.operation.id)
+    before = await runtime.inspect(started.operation.id)
+    inject_failure = True
+
+    with pytest.raises(RuntimeError, match="injected context terminal event failure"):
+        await runtime.fail_required_context(
+            started.operation.id,
+            profile_id="mock:context-overflow",
+            input_limit_tokens=100,
+            output_reserve_tokens=20,
+            tool_tokens=10,
+            required_system_tokens=10,
+            required_routing_tokens=5,
+            required_intent_tokens=5,
+            current_operation_envelope_tokens=20,
+            current_operation_body_tokens=10,
+            minimum_session_tokens=20,
+            projected_session_tokens=30,
+            required_tokens=70,
+            available_tokens=60,
+            total_required_tokens=80,
+            optional_omitted_tokens=None,
+        )
+
+    assert await runtime.inspect(started.operation.id) == before

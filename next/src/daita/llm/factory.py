@@ -9,6 +9,7 @@ from ..security.secrets import (
     SecretReference,
     default_secret_provider,
 )
+from .errors import ModelProviderError, ProviderErrorCode
 from .models import ModelProfile, ModelRequest, ModelResponse, ModelSensitivity
 from .protocols import ModelProvider
 from .providers import (
@@ -140,7 +141,26 @@ class _LazyRouteProvider:
     def provider_id(self) -> str:
         return self._candidate.provider_id
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        if self._provider is not None:
+            return self._provider.supports_request_policy(request) is True
+        if request.allow_parallel_tool_calls is None:
+            return True
+        provider_name, _, _ = self._candidate.provider_id.partition(":")
+        if provider_name in {"openai", "grok", "ollama"}:
+            return True
+        if provider_name in {"anthropic", "gemini"}:
+            return False
+        return self._candidate.base_url is not None
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
+        if not self.supports_request_policy(request):
+            raise ModelProviderError(
+                ProviderErrorCode.INVALID_REQUEST,
+                "configured provider cannot enforce the requested tool-call policy",
+            )
         if self._provider is None:
             reference = self._candidate.secret_reference
             api_key = (

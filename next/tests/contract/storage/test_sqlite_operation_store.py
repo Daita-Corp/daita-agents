@@ -9,6 +9,11 @@ import sqlite3
 
 import pytest
 
+from daita._json import FrozenJsonObject
+from daita.catalog import (
+    CATALOG_INSPECT_CAPABILITY_ID,
+    CATALOG_INSPECT_EVIDENCE_KIND,
+)
 from daita.events.models import RuntimeEvent
 from daita.identity import AgentIdentity
 from daita.llm.models import (
@@ -43,7 +48,9 @@ from daita.operations.models import (
     TaskStatus,
     TriggerKind,
 )
+from daita.operations.runtime import OperationRuntime
 from daita.sessions import Session
+from daita.storage import sqlite as sqlite_owner
 from daita.storage.sqlite import SQLiteCorruptionError, SQLiteOperationStore
 
 OFFSET = timezone(timedelta(hours=5, minutes=30))
@@ -204,6 +211,7 @@ def _maximal_snapshot() -> OperationSnapshot:
             "additionalProperties": False,
         },
         sensitivity=ModelSensitivity.RESTRICTED,
+        allow_parallel_tool_calls=False,
     )
     response_z = ModelResponse(
         finish_reason=FinishReason.TOOL_CALLS,
@@ -360,6 +368,14 @@ def _maximal_snapshot() -> OperationSnapshot:
         code="missing_nested_fact",
         message="A nested fact is still missing.",
         missing_facts=("alpha.total", "beta.status"),
+        repair_details={
+            "required_citations": [
+                {
+                    "citation": "[evidence:evidence-z]",
+                    "evidence_id": "evidence-z",
+                }
+            ]
+        },
         evaluated_at=LATE,
     )
     readiness_early = Readiness(
@@ -542,7 +558,8 @@ async def test_maximal_snapshot_round_trips_through_lookups_and_reopen(
         response_data = json.loads(str(row[1]))
         request_calls = request_data["messages"][2]["tool_calls"]
         request_metadata = request_data["messages"][2]["provider_metadata"]
-        assert request_data["codec_version"] == 3
+        assert request_data["codec_version"] == 4
+        assert request_data["allow_parallel_tool_calls"] is False
         assert request_data["messages"][2]["provider_id"] == "openai:gpt-prior"
         assert request_data["sensitivity"] == "restricted"
         assert request_data["response_schema"]["required"] == ["answer"]
@@ -564,6 +581,20 @@ async def test_maximal_snapshot_round_trips_through_lookups_and_reopen(
             "failed",
             "succeeded",
         ]
+        repair_details_row = connection.execute(
+            "SELECT repair_details_json FROM readiness "
+            "WHERE operation_id = ? AND position = 0",
+            (snapshot.operation.id,),
+        ).fetchone()
+        assert repair_details_row is not None
+        assert json.loads(str(repair_details_row[0])) == {
+            "required_citations": [
+                {
+                    "citation": "[evidence:evidence-z]",
+                    "evidence_id": "evidence-z",
+                }
+            ]
+        }
     finally:
         connection.close()
 
@@ -571,6 +602,234 @@ async def test_maximal_snapshot_round_trips_through_lookups_and_reopen(
     try:
         assert await reopened.load(snapshot.operation.id) == created.operation
         assert await reopened.load_by_trigger(snapshot.trigger.id) == created.operation
+    finally:
+        await reopened.close()
+
+
+async def test_required_context_overflow_facts_round_trip_on_cold_reopen(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "context-overflow.db"
+    store = await SQLiteOperationStore.open(path, clock=lambda: EARLY)
+    await store.initialize_identity(
+        AgentIdentity(
+            id="agent-context-overflow",
+            display_name="Context overflow",
+            created_at=EARLY,
+        )
+    )
+    runtime = OperationRuntime(store=store, clock=lambda: EARLY)
+    started = await runtime.begin(
+        AgentTrigger(
+            id="trigger-context-overflow",
+            agent_id="agent-context-overflow",
+            kind=TriggerKind.USER,
+            source_id="user-context-overflow",
+            payload={"message": "credential-sentinel-must-not-enter-overflow"},
+            created_at=EARLY,
+        )
+    )
+    await runtime.begin_turn(started.operation.id)
+    await runtime.fail_required_context(
+        started.operation.id,
+        profile_id="mock:context-overflow",
+        input_limit_tokens=100,
+        output_reserve_tokens=20,
+        tool_tokens=10,
+        required_system_tokens=10,
+        required_routing_tokens=5,
+        required_intent_tokens=5,
+        current_operation_envelope_tokens=20,
+        current_operation_body_tokens=10,
+        minimum_session_tokens=20,
+        projected_session_tokens=30,
+        required_tokens=70,
+        available_tokens=60,
+        total_required_tokens=80,
+        optional_omitted_tokens=None,
+    )
+    before = await runtime.inspect(started.operation.id)
+    await store.close()
+
+    reopened = await SQLiteOperationStore.open(path, clock=lambda: LATE)
+    try:
+        after = (await reopened.load(started.operation.id)).snapshot
+        assert after == before
+        overflow = next(
+            event for event in after.events if event.type == "context.required_overflow"
+        )
+        assert overflow.payload["code"] == "context.required_overflow"
+        assert overflow.payload["total_required_tokens"] == 80
+        assert overflow.payload["optional_omitted_tokens"] is None
+        assert "credential-sentinel" not in repr(overflow.payload)
+    finally:
+        await reopened.close()
+
+
+async def test_legacy_catalog_inspect_v1_evidence_reopens_without_rewrite(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-catalog-evidence.db"
+    snapshot = _maximal_snapshot()
+    executor_id = "catalog.inspect.executor"
+    legacy_payload = {
+        "facets": [],
+        "resource": {
+            "kind": "table",
+            "resource_id": "resource-historical",
+            "revision": "sha256:" + "7" * 64,
+            "source_id": "source-historical",
+        },
+        "trust_classification": "untrusted_external_data",
+    }
+    legacy_evidence_ids = {
+        evidence.id for evidence in snapshot.evidence if evidence.task_id == "task-z"
+    }
+    historical = replace(
+        snapshot,
+        tasks=tuple(
+            (
+                replace(
+                    task,
+                    capability_id=CATALOG_INSPECT_CAPABILITY_ID,
+                    executor_id=executor_id,
+                )
+                if task.id == "task-z"
+                else task
+            )
+            for task in snapshot.tasks
+        ),
+        evidence=tuple(
+            (
+                replace(
+                    evidence,
+                    capability_id=CATALOG_INSPECT_CAPABILITY_ID,
+                    executor_id=executor_id,
+                    kind=CATALOG_INSPECT_EVIDENCE_KIND,
+                    schema_version=1,
+                    payload=legacy_payload,
+                )
+                if evidence.id in legacy_evidence_ids
+                else evidence
+            )
+            for evidence in snapshot.evidence
+        ),
+        events=tuple(
+            (
+                replace(
+                    event,
+                    capability_id=CATALOG_INSPECT_CAPABILITY_ID,
+                    executor_id=executor_id,
+                )
+                if event.task_id == "task-z"
+                else event
+            )
+            for event in snapshot.events
+        ),
+    )
+    store = await SQLiteOperationStore.open(path)
+    try:
+        await store.initialize_identity(
+            AgentIdentity(
+                id=historical.operation.agent_id,
+                display_name="Historical catalog evidence agent",
+                created_at=EARLY,
+            )
+        )
+        session_id = historical.operation.session_id
+        assert session_id is not None
+        await store.create_session(
+            Session(
+                id=session_id,
+                agent_id=historical.operation.agent_id,
+                title="Historical catalog evidence",
+                created_at=EARLY,
+                updated_at=EARLY,
+            )
+        )
+        await store.create(historical)
+    finally:
+        await store.close()
+
+    reopened = await SQLiteOperationStore.open(path)
+    try:
+        loaded = (await reopened.load(historical.operation.id)).snapshot
+        legacy = tuple(
+            evidence
+            for evidence in loaded.evidence
+            if evidence.id in legacy_evidence_ids
+        )
+        assert all(evidence.schema_version == 1 for evidence in legacy)
+        for evidence in legacy:
+            assert isinstance(evidence.payload, FrozenJsonObject)
+            assert evidence.payload.to_dict() == legacy_payload
+        assert all(
+            evidence.kind == CATALOG_INSPECT_EVIDENCE_KIND for evidence in legacy
+        )
+    finally:
+        await reopened.close()
+
+
+async def test_readiness_repair_details_legacy_decode_and_cold_reopen(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-readiness-v17.db"
+    original = _maximal_snapshot()
+    legacy_snapshot = replace(
+        original,
+        readiness=tuple(
+            replace(readiness, repair_details={}) for readiness in original.readiness
+        ),
+    )
+    legacy = await sqlite_owner._open_with_migrations(
+        path,
+        migrations=sqlite_owner._MIGRATIONS[:17],
+    )
+    try:
+        created = await legacy.create(legacy_snapshot)
+        assert created.operation.snapshot == legacy_snapshot
+    finally:
+        await legacy.close()
+
+    upgraded = await SQLiteOperationStore.open(path)
+    try:
+        loaded = await upgraded.load(legacy_snapshot.operation.id)
+        assert loaded.snapshot == legacy_snapshot
+        assert all(not item.repair_details for item in loaded.snapshot.readiness)
+    finally:
+        await upgraded.close()
+
+    cold = await SQLiteOperationStore.open(path)
+    try:
+        loaded = await cold.load(legacy_snapshot.operation.id)
+        assert all(not item.repair_details for item in loaded.snapshot.readiness)
+    finally:
+        await cold.close()
+
+
+async def test_readiness_repair_details_codec_rejects_malformed_json_object(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "corrupt-readiness-repair-details.db"
+    snapshot = _maximal_snapshot()
+    store = await SQLiteOperationStore.open(path)
+    try:
+        await store.create(snapshot)
+    finally:
+        await store.close()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE readiness SET repair_details_json = '[]' "
+            "WHERE operation_id = ? AND position = 0",
+            (snapshot.operation.id,),
+        )
+        connection.commit()
+
+    reopened = await SQLiteOperationStore.open(path)
+    try:
+        with pytest.raises(SQLiteCorruptionError):
+            await reopened.load(snapshot.operation.id)
     finally:
         await reopened.close()
 

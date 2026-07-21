@@ -75,6 +75,11 @@ class OpenAIResponsesProvider:
     def provider_id(self) -> str:
         return f"openai:{self.model}"
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return True
+
     @property
     def client(self) -> _OpenAIClient:
         if self._client is None:
@@ -288,6 +293,8 @@ class OpenAIResponsesProvider:
         }
         if self._max_output_tokens is not None:
             arguments["max_output_tokens"] = self._max_output_tokens
+        if request.allow_parallel_tool_calls is not None:
+            arguments["parallel_tool_calls"] = request.allow_parallel_tool_calls
         if request.tools:
             arguments["tools"] = [
                 {

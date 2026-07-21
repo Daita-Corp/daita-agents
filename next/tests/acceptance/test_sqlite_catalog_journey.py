@@ -33,6 +33,9 @@ class JourneyProvider:
         self.script: list[ModelResponse] = []
         self.requests: list[ModelRequest] = []
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         if not self.script:
@@ -158,6 +161,10 @@ async def test_public_persistent_grounded_sqlite_journey(tmp_path: Path) -> None
     assert query_row["customer_count"] == 2
     assert query_evidence.payload["trust_classification"] == "untrusted_external_data"
     assert [decision.allowed for decision in snapshot.readiness] == [False, True]
+    assert [decision.code for decision in snapshot.readiness] == [
+        "data.response_contract_incomplete",
+        "data.response_contract_satisfied",
+    ]
     event_types = {event.type for event in snapshot.events}
     assert {
         "action.rejected",
@@ -172,6 +179,7 @@ async def test_public_persistent_grounded_sqlite_journey(tmp_path: Path) -> None
         for event in snapshot.events
     )
     for request in provider.requests:
+        assert request.allow_parallel_tool_calls is False
         system_block = request.messages[0].content[0]
         assert isinstance(system_block, TextBlock)
         assert "UNTRUSTED_CATALOG_CONTEXT" in system_block.text
@@ -185,5 +193,21 @@ async def test_public_persistent_grounded_sqlite_journey(tmp_path: Path) -> None
     await reopened.close()
 
     assert recovered == snapshot
+    assert [(item.code, item.message) for item in recovered.readiness] == [
+        (
+            "data.response_contract_incomplete",
+            "The data response contract is incomplete; required evidence links or "
+            "disclosures are missing.",
+        ),
+        (
+            "data.response_contract_satisfied",
+            "The data response contract's evidence-linking and disclosure requirements "
+            "are satisfied.",
+        ),
+    ]
+    assert all(
+        call.request.allow_parallel_tool_calls is False
+        for call in recovered.model_calls
+    )
     assert transcript.session.id == "session-atlas"
     assert transcript.operation_ids == (result.operation_id,)

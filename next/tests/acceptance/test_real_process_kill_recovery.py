@@ -58,7 +58,7 @@ class _TextContext:
 
 
 class _TextDomain:
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:
@@ -93,6 +93,9 @@ class _RecoveryProvider:
 
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
@@ -138,7 +141,7 @@ _CHILD = textwrap.dedent("""
 
 
     class Domain:
-        def tool_views(self, operation):
+        async def tool_views(self, operation):
             return ()
 
         async def validate_action(self, call, operation):
@@ -161,6 +164,9 @@ _CHILD = textwrap.dedent("""
 
         def __init__(self, marker):
             self.marker = marker
+
+        def supports_request_policy(self, request):
+            return True
 
         async def generate(self, request):
             descriptor = os.open(

@@ -6,6 +6,7 @@ import pytest
 
 from daita import Agent, AgentConfig, ConfigError, RetryPolicy, RetryStrategy
 from daita.agent import AgentNotConfiguredError
+from daita.context import SessionCompressionPolicy
 from daita.llm import (
     CanonicalMessage,
     FinishReason,
@@ -104,6 +105,10 @@ async def test_public_agent_reopens_with_state_owned_runtime_defaults(
     config = AgentConfig(
         budgets=LoopBudgets(max_turns=3, max_actions=5),
         policy_profile=DefaultPolicyProfile(version="2"),
+        session_compression_policy=SessionCompressionPolicy(
+            compression_threshold_tokens=512,
+            retain_latest_operations=2,
+        ),
     )
     created = await Agent.create(
         "runtime-default-agent",
@@ -139,6 +144,16 @@ async def test_public_agent_reopens_with_state_owned_runtime_defaults(
                 policy_profile=DefaultPolicyProfile(version="3"),
             ),
             "policy",
+        ),
+        (
+            AgentConfig(
+                budgets=LoopBudgets(max_turns=3, max_actions=5),
+                policy_profile=DefaultPolicyProfile(version="2"),
+                session_compression_policy=SessionCompressionPolicy(
+                    compression_threshold_tokens=256
+                ),
+            ),
+            "session_compression",
         ),
     ),
 )

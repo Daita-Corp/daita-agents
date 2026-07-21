@@ -10,7 +10,9 @@ import pytest
 from daita import Agent, AgentConfig, SQLiteSource
 from daita.identity import AgentIdentity
 from daita.llm import (
+    CanonicalMessage,
     FinishReason,
+    MessageRole,
     ModelProfile,
     ModelProviderError,
     ModelRequest,
@@ -21,8 +23,10 @@ from daita.llm import (
     ProviderErrorCode,
     RetryPolicy,
     RetryStrategy,
+    TextBlock,
     ToolCall,
 )
+from daita.llm.factory import create_model_route_provider
 from daita.llm.protocols import ModelRouteConflictError
 from daita.llm.routing import ModelRouter
 from daita.operations.models import AgentTrigger, TriggerKind
@@ -137,6 +141,9 @@ class _ScriptedProvider:
         self._responses = list(responses)
         self.requests: list[ModelRequest] = []
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         if not self._responses:
@@ -146,6 +153,78 @@ class _ScriptedProvider:
             raise response
         assert isinstance(response, ModelResponse)
         return response
+
+
+def _request_with_policy(policy: bool | None) -> ModelRequest:
+    return ModelRequest(
+        operation_id="operation-policy",
+        turn_id="turn-policy",
+        messages=(
+            CanonicalMessage(
+                agent_id="agent-policy",
+                operation_id="operation-policy",
+                turn_id="turn-policy",
+                role=MessageRole.USER,
+                content=(TextBlock("test request policy"),),
+            ),
+        ),
+        allow_parallel_tool_calls=policy,
+    )
+
+
+async def test_lazy_route_request_policy_is_known_without_secret_resolution() -> None:
+    class CountingSecrets:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def resolve(self, reference: SecretReference) -> str:
+            self.calls += 1
+            return "must-not-be-resolved"
+
+    secrets = CountingSecrets()
+    explicit_false = _request_with_policy(False)
+    legacy = _request_with_policy(None)
+
+    def lazy_provider(
+        provider_id: str,
+        *,
+        base_url: str | None = None,
+    ):
+        return create_model_route_provider(
+            ModelRoute(
+                candidates=(
+                    ModelRouteCandidate(
+                        profile=_profile(provider_id),
+                        allowed_sensitivities=frozenset({ModelSensitivity.INTERNAL}),
+                        base_url=base_url,
+                        secret_reference=SecretReference.environment(
+                            "POLICY_TEST_SECRET"
+                        ),
+                    ),
+                )
+            ),
+            secret_provider=secrets,
+        )
+
+    openai = lazy_provider("openai:gpt-policy")
+    compatible = lazy_provider(
+        "compatible:model-policy",
+        base_url="https://models.example.test/v1",
+    )
+    anthropic = lazy_provider("anthropic:claude-policy")
+    unknown = lazy_provider("future:model-policy")
+
+    assert openai.supports_request_policy(explicit_false) is True
+    assert compatible.supports_request_policy(explicit_false) is True
+    assert anthropic.supports_request_policy(explicit_false) is False
+    assert unknown.supports_request_policy(explicit_false) is False
+    assert anthropic.supports_request_policy(legacy) is True
+    assert secrets.calls == 0
+
+    with pytest.raises(ModelProviderError) as captured:
+        await anthropic.generate(explicit_false)
+    assert captured.value.code is ProviderErrorCode.INVALID_REQUEST
+    assert secrets.calls == 0
 
 
 async def test_model_route_round_trips_exact_order_profiles_policy_and_references(
@@ -252,7 +331,7 @@ async def test_v15_profile_only_home_gains_no_invented_route(
         await upgraded.close()
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (17,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (18,)
         assert (
             connection.execute(
                 "SELECT model_route_revision, model_route_fingerprint FROM operations"

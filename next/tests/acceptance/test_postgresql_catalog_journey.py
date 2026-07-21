@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from daita import Agent, PostgreSQLSource
-from daita._json import FrozenJsonObject
+from daita._json import FrozenJsonObject, canonical_json
 from daita.catalog import ResourceKind, catalog_resource_id
 from daita.llm.models import (
     FinishReason,
@@ -33,6 +33,9 @@ class JourneyProvider:
     def __init__(self) -> None:
         self.script: list[ModelResponse] = []
         self.requests: list[ModelRequest] = []
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
@@ -202,8 +205,12 @@ def _inspect_observation(request: ModelRequest) -> str:
         for block in message.content:
             if isinstance(block, ToolResultBlock) and block.call_id == "call-inspect":
                 observation = block.output["observation"]
-                assert isinstance(observation, str)
-                return observation
+                assert isinstance(observation, FrozenJsonObject)
+                body = observation["body"]
+                assert isinstance(body, FrozenJsonObject)
+                data = body["data"]
+                assert isinstance(data, FrozenJsonObject)
+                return canonical_json(data)
     raise AssertionError("catalog inspection was not projected to the model")
 
 
@@ -288,6 +295,9 @@ async def test_public_grounded_postgresql_journey_uses_qualified_catalog_identit
     ]
     assert snapshot.loop_state.repair_count == 0
     assert [decision.allowed for decision in snapshot.readiness] == [True]
+    assert [decision.code for decision in snapshot.readiness] == [
+        "data.response_contract_satisfied"
+    ]
     assert not any(event.type == "action.rejected" for event in snapshot.events)
 
     inspect_evidence = snapshot.evidence[1]

@@ -252,8 +252,8 @@ async def test_completion_is_trigger_linked_cas_and_survives_reopen(
         )
         assert await reopened.enqueue_host_inbox(replay) == completion
         assert await reopened.list_pending_host_inbox(AGENT_ID, limit=10) == ()
-        assert sqlite_owner._MIGRATIONS[-1].version == 17
-        assert sqlite_owner._MIGRATIONS[-1].name == "bind_configured_extensions"
+        assert sqlite_owner._MIGRATIONS[-1].version == 18
+        assert sqlite_owner._MIGRATIONS[-1].name == "persist_wave1_runtime_foundation"
     finally:
         await reopened.close()
 

@@ -52,12 +52,15 @@ from ..catalog.protocols import (
 )
 from ..context.session import (
     SessionApprovalStateFact,
+    SessionCompressionPolicy,
     SessionOperationFacts,
     SessionResourceScopeFact,
 )
 from ..config import (
     AgentRuntimeDefaults,
     AgentRuntimeDefaultsConflictError,
+    _session_compression_policy_data,
+    _session_compression_policy_from_data,
 )
 from ..events.models import CommittedEvent, EventCursor, RuntimeEvent
 from ..events.protocols import (
@@ -2858,6 +2861,153 @@ _EXTENSION_BINDING_SCHEMA_SQL = (
 )
 
 
+_DEFAULT_SESSION_COMPRESSION_POLICY_JSON = canonical_json(
+    _session_compression_policy_data(SessionCompressionPolicy())
+)
+_RUNTIME_DEFAULTS_FINGERPRINT_FUNCTION = "daita_runtime_defaults_fingerprint_v2"
+
+
+def _runtime_defaults_fingerprint_v2(
+    stored_fingerprint: object,
+    schema_version: object,
+    revision: object,
+    max_turns: object,
+    max_actions: object,
+    max_repairs: object,
+    max_identical_failures: object,
+    max_observation_characters: object,
+    max_total_tokens: object,
+    max_wall_time_seconds: object,
+    task_timeout_seconds: object,
+    max_estimated_cost_usd: object,
+    policy_id: object,
+    policy_version: object,
+    policy_allow_destructive: object,
+    session_compression_policy_json: object,
+) -> str:
+    """Recompute one migrated runtime-default fingerprint from typed owners."""
+
+    encoded_policy = _sqlite_text(
+        session_compression_policy_json,
+        "runtime-default session compression policy",
+    )
+    decoded_policy = _decode_json(encoded_policy)
+    if not isinstance(decoded_policy, dict):
+        raise ValueError("runtime-default session compression policy must be an object")
+    cost = (
+        None
+        if max_estimated_cost_usd is None
+        else _decode_decimal(
+            _sqlite_text(
+                max_estimated_cost_usd,
+                "runtime-default max estimated cost",
+            )
+        )
+    )
+    defaults = AgentRuntimeDefaults(
+        schema_version=_sqlite_int(
+            schema_version,
+            "runtime-default schema_version",
+        ),
+        revision=_sqlite_int(revision, "runtime-default revision"),
+        budgets=LoopBudgets(
+            max_turns=_sqlite_int(max_turns, "runtime-default max_turns"),
+            max_actions=_sqlite_int(max_actions, "runtime-default max_actions"),
+            max_repairs=_sqlite_int(max_repairs, "runtime-default max_repairs"),
+            max_identical_failures=_sqlite_int(
+                max_identical_failures,
+                "runtime-default max_identical_failures",
+            ),
+            max_observation_characters=_sqlite_int(
+                max_observation_characters,
+                "runtime-default max_observation_characters",
+            ),
+            max_total_tokens=_sqlite_int(
+                max_total_tokens,
+                "runtime-default max_total_tokens",
+            ),
+            max_wall_time_seconds=_sqlite_real(
+                max_wall_time_seconds,
+                "runtime-default max_wall_time_seconds",
+            ),
+            task_timeout_seconds=_sqlite_real(
+                task_timeout_seconds,
+                "runtime-default task_timeout_seconds",
+            ),
+            max_estimated_cost_usd=cost,
+        ),
+        policy_profile=DefaultPolicyProfile(
+            id=_sqlite_text(policy_id, "runtime-default policy_id"),
+            version=_sqlite_text(policy_version, "runtime-default policy_version"),
+            allow_destructive=_decode_bool(policy_allow_destructive),
+        ),
+        session_compression_policy=_session_compression_policy_from_data(
+            decoded_policy
+        ),
+    )
+    if (
+        _sqlite_text(stored_fingerprint, "runtime-default fingerprint")
+        != defaults._legacy_fingerprint
+    ):
+        raise ValueError("legacy runtime-default fingerprint does not match its fields")
+    return defaults.fingerprint
+
+
+def _register_migration_functions(connection: sqlite3.Connection) -> None:
+    connection.create_function(
+        _RUNTIME_DEFAULTS_FINGERPRINT_FUNCTION,
+        16,
+        _runtime_defaults_fingerprint_v2,
+        deterministic=True,
+    )
+
+
+_WAVE1_FOUNDATION_SCHEMA_SQL = (
+    """
+    ALTER TABLE readiness ADD COLUMN repair_details_json TEXT NOT NULL
+        DEFAULT '{}' CHECK (length(repair_details_json) <= 4096)
+    """.strip(),
+    """
+    DROP TRIGGER agent_runtime_defaults_reject_update
+    """.strip(),
+    f"""
+    ALTER TABLE agent_runtime_defaults
+        ADD COLUMN session_compression_policy_json TEXT NOT NULL
+        DEFAULT '{_DEFAULT_SESSION_COMPRESSION_POLICY_JSON}' CHECK (
+            length(session_compression_policy_json) <= 4096
+        )
+    """.strip(),
+    f"""
+    UPDATE agent_runtime_defaults
+    SET fingerprint = {_RUNTIME_DEFAULTS_FINGERPRINT_FUNCTION}(
+        fingerprint,
+        schema_version,
+        revision,
+        budget_max_turns,
+        budget_max_actions,
+        budget_max_repairs,
+        budget_max_identical_failures,
+        budget_max_observation_characters,
+        budget_max_total_tokens,
+        budget_max_wall_time_seconds,
+        budget_task_timeout_seconds,
+        budget_max_estimated_cost_usd,
+        policy_id,
+        policy_version,
+        policy_allow_destructive,
+        session_compression_policy_json
+    )
+    """.strip(),
+    """
+    CREATE TRIGGER agent_runtime_defaults_reject_update
+    BEFORE UPDATE ON agent_runtime_defaults
+    BEGIN
+        SELECT RAISE(ABORT, 'agent runtime-default binding is immutable');
+    END
+    """.strip(),
+)
+
+
 # Migration 1 records only the v2 file/migration foundation. Migration 2 adds
 # the first normalized runtime lifecycle aggregate without an opaque snapshot.
 # Migration 3 assigns one append-only committed-event sequence per agent.
@@ -2899,6 +3049,10 @@ _EXTENSION_BINDING_SCHEMA_SQL = (
 # operations remain unconfigured/nullable rather than gaining invented routes.
 # Migration 17 binds the exact ordered configured capability-extension set.
 # Legacy Agent Homes gain no invented binding and remain valid with no extension.
+# Migration 18 adds bounded readiness repair details and makes the existing
+# session-compression policy an immutable runtime default. Existing homes retain
+# the prior profile-derived threshold through an explicit nullable policy field;
+# their complete runtime-default fingerprints are recomputed atomically.
 _MIGRATIONS = (
     _SQLiteMigration(
         version=1,
@@ -2984,6 +3138,11 @@ _MIGRATIONS = (
         version=17,
         name="bind_configured_extensions",
         statements=_EXTENSION_BINDING_SCHEMA_SQL,
+    ),
+    _SQLiteMigration(
+        version=18,
+        name="persist_wave1_runtime_foundation",
+        statements=_WAVE1_FOUNDATION_SCHEMA_SQL,
     ),
 )
 
@@ -4134,6 +4293,66 @@ class SQLiteOperationStore:
             )
         )
 
+    async def load_incident_relationships(
+        self,
+        agent_id: str,
+        resource_id: str,
+        *,
+        relationship_kinds: tuple[RelationshipKind, ...] = (),
+        limit: int = 50,
+    ) -> tuple[CatalogRelationship, ...]:
+        """Load bounded current relationships incident to one resource."""
+
+        _require_identity(agent_id, "agent_id")
+        _require_identity(resource_id, "resource_id")
+        if isinstance(relationship_kinds, (str, bytes)):
+            raise TypeError("relationship_kinds must be a sequence")
+        kinds = tuple(relationship_kinds)
+        if any(not isinstance(kind, RelationshipKind) for kind in kinds):
+            raise TypeError("relationship_kinds must contain RelationshipKind")
+        if len(kinds) != len(set(kinds)):
+            raise ValueError("relationship_kinds cannot contain duplicates")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 2_001
+        ):
+            raise ValueError("relationship limit must be from 1 through 2001")
+        return await self._run_connection(
+            lambda connection: _load_current_catalog_incident_relationships(
+                connection,
+                agent_id,
+                resource_id,
+                kinds,
+                limit,
+            )
+        )
+
+    async def load_relationships(
+        self,
+        agent_id: str,
+        relationship_ids: tuple[str, ...],
+    ) -> tuple[CatalogRelationship, ...]:
+        """Load bounded current relationships in caller-requested order."""
+
+        _require_identity(agent_id, "agent_id")
+        if isinstance(relationship_ids, (str, bytes)):
+            raise TypeError("relationship_ids must be a sequence")
+        ids = tuple(relationship_ids)
+        if len(ids) > 64:
+            raise ValueError("relationship_ids exceed 64 items")
+        for relationship_id in ids:
+            _require_identity(relationship_id, "relationship_id")
+        if len(ids) != len(set(ids)):
+            raise ValueError("relationship_ids cannot contain duplicates")
+        return await self._run_connection(
+            lambda connection: _load_current_catalog_relationships(
+                connection,
+                agent_id,
+                ids,
+            )
+        )
+
     async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
         """Run one bounded literal-token FTS search over current resources."""
 
@@ -4544,6 +4763,7 @@ async def _open_with_migrations(
                 check_same_thread=False,
             )
             connection.row_factory = sqlite3.Row
+            _register_migration_functions(connection)
             _prepare_database(
                 connection,
                 database_path,
@@ -4910,6 +5130,7 @@ def _expected_schema_manifest(
 ) -> tuple[tuple[str, str, str, str], ...]:
     connection = sqlite3.connect(":memory:", isolation_level=None)
     try:
+        _register_migration_functions(connection)
         connection.execute(_SCHEMA_HISTORY_SQL)
         for migration in migrations:
             for statement in migration.statements:
@@ -5127,39 +5348,66 @@ def _bind_agent_runtime_defaults(
         if current is None:
             budgets = defaults.budgets
             policy = defaults.policy_profile
-            connection.execute(
-                "INSERT INTO agent_runtime_defaults("
+            has_compression_policy = _pragma_int(connection, "user_version") >= 18
+            if (
+                not has_compression_policy
+                and defaults.session_compression_policy != SessionCompressionPolicy()
+            ):
+                raise ValueError(
+                    "historical runtime-default schema cannot store an explicit "
+                    "session compression policy"
+                )
+            columns = (
                 "agent_id, schema_version, revision, fingerprint, "
                 "budget_max_turns, budget_max_actions, budget_max_repairs, "
                 "budget_max_identical_failures, "
                 "budget_max_observation_characters, budget_max_total_tokens, "
                 "budget_max_wall_time_seconds, budget_task_timeout_seconds, "
                 "budget_max_estimated_cost_usd, policy_id, policy_version, "
-                "policy_allow_destructive, bound_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "policy_allow_destructive, "
+            )
+            values: tuple[object, ...] = (
+                agent_id,
+                defaults.schema_version,
+                defaults.revision,
                 (
-                    agent_id,
-                    defaults.schema_version,
-                    defaults.revision,
-                    defaults.fingerprint,
-                    budgets.max_turns,
-                    budgets.max_actions,
-                    budgets.max_repairs,
-                    budgets.max_identical_failures,
-                    budgets.max_observation_characters,
-                    budgets.max_total_tokens,
-                    budgets.max_wall_time_seconds,
-                    budgets.task_timeout_seconds,
-                    (
-                        None
-                        if budgets.max_estimated_cost_usd is None
-                        else _encode_decimal(budgets.max_estimated_cost_usd)
-                    ),
-                    policy.id,
-                    policy.version,
-                    int(policy.allow_destructive),
-                    _encode_datetime(bound_at),
+                    defaults.fingerprint
+                    if has_compression_policy
+                    else defaults._legacy_fingerprint
                 ),
+                budgets.max_turns,
+                budgets.max_actions,
+                budgets.max_repairs,
+                budgets.max_identical_failures,
+                budgets.max_observation_characters,
+                budgets.max_total_tokens,
+                budgets.max_wall_time_seconds,
+                budgets.task_timeout_seconds,
+                (
+                    None
+                    if budgets.max_estimated_cost_usd is None
+                    else _encode_decimal(budgets.max_estimated_cost_usd)
+                ),
+                policy.id,
+                policy.version,
+                int(policy.allow_destructive),
+            )
+            if has_compression_policy:
+                columns += "session_compression_policy_json, "
+                values += (
+                    canonical_json(
+                        _session_compression_policy_data(
+                            defaults.session_compression_policy
+                        )
+                    ),
+                )
+            columns += "bound_at"
+            values += (_encode_datetime(bound_at),)
+            placeholders = ", ".join("?" for _ in values)
+            connection.execute(
+                f"INSERT INTO agent_runtime_defaults({columns}) "
+                f"VALUES ({placeholders})",
+                values,
             )
             current = defaults
         elif current != defaults:
@@ -5178,13 +5426,18 @@ def _load_agent_runtime_defaults(
     connection: sqlite3.Connection,
     agent_id: str,
 ) -> AgentRuntimeDefaults | None:
+    has_compression_policy = _pragma_int(connection, "user_version") >= 18
+    compression_policy_column = (
+        "session_compression_policy_json, " if has_compression_policy else ""
+    )
     rows = connection.execute(
         "SELECT schema_version, revision, fingerprint, budget_max_turns, "
         "budget_max_actions, budget_max_repairs, "
         "budget_max_identical_failures, budget_max_observation_characters, "
         "budget_max_total_tokens, budget_max_wall_time_seconds, "
         "budget_task_timeout_seconds, budget_max_estimated_cost_usd, "
-        "policy_id, policy_version, policy_allow_destructive, bound_at "
+        "policy_id, policy_version, policy_allow_destructive, "
+        f"{compression_policy_column}bound_at "
         "FROM agent_runtime_defaults WHERE agent_id = ?",
         (agent_id,),
     ).fetchall()
@@ -5197,6 +5450,20 @@ def _load_agent_runtime_defaults(
     row = rows[0]
     try:
         cost = row["budget_max_estimated_cost_usd"]
+        compression_policy = SessionCompressionPolicy()
+        if has_compression_policy:
+            encoded_compression_policy = _sqlite_text(
+                row["session_compression_policy_json"],
+                "runtime-default session compression policy",
+            )
+            decoded_compression_policy = _decode_json(encoded_compression_policy)
+            if not isinstance(decoded_compression_policy, dict):
+                raise ValueError(
+                    "runtime-default session compression policy must be an object"
+                )
+            compression_policy = _session_compression_policy_from_data(
+                decoded_compression_policy
+            )
         defaults = AgentRuntimeDefaults(
             schema_version=_sqlite_int(
                 row["schema_version"],
@@ -5253,13 +5520,19 @@ def _load_agent_runtime_defaults(
                     )
                 ),
             ),
+            session_compression_policy=compression_policy,
         )
         fingerprint = _sqlite_text(
             row["fingerprint"],
             "runtime-default fingerprint",
         )
         _decode_datetime(_sqlite_text(row["bound_at"], "runtime-default bound_at"))
-        if fingerprint != defaults.fingerprint:
+        expected_fingerprint = (
+            defaults.fingerprint
+            if has_compression_policy
+            else defaults._legacy_fingerprint
+        )
+        if fingerprint != expected_fingerprint:
             raise ValueError("runtime-default fingerprint does not match its fields")
         return defaults
     except (InvalidOperation, TypeError, ValueError) as error:
@@ -6801,6 +7074,8 @@ def _catalog_search_terms(query: str) -> tuple[str, ...]:
     seen: set[str] = set()
     for match in _CATALOG_SEARCH_TERM.finditer(query.lower()):
         term = match.group(0)
+        if len(term) < 3:
+            continue
         if term in seen:
             continue
         seen.add(term)
@@ -6845,6 +7120,7 @@ def _catalog_hit_match_fields(
 def _decode_catalog_search_hit(
     row: sqlite3.Row,
     terms: tuple[str, ...],
+    match_reason: str | None,
 ) -> CatalogSearchHit:
     try:
         rank_value = row["rank_value"]
@@ -6863,7 +7139,7 @@ def _decode_catalog_search_hit(
             ),
             score=score,
             matched_fields=matched_fields,
-            match_reasons=("lexical_fts",) if terms else (),
+            match_reasons=() if match_reason is None else (match_reason,),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise SQLiteCorruptionError("cannot reconstruct catalog search hit") from error
@@ -6894,36 +7170,41 @@ def _search_catalog(
             "ORDER BY resource.name COLLATE BINARY, resource.id LIMIT ?",
             (*resource_parameters, request.limit),
         ).fetchall()
+        hits = tuple(_decode_catalog_search_hit(row, terms, None) for row in rows)
     else:
-        fts_query = " OR ".join(f'"{term}"' for term in terms)
-        filters = ["catalog_resource_search MATCH ?", *resource_filters]
-        parameters: list[object] = [fts_query, *resource_parameters]
-        where = " AND ".join(filters)
-        total_row = connection.execute(
-            "SELECT COUNT(*) FROM catalog_resource_search "
-            "JOIN catalog_resources AS resource "
-            "ON resource.agent_id = catalog_resource_search.agent_id "
-            "AND resource.id = catalog_resource_search.resource_id "
-            f"WHERE {where}",
-            tuple(parameters),
-        ).fetchone()
-        assert total_row is not None
-        total_matches = _sqlite_int(total_row[0], "catalog search total")
-        rows = connection.execute(
-            "SELECT resource.id, resource.source_id, resource.kind, resource.name, "
-            "catalog_resource_search.native_identity AS native_identity, "
-            "catalog_resource_search.external_uri AS external_uri, "
-            "catalog_resource_search.structural_text AS structural_text, "
-            "resource.current_revision, resource.sensitivity, "
-            "bm25(catalog_resource_search) AS rank_value "
-            "FROM catalog_resource_search JOIN catalog_resources AS resource "
-            "ON resource.agent_id = catalog_resource_search.agent_id "
-            "AND resource.id = catalog_resource_search.resource_id "
-            f"WHERE {where} ORDER BY rank_value, resource.name COLLATE BINARY, "
-            "resource.id LIMIT ?",
-            (*parameters, request.limit),
-        ).fetchall()
-    hits = tuple(_decode_catalog_search_hit(row, terms) for row in rows)
+        exact_query = " OR ".join(f'"{term}"' for term in terms)
+        prefix_query = " OR ".join(f'"{term}"*' for term in terms)
+        exact_rows, exact_matches = _catalog_fts_rows(
+            connection,
+            request,
+            exact_query,
+            limit=request.limit,
+        )
+        hits_list = [
+            _decode_catalog_search_hit(row, terms, "lexical_exact")
+            for row in exact_rows
+        ]
+        _, total_matches = _catalog_fts_rows(
+            connection,
+            request,
+            prefix_query,
+            limit=0,
+        )
+        if exact_matches < request.limit:
+            prefix_rows, _ = _catalog_fts_rows(
+                connection,
+                request,
+                prefix_query,
+                limit=request.limit + exact_matches,
+            )
+            exact_resource_ids = {hit.resource_id for hit in hits_list}
+            hits_list.extend(
+                _decode_catalog_search_hit(row, terms, "lexical_prefix")
+                for row in prefix_rows
+                if _sqlite_text(row["id"], "catalog search resource id")
+                not in exact_resource_ids
+            )
+        hits = tuple(hits_list[: request.limit])
     return CatalogSearchResult(
         request=request,
         hits=hits,
@@ -6932,20 +7213,65 @@ def _search_catalog(
     )
 
 
-def _catalog_adjacency(
+def _catalog_fts_rows(
     connection: sqlite3.Connection,
-    request: CatalogTraversalRequest,
+    request: CatalogSearchRequest,
+    query: str,
+    *,
+    limit: int,
+) -> tuple[list[sqlite3.Row], int]:
+    resource_filters, resource_parameters = _catalog_search_filters(
+        request,
+        table_name="resource",
+    )
+    filters = ["catalog_resource_search MATCH ?", *resource_filters]
+    parameters: list[object] = [query, *resource_parameters]
+    where = " AND ".join(filters)
+    total_row = connection.execute(
+        "SELECT COUNT(*) FROM catalog_resource_search "
+        "JOIN catalog_resources AS resource "
+        "ON resource.agent_id = catalog_resource_search.agent_id "
+        "AND resource.id = catalog_resource_search.resource_id "
+        f"WHERE {where}",
+        tuple(parameters),
+    ).fetchone()
+    assert total_row is not None
+    total_matches = _sqlite_int(total_row[0], "catalog search total")
+    if limit == 0:
+        return [], total_matches
+    rows = connection.execute(
+        "SELECT resource.id, resource.source_id, resource.kind, resource.name, "
+        "catalog_resource_search.native_identity AS native_identity, "
+        "catalog_resource_search.external_uri AS external_uri, "
+        "catalog_resource_search.structural_text AS structural_text, "
+        "resource.current_revision, resource.sensitivity, "
+        "bm25(catalog_resource_search) AS rank_value "
+        "FROM catalog_resource_search JOIN catalog_resources AS resource "
+        "ON resource.agent_id = catalog_resource_search.agent_id "
+        "AND resource.id = catalog_resource_search.resource_id "
+        f"WHERE {where} ORDER BY rank_value, resource.name COLLATE BINARY, "
+        "resource.id LIMIT ?",
+        (*parameters, limit),
+    ).fetchall()
+    return rows, total_matches
+
+
+def _load_current_catalog_incident_relationships(
+    connection: sqlite3.Connection,
+    agent_id: str,
     resource_id: str,
+    relationship_kinds: tuple[RelationshipKind, ...],
+    limit: int,
 ) -> tuple[CatalogRelationship, ...]:
     filters = [
         "relationship.agent_id = ?",
         "(relationship.from_resource_id = ? OR relationship.to_resource_id = ?)",
     ]
-    parameters: list[object] = [request.agent_id, resource_id, resource_id]
-    if request.relationship_kinds:
-        placeholders = ", ".join("?" for _ in request.relationship_kinds)
+    parameters: list[object] = [agent_id, resource_id, resource_id]
+    if relationship_kinds:
+        placeholders = ", ".join("?" for _ in relationship_kinds)
         filters.append(f"relationship.kind IN ({placeholders})")
-        parameters.extend(kind.value for kind in request.relationship_kinds)
+        parameters.extend(kind.value for kind in relationship_kinds)
     rows = connection.execute(
         "SELECT relationship.id, relationship.revision, relationship.source_id, "
         "relationship.from_resource_id, relationship.to_resource_id, "
@@ -6963,9 +7289,60 @@ def _catalog_adjacency(
         "AND to_resource.current_sync_id = relationship.sync_id WHERE "
         + " AND ".join(filters)
         + " ORDER BY relationship.id LIMIT ?",
-        (*parameters, request.max_edges + 1),
+        (*parameters, limit),
     ).fetchall()
     return tuple(_decode_catalog_relationship_row(row) for row in rows)
+
+
+def _load_current_catalog_relationships(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    relationship_ids: tuple[str, ...],
+) -> tuple[CatalogRelationship, ...]:
+    if not relationship_ids:
+        return ()
+    placeholders = ", ".join("?" for _ in relationship_ids)
+    rows = connection.execute(
+        "SELECT relationship.id, relationship.revision, relationship.source_id, "
+        "relationship.from_resource_id, relationship.to_resource_id, "
+        "relationship.kind, relationship.provenance, relationship.confidence, "
+        "relationship.sync_id, relationship.observed_at, "
+        "relationship.field_pairs_json, relationship.attributes_json "
+        "FROM catalog_relationships AS relationship "
+        "JOIN catalog_resources AS from_resource "
+        "ON from_resource.agent_id = relationship.agent_id "
+        "AND from_resource.id = relationship.from_resource_id "
+        "AND from_resource.current_sync_id = relationship.sync_id "
+        "JOIN catalog_resources AS to_resource "
+        "ON to_resource.agent_id = relationship.agent_id "
+        "AND to_resource.id = relationship.to_resource_id "
+        "AND to_resource.current_sync_id = relationship.sync_id "
+        f"WHERE relationship.agent_id = ? AND relationship.id IN ({placeholders})",
+        (agent_id, *relationship_ids),
+    ).fetchall()
+    by_id = {
+        relationship.id: relationship
+        for relationship in (_decode_catalog_relationship_row(row) for row in rows)
+    }
+    return tuple(
+        by_id[relationship_id]
+        for relationship_id in relationship_ids
+        if relationship_id in by_id
+    )
+
+
+def _catalog_adjacency(
+    connection: sqlite3.Connection,
+    request: CatalogTraversalRequest,
+    resource_id: str,
+) -> tuple[CatalogRelationship, ...]:
+    return _load_current_catalog_incident_relationships(
+        connection,
+        request.agent_id,
+        resource_id,
+        request.relationship_kinds,
+        request.max_edges + 1,
+    )
 
 
 def _traverse_catalog(
@@ -13400,11 +13777,30 @@ def _insert_readiness(
     position: int,
     readiness: Readiness,
 ) -> None:
+    if _pragma_int(connection, "user_version") < 18:
+        if readiness.repair_details:
+            raise ValueError("historical readiness schema cannot store repair details")
+        connection.execute(
+            "INSERT INTO readiness("
+            "operation_id, position, allowed, code, message, evaluated_at, "
+            "missing_facts_json"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                operation_id,
+                position,
+                int(readiness.allowed),
+                readiness.code,
+                readiness.message,
+                _encode_datetime(readiness.evaluated_at),
+                canonical_json(readiness.missing_facts),
+            ),
+        )
+        return
     connection.execute(
         "INSERT INTO readiness("
         "operation_id, position, allowed, code, message, evaluated_at, "
-        "missing_facts_json"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "missing_facts_json, repair_details_json"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             operation_id,
             position,
@@ -13413,6 +13809,7 @@ def _insert_readiness(
             readiness.message,
             _encode_datetime(readiness.evaluated_at),
             canonical_json(readiness.missing_facts),
+            canonical_json(readiness.repair_details),
         ),
     )
 
@@ -14285,6 +14682,7 @@ def _decode_snapshot(
     persisted_schema_version = _pragma_int(connection, "user_version")
     has_task_validation = persisted_schema_version >= 13
     has_trusted_read_metadata = persisted_schema_version >= 15
+    has_readiness_repair_details = persisted_schema_version >= 18
 
     turns = tuple(
         Turn(
@@ -14337,6 +14735,16 @@ def _decode_snapshot(
             ),
             missing_facts=_decode_string_tuple(
                 _sqlite_text(row["missing_facts_json"], "readiness missing facts")
+            ),
+            repair_details=(
+                _decode_json_object(
+                    _sqlite_text(
+                        row["repair_details_json"],
+                        "readiness repair details",
+                    )
+                )
+                if has_readiness_repair_details
+                else {}
             ),
         )
         for row in readiness_rows
@@ -15230,7 +15638,8 @@ def _message_from_data(value: object) -> CanonicalMessage:
 def _encode_model_request(request: ModelRequest) -> str:
     return canonical_json(
         {
-            "codec_version": 3,
+            "allow_parallel_tool_calls": request.allow_parallel_tool_calls,
+            "codec_version": 4,
             "context_selection": request.context_selection,
             "messages": [_message_to_data(message) for message in request.messages],
             "operation_id": request.operation_id,
@@ -15253,6 +15662,7 @@ def _decode_model_request(value: str) -> ModelRequest:
     legacy_keys = {"codec_version", "messages", "operation_id", "tools", "turn_id"}
     if codec_version == 1:
         data = _expect_object(decoded, keys=legacy_keys, label="model request")
+        allow_parallel_tool_calls = None
         context_selection: Mapping[str, object] = {}
         response_schema: Mapping[str, object] | None = None
         sensitivity = ModelSensitivity.INTERNAL
@@ -15262,6 +15672,7 @@ def _decode_model_request(value: str) -> ModelRequest:
             keys=legacy_keys | {"context_selection"},
             label="model request",
         )
+        allow_parallel_tool_calls = None
         selection_value = data["context_selection"]
         if not isinstance(selection_value, dict):
             raise ValueError("model-request context selection must be a JSON object")
@@ -15273,6 +15684,39 @@ def _decode_model_request(value: str) -> ModelRequest:
             decoded,
             keys=legacy_keys | {"context_selection", "response_schema", "sensitivity"},
             label="model request",
+        )
+        allow_parallel_tool_calls = None
+        selection_value = data["context_selection"]
+        if not isinstance(selection_value, dict):
+            raise ValueError("model-request context selection must be a JSON object")
+        context_selection = selection_value
+        schema_value = data["response_schema"]
+        if schema_value is not None and not isinstance(schema_value, dict):
+            raise ValueError("model-request response schema must be a JSON object")
+        response_schema = schema_value
+        sensitivity = ModelSensitivity(
+            _expect_text(data["sensitivity"], "model-request sensitivity")
+        )
+    elif codec_version == 4:
+        data = _expect_object(
+            decoded,
+            keys=legacy_keys
+            | {
+                "allow_parallel_tool_calls",
+                "context_selection",
+                "response_schema",
+                "sensitivity",
+            },
+            label="model request",
+        )
+        parallel_value = data["allow_parallel_tool_calls"]
+        allow_parallel_tool_calls = (
+            None
+            if parallel_value is None
+            else _expect_bool(
+                parallel_value,
+                "model-request allow_parallel_tool_calls",
+            )
         )
         selection_value = data["context_selection"]
         if not isinstance(selection_value, dict):
@@ -15301,6 +15745,7 @@ def _decode_model_request(value: str) -> ModelRequest:
         response_schema=response_schema,
         sensitivity=sensitivity,
         context_selection=context_selection,
+        allow_parallel_tool_calls=allow_parallel_tool_calls,
     )
 
 

@@ -218,6 +218,260 @@ def _profile() -> ModelProfile:
     )
 
 
+def test_session_compression_policy_is_versioned_and_profile_default_is_explicit() -> (
+    None
+):
+    policy = SessionCompressionPolicy()
+
+    assert policy.schema_version == 1
+    assert policy.compression_threshold_tokens is None
+
+    with pytest.raises(ValueError, match="schema_version"):
+        SessionCompressionPolicy(schema_version=2)
+    with pytest.raises(ValueError, match="positive integer or None"):
+        SessionCompressionPolicy(compression_threshold_tokens=False)
+
+
+async def test_default_compression_threshold_is_derived_from_truthful_profile() -> None:
+    history = _plain_exchange("op-history", "prior", "answer")
+    current = _plain_exchange("op-current", "current", "unused")
+    backend = MemorySessionBackend(
+        _transcript(("op-history", "op-current"), (*history, *current)),
+        {
+            "op-history": _facts("op-history"),
+            "op-current": _facts("op-current"),
+        },
+    )
+    service = SessionCompressionService(
+        transcripts=backend,
+        checkpoints=backend,
+        operations=backend,
+        committer=backend,
+        policy=SessionCompressionPolicy(),
+        clock=lambda: NOW,
+        id_factory=lambda prefix: f"{prefix}-1",
+    )
+
+    projection = await service.project(
+        agent_id=AGENT_ID,
+        session_id=SESSION_ID,
+        current_operation_id="op-current",
+        profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
+    )
+
+    assert projection.threshold_tokens == _profile().maximum_input_tokens * 3 // 4
+
+
+async def test_low_threshold_compresses_history_shorter_than_retention_cap() -> None:
+    history = _plain_exchange(
+        "op-history",
+        "question-" + "x" * 3_000,
+        "answer-" + "y" * 3_000,
+    )
+    current = _plain_exchange("op-current", "continue", "unused")
+    transcript = _transcript(("op-history", "op-current"), (*history, *current))
+    facts = {
+        "op-history": _facts(
+            "op-history",
+            evidence_ids=("evidence-history",),
+            objective="Retain the historical objective",
+        ),
+        "op-current": _facts("op-current"),
+    }
+    backend = MemorySessionBackend(transcript, facts)
+
+    projection = await _service(
+        backend,
+        threshold=1,
+        retain=4,
+    ).project(
+        agent_id=AGENT_ID,
+        session_id=SESSION_ID,
+        current_operation_id="op-current",
+        profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
+    )
+
+    assert projection.compressed_now
+    assert projection.checkpoint is not None
+    assert projection.checkpoint.operation_ids == ("op-history",)
+    assert projection.checkpoint.through_position == 0
+    assert projection.checkpoint.evidence_ids == ("evidence-history",)
+    assert [block.kind for block in projection.blocks] == [ContextKind.SESSION_SUMMARY]
+    assert backend.commits == 1
+    assert backend.transcript == transcript
+    assert backend.facts == facts
+
+
+async def test_low_threshold_advances_short_checkpoint_when_new_history_arrives() -> (
+    None
+):
+    first_history = _plain_exchange(
+        "op-0",
+        "question-zero-" + "x" * 3_000,
+        "answer-zero-" + "y" * 3_000,
+    )
+    next_history = _plain_exchange(
+        "op-1",
+        "question-one-" + "x" * 3_000,
+        "answer-one-" + "y" * 3_000,
+    )
+    backend = MemorySessionBackend(
+        _transcript(("op-0", "op-1"), (*first_history, *next_history)),
+        {
+            "op-0": _facts("op-0", evidence_ids=("evidence-0",)),
+            "op-1": _facts("op-1", evidence_ids=("evidence-1",)),
+        },
+    )
+    service = _service(backend, threshold=1_000, retain=4)
+
+    first = await service.project(
+        agent_id=AGENT_ID,
+        session_id=SESSION_ID,
+        current_operation_id="op-1",
+        profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
+    )
+
+    assert first.compressed_now
+    assert first.checkpoint is not None
+    assert first.checkpoint.operation_ids == ("op-0",)
+    assert first.estimated_tokens <= first.threshold_tokens
+
+    current = _plain_exchange("op-current", "continue", "unused")
+    backend.transcript = _transcript(
+        ("op-0", "op-1", "op-current"),
+        (*first_history, *next_history, *current),
+    )
+    backend.facts["op-current"] = _facts("op-current")
+
+    advanced = await service.project(
+        agent_id=AGENT_ID,
+        session_id=SESSION_ID,
+        current_operation_id="op-current",
+        profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
+    )
+    reused = await service.project(
+        agent_id=AGENT_ID,
+        session_id=SESSION_ID,
+        current_operation_id="op-current",
+        profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
+    )
+
+    assert advanced.compressed_now
+    assert advanced.checkpoint is not None
+    assert advanced.checkpoint.operation_ids == ("op-0", "op-1")
+    assert advanced.checkpoint.evidence_ids == ("evidence-0", "evidence-1")
+    assert advanced.estimated_tokens <= advanced.threshold_tokens
+    assert reused.checkpoint == advanced.checkpoint
+    assert not reused.compressed_now
+    assert backend.commits == 2
+
+
+async def test_projection_reduces_recent_history_until_it_fits_explicit_residual() -> (
+    None
+):
+    historical_ids = tuple(f"op-{index}" for index in range(6))
+    operation_ids = (*historical_ids, "op-current")
+    messages = tuple(
+        message
+        for operation_id in historical_ids
+        for message in _plain_exchange(
+            operation_id,
+            f"question-{operation_id}-" + "x" * 3_000,
+            f"answer-{operation_id}-" + "y" * 3_000,
+        )
+    ) + _plain_exchange("op-current", "continue", "unused")
+
+    def backend() -> MemorySessionBackend:
+        return MemorySessionBackend(
+            _transcript(operation_ids, messages),
+            {operation_id: _facts(operation_id) for operation_id in operation_ids},
+        )
+
+    one_recent_backend = backend()
+    one_recent = await _service(
+        one_recent_backend,
+        threshold=3_000,
+        retain=1,
+    ).project(
+        agent_id=AGENT_ID,
+        session_id=SESSION_ID,
+        current_operation_id="op-current",
+        profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
+    )
+    residual = one_recent.estimated_tokens
+
+    constrained_backend = backend()
+    constrained = await _service(
+        constrained_backend,
+        threshold=_profile().maximum_input_tokens,
+        retain=4,
+    ).project(
+        agent_id=AGENT_ID,
+        session_id=SESSION_ID,
+        current_operation_id="op-current",
+        profile=_profile(),
+        maximum_projection_tokens=residual,
+    )
+
+    assert constrained.compressed_now
+    assert constrained.estimated_tokens <= residual
+    assert constrained.checkpoint is not None
+    assert constrained.checkpoint.operation_ids == historical_ids[:-1]
+    assert [block.kind for block in constrained.blocks] == [
+        ContextKind.SESSION_SUMMARY,
+        ContextKind.SESSION_RECENT,
+    ]
+    assert constrained.blocks[-1].provenance[0].reference_id == historical_ids[-1]
+    assert constrained_backend.commits == 1
+
+
+async def test_impossible_session_residual_fails_typed_without_mutating_history() -> (
+    None
+):
+    transcript = _transcript(
+        ("op-0", "op-1", "op-current"),
+        (
+            *_plain_exchange("op-0", "old zero", "answer zero"),
+            *_plain_exchange("op-1", "old one", "answer one"),
+            *_plain_exchange("op-current", "continue", "unused"),
+        ),
+    )
+    facts = {
+        operation_id: _facts(operation_id) for operation_id in transcript.operation_ids
+    }
+    backend = MemorySessionBackend(transcript, facts)
+
+    with pytest.raises(RequiredContextOverflow) as raised:
+        await _service(
+            backend,
+            threshold=_profile().maximum_input_tokens,
+            retain=4,
+        ).project(
+            agent_id=AGENT_ID,
+            session_id=SESSION_ID,
+            current_operation_id="op-current",
+            profile=_profile(),
+            maximum_projection_tokens=0,
+        )
+
+    assert raised.value.available_tokens == 0
+    assert raised.value.minimum_session_tokens > 0
+    assert raised.value.projected_session_tokens > 0
+    # The minimum safe *shape* is the all-history summary. For very short raw
+    # messages that structured summary can legitimately cost more tokens.
+    assert raised.value.projected_session_tokens != raised.value.minimum_session_tokens
+    assert backend.commits == 0
+    assert backend.checkpoint is None
+    assert backend.transcript == transcript
+    assert backend.facts == facts
+
+
 async def test_small_history_rebinds_and_keeps_tool_exchange_indivisible() -> None:
     history = _tool_exchange("op-tool")
     current = _plain_exchange("op-current", "current request", "not yet used")
@@ -238,6 +492,7 @@ async def test_small_history_rebinds_and_keeps_tool_exchange_indivisible() -> No
         session_id=SESSION_ID,
         current_operation_id="op-current",
         profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
     )
 
     assert not projection.compressed_now
@@ -274,9 +529,13 @@ async def test_compression_summarizes_only_old_prefix_and_preserves_references()
     op0 = _plain_exchange(
         "op-0",
         "Correction: revenue means net revenue after refunds.",
-        "Understood.",
+        "Understood." + "x" * 3_000,
     )
-    op1 = _plain_exchange("op-1", "inspect orders", "Orders inspected.")
+    op1 = _plain_exchange(
+        "op-1",
+        "inspect orders",
+        "Orders inspected." + "y" * 3_000,
+    )
     op2 = _plain_exchange("op-2", "latest question", "Latest answer.")
     current = _plain_exchange("op-current", "continue", "not projected")
     transcript = _transcript(
@@ -329,11 +588,12 @@ async def test_compression_summarizes_only_old_prefix_and_preserves_references()
         },
     )
 
-    projection = await _service(backend, threshold=1, retain=1).project(
+    projection = await _service(backend, threshold=1_000, retain=1).project(
         agent_id=AGENT_ID,
         session_id=SESSION_ID,
         current_operation_id="op-current",
         profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
     )
 
     checkpoint = projection.checkpoint
@@ -443,12 +703,14 @@ async def test_matching_checkpoint_is_reused_without_rewriting_history() -> None
         session_id=SESSION_ID,
         current_operation_id="op-current",
         profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
     )
     second = await service.project(
         agent_id=AGENT_ID,
         session_id=SESSION_ID,
         current_operation_id="op-current",
         profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
     )
 
     assert first.checkpoint == second.checkpoint
@@ -516,6 +778,7 @@ async def test_terminal_incomplete_tool_exchange_uses_required_factual_fallback(
         session_id=SESSION_ID,
         current_operation_id="op-current",
         profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
     )
 
     assert len(projection.blocks) == 1
@@ -581,6 +844,7 @@ async def test_required_summary_fails_closed_instead_of_dropping_facts() -> None
             session_id=SESSION_ID,
             current_operation_id="op-current",
             profile=_profile(),
+            maximum_projection_tokens=_profile().maximum_input_tokens,
         )
 
     assert backend.commits == 0
@@ -603,6 +867,7 @@ async def test_checkpoint_source_or_frontier_mismatch_fails_closed() -> None:
         session_id=SESSION_ID,
         current_operation_id="op-current",
         profile=_profile(),
+        maximum_projection_tokens=_profile().maximum_input_tokens,
     )
     assert backend.checkpoint is not None
 
@@ -621,6 +886,7 @@ async def test_checkpoint_source_or_frontier_mismatch_fails_closed() -> None:
             session_id=SESSION_ID,
             current_operation_id="op-current",
             profile=_profile(),
+            maximum_projection_tokens=_profile().maximum_input_tokens,
         )
 
     backend.transcript = transcript
@@ -651,6 +917,7 @@ async def test_checkpoint_source_or_frontier_mismatch_fails_closed() -> None:
             session_id=SESSION_ID,
             current_operation_id="op-current",
             profile=_profile(),
+            maximum_projection_tokens=_profile().maximum_input_tokens,
         )
 
     backend.checkpoint = SessionCompressionCheckpoint(
@@ -674,4 +941,5 @@ async def test_checkpoint_source_or_frontier_mismatch_fails_closed() -> None:
             session_id=SESSION_ID,
             current_operation_id="op-1",
             profile=_profile(),
+            maximum_projection_tokens=_profile().maximum_input_tokens,
         )

@@ -80,13 +80,16 @@ def _message(role: MessageRole, text: str) -> CanonicalMessage:
 
 
 def _request(
-    *messages: CanonicalMessage, tools: tuple[ToolDefinition, ...] = ()
+    *messages: CanonicalMessage,
+    tools: tuple[ToolDefinition, ...] = (),
+    allow_parallel_tool_calls: bool | None = None,
 ) -> ModelRequest:
     return ModelRequest(
         operation_id="operation-1",
         turn_id="turn-1",
         messages=messages or (_message(MessageRole.USER, "hello"),),
         tools=tools,
+        allow_parallel_tool_calls=allow_parallel_tool_calls,
     )
 
 
@@ -134,6 +137,17 @@ async def test_text_translation_uses_responses_without_provider_state() -> None:
     assert response.usage.reasoning_tokens == 2
 
 
+async def test_explicit_sequential_tool_policy_uses_native_responses_option() -> None:
+    client = FakeClient(_text_response())
+    provider = OpenAIResponsesProvider("gpt-test", client=client)
+    request = _request(allow_parallel_tool_calls=False)
+
+    assert provider.supports_request_policy(request) is True
+    await provider.generate(request)
+
+    assert client.responses.calls[0]["parallel_tool_calls"] is False
+
+
 async def test_structured_output_schema_uses_native_responses_format() -> None:
     client = FakeClient(_text_response('{"answer":42}'))
     provider = OpenAIResponsesProvider("gpt-test", client=client)
@@ -179,7 +193,10 @@ async def test_stream_normalizes_text_and_terminal_response() -> None:
     )
     provider = OpenAIResponsesProvider("gpt-test", client=client)
 
-    events = [event async for event in provider.stream(_request())]
+    events = [
+        event
+        async for event in provider.stream(_request(allow_parallel_tool_calls=False))
+    ]
 
     assert events[:3] == [
         ModelTextDelta("hel"),
@@ -191,6 +208,7 @@ async def test_stream_normalizes_text_and_terminal_response() -> None:
     assert terminal.response.text == "hel lo"
     assert terminal.response.provider_id == "openai:gpt-test"
     assert client.responses.calls[0]["stream"] is True
+    assert client.responses.calls[0]["parallel_tool_calls"] is False
 
 
 async def test_stream_keeps_tool_delta_and_completion_call_identity_stable() -> None:

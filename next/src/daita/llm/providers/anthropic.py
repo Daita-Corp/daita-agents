@@ -95,6 +95,11 @@ class AnthropicMessagesProvider:
     def provider_id(self) -> str:
         return f"anthropic:{self.model}"
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return request.allow_parallel_tool_calls is None
+
     @property
     def client(self) -> _AnthropicClient:
         if self._client is None:
@@ -135,6 +140,7 @@ class AnthropicMessagesProvider:
     async def _generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
         try:
             response = await self.client.messages.create(**arguments)
@@ -185,6 +191,7 @@ class AnthropicMessagesProvider:
     ) -> AsyncIterator[ModelStreamEvent]:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
         decoder = _AnthropicStreamDecoder(
             provider_id=self.provider_id,
@@ -217,6 +224,13 @@ class AnthropicMessagesProvider:
             raise
         except Exception as error:
             raise _normalize_error(error) from error
+
+    def _require_supported_request_policy(self, request: ModelRequest) -> None:
+        if not self.supports_request_policy(request):
+            raise ModelProviderError(
+                ProviderErrorCode.INVALID_REQUEST,
+                "Anthropic cannot enforce the requested tool-call policy",
+            )
 
     def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
         system, messages = _message_input(request.messages, self.provider_id)

@@ -38,6 +38,9 @@ class ScriptedModel:
     def extend(self, *responses: ModelResponse) -> None:
         self._responses.extend(responses)
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return request.allow_parallel_tool_calls in {None, False}
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         if not self._responses:

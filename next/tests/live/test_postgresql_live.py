@@ -107,7 +107,7 @@ async def test_live_postgresql_catalog_and_bounded_read_are_least_privileged(
         ):
             pytest.fail("the configured test-owned base table was not cataloged")
 
-        catalog_service = CatalogService(store)
+        catalog_service = CatalogService(store, store)
         search = await catalog_service.search(
             CatalogSearchRequest(
                 agent_id=agent_id,
@@ -121,7 +121,7 @@ async def test_live_postgresql_catalog_and_bounded_read_are_least_privileged(
 
         backend = PostgreSQLQueryBackend(
             store,
-            CatalogDataView(store, catalog_service),
+            CatalogDataView(store, catalog_service, store),
             secret_provider,
         )
         result = await backend.execute_read(

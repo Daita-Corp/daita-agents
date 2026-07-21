@@ -89,7 +89,7 @@ class TextDomain:
     def __init__(self, clock: MutableClock) -> None:
         self._clock = clock
 
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:
@@ -125,6 +125,9 @@ class BlockingProvider:
         self.started = asyncio.Event()
         self.finished = asyncio.Event()
         self.operation_id: str | None = None
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.operation_id = request.operation_id

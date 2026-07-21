@@ -69,7 +69,7 @@ class StaticContextBuilder:
 
 
 class AllowTextDomain:
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:

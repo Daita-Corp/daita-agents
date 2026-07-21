@@ -38,6 +38,7 @@ class ContextKind(str, Enum):
     EVIDENCE = "evidence"
     SKILL = "skill"
     CATALOG = "catalog"
+    SOURCE_ROUTING = "source_routing"
     MEMORY = "memory"
     SESSION_SUMMARY = "session_summary"
     POLICY_NOTICE = "policy_notice"
@@ -95,22 +96,39 @@ class ContextMessageGroup:
         if len({message.operation_id for message in messages}) != 1:
             raise ValueError("context message group must belong to one operation")
 
-        tool_call_ids = {
-            call.id
-            for message in messages
-            if message.role is MessageRole.ASSISTANT
-            for call in message.tool_calls
-        }
-        tool_result_ids = [
-            block.call_id
-            for message in messages
-            if message.role is MessageRole.TOOL
-            for block in message.content
-            if isinstance(block, ToolResultBlock)
-        ]
-        if len(tool_result_ids) != len(set(tool_result_ids)):
-            raise ValueError("context message group has duplicate tool results")
-        if tool_call_ids != set(tool_result_ids):
+        tool_call_ids: set[str] = set()
+        tool_result_ids: set[str] = set()
+        pending_result_ids: set[str] = set()
+        for message in messages:
+            if message.role is MessageRole.ASSISTANT:
+                if pending_result_ids:
+                    raise ValueError(
+                        "context message group cannot interrupt pending tool results"
+                    )
+                message_call_ids = {call.id for call in message.tool_calls}
+                if message_call_ids & tool_call_ids:
+                    raise ValueError(
+                        "context message group has duplicate assistant tool-call IDs"
+                    )
+                tool_call_ids.update(message_call_ids)
+                pending_result_ids.update(message_call_ids)
+                continue
+            if message.role is not MessageRole.TOOL:
+                if pending_result_ids:
+                    raise ValueError(
+                        "context message group cannot interrupt pending tool results"
+                    )
+                continue
+            for block in message.content:
+                if not isinstance(block, ToolResultBlock):
+                    continue
+                if block.call_id in tool_result_ids:
+                    raise ValueError("context message group has duplicate tool results")
+                if block.call_id not in pending_result_ids:
+                    raise ValueError("context message group has an orphan tool result")
+                tool_result_ids.add(block.call_id)
+                pending_result_ids.remove(block.call_id)
+        if pending_result_ids or tool_call_ids != tool_result_ids:
             raise ValueError(
                 "context message group must keep tool calls and results together"
             )

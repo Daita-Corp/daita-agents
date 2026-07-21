@@ -21,6 +21,7 @@ _MAX_CANDIDATES = 8
 _MAX_UPDATE_IDENTIFIER_CHARACTERS = 512
 _MAX_UPDATE_COLUMN_CHARACTERS = 256
 _MAX_UPDATE_VALUE_CHARACTERS = 4_096
+_MAX_VALIDATION_ISSUE_DETAILS_CHARACTERS = 1_536
 _ASCII_IDENTIFIER_CASE_TRANSLATION = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
     "abcdefghijklmnopqrstuvwxyz",
@@ -469,7 +470,10 @@ class SqlValidationIssue:
             raise ValueError("validation issue text must be bounded")
         object.__setattr__(self, "code", code)
         object.__setattr__(self, "message", message)
-        object.__setattr__(self, "details", FrozenJsonObject.from_mapping(self.details))
+        details = FrozenJsonObject.from_mapping(self.details)
+        if len(canonical_json(details)) > _MAX_VALIDATION_ISSUE_DETAILS_CHARACTERS:
+            raise ValueError("validation issue details must be bounded")
+        object.__setattr__(self, "details", details)
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,6 +529,27 @@ class SqlValidationResult:
     @property
     def issue_codes(self) -> tuple[str, ...]:
         return tuple(issue.code for issue in self.issues)
+
+
+@dataclass(frozen=True, slots=True)
+class _LexicalRelation:
+    """One relation visible inside one sqlglot lexical scope."""
+
+    qualifier: str
+    columns: tuple[str, ...]
+    lineage: tuple[str, ...]
+    kind: Literal["base", "cte", "subquery", "set"]
+    scope_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _LexicalScope:
+    """The projected schema and local environment for one sqlglot scope."""
+
+    columns: tuple[str, ...]
+    lineage: tuple[str, ...]
+    relations: tuple[_LexicalRelation, ...]
+    scope_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -729,6 +754,11 @@ def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
         raise SqlAnalysisError("empty_sql", "SQL must not be empty.")
 
     root = expressions[0]
+    if any(bool(item.args.get("recursive", False)) for item in root.find_all(exp.With)):
+        raise SqlAnalysisError(
+            "recursive_cte_not_supported",
+            "Recursive common-table expressions are not supported.",
+        )
     try:
         cte_table_ids, column_resources = _lexical_scope_facts(
             root,
@@ -1244,6 +1274,602 @@ def _mutation_types(root: Any, exp: Any) -> tuple[str, ...]:
     )
 
 
+def _semantic_identifier(
+    value: str,
+    *,
+    dialect: _SqlDialect,
+    quoted: bool = False,
+) -> str:
+    """Return the identifier spelling exposed by the selected SQL dialect."""
+
+    normalized = value.strip().strip('"`[]')
+    if dialect == "postgresql" and not quoted:
+        return normalized.translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
+    if dialect == "sqlite":
+        return sqlite_identifier_key(normalized)
+    return normalized
+
+
+def _selected_source_qualifier(
+    selected: Any,
+    fallback: str,
+    exp: Any,
+    *,
+    dialect: _SqlDialect,
+) -> str:
+    alias = selected.args.get("alias") if hasattr(selected, "args") else None
+    identifier = getattr(alias, "this", None)
+    if identifier is None and isinstance(selected, exp.Table):
+        identifier = selected.this
+    if identifier is None:
+        parent = getattr(selected, "parent", None)
+        if parent is not None and isinstance(parent, exp.Subquery):
+            parent_alias = parent.args.get("alias")
+            identifier = getattr(parent_alias, "this", None)
+    value = str(getattr(identifier, "name", None) or fallback)
+    return _semantic_identifier(
+        value,
+        dialect=dialect,
+        quoted=bool(getattr(identifier, "args", {}).get("quoted", False)),
+    )
+
+
+def _projection_alias(
+    expression: Any,
+    *,
+    dialect: _SqlDialect,
+) -> str:
+    alias = expression.args.get("alias") if hasattr(expression, "args") else None
+    identifier = getattr(alias, "this", None)
+    if identifier is None and hasattr(expression, "this"):
+        candidate = expression.this
+        if type(candidate).__name__ == "Identifier":
+            identifier = candidate
+    value = str(
+        getattr(identifier, "name", None)
+        or getattr(expression, "alias_or_name", None)
+        or ""
+    ).strip()
+    if not value or value == "*":
+        return ""
+    return _semantic_identifier(
+        value,
+        dialect=dialect,
+        quoted=bool(getattr(identifier, "args", {}).get("quoted", False)),
+    )
+
+
+def _outer_projection_columns(
+    scope: Any,
+    *,
+    dialect: _SqlDialect,
+) -> tuple[str, ...]:
+    if not scope.outer_columns:
+        return ()
+    owner = scope.expression.parent
+    alias = owner.args.get("alias") if hasattr(owner, "args") else None
+    identifiers = tuple(alias.args.get("columns") or ()) if alias is not None else ()
+    if len(identifiers) != len(scope.outer_columns):
+        return tuple(
+            _semantic_identifier(item, dialect=dialect) for item in scope.outer_columns
+        )
+    return tuple(
+        _semantic_identifier(
+            str(identifier.name),
+            dialect=dialect,
+            quoted=bool(identifier.args.get("quoted", False)),
+        )
+        for identifier in identifiers
+    )
+
+
+def _relation_column_matches(
+    relation: _LexicalRelation,
+    column: Any,
+    *,
+    dialect: _SqlDialect,
+) -> tuple[str, ...]:
+    identifier = column.this
+    expected = _semantic_identifier(
+        str(column.name),
+        dialect=dialect,
+        quoted=bool(getattr(identifier, "args", {}).get("quoted", False)),
+    )
+    return tuple(item for item in relation.columns if item == expected)
+
+
+def _scope_projection(
+    scope: Any,
+    relations: tuple[_LexicalRelation, ...],
+    states: Mapping[int, _LexicalScope],
+    exp: Any,
+    issues: list[SqlValidationIssue],
+    *,
+    dialect: _SqlDialect,
+) -> tuple[str, ...]:
+    if isinstance(
+        scope.expression,
+        tuple(
+            item
+            for item in (
+                getattr(exp, "Union", None),
+                getattr(exp, "Intersect", None),
+                getattr(exp, "Except", None),
+            )
+            if item is not None
+        ),
+    ):
+        branches = tuple(states[id(item)] for item in scope.union_scopes)
+        if not branches:
+            return ()
+        expected = len(branches[0].columns)
+        received = tuple(len(item.columns) for item in branches)
+        if any(count != expected for count in received[1:]):
+            issues.append(
+                SqlValidationIssue(
+                    "set_projection_arity_mismatch",
+                    "SQL set-operation branches must expose the same column count.",
+                    {"branch_column_counts": received[:_MAX_CANDIDATES]},
+                )
+            )
+        projected = branches[0].columns
+    else:
+        projected_items: list[str] = []
+        for expression in getattr(scope.expression, "expressions", ()):
+            if isinstance(expression, exp.Star):
+                for relation in relations:
+                    projected_items.extend(relation.columns)
+                continue
+            if isinstance(expression, exp.Column) and str(expression.name) == "*":
+                table_identifier = expression.args.get("table")
+                qualifier = _semantic_identifier(
+                    str(expression.table),
+                    dialect=dialect,
+                    quoted=bool(
+                        getattr(table_identifier, "args", {}).get("quoted", False)
+                    ),
+                )
+                star_relation = next(
+                    (item for item in relations if item.qualifier == qualifier),
+                    None,
+                )
+                if star_relation is not None:
+                    projected_items.extend(star_relation.columns)
+                else:
+                    issues.append(
+                        SqlValidationIssue(
+                            "unknown_relation_qualifier",
+                            "SQL references a relation qualifier not visible in this scope.",
+                            {"qualifier": str(expression.table)},
+                        )
+                    )
+                continue
+            projected_items.append(_projection_alias(expression, dialect=dialect))
+        projected = tuple(projected_items)
+
+    outer_columns = _outer_projection_columns(scope, dialect=dialect)
+    if outer_columns:
+        if len(outer_columns) != len(projected):
+            issues.append(
+                SqlValidationIssue(
+                    "derived_projection_arity_mismatch",
+                    "A derived relation column list must match its projection count.",
+                    {
+                        "declared_column_count": len(outer_columns),
+                        "projected_column_count": len(projected),
+                    },
+                )
+            )
+        else:
+            projected = outer_columns
+    return projected
+
+
+def _direct_scope_columns(
+    scope: Any,
+    expression_scope_ids: frozenset[int],
+    exp: Any,
+) -> tuple[Any, ...]:
+    """Return columns whose nearest query owner is exactly ``scope``."""
+
+    columns: list[Any] = []
+    for column in scope.expression.find_all(exp.Column):
+        owner = column.parent
+        while owner is not None and id(owner) not in expression_scope_ids:
+            owner = owner.parent
+        if owner is scope.expression:
+            columns.append(column)
+    return tuple(columns)
+
+
+def _is_legal_output_alias(
+    column: Any,
+    scope: Any,
+    state: _LexicalScope,
+    exp: Any,
+    *,
+    dialect: _SqlDialect,
+) -> bool:
+    if str(column.table or "").strip():
+        return False
+    identifier = column.this
+    name = _semantic_identifier(
+        str(column.name),
+        dialect=dialect,
+        quoted=bool(getattr(identifier, "args", {}).get("quoted", False)),
+    )
+    explicit_aliases = {
+        _projection_alias(expression, dialect=dialect)
+        for expression in getattr(scope.expression, "expressions", ())
+        if bool(str(getattr(expression, "alias", "") or "").strip())
+    }
+    if isinstance(
+        scope.expression,
+        tuple(
+            item
+            for item in (
+                getattr(exp, "Union", None),
+                getattr(exp, "Intersect", None),
+                getattr(exp, "Except", None),
+            )
+            if item is not None
+        ),
+    ):
+        explicit_aliases.update(state.columns)
+    if name not in explicit_aliases:
+        return False
+    ancestor = column.parent
+    while ancestor is not None and ancestor is not scope.expression:
+        if isinstance(ancestor, (exp.Order, exp.Ordered, exp.Group)):
+            return True
+        if dialect == "sqlite" and isinstance(
+            ancestor,
+            (exp.Where, exp.Having, exp.Join),
+        ):
+            return True
+        ancestor = ancestor.parent
+    return False
+
+
+def _lexical_column_issues(
+    sql: str,
+    *,
+    resources: tuple[ResourceSchema, ...],
+    allowed_resource_ids: frozenset[str] | None,
+    dialect: _SqlDialect,
+) -> tuple[SqlValidationIssue, ...]:
+    """Validate columns against relation schemas in their lexical scopes."""
+
+    sqlglot, exp = _load_sqlglot(dialect)
+    parse_sql = (_explain_prefix(sql) or ("", sql))[1]
+    root = sqlglot.parse_one(
+        parse_sql,
+        read="postgres" if dialect == "postgresql" else "sqlite",
+    )
+    from sqlglot.optimizer.scope import traverse_scope
+
+    scopes = tuple(traverse_scope(root))
+    scope_ids = {id(scope): f"scope:{index}" for index, scope in enumerate(scopes)}
+    expression_scope_ids = frozenset(id(scope.expression) for scope in scopes)
+    consumed_scope_ids = {
+        id(source)
+        for scope in scopes
+        for _, source in scope.selected_sources.values()
+        if not isinstance(source, exp.Table)
+    }
+    states: dict[int, _LexicalScope] = {}
+    unresolved_qualifiers: dict[int, frozenset[str]] = {}
+    issues: list[SqlValidationIssue] = []
+    for scope in scopes:
+        relations: list[_LexicalRelation] = []
+        unresolved: set[str] = set()
+        for fallback, (selected, source) in scope.selected_sources.items():
+            qualifier = _selected_source_qualifier(
+                selected,
+                fallback,
+                exp,
+                dialect=dialect,
+            )
+            if isinstance(source, exp.Table):
+                references = _table_references(
+                    source,
+                    exp,
+                    set(),
+                    dialect=dialect,
+                )
+                candidates = (
+                    _resource_candidates(
+                        references[0],
+                        resources,
+                        dialect=dialect,
+                    )
+                    if references
+                    else ()
+                )
+                if len(candidates) != 1:
+                    unresolved.add(qualifier)
+                    continue
+                resource = candidates[0]
+                if (
+                    allowed_resource_ids is not None
+                    and resource.resource_id not in allowed_resource_ids
+                ):
+                    unresolved.add(qualifier)
+                    continue
+                relations.append(
+                    _LexicalRelation(
+                        qualifier=qualifier,
+                        columns=tuple(
+                            _semantic_identifier(
+                                column,
+                                dialect=dialect,
+                                quoted=(
+                                    dialect == "postgresql"
+                                    and column
+                                    != column.translate(
+                                        _ASCII_IDENTIFIER_CASE_TRANSLATION
+                                    )
+                                ),
+                            )
+                            for column in resource.columns
+                        ),
+                        lineage=(resource.resource_id,),
+                        kind="base",
+                        scope_id=scope_ids[id(scope)],
+                    )
+                )
+                continue
+            derived = states.get(id(source))
+            if derived is None:
+                unresolved.add(qualifier)
+                continue
+            kind: Literal["cte", "subquery", "set"] = (
+                "set"
+                if isinstance(
+                    source.expression,
+                    tuple(
+                        item
+                        for item in (
+                            getattr(exp, "Union", None),
+                            getattr(exp, "Intersect", None),
+                            getattr(exp, "Except", None),
+                        )
+                        if item is not None
+                    ),
+                )
+                else "cte" if isinstance(selected, exp.Table) else "subquery"
+            )
+            relations.append(
+                _LexicalRelation(
+                    qualifier=qualifier,
+                    columns=derived.columns,
+                    lineage=derived.lineage,
+                    kind=kind,
+                    scope_id=scope_ids[id(scope)],
+                )
+            )
+
+        relation_tuple = tuple(relations)
+        projected = _scope_projection(
+            scope,
+            relation_tuple,
+            states,
+            exp,
+            issues,
+            dialect=dialect,
+        )
+        child_scopes = tuple(
+            item for item in scopes if item.parent is scope and id(item) in states
+        )
+        if getattr(scope, "union_scopes", ()):
+            lineage = tuple(
+                dict.fromkeys(
+                    resource_id
+                    for branch in scope.union_scopes
+                    for resource_id in states[id(branch)].lineage
+                )
+            )
+        else:
+            lineage = tuple(
+                dict.fromkeys(
+                    (
+                        resource_id
+                        for relation in relation_tuple
+                        for resource_id in relation.lineage
+                    ),
+                )
+            )
+        lineage = tuple(
+            dict.fromkeys(
+                (
+                    *lineage,
+                    *(
+                        resource_id
+                        for child in child_scopes
+                        for resource_id in states[id(child)].lineage
+                    ),
+                )
+            )
+        )
+        states[id(scope)] = _LexicalScope(
+            columns=projected,
+            lineage=lineage,
+            relations=relation_tuple,
+            scope_id=scope_ids[id(scope)],
+        )
+        unresolved_qualifiers[id(scope)] = frozenset(unresolved)
+
+    for scope in scopes:
+        state = states[id(scope)]
+        relation_tuple = state.relations
+        for column in _direct_scope_columns(scope, expression_scope_ids, exp):
+            if str(column.name) == "*":
+                continue
+            qualifier_text = str(column.table or "").strip()
+            if qualifier_text:
+                qualifier = _semantic_identifier(
+                    qualifier_text,
+                    dialect=dialect,
+                    quoted=bool(
+                        getattr(column.args.get("table"), "args", {}).get(
+                            "quoted", False
+                        )
+                    ),
+                )
+                relation = next(
+                    (item for item in relation_tuple if item.qualifier == qualifier),
+                    None,
+                )
+                if relation is None:
+                    ancestor = scope.parent
+                    ancestor_relation = None
+                    while ancestor is not None and ancestor_relation is None:
+                        ancestor_relation = next(
+                            (
+                                item
+                                for item in states[id(ancestor)].relations
+                                if item.qualifier == qualifier
+                            ),
+                            None,
+                        )
+                        ancestor = ancestor.parent
+                    if ancestor_relation is not None:
+                        if not bool(scope.can_be_correlated):
+                            issues.append(
+                                SqlValidationIssue(
+                                    "column_scope_escape",
+                                    "SQL column escapes a non-correlated lexical scope.",
+                                    {"qualifier": qualifier_text},
+                                )
+                            )
+                            continue
+                        relation = ancestor_relation
+                    elif qualifier in unresolved_qualifiers[id(scope)]:
+                        continue
+                if relation is None:
+                    issues.append(
+                        SqlValidationIssue(
+                            "unknown_relation_qualifier",
+                            "SQL references a relation qualifier not visible in this scope.",
+                            {"qualifier": qualifier_text},
+                        )
+                    )
+                    continue
+                matches = _relation_column_matches(
+                    relation,
+                    column,
+                    dialect=dialect,
+                )
+            else:
+                matches = tuple(
+                    match
+                    for relation in relation_tuple
+                    for match in _relation_column_matches(
+                        relation,
+                        column,
+                        dialect=dialect,
+                    )
+                )
+                relation = None
+                if not matches:
+                    ancestor_matches: tuple[str, ...] = ()
+                    ancestor = scope.parent
+                    while ancestor is not None and not ancestor_matches:
+                        ancestor_matches = tuple(
+                            match
+                            for ancestor_relation in states[id(ancestor)].relations
+                            for match in _relation_column_matches(
+                                ancestor_relation,
+                                column,
+                                dialect=dialect,
+                            )
+                        )
+                        ancestor = ancestor.parent
+                    if ancestor_matches:
+                        if not bool(scope.can_be_correlated):
+                            issues.append(
+                                SqlValidationIssue(
+                                    "column_scope_escape",
+                                    "SQL column escapes a non-correlated lexical scope.",
+                                    {"column": str(column.name)},
+                                )
+                            )
+                            continue
+                        matches = ancestor_matches
+            if not matches:
+                if unresolved_qualifiers[id(scope)]:
+                    continue
+                if _is_legal_output_alias(
+                    column,
+                    scope,
+                    state,
+                    exp,
+                    dialect=dialect,
+                ):
+                    continue
+                if relation is None and len(relation_tuple) == 1:
+                    relation = relation_tuple[0]
+                if relation is not None and relation.kind == "base":
+                    missing_resource = next(
+                        (
+                            item
+                            for item in resources
+                            if item.resource_id in relation.lineage
+                        ),
+                        None,
+                    )
+                    if missing_resource is not None:
+                        issues.append(
+                            _missing_column_issue(
+                                SqlColumnReference(
+                                    name=str(column.name),
+                                    qualifier=(
+                                        str(column.table) if column.table else None
+                                    ),
+                                    name_quoted=bool(
+                                        getattr(column.this, "args", {}).get(
+                                            "quoted", False
+                                        )
+                                    ),
+                                ),
+                                missing_resource,
+                            )
+                        )
+                        continue
+                issues.append(
+                    SqlValidationIssue(
+                        (
+                            "unknown_derived_column"
+                            if relation is not None and relation.kind != "base"
+                            else "missing_column"
+                        ),
+                        "SQL references a column absent from the visible relation schema.",
+                        {"column": str(column.name)},
+                    )
+                )
+            elif len(matches) > 1:
+                issues.append(
+                    SqlValidationIssue(
+                        "ambiguous_column",
+                        "SQL column is ambiguous in its lexical scope.",
+                        {"column": str(column.name)},
+                    )
+                )
+
+    for scope_id in consumed_scope_ids:
+        consumed_state = states.get(scope_id)
+        if consumed_state is not None and any(
+            not column for column in consumed_state.columns
+        ):
+            issues.append(
+                SqlValidationIssue(
+                    "derived_projection_name_required",
+                    "Every derived-relation output column must have a stable name.",
+                )
+            )
+    return tuple(issues)
+
+
 def validate_sqlite_read(
     sql: str,
     *,
@@ -1447,7 +2073,6 @@ def _validate_sql_read(
         if allowed_resource_ids is None
         else frozenset(str(item) for item in allowed_resource_ids)
     )
-    resolved_by_table: dict[str, ResourceSchema] = {}
     resolved_ids: list[str] = []
     for table in analysis.tables:
         if table.is_cte:
@@ -1520,18 +2145,9 @@ def _validate_sql_read(
                     },
                 )
             )
-        for key in (table.qualified_name, table.name, table.alias or ""):
-            if key:
-                resolved_by_table[_dialect_identifier_key(key, dialect=dialect)] = (
-                    resource
-                )
         if resource.resource_id not in resolved_ids:
             resolved_ids.append(resource.resource_id)
 
-    selected_aliases = {
-        _dialect_identifier_key(item, dialect=dialect)
-        for item in analysis.select_aliases
-    }
     resolved_resources = tuple(
         resource
         for resource in source_resources
@@ -1575,24 +2191,14 @@ def _validate_sql_read(
                 {"source_revisions": unique_source_revisions[:_MAX_CANDIDATES]},
             )
         )
-    for column in analysis.columns:
-        if (
-            _dialect_identifier_key(
-                column.name,
-                dialect=dialect,
-                quoted=column.name_quoted,
-            )
-            in selected_aliases
-            and column.qualifier is None
-        ):
-            continue
-        _validate_column(
-            column,
-            resolved_by_table,
-            resolved_resources,
-            issues,
+    issues.extend(
+        _lexical_column_issues(
+            analysis.sql,
+            resources=source_resources,
+            allowed_resource_ids=allowed,
             dialect=dialect,
         )
+    )
 
     bounded_issues = tuple(issues[:_MAX_ISSUES])
     return SqlValidationResult(
@@ -1973,74 +2579,6 @@ def _resource_name_candidates(
         n=_MAX_CANDIDATES,
         cutoff=0.45,
     )
-
-
-def _validate_column(
-    column: SqlColumnReference,
-    resolved_by_table: Mapping[str, ResourceSchema],
-    resolved_resources: tuple[ResourceSchema, ...],
-    issues: list[SqlValidationIssue],
-    *,
-    dialect: _SqlDialect,
-) -> None:
-    if column.resource_name is not None:
-        resource = resolved_by_table.get(
-            _dialect_identifier_key(column.resource_name, dialect=dialect)
-        )
-        if resource is None and column.qualifier is not None:
-            resource = resolved_by_table.get(
-                _dialect_identifier_key(column.qualifier, dialect=dialect)
-            )
-        if resource is None:
-            return
-        if not _resource_has_column(resource, column, dialect=dialect):
-            issues.append(_missing_column_issue(column, resource))
-        return
-
-    matches = tuple(
-        resource
-        for resource in resolved_resources
-        if _resource_has_column(resource, column, dialect=dialect)
-    )
-    if len(resolved_resources) == 1 and not matches:
-        issues.append(_missing_column_issue(column, resolved_resources[0]))
-    elif len(resolved_resources) > 1 and not matches:
-        issues.append(
-            SqlValidationIssue(
-                "missing_column",
-                "SQL references a column absent from the selected resources.",
-                {"column": column.name},
-            )
-        )
-    elif len(matches) > 1:
-        issues.append(
-            SqlValidationIssue(
-                "ambiguous_column",
-                "Unqualified SQL column is ambiguous across selected resources.",
-                {
-                    "column": column.name,
-                    "resource_ids": [item.resource_id for item in matches][
-                        :_MAX_CANDIDATES
-                    ],
-                },
-            )
-        )
-
-
-def _resource_has_column(
-    resource: ResourceSchema,
-    column: SqlColumnReference,
-    *,
-    dialect: _SqlDialect,
-) -> bool:
-    if dialect == "postgresql":
-        expected = (
-            column.name
-            if column.name_quoted
-            else column.name.translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
-        )
-        return expected in resource.columns
-    return _identifier_key(column.name) in resource.column_keys
 
 
 def _missing_column_issue(

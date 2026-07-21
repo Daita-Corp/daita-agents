@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "fixture_version": "wave1-commerce-v1",
+  "reporting_period": {
+    "start_inclusive": "2026-01-01",
+    "end_exclusive": "2026-04-01"
+  },
+  "database": {
+    "filename": "wave1-commerce.db",
+    "ddl": [
+      "CREATE TABLE regions (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL)",
+      "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL, region_id INTEGER NOT NULL REFERENCES regions(id), plan TEXT NOT NULL, lifecycle_status TEXT NOT NULL, email TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+      "CREATE TABLE customers_archive_2025 (id INTEGER PRIMARY KEY, name TEXT NOT NULL, region_id INTEGER NOT NULL, plan TEXT NOT NULL, lifecycle_status TEXT NOT NULL, email TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+      "CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT NOT NULL UNIQUE, name TEXT NOT NULL, category TEXT NOT NULL, unit_price_cents INTEGER NOT NULL CHECK (unit_price_cents >= 0))",
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL REFERENCES customers(id), ordered_at TEXT NOT NULL, status TEXT NOT NULL)",
+      "CREATE TABLE orders_archive_2025 (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, ordered_at TEXT NOT NULL, status TEXT NOT NULL)",
+      "CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL REFERENCES orders(id), product_id INTEGER NOT NULL REFERENCES products(id), quantity INTEGER NOT NULL CHECK (quantity > 0), unit_price_cents INTEGER NOT NULL CHECK (unit_price_cents >= 0))",
+      "CREATE TABLE payments (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL REFERENCES orders(id), status TEXT NOT NULL, amount_cents INTEGER NOT NULL CHECK (amount_cents >= 0), paid_at TEXT)",
+      "CREATE TABLE refunds (id INTEGER PRIMARY KEY, payment_id INTEGER NOT NULL REFERENCES payments(id), amount_cents INTEGER NOT NULL CHECK (amount_cents >= 0), refunded_at TEXT NOT NULL, reason TEXT)",
+      "CREATE TABLE support_cases (id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id), opened_at TEXT NOT NULL, closed_at TEXT, subject TEXT NOT NULL, notes TEXT)",
+      "CREATE TABLE monitor_metrics (id INTEGER PRIMARY KEY, measured_at TEXT NOT NULL, metric_name TEXT NOT NULL, metric_value_cents INTEGER NOT NULL)"
+    ],
+    "rows": {
+      "regions": [
+        [1, "NA", "North America"],
+        [2, "EU", "Europe"],
+        [3, "APAC", "Asia-Pacific"]
+      ],
+      "customers": [
+        [1, "Ada Lovelace", 1, "enterprise", "active", "ada@example.test", "2024-01-15T00:00:00Z", "2026-03-01T08:00:00Z"],
+        [2, "Grace Hopper", 2, "growth", "active", "grace@example.test", "2024-02-29T00:00:00Z", "2026-02-15T09:30:00Z"],
+        [3, "Linus Torvalds", 3, "enterprise", "inactive", "linus@example.test", "2023-12-31T00:00:00Z", "2026-01-10T10:00:00Z"],
+        [4, "Jos\u00e9 N\u00fa\u00f1ez", 2, "enterprise", "active", "jose@example.test", "2025-06-01T00:00:00Z", "2026-03-31T23:59:59Z"],
+        [5, "Chlo\u00eb Dubois", 1, "starter", "active", null, "2025-07-04T00:00:00Z", "2026-03-10T12:00:00Z"],
+        [6, "Alex Kim", 3, "growth", "active", "alex.apac@example.test", "2025-08-20T00:00:00Z", "2026-02-28T23:59:59Z"],
+        [7, "Alex Kim", 1, "enterprise", "active", "alex.na@example.test", "2025-09-01T00:00:00Z", "2026-01-01T00:00:00Z"]
+      ],
+      "customers_archive_2025": [
+        [1, "Ada Lovelace", 1, "growth", "active", "ada.old@example.test", "2024-01-15T00:00:00Z", "2025-12-31T23:59:59Z"],
+        [2, "Grace Hopper", 2, "starter", "inactive", "grace.old@example.test", "2024-02-29T00:00:00Z", "2025-12-31T23:59:59Z"],
+        [90, "Archive Only", 3, "enterprise", "active", "archive@example.test", "2025-01-01T00:00:00Z", "2025-12-31T23:59:59Z"]
+      ],
+      "products": [
+        [101, "ANALYTICS-SEAT", "Analytics seat", "software", 1299],
+        [102, "ENTERPRISE-SUPPORT", "Enterprise support", "service", 5000],
+        [103, "DATA-EXPORT", "Data export", "software", 725]
+      ],
+      "orders": [
+        [1001, 1, "2026-01-01T00:00:00Z", "paid"],
+        [1002, 2, "2026-02-15T12:00:00Z", "paid"],
+        [1003, 3, "2026-03-31T23:59:59Z", "paid"],
+        [1004, 4, "2026-03-31T23:59:59Z", "paid"],
+        [1005, 5, "2026-04-01T00:00:00Z", "paid"],
+        [1006, 6, "2025-12-31T23:59:59Z", "paid"],
+        [1007, 1, "2026-03-20T10:00:00Z", "cancelled"],
+        [1008, 6, "2026-02-28T23:59:59Z", "paid"]
+      ],
+      "orders_archive_2025": [
+        [9001, 90, "2025-11-15T12:00:00Z", "paid"],
+        [9002, 1, "2025-12-31T23:59:59Z", "paid"]
+      ],
+      "order_items": [
+        [4001, 1001, 101, 2, 1299],
+        [4002, 1001, 103, 1, 725],
+        [4003, 1002, 102, 1, 5000],
+        [4004, 1003, 101, 1, 1299],
+        [4005, 1004, 102, 2, 5000],
+        [4006, 1005, 101, 1, 1299],
+        [4007, 1006, 102, 1, 5000],
+        [4008, 1007, 101, 2, 1299],
+        [4009, 1007, 103, 1, 725],
+        [4010, 1008, 103, 1, 725]
+      ],
+      "payments": [
+        [2001, 1001, "succeeded", 3323, "2026-01-01T00:05:00Z"],
+        [2002, 1002, "succeeded", 5000, "2026-02-15T12:05:00Z"],
+        [2003, 1003, "succeeded", 1299, "2026-03-31T23:59:59Z"],
+        [2004, 1004, "succeeded", 10000, "2026-03-31T23:59:59Z"],
+        [2005, 1005, "succeeded", 1299, "2026-04-01T00:05:00Z"],
+        [2006, 1006, "succeeded", 5000, "2025-12-31T23:59:59Z"],
+        [2007, 1007, "failed", 3323, null],
+        [2008, 1008, "succeeded", 725, "2026-02-28T23:59:59Z"]
+      ],
+      "refunds": [
+        [3001, 2001, 323, "2026-01-05T10:00:00Z", "seat adjustment"],
+        [3002, 2004, 2500, "2026-03-31T23:59:59Z", "service credit"],
+        [3003, 2008, 25, "2026-03-01T00:00:00Z", null]
+      ],
+      "support_cases": [
+        [5001, 1, "2026-01-02T08:00:00Z", "2026-01-03T09:00:00Z", "Invoice question", "Resolved without adjustment"],
+        [5002, 4, "2026-03-31T23:59:59Z", null, "Unicode display: \u00a1Hola!", null]
+      ],
+      "monitor_metrics": [
+        [6001, "2026-03-30T00:00:00Z", "refund_rate", 120],
+        [6002, "2026-03-31T00:00:00Z", "refund_rate", 825]
+      ]
+    }
+  },
+  "files": [
+    {
+      "filename": "customers-2026-02-01.csv",
+      "kind": "customer_export",
+      "modified_at": "2026-02-01T12:00:00Z",
+      "columns": ["id", "name", "plan", "lifecycle_status", "email"],
+      "rows": [
+        ["1", "Ada Lovelace", "growth", "active", "ada.old@example.test"],
+        ["2", "Grace Hopper", "starter", "active", "grace@example.test"],
+        ["3", "Linus Torvalds", "enterprise", "active", "linus@example.test"]
+      ]
+    },
+    {
+      "filename": "customers-2026-03-15.csv",
+      "kind": "customer_export",
+      "modified_at": "2026-03-15T12:00:00Z",
+      "columns": ["id", "name", "plan", "lifecycle_status", "email"],
+      "rows": [
+        ["1", "Ada Lovelace", "enterprise", "active", "ada@example.test"],
+        ["2", "Grace Hopper", "enterprise", "active", "grace@example.test"],
+        ["3", "Linus Torvalds", "enterprise", "inactive", "linus@example.test"],
+        ["4", "Jos\u00e9 N\u00fa\u00f1ez", "enterprise", "inactive", "jose@example.test"],
+        ["5", "Chlo\u00eb Dubois", "starter", "active", "chloe@example.test"],
+        ["6", "Alex Kim", "growth", "active", "alex.apac@example.test"],
+        ["8", "Katherine Johnson", "growth", "active", "katherine@example.test"]
+      ]
+    },
+    {
+      "filename": "support-cases-2026-03-10.json",
+      "kind": "support_export",
+      "modified_at": "2026-03-10T12:00:00Z",
+      "rows": [
+        {"case_id": "5001", "subject": "Invoice question", "closed": true},
+        {"case_id": "5002", "subject": "Unicode display: \u00a1Hola!", "closed": false}
+      ]
+    }
+  ]
+}

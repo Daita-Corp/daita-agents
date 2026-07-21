@@ -11,6 +11,15 @@ from typing import Protocol
 from ._json import FrozenJsonObject, canonical_json
 from .llm.models import ToolDefinition
 
+_MAX_TOOL_APPLICABILITY_ITEMS = 32
+_MAX_TOOL_APPLICABILITY_TEXT = 128
+_MAX_TOOL_APPLICABILITY_SOURCES = 64
+_MAX_INPUT_ERROR_COLLECTION_ITEMS = 32
+_MAX_INPUT_ERROR_TEXT = 128
+_MAX_INPUT_ERROR_DETAILS_CHARACTERS = 1_536
+_MAX_STRING_ENUM_ITEMS = 32
+_MAX_STRING_ENUM_TEXT = 128
+
 
 def _required_text(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
@@ -29,7 +38,24 @@ class RiskLevel(str, Enum):
 
 
 class CapabilityInputError(ValueError):
-    """Raised when proposed arguments violate a capability schema."""
+    """Typed, bounded failure for proposed capability arguments."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        _required_text(code, "capability input error code")
+        _required_text(message, "capability input error message")
+        if len(code) > 128 or len(message) > 512:
+            raise ValueError("capability input error text must be bounded")
+        bounded_details = _bounded_input_error_details(
+            {} if details is None else details
+        )
+        self.code = code
+        self.details = FrozenJsonObject.from_mapping(bounded_details)
+        super().__init__(message)
 
 
 class CapabilityExecutionError(RuntimeError):
@@ -168,17 +194,69 @@ class Capability:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolApplicability:
+    """Bounded source requirements for projecting one model-facing tool."""
+
+    source_adapter_ids: tuple[str, ...] = ()
+    minimum_active_sources: int = 0
+    required_configuration_flags: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "source_adapter_ids",
+            "required_configuration_flags",
+        ):
+            raw_values = getattr(self, field_name)
+            if isinstance(raw_values, (str, bytes)):
+                raise TypeError(f"tool applicability {field_name} must be a sequence")
+            values = tuple(raw_values)
+            if len(values) > _MAX_TOOL_APPLICABILITY_ITEMS:
+                raise ValueError(
+                    f"tool applicability {field_name} exceeds "
+                    f"{_MAX_TOOL_APPLICABILITY_ITEMS} items"
+                )
+            for value in values:
+                _required_text(value, f"tool applicability {field_name} item")
+                if value != value.strip():
+                    raise ValueError(
+                        f"tool applicability {field_name} items cannot have "
+                        "surrounding whitespace"
+                    )
+                if len(value) > _MAX_TOOL_APPLICABILITY_TEXT:
+                    raise ValueError(
+                        f"tool applicability {field_name} items exceed "
+                        f"{_MAX_TOOL_APPLICABILITY_TEXT} characters"
+                    )
+            if len(values) != len(set(values)):
+                raise ValueError(f"tool applicability {field_name} must be unique")
+            object.__setattr__(self, field_name, values)
+
+        if (
+            not isinstance(self.minimum_active_sources, int)
+            or isinstance(self.minimum_active_sources, bool)
+            or not 0 <= self.minimum_active_sources <= _MAX_TOOL_APPLICABILITY_SOURCES
+        ):
+            raise ValueError(
+                "tool applicability minimum_active_sources must be from 0 through "
+                f"{_MAX_TOOL_APPLICABILITY_SOURCES}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ToolView:
     """A bounded model-facing projection over one runtime capability."""
 
     name: str
     capability_id: str
     description: str
+    applicability: ToolApplicability = field(default_factory=ToolApplicability)
 
     def __post_init__(self) -> None:
         _required_text(self.name, "tool view name")
         _required_text(self.capability_id, "tool view capability_id")
         _required_text(self.description, "tool view description")
+        if not isinstance(self.applicability, ToolApplicability):
+            raise TypeError("tool view applicability must be a ToolApplicability")
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,7 +614,7 @@ _SUPPORTED_PROPERTY_TYPES = {
     "string",
 }
 _ROOT_SCHEMA_KEYS = {"type", "properties", "required", "additionalProperties"}
-_PROPERTY_SCHEMA_KEYS = {"type"}
+_PROPERTY_SCHEMA_KEYS = {"enum", "type"}
 
 
 def _validate_supported_object_schema(
@@ -582,6 +660,26 @@ def _validate_supported_object_schema(
         property_type = property_schema.get("type")
         if property_type not in _SUPPORTED_PROPERTY_TYPES:
             raise ValueError(f"unsupported capability property type: {property_type}")
+        if "enum" in property_schema:
+            enum = property_schema["enum"]
+            if property_type != "string":
+                raise ValueError("capability property enum requires type string")
+            if (
+                not isinstance(enum, list)
+                or not enum
+                or len(enum) > _MAX_STRING_ENUM_ITEMS
+                or any(
+                    not isinstance(item, str)
+                    or not item
+                    or len(item) > _MAX_STRING_ENUM_TEXT
+                    for item in enum
+                )
+                or len(enum) != len(set(enum))
+            ):
+                raise ValueError(
+                    "capability string enum must contain 1 through "
+                    f"{_MAX_STRING_ENUM_ITEMS} unique bounded strings"
+                )
 
 
 def _validate_object(
@@ -598,11 +696,29 @@ def _validate_object(
     assert isinstance(required, list)
     assert isinstance(additional, bool)
 
-    missing = [name for name in required if name not in object_value]
+    missing = sorted(name for name in required if name not in object_value)
     if missing:
+        if error_type is CapabilityInputError:
+            raise CapabilityInputError(
+                "capability.input.missing_required_fields",
+                "Capability input is missing required fields.",
+                {
+                    "allowed_fields": sorted(properties),
+                    "missing_fields": missing,
+                },
+            )
         raise error_type(f"required field is missing: {', '.join(missing)}")
     unexpected = sorted(set(object_value) - set(properties))
     if unexpected and not additional:
+        if error_type is CapabilityInputError:
+            raise CapabilityInputError(
+                "capability.input.unexpected_fields",
+                "Capability input contains unexpected fields.",
+                {
+                    "allowed_fields": sorted(properties),
+                    "unexpected_fields": unexpected,
+                },
+            )
         raise error_type(f"unexpected field: {', '.join(unexpected)}")
     for name, item in object_value.items():
         property_schema = properties.get(name)
@@ -611,7 +727,111 @@ def _validate_object(
         assert isinstance(property_schema, dict)
         expected = property_schema["type"]
         if not _matches_json_type(item, expected):
+            if error_type is CapabilityInputError:
+                raise CapabilityInputError(
+                    "capability.input.type_mismatch",
+                    "A capability input field has the wrong JSON type.",
+                    {
+                        "actual_type": _json_type_name(item),
+                        "expected_type": expected,
+                        "field_path": f"$.{name}",
+                    },
+                )
             raise error_type(f"field {name} must be {expected}")
+        allowed_values = property_schema.get("enum")
+        if allowed_values is not None and item not in allowed_values:
+            assert isinstance(allowed_values, list)
+            if error_type is CapabilityInputError:
+                raise CapabilityInputError(
+                    "capability.input.enum_mismatch",
+                    "A capability input field is outside its declared string policy.",
+                    {
+                        "allowed_values": sorted(allowed_values),
+                        "field_path": f"$.{name}",
+                    },
+                )
+            raise error_type(f"field {name} must be one of the declared values")
+
+
+def _bounded_input_error_details(
+    details: Mapping[str, object],
+) -> dict[str, object]:
+    """Bound safe repair facts without ever accepting submitted values."""
+
+    if not isinstance(details, Mapping):
+        raise TypeError("capability input error details must be a mapping")
+    bounded: dict[str, object] = {}
+    truncated = False
+    collection_keys = {
+        "allowed_fields",
+        "allowed_values",
+        "missing_fields",
+        "unexpected_fields",
+    }
+    scalar_keys = {"actual_type", "expected_type", "field_path"}
+    for key in sorted(details):
+        value = details[key]
+        if key in collection_keys:
+            if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+                raise TypeError(f"capability input error {key} must be a sequence")
+            if any(not isinstance(item, str) for item in value):
+                raise TypeError(f"capability input error {key} must contain strings")
+            values: list[str] = []
+            for item in sorted(set(value)):
+                assert isinstance(item, str)
+                clipped = item[:_MAX_INPUT_ERROR_TEXT]
+                truncated = truncated or clipped != item
+                values.append(clipped)
+            if len(values) > _MAX_INPUT_ERROR_COLLECTION_ITEMS:
+                values = values[:_MAX_INPUT_ERROR_COLLECTION_ITEMS]
+                truncated = True
+            bounded[key] = values
+        elif key in scalar_keys:
+            if not isinstance(value, str):
+                raise TypeError(f"capability input error {key} must be text")
+            clipped = value[:_MAX_INPUT_ERROR_TEXT]
+            truncated = truncated or clipped != value
+            bounded[key] = clipped
+        else:
+            raise ValueError(f"unsupported capability input error detail: {key}")
+
+    bounded["details_truncated"] = truncated
+    collection_trim_order = (
+        "allowed_fields",
+        "allowed_values",
+        "unexpected_fields",
+        "missing_fields",
+    )
+    while len(canonical_json(bounded)) > _MAX_INPUT_ERROR_DETAILS_CHARACTERS:
+        trimmed = False
+        for key in collection_trim_order:
+            trim_values = bounded.get(key)
+            if isinstance(trim_values, list) and trim_values:
+                trim_values.pop()
+                bounded["details_truncated"] = True
+                trimmed = True
+                break
+        if not trimmed:
+            raise ValueError("capability input error details cannot fit their bound")
+    return bounded
+
+
+def _json_type_name(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    return "unknown"
 
 
 def _matches_json_type(value: object, expected: object) -> bool:

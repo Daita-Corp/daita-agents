@@ -38,17 +38,102 @@ class RequiredContextOverflow(ContextBudgetError):
         available_tokens: int,
         tool_tokens: int,
         output_reserve_tokens: int,
+        input_limit_tokens: int | None = None,
+        required_system_tokens: int = 0,
+        required_routing_tokens: int = 0,
+        required_intent_tokens: int = 0,
+        current_operation_envelope_tokens: int = 0,
+        current_operation_body_tokens: int = 0,
+        minimum_session_tokens: int = 0,
+        projected_session_tokens: int = 0,
+        optional_omitted_tokens: int | None = None,
     ) -> None:
+        if (
+            not isinstance(profile_id, str)
+            or not profile_id.strip()
+            or profile_id != profile_id.strip()
+            or len(profile_id) > 256
+        ):
+            raise ValueError("overflow profile_id must be bounded non-empty text")
+        resolved_input_limit = (
+            available_tokens + tool_tokens
+            if input_limit_tokens is None
+            else input_limit_tokens
+        )
+        for value, field_name in (
+            (required_tokens, "required_tokens"),
+            (available_tokens, "available_tokens"),
+            (tool_tokens, "tool_tokens"),
+            (output_reserve_tokens, "output_reserve_tokens"),
+            (resolved_input_limit, "input_limit_tokens"),
+            (required_system_tokens, "required_system_tokens"),
+            (required_routing_tokens, "required_routing_tokens"),
+            (required_intent_tokens, "required_intent_tokens"),
+            (
+                current_operation_envelope_tokens,
+                "current_operation_envelope_tokens",
+            ),
+            (current_operation_body_tokens, "current_operation_body_tokens"),
+            (minimum_session_tokens, "minimum_session_tokens"),
+            (projected_session_tokens, "projected_session_tokens"),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(
+                    f"overflow {field_name} must be a non-negative integer"
+                )
+        if optional_omitted_tokens is not None and (
+            not isinstance(optional_omitted_tokens, int)
+            or isinstance(optional_omitted_tokens, bool)
+            or optional_omitted_tokens < 0
+        ):
+            raise ValueError(
+                "overflow optional_omitted_tokens must be a non-negative integer "
+                "or None"
+            )
         self.profile_id = profile_id
         self.required_tokens = required_tokens
         self.available_tokens = available_tokens
         self.tool_tokens = tool_tokens
         self.output_reserve_tokens = output_reserve_tokens
+        self.input_limit_tokens = resolved_input_limit
+        self.required_system_tokens = required_system_tokens
+        self.required_routing_tokens = required_routing_tokens
+        self.required_intent_tokens = required_intent_tokens
+        self.current_operation_envelope_tokens = current_operation_envelope_tokens
+        self.current_operation_body_tokens = current_operation_body_tokens
+        self.minimum_session_tokens = minimum_session_tokens
+        self.projected_session_tokens = projected_session_tokens
+        self.optional_omitted_tokens = optional_omitted_tokens
+        self.total_required_tokens = tool_tokens + required_tokens
         super().__init__(
             f"required context needs {required_tokens} tokens but model profile "
             f"{profile_id} has {available_tokens} available after tool and output "
             "reserves"
         )
+
+    @property
+    def safe_facts(self) -> dict[str, int | str | None]:
+        """Return the fixed, non-secret scalar facts safe for persistence."""
+
+        return {
+            "available_tokens": self.available_tokens,
+            "current_operation_body_tokens": self.current_operation_body_tokens,
+            "current_operation_envelope_tokens": (
+                self.current_operation_envelope_tokens
+            ),
+            "input_limit_tokens": self.input_limit_tokens,
+            "minimum_session_tokens": self.minimum_session_tokens,
+            "optional_omitted_tokens": self.optional_omitted_tokens,
+            "output_reserve_tokens": self.output_reserve_tokens,
+            "profile_id": self.profile_id,
+            "projected_session_tokens": self.projected_session_tokens,
+            "required_intent_tokens": self.required_intent_tokens,
+            "required_routing_tokens": self.required_routing_tokens,
+            "required_system_tokens": self.required_system_tokens,
+            "required_tokens": self.required_tokens,
+            "tool_tokens": self.tool_tokens,
+            "total_required_tokens": self.total_required_tokens,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +330,10 @@ def select_context_blocks(
             available_tokens=max(0, available),
             tool_tokens=tool_tokens,
             output_reserve_tokens=reserve,
+            input_limit_tokens=input_limit,
+            optional_omitted_tokens=sum(
+                item.estimated_tokens for item in estimates if not item.block.required
+            ),
         )
 
     selected_indexes = {

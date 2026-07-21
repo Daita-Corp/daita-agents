@@ -292,6 +292,7 @@ def _request(
     *messages: CanonicalMessage,
     tools: tuple[ToolDefinition, ...] = (),
     response_schema: Mapping[str, object] | None = None,
+    allow_parallel_tool_calls: bool | None = None,
 ) -> ModelRequest:
     return ModelRequest(
         operation_id="operation-1",
@@ -299,7 +300,21 @@ def _request(
         messages=messages or (_message(MessageRole.USER, "hello"),),
         tools=tools,
         response_schema=response_schema,
+        allow_parallel_tool_calls=allow_parallel_tool_calls,
     )
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+def test_request_policy_support_matrix_is_explicit(case: _ProviderCase) -> None:
+    provider, resource = case.make()
+
+    assert provider.supports_request_policy(_request()) is True
+    assert provider.supports_request_policy(
+        _request(allow_parallel_tool_calls=False)
+    ) is (case.wire not in {"anthropic", "gemini"})
+    assert resource.calls == []
+    if isinstance(resource, _AnthropicResource):
+        assert resource.stream_calls == []
 
 
 TOOL = ToolDefinition(

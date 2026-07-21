@@ -103,7 +103,7 @@ class RepairingFakeReadDomain:
         self.registry = registry
         self.validated_call_ids: list[str] = []
 
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:
@@ -246,11 +246,12 @@ class RepairTranscriptContextBuilder:
             turn_id=turn.id,
             messages=tuple(messages),
             tools=tools,
+            allow_parallel_tool_calls=False,
         )
 
 
 class CorrectingReadinessDomain:
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:
@@ -675,6 +676,9 @@ async def test_rejection_first_skips_later_call_and_repair_transcript_is_complet
     assert final.loop_state.repair_count == 1
     assert final.loop_state.identical_failure_count == 0
     assert final.loop_state.no_progress_fingerprints == ()
+    assert all(
+        request.allow_parallel_tool_calls is False for request in provider.requests
+    )
     provider.assert_consumed()
 
 
@@ -986,7 +990,10 @@ async def test_denied_readiness_is_observed_then_corrected_by_the_model() -> Non
     assert correction.evidence_id is None
     assert correction.code == "readiness.missing_evidence"
     assert isinstance(correction.payload, FrozenJsonObject)
-    assert correction.payload.to_dict() == {"missing_facts": [MISSING_FACT]}
+    assert correction.payload.to_dict() == {
+        "missing_facts": [MISSING_FACT],
+        "repair_details": {},
+    }
     assert final.loop_state.repair_count == 1
     assert final.loop_state.identical_failure_count == 0
     assert final.loop_state.no_progress_fingerprints == ()

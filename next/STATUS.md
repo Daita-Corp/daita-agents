@@ -5,16 +5,86 @@ project. Update it before and after every material task.
 
 ## Current position
 
-- **Active phase:** Phase 9.5 complete; Phase 10 excluded
-- **Active task:** none — awaiting separate human Phase 10 authorization
-- **Last completed task:** P9.5-08 — joined replacement-readiness gate
-- **Current checkpoint:** the Phase 9.5 candidate is replacement-ready and
-  eligible for human Phase 10 review; no cutover work is authorized
+- **Active phase:** Live LLM readiness Wave 1 stopped at failed LLM-G02; later
+  waves and Phase 10 excluded
+- **Active task:** none; preserve the outcome-first benchmark and address its
+  rows one at a time, beginning with LIVE-MVP-01 direct
+- **Last completed task:** refocus Wave 1 live evaluation on MVP outcome,
+  read-only safety, and supporting evidence; separate pre-cutover stress; then
+  execute the explicitly authorized ordered 12-row benchmark once against
+  OpenAI `gpt-4.1-mini`
+- **Current checkpoint:** the Phase 9.5 candidate remains replacement-ready;
+  the added pre-cutover live LLM gate is incomplete and no cutover work is
+  authorized
 - **Architecture-plan fingerprint:** ignored local source
   `docs/DAITA_AUTONOMOUS_AGENT_V2_MVP_PLAN.md`, SHA-256
   `e54f43dd0bfc0fa8478b496e7d2a89e53439d7fe9f5c8cf58f5c947f7682364b`
-- **Exact next action:** stop and await separate human authorization; do not
-  begin Phase 10, modify root v1, push, publish, open a PR, or create a release
+- **Exact next action:** analyze and repair LIVE-MVP-01 direct offline. Do not
+  rerun it or any other paid row into a pass; a later real-provider run needs
+  explicit direction after deterministic gates. Do not begin later waves or
+  Phase 10, modify root v1, push, publish, open a PR, or create a release.
+
+## Live LLM readiness Wave 1 checkpoint
+
+- LLM-G00: **PASS**. Scope, fixture, prompt corpus, budgets, artifact policy,
+  OpenAI provider, `gpt-4.1-mini` model, and CPython 3.11.15 reference
+  interpreter are explicit and frozen for the first run.
+- LLM-G01: **PASS**. The repaired versioned fixture/oracles, exact 12-row
+  collection, xUnit1 properties, failure-safe JSON sidecar, correlation,
+  graph, comparison, session, metrics, and redaction contracts pass 32 offline
+  tests.
+- LLM-G02: **FAIL**. The one authorized repaired run completed all 12 unchanged
+  rows once and returned 12 failures, zero passes. The earlier first-live
+  record remains immutable; the repaired run and its separate attribution are
+  recorded in `QUALITY_GATES.md` and
+  `docs/LIVE_LLM_PRODUCTION_READINESS.md`.
+- A subsequent explicitly authorized outcome-first benchmark retained the same
+  12 prompts but ordered four direct smoke rows first, then four conversational
+  and four answerable-ambiguous reliability rows. Prescribed catalog
+  choreography, graph depth, duplicate reads, and compression stress no longer
+  decide MVP pass/fail. The run still returned 0/12 because every row failed an
+  outcome check; safety passed in seven rows and evidence passed in one.
+- The outcome-first harness and collection contracts pass 37 deterministic
+  tests. Complete supported-interpreter runs now pass 1,818 tests on Python
+  3.11.15 and 3.12.7, with two known sandbox-only skips and 24 deselections.
+  Black, compilation, mypy, Pyright, all 95 architecture tests, and
+  `git diff --check` pass.
+- The outcome-first benchmark used 165 provider calls, 898,910 total tokens,
+  82 accepted actions, 71 repairs, zero retries, and zero fallbacks. Eight rows
+  had at least one operation exhaust a repair or turn budget; three completed
+  every requested operation but returned a wrong or incomplete business
+  answer. A fourth, LIVE-MVP-03 conversational, produced the exact comparison
+  with valid safety/evidence but exposed one remaining prose-oracle false
+  negative for the natural phrase “present only in”; that evaluator defect is
+  recorded separately and was not used to excuse the other failures.
+- All RP-01 through RP-09 and ER-01 owner contracts in
+  `docs/LIVE_MVP_WAVE1_REPAIR_SPEC_2026-07-20.md` are implemented without a
+  second loop, executor, catalog, store, policy, provider registry, evaluator,
+  or context subsystem. The retained fixture and prompt corpus are unchanged.
+- The final repair-owner selection passes 442 tests. Complete deterministic
+  runs pass 1,813 tests on each supported interpreter with two sandbox-only
+  Unix-socket skips and 21 live/database deselections.
+- Black leaves 303 files unchanged; compilation succeeds; mypy is clean over
+  291 files; Pyright reports zero errors/warnings; all 95 architecture tests,
+  26 packaging contracts, generated disposition, four frozen-v1 oracles,
+  baseline root diff, and 2,498 root-v1 safe tests pass.
+- Clean 106-entry wheels and 133-entry sdists pass both the dependency-free
+  and joined OpenAI/SQLite installed lifecycle on Python 3.11.15 and 3.12.7,
+  including cold reopen and state retention after uninstall.
+- The repaired live corpus ran exactly once on CPython 3.11.15 with explicit
+  OpenAI `gpt-4.1-mini`: 105 provider calls, 516,399 total tokens, 51 tasks,
+  50 accepted evidence records, 44 repairs, zero retries, and zero fallbacks.
+  All provider requests completed successfully, but no row satisfied every
+  hard oracle. The credential was loaded only for that run and was absent from
+  the redacted JSON sidecar, JUnit, log, and retained synthetic Agent Homes.
+- Runtime/framework attribution is limited but material: one mistyped catalog
+  resource ID became fatal generic `executor_failed` instead of bounded typed
+  repair evidence. Model behavior caused the remaining observed terminal,
+  discovery/freshness, graph, and semantic failures. A newline-sensitive
+  discrepancy-prose assertion is a latent evaluator risk, but it did not cause
+  any recorded row failure because authoritative freshness inspection failed
+  first. LIVE-MVP-04 never reached compression or cold reopen because each
+  primary operation failed its initial grounded-answer contract.
 
 ## Development cadence
 

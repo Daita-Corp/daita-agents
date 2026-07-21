@@ -340,7 +340,7 @@ async def test_migration_nine_and_session_compression_are_versioned_and_exact(
 
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (17,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (18,)
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             connection.execute(
                 "UPDATE session_compression_checkpoints SET summary = 'x'"

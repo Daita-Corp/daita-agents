@@ -97,7 +97,7 @@ class LiveFakeReadDomain:
     def __init__(self, registry: CapabilityRegistry) -> None:
         self._registry = registry
 
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:

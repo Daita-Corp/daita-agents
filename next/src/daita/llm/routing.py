@@ -395,6 +395,14 @@ class ModelRouter:
     def retry_policy(self) -> RetryPolicy:
         return self._retry_policy
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return any(
+            _provider_supports_request_policy(registration.provider, request)
+            for registration in self._candidates
+        )
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
@@ -723,6 +731,8 @@ def _candidate_is_eligible(
         return False
     if request.response_schema is not None and not profile.supports_structured_output:
         return False
+    if not _provider_supports_request_policy(registration.provider, request):
+        return False
     if require_streaming and not profile.supports_streaming:
         return False
     estimated_input = request.context_selection.get("estimated_input_tokens")
@@ -737,6 +747,20 @@ def _candidate_is_eligible(
     ):
         return False
     return True
+
+
+def _provider_supports_request_policy(
+    provider: ModelProvider,
+    request: ModelRequest,
+) -> bool:
+    check = getattr(provider, "supports_request_policy", None)
+    if not callable(check):
+        return request.allow_parallel_tool_calls is None
+    try:
+        supported = check(request)
+    except Exception:
+        return False
+    return supported is True
 
 
 def _request_for_provider(request: ModelRequest, provider_id: str) -> ModelRequest:

@@ -10,6 +10,9 @@ REQUIRED_DOCUMENTS = {
     "BREAKING_CHANGES.md",
     "CLI_AND_CLIENT.md",
     "FRESH_STATE_AND_MIGRATION.md",
+    "LIVE_LLM_PRODUCTION_READINESS.md",
+    "LIVE_MVP_WAVE1_FAILURE_ANALYSIS_2026-07-20.md",
+    "LIVE_MVP_WAVE1_REPAIR_SPEC_2026-07-20.md",
     "OPERATIONS.md",
     "README.md",
     "SECURITY.md",
@@ -44,6 +47,22 @@ def test_fresh_start_and_phase10_boundaries_are_explicit() -> None:
     assert "Uninstalling the Python package does not remove" in migration
     assert "Phase 10" in breaking
     assert "must not be used as a fallback" in client
+
+
+def test_live_llm_plan_is_a_real_provider_pre_cutover_gate_not_pass_evidence() -> None:
+    plan = (DOCS_ROOT / "LIVE_LLM_PRODUCTION_READINESS.md").read_text(encoding="utf-8")
+    normalized = " ".join(plan.split())
+
+    assert "PROPOSED — NOT EXECUTED" in plan
+    assert "A mock, scripted provider, cached provider response" in normalized
+    assert "never `PASS`" in plan
+    assert "LIVE-MVP-01" in plan
+    assert "LIVE-MVP-13" in plan
+    assert "LLM-G09 — Human cutover authorization" in plan
+    assert "test success alone does not authorize it" in normalized
+    assert "Wave 1 implementation record" in plan
+    assert "LLM-G01 is PASS" in plan
+    assert "LLM-G02 is **BLOCKED / NOT RUN**" in plan
 
 
 def test_support_matrix_names_every_deferred_integration_family() -> None:

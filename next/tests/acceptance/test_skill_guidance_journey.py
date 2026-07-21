@@ -28,12 +28,8 @@ PROFILE = ModelProfile(
 EXPECTED_TOOLS = (
     "catalog_search",
     "catalog_inspect",
+    "catalog_traverse",
     "data_query_sqlite",
-    "data_query_postgresql",
-    "data_preview_sqlite_update",
-    "data_update_sqlite",
-    "data_read_file",
-    "data_compare_tabular",
 )
 INSTRUCTIONS = (
     "For completed customer counts, use the registered SQLite read capability "
@@ -49,6 +45,9 @@ class JourneyProvider:
     def __init__(self) -> None:
         self.script: list[ModelResponse] = []
         self.requests: list[ModelRequest] = []
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)

@@ -79,6 +79,20 @@ class Catalog:
             item for item in self.snapshot.facets if item.resource_id == resource_id
         )
 
+    async def load_incident_relationships(
+        self, agent_id, resource_id, *, relationship_kinds=(), limit=50
+    ):
+        return tuple(
+            item
+            for item in self.snapshot.relationships
+            if resource_id in {item.from_resource_id, item.to_resource_id}
+            and (not relationship_kinds or item.kind in relationship_kinds)
+        )[:limit]
+
+    async def load_relationships(self, agent_id, relationship_ids):
+        by_id = {item.id: item for item in self.snapshot.relationships}
+        return tuple(by_id[item] for item in relationship_ids if item in by_id)
+
     async def search(self, request):
         raise NotImplementedError
 

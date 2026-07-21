@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 import threading
 
@@ -114,6 +115,41 @@ async def test_local_directory_discovers_bounded_file_facets_and_contains_edges(
     )
     assert adapter.registration.configuration["root"] == str(root.resolve())
     assert adapter.registration.configuration["formats"] == ("csv", "json")
+
+
+async def test_local_directory_file_freshness_uses_stat_mtime_not_filename_order(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "adversarial-freshness"
+    root.mkdir()
+    lexically_first = root / "a-export.csv"
+    lexically_last = root / "z-export.csv"
+    lexically_first.write_text("id\n1\n", encoding="utf-8")
+    lexically_last.write_text("id\n2\n", encoding="utf-8")
+    older_timestamp = NOW.timestamp() - 300
+    newer_timestamp = NOW.timestamp() - 60
+    os.utime(lexically_first, (newer_timestamp, newer_timestamp))
+    os.utime(lexically_last, (older_timestamp, older_timestamp))
+    adapter = await _open(root)
+
+    try:
+        result = await adapter.discover(_request(adapter))
+    finally:
+        await adapter.close()
+
+    freshness_by_name: dict[str, str] = {}
+    for resource in result.snapshot.resources:
+        if resource.kind is not ResourceKind.FILE:
+            continue
+        modified_at = next(
+            facet.payload["modified_at"]
+            for facet in result.snapshot.facets
+            if facet.resource_id == resource.id and facet.kind is FacetKind.FILE
+        )
+        assert isinstance(modified_at, str)
+        freshness_by_name[resource.name] = modified_at
+    assert tuple(sorted(freshness_by_name)) == ("a-export.csv", "z-export.csv")
+    assert freshness_by_name["a-export.csv"] > freshness_by_name["z-export.csv"]
 
 
 @pytest.mark.parametrize("kind", ["missing", "file", "symlink", "parent_symlink"])

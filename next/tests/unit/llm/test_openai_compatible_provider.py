@@ -88,6 +88,7 @@ def _request(
     *messages: CanonicalMessage,
     tools: tuple[ToolDefinition, ...] = (),
     response_schema: Mapping[str, object] | None = None,
+    allow_parallel_tool_calls: bool | None = None,
 ) -> ModelRequest:
     return ModelRequest(
         operation_id="operation-1",
@@ -95,6 +96,7 @@ def _request(
         messages=messages or (_message(MessageRole.USER, "hello"),),
         tools=tools,
         response_schema=response_schema,
+        allow_parallel_tool_calls=allow_parallel_tool_calls,
     )
 
 
@@ -188,6 +190,22 @@ async def test_compatible_text_translation_and_usage_are_canonical() -> None:
     assert response.usage.cache_read_tokens == 3
     assert response.usage.reasoning_tokens == 2
     assert response.provider_response_id == "response-1"
+
+
+async def test_compatible_explicit_sequential_policy_uses_native_option() -> None:
+    client = FakeClient(_completion())
+    provider = OpenAICompatibleProvider(
+        "model-a",
+        provider="compatible",
+        base_url="https://models.example.test/v1",
+        client=client,
+    )
+    request = _request(allow_parallel_tool_calls=False)
+
+    assert provider.supports_request_policy(request) is True
+    await provider.generate(request)
+
+    assert client.chat.completions.calls[0]["parallel_tool_calls"] is False
 
 
 async def test_compatible_tools_keep_canonical_and_native_ids_separate() -> None:
@@ -363,7 +381,10 @@ async def test_compatible_stream_normalizes_text_and_terminal_usage() -> None:
         client=client,
     )
 
-    events = [event async for event in provider.stream(_request())]
+    events = [
+        event
+        async for event in provider.stream(_request(allow_parallel_tool_calls=False))
+    ]
 
     assert [event.text for event in events if isinstance(event, ModelTextDelta)] == [
         "Hello",
@@ -376,6 +397,7 @@ async def test_compatible_stream_normalizes_text_and_terminal_usage() -> None:
     assert completed.response.usage.input_tokens == 9
     assert completed.response.usage.output_tokens == 3
     assert client.chat.completions.calls[0]["stream"] is True
+    assert client.chat.completions.calls[0]["parallel_tool_calls"] is False
     assert client.chat.completions.calls[0]["stream_options"] == {"include_usage": True}
 
 

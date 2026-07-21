@@ -92,7 +92,7 @@ class _Context:
 
 
 class _Domain:
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:
@@ -179,6 +179,9 @@ class _ScriptedProvider:
 
     def __init__(self) -> None:
         self.responses: list[ModelResponse] = []
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         del request

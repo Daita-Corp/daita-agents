@@ -54,6 +54,9 @@ class ScriptedProvider:
         self.responses = list(responses)
         self.requests: list[ModelRequest] = []
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         if not self.responses:
@@ -239,6 +242,7 @@ async def test_default_host_matches_and_unmatches_typed_thresholds_atomically(
         }
         assert "catalog_search" not in tool_names
         assert "catalog_inspect" not in tool_names
+        assert "catalog_traverse" not in tool_names
         assert "data_update_sqlite" not in tool_names
     finally:
         await host.stop(drain=False)

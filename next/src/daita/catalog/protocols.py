@@ -6,6 +6,7 @@ from typing import Protocol, runtime_checkable
 
 from .models import (
     CatalogFacet,
+    CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
     CatalogSearchRequest,
@@ -13,6 +14,7 @@ from .models import (
     CatalogSync,
     CatalogTraversalRequest,
     CatalogTraversalResult,
+    RelationshipKind,
     SourceCatalogSnapshot,
 )
 
@@ -97,6 +99,21 @@ class CatalogStore(Protocol):
         resource_id: str,
         revision: str | None = None,
     ) -> tuple[CatalogFacet, ...]: ...
+
+    async def load_incident_relationships(
+        self,
+        agent_id: str,
+        resource_id: str,
+        *,
+        relationship_kinds: tuple[RelationshipKind, ...] = (),
+        limit: int = 50,
+    ) -> tuple[CatalogRelationship, ...]: ...
+
+    async def load_relationships(
+        self,
+        agent_id: str,
+        relationship_ids: tuple[str, ...],
+    ) -> tuple[CatalogRelationship, ...]: ...
 
     async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult: ...
 

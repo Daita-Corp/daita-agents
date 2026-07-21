@@ -41,6 +41,11 @@ class MockModelProvider:
     def requests(self) -> tuple[ModelRequest, ...]:
         return tuple(self._requests)
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return True
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")

@@ -15,6 +15,7 @@ from ...capabilities import (
     ExecutionRequest,
     Executor,
     RiskLevel,
+    ToolApplicability,
     ToolView,
 )
 from .controller import (
@@ -573,6 +574,7 @@ def sqlite_query_extension_declarations() -> ExtensionDeclarations:
         capability_id=SQLITE_QUERY_CAPABILITY_ID,
         evidence_kind=SQLITE_QUERY_EVIDENCE_KIND,
         executor_id=SQLITE_QUERY_EXECUTOR_ID,
+        adapter_id="sqlite",
         adapter_name="SQLite",
         tool_name="data_query_sqlite",
         idempotent=True,
@@ -593,6 +595,7 @@ def postgresql_query_extension_declarations() -> ExtensionDeclarations:
         capability_id=POSTGRESQL_QUERY_CAPABILITY_ID,
         evidence_kind=POSTGRESQL_QUERY_EVIDENCE_KIND,
         executor_id=POSTGRESQL_QUERY_EXECUTOR_ID,
+        adapter_id="postgresql",
         adapter_name="PostgreSQL",
         tool_name="data_query_postgresql",
         idempotent=False,
@@ -605,6 +608,7 @@ def _query_extension_declarations(
     capability_id: str,
     evidence_kind: str,
     executor_id: str,
+    adapter_id: str,
     adapter_name: str,
     tool_name: str,
     idempotent: bool,
@@ -639,6 +643,10 @@ def _query_extension_declarations(
         name=tool_name,
         capability_id=capability.id,
         description=capability.description,
+        applicability=ToolApplicability(
+            source_adapter_ids=(adapter_id,),
+            minimum_active_sources=1,
+        ),
     )
     return ExtensionDeclarations(
         capabilities=(capability,),
@@ -664,6 +672,11 @@ def sqlite_update_declarations(
 def sqlite_update_extension_declarations() -> ExtensionDeclarations:
     """Advertise semantic preview and controlled-write SQLite contracts."""
 
+    applicability = ToolApplicability(
+        source_adapter_ids=("sqlite",),
+        minimum_active_sources=1,
+        required_configuration_flags=("write_access",),
+    )
     common_properties = _update_input_properties()
     common_required = list(common_properties)
     impact = Capability(
@@ -723,11 +736,13 @@ def sqlite_update_extension_declarations() -> ExtensionDeclarations:
                 name=SQLITE_UPDATE_IMPACT_TOOL_NAME,
                 capability_id=impact.id,
                 description=impact.description,
+                applicability=applicability,
             ),
             ToolView(
                 name=SQLITE_UPDATE_TOOL_NAME,
                 capability_id=update.id,
                 description=update.description,
+                applicability=applicability,
             ),
         ),
     )

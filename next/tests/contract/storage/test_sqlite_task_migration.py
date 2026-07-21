@@ -46,7 +46,7 @@ MIGRATION_SIX_NAME = "normalize_approval_lifecycle"
 MIGRATION_SEVEN_NAME = "add_agent_identity_and_sessions"
 MIGRATION_THIRTEEN_NAME = "persist_task_validation_facts"
 MIGRATION_FOURTEEN_NAME = "bind_agent_runtime_defaults"
-LATEST_MIGRATION_NAME = "bind_configured_extensions"
+LATEST_MIGRATION_NAME = "persist_wave1_runtime_foundation"
 LEGACY_RECOVERY_REASON = "legacy_running_task_missing_lease"
 LEGACY_RECOVERY_EVENT_TYPE = "task.manual_recovery_required"
 

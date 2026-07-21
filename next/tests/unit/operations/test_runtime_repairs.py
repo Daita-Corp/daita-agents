@@ -704,6 +704,14 @@ async def test_denied_readiness_commits_a_structured_correction() -> None:
         code="readiness.missing_evidence",
         message="Accepted evidence is required before answering.",
         missing_facts=("accepted_evidence", "observed_result"),
+        repair_details={
+            "required_citations": [
+                {
+                    "citation": "[evidence:evidence-required]",
+                    "evidence_id": "evidence-required",
+                }
+            ]
+        },
         evaluated_at=NOW,
     )
 
@@ -725,8 +733,17 @@ async def test_denied_readiness_commits_a_structured_correction() -> None:
     assert correction.evidence_id is None
     assert isinstance(correction.payload, FrozenJsonObject)
     assert correction.payload.to_dict() == {
-        "missing_facts": ["accepted_evidence", "observed_result"]
+        "missing_facts": ["accepted_evidence", "observed_result"],
+        "repair_details": {
+            "required_citations": [
+                {
+                    "citation": "[evidence:evidence-required]",
+                    "evidence_id": "evidence-required",
+                }
+            ]
+        },
     }
+    assert correction.payload["repair_details"] == readiness.repair_details
     assert snapshot.readiness == (readiness,)
     assert snapshot.observations == (correction,)
     assert snapshot.operation.status is OperationStatus.RUNNING

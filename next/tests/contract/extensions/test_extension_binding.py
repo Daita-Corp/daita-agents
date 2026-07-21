@@ -55,7 +55,7 @@ async def test_sqlite_extension_set_is_normalized_immutable_and_reopen_exact(
     await reopened.close()
 
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (17,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (18,)
         assert connection.execute(
             "SELECT extension_count FROM agent_extension_sets"
         ).fetchone() == (1,)

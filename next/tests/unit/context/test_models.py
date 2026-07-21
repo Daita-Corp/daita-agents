@@ -81,6 +81,138 @@ def test_context_message_group_requires_complete_tool_exchange() -> None:
         ContextMessageGroup(id="operation.split", messages=(assistant,))
 
 
+def test_context_message_group_accepts_parallel_result_batches() -> None:
+    calls = (
+        ToolCall(id="call-a", name="catalog_search", arguments={"q": "a"}),
+        ToolCall(id="call-b", name="catalog_search", arguments={"q": "b"}),
+    )
+    assistant = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.ASSISTANT,
+        tool_calls=calls,
+    )
+    batch = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.TOOL,
+        content=(
+            ToolResultBlock(call_id="call-b", output={"value": "b"}),
+            ToolResultBlock(call_id="call-a", output={"value": "a"}),
+        ),
+    )
+
+    group = ContextMessageGroup(
+        id="operation.parallel-tool-exchange",
+        messages=(assistant, batch),
+    )
+
+    assert group.messages == (assistant, batch)
+
+
+def test_context_message_group_accepts_ordinary_non_tool_messages() -> None:
+    user = _message("question")
+    assistant = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.ASSISTANT,
+        content=(TextBlock("answer"),),
+    )
+
+    group = ContextMessageGroup(
+        id="operation.ordinary-exchange",
+        messages=(user, assistant),
+    )
+
+    assert group.messages == (user, assistant)
+
+
+@pytest.mark.parametrize("intervening_role", (MessageRole.USER, MessageRole.ASSISTANT))
+def test_context_message_group_rejects_message_before_pending_results(
+    intervening_role: MessageRole,
+) -> None:
+    call = ToolCall(id="call-pending", name="catalog_search", arguments={})
+    assistant = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.ASSISTANT,
+        tool_calls=(call,),
+    )
+    intervening = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=intervening_role,
+        content=(TextBlock("too early"),),
+    )
+
+    with pytest.raises(ValueError, match="interrupt pending tool results"):
+        ContextMessageGroup(
+            id="operation.interrupted-tool-exchange",
+            messages=(assistant, intervening),
+        )
+
+
+def test_context_message_group_rejects_orphan_and_duplicate_results() -> None:
+    call = ToolCall(id="call-1", name="catalog_search", arguments={})
+    assistant = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.ASSISTANT,
+        tool_calls=(call,),
+    )
+    result = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.TOOL,
+        content=(ToolResultBlock(call_id=call.id, output={}),),
+    )
+    orphan = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.TOOL,
+        content=(ToolResultBlock(call_id="call-unknown", output={}),),
+    )
+
+    with pytest.raises(ValueError, match="orphan tool result"):
+        ContextMessageGroup(
+            id="operation.orphan-tool-result",
+            messages=(orphan,),
+        )
+    with pytest.raises(ValueError, match="duplicate tool results"):
+        ContextMessageGroup(
+            id="operation.duplicate-tool-result",
+            messages=(assistant, result, result),
+        )
+
+
+def test_context_message_group_rejects_cross_assistant_duplicate_call_id() -> None:
+    call = ToolCall(id="call-reused", name="catalog_search", arguments={})
+    first_assistant = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.ASSISTANT,
+        tool_calls=(call,),
+    )
+    result = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.TOOL,
+        content=(ToolResultBlock(call_id=call.id, output={}),),
+    )
+    second_assistant = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.ASSISTANT,
+        tool_calls=(call,),
+    )
+
+    with pytest.raises(ValueError, match="duplicate assistant tool-call IDs"):
+        ContextMessageGroup(
+            id="operation.reused-tool-call",
+            messages=(first_assistant, result, second_assistant),
+        )
+
+
 def test_context_block_rejects_missing_provenance_and_cross_operation_groups() -> None:
     first = ContextMessageGroup(id="first", messages=(_message("one"),))
     second = ContextMessageGroup(

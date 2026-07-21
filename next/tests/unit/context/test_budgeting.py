@@ -121,6 +121,59 @@ def test_required_context_overflow_fails_before_returning_partial_projection() -
     assert captured.value.profile_id == "mock:budget"
 
 
+def test_required_context_overflow_exposes_only_bounded_scalar_component_facts() -> (
+    None
+):
+    error = RequiredContextOverflow(
+        profile_id="mock:budget",
+        required_tokens=29,
+        available_tokens=20,
+        tool_tokens=7,
+        output_reserve_tokens=11,
+        input_limit_tokens=27,
+        required_system_tokens=3,
+        required_routing_tokens=2,
+        required_intent_tokens=4,
+        current_operation_envelope_tokens=5,
+        current_operation_body_tokens=6,
+        minimum_session_tokens=9,
+        projected_session_tokens=15,
+        optional_omitted_tokens=8,
+    )
+
+    assert error.total_required_tokens == 36
+    assert error.safe_facts == {
+        "available_tokens": 20,
+        "current_operation_body_tokens": 6,
+        "current_operation_envelope_tokens": 5,
+        "input_limit_tokens": 27,
+        "minimum_session_tokens": 9,
+        "optional_omitted_tokens": 8,
+        "output_reserve_tokens": 11,
+        "profile_id": "mock:budget",
+        "projected_session_tokens": 15,
+        "required_intent_tokens": 4,
+        "required_routing_tokens": 2,
+        "required_system_tokens": 3,
+        "required_tokens": 29,
+        "tool_tokens": 7,
+        "total_required_tokens": 36,
+    }
+    mutated = error.safe_facts
+    mutated["profile_id"] = "mock:changed"
+    assert error.profile_id == "mock:budget"
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        RequiredContextOverflow(
+            profile_id="mock:budget",
+            required_tokens=1,
+            available_tokens=0,
+            tool_tokens=0,
+            output_reserve_tokens=1,
+            required_system_tokens=False,
+        )
+
+
 def test_optional_blocks_select_by_priority_but_keep_declaration_order() -> None:
     required = _block("system.required", "required", priority=0, required=True)
     low = _block("memory.low", "low" * 20, priority=10)

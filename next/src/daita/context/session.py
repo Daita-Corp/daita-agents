@@ -22,7 +22,7 @@ from ..llm.models import (
 from ..operations.governance import ApprovalStatus
 from ..operations.models import OperationStatus
 from ..sessions import SessionCompressionCheckpoint, SessionTranscript
-from .budgeting import estimate_context_block_tokens
+from .budgeting import RequiredContextOverflow, estimate_context_block_tokens
 from .models import (
     ContextBlock,
     ContextKind,
@@ -232,15 +232,25 @@ class SessionOperationFacts:
 class SessionCompressionPolicy:
     """Hard deterministic bounds for one session projection."""
 
-    compression_threshold_tokens: int
+    schema_version: int = 1
+    compression_threshold_tokens: int | None = None
     retain_latest_operations: int = 4
     max_summary_characters: int = 16_384
     max_excerpt_characters: int = 512
     max_corrections: int = 32
 
     def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("session compression policy schema_version must be 1")
+        if self.compression_threshold_tokens is not None and (
+            not isinstance(self.compression_threshold_tokens, int)
+            or isinstance(self.compression_threshold_tokens, bool)
+            or self.compression_threshold_tokens < 1
+        ):
+            raise ValueError(
+                "compression_threshold_tokens must be a positive integer or None"
+            )
         for value, field_name in (
-            (self.compression_threshold_tokens, "compression_threshold_tokens"),
             (self.retain_latest_operations, "retain_latest_operations"),
             (self.max_summary_characters, "max_summary_characters"),
             (self.max_excerpt_characters, "max_excerpt_characters"),
@@ -401,6 +411,7 @@ class SessionCompressionService:
         session_id: str,
         current_operation_id: str,
         profile: ModelProfile,
+        maximum_projection_tokens: int,
     ) -> SessionContextProjection:
         for value, field_name in (
             (agent_id, "session projection agent_id"),
@@ -410,6 +421,14 @@ class SessionCompressionService:
             _required_text(value, field_name)
         if not isinstance(profile, ModelProfile):
             raise TypeError("session projection profile must be a ModelProfile")
+        if (
+            not isinstance(maximum_projection_tokens, int)
+            or isinstance(maximum_projection_tokens, bool)
+            or maximum_projection_tokens < 0
+        ):
+            raise ValueError(
+                "session maximum_projection_tokens must be a non-negative integer"
+            )
 
         transcript = await self._transcripts.load_session(agent_id, session_id)
         if transcript is None:
@@ -452,8 +471,13 @@ class SessionCompressionService:
                 facts=facts,
             )
 
+        configured_threshold = self._policy.compression_threshold_tokens
         threshold = min(
-            self._policy.compression_threshold_tokens,
+            (
+                max(1, profile.maximum_input_tokens * 3 // 4)
+                if configured_threshold is None
+                else configured_threshold
+            ),
             profile.maximum_input_tokens,
         )
         blocks = _projection_blocks(
@@ -467,49 +491,108 @@ class SessionCompressionService:
             policy=self._policy,
         )
         projected_tokens = sum(estimate_context_block_tokens(block) for block in blocks)
-        desired_prefix_count = max(
-            0,
-            len(historical_ids) - self._policy.retain_latest_operations,
-        )
         current_prefix_count = (
             0 if checkpoint is None else checkpoint.through_position + 1
         )
         compressed_now = False
-        if projected_tokens > threshold and desired_prefix_count > current_prefix_count:
-            prefix_ids = historical_ids[:desired_prefix_count]
-            checkpoint = self._new_checkpoint(
-                agent_id=agent_id,
-                session_id=session_id,
-                prefix_ids=prefix_ids,
-                messages_by_operation=messages_by_operation,
-                facts=facts,
-                previous=checkpoint,
+        threshold_exceeded = projected_tokens > threshold
+        residual_exceeded = projected_tokens > maximum_projection_tokens
+        threshold_requires_advance = threshold_exceeded and current_prefix_count < len(
+            historical_ids
+        )
+        if threshold_requires_advance or residual_exceeded:
+            available_recent = len(historical_ids) - current_prefix_count
+            maximum_recent = min(
+                self._policy.retain_latest_operations,
+                available_recent,
             )
-            committed = await self._committer.commit_session_compression(
-                checkpoint,
-                expected_version=(
-                    0 if checkpoint.version == 1 else checkpoint.version - 1
-                ),
+            first_candidate_prefix = len(historical_ids) - maximum_recent
+            winning_checkpoint: SessionCompressionCheckpoint | None = None
+            winning_blocks: tuple[ContextBlock, ...] | None = None
+            residual_checkpoint: SessionCompressionCheckpoint | None = None
+            residual_blocks: tuple[ContextBlock, ...] | None = None
+            minimum_tokens = projected_tokens
+            first_eligible_prefix = max(
+                current_prefix_count,
+                first_candidate_prefix,
             )
-            if not isinstance(committed, SessionCompressionCheckpoint):
-                raise SessionCompressionIntegrityError(
-                    "checkpoint committer returned an invalid record"
+            target_tokens = (
+                min(threshold, maximum_projection_tokens)
+                if threshold_exceeded
+                else maximum_projection_tokens
+            )
+            for prefix_count in range(
+                first_eligible_prefix,
+                len(historical_ids) + 1,
+            ):
+                if prefix_count == current_prefix_count:
+                    candidate_checkpoint = checkpoint
+                    candidate_blocks = blocks
+                    candidate_tokens = projected_tokens
+                else:
+                    candidate_checkpoint = self._new_checkpoint(
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        prefix_ids=historical_ids[:prefix_count],
+                        messages_by_operation=messages_by_operation,
+                        facts=facts,
+                        previous=checkpoint,
+                    )
+                    candidate_blocks = _projection_blocks(
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        current_operation_id=current_operation_id,
+                        historical_ids=historical_ids,
+                        messages_by_operation=messages_by_operation,
+                        facts=facts,
+                        checkpoint=candidate_checkpoint,
+                        policy=self._policy,
+                    )
+                    candidate_tokens = sum(
+                        estimate_context_block_tokens(block)
+                        for block in candidate_blocks
+                    )
+                minimum_tokens = candidate_tokens
+                if candidate_tokens <= maximum_projection_tokens:
+                    residual_checkpoint = candidate_checkpoint
+                    residual_blocks = candidate_blocks
+                    if candidate_tokens <= target_tokens:
+                        winning_checkpoint = candidate_checkpoint
+                        winning_blocks = candidate_blocks
+                        break
+
+            if winning_blocks is None and residual_blocks is not None:
+                winning_checkpoint = residual_checkpoint
+                winning_blocks = residual_blocks
+
+            if winning_blocks is None:
+                raise RequiredContextOverflow(
+                    profile_id=profile.id,
+                    required_tokens=minimum_tokens,
+                    available_tokens=maximum_projection_tokens,
+                    tool_tokens=0,
+                    output_reserve_tokens=profile.max_output_tokens,
+                    input_limit_tokens=maximum_projection_tokens,
+                    minimum_session_tokens=minimum_tokens,
+                    projected_session_tokens=projected_tokens,
                 )
-            if committed != checkpoint:
-                raise SessionCompressionIntegrityError(
-                    "checkpoint commit did not return the proposed CAS winner"
+
+            if winning_checkpoint is not None and winning_checkpoint != checkpoint:
+                committed = await self._committer.commit_session_compression(
+                    winning_checkpoint,
+                    expected_version=(0 if checkpoint is None else checkpoint.version),
                 )
-            compressed_now = True
-            blocks = _projection_blocks(
-                agent_id=agent_id,
-                session_id=session_id,
-                current_operation_id=current_operation_id,
-                historical_ids=historical_ids,
-                messages_by_operation=messages_by_operation,
-                facts=facts,
-                checkpoint=checkpoint,
-                policy=self._policy,
-            )
+                if not isinstance(committed, SessionCompressionCheckpoint):
+                    raise SessionCompressionIntegrityError(
+                        "checkpoint committer returned an invalid record"
+                    )
+                if committed != winning_checkpoint:
+                    raise SessionCompressionIntegrityError(
+                        "checkpoint commit did not return the proposed CAS winner"
+                    )
+                checkpoint = committed
+                compressed_now = True
+            blocks = winning_blocks
 
         return SessionContextProjection(
             agent_id=agent_id,

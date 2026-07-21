@@ -558,7 +558,10 @@ class OperationRuntime:
                     turn_id=model_call.turn_id,
                     code=readiness.code,
                     message=readiness.message,
-                    payload={"missing_facts": readiness.missing_facts},
+                    payload={
+                        "missing_facts": readiness.missing_facts,
+                        "repair_details": readiness.repair_details,
+                    },
                     success=False,
                     created_at=now,
                 )
@@ -2318,6 +2321,83 @@ class OperationRuntime:
                 },
             )
             result = self._fail_locked(state, reason)
+            await self._commit(state)
+            return result
+
+    async def fail_required_context(
+        self,
+        operation_id: str,
+        *,
+        profile_id: str,
+        input_limit_tokens: int,
+        output_reserve_tokens: int,
+        tool_tokens: int,
+        required_system_tokens: int,
+        required_routing_tokens: int,
+        required_intent_tokens: int,
+        current_operation_envelope_tokens: int,
+        current_operation_body_tokens: int,
+        minimum_session_tokens: int,
+        projected_session_tokens: int,
+        required_tokens: int,
+        available_tokens: int,
+        total_required_tokens: int,
+        optional_omitted_tokens: int | None,
+    ) -> LoopExit:
+        """Atomically persist one safe typed context-overflow decision."""
+
+        _required_text(profile_id, "context overflow profile_id")
+        if len(profile_id) > 256 or profile_id != profile_id.strip():
+            raise ValueError("context overflow profile_id must be bounded text")
+        numeric_facts = {
+            "available_tokens": available_tokens,
+            "current_operation_body_tokens": current_operation_body_tokens,
+            "current_operation_envelope_tokens": current_operation_envelope_tokens,
+            "input_limit_tokens": input_limit_tokens,
+            "minimum_session_tokens": minimum_session_tokens,
+            "output_reserve_tokens": output_reserve_tokens,
+            "projected_session_tokens": projected_session_tokens,
+            "required_intent_tokens": required_intent_tokens,
+            "required_routing_tokens": required_routing_tokens,
+            "required_system_tokens": required_system_tokens,
+            "required_tokens": required_tokens,
+            "tool_tokens": tool_tokens,
+            "total_required_tokens": total_required_tokens,
+        }
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in numeric_facts.values()
+        ):
+            raise ValueError(
+                "context overflow token facts must be non-negative integers"
+            )
+        if total_required_tokens != tool_tokens + required_tokens:
+            raise ValueError("context overflow total_required_tokens is inconsistent")
+        if optional_omitted_tokens is not None and (
+            not isinstance(optional_omitted_tokens, int)
+            or isinstance(optional_omitted_tokens, bool)
+            or optional_omitted_tokens < 0
+        ):
+            raise ValueError(
+                "context overflow optional_omitted_tokens must be a non-negative "
+                "integer or None"
+            )
+
+        async with self._lock:
+            state = await self._working_state(operation_id)
+            self._append_event(
+                state,
+                "context.required_overflow",
+                turn_id=state.turns[-1].id if state.turns else None,
+                payload={
+                    "code": "context.required_overflow",
+                    **numeric_facts,
+                    "optional_omitted_tokens": optional_omitted_tokens,
+                    "profile_id": profile_id,
+                    "schema_version": 1,
+                },
+            )
+            result = self._fail_locked(state, "context.required_overflow")
             await self._commit(state)
             return result
 

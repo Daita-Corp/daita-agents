@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 import hashlib
 from typing import cast
 
@@ -17,6 +17,7 @@ from daita.capabilities import (
     ExecutionRequest,
     ExecutorKnownNoEffectError,
     RiskLevel,
+    ToolApplicability,
     ToolView,
 )
 
@@ -100,6 +101,70 @@ def test_registry_projects_only_model_visible_capability_fields() -> None:
     assert not hasattr(tool, "risk")
 
 
+def test_tool_applicability_is_immutable_and_defaults_to_a_global_view() -> None:
+    first = ToolView(
+        name="read_fake_value",
+        capability_id="fake.read",
+        description="Read one fake value by key.",
+    )
+    second = ToolView(
+        name="read_fake_value_again",
+        capability_id="fake.read",
+        description="Read one fake value by key.",
+    )
+
+    assert first.applicability == ToolApplicability()
+    assert first.applicability is not second.applicability
+    assert first.applicability.source_adapter_ids == ()
+    assert first.applicability.minimum_active_sources == 0
+    assert first.applicability.required_configuration_flags == ()
+
+    declared = ToolApplicability(
+        source_adapter_ids=cast(
+            tuple[str, ...],
+            ["custom-adapter", "sqlite"],
+        ),
+        minimum_active_sources=2,
+        required_configuration_flags=cast(
+            tuple[str, ...],
+            ["write_access", "catalog_access"],
+        ),
+    )
+    assert declared.source_adapter_ids == ("custom-adapter", "sqlite")
+    assert declared.required_configuration_flags == (
+        "write_access",
+        "catalog_access",
+    )
+    with pytest.raises(FrozenInstanceError):
+        declared.minimum_active_sources = 1  # type: ignore[misc]
+
+    with pytest.raises(TypeError, match="must be a ToolApplicability"):
+        replace(first, applicability=cast(ToolApplicability, object()))
+
+
+def test_tool_applicability_rejects_unbounded_or_ambiguous_declarations() -> None:
+    with pytest.raises(TypeError, match="source_adapter_ids must be a sequence"):
+        ToolApplicability(
+            source_adapter_ids=cast(tuple[str, ...], "sqlite"),
+        )
+    with pytest.raises(ValueError, match="source_adapter_ids exceeds 32 items"):
+        ToolApplicability(
+            source_adapter_ids=tuple(f"adapter-{index}" for index in range(33)),
+        )
+    with pytest.raises(ValueError, match="source_adapter_ids must be unique"):
+        ToolApplicability(source_adapter_ids=("sqlite", "sqlite"))
+    with pytest.raises(ValueError, match="surrounding whitespace"):
+        ToolApplicability(source_adapter_ids=(" sqlite",))
+    with pytest.raises(ValueError, match="exceed 128 characters"):
+        ToolApplicability(required_configuration_flags=("x" * 129,))
+    with pytest.raises(ValueError, match="minimum_active_sources"):
+        ToolApplicability(minimum_active_sources=cast(int, True))
+    with pytest.raises(ValueError, match="minimum_active_sources"):
+        ToolApplicability(minimum_active_sources=-1)
+    with pytest.raises(ValueError, match="minimum_active_sources"):
+        ToolApplicability(minimum_active_sources=65)
+
+
 def test_registry_validates_declared_input_shape_without_coercion() -> None:
     registry = _registry()
 
@@ -107,14 +172,146 @@ def test_registry_validates_declared_input_shape_without_coercion() -> None:
     assert isinstance(validated, FrozenJsonObject)
     assert validated.to_dict() == {"key": "alpha"}
 
-    with pytest.raises(CapabilityInputError, match="required.*key"):
+    with pytest.raises(CapabilityInputError) as missing:
         registry.validate_arguments("fake.read", {})
+    assert missing.value.code == "capability.input.missing_required_fields"
+    assert missing.value.details == FrozenJsonObject.from_mapping(
+        {
+            "allowed_fields": ["key"],
+            "details_truncated": False,
+            "missing_fields": ["key"],
+        }
+    )
 
-    with pytest.raises(CapabilityInputError, match="string"):
-        registry.validate_arguments("fake.read", {"key": 42})
+    with pytest.raises(CapabilityInputError) as wrong_type:
+        registry.validate_arguments("fake.read", {"key": 42, "secret": "not-read"})
+    assert wrong_type.value.code == "capability.input.unexpected_fields"
+    assert "not-read" not in canonical_json(wrong_type.value.details)
 
-    with pytest.raises(CapabilityInputError, match="unexpected"):
+    with pytest.raises(CapabilityInputError) as unexpected:
         registry.validate_arguments("fake.read", {"key": "alpha", "extra": True})
+    assert unexpected.value.code == "capability.input.unexpected_fields"
+    assert unexpected.value.details == FrozenJsonObject.from_mapping(
+        {
+            "allowed_fields": ["key"],
+            "details_truncated": False,
+            "unexpected_fields": ["extra"],
+        }
+    )
+
+    with pytest.raises(CapabilityInputError) as wrong_type:
+        registry.validate_arguments("fake.read", {"key": 42})
+    assert wrong_type.value.code == "capability.input.type_mismatch"
+    assert wrong_type.value.details == FrozenJsonObject.from_mapping(
+        {
+            "actual_type": "integer",
+            "details_truncated": False,
+            "expected_type": "string",
+            "field_path": "$.key",
+        }
+    )
+
+
+def test_string_enum_is_declared_projected_and_validated_by_the_schema_owner() -> None:
+    capability = replace(
+        _capability(),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "key": {"type": "string"},
+                "mode": {
+                    "type": "string",
+                    "enum": ["strict", "stringify_integral"],
+                },
+            },
+            "required": ["key", "mode"],
+            "additionalProperties": False,
+        },
+    )
+    registry = CapabilityRegistry(
+        capabilities=(capability,),
+        executors=(NoopReadExecutor(),),
+        tool_views=(
+            ToolView(
+                name="read_fake_value",
+                capability_id=capability.id,
+                description="Read one fake value by key.",
+            ),
+        ),
+    )
+
+    assert (
+        registry.validate_arguments(
+            capability.id,
+            {"key": "alpha", "mode": "strict"},
+        )["mode"]
+        == "strict"
+    )
+    input_schema = registry.tool_definition("read_fake_value").input_schema
+    assert isinstance(input_schema, FrozenJsonObject)
+    projected = input_schema.to_dict()
+    properties = projected["properties"]
+    assert isinstance(properties, dict)
+    mode = properties["mode"]
+    assert isinstance(mode, dict)
+    assert mode["enum"] == [
+        "strict",
+        "stringify_integral",
+    ]
+
+    with pytest.raises(CapabilityInputError) as mismatch:
+        registry.validate_arguments(
+            capability.id,
+            {"key": "alpha", "mode": "coerce_everything"},
+        )
+    assert mismatch.value.code == "capability.input.enum_mismatch"
+    assert mismatch.value.details == FrozenJsonObject.from_mapping(
+        {
+            "allowed_values": ["strict", "stringify_integral"],
+            "details_truncated": False,
+            "field_path": "$.mode",
+        }
+    )
+    assert "coerce_everything" not in canonical_json(mismatch.value.details)
+
+
+@pytest.mark.parametrize(
+    "property_schema",
+    (
+        {"type": "integer", "enum": ["strict"]},
+        {"type": "string", "enum": []},
+        {"type": "string", "enum": ["strict", "strict"]},
+        {"type": "string", "enum": ["x" * 129]},
+        {"type": "string", "enum": [f"mode-{index}" for index in range(33)]},
+    ),
+)
+def test_string_enum_declarations_fail_closed(property_schema: object) -> None:
+    with pytest.raises(ValueError, match="enum"):
+        replace(
+            _capability(),
+            input_schema={
+                "type": "object",
+                "properties": {"key": property_schema},
+                "required": ["key"],
+                "additionalProperties": False,
+            },
+        )
+
+
+def test_capability_input_error_details_are_deterministic_and_bounded() -> None:
+    fields = [f"field-{index:02d}-" + ("x" * 120) for index in range(40)]
+    error = CapabilityInputError(
+        "capability.input.unexpected_fields",
+        "Capability input contains unexpected fields.",
+        {"allowed_fields": fields, "unexpected_fields": tuple(reversed(fields))},
+    )
+
+    assert error.details["details_truncated"] is True
+    assert len(canonical_json(error.details)) <= 1_536
+    allowed_fields_value = error.details["allowed_fields"]
+    assert isinstance(allowed_fields_value, tuple)
+    allowed_fields = cast(tuple[str, ...], allowed_fields_value)
+    assert allowed_fields == tuple(sorted(allowed_fields))
 
 
 def test_registry_rejects_duplicate_identity_and_unknown_capabilities() -> None:

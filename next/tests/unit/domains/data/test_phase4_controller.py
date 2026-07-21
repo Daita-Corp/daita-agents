@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime, timezone
 
+from daita._json import FrozenJsonObject
 from daita.capabilities import (
     AccessMode,
     Capability,
@@ -10,6 +11,7 @@ from daita.capabilities import (
     EvidenceCandidate,
     ExecutionRequest,
     RiskLevel,
+    ToolApplicability,
     ToolView,
 )
 from daita.domains.data import (
@@ -21,6 +23,7 @@ from daita.domains.data import (
     TABULAR_COMPARE_EVIDENCE_KIND,
     DataDomainController,
     ResourceSchema,
+    TabularEvidenceDataset,
 )
 from daita.llm.models import (
     CanonicalMessage,
@@ -47,9 +50,100 @@ FILE_REVISION = "sha256:" + ("a" * 64)
 DATABASE_REVISION = "sha256:" + ("b" * 64)
 
 
+class ComparisonDatasetReader:
+    def __init__(self, datasets: tuple[TabularEvidenceDataset, ...]) -> None:
+        self._datasets = {dataset.evidence_id: dataset for dataset in datasets}
+
+    async def load_dataset(
+        self,
+        *,
+        operation_id: str,
+        evidence_id: str,
+    ) -> TabularEvidenceDataset:
+        dataset = self._datasets[evidence_id]
+        assert dataset.operation_id == operation_id
+        return dataset
+
+
+def _comparison_dataset(
+    *,
+    operation_id: str,
+    evidence_id: str,
+    evidence_kind: str,
+    source_id: str,
+    resource_id: str,
+    revision: str,
+    rows: tuple[Mapping[str, object], ...] = (
+        {"id": 1, "name": "Ada", "status": "active"},
+    ),
+) -> TabularEvidenceDataset:
+    return TabularEvidenceDataset(
+        operation_id=operation_id,
+        evidence_id=evidence_id,
+        evidence_kind=evidence_kind,
+        source_id=source_id,
+        source_revision=f"revision:{source_id}",
+        resource_revisions=((resource_id, revision),),
+        columns=("id", "name", "status"),
+        rows=rows,
+        complete=True,
+        truncation_reasons=(),
+        row_limit=100,
+        byte_limit=65_536,
+    )
+
+
 class CatalogReader:
+    def __init__(self) -> None:
+        self.adapter_overrides: dict[str, str | None] = {}
+        self.identity_overrides: dict[str, tuple[str, str, str] | None] = {}
+        self.routing_sources: tuple[tuple[str, str, Mapping[str, object]], ...] = (
+            ("source-files", "local-directory", {}),
+            ("source-database", "sqlite", {"write_access": False}),
+        )
+
+    async def source_routing_facts(
+        self,
+        agent_id: str,
+        configuration_flags: tuple[str, ...],
+    ) -> tuple[FrozenJsonObject, ...]:
+        assert agent_id == "agent-atlas"
+        return tuple(
+            FrozenJsonObject.from_mapping(
+                {
+                    "adapter_id": adapter_id,
+                    "configuration_flags": {
+                        flag: configuration.get(flag) is True
+                        for flag in configuration_flags
+                    },
+                    "source_id": source_id,
+                }
+            )
+            for source_id, adapter_id, configuration in self.routing_sources
+        )
+
     async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None:
+        if source_id in self.adapter_overrides:
+            return self.adapter_overrides[source_id]
         return "local-directory" if source_id == "source-files" else "sqlite"
+
+    async def resource_identity(
+        self,
+        agent_id: str,
+        resource_id: str,
+    ) -> tuple[str, str, str] | None:
+        assert agent_id == "agent-atlas"
+        if resource_id in self.identity_overrides:
+            return self.identity_overrides[resource_id]
+        identities = {
+            "resource-export": ("source-files", "file", FILE_REVISION),
+            "resource-customers": (
+                "source-database",
+                "table",
+                DATABASE_REVISION,
+            ),
+        }
+        return identities.get(resource_id)
 
     async def resource_schemas(
         self,
@@ -233,6 +327,7 @@ def _registry(
                 "right_evidence_id": "string",
                 "key_columns": "array",
                 "compare_columns": "array",
+                "key_normalization": "string",
                 "test_truncated": "boolean",
             },
             {"left": "object", "right": "object", "truncated": "boolean"},
@@ -248,6 +343,20 @@ def _registry(
                     name=name,
                     capability_id=capability.id,
                     description=capability.description,
+                    applicability=ToolApplicability(
+                        source_adapter_ids=(
+                            ("local-directory",)
+                            if capability.id == LOCAL_FILE_READ_CAPABILITY_ID
+                            else (
+                                ("sqlite",)
+                                if capability.id == SQLITE_QUERY_CAPABILITY_ID
+                                else ()
+                            )
+                        ),
+                        minimum_active_sources=(
+                            2 if capability.id == TABULAR_COMPARE_CAPABILITY_ID else 1
+                        ),
+                    ),
                 )
                 for name, capability in zip(
                     ("data_read_file", "data_query_sqlite", "data_compare_tabular"),
@@ -270,6 +379,35 @@ def _ids(label: str):
     return factory
 
 
+async def _new_operation_snapshot(
+    registry: CapabilityRegistry,
+    *,
+    label: str,
+    kind: TriggerKind = TriggerKind.USER,
+):
+    runtime = OperationRuntime(
+        clock=lambda: NOW,
+        id_factory=_ids(label),
+        capabilities=registry,
+    )
+    payload: dict[str, object] = {"message": "Inspect available data."}
+    if kind is TriggerKind.MONITOR:
+        payload["monitor_scope"] = {
+            "resource_ids": [],
+            "source_ids": ["source-database"],
+        }
+    return await runtime.begin(
+        AgentTrigger(
+            id=f"trigger-{label}",
+            agent_id="agent-atlas",
+            kind=kind,
+            source_id="user:test" if kind is TriggerKind.USER else "monitor:test",
+            payload=payload,
+            created_at=NOW,
+        )
+    )
+
+
 async def _snapshot_with_reads(
     *,
     label: str,
@@ -278,9 +416,44 @@ async def _snapshot_with_reads(
     with_comparison: bool = False,
     comparison_truncated: bool = False,
     message: str = "Compare the newest export for discrepancies.",
+    catalog: CatalogReader | None = None,
+    comparison_left_rows: tuple[Mapping[str, object], ...] = (
+        {"id": 1, "name": "Ada", "status": "active"},
+    ),
+    comparison_right_rows: tuple[Mapping[str, object], ...] = (
+        {"id": 1, "name": "Ada", "status": "active"},
+    ),
 ) -> tuple[DataDomainController, OperationRuntime, tuple[Evidence, ...]]:
     registry, _ = _registry(file_source=file_source, query_source=query_source)
-    controller = DataDomainController(registry, CatalogReader(), clock=lambda: NOW)
+    operation_id = f"operation-{label}-1"
+    comparison_datasets = ComparisonDatasetReader(
+        (
+            _comparison_dataset(
+                operation_id=operation_id,
+                evidence_id=f"evidence-{label}-1",
+                evidence_kind=LOCAL_FILE_READ_EVIDENCE_KIND,
+                source_id=file_source,
+                resource_id="resource-export",
+                revision=FILE_REVISION,
+                rows=comparison_left_rows,
+            ),
+            _comparison_dataset(
+                operation_id=operation_id,
+                evidence_id=f"evidence-{label}-2",
+                evidence_kind=SQLITE_QUERY_EVIDENCE_KIND,
+                source_id=query_source,
+                resource_id="resource-customers",
+                revision=DATABASE_REVISION,
+                rows=comparison_right_rows,
+            ),
+        )
+    )
+    controller = DataDomainController(
+        registry,
+        CatalogReader() if catalog is None else catalog,
+        comparison_datasets=comparison_datasets,
+        clock=lambda: NOW,
+    )
     runtime = OperationRuntime(
         clock=lambda: NOW,
         id_factory=_ids(label),
@@ -322,6 +495,7 @@ async def _snapshot_with_reads(
                     "right_evidence_id": f"evidence-{label}-2",
                     "key_columns": ["id"],
                     "compare_columns": ["name", "status"],
+                    "key_normalization": "strict",
                     "test_truncated": comparison_truncated,
                 },
             )
@@ -400,6 +574,8 @@ def _comparison_call(
     label: str,
     left_id: str,
     right_id: str,
+    *,
+    key_normalization: str = "strict",
 ) -> ToolCall:
     return ToolCall(
         id=f"call-{label}-comparison-proposal",
@@ -409,9 +585,171 @@ def _comparison_call(
             "right_evidence_id": right_id,
             "key_columns": ["id"],
             "compare_columns": ["name", "status"],
+            "key_normalization": key_normalization,
             "test_truncated": False,
         },
     )
+
+
+async def test_tool_projection_uses_arbitrary_declared_adapter_without_controller_code() -> (
+    None
+):
+    base, _ = _registry(
+        file_source="source-files",
+        query_source="source-database",
+    )
+    executor = CandidateExecutor("test.warehouse.executor", "test.warehouse.result")
+    capability = _capability(
+        "test.warehouse.lookup",
+        executor.executor_id,
+        executor.evidence_kind,
+        {"query": "string"},
+        {"value": "string"},
+    )
+    registry = CapabilityRegistry.compose(
+        base,
+        CapabilityRegistry(
+            capabilities=(capability,),
+            executors=(executor,),
+            tool_views=(
+                ToolView(
+                    name="warehouse_lookup",
+                    capability_id=capability.id,
+                    description=capability.description,
+                    applicability=ToolApplicability(
+                        source_adapter_ids=("warehouse-v2",),
+                        minimum_active_sources=1,
+                    ),
+                ),
+            ),
+        ),
+    )
+    catalog = CatalogReader()
+    catalog.routing_sources = (("source-warehouse", "warehouse-v2", {}),)
+    controller = DataDomainController(registry, catalog, clock=lambda: NOW)
+    snapshot = await _new_operation_snapshot(registry, label="warehouse")
+
+    assert "warehouse_lookup" in {
+        tool.name for tool in await controller.tool_views(snapshot)
+    }
+    catalog.routing_sources = (("source-warehouse", "unrelated-adapter", {}),)
+    assert "warehouse_lookup" not in {
+        tool.name for tool in await controller.tool_views(snapshot)
+    }
+
+
+async def test_tool_projection_requires_exact_true_configuration_flag() -> None:
+    base, _ = _registry(
+        file_source="source-files",
+        query_source="source-database",
+    )
+    executor = CandidateExecutor("test.write.executor", "test.write.result")
+    capability = _capability(
+        "test.sqlite.write",
+        executor.executor_id,
+        executor.evidence_kind,
+        {"value": "string"},
+        {"value": "string"},
+    )
+    registry = CapabilityRegistry.compose(
+        base,
+        CapabilityRegistry(
+            capabilities=(capability,),
+            executors=(executor,),
+            tool_views=(
+                ToolView(
+                    name="sqlite_write",
+                    capability_id=capability.id,
+                    description=capability.description,
+                    applicability=ToolApplicability(
+                        source_adapter_ids=("sqlite",),
+                        minimum_active_sources=1,
+                        required_configuration_flags=("write_access",),
+                    ),
+                ),
+            ),
+        ),
+    )
+    catalog = CatalogReader()
+    controller = DataDomainController(registry, catalog, clock=lambda: NOW)
+    snapshot = await _new_operation_snapshot(registry, label="write-flag")
+    catalog.routing_sources = (("source-database", "sqlite", {"write_access": "true"}),)
+
+    assert "sqlite_write" not in {
+        tool.name for tool in await controller.tool_views(snapshot)
+    }
+    catalog.routing_sources = (("source-database", "sqlite", {"write_access": True}),)
+    assert "sqlite_write" in {
+        tool.name for tool in await controller.tool_views(snapshot)
+    }
+
+
+async def test_detached_source_removes_its_tool_views_on_next_projection() -> None:
+    registry, _ = _registry(
+        file_source="source-files",
+        query_source="source-database",
+    )
+    catalog = CatalogReader()
+    controller = DataDomainController(registry, catalog, clock=lambda: NOW)
+    snapshot = await _new_operation_snapshot(registry, label="detach")
+
+    assert {tool.name for tool in await controller.tool_views(snapshot)} == {
+        "data_compare_tabular",
+        "data_query_sqlite",
+        "data_read_file",
+    }
+    catalog.routing_sources = (("source-files", "local-directory", {}),)
+    assert {tool.name for tool in await controller.tool_views(snapshot)} == {
+        "data_read_file",
+    }
+
+
+async def test_monitor_projection_intersects_applicability_with_monitor_scope() -> None:
+    base, _ = _registry(
+        file_source="source-files",
+        query_source="source-database",
+    )
+    executor = CandidateExecutor("test.monitor-hidden.executor", "test.hidden.result")
+    capability = _capability(
+        "test.monitor-hidden",
+        executor.executor_id,
+        executor.evidence_kind,
+        {"value": "string"},
+        {"value": "string"},
+    )
+    registry = CapabilityRegistry.compose(
+        base,
+        CapabilityRegistry(
+            capabilities=(capability,),
+            executors=(executor,),
+            tool_views=(
+                ToolView(
+                    name="applicable_but_not_monitor_scoped",
+                    capability_id=capability.id,
+                    description=capability.description,
+                    applicability=ToolApplicability(
+                        source_adapter_ids=("sqlite",),
+                        minimum_active_sources=1,
+                    ),
+                ),
+            ),
+        ),
+    )
+    catalog = CatalogReader()
+    controller = DataDomainController(registry, catalog, clock=lambda: NOW)
+    user_snapshot = await _new_operation_snapshot(registry, label="user-tools")
+    monitor_snapshot = await _new_operation_snapshot(
+        registry,
+        label="monitor-tools",
+        kind=TriggerKind.MONITOR,
+    )
+
+    assert "applicable_but_not_monitor_scoped" in {
+        tool.name for tool in await controller.tool_views(user_snapshot)
+    }
+    assert "applicable_but_not_monitor_scoped" not in {
+        tool.name for tool in await controller.tool_views(monitor_snapshot)
+    }
 
 
 async def test_file_resource_scope_rejects_before_action_proposal() -> None:
@@ -430,8 +768,118 @@ async def test_file_resource_scope_rejects_before_action_proposal() -> None:
     result = await controller.validate_action(call, snapshot)
 
     assert isinstance(result, ActionRejection)
-    assert result.code == "data.file.catalog_resource_missing"
+    assert result.code == "data.file.resource_not_found"
     assert len((await runtime.inspect(snapshot.operation.id)).tasks) == task_count
+
+
+async def test_capability_input_repair_facts_survive_controller_validation() -> None:
+    controller, runtime, _ = await _snapshot_with_reads(label="typed-input")
+    snapshot = await runtime.inspect("operation-typed-input-1")
+
+    result = await controller.validate_action(
+        ToolCall(
+            id="call-typed-input-repair",
+            name="data_read_file",
+            arguments={"source_id": "source-files"},
+        ),
+        snapshot,
+    )
+
+    assert isinstance(result, ActionRejection)
+    assert result.code == "capability.input.missing_required_fields"
+    assert result.details["tool_name"] == "data_read_file"
+    assert result.details["capability_id"] == LOCAL_FILE_READ_CAPABILITY_ID
+    assert result.details["missing_fields"] == ("resource_id",)
+    assert result.details["allowed_fields"] == ("resource_id", "source_id")
+    assert result.details["details_truncated"] is False
+
+
+async def test_file_validation_distinguishes_revision_source_kind_and_adapter() -> None:
+    catalog = CatalogReader()
+    controller, runtime, _ = await _snapshot_with_reads(
+        label="file-repair",
+        catalog=catalog,
+    )
+    snapshot = await runtime.inspect("operation-file-repair-1")
+
+    revision = await controller.validate_action(
+        ToolCall(
+            id="call-file-revision",
+            name="data_read_file",
+            arguments={
+                "source_id": "source-files",
+                "resource_id": FILE_REVISION,
+            },
+        ),
+        snapshot,
+    )
+    assert isinstance(revision, ActionRejection)
+    assert revision.code == "data.file.revision_used_as_resource_id"
+    assert revision.details["resource_id"] == "resource-export"
+
+    catalog.identity_overrides["resource-export"] = (
+        "source-other-files",
+        "file",
+        FILE_REVISION,
+    )
+    wrong_source = await controller.validate_action(
+        ToolCall(
+            id="call-file-wrong-source",
+            name="data_read_file",
+            arguments={
+                "source_id": "source-files",
+                "resource_id": "resource-export",
+            },
+        ),
+        snapshot,
+    )
+    assert isinstance(wrong_source, ActionRejection)
+    assert wrong_source.code == "data.file.wrong_source"
+    assert wrong_source.details["actual_source_id"] == "source-other-files"
+
+    catalog.identity_overrides["resource-export"] = (
+        "source-files",
+        "table",
+        FILE_REVISION,
+    )
+    wrong_kind = await controller.validate_action(
+        ToolCall(
+            id="call-file-wrong-kind",
+            name="data_read_file",
+            arguments={
+                "source_id": "source-files",
+                "resource_id": "resource-export",
+            },
+        ),
+        snapshot,
+    )
+    assert isinstance(wrong_kind, ActionRejection)
+    assert wrong_kind.code == "data.file.resource_kind_mismatch"
+    assert wrong_kind.details["resource_kind"] == "table"
+
+    catalog.identity_overrides.clear()
+    catalog.adapter_overrides["source-files"] = "sqlite"
+    wrong_adapter = await controller.validate_action(
+        ToolCall(
+            id="call-file-wrong-adapter",
+            name="data_read_file",
+            arguments={
+                "source_id": "source-files",
+                "resource_id": "resource-export",
+            },
+        ),
+        snapshot,
+    )
+    assert isinstance(wrong_adapter, ActionRejection)
+    assert wrong_adapter.code == "data.file.source_tool_not_applicable"
+    assert wrong_adapter.details["source_adapter_id"] == "sqlite"
+    assert wrong_adapter.details["selected_tool_name"] == "data_read_file"
+    assert wrong_adapter.details["selected_capability_id"] == (
+        LOCAL_FILE_READ_CAPABILITY_ID
+    )
+    assert wrong_adapter.details["declared_applicable_adapter_ids"] == (
+        "local-directory",
+    )
 
 
 async def test_current_file_read_carries_exact_catalog_authority() -> None:
@@ -524,6 +972,75 @@ async def test_valid_distinct_source_evidence_becomes_comparison_proposal() -> N
     assert result.validation_facts.freshness_state == "current"
 
 
+async def test_comparison_preflight_rejections_create_no_task_or_evidence() -> None:
+    controller, runtime, evidence = await _snapshot_with_reads(
+        label="incompatible-keys",
+        comparison_left_rows=({"id": "1", "name": "Ada", "status": "active"},),
+        comparison_right_rows=({"id": 1, "name": "Ada", "status": "active"},),
+    )
+    before = await runtime.inspect("operation-incompatible-keys-1")
+
+    rejected = await controller.validate_action(
+        _comparison_call(
+            "incompatible-keys",
+            evidence[0].id,
+            evidence[1].id,
+            key_normalization="strict",
+        ),
+        before,
+    )
+    after = await runtime.inspect(before.operation.id)
+    readiness = await controller.evaluate_final_answer(
+        (
+            "The sources have discrepancies. "
+            f"[evidence:{evidence[0].id}] [evidence:{evidence[1].id}]"
+        ),
+        after,
+    )
+
+    assert isinstance(rejected, ActionRejection)
+    assert rejected.code == "data.compare.incompatible_key_types"
+    assert rejected.details["left_type_domain"] == ("string",)
+    assert rejected.details["right_type_domain"] == ("integer",)
+    assert after.tasks == before.tasks
+    assert after.evidence == before.evidence
+    assert readiness.allowed is False
+    assert readiness.code == "data.response_contract_incomplete"
+    assert readiness.missing_facts == (
+        "accepted current-operation comparison evidence",
+    )
+
+
+async def test_comparison_collision_preflight_creates_no_task_or_evidence() -> None:
+    controller, runtime, evidence = await _snapshot_with_reads(
+        label="collision-keys",
+        comparison_left_rows=(
+            {"id": "1", "name": "Ada", "status": "active"},
+            {"id": 1, "name": "Ada", "status": "active"},
+        ),
+        comparison_right_rows=({"id": 1, "name": "Ada", "status": "active"},),
+    )
+    before = await runtime.inspect("operation-collision-keys-1")
+
+    rejected = await controller.validate_action(
+        _comparison_call(
+            "collision-keys",
+            evidence[0].id,
+            evidence[1].id,
+            key_normalization="stringify_integral",
+        ),
+        before,
+    )
+    after = await runtime.inspect(before.operation.id)
+
+    assert isinstance(rejected, ActionRejection)
+    assert rejected.code == "data.compare.normalization_collision"
+    assert rejected.details["side"] == "left"
+    assert rejected.details["row_indexes"] == (0, 1)
+    assert after.tasks == before.tasks
+    assert after.evidence == before.evidence
+
+
 async def test_readiness_requires_comparison_and_both_input_citations() -> None:
     controller, runtime, evidence = await _snapshot_with_reads(
         label="ready",
@@ -549,8 +1066,28 @@ async def test_readiness_requires_comparison_and_both_input_citations() -> None:
     )
 
     assert no_comparison.allowed is False
+    assert no_comparison.code == "data.response_contract_incomplete"
+    assert FrozenJsonObject.from_mapping(no_comparison.repair_details).to_dict() == {
+        "required_citations": [
+            {
+                "citation": f"[evidence:{comparison.id}]",
+                "evidence_id": comparison.id,
+            },
+            {
+                "citation": f"[evidence:{left.id}]",
+                "evidence_id": left.id,
+            },
+            {
+                "citation": f"[evidence:{right.id}]",
+                "evidence_id": right.id,
+            },
+        ]
+    }
     assert missing_input.allowed is False
+    assert missing_input.code == "data.response_contract_incomplete"
+    assert missing_input.repair_details == no_comparison.repair_details
     assert ready.allowed is True
+    assert ready.code == "data.response_contract_satisfied"
 
 
 async def test_truncated_comparison_requires_explicit_partial_disclosure() -> None:
@@ -583,6 +1120,7 @@ async def test_truncated_comparison_requires_explicit_partial_disclosure() -> No
     assert negated.allowed is False
     assert negated.missing_facts == ("an explicit partial or truncation disclosure",)
     assert disclosed.allowed is True
+    assert disclosed.code == "data.response_contract_satisfied"
 
 
 async def test_reconciliation_language_requires_comparison_evidence() -> None:
@@ -598,6 +1136,7 @@ async def test_reconciliation_language_requires_comparison_evidence() -> None:
     )
 
     assert readiness.allowed is False
+    assert readiness.code == "data.response_contract_incomplete"
     assert readiness.missing_facts == (
         "accepted current-operation comparison evidence",
     )

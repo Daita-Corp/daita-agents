@@ -6,7 +6,8 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Protocol, TypeVar
 
-from ..llm.errors import ModelProviderError
+from ..context.budgeting import RequiredContextOverflow
+from ..llm.errors import ModelProviderError, ProviderErrorCode
 from ..llm.models import ModelRequest, ModelResponse, ToolCall, ToolDefinition
 from ..llm.protocols import ModelProvider
 from ..operations.checkpoints import ModelCall, ModelCallStatus, OperationSnapshot
@@ -47,7 +48,7 @@ class ContextBuilder(Protocol):
 class DomainController(Protocol):
     """Supplies domain semantics without owning runtime authority or progression."""
 
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]: ...
@@ -189,7 +190,10 @@ class AgentLoop:
         if terminal is not None:
             return terminal
         try:
-            tools = self._domain.tool_views(snapshot)
+            tools = await self._await_with_wall_time(
+                snapshot.operation.id,
+                lambda: self._domain.tool_views(snapshot),
+            )
             request = await self._await_with_wall_time(
                 snapshot.operation.id,
                 lambda: self._context_builder.build(snapshot, turn, tools),
@@ -205,6 +209,27 @@ class AgentLoop:
             )
         except _WallTimeExhausted:
             raise
+        except RequiredContextOverflow as error:
+            return await self._runtime.fail_required_context(
+                snapshot.operation.id,
+                profile_id=error.profile_id,
+                input_limit_tokens=error.input_limit_tokens,
+                output_reserve_tokens=error.output_reserve_tokens,
+                tool_tokens=error.tool_tokens,
+                required_system_tokens=error.required_system_tokens,
+                required_routing_tokens=error.required_routing_tokens,
+                required_intent_tokens=error.required_intent_tokens,
+                current_operation_envelope_tokens=(
+                    error.current_operation_envelope_tokens
+                ),
+                current_operation_body_tokens=error.current_operation_body_tokens,
+                minimum_session_tokens=error.minimum_session_tokens,
+                projected_session_tokens=error.projected_session_tokens,
+                required_tokens=error.required_tokens,
+                available_tokens=error.available_tokens,
+                total_required_tokens=error.total_required_tokens,
+                optional_omitted_tokens=error.optional_omitted_tokens,
+            )
         except Exception:
             return await self._runtime.fail(
                 snapshot.operation.id,
@@ -221,6 +246,12 @@ class AgentLoop:
                 operation_id,
                 model_call.id,
                 "model_provider_identity_changed",
+            )
+        if not _provider_supports_request_policy(self._model, model_call.request):
+            return await self._runtime.record_model_failure(
+                operation_id,
+                model_call.id,
+                ProviderErrorCode.INVALID_REQUEST.value,
             )
         try:
             response = await self._await_with_wall_time(
@@ -528,6 +559,26 @@ class AgentLoop:
                     return await self._runtime.fail(
                         operation_id,
                         "action_processing_failed",
+                    )
+
+                # The provider may emit a registered tool that was not exposed in
+                # this exact request.  Domain validation still runs so projection
+                # remains presentation metadata rather than an authorization
+                # grant, but an unexposed call must become model-visible repair
+                # evidence before the runtime can materialize a task.
+                if isinstance(validation, ActionProposal) and call.name not in {
+                    definition.name for definition in model_call.request.tools
+                }:
+                    validation = ActionRejection(
+                        code="action.tool_not_projected",
+                        message=(
+                            "The requested tool was not available for this model "
+                            "request."
+                        ),
+                        details={
+                            "capability_id": validation.capability_id,
+                            "tool_name": call.name,
+                        },
                     )
 
                 if isinstance(validation, ActionRejection):
@@ -1060,3 +1111,17 @@ class AgentLoop:
             except Exception:
                 break
         commit.result()
+
+
+def _provider_supports_request_policy(
+    provider: ModelProvider,
+    request: ModelRequest,
+) -> bool:
+    check = getattr(provider, "supports_request_policy", None)
+    if not callable(check):
+        return request.allow_parallel_tool_calls is None
+    try:
+        supported = check(request)
+    except Exception:
+        return False
+    return supported is True

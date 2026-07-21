@@ -84,7 +84,9 @@ def test_embedded_composition_binds_one_registry_and_one_blob_store() -> None:
     assert "local_file_read_declarations(" in source
     assert "tabular_comparison_declarations(" in source
     assert "postgresql_query_declarations(" in source
-    assert "PersistedAcceptedEvidenceDatasetReader(" in source
+    assert source.count("PersistedAcceptedEvidenceDatasetReader(") == 1
+    assert "tabular_comparison_declarations(comparison_datasets)" in source
+    assert "comparison_datasets=comparison_datasets" in source
 
 
 def test_public_surface_exports_the_sandboxed_source_not_its_backend() -> None:

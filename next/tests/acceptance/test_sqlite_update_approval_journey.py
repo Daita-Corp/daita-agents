@@ -34,6 +34,9 @@ class JourneyProvider:
         self.script: list[ModelResponse] = []
         self.requests: list[ModelRequest] = []
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         if not self.script:

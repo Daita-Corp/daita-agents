@@ -103,6 +103,11 @@ class OpenAICompatibleProvider:
     def provider_id(self) -> str:
         return f"{self.provider}:{self.model}"
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return True
+
     @property
     def client(self) -> _OpenAICompatibleClient:
         if self._client is None:
@@ -395,6 +400,8 @@ class OpenAICompatibleProvider:
                 "messages": _chat_messages(request.messages, self.provider_id),
                 "model": self.model,
             }
+            if request.allow_parallel_tool_calls is not None:
+                arguments["parallel_tool_calls"] = request.allow_parallel_tool_calls
             if request.tools:
                 arguments["tools"] = [
                     {

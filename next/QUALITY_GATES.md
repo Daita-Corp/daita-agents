@@ -786,3 +786,186 @@ satisfy any behavioral or gate row below.
 - [x] One reviewed `chore(v2-phase-9-5): complete phase 9.5 gate` commit contains
       the final ledger evidence. Phase 10 remains excluded before and after
       that commit unless separately authorized.
+
+## Live LLM readiness — Wave 1
+
+Status: **LLM-G00 PASS; LLM-G01 PASS; LLM-G02 FAIL.** The deterministic
+harness and all non-live regression gates pass, but the first authorized real
+OpenAI execution failed every row. No real-provider acceptance is claimed, no
+repair or rerun occurred, no later wave is started, and Phase 10 remains
+excluded.
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| W1-Q01 | `next/` | `../.venv/bin/python -m pytest tests/live/mvp -m 'not requires_llm' -q -rs` | PASS — 8 fixture/oracle/configuration/prompt/redaction self-tests. Manifest `wave1-commerce-v1` reproduces digest `sha256:a313d61d1e4dc0411b02e3d3314ba49b18dc238ea62621f1d77b9f5b4f01439c`; prompt corpus `wave1-prompts-v1` has three uncoached variants for each of four scenarios. |
+| W1-Q02 | `next/`, named selectors and credential absent from the process | `../.venv/bin/python -m pytest tests/live/mvp -m requires_llm -q -rs` | BLOCKED / NOT RUN — 12/12 rows skipped before provider construction. The exact missing process settings were `DAITA_RUN_LIVE_LLM=1`, `DAITA_RUN_LIVE_MVP=1`, `DAITA_LIVE_MVP_PROVIDER=openai`, `DAITA_LIVE_MVP_MODEL=<explicit-model>`, and `OPENAI_API_KEY`. Zero remote calls, tokens, tool calls, provider latency, retries, or fallbacks were recorded. A repository-local dotenv contains a named credential, but the harness did not load it or infer a model. |
+| W1-Q03 | `next/`, CPython 3.11.15 | `../.venv/bin/python -m pytest tests/ -m 'not requires_llm and not requires_db' -q -rs -p no:cacheprovider --junitxml=/private/tmp/daita-wave1-deterministic.xml` | PASS — 1,640 passed and two known sandbox-only Unix-socket tests skipped; 1,642 selected in 74.356s. No production code changed, so a second complete-interpreter run was not required by the Wave 1 contract. |
+| W1-Q04 | `next/` | Black over `src tests scripts`; byte compilation; full mypy with `MYPYPATH=src`; Pyright 1.1.411; all architecture tests | PASS after one test-only unused-import repair — Black leaves 288 files unchanged; compilation succeeds; mypy reports no issues in 287 files; Pyright reports zero errors/warnings; 94 architecture tests pass. |
+| W1-Q05 | repository root and `next/` | `scripts/build_test_disposition.py --check`; `next/scripts/capture_v1_oracles.py --check`; baseline-scoped root diff; `git diff --check`; root `pytest tests/ -m 'not requires_llm and not requires_db'` | PASS — generated disposition and four frozen-v1 fixtures reproduce; root production/tests/metadata match `b87df31873d33fffbf50498f5dc4d8892115e8f8`; the diff is whitespace-clean and confined to `next/`; root reports 2,498 passed and 221 deselected. |
+| W1-Q06 | repository root, with user-approved synthetic-data transmission and credential loaded from `.env` without printing it | `set -a; source .env; set +a; DAITA_RUN_LIVE_LLM=1 DAITA_RUN_LIVE_MVP=1 DAITA_LIVE_MVP_PROVIDER=openai DAITA_LIVE_MVP_MODEL=gpt-4.1-mini .venv/bin/python -m pytest next/tests/live/mvp -m "requires_llm and acceptance" -q -rs -s -p no:cacheprovider --junitxml=/private/tmp/daita-live-mvp-wave1.xml` | FAIL — 12 failed, zero passed/skipped in 340.079s on CPython 3.11.15. All 74 real OpenAI calls completed without provider error. Retained operations record 273,205 input and 11,727 output tokens, 47 tasks, and 47 accepted evidence records; retries/fallbacks were zero. No failed row was rerun. |
+| W1-Q07 | retained synthetic pytest homes and JUnit, read-only | Existing `assert_artifacts_redacted` plus a SQLite cross-session scan using the configured secret and generated sentinel values without printing either | PASS — the credential is absent from all retained Agent Homes and JUnit; all three isolation sentinels are absent from primary-session model requests. The first diagnostic command referenced `.env` from the wrong directory and performed no scan; the corrected `../.env` command passed. |
+
+### First live row results
+
+| Scenario / variant | Seconds | Calls / tasks | Input / output tokens | Terminal reason | Observed failure evidence |
+| --- | ---: | ---: | ---: | --- | --- |
+| LIVE-MVP-01 direct | 58.958 | 9 / 4 | 37,180 / 1,264 | `repair_budget_exhausted` | Repeated missing-column and invalid-action repairs; one query completed but the operation did not reach grounded readiness. |
+| LIVE-MVP-01 conversational | 59.986 | 7 / 5 | 29,184 / 1,395 | `repair_budget_exhausted` | Wrong adapter/SQL rejections followed by five accepted query results and repeated `data.not_grounded`. |
+| LIVE-MVP-01 ambiguous | 29.838 | 6 / 5 | 27,086 / 1,591 | `repair_budget_exhausted` | Inspections succeeded; invalid arguments and a nonexistent file resource prevented a completed answer. |
+| LIVE-MVP-02 direct | 29.590 | 7 / 5 | 38,192 / 867 | `repair_budget_exhausted` | Five query results were accepted, but each final candidate remained `data.not_grounded`. |
+| LIVE-MVP-02 conversational | 15.711 | 3 / 4 | 11,880 / 1,002 | `no_progress_action_failure_limit` | Four inspections succeeded; two repeated missing-column SQL actions triggered no-progress termination. |
+| LIVE-MVP-02 ambiguous | 55.785 | 12 / 9 | 63,651 / 2,102 | `turn_budget_exhausted` | Nine queries succeeded amid wrong-adapter and missing-column repairs; no completed grounded answer emerged. |
+| LIVE-MVP-03 direct | 17.666 | 5 / 0 | 9,113 / 597 | `repair_budget_exhausted` | File resource selection and arguments were invalid; no task executed. |
+| LIVE-MVP-03 conversational | 27.406 | 7 / 5 | 31,275 / 1,068 | `repair_budget_exhausted` | Searches and two file reads succeeded, but invalid comparison/query arguments left the result ungrounded. |
+| LIVE-MVP-03 ambiguous | 14.404 | 5 / 0 | 9,831 / 742 | `repair_budget_exhausted` | Repeated missing file-resource choices; no task executed. |
+| LIVE-MVP-04 direct | 9.709 | 4 / 2 | 4,573 / 281 | `context_build_failed` | The isolation operation repaired wrong-adapter/missing-column actions, then its required current-operation context exceeded the 5,000-token profile. |
+| LIVE-MVP-04 conversational | 12.062 | 5 / 6 | 6,630 / 520 | `context_build_failed` | The isolation operation completed; the primary operation accepted four query results, then failed building its next context. |
+| LIVE-MVP-04 ambiguous | 8.860 | 4 / 2 | 4,610 / 298 | `context_build_failed` | Same isolation-path wrong-adapter/missing-column repairs followed by context construction failure. |
+
+LLM-G00 now passes for the explicit OpenAI/`gpt-4.1-mini`/CPython 3.11.15
+reference. LLM-G01 retains its deterministic PASS, with a newly observed
+reporting gap: every failed test warned that `record_property` is incompatible
+with xUnit2 and the assertions stopped before properties were recorded.
+LLM-G02 fails. The completed read-only root-cause review supersedes the
+provisional model-only classification. Direct product-contract causes include
+newest-evidence context truncation (MVP-01 conversational) and false-positive
+CTE validation (MVP-02 conversational); source/tool/catalog/repair defects
+amplified most other model mistakes. Genuine model errors remain. All three
+MVP-04 rows are primarily test-fixture failures caused by the nonviable
+5,000-token profile and did not reach compression. Latent evaluator defects
+would also reject some valid recovered paths. No provider-adapter execution or
+infrastructure failure was observed. Exact row attribution, numeric context
+overflow reconstruction, latent blockers, and the owner-aligned P0/P1 proof
+plan are recorded in
+`docs/LIVE_MVP_WAVE1_FAILURE_ANALYSIS_2026-07-20.md`. No production/test repair,
+prompt change, budget change, or live rerun occurred during analysis.
+
+### Wave 1 repair — consolidated pre-live gate
+
+Status: **PRE-LIVE PASS; LLM-G01 PASS; LLM-G02 remains FAIL until the one
+authorized repaired real-provider run passes all 12 rows.** The immutable first
+live execution and failure analysis above are unchanged. No paid inference was
+used during repair or this gate.
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| W1-RQ01 | `next/`, CPython 3.11.15 | The named repair-owner selection shown below, covering versioned capability/model/config/storage contracts, migration/corruption/reopen, observations/context/session, catalog/routing/SQL/comparison, providers/request policy, runtime repair/budgets, and `tests/live/mvp` with live rows deselected | PASS — 442 tests in 46.054s; JUnit `/private/tmp/daita-wave1-repair-focused-final.xml`. |
+| W1-RQ02 | `next/`, CPython 3.11.15 | `PYTHONPATH=/Users/jendala/daita/daita-agents/next/src:/Users/jendala/daita/daita-agents/.venv/lib/python3.11/site-packages /Users/jendala/daita/daita-agents/.venv/bin/python -S -m pytest -o addopts='' tests/live/mvp -m 'not requires_llm' -q -rs -p no:cacheprovider --junitxml=/private/tmp/daita-wave1-harness-final-py311.xml -o junit_family=xunit1` | PASS — 32 passed and 12 live rows deselected in 1.15s. The fixture digest, three unchanged natural variants for each scenario, exact 12-row collection, full comparison kinds, exact runtime correlations, graph provenance, failure-path metrics, JSON/JUnit output, and redaction checks pass. |
+| W1-RQ03 | `next/`, CPython 3.11.15 and 3.12.7 | `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/Users/jendala/daita/daita-agents/next/src:/Users/jendala/daita/daita-agents/.venv/lib/python3.11/site-packages /Users/jendala/daita/daita-agents/.venv/bin/python -S -m pytest -o addopts='' tests/ -m 'not requires_llm and not requires_db' -q -rs --tb=short -p no:cacheprovider --junitxml=/private/tmp/daita-wave1-repair-final-py311.xml -o junit_family=xunit1`; repeat with `PYTHONPATH=/Users/jendala/daita/daita-agents/next/src:/opt/homebrew/Caskroom/miniforge/base/lib/python3.12/site-packages /opt/homebrew/Caskroom/miniforge/base/bin/python3.12` and JUnit `daita-wave1-repair-final-py312.xml` | PASS — 1,813 passed, two sandbox-only Unix-socket skips, and 21 live/database deselections on each interpreter in 116.77s/131.76s. |
+| W1-RQ04 | `next/` | `../.venv/bin/black --check src tests scripts examples`; `../.venv/bin/python -m compileall -q src tests scripts examples`; `MYPYPATH=src ../.venv/bin/python -m mypy src/daita tests scripts/build_test_disposition.py scripts/verify_candidate_lifecycle.py`; `npx --yes pyright@1.1.411 --pythonpath ../.venv/bin/python` | PASS — Black leaves 303 files unchanged; compilation exits zero; mypy is clean over 291 files; Pyright reports 0 errors and 0 warnings. |
+| W1-RQ05 | `next/`, isolated CPython 3.11.15 | `PYTHONPATH=/Users/jendala/daita/daita-agents/next/src:/Users/jendala/daita/daita-agents/.venv/lib/python3.11/site-packages /Users/jendala/daita/daita-agents/.venv/bin/python -S -m pytest -o addopts='' tests/architecture -q -p no:cacheprovider --junitxml=/private/tmp/daita-wave1-architecture-final.xml -o junit_family=xunit1` | PASS — 95 passed in 11.70s. |
+| W1-RQ06 | repository root and `next/` | `../.venv/bin/python scripts/build_test_disposition.py --check`; isolated `next/scripts/capture_v1_oracles.py --check`; `git diff --quiet b87df31873d33fffbf50498f5dc4d8892115e8f8 -- daita tests pyproject.toml`; root safe pytest selection; `git diff --check` | PASS — generated disposition and all four frozen-v1 fixtures reproduce; root-v1 paths have no status/diff; root reports 2,498 passed and 221 deselected in 11.04s; diff check is clean. |
+| W1-RQ07 | repository root | `PYTHONPATH=next/src .venv/bin/python -m pytest -o addopts='' next/tests/contract/packaging -q -p no:cacheprovider --junitxml=/private/tmp/daita-wave1-packaging-final.xml -o junit_family=xunit1` | PASS — 26 packaging contracts in 3.41s. |
+| W1-RQ08 | `next/`, clean temporary copies | `../.venv/bin/python scripts/verify_candidate_lifecycle.py --python /opt/homebrew/bin/python3.11 --python /opt/homebrew/Caskroom/miniforge/base/bin/python3.12`; repeat with `--phase-9-5-joined` | PASS — clean 106-entry wheel/133-entry sdist; dependency-free and joined OpenAI/SQLite installed lifecycles succeed on Python 3.11.15/3.12.7, including local host inference, cold reopen without model injection, uninstall, and retained state. |
+| W1-RQ09 | repository root after pre-live ledger update | `PYTHONPATH=next/src .venv/bin/python -m pytest -o addopts='' next/tests/architecture/test_release_documentation.py next/tests/architecture/test_parity_matrix.py -q -p no:cacheprovider`; `git diff --check` | PASS — 13 documentation/parity contracts in 0.21s and a clean diff check. |
+
+The W1-RQ01 command was:
+
+```text
+PYTHONPATH=src ../.venv/bin/python -m pytest -o addopts='' tests/unit/test_capabilities.py tests/unit/context/test_models.py tests/unit/context/test_budgeting.py tests/unit/context/test_session_compression.py tests/unit/catalog/test_protocols.py tests/unit/catalog/test_sqlite_catalog_service.py tests/unit/storage/test_sqlite_catalog_store.py tests/unit/storage/test_sqlite_codec_corruption.py tests/contract/storage/test_sqlite_operation_store.py tests/contract/storage/test_sqlite_task_migration.py tests/contract/storage/test_sqlite_approval_projection.py tests/contract/config/test_runtime_configuration.py tests/unit/domains/data/test_phase4_capabilities.py tests/unit/domains/data/test_controller_context.py tests/unit/domains/data/test_phase4_controller.py tests/unit/domains/data/test_postgresql_controller.py tests/unit/domains/data/test_sql.py tests/unit/domains/data/test_sql_derived_relations.py tests/unit/domains/data/test_tabular_comparison_policy.py tests/unit/domains/data/test_tool_applicability_declarations.py tests/acceptance/test_local_file_comparison_journey.py tests/acceptance/test_session_compression_journey.py tests/unit/operations/test_runtime_budgets.py tests/unit/operations/test_runtime_repairs.py tests/unit/loop/test_context_tool_boundary.py tests/unit/llm/test_llm_models.py tests/unit/llm/test_openai_provider.py tests/unit/llm/test_openai_compatible_provider.py tests/unit/llm/test_anthropic_provider.py tests/unit/llm/test_gemini_provider.py tests/unit/llm/test_routing.py tests/live/mvp -m 'not requires_llm and not requires_db' -q -p no:cacheprovider --junitxml=/private/tmp/daita-wave1-repair-focused-final.xml -o junit_family=xunit1
+```
+
+Pre-live red/repair evidence is retained rather than rewritten: the first broad
+repair run found the stale parity anchor and offline example request-policy
+fixture (1,801 passed, two skipped, 21 deselected, two failed); focused repairs
+passed. The first final dual-interpreter run then found one stale
+threshold-as-retention-floor expectation in the approval-projection contract
+(1,812 passed, two skipped, 21 deselected, one failed on each interpreter).
+The corrected approval projection passed on both interpreters, and the complete
+W1-RQ03 rerun above is green. No failed live row was executed or rerun during
+these deterministic repairs.
+
+### Wave 1 repair — one authorized live execution
+
+Status: **LLM-G01 PASS; LLM-G02 FAIL.** All pre-live gates above were green,
+so the unchanged 12-row corpus ran once. It produced 12 failures and zero
+passes. The artifacts were preserved and reviewed read-only; no failed row was
+rerun and no production/evaluator repair followed the result.
+
+| ID | Working directory | Exact command/scope | Result |
+| --- | --- | --- | --- |
+| W1-RQ10 | `next/`, CPython 3.11.15, credential loaded from repository `.env` without printing it | `set -a; source /Users/jendala/daita/daita-agents/.env; set +a; DAITA_RUN_LIVE_LLM=1 DAITA_RUN_LIVE_MVP=1 DAITA_LIVE_MVP_PROVIDER=openai DAITA_LIVE_MVP_MODEL=gpt-4.1-mini DAITA_LIVE_MVP_JSON_SIDECAR=/private/tmp/daita-wave1-repair-live.XWPkkC/wave1.json PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/Users/jendala/daita/daita-agents/next/src:/Users/jendala/daita/daita-agents/.venv/lib/python3.11/site-packages /Users/jendala/daita/daita-agents/.venv/bin/python -S -m pytest -o addopts='' tests/live/mvp/test_data_journeys_live.py tests/live/mvp/test_sessions_live.py -m 'requires_llm and acceptance' -q -rs -s -p no:cacheprovider --basetemp=/private/tmp/daita-wave1-repair-live.XWPkkC/homes --junitxml=/private/tmp/daita-wave1-repair-live.XWPkkC/wave1.xml -o junit_family=xunit1 -o log_file=/private/tmp/daita-wave1-repair-live.XWPkkC/wave1.log -o log_file_level=INFO` | FAIL — 12 failed, zero passed/skipped in 746.25s. All 105 real OpenAI `gpt-4.1-mini` calls completed; 87 tool calls, 51 tasks, 50 evidence records, 44 repairs, 497,195 input plus 19,204 output tokens, 420,935ms provider latency, zero retries, and zero fallbacks. This is the sole repaired live run. |
+| W1-RQ11 | `/private/tmp/daita-wave1-repair-live.XWPkkC`, read-only retained sidecar/JUnit/log/homes | Harness session-finish configured-secret/session-sentinel scan; sidecar/JUnit structural review; per-operation SQLite and comparison-artifact review | PASS for artifact integrity/redaction — sidecar schema 1 has exactly 12 rows; JUnit has 12 failures/zero errors; the log records successful provider responses only; configured credentials and complete generated session sentinels are absent from the sidecar, JUnit, log, and retained homes. The artifacts remain private and unchanged. |
+| W1-RQ12 | `next/`, after failure-ledger updates only | `PYTHONPATH=src ../.venv/bin/python -m pytest -o addopts='' tests/architecture/test_release_documentation.py tests/architecture/test_parity_matrix.py -q -p no:cacheprovider`; `git diff --check` | PASS — 13 documentation/parity contracts in 0.21s and a clean diff check. No behavioral or live test was rerun. |
+
+Overall recorded metrics are 15 operations, 105 model calls, 87 tool calls,
+51 actions/tasks, 50 accepted evidence records, 36 rejected actions, 44
+repairs, 497,195 input tokens, 19,204 output tokens, 516,399 total tokens,
+420,935ms provider latency, and 743.346086s summed row wall time. Selected
+context was 432,240 tokens; omitted context, source/projection truncation,
+cancelled tasks, retries, and fallbacks were all zero. Two harmless duplicate
+reads were recorded. The normalized estimated-cost field was zero and is not
+reported as an actual price estimate.
+
+| Scenario / variant | Calls / tasks / evidence | Repairs / rejected | Input / output tokens | Wall / provider latency | Terminal and decisive failure |
+| --- | ---: | ---: | ---: | ---: | --- |
+| LIVE-MVP-01 direct | 2 / 1 / 0 | 1 / 1 | 3,399 / 453 | 9.609103s / 9,396ms | `action_processing_failed`; invented SQL was typed-rejected, then a model-corrupted resource ID became fatal generic `executor_failed` instead of repair evidence (mixed model/framework). |
+| LIVE-MVP-01 conversational | 10 / 5 / 5 | 5 / 4 | 62,261 / 2,589 | 99.805195s / 52,147ms | `repair_budget_exhausted`; cited-answer repair followed accepted but semantically wrong `$195.23` query evidence (model). |
+| LIVE-MVP-01 ambiguous | 8 / 4 / 4 | 3 / 3 | 40,166 / 1,566 | 46.102159s / 31,199ms | Completed, but used the forbidden archive and returned `0`/`NULL`; required current-resource inspection and hard `4`/`$162.00` oracle fail (model). |
+| LIVE-MVP-02 direct | 10 / 7 / 7 | 2 / 2 | 56,599 / 1,833 | 109.622030s / 42,961ms | Completed `Europe`/`$50.00` without accepted graph traversal; required `$125.00` oracle fails (model). |
+| LIVE-MVP-02 conversational | 10 / 5 / 5 | 4 / 4 | 62,611 / 2,856 | 102.489737s / 55,188ms | Completed from empty rows after wrong status semantics, without graph traversal; hard oracle fails (model). |
+| LIVE-MVP-02 ambiguous | 8 / 3 / 3 | 5 / 5 | 43,565 / 852 | 56.099057s / 22,791ms | `repair_budget_exhausted`; repeated schema guessing produced no accepted query or traversal evidence (model; framework failed closed). |
+| LIVE-MVP-03 direct | 6 / 3 / 3 | 2 / 1 | 21,852 / 1,082 | 27.998157s / 20,770ms | Exact five-discrepancy result, but zero accepted inspections meant “newest” was unproven (model provenance failure). |
+| LIVE-MVP-03 conversational | 6 / 3 / 3 | 2 / 1 | 23,001 / 998 | 30.599051s / 22,012ms | Exact five-discrepancy result after typed key-policy repair, but zero freshness inspection (model provenance failure). |
+| LIVE-MVP-03 ambiguous | 6 / 3 / 3 | 2 / 0 | 22,260 / 1,067 | 26.388884s / 19,515ms | Chose the older file and queried only IDs 1–3; comparison scope and freshness oracle fail (model). |
+| LIVE-MVP-04 direct | 11 / 5 / 5 | 5 / 5 | 35,161 / 1,390 | 43.826481s / 29,615ms | Isolation succeeded; primary hit `no_progress_action_failure_limit` after invalid SQL (model; framework failed closed). |
+| LIVE-MVP-04 conversational | 15 / 6 / 6 | 7 / 6 | 67,147 / 2,667 | 115.311781s / 63,753ms | Both operations completed, but primary cited `0`/`NULL` instead of `4`/`$162.00`; hard evidence oracle correctly failed (model). |
+| LIVE-MVP-04 ambiguous | 13 / 6 / 6 | 6 / 4 | 59,173 / 1,851 | 75.494452s / 51,588ms | Isolation succeeded; primary omitted active-customer semantics, found `5`/`$174.99`, then exhausted citation repair (model). |
+
+All three MVP-04 isolation sentinels remained outside primary-session model
+requests. No MVP-04 row reached follow-up history, compression, or cold reopen,
+so those live contracts remain unexercised. A latent evaluator risk was found
+after MVP-03: discrepancy prose split across adjacent lines may be rejected by
+the newline-local identity check. It did not cause these failures because all
+three rows first lacked authoritative file freshness inspection. Requiring
+current-table inspection may also be stronger than necessary but was likewise
+not decisive. LLM-G02 therefore remains FAIL; later waves and Phase 10 are not
+authorized by this record.
+
+### Wave 1 — outcome-first MVP benchmark
+
+Status: **LLM-G01 PASS; LLM-G02 FAIL.** By explicit user direction, the live
+rows were reordered and narrowed to an MVP contract: exact business outcome,
+read-only safety, and accepted evidence supporting the answer are hard layers.
+Prescribed catalog/tool choreography, graph depth, duplicate reads, and other
+pre-cutover robustness checks are diagnostic or separately marked
+`live_precutover`.
+
+| ID | Scope | Result |
+| --- | --- | --- |
+| W1-MB01 | `tests/live/mvp/test_evaluator_contracts.py` | PASS — 27 tests in 2.59s. |
+| W1-MB02 | `tests/live/mvp -m 'not requires_llm'` | PASS — 37 passed and 15 deselected in 2.88s. |
+| W1-MB03 | Exact `live_mvp` collection | PASS — 12 rows: LIVE-MVP-01 through 04 direct, then conversational, then answerable-ambiguous; three `live_precutover` rows excluded. |
+| W1-MB04 | Complete deterministic suite on CPython 3.11.15 and 3.12.7 | PASS — 1,818 passed, two skipped, and 24 deselected in 137.10s / 151.40s. |
+| W1-MB05 | Black, byte compilation, mypy, Pyright, architecture, and `git diff --check` | PASS — 303 files formatted; compilation clean; mypy clean over 289 files; Pyright 0 errors/warnings; 95 architecture tests pass. |
+| W1-MB06 | One ordered OpenAI `gpt-4.1-mini` execution with exact `live_mvp` selector, CPython 3.11.15 | FAIL — 12 failed and three pre-cutover rows deselected in 1,341.85s. Artifacts: `/private/tmp/daita-wave1-mvp-benchmark.dzwuoC/{wave1.json,wave1.xml,wave1.log,homes}`. No row was rerun. |
+| W1-MB07 | Failure-safe sidecar and prohibited-value scans | PASS — schema-1 sidecar contains all 12 rows; the configured credential is absent from retained homes/reports/logs; no complete generated session sentinel appears in JSON, JUnit, or log. |
+
+Aggregate live metrics: 165 provider calls, 142 tool calls, 82 actions, 71
+repairs, 60 rejected actions, 871,460 input plus 27,450 output tokens (898,910
+total), 683,768ms provider latency, 1,335.236926s summed row wall time, six
+duplicate reads, zero retries, zero fallbacks, zero omitted context tokens, and
+zero observation/evidence truncations. OpenAI completed every provider request.
+
+| Order | Row | Hard-layer result | Decisive observation |
+| ---: | --- | --- | --- |
+| 1 | LIVE-MVP-01 direct | outcome/safety/evidence fail | Five typed `data.sql.missing_column` rejections exhausted repair budget; no query evidence. |
+| 2 | LIVE-MVP-02 direct | outcome fail; safety pass; evidence unavailable | Four missing-column rejections and repeated tool use exhausted the turn budget. |
+| 3 | LIVE-MVP-03 direct | outcome fail; safety/evidence unavailable | Comparison bounds/type and read-statement rejections exhausted repair budget. |
+| 4 | LIVE-MVP-04 direct | outcome/evidence fail; safety pass | Initial and follow-up answers were semantically wrong; post-reopen repair budget exhausted. |
+| 5 | LIVE-MVP-01 conversational | outcome/evidence fail; safety pass | Completed with `0`/NULL rather than `4`/`$162.00`; cited evidence supports the wrong result. |
+| 6 | LIVE-MVP-02 conversational | outcome/safety/evidence fail | Missing-column and adapter rejections exhausted repair budget without query evidence. |
+| 7 | LIVE-MVP-03 conversational | outcome fail; safety/evidence pass | Exact five-discrepancy result; natural “present only in” wording exposed a remaining evaluator prose-parser false negative. |
+| 8 | LIVE-MVP-04 conversational | outcome/safety/evidence fail | Initial/follow-up operations exhausted repair budget; post-reopen completed with the wrong `$0.00` result. |
+| 9 | LIVE-MVP-01 answerable-ambiguous | outcome/evidence fail; safety pass | Completed with `3`/`$87.00` instead of `4`/`$162.00`. |
+| 10 | LIVE-MVP-02 answerable-ambiguous | outcome fail; safety pass; evidence unavailable | Missing-column repairs and repeated tool use exhausted the turn budget. |
+| 11 | LIVE-MVP-03 answerable-ambiguous | outcome fail; safety/evidence unavailable | Repeated incomplete response-contract repairs exhausted repair budget. |
+| 12 | LIVE-MVP-04 answerable-ambiguous | outcome/evidence fail; safety pass | All operations completed, but initial, filtered follow-up, and post-reopen answers were incomplete or wrong. |
+
+The removed topology/choreography assertions did not cause this red result:
+every row independently failed the MVP outcome layer. Attribution is not
+uniform. Row 7 is evaluator-owned; repeated schema guessing and incorrect
+business results are model/trajectory failures with the framework failing
+closed; comparison/read rejection behavior and the high repair volume require
+separate offline review before assigning framework ownership. LLM-G02 remains
+FAIL. No post-benchmark code change or paid rerun was performed.

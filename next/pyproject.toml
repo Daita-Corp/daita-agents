@@ -95,6 +95,10 @@ markers = [
     "integration: local component integration tests",
     "acceptance: black-box public behavior tests",
     "performance: performance and reliability tests",
+    "live_mvp: outcome-first real-provider MVP benchmark rows",
+    "live_mvp_smoke: four canonical direct-prompt MVP benchmark rows",
+    "live_mvp_reliability: eight MVP prompt-paraphrase reliability rows",
+    "live_precutover: retained session compression and cold-reopen stress rows",
     "requires_llm: requires live model credentials",
     "requires_db: requires an external database",
 ]

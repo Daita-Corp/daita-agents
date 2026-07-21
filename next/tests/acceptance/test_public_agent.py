@@ -74,7 +74,9 @@ class TextContext:
 
 
 class TextDomain:
-    def tool_views(self, operation: OperationSnapshot) -> tuple[ToolDefinition, ...]:
+    async def tool_views(
+        self, operation: OperationSnapshot
+    ) -> tuple[ToolDefinition, ...]:
         return ()
 
     async def validate_action(

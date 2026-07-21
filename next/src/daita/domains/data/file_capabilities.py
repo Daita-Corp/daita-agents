@@ -15,6 +15,7 @@ from ...capabilities import (
     ExecutionRequest,
     Executor,
     RiskLevel,
+    ToolApplicability,
     ToolView,
 )
 from .results import BoundedResultProjection
@@ -254,6 +255,10 @@ def local_file_read_extension_declarations() -> ExtensionDeclarations:
         name=LOCAL_FILE_READ_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
+        applicability=ToolApplicability(
+            source_adapter_ids=("local-directory",),
+            minimum_active_sources=1,
+        ),
     )
     return ExtensionDeclarations(
         capabilities=(capability,),

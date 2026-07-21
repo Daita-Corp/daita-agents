@@ -4,11 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import FrozenInstanceError, replace
+import hashlib
 
 import pytest
 import daita
 
-from daita.capabilities import AccessMode, CapabilityRegistry, RiskLevel
+from daita._json import canonical_json
+from daita.capabilities import (
+    AccessMode,
+    CapabilityRegistry,
+    RiskLevel,
+    ToolApplicability,
+)
 from daita.extensions import (
     ConfiguredExtension,
     ExtensionKind,
@@ -152,6 +159,108 @@ def test_manifest_and_ordered_set_fingerprints_bind_runtime_declarations() -> No
 
     assert changed_version.fingerprint != registry.fingerprint
     assert changed_projection.fingerprint != registry.fingerprint
+
+
+def test_tool_applicability_extends_only_opted_in_declaration_fingerprints() -> None:
+    registration = _registration()
+    manifest = registration.manifest
+    declarations = manifest.declarations
+    view = declarations.tool_views[0]
+    legacy_material = {
+        "capabilities": tuple(
+            {
+                "contract_fingerprint": capability.contract_fingerprint,
+                "id": capability.id,
+            }
+            for capability in declarations.capabilities
+        ),
+        "executor_ids": declarations.executor_ids,
+        "tool_views": (
+            {
+                "capability_id": view.capability_id,
+                "description": view.description,
+                "name": view.name,
+            },
+        ),
+    }
+    legacy_fingerprint = (
+        "sha256:"
+        + hashlib.sha256(canonical_json(legacy_material).encode("utf-8")).hexdigest()
+    )
+
+    assert legacy_fingerprint == (
+        "sha256:188b4b0b5cb215ad9c22e71eb40ef94982fd2531721d0e7bf6cff40176074312"
+    )
+    assert manifest.declaration_fingerprint == legacy_fingerprint
+    assert manifest.fingerprint == (
+        "sha256:05ea6df13656f4918bf5f5bd10b8dfcef831f43dd5a1cdc066d5089accb5ee98"
+    )
+    assert ExtensionRegistry((registration,)).fingerprint == (
+        "sha256:eb36c8e7a26819e6128cc9bc9fcab0913085258f3b25855b6ef97aa9b1c31c78"
+    )
+
+    explicit_default = replace(
+        manifest,
+        declarations=replace(
+            declarations,
+            tool_views=(replace(view, applicability=ToolApplicability()),),
+        ),
+    )
+    assert explicit_default.declaration_fingerprint == legacy_fingerprint
+    assert explicit_default.fingerprint == manifest.fingerprint
+
+    applicability = ToolApplicability(
+        source_adapter_ids=("custom-adapter", "sqlite"),
+        minimum_active_sources=2,
+        required_configuration_flags=("write_access",),
+    )
+    declared = replace(
+        manifest,
+        declarations=replace(
+            declarations,
+            tool_views=(replace(view, applicability=applicability),),
+        ),
+    )
+    declared_material = {
+        **legacy_material,
+        "tool_views": (
+            {
+                "applicability": {
+                    "minimum_active_sources": 2,
+                    "required_configuration_flags": ("write_access",),
+                    "source_adapter_ids": ("custom-adapter", "sqlite"),
+                },
+                "capability_id": view.capability_id,
+                "description": view.description,
+                "name": view.name,
+            },
+        ),
+    }
+    expected = (
+        "sha256:"
+        + hashlib.sha256(canonical_json(declared_material).encode("utf-8")).hexdigest()
+    )
+
+    assert declared.declaration_fingerprint == expected
+    assert declared.declaration_fingerprint != legacy_fingerprint
+    assert declared.fingerprint != manifest.fingerprint
+
+    reordered = replace(
+        declared,
+        declarations=replace(
+            declarations,
+            tool_views=(
+                replace(
+                    view,
+                    applicability=replace(
+                        applicability,
+                        source_adapter_ids=("sqlite", "custom-adapter"),
+                    ),
+                ),
+            ),
+        ),
+    )
+    assert reordered.declaration_fingerprint != declared.declaration_fingerprint
 
 
 def test_extension_registry_rejects_more_than_64_manifests() -> None:

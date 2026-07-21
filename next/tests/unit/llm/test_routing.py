@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import replace
 from decimal import Decimal
 import traceback
@@ -85,6 +85,7 @@ def _request(
     messages: tuple[CanonicalMessage, ...] | None = None,
     tools: tuple[ToolDefinition, ...] = (),
     estimated_input_tokens: int = 100,
+    allow_parallel_tool_calls: bool | None = None,
 ) -> ModelRequest:
     return ModelRequest(
         operation_id="operation-1",
@@ -101,6 +102,7 @@ def _request(
         ),
         tools=tools,
         sensitivity=sensitivity,
+        allow_parallel_tool_calls=allow_parallel_tool_calls,
         context_selection={
             "schema_version": 1,
             "estimated_input_tokens": estimated_input_tokens,
@@ -122,10 +124,15 @@ class StreamingScriptProvider:
         self,
         provider_id: str,
         *scripts: tuple[ModelStreamEvent | BaseException, ...],
+        supports_policy: bool = True,
     ) -> None:
         self.provider_id = provider_id
         self._scripts = list(scripts)
         self.requests: list[ModelRequest] = []
+        self._supports_policy = supports_policy
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return self._supports_policy
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         raise AssertionError("streaming route must not call generate")
@@ -138,6 +145,23 @@ class StreamingScriptProvider:
             if isinstance(item, BaseException):
                 raise item
             yield item
+
+
+class PolicyScriptProvider(MockModelProvider):
+    def __init__(
+        self,
+        script: Iterable[ModelResponse | Exception],
+        *,
+        provider_id: str,
+        supports_policy: object,
+    ) -> None:
+        super().__init__(script, provider_id=provider_id)
+        self._supports_policy = supports_policy
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        if isinstance(self._supports_policy, BaseException):
+            raise self._supports_policy
+        return self._supports_policy  # type: ignore[return-value]
 
 
 def _stream_registration(
@@ -344,6 +368,61 @@ async def test_capability_and_context_requirements_are_checked_before_io() -> No
     assert len(suitable.requests) == 1
 
 
+async def test_request_policy_skips_unsupported_primary_for_supporting_fallback() -> (
+    None
+):
+    primary = PolicyScriptProvider(
+        (_response("must not run"),),
+        provider_id="mock:unsupported",
+        supports_policy=False,
+    )
+    fallback = PolicyScriptProvider(
+        (_response("supported"),),
+        provider_id="mock:supported",
+        supports_policy=True,
+    )
+    route = ModelRouter(_registration(primary), (_registration(fallback),))
+    request = _request(allow_parallel_tool_calls=False)
+
+    assert route.supports_request_policy(request) is True
+    response = await route.generate(request)
+
+    assert response.provider_id == "mock:supported"
+    assert primary.requests == ()
+    assert fallback.requests == (request,)
+
+
+@pytest.mark.parametrize(
+    "unsupported_result",
+    (False, None, 1, RuntimeError("policy check failed")),
+)
+async def test_all_request_policy_ineligible_routes_fail_before_io(
+    unsupported_result: object,
+) -> None:
+    first = PolicyScriptProvider(
+        (_response("must not run"),),
+        provider_id="mock:first",
+        supports_policy=unsupported_result,
+    )
+    second = PolicyScriptProvider(
+        (_response("must not run"),),
+        provider_id="mock:second",
+        supports_policy=False,
+    )
+    route = ModelRouter(_registration(first), (_registration(second),))
+    request = _request(allow_parallel_tool_calls=False)
+
+    assert route.supports_request_policy(request) is False
+    with pytest.raises(ModelProviderError) as captured:
+        await route.generate(request)
+
+    assert captured.value.code is ProviderErrorCode.INVALID_REQUEST
+    assert captured.value.routing is not None
+    assert captured.value.routing.attempts == ()
+    assert first.requests == ()
+    assert second.requests == ()
+
+
 async def test_missing_context_estimate_fails_closed_before_provider_io() -> None:
     provider = MockModelProvider((_response("must not run"),), provider_id="mock:main")
     route = ModelRouter(_registration(provider))
@@ -361,6 +440,9 @@ async def test_missing_context_estimate_fails_closed_before_provider_io() -> Non
 async def test_cancellation_propagates_without_retry_or_fallback() -> None:
     class CancellingProvider:
         provider_id = "mock:main"
+
+        def supports_request_policy(self, request: ModelRequest) -> bool:
+            return True
 
         async def generate(self, request: ModelRequest) -> ModelResponse:
             raise asyncio.CancelledError
@@ -482,6 +564,50 @@ async def test_streaming_capability_is_checked_before_provider_io() -> None:
     assert nonstreaming.requests == ()
     assert len(fallback.requests) == 1
     assert isinstance(events[-1], ModelStreamCompleted)
+
+
+async def test_stream_request_policy_uses_supporting_fallback_before_io() -> None:
+    primary = StreamingScriptProvider(
+        "mock:unsupported",
+        (ModelStreamCompleted(_response("must not run")),),
+        supports_policy=False,
+    )
+    fallback = StreamingScriptProvider(
+        "mock:supported",
+        (ModelStreamCompleted(_response("supported")),),
+    )
+    route = ModelRouter(
+        _stream_registration(primary),
+        (_stream_registration(fallback),),
+    )
+
+    events = [
+        event async for event in route.stream(_request(allow_parallel_tool_calls=False))
+    ]
+
+    assert primary.requests == []
+    assert len(fallback.requests) == 1
+    assert isinstance(events[-1], ModelStreamCompleted)
+
+
+async def test_stream_all_request_policy_ineligible_fails_before_io() -> None:
+    provider = StreamingScriptProvider(
+        "mock:unsupported",
+        (ModelStreamCompleted(_response("must not run")),),
+        supports_policy=False,
+    )
+    route = ModelRouter(_stream_registration(provider))
+
+    with pytest.raises(ModelProviderError) as captured:
+        _ = [
+            event
+            async for event in route.stream(_request(allow_parallel_tool_calls=False))
+        ]
+
+    assert captured.value.code is ProviderErrorCode.INVALID_REQUEST
+    assert captured.value.routing is not None
+    assert captured.value.routing.attempts == ()
+    assert provider.requests == []
 
 
 def test_route_identity_binds_policy_profile_order_and_retry_configuration() -> None:

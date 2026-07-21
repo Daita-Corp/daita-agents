@@ -94,6 +94,7 @@ def _request(
     *messages: CanonicalMessage,
     tools: tuple[ToolDefinition, ...] = (),
     response_schema: Mapping[str, object] | None = None,
+    allow_parallel_tool_calls: bool | None = None,
 ) -> ModelRequest:
     return ModelRequest(
         operation_id="operation-1",
@@ -101,7 +102,28 @@ def _request(
         messages=messages or (_message(MessageRole.USER, "hello"),),
         tools=tools,
         response_schema=response_schema,
+        allow_parallel_tool_calls=allow_parallel_tool_calls,
     )
+
+
+@pytest.mark.parametrize("policy", (False, True))
+async def test_explicit_tool_policy_is_rejected_before_gemini_io(
+    policy: bool,
+) -> None:
+    client = FakeClient()
+    provider = GeminiProvider("gemini-test", client=client)
+    request = _request(allow_parallel_tool_calls=policy)
+
+    assert provider.supports_request_policy(request) is False
+    with pytest.raises(ModelProviderError) as generated:
+        await provider.generate(request)
+    with pytest.raises(ModelProviderError) as streamed:
+        _ = [event async for event in provider.stream(request)]
+
+    assert generated.value.code is ProviderErrorCode.INVALID_REQUEST
+    assert streamed.value.code is ProviderErrorCode.INVALID_REQUEST
+    assert client.aio.models.calls == []
+    assert client.aio.models.stream_calls == []
 
 
 def _response(*parts: object, finish_reason: str = "STOP") -> SimpleNamespace:

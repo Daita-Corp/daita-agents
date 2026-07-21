@@ -372,6 +372,7 @@ async def _bind_or_load_runtime_defaults(
     *,
     policy: DefaultPolicyEvaluator | None,
     budgets: LoopBudgets | None,
+    session_compression_policy: SessionCompressionPolicy | None,
 ) -> tuple[AgentRuntimeDefaults, DefaultPolicyEvaluator]:
     """Resolve future-operation defaults from the authoritative state store."""
 
@@ -381,6 +382,9 @@ async def _bind_or_load_runtime_defaults(
         proposed = AgentRuntimeDefaults(
             budgets=budgets or LoopBudgets(),
             policy_profile=active_policy.profile,
+            session_compression_policy=(
+                session_compression_policy or SessionCompressionPolicy()
+            ),
         )
         try:
             current = await store.bind_runtime_defaults(agent_id, proposed)
@@ -401,6 +405,16 @@ async def _bind_or_load_runtime_defaults(
         raise ConfigError(
             "Configured policy differs from the stored agent defaults.",
             section="policy",
+            error_code="config_conflict",
+        )
+    if (
+        session_compression_policy is not None
+        and session_compression_policy != current.session_compression_policy
+    ):
+        raise ConfigError(
+            "Configured session compression policy differs from the stored "
+            "agent defaults.",
+            section="session_compression",
             error_code="config_conflict",
         )
     return current, policy or DefaultPolicyEvaluator(current.policy_profile)
@@ -626,12 +640,14 @@ class EmbeddedAgent:
             raise AgentNotConfiguredError(
                 "configured extensions require the default data composition"
             )
-        model_profile, policy, budgets = resolve_agent_configuration(
-            config,
-            model=model,
-            model_profile=model_profile,
-            policy=policy,
-            budgets=budgets,
+        model_profile, policy, budgets, session_compression_policy = (
+            resolve_agent_configuration(
+                config,
+                model=model,
+                model_profile=model_profile,
+                policy=policy,
+                budgets=budgets,
+            )
         )
         model, model_profile, requested_route = _resolve_model_route_input(
             config,
@@ -719,6 +735,7 @@ class EmbeddedAgent:
                 identity.id,
                 policy=policy,
                 budgets=budgets,
+                session_compression_policy=session_compression_policy,
             )
             embedded = cls._compose(
                 identity=identity,
@@ -786,12 +803,14 @@ class EmbeddedAgent:
             raise AgentNotConfiguredError(
                 "configured extensions require the default data composition"
             )
-        model_profile, policy, budgets = resolve_agent_configuration(
-            config,
-            model=model,
-            model_profile=model_profile,
-            policy=policy,
-            budgets=budgets,
+        model_profile, policy, budgets, session_compression_policy = (
+            resolve_agent_configuration(
+                config,
+                model=model,
+                model_profile=model_profile,
+                policy=policy,
+                budgets=budgets,
+            )
         )
         model, model_profile, requested_route = _resolve_model_route_input(
             config,
@@ -949,6 +968,7 @@ class EmbeddedAgent:
                 identity.id,
                 policy=policy,
                 budgets=budgets,
+                session_compression_policy=session_compression_policy,
             )
             return cls._compose(
                 identity=identity,
@@ -1003,7 +1023,7 @@ class EmbeddedAgent:
         resolved_domain = domain
         resolved_capabilities = capabilities
         blob_store = LocalBlobStore(home / "blobs")
-        catalog_service = CatalogService(store)
+        catalog_service = CatalogService(store, store)
         memory_service = MemoryService(store, clock=clock)
         monitor_service = MonitorService(
             agent_id=identity.id,
@@ -1015,8 +1035,9 @@ class EmbeddedAgent:
         )
         resolved_profile = model_profile
         data_view: CatalogDataView | None = None
+        comparison_datasets: PersistedAcceptedEvidenceDatasetReader | None = None
         if context_builder is None and domain is None and capabilities is None:
-            data_view = CatalogDataView(store, catalog_service)
+            data_view = CatalogDataView(store, catalog_service, store)
             catalog = catalog_declarations(identity.id, catalog_service)
             sqlite_query = sqlite_query_declarations(
                 identity.id,
@@ -1043,14 +1064,13 @@ class EmbeddedAgent:
                 identity.id,
                 LocalDirectoryReadBackend(store, store),
             )
-            comparison = tabular_comparison_declarations(
-                PersistedAcceptedEvidenceDatasetReader(
-                    store,
-                    store,
-                    store,
-                    blob_store,
-                )
+            comparison_datasets = PersistedAcceptedEvidenceDatasetReader(
+                store,
+                store,
+                store,
+                blob_store,
             )
+            comparison = tabular_comparison_declarations(comparison_datasets)
             built_in_capabilities = CapabilityRegistry(
                 capabilities=(
                     *catalog.capabilities,
@@ -1114,18 +1134,14 @@ class EmbeddedAgent:
                 checkpoints=store,
                 operations=store,
                 committer=store,
-                policy=SessionCompressionPolicy(
-                    compression_threshold_tokens=max(
-                        1,
-                        resolved_profile.maximum_input_tokens * 3 // 4,
-                    )
-                ),
+                policy=runtime_defaults.session_compression_policy,
                 clock=clock,
                 id_factory=id_factory,
             )
             resolved_context = DataContextBuilder(
                 data_view,
                 profile=resolved_profile,
+                capabilities=active_capabilities,
                 session_projector=session_context,
                 memory_projector=MemoryContextProjector(memory_service),
                 skill_projector=SkillContextProjector(skill_service),
@@ -1133,6 +1149,7 @@ class EmbeddedAgent:
             resolved_domain = DataDomainController(
                 active_capabilities,
                 data_view,
+                comparison_datasets=comparison_datasets,
                 clock=clock,
             )
         runtime = OperationRuntime(

@@ -17,6 +17,7 @@ from ...capabilities import (
     ExecutionRequest,
     Executor,
     RiskLevel,
+    ToolApplicability,
     ToolView,
 )
 
@@ -25,11 +26,47 @@ TABULAR_COMPARE_EVIDENCE_KIND = "data.tabular.comparison"
 TABULAR_COMPARE_EXECUTOR_ID = "data.tabular.compare.executor"
 TABULAR_COMPARE_TOOL_NAME = "data_compare_tabular"
 TABULAR_COMPARISON_MEDIA_TYPE = "application/vnd.daita.tabular-comparison+json"
+TABULAR_COMPARISON_POLICY_SCHEMA_VERSION = 1
+TABULAR_COMPARISON_SCHEMA_VERSION = 2
+TABULAR_KEY_NORMALIZATION_MODES = ("strict", "stringify_integral")
 
 _MAX_COLUMNS = 512
 _MAX_COMPARE_COLUMNS = 64
 _MAX_DATASET_ROWS = 10_000
 _MAX_RESOURCES = 1_000
+_MAX_COLLISION_ROWS = 8
+_MAX_COLLISION_KEYS = 4
+_MAX_COLLISION_KEY_CHARACTERS = 512
+
+
+class AcceptedEvidenceDatasetError(RuntimeError):
+    """Typed failure at the accepted-evidence dataset reader boundary."""
+
+    def __init__(self, code: str) -> None:
+        _required_text(code, "code", maximum=128)
+        self.code = code
+        super().__init__(code)
+
+
+class TabularComparisonPreflightError(ValueError):
+    """Typed, bounded rejection from the comparison-owned preflight."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: Mapping[str, object],
+    ) -> None:
+        _required_text(code, "code", maximum=128)
+        _required_text(message, "message", maximum=512)
+        if code not in {
+            "data.compare.incompatible_key_types",
+            "data.compare.normalization_collision",
+        }:
+            raise ValueError("comparison preflight error code is unsupported")
+        self.code = code
+        self.details = FrozenJsonObject.from_mapping(details)
+        super().__init__(message)
 
 
 def _required_text(value: str, field_name: str, *, maximum: int = 2_048) -> None:
@@ -199,6 +236,26 @@ class AcceptedEvidenceDatasetReader(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class TabularComparisonPreflight:
+    """Successful type-domain and normalization compatibility decision."""
+
+    comparison_policy: FrozenJsonObject
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.comparison_policy, FrozenJsonObject):
+            raise TypeError("comparison_policy must be a FrozenJsonObject")
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedRow:
+    row_index: int
+    row: FrozenJsonObject
+    key: FrozenJsonObject
+    typed_key: FrozenJsonObject
+    normalized_key: FrozenJsonObject
+
+
+@dataclass(frozen=True, slots=True)
 class TabularComparisonResult:
     payload: FrozenJsonObject
     artifact: EvidenceArtifact
@@ -269,10 +326,12 @@ class TabularComparisonExecutor:
         right_id = request.arguments["right_evidence_id"]
         key_columns = request.arguments["key_columns"]
         compare_columns = request.arguments["compare_columns"]
+        key_normalization = request.arguments["key_normalization"]
         assert isinstance(left_id, str)
         assert isinstance(right_id, str)
         assert isinstance(key_columns, tuple)
         assert isinstance(compare_columns, tuple)
+        assert isinstance(key_normalization, str)
         _required_text(left_id, "left_evidence_id", maximum=512)
         _required_text(right_id, "right_evidence_id", maximum=512)
         if left_id == right_id:
@@ -313,13 +372,14 @@ class TabularComparisonExecutor:
             right,
             key_columns=keys,
             compare_columns=compared,
+            key_normalization=key_normalization,
             max_discrepancies=self._max_discrepancies,
             max_inline_discrepancies=self._max_inline_discrepancies,
             max_artifact_bytes=self._max_artifact_bytes,
         )
         return EvidenceCandidate(
             kind=TABULAR_COMPARE_EVIDENCE_KIND,
-            schema_version=1,
+            schema_version=TABULAR_COMPARISON_SCHEMA_VERSION,
             payload=result.payload,
             artifact=result.artifact,
         )
@@ -331,6 +391,7 @@ def compare_tabular_datasets(
     *,
     key_columns: tuple[str, ...],
     compare_columns: tuple[str, ...],
+    key_normalization: str,
     max_discrepancies: int = 1_000,
     max_inline_discrepancies: int = 20,
     max_artifact_bytes: int = 4 * 1_024 * 1_024,
@@ -370,6 +431,13 @@ def compare_tabular_datasets(
     if max_inline_discrepancies > max_discrepancies:
         raise ValueError("inline discrepancy bound cannot exceed artifact bound")
 
+    preflight = preflight_tabular_comparison(
+        left,
+        right,
+        key_columns=keys,
+        key_normalization=key_normalization,
+    )
+
     stored: list[FrozenJsonObject] = []
     total_discrepancies = 0
 
@@ -379,8 +447,20 @@ def compare_tabular_datasets(
         if len(stored) < max_discrepancies:
             stored.append(FrozenJsonObject.from_mapping(payload))
 
-    left_index, left_invalid = _index_rows(left, "left", keys, record)
-    right_index, right_invalid = _index_rows(right, "right", keys, record)
+    left_index, left_invalid = _index_rows(
+        left,
+        "left",
+        keys,
+        key_normalization,
+        record,
+    )
+    right_index, right_invalid = _index_rows(
+        right,
+        "right",
+        keys,
+        key_normalization,
+        record,
+    )
     left_duplicates = _record_duplicates(left_index, "left", record)
     right_duplicates = _record_duplicates(right_index, "right", record)
 
@@ -392,11 +472,14 @@ def compare_tabular_datasets(
         if len(rows) != 1:
             continue
         left_only += 1
+        indexed = rows[0]
         record(
             {
                 "kind": "left_only",
-                "key": rows[0][2],
-                "left_row_index": rows[0][0],
+                "key": indexed.key,
+                "left_key": indexed.typed_key,
+                "left_row_index": indexed.row_index,
+                "normalized_key": indexed.normalized_key,
             }
         )
     right_only = 0
@@ -405,11 +488,14 @@ def compare_tabular_datasets(
         if len(rows) != 1:
             continue
         right_only += 1
+        indexed = rows[0]
         record(
             {
                 "kind": "right_only",
-                "key": rows[0][2],
-                "right_row_index": rows[0][0],
+                "key": indexed.key,
+                "normalized_key": indexed.normalized_key,
+                "right_key": indexed.typed_key,
+                "right_row_index": indexed.row_index,
             }
         )
 
@@ -423,8 +509,13 @@ def compare_tabular_datasets(
         if len(left_group) != 1 or len(right_group) != 1:
             continue
         matched_keys += 1
-        left_index_value, left_row, key_payload = left_group[0]
-        right_index_value, right_row, _ = right_group[0]
+        left_indexed = left_group[0]
+        right_indexed = right_group[0]
+        left_index_value = left_indexed.row_index
+        right_index_value = right_indexed.row_index
+        left_row = left_indexed.row
+        right_row = right_indexed.row
+        key_payload = left_indexed.key
         row_different = False
         for column in compared:
             left_present = column in left_row
@@ -453,12 +544,15 @@ def compare_tabular_datasets(
                     "column": column,
                     "key": key_payload,
                     "kind": kind,
+                    "left_key": left_indexed.typed_key,
                     "left_present": left_present,
                     "left_row_index": left_index_value,
                     "left_type": (
                         "missing" if not left_present else _json_type(left_value)
                     ),
                     "left_value": left_value,
+                    "normalized_key": left_indexed.normalized_key,
+                    "right_key": right_indexed.typed_key,
                     "right_present": right_present,
                     "right_row_index": right_index_value,
                     "right_type": (
@@ -498,6 +592,7 @@ def compare_tabular_datasets(
         right,
         keys,
         compared,
+        preflight.comparison_policy,
         counts,
         artifact_discrepancies,
         total_discrepancies,
@@ -511,6 +606,7 @@ def compare_tabular_datasets(
             right,
             keys,
             compared,
+            preflight.comparison_policy,
             counts,
             artifact_discrepancies,
             total_discrepancies,
@@ -522,6 +618,7 @@ def compare_tabular_datasets(
             right,
             keys,
             compared,
+            preflight.comparison_policy,
             counts,
             artifact_discrepancies,
             total_discrepancies,
@@ -548,6 +645,7 @@ def compare_tabular_datasets(
             "artifact_digest": digest,
             "artifact_media_type": TABULAR_COMPARISON_MEDIA_TYPE,
             "compare_columns": compared,
+            "comparison_policy": preflight.comparison_policy,
             "complete": complete,
             "counts": counts,
             "discrepancy_sample": tuple(
@@ -574,18 +672,250 @@ def compare_tabular_datasets(
     )
 
 
+def preflight_tabular_comparison(
+    left: TabularEvidenceDataset,
+    right: TabularEvidenceDataset,
+    *,
+    key_columns: tuple[str, ...],
+    key_normalization: str,
+) -> TabularComparisonPreflight:
+    """Decide key-domain compatibility over every retained authoritative row.
+
+    ``dataset.complete`` describes upstream read coverage, not whether ``rows``
+    is an inline sample. The persisted reader expands artifacts before creating
+    this record, so partial upstream coverage remains comparable and is carried
+    into the comparison's existing truncation facts.
+    """
+
+    if not isinstance(left, TabularEvidenceDataset) or not isinstance(
+        right,
+        TabularEvidenceDataset,
+    ):
+        raise TypeError("comparison inputs must be TabularEvidenceDataset records")
+    keys = _texts(
+        key_columns,
+        "key_columns",
+        maximum_items=_MAX_COMPARE_COLUMNS,
+    )
+    if key_normalization not in TABULAR_KEY_NORMALIZATION_MODES:
+        raise ValueError("key_normalization is unsupported")
+    for dataset, side in ((left, "left"), (right, "right")):
+        missing = tuple(column for column in keys if column not in dataset.columns)
+        if missing:
+            raise ValueError(
+                f"{side} dataset lacks declared columns: {', '.join(missing)}"
+            )
+
+    left_domains = _key_type_domains(left, keys)
+    right_domains = _key_type_domains(right, keys)
+    compatibility: list[dict[str, object]] = []
+    for column in keys:
+        left_domain = left_domains[column]
+        right_domain = right_domains[column]
+        left_normalized = _normalized_type_domain(left_domain, key_normalization)
+        right_normalized = _normalized_type_domain(right_domain, key_normalization)
+        compatible = bool(
+            left_normalized is not None
+            and right_normalized is not None
+            and (
+                not left_domain
+                or not right_domain
+                or left_normalized == right_normalized
+            )
+        )
+        if not compatible:
+            raise TabularComparisonPreflightError(
+                "data.compare.incompatible_key_types",
+                (
+                    "Comparison key type domains are incompatible under the "
+                    "selected normalization policy."
+                ),
+                {
+                    "allowed_modes": TABULAR_KEY_NORMALIZATION_MODES,
+                    "details_truncated": False,
+                    "key_column": column,
+                    "key_normalization": key_normalization,
+                    "left_evidence_id": left.evidence_id,
+                    "left_type_domain": left_domain,
+                    "right_evidence_id": right.evidence_id,
+                    "right_type_domain": right_domain,
+                },
+            )
+        compatibility.append(
+            {
+                "key_column": column,
+                "left_normalized_type_domain": left_normalized or (),
+                "left_type_domain": left_domain,
+                "right_normalized_type_domain": right_normalized or (),
+                "right_type_domain": right_domain,
+            }
+        )
+
+    for dataset, side in ((left, "left"), (right, "right")):
+        collision = _normalization_collision(
+            dataset,
+            keys,
+            key_normalization,
+        )
+        if collision is not None:
+            details = collision.to_dict()
+            details.update(
+                {
+                    "evidence_id": dataset.evidence_id,
+                    "key_columns": keys,
+                    "key_normalization": key_normalization,
+                    "side": side,
+                }
+            )
+            raise TabularComparisonPreflightError(
+                "data.compare.normalization_collision",
+                "Comparison key normalization creates a same-side collision.",
+                details,
+            )
+
+    return TabularComparisonPreflight(
+        comparison_policy=FrozenJsonObject.from_mapping(
+            {
+                "compatibility": {
+                    "columns": tuple(compatibility),
+                    "compatible": True,
+                    "left_evidence_id": left.evidence_id,
+                    "right_evidence_id": right.evidence_id,
+                },
+                "key_normalization": key_normalization,
+                "schema_version": TABULAR_COMPARISON_POLICY_SCHEMA_VERSION,
+            }
+        )
+    )
+
+
+def _key_type_domains(
+    dataset: TabularEvidenceDataset,
+    keys: tuple[str, ...],
+) -> dict[str, tuple[str, ...]]:
+    domains: dict[str, set[str]] = {column: set() for column in keys}
+    for row in dataset.rows:
+        for column in keys:
+            if column in row and row[column] is not None:
+                domains[column].add(_json_type(row[column]))
+    return {column: tuple(sorted(domains[column])) for column in keys}
+
+
+def _normalized_type_domain(
+    domain: tuple[str, ...],
+    key_normalization: str,
+) -> tuple[str, ...] | None:
+    if key_normalization == "strict":
+        return domain
+    if any(value not in {"integer", "string"} for value in domain):
+        return None
+    return ("string",) if domain else ()
+
+
+def _normalization_collision(
+    dataset: TabularEvidenceDataset,
+    keys: tuple[str, ...],
+    key_normalization: str,
+) -> FrozenJsonObject | None:
+    if key_normalization == "strict":
+        return None
+    grouped: dict[
+        str,
+        list[tuple[int, str, FrozenJsonObject, FrozenJsonObject]],
+    ] = {}
+    for row_index, row in enumerate(dataset.rows):
+        if any(column not in row or row[column] is None for column in keys):
+            continue
+        values = tuple(row[column] for column in keys)
+        normalized_values = _normalize_key_values(values, key_normalization)
+        normalized_key = FrozenJsonObject.from_mapping(
+            dict(zip(keys, normalized_values, strict=True))
+        )
+        typed_key = _typed_key(keys, values)
+        grouped.setdefault(canonical_json(normalized_values), []).append(
+            (row_index, canonical_json(values), typed_key, normalized_key)
+        )
+    for fingerprint in sorted(grouped):
+        entries = grouped[fingerprint]
+        original_fingerprints = {entry[1] for entry in entries}
+        if len(original_fingerprints) < 2:
+            continue
+        original_keys: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for _, original_fingerprint, typed_key, _ in entries:
+            if original_fingerprint in seen:
+                continue
+            seen.add(original_fingerprint)
+            original_keys.append(_bounded_collision_key(typed_key))
+        return FrozenJsonObject.from_mapping(
+            {
+                "details_truncated": (
+                    len(entries) > _MAX_COLLISION_ROWS
+                    or len(original_keys) > _MAX_COLLISION_KEYS
+                ),
+                "normalized_key": _bounded_collision_key(entries[0][3]),
+                "original_keys": tuple(original_keys[:_MAX_COLLISION_KEYS]),
+                "row_indexes": tuple(
+                    entry[0] for entry in entries[:_MAX_COLLISION_ROWS]
+                ),
+            }
+        )
+    return None
+
+
+def _bounded_collision_key(value: FrozenJsonObject) -> dict[str, object]:
+    payload = value.to_dict()
+    encoded = canonical_json(payload)
+    if len(encoded) <= _MAX_COLLISION_KEY_CHARACTERS:
+        return {"value": payload, "value_truncated": False}
+    return {
+        "value_digest": "sha256:" + sha256(encoded.encode("utf-8")).hexdigest(),
+        "value_truncated": True,
+    }
+
+
+def _normalize_key_values(
+    values: tuple[object, ...],
+    key_normalization: str,
+) -> tuple[object, ...]:
+    if key_normalization == "strict":
+        return values
+    normalized: list[object] = []
+    for value in values:
+        if isinstance(value, str):
+            normalized.append(value)
+        elif isinstance(value, int) and not isinstance(value, bool):
+            normalized.append(str(value))
+        else:
+            raise ValueError("incompatible key value reached normalization")
+    return tuple(normalized)
+
+
+def _typed_key(
+    keys: tuple[str, ...],
+    values: tuple[object, ...],
+) -> FrozenJsonObject:
+    return FrozenJsonObject.from_mapping(
+        {
+            "types": {
+                column: _json_type(value)
+                for column, value in zip(keys, values, strict=True)
+            },
+            "values": dict(zip(keys, values, strict=True)),
+        }
+    )
+
+
 def _index_rows(
     dataset: TabularEvidenceDataset,
     side: str,
     keys: tuple[str, ...],
+    key_normalization: str,
     record: object,
-) -> tuple[
-    dict[str, list[tuple[int, FrozenJsonObject, FrozenJsonObject]]],
-    int,
-]:
+) -> tuple[dict[str, list[_IndexedRow]], int]:
     recorder = record
     assert callable(recorder)
-    indexed: dict[str, list[tuple[int, FrozenJsonObject, FrozenJsonObject]]] = {}
+    indexed: dict[str, list[_IndexedRow]] = {}
     invalid = 0
     for row_index, raw_row in enumerate(dataset.rows):
         # __post_init__ freezes every accepted row before a dataset is observable.
@@ -607,19 +937,28 @@ def _index_rows(
             )
             continue
         values = tuple(row[column] for column in keys)
-        fingerprint = canonical_json(values)
+        normalized_values = _normalize_key_values(values, key_normalization)
+        fingerprint = canonical_json(normalized_values)
         key_payload = FrozenJsonObject.from_mapping(
             {column: row[column] for column in keys}
         )
-        indexed.setdefault(fingerprint, []).append((row_index, row, key_payload))
+        normalized_key = FrozenJsonObject.from_mapping(
+            dict(zip(keys, normalized_values, strict=True))
+        )
+        indexed.setdefault(fingerprint, []).append(
+            _IndexedRow(
+                row_index=row_index,
+                row=row,
+                key=key_payload,
+                typed_key=_typed_key(keys, values),
+                normalized_key=normalized_key,
+            )
+        )
     return indexed, invalid
 
 
 def _record_duplicates(
-    indexed: Mapping[
-        str,
-        list[tuple[int, FrozenJsonObject, FrozenJsonObject]],
-    ],
+    indexed: Mapping[str, list[_IndexedRow]],
     side: str,
     record: object,
 ) -> int:
@@ -633,9 +972,11 @@ def _record_duplicates(
         count += 1
         recorder(
             {
-                "key": rows[0][2],
+                "key": rows[0].key,
                 "kind": "duplicate_key",
-                "row_indexes": tuple(row[0] for row in rows),
+                "normalized_key": rows[0].normalized_key,
+                f"{side}_key": rows[0].typed_key,
+                "row_indexes": tuple(row.row_index for row in rows),
                 "side": side,
             }
         )
@@ -671,6 +1012,7 @@ def _artifact_payload(
     right: TabularEvidenceDataset,
     keys: tuple[str, ...],
     compared: tuple[str, ...],
+    comparison_policy: FrozenJsonObject,
     counts: Mapping[str, object],
     discrepancies: tuple[FrozenJsonObject, ...],
     total_discrepancies: int,
@@ -678,13 +1020,14 @@ def _artifact_payload(
 ) -> dict[str, object]:
     return {
         "compare_columns": compared,
+        "comparison_policy": comparison_policy,
         "complete": not reasons,
         "counts": counts,
         "discrepancies": tuple(thaw_json(item) for item in discrepancies),
         "key_columns": keys,
         "left": left.provenance_payload(),
         "right": right.provenance_payload(),
-        "schema_version": 1,
+        "schema_version": TABULAR_COMPARISON_SCHEMA_VERSION,
         "stored_discrepancies": len(discrepancies),
         "total_discrepancies": total_discrepancies,
         "truncated": bool(reasons),
@@ -698,6 +1041,7 @@ def _comparison_artifact_bytes(
     right: TabularEvidenceDataset,
     keys: tuple[str, ...],
     compared: tuple[str, ...],
+    comparison_policy: FrozenJsonObject,
     counts: Mapping[str, object],
     discrepancies: tuple[FrozenJsonObject, ...],
     total_discrepancies: int,
@@ -709,6 +1053,7 @@ def _comparison_artifact_bytes(
             right,
             keys,
             compared,
+            comparison_policy,
             counts,
             discrepancies,
             total_discrepancies,
@@ -722,6 +1067,7 @@ def _fit_artifact_discrepancies(
     right: TabularEvidenceDataset,
     keys: tuple[str, ...],
     compared: tuple[str, ...],
+    comparison_policy: FrozenJsonObject,
     counts: Mapping[str, object],
     discrepancies: tuple[FrozenJsonObject, ...],
     total_discrepancies: int,
@@ -738,6 +1084,7 @@ def _fit_artifact_discrepancies(
             right,
             keys,
             compared,
+            comparison_policy,
             counts,
             candidate,
             total_discrepancies,
@@ -791,17 +1138,22 @@ def tabular_comparison_extension_declarations() -> ExtensionDeclarations:
                 "right_evidence_id": {"type": "string"},
                 "key_columns": {"type": "array"},
                 "compare_columns": {"type": "array"},
+                "key_normalization": {
+                    "type": "string",
+                    "enum": list(TABULAR_KEY_NORMALIZATION_MODES),
+                },
             },
             "required": [
                 "left_evidence_id",
                 "right_evidence_id",
                 "key_columns",
                 "compare_columns",
+                "key_normalization",
             ],
             "additionalProperties": False,
         },
         output_evidence_kind=TABULAR_COMPARE_EVIDENCE_KIND,
-        output_schema_version=1,
+        output_schema_version=TABULAR_COMPARISON_SCHEMA_VERSION,
         output_schema=_comparison_output_schema(),
         executor_id=TABULAR_COMPARE_EXECUTOR_ID,
         access_mode=AccessMode.READ,
@@ -814,6 +1166,7 @@ def tabular_comparison_extension_declarations() -> ExtensionDeclarations:
         name=TABULAR_COMPARE_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
+        applicability=ToolApplicability(minimum_active_sources=2),
     )
     return ExtensionDeclarations(
         capabilities=(capability,),
@@ -827,6 +1180,7 @@ def _comparison_output_schema() -> dict[str, object]:
         "artifact_digest": {"type": "string"},
         "artifact_media_type": {"type": "string"},
         "compare_columns": {"type": "array"},
+        "comparison_policy": {"type": "object"},
         "complete": {"type": "boolean"},
         "counts": {"type": "object"},
         "discrepancy_sample": {"type": "array"},
@@ -853,12 +1207,19 @@ __all__ = [
     "TABULAR_COMPARE_EXECUTOR_ID",
     "TABULAR_COMPARE_TOOL_NAME",
     "TABULAR_COMPARISON_MEDIA_TYPE",
+    "TABULAR_COMPARISON_POLICY_SCHEMA_VERSION",
+    "TABULAR_COMPARISON_SCHEMA_VERSION",
+    "TABULAR_KEY_NORMALIZATION_MODES",
+    "AcceptedEvidenceDatasetError",
     "AcceptedEvidenceDatasetReader",
     "TabularComparisonDeclarations",
     "TabularComparisonExecutor",
+    "TabularComparisonPreflight",
+    "TabularComparisonPreflightError",
     "TabularComparisonResult",
     "TabularEvidenceDataset",
     "compare_tabular_datasets",
+    "preflight_tabular_comparison",
     "tabular_comparison_declarations",
     "tabular_comparison_extension_declarations",
 ]

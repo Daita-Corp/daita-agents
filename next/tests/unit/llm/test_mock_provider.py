@@ -33,6 +33,8 @@ async def test_mock_provider_captures_requests_and_fails_on_script_exhaustion() 
     response = ModelResponse(text="hello back", finish_reason=FinishReason.STOP)
     provider = MockModelProvider((response,))
 
+    assert provider.supports_request_policy(_request()) is True
+
     with pytest.raises(AssertionError, match="unconsumed"):
         provider.assert_consumed()
 

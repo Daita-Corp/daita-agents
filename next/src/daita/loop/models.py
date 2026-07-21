@@ -6,13 +6,14 @@ these implementation-free records only to commit the resulting durable state.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 import math
 
-from .._json import canonical_json
+from .._json import FrozenJsonObject, canonical_json
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -190,6 +191,7 @@ class Readiness:
     message: str
     evaluated_at: datetime
     missing_facts: tuple[str, ...] = ()
+    repair_details: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.allowed, bool):
@@ -212,7 +214,11 @@ class Readiness:
             raise ValueError("readiness missing facts must be bounded")
         if self.allowed and missing_facts:
             raise ValueError("allowed readiness cannot contain missing facts")
+        repair_details = FrozenJsonObject.from_mapping(self.repair_details)
+        if len(canonical_json(repair_details)) > 4096:
+            raise ValueError("readiness repair details must be bounded")
         object.__setattr__(self, "missing_facts", missing_facts)
+        object.__setattr__(self, "repair_details", repair_details)
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,6 +5,7 @@ from decimal import Decimal
 
 import pytest
 
+from daita._json import FrozenJsonObject
 from daita.loop.models import (
     LoopBudgets,
     LoopExit,
@@ -122,11 +123,20 @@ def test_turn_requires_positive_number_and_stable_operation_linkage() -> None:
 
 
 def test_readiness_and_exit_records_fail_closed() -> None:
+    source_details = {
+        "required_citations": [
+            {
+                "evidence_id": "evidence-1",
+                "citation": "[evidence:evidence-1]",
+            }
+        ]
+    }
     allowed = Readiness(
         allowed=True,
         code="ready",
         message="Current evidence supports the answer.",
         evaluated_at=NOW,
+        repair_details=source_details,
     )
     failed = LoopExit(
         operation_id="op-1",
@@ -137,6 +147,17 @@ def test_readiness_and_exit_records_fail_closed() -> None:
     )
 
     assert allowed.missing_facts == ()
+    source_details["required_citations"][0]["citation"] = "mutated"
+    repair_details = allowed.repair_details
+    assert isinstance(repair_details, FrozenJsonObject)
+    assert repair_details.to_dict() == {
+        "required_citations": [
+            {
+                "citation": "[evidence:evidence-1]",
+                "evidence_id": "evidence-1",
+            }
+        ]
+    }
     assert failed.final_text is None
     assert failed.post_operation_notices == ("learning.correction_failed",)
 
@@ -202,4 +223,24 @@ def test_readiness_correction_fields_are_bounded(
             message=message,
             missing_facts=missing_facts,
             evaluated_at=NOW,
+        )
+
+
+def test_readiness_repair_details_are_strict_bounded_json() -> None:
+    with pytest.raises(TypeError, match="JSON object"):
+        Readiness(
+            allowed=False,
+            code="not_ready",
+            message="Missing evidence.",
+            evaluated_at=NOW,
+            repair_details=["not", "an", "object"],  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(ValueError, match="bounded"):
+        Readiness(
+            allowed=False,
+            code="not_ready",
+            message="Missing evidence.",
+            evaluated_at=NOW,
+            repair_details={"detail": "x" * 4_096},
         )

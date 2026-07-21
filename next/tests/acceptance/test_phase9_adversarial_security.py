@@ -53,12 +53,10 @@ EXPECTED_TOOLS = frozenset(
     {
         "catalog_inspect",
         "catalog_search",
+        "catalog_traverse",
         "data_compare_tabular",
-        "data_preview_sqlite_update",
-        "data_query_postgresql",
         "data_query_sqlite",
         "data_read_file",
-        "data_update_sqlite",
     }
 )
 
@@ -250,7 +248,7 @@ async def test_untrusted_data_cannot_gain_authority_and_secrets_cross_no_boundar
         ]
         assert rejected == [
             "data.tool_not_available",
-            "data.file.catalog_resource_missing",
+            "data.file.resource_not_found",
             "data.tool_not_available",
         ]
         assert all(evidence.accepted for evidence in snapshot.evidence)

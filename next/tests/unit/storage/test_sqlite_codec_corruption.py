@@ -44,7 +44,10 @@ NOW = datetime(2026, 7, 17, 12, 34, 56, 789_012, tzinfo=timezone.utc)
 OPERATION_ID = "operation-codec-corruption"
 
 
-def _minimal_model_snapshot() -> OperationSnapshot:
+def _minimal_model_snapshot(
+    *,
+    allow_parallel_tool_calls: bool | None = False,
+) -> OperationSnapshot:
     agent_id = "agent-codec-corruption"
     trigger = AgentTrigger(
         id="trigger-codec-corruption",
@@ -121,6 +124,7 @@ def _minimal_model_snapshot() -> OperationSnapshot:
             ],
             "tool_tokens": 0,
         },
+        allow_parallel_tool_calls=allow_parallel_tool_calls,
     )
     response = ModelResponse(
         finish_reason=FinishReason.STOP,
@@ -166,8 +170,14 @@ def _minimal_model_snapshot() -> OperationSnapshot:
     )
 
 
-async def _create_valid_database(path: Path) -> None:
-    snapshot = _minimal_model_snapshot()
+async def _create_valid_database(
+    path: Path,
+    *,
+    allow_parallel_tool_calls: bool | None = False,
+) -> None:
+    snapshot = _minimal_model_snapshot(
+        allow_parallel_tool_calls=allow_parallel_tool_calls
+    )
     store = await SQLiteOperationStore.open(path)
     try:
         created = await store.create(snapshot)
@@ -239,6 +249,7 @@ async def test_model_request_context_selection_roundtrips_and_decodes_v1(
     try:
         loaded = await store.load(OPERATION_ID)
         context_selection = loaded.snapshot.model_calls[0].request.context_selection
+        assert loaded.snapshot.model_calls[0].request.allow_parallel_tool_calls is False
         assert context_selection["schema_version"] == 1
         assert context_selection["profile_id"] == "mock:codec-corruption"
         assert context_selection["selected_blocks"]
@@ -250,14 +261,66 @@ async def test_model_request_context_selection_roundtrips_and_decodes_v1(
         request.pop("context_selection")
         request.pop("response_schema")
         request.pop("sensitivity")
+        request.pop("allow_parallel_tool_calls")
 
     _edit_request_json(path, downgrade_to_v1)
     legacy_store = await SQLiteOperationStore.open(path)
     try:
         legacy = await legacy_store.load(OPERATION_ID)
         assert not legacy.snapshot.model_calls[0].request.context_selection
+        assert legacy.snapshot.model_calls[0].request.allow_parallel_tool_calls is None
     finally:
         await legacy_store.close()
+
+
+@pytest.mark.parametrize("codec_version", (2, 3))
+async def test_model_request_v2_v3_decode_parallel_policy_as_none(
+    tmp_path: Path,
+    codec_version: int,
+) -> None:
+    path = tmp_path / "state.db"
+    await _create_valid_database(path)
+
+    def downgrade_request(request: dict[str, object]) -> None:
+        request["codec_version"] = codec_version
+        request.pop("allow_parallel_tool_calls")
+        if codec_version == 2:
+            request.pop("response_schema")
+            request.pop("sensitivity")
+
+    _edit_request_json(path, downgrade_request)
+    store = await SQLiteOperationStore.open(path)
+    try:
+        loaded = await store.load(OPERATION_ID)
+        assert loaded.snapshot.model_calls[0].request.allow_parallel_tool_calls is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "allow_parallel_tool_calls",
+    (None, False, True),
+    ids=("provider-default", "single-call", "parallel-allowed"),
+)
+async def test_model_request_parallel_policy_roundtrips_after_cold_reopen(
+    tmp_path: Path,
+    allow_parallel_tool_calls: bool | None,
+) -> None:
+    path = tmp_path / "state.db"
+    await _create_valid_database(
+        path,
+        allow_parallel_tool_calls=allow_parallel_tool_calls,
+    )
+
+    store = await SQLiteOperationStore.open(path)
+    try:
+        loaded = await store.load(OPERATION_ID)
+        assert (
+            loaded.snapshot.model_calls[0].request.allow_parallel_tool_calls
+            is allow_parallel_tool_calls
+        )
+    finally:
+        await store.close()
 
 
 @pytest.mark.parametrize(
@@ -285,7 +348,7 @@ async def test_load_rejects_corrupt_generic_json(
 
 
 def _set_unknown_request_codec(request: dict[str, object]) -> None:
-    request["codec_version"] = 4
+    request["codec_version"] = 5
 
 
 def _set_unknown_content_kind(request: dict[str, object]) -> None:
@@ -309,6 +372,30 @@ def _set_unknown_message_role(request: dict[str, object]) -> None:
     ids=("codec-version", "content-kind", "message-role-enum"),
 )
 async def test_load_rejects_unknown_model_codec_values(
+    tmp_path: Path,
+    edit: Callable[[dict[str, object]], None],
+) -> None:
+    path = tmp_path / "state.db"
+    await _create_valid_database(path)
+    _edit_request_json(path, edit)
+
+    await _assert_typed_corruption(path)
+
+
+def _remove_parallel_tool_policy(request: dict[str, object]) -> None:
+    request.pop("allow_parallel_tool_calls")
+
+
+def _set_non_boolean_parallel_tool_policy(request: dict[str, object]) -> None:
+    request["allow_parallel_tool_calls"] = 0
+
+
+@pytest.mark.parametrize(
+    "edit",
+    (_remove_parallel_tool_policy, _set_non_boolean_parallel_tool_policy),
+    ids=("missing", "non-boolean"),
+)
+async def test_load_rejects_corrupt_parallel_tool_policy(
     tmp_path: Path,
     edit: Callable[[dict[str, object]], None],
 ) -> None:

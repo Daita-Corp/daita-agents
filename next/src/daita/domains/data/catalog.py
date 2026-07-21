@@ -2,27 +2,68 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from typing import cast
+from typing import TYPE_CHECKING
 
 from ..._json import FrozenJsonObject
-from ...adapters.models import SourceRegistration
+from ...capabilities import ToolApplicability
 from ...catalog.models import FacetKind, ResourceKind
 from ...catalog.protocols import CatalogStore
 from ...catalog.service import CatalogService
 from .sql import ResourceSchema
 
+if TYPE_CHECKING:
+    from ...adapters.protocols import SourceStore
+
 
 class CatalogDataView:
     """Translate catalog records without creating a second catalog owner."""
 
-    def __init__(self, store: CatalogStore, service: CatalogService) -> None:
+    def __init__(
+        self,
+        store: CatalogStore,
+        service: CatalogService,
+        sources: SourceStore,
+    ) -> None:
         if not isinstance(store, CatalogStore):
             raise TypeError("store must implement CatalogStore")
         if not isinstance(service, CatalogService):
             raise TypeError("service must be a CatalogService")
+        if not callable(getattr(sources, "load_source", None)) or not callable(
+            getattr(sources, "list_sources", None)
+        ):
+            raise TypeError("sources must provide source registration reads")
         self._store = store
         self._service = service
+        self._sources = sources
+
+    async def source_routing_facts(
+        self,
+        agent_id: str,
+        configuration_flags: tuple[str, ...],
+    ) -> tuple[FrozenJsonObject, ...]:
+        """Project only active, declared source-routing control facts."""
+
+        requested_flags = ToolApplicability(
+            required_configuration_flags=configuration_flags
+        ).required_configuration_flags
+        registrations = await self._sources.list_sources(agent_id)
+        return tuple(
+            FrozenJsonObject.from_mapping(
+                {
+                    "source_id": registration.id,
+                    "adapter_id": registration.adapter_id,
+                    "configuration_flags": {
+                        flag: registration.configuration.get(flag) is True
+                        for flag in requested_flags
+                    },
+                }
+            )
+            for registration in sorted(
+                registrations,
+                key=lambda item: (item.id, item.adapter_id),
+            )
+            if registration.agent_id == agent_id and registration.active
+        )
 
     async def resource_schemas(
         self,
@@ -139,14 +180,7 @@ class CatalogDataView:
     ) -> str | None:
         """Return the durable attached-source adapter identity, if current."""
 
-        load_source = getattr(self._store, "load_source", None)
-        if not callable(load_source):
-            return None
-        typed_load_source = cast(
-            Callable[[str, str], Awaitable[SourceRegistration | None]],
-            load_source,
-        )
-        registration = await typed_load_source(agent_id, source_id)
+        registration = await self._sources.load_source(agent_id, source_id)
         if (
             registration is None
             or registration.agent_id != agent_id
@@ -156,6 +190,27 @@ class CatalogDataView:
             return None
         return registration.adapter_id
 
+    async def resource_identity(
+        self,
+        agent_id: str,
+        resource_id: str,
+    ) -> tuple[str, str, str] | None:
+        """Project source, kind, and revision for an active current resource."""
+
+        resource = await self._store.load_resource(agent_id, resource_id)
+        if (
+            resource is None
+            or resource.agent_id != agent_id
+            or resource.id != resource_id
+            or await self.source_adapter_id(agent_id, resource.source_id) is None
+        ):
+            return None
+        return (
+            resource.source_id,
+            resource.kind.value,
+            resource.current_revision,
+        )
+
     async def is_writable_sqlite_source(
         self,
         agent_id: str,
@@ -163,14 +218,7 @@ class CatalogDataView:
     ) -> bool:
         """Project explicit write admission from the durable source registration."""
 
-        load_source = getattr(self._store, "load_source", None)
-        if not callable(load_source):
-            return False
-        typed_load_source = cast(
-            Callable[[str, str], Awaitable[SourceRegistration | None]],
-            load_source,
-        )
-        registration = await typed_load_source(agent_id, source_id)
+        registration = await self._sources.load_source(agent_id, source_id)
         return bool(
             registration is not None
             and registration.agent_id == agent_id

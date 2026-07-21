@@ -87,6 +87,11 @@ class GeminiProvider:
     def provider_id(self) -> str:
         return f"gemini:{self.model}"
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return request.allow_parallel_tool_calls is None
+
     @property
     def client(self) -> _GeminiClient:
         if self._client is None:
@@ -124,6 +129,7 @@ class GeminiProvider:
     async def _generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
         try:
             response = await self.client.aio.models.generate_content(**arguments)
@@ -177,6 +183,7 @@ class GeminiProvider:
     ) -> AsyncIterator[ModelStreamEvent]:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
         try:
             raw_stream = await self.client.aio.models.generate_content_stream(
@@ -398,6 +405,13 @@ class GeminiProvider:
                 "Gemini returned a malformed stream",
             ) from error
         yield ModelStreamCompleted(response)
+
+    def _require_supported_request_policy(self, request: ModelRequest) -> None:
+        if not self.supports_request_policy(request):
+            raise ModelProviderError(
+                ProviderErrorCode.INVALID_REQUEST,
+                "Gemini cannot enforce the requested tool-call policy",
+            )
 
     def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
         try:

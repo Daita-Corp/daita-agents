@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import cast
 
 import pytest
 
@@ -288,6 +289,55 @@ def test_model_request_freezes_versioned_bounded_context_selection() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "allow_parallel_tool_calls",
+    (None, False, True),
+    ids=("provider-default", "single-call", "parallel-allowed"),
+)
+def test_model_request_accepts_optional_parallel_tool_policy(
+    allow_parallel_tool_calls: bool | None,
+) -> None:
+    message = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.USER,
+        content=(TextBlock("hello"),),
+    )
+
+    request = ModelRequest(
+        operation_id="operation-1",
+        turn_id="turn-1",
+        messages=(message,),
+        allow_parallel_tool_calls=allow_parallel_tool_calls,
+    )
+
+    assert request.allow_parallel_tool_calls is allow_parallel_tool_calls
+
+
+@pytest.mark.parametrize(
+    "invalid_policy",
+    (0, 1, "false"),
+    ids=("zero", "one", "text"),
+)
+def test_model_request_rejects_non_boolean_parallel_tool_policy(
+    invalid_policy: object,
+) -> None:
+    message = CanonicalMessage(
+        agent_id="agent-1",
+        operation_id="operation-1",
+        role=MessageRole.USER,
+        content=(TextBlock("hello"),),
+    )
+
+    with pytest.raises(TypeError, match="allow_parallel_tool_calls"):
+        ModelRequest(
+            operation_id="operation-1",
+            turn_id="turn-1",
+            messages=(message,),
+            allow_parallel_tool_calls=cast(bool | None, invalid_policy),
+        )
+
+
 def test_response_is_strict_and_preserves_mixed_text_and_ordered_calls() -> None:
     first = ToolCall(id="call-1", name="fake.read", arguments={"key": "alpha"})
     second = ToolCall(id="call-2", name="fake.read", arguments={"key": "beta"})
@@ -351,11 +401,14 @@ def test_usage_accounts_exact_decimal_cost_without_float_drift() -> None:
         ModelUsage(input_tokens=-1)
 
 
-async def test_model_provider_protocol_exposes_only_provider_id_and_generate() -> None:
+async def test_model_provider_protocol_exposes_request_policy_and_generate() -> None:
     class StubProvider:
         @property
         def provider_id(self) -> str:
             return "stub"
+
+        def supports_request_policy(self, request: ModelRequest) -> bool:
+            return request.allow_parallel_tool_calls is None
 
         async def generate(self, request: ModelRequest) -> ModelResponse:
             return ModelResponse(
@@ -377,6 +430,7 @@ async def test_model_provider_protocol_exposes_only_provider_id_and_generate() -
         ),
     )
 
+    assert provider.supports_request_policy(request) is True
     response = await provider.generate(request)
 
     assert provider.provider_id == "stub"

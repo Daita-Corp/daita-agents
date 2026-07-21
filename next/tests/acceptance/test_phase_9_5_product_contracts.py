@@ -62,6 +62,9 @@ class ScriptedProvider:
     def __init__(self, *responses: ModelResponse) -> None:
         self._responses = list(responses)
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         del request
         if not self._responses:
@@ -96,7 +99,9 @@ class TextContext:
 
 
 class TextDomain:
-    def tool_views(self, operation: OperationSnapshot) -> tuple[ToolDefinition, ...]:
+    async def tool_views(
+        self, operation: OperationSnapshot
+    ) -> tuple[ToolDefinition, ...]:
         del operation
         return ()
 

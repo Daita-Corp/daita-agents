@@ -209,6 +209,18 @@ async def test_catalog_snapshot_reopens_searches_and_traverses_current_state(
     assert await store.load_facets("agent-1", orders.id) == tuple(
         facet for facet in snapshot.facets if facet.resource_id == orders.id
     )
+    relationship = snapshot.relationships[0]
+    assert await store.load_incident_relationships(
+        "agent-1",
+        orders.id,
+        relationship_kinds=(RelationshipKind.REFERENCES,),
+        limit=1,
+    ) == (relationship,)
+    assert await store.load_relationships(
+        "agent-1",
+        (relationship.id,),
+    ) == (relationship,)
+    assert await store.load_relationships("other-agent", (relationship.id,)) == ()
 
     hostile = await store.search(
         CatalogSearchRequest(
@@ -249,6 +261,9 @@ async def test_catalog_snapshot_reopens_searches_and_traverses_current_state(
     try:
         assert await reopened.load_resource("agent-1", orders.id) == orders
         assert await reopened.load_facets("agent-1", orders.id, orders.current_revision)
+        assert await reopened.load_relationships("agent-1", (relationship.id,)) == (
+            relationship,
+        )
     finally:
         await reopened.close()
 
@@ -288,6 +303,147 @@ async def test_complete_snapshot_replaces_projection_but_retains_revision_histor
         assert removed_search.hits == ()
         assert removed_search.total_matches == 0
         assert removed_search.truncated is False
+        assert (
+            await store.load_relationships(
+                "agent-1",
+                tuple(relationship.id for relationship in first.relationships),
+            )
+            == ()
+        )
+        assert (
+            await store.load_incident_relationships(
+                "agent-1",
+                removed.id,
+            )
+            == ()
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_names"),
+    (
+        ("customer", {"customer", "customers", "orders"}),
+        ("invoice", {"invoice", "invoices"}),
+    ),
+)
+async def test_catalog_search_ranks_exact_tokens_before_safe_prefix_matches(
+    tmp_path,
+    query: str,
+    expected_names: set[str],
+) -> None:
+    store = await _open_store(tmp_path / f"{query}.sqlite3")
+    snapshot = _snapshot(
+        native_names=(
+            "main.customer",
+            "main.customers",
+            "main.invoice",
+            "main.invoices",
+            "main.orders",
+        )
+    )
+    try:
+        await store.commit_snapshot(snapshot)
+
+        result = await store.search(
+            CatalogSearchRequest(
+                agent_id="agent-1",
+                query=query,
+                source_ids=("source-1",),
+                resource_kinds=(ResourceKind.TABLE,),
+                limit=10,
+            )
+        )
+
+        assert {hit.name for hit in result.hits} == expected_names
+        assert result.hits[0].name == query
+        assert result.hits[0].match_reasons == ("lexical_exact",)
+        reasons = tuple(hit.match_reasons for hit in result.hits)
+        first_prefix = reasons.index(("lexical_prefix",))
+        assert all(reason == ("lexical_exact",) for reason in reasons[:first_prefix])
+        assert all(reason == ("lexical_prefix",) for reason in reasons[first_prefix:])
+        assert (
+            await store.search(
+                CatalogSearchRequest(
+                    agent_id="agent-1",
+                    query=query,
+                    source_ids=("other-source",),
+                    limit=10,
+                )
+            )
+        ).hits == ()
+        assert (
+            await store.search(
+                CatalogSearchRequest(
+                    agent_id="agent-1",
+                    query=query,
+                    resource_kinds=(ResourceKind.FILE,),
+                    limit=10,
+                )
+            )
+        ).hits == ()
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        '" orders OR customers * NEAR(',
+        "a an id",
+        "café 客户",
+        " ".join(f"term{index}" for index in range(40)),
+    ),
+    ids=("operators-and-quotes", "short", "unicode", "maximum-terms"),
+)
+async def test_catalog_search_expansion_is_literal_safe_and_bounded(
+    tmp_path,
+    query: str,
+) -> None:
+    store = await _open_store(tmp_path / "safe-search.sqlite3")
+    try:
+        await store.commit_snapshot(_snapshot())
+
+        result = await store.search(
+            CatalogSearchRequest(
+                agent_id="agent-1",
+                query=query,
+                source_ids=("source-1",),
+                resource_kinds=(ResourceKind.TABLE,),
+                limit=1,
+            )
+        )
+
+        assert len(result.hits) <= 1
+        assert result.total_matches >= len(result.hits)
+        assert all(hit.source_id == "source-1" for hit in result.hits)
+        assert all(hit.kind is ResourceKind.TABLE for hit in result.hits)
+    finally:
+        await store.close()
+
+
+async def test_current_relationship_reads_validate_bounds_before_storage_io(
+    tmp_path,
+) -> None:
+    store = await _open_store(tmp_path / "relationship-bounds.sqlite3")
+    try:
+        with pytest.raises(ValueError, match="2001"):
+            await store.load_incident_relationships(
+                "agent-1",
+                "resource-1",
+                limit=2_002,
+            )
+        with pytest.raises(ValueError, match="64"):
+            await store.load_relationships(
+                "agent-1",
+                tuple(f"relationship-{index}" for index in range(65)),
+            )
+        with pytest.raises(ValueError, match="duplicates"):
+            await store.load_relationships(
+                "agent-1",
+                ("relationship-1", "relationship-1"),
+            )
     finally:
         await store.close()
 

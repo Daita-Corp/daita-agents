@@ -196,6 +196,7 @@ def test_loop_checkpoint_contracts_are_an_implementation_free_leaf() -> None:
     assert imported_modules == {
         "__future__",
         "_json",
+        "collections.abc",
         "dataclasses",
         "datetime",
         "decimal",
@@ -215,6 +216,7 @@ def test_generic_loop_imports_contracts_not_domain_or_provider_implementations()
         "__future__",
         "asyncio",
         "collections.abc",
+        "context.budgeting",
         "llm.errors",
         "llm.models",
         "llm.protocols",
@@ -239,6 +241,26 @@ def test_generic_loop_imports_contracts_not_domain_or_provider_implementations()
                 violations.append((node.lineno, module))
 
     assert violations == []
+
+
+def test_generic_loop_imports_only_the_typed_context_overflow_contract() -> None:
+    tree = ast.parse(
+        LOOP_DRIVER.read_text(encoding="utf-8"),
+        filename=str(LOOP_DRIVER),
+    )
+    context_imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module is not None
+        and node.module.startswith("context")
+    ]
+
+    assert len(context_imports) == 1
+    assert context_imports[0].module == "context.budgeting"
+    assert {alias.name for alias in context_imports[0].names} == {
+        "RequiredContextOverflow"
+    }
 
 
 def test_generic_loop_never_branches_on_provider_or_domain_identity() -> None:

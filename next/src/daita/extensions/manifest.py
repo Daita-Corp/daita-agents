@@ -8,7 +8,7 @@ from hashlib import sha256
 import re
 
 from .._json import canonical_json
-from ..capabilities import ExtensionDeclarations
+from ..capabilities import ExtensionDeclarations, ToolApplicability
 
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _EXTRA_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -85,6 +85,24 @@ class ExtensionManifest:
     @property
     def declaration_fingerprint(self) -> str:
         declarations = self.declarations
+        tool_views: list[dict[str, object]] = []
+        for view in declarations.tool_views:
+            view_material: dict[str, object] = {
+                "capability_id": view.capability_id,
+                "description": view.description,
+                "name": view.name,
+            }
+            if view.applicability != ToolApplicability():
+                view_material["applicability"] = {
+                    "minimum_active_sources": (
+                        view.applicability.minimum_active_sources
+                    ),
+                    "required_configuration_flags": (
+                        view.applicability.required_configuration_flags
+                    ),
+                    "source_adapter_ids": view.applicability.source_adapter_ids,
+                }
+            tool_views.append(view_material)
         material = {
             "capabilities": tuple(
                 {
@@ -94,14 +112,7 @@ class ExtensionManifest:
                 for capability in declarations.capabilities
             ),
             "executor_ids": declarations.executor_ids,
-            "tool_views": tuple(
-                {
-                    "capability_id": view.capability_id,
-                    "description": view.description,
-                    "name": view.name,
-                }
-                for view in declarations.tool_views
-            ),
+            "tool_views": tuple(tool_views),
         }
         return _hash_json(material)
 

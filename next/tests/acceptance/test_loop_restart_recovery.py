@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
+import sqlite3
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -30,6 +34,8 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.llm.providers.openai import OpenAIResponsesProvider
+from daita.llm.protocols import ModelProvider
 from daita.loop.driver import AgentLoop
 from daita.loop.models import (
     LoopBudgets,
@@ -359,7 +365,7 @@ class CountingDomain:
         self.projection_calls = 0
         self.readiness_calls = 0
 
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:
@@ -422,7 +428,7 @@ class TextDomain:
         self.tool_view_calls = 0
         self.readiness_calls = 0
 
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:
@@ -564,6 +570,50 @@ def _final_response() -> ModelResponse:
     )
 
 
+class _WireCapturingResponses:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def create(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            id="response-legacy-replay",
+            status="completed",
+            output=(
+                SimpleNamespace(
+                    type="message",
+                    content=(
+                        SimpleNamespace(type="output_text", text="Recovered answer."),
+                    ),
+                ),
+            ),
+            output_text="Recovered answer.",
+            usage=SimpleNamespace(
+                input_tokens=7,
+                output_tokens=2,
+                input_tokens_details=None,
+                output_tokens_details=None,
+            ),
+        )
+
+
+class _WireCapturingOpenAIClient:
+    def __init__(self) -> None:
+        self.responses = _WireCapturingResponses()
+
+
+class _ProviderWithoutRequestPolicy:
+    """Legacy provider double that genuinely lacks the new policy method."""
+
+    def __init__(self, provider_id: str) -> None:
+        self.provider_id = provider_id
+        self.requests: list[ModelRequest] = []
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        return _final_response()
+
+
 def _tool_response() -> ModelResponse:
     return ModelResponse(
         tool_calls=(
@@ -619,6 +669,8 @@ async def _seed_model_call(
     *,
     budgets: LoopBudgets = LoopBudgets(),
     trigger: AgentTrigger | None = None,
+    provider_id: str = "mock:scripted",
+    allow_parallel_tool_calls: bool | None = None,
 ) -> tuple[OperationSnapshot, Turn, ModelRequest, str]:
     started = await runtime.begin(
         _trigger() if trigger is None else trigger,
@@ -631,10 +683,14 @@ async def _seed_model_call(
         turn,
         registry.tool_definitions(),
     )
+    request = replace(
+        request,
+        allow_parallel_tool_calls=allow_parallel_tool_calls,
+    )
     model_call = await runtime.begin_model_call(
         started.operation.id,
         turn.id,
-        "mock:scripted",
+        provider_id,
         request,
     )
     if response is not None:
@@ -649,6 +705,44 @@ async def _seed_model_call(
             ),
         )
     return started, turn, request, model_call.id
+
+
+def _downgrade_persisted_model_request(
+    path: Path,
+    operation_id: str,
+    codec_version: int,
+) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT request_json FROM model_calls WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        assert row is not None
+        request = cast(dict[str, object], json.loads(str(row[0])))
+        request["codec_version"] = codec_version
+        request.pop("allow_parallel_tool_calls")
+        if codec_version < 3:
+            request.pop("response_schema")
+            request.pop("sensitivity")
+        if codec_version < 2:
+            request.pop("context_selection")
+        connection.execute(
+            "UPDATE model_calls SET request_json = ? WHERE operation_id = ?",
+            (
+                json.dumps(
+                    request,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                operation_id,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _proposal(
@@ -877,6 +971,155 @@ async def test_resume_resends_exact_started_model_request_after_sqlite_reopen(
     assert provider.requests == (request,)
     assert context.calls == 0
     assert domain.tool_view_calls == 0
+
+
+@pytest.mark.parametrize("codec_version", (1, 2, 3))
+async def test_resume_legacy_request_omits_parallel_policy_on_openai_wire(
+    tmp_path: Path,
+    codec_version: int,
+) -> None:
+    database_path = tmp_path / f"legacy-request-v{codec_version}.db"
+    executor = RecordingExecutor()
+    registry = _registry(executor)
+    provider_id = "openai:gpt-legacy-replay"
+    first_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=registry,
+            store=first_store,
+            clock=lambda: NOW,
+        )
+        started, _, _, _ = await _seed_model_call(
+            first_runtime,
+            registry,
+            None,
+            provider_id=provider_id,
+            allow_parallel_tool_calls=False,
+        )
+    finally:
+        await first_store.close()
+
+    _downgrade_persisted_model_request(
+        database_path,
+        started.operation.id,
+        codec_version,
+    )
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT request_json FROM model_calls WHERE operation_id = ?",
+            (started.operation.id,),
+        ).fetchone()
+    assert row is not None
+    persisted_request = cast(dict[str, object], json.loads(str(row[0])))
+    assert persisted_request["codec_version"] == codec_version
+    assert "allow_parallel_tool_calls" not in persisted_request
+
+    wire_client = _WireCapturingOpenAIClient()
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=registry,
+            store=resumed_store,
+            clock=lambda: NOW,
+        )
+        before_resume = await resumed_runtime.inspect(started.operation.id)
+        context = CountingContextBuilder()
+        domain = TextDomain(registry)
+        provider = OpenAIResponsesProvider(
+            "gpt-legacy-replay",
+            client=wire_client,
+        )
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=provider,
+            context_builder=context,
+            domain=domain,
+        )
+
+        result = await loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert before_resume.model_calls[0].request.allow_parallel_tool_calls is None
+    assert result.kind is LoopExitKind.COMPLETED
+    assert final.model_calls[0].request.allow_parallel_tool_calls is None
+    assert len(wire_client.responses.calls) == 1
+    assert "parallel_tool_calls" not in wire_client.responses.calls[0]
+    assert context.calls == 0
+    assert domain.tool_view_calls == 0
+    assert executor.requests == []
+
+
+@pytest.mark.parametrize(
+    ("allow_parallel_tool_calls", "expected_kind", "expected_reason", "request_count"),
+    (
+        (None, LoopExitKind.COMPLETED, "completed", 1),
+        (False, LoopExitKind.FAILED, "invalid_request", 0),
+    ),
+    ids=("legacy-none-compatible", "explicit-false-fails-closed"),
+)
+async def test_resumed_started_request_handles_provider_without_policy_method(
+    tmp_path: Path,
+    allow_parallel_tool_calls: bool | None,
+    expected_kind: LoopExitKind,
+    expected_reason: str,
+    request_count: int,
+) -> None:
+    database_path = tmp_path / f"missing-policy-{request_count}.db"
+    executor = RecordingExecutor()
+    registry = _registry(executor)
+    provider_id = "legacy:no-request-policy"
+    first_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        first_runtime = OperationRuntime(
+            capabilities=registry,
+            store=first_store,
+            clock=lambda: NOW,
+        )
+        started, _, request, _ = await _seed_model_call(
+            first_runtime,
+            registry,
+            None,
+            provider_id=provider_id,
+            allow_parallel_tool_calls=allow_parallel_tool_calls,
+        )
+    finally:
+        await first_store.close()
+
+    provider = _ProviderWithoutRequestPolicy(provider_id)
+    assert not hasattr(provider, "supports_request_policy")
+    resumed_store = await SQLiteOperationStore.open(database_path, clock=lambda: NOW)
+    try:
+        resumed_runtime = OperationRuntime(
+            capabilities=registry,
+            store=resumed_store,
+            clock=lambda: NOW,
+        )
+        context = CountingContextBuilder()
+        domain = TextDomain(registry)
+        loop = AgentLoop(
+            runtime=resumed_runtime,
+            model=cast(ModelProvider, provider),
+            context_builder=context,
+            domain=domain,
+        )
+
+        result = await loop.resume(started.operation.id)
+        final = await resumed_runtime.inspect(started.operation.id)
+    finally:
+        await resumed_store.close()
+
+    assert result.kind is expected_kind
+    assert result.reason == expected_reason
+    assert final.model_calls[0].request == request
+    assert final.model_calls[0].error_code == (
+        None if allow_parallel_tool_calls is None else "invalid_request"
+    )
+    assert len(provider.requests) == request_count
+    assert context.calls == 0
+    assert domain.tool_view_calls == 0
+    assert executor.requests == []
 
 
 async def test_resume_existing_pending_task_without_revalidation(

@@ -123,7 +123,7 @@ class FakeReadDomain:
     def __init__(self, registry: CapabilityRegistry) -> None:
         self.registry = registry
 
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:

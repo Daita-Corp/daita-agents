@@ -361,7 +361,7 @@ async def test_migration_six_normalizes_approvals_and_event_correlation(
 
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (17,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (18,)
         approval_columns = tuple(
             row[1] for row in connection.execute("PRAGMA table_info(approvals)")
         )
@@ -665,12 +665,16 @@ async def test_real_sqlite_compression_projects_persisted_approval_state(
                 context_window_tokens=20_000,
                 max_output_tokens=1_000,
             ),
+            maximum_projection_tokens=19_000,
         )
 
         assert projection.compressed_now
         checkpoint = projection.checkpoint
         assert checkpoint is not None
-        assert checkpoint.operation_ids == (denied.operation.id,)
+        assert checkpoint.operation_ids == (
+            denied.operation.id,
+            recent.operation.id,
+        )
         assert checkpoint.approval_ids == ("approval-global",)
         expected_approvals = [
             {
@@ -682,7 +686,6 @@ async def test_real_sqlite_compression_projects_persisted_approval_state(
         assert json.loads(checkpoint.summary)["approvals"] == expected_approvals
         assert tuple(block.kind for block in projection.blocks) == (
             ContextKind.SESSION_SUMMARY,
-            ContextKind.SESSION_RECENT,
         )
         assert all(block.required for block in projection.blocks)
         summary_text = projection.blocks[0].messages[0].content[0]
@@ -701,3 +704,39 @@ async def test_real_sqlite_compression_projects_persisted_approval_state(
         )
     finally:
         await reopened.close()
+
+    cold = await SQLiteOperationStore.open(path)
+    try:
+        cold_projection = await SessionCompressionService(
+            transcripts=cold,
+            checkpoints=cold,
+            operations=cold,
+            committer=cold,
+            policy=SessionCompressionPolicy(
+                compression_threshold_tokens=1,
+                retain_latest_operations=1,
+            ),
+            clock=lambda: NOW + timedelta(minutes=4),
+            id_factory=lambda prefix: f"{prefix}-must-not-be-used",
+        ).project(
+            agent_id="agent-approval",
+            session_id="session-approval",
+            current_operation_id=current.operation.id,
+            profile=ModelProfile(
+                id="mock:approval-compression",
+                context_window_tokens=20_000,
+                max_output_tokens=1_000,
+            ),
+            maximum_projection_tokens=19_000,
+        )
+
+        assert not cold_projection.compressed_now
+        assert cold_projection.checkpoint == checkpoint
+        assert cold_projection.blocks == projection.blocks
+        assert all(
+            message.operation_id == current.operation.id
+            for block in cold_projection.blocks
+            for message in block.messages
+        )
+    finally:
+        await cold.close()

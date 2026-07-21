@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -17,6 +18,7 @@ from daita.llm.models import (
     ToolCall,
 )
 from daita.loop.models import LoopExitKind
+from daita.storage.blobs import LocalBlobStore
 
 NOW = datetime(2026, 7, 19, 2, 0, tzinfo=timezone.utc)
 OLD_MTIME = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
@@ -35,6 +37,9 @@ class JourneyProvider:
     def __init__(self) -> None:
         self.script: list[ModelResponse] = []
         self.requests: list[ModelRequest] = []
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
@@ -214,10 +219,7 @@ async def test_public_cross_source_local_file_comparison_journey(
                 "data_query_sqlite",
                 {
                     "source_id": database_source.id,
-                    "sql": (
-                        "SELECT CAST(id AS TEXT) AS id, name, status "
-                        "FROM customers ORDER BY id"
-                    ),
+                    "sql": "SELECT id, name, status FROM customers ORDER BY id",
                 },
             ),
             _tool(
@@ -228,6 +230,7 @@ async def test_public_cross_source_local_file_comparison_journey(
                     "right_evidence_id": "evidence-6",
                     "key_columns": ["id"],
                     "compare_columns": ["name", "status"],
+                    "key_normalization": "stringify_integral",
                 },
             ),
             ModelResponse(
@@ -298,11 +301,15 @@ async def test_public_cross_source_local_file_comparison_journey(
 
     assert comparison.id == "evidence-7"
     assert comparison.kind == "data.tabular.comparison"
+    assert comparison.schema_version == 2
     assert comparison.blob_id is not None
     assert comparison.content_hash == comparison.payload["artifact_digest"]
     assert comparison.payload["complete"] is True
     assert comparison.payload["truncated"] is False
     assert comparison.payload["total_discrepancies"] == 3
+    comparison_policy = _frozen_object(comparison.payload["comparison_policy"])
+    assert comparison_policy["schema_version"] == 1
+    assert comparison_policy["key_normalization"] == "stringify_integral"
     counts = _frozen_object(comparison.payload["counts"])
     assert counts["left_rows"] == 3
     assert counts["right_rows"] == 3
@@ -336,6 +343,10 @@ async def test_public_cross_source_local_file_comparison_journey(
     assert right_revisions[0]["resource_id"] == table_resource_id
 
     assert [decision.allowed for decision in snapshot.readiness] == [False, True]
+    assert [decision.code for decision in snapshot.readiness] == [
+        "data.response_contract_incomplete",
+        "data.response_contract_satisfied",
+    ]
     assert snapshot.readiness[0].missing_facts == (
         "citations to one comparison and both accepted source inputs",
     )
@@ -365,10 +376,22 @@ async def test_public_cross_source_local_file_comparison_journey(
     reopened = await Agent.open("atlas", root=state_root, clock=lambda: NOW)
     recovered = await reopened.inspect(result.operation_id)
     transcript = await reopened.transcript("session-cross-source")
+    original_blob_id = comparison.blob_id
+    assert original_blob_id is not None
+    retained_blobs = LocalBlobStore(state_root / "agents" / "atlas" / "blobs")
+    retained_reader = await retained_blobs.open(original_blob_id)
+    async with retained_reader:
+        retained_artifact = json.loads(
+            await retained_reader.read(retained_reader.metadata.size_bytes)
+        )
     await reopened.close()
 
     assert recovered == snapshot
     assert recovered.evidence[-1].blob_id == comparison.blob_id
     assert recovered.evidence[-1].content_hash == comparison.content_hash
+    assert recovered.evidence[-1].schema_version == 2
+    assert recovered.evidence[-1].payload["comparison_policy"] == comparison_policy
+    assert retained_artifact["schema_version"] == 2
+    assert retained_artifact["comparison_policy"] == comparison_policy.to_dict()
     assert transcript.session.id == "session-cross-source"
     assert transcript.operation_ids == (result.operation_id,)

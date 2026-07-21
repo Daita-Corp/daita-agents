@@ -440,6 +440,7 @@ class ModelRequest:
     response_schema: Mapping[str, object] | None = None
     sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
     context_selection: Mapping[str, object] = field(default_factory=dict)
+    allow_parallel_tool_calls: bool | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.operation_id, "model-request operation_id")
@@ -488,6 +489,13 @@ class ModelRequest:
                 )
         if not isinstance(self.sensitivity, ModelSensitivity):
             raise TypeError("model-request sensitivity must be ModelSensitivity")
+        if self.allow_parallel_tool_calls is not None and not isinstance(
+            self.allow_parallel_tool_calls,
+            bool,
+        ):
+            raise TypeError(
+                "model-request allow_parallel_tool_calls must be bool or None"
+            )
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "response_schema", response_schema)

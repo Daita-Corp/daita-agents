@@ -25,6 +25,11 @@ REVISION_A = "sha256:" + "a" * 64
 REVISION_B = "sha256:" + "b" * 64
 
 
+def _frozen_object(value: object) -> FrozenJsonObject:
+    assert isinstance(value, FrozenJsonObject)
+    return value
+
+
 def _request(capability_id: str, arguments: dict[str, object]) -> ExecutionRequest:
     return ExecutionRequest(
         operation_id="operation-1",
@@ -169,12 +174,14 @@ def test_tabular_comparison_is_strict_deterministic_and_reports_bad_keys() -> No
         right,
         key_columns=("id",),
         compare_columns=("name", "status"),
+        key_normalization="strict",
     )
     second = compare_tabular_datasets(
         left,
         right,
         key_columns=("id",),
         compare_columns=("name", "status"),
+        key_normalization="strict",
     )
 
     assert first == second
@@ -204,6 +211,45 @@ def test_tabular_comparison_is_strict_deterministic_and_reports_bad_keys() -> No
         "value_mismatch",
         "missing_value",
     )
+
+
+def test_tabular_comparison_stringifies_only_integral_keys_and_preserves_types() -> (
+    None
+):
+    left = _dataset(
+        "evidence-left",
+        "source-files",
+        REVISION_A,
+        ({"id": "1", "name": "Ada", "status": "active"},),
+    )
+    right = _dataset(
+        "evidence-right",
+        "source-database",
+        REVISION_B,
+        ({"id": 1, "name": "Ada", "status": "inactive"},),
+    )
+
+    result = compare_tabular_datasets(
+        left,
+        right,
+        key_columns=("id",),
+        compare_columns=("status",),
+        key_normalization="stringify_integral",
+    )
+
+    policy = _frozen_object(result.payload["comparison_policy"])
+    counts = _frozen_object(result.payload["counts"])
+    assert policy["key_normalization"] == "stringify_integral"
+    assert counts["matched_keys"] == 1
+    discrepancy = result.discrepancies[0]
+    assert discrepancy["kind"] == "value_mismatch"
+    left_key = _frozen_object(discrepancy["left_key"])
+    right_key = _frozen_object(discrepancy["right_key"])
+    assert _frozen_object(left_key["values"])["id"] == "1"
+    assert _frozen_object(left_key["types"])["id"] == "string"
+    assert _frozen_object(right_key["values"])["id"] == 1
+    assert _frozen_object(right_key["types"])["id"] == "integer"
+    assert _frozen_object(discrepancy["normalized_key"])["id"] == "1"
 
 
 class DatasetReader:
@@ -251,6 +297,7 @@ async def test_comparison_executor_resolves_only_accepted_evidence_ids() -> None
                 "right_evidence_id": "evidence-right",
                 "key_columns": ["id"],
                 "compare_columns": ["name", "status"],
+                "key_normalization": "strict",
             },
         )
     )
@@ -297,6 +344,7 @@ def test_partial_inputs_and_discrepancy_limit_are_explicit() -> None:
         right,
         key_columns=("id",),
         compare_columns=("name",),
+        key_normalization="strict",
         max_discrepancies=2,
         max_inline_discrepancies=1,
     )

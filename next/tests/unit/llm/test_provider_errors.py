@@ -82,7 +82,7 @@ class _TextContext:
 
 
 class _NoActionDomain:
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:

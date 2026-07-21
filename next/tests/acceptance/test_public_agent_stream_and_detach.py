@@ -51,7 +51,9 @@ class _TextContext:
 
 
 class _TextDomain:
-    def tool_views(self, operation: OperationSnapshot) -> tuple[ToolDefinition, ...]:
+    async def tool_views(
+        self, operation: OperationSnapshot
+    ) -> tuple[ToolDefinition, ...]:
         return ()
 
     async def validate_action(
@@ -85,6 +87,9 @@ class _GatedProvider:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.calls += 1
         if self.calls == 2:
@@ -101,6 +106,9 @@ class _BlockingProvider:
 
     def __init__(self) -> None:
         self.entered = asyncio.Event()
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.entered.set()

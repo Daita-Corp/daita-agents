@@ -206,7 +206,7 @@ class AdversarialDomain:
         self._clock = clock
         self.readiness_calls = 0
 
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:
@@ -265,6 +265,9 @@ class CancellationSuppressingProvider:
 
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)

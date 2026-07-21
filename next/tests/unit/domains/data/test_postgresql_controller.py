@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from daita._json import FrozenJsonObject
 from daita.domains.data import (
     DataDomainController,
     PostgreSQLReadResult,
@@ -48,6 +49,24 @@ class Catalog:
     def __init__(self, adapter_id: str = "postgresql") -> None:
         self.adapter_id = adapter_id
 
+    async def source_routing_facts(
+        self,
+        agent_id: str,
+        configuration_flags: tuple[str, ...],
+    ) -> tuple[FrozenJsonObject, ...]:
+        assert agent_id == "agent-1"
+        return (
+            FrozenJsonObject.from_mapping(
+                {
+                    "adapter_id": self.adapter_id,
+                    "configuration_flags": {
+                        flag: False for flag in configuration_flags
+                    },
+                    "source_id": "source-postgresql",
+                }
+            ),
+        )
+
     async def source_adapter_id(
         self,
         agent_id: str,
@@ -55,6 +74,16 @@ class Catalog:
     ) -> str | None:
         assert agent_id == "agent-1"
         return self.adapter_id
+
+    async def resource_identity(
+        self,
+        agent_id: str,
+        resource_id: str,
+    ) -> tuple[str, str, str] | None:
+        assert agent_id == "agent-1"
+        if resource_id == "resource-orders":
+            return ("source-postgresql", "table", RESOURCE_REVISION)
+        return None
 
     async def resource_schemas(
         self,
@@ -201,6 +230,30 @@ async def test_controller_routes_postgresql_proposals_to_postgresql_validation()
 
     assert isinstance(invalid, ActionRejection)
     assert invalid.code == "data.sql.parameter_style_invalid"
+    assert invalid.details["anonymous_placeholders"] == 1
+    issue_codes = invalid.details["issue_codes"]
+    assert isinstance(issue_codes, tuple)
+    assert "parameter_style_invalid" in issue_codes
+
+    missing_column_call = ToolCall(
+        id="missing-column",
+        name="data_query_postgresql",
+        arguments={
+            "source_id": "source-postgres",
+            "sql": "SELECT sttaus FROM public.orders",
+            "parameters": [],
+        },
+    )
+    registry, snapshot = await _snapshot(missing_column_call)
+    missing_column = await DataDomainController(
+        registry, Catalog(), clock=lambda: NOW
+    ).validate_action(missing_column_call, snapshot)
+
+    assert isinstance(missing_column, ActionRejection)
+    assert missing_column.code == "data.sql.missing_column"
+    assert missing_column.details["column"] == "sttaus"
+    assert missing_column.details["resource_id"] == "resource-orders"
+    assert missing_column.details["candidates"] == ("status",)
 
 
 async def test_controller_rejects_postgresql_tool_for_sqlite_source_before_task() -> (

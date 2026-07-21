@@ -203,6 +203,35 @@ def test_valid_read_is_checked_against_catalog_scope_and_parameter_arity(
     )
 
 
+def test_chained_cte_columns_validate_in_their_lexical_relation_scope(
+    resources: tuple[ResourceSchema, ...],
+) -> None:
+    result = validate_sqlite_read(
+        """
+        WITH picked AS (
+            SELECT id AS order_key, customer_id
+            FROM orders
+            WHERE status = ?
+        ), named AS (
+            SELECT p.order_key, c.name AS customer_name
+            FROM picked AS p
+            JOIN customers AS c ON c.id = p.customer_id
+        )
+        SELECT n.order_key, n.customer_name
+        FROM named AS n
+        """,
+        source_id="source:sqlite:test",
+        resources=resources,
+        parameters=("complete",),
+    )
+
+    assert result.valid is True
+    assert result.resource_ids == (
+        "resource:sqlite:orders",
+        "resource:sqlite:customers",
+    )
+
+
 @pytest.mark.parametrize(
     ("sql", "parameters", "expected_code"),
     [

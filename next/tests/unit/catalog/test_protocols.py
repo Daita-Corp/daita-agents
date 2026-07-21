@@ -30,6 +30,14 @@ class _CatalogStoreDouble:
     async def load_facets(self, agent_id, resource_id, revision=None):
         return ()
 
+    async def load_incident_relationships(
+        self, agent_id, resource_id, *, relationship_kinds=(), limit=50
+    ):
+        return ()
+
+    async def load_relationships(self, agent_id, relationship_ids):
+        return ()
+
     async def search(self, request):
         raise NotImplementedError
 

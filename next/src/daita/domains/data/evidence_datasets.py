@@ -21,7 +21,7 @@ from ...catalog.protocols import CatalogStore
 from ...operations.models import Evidence, Task, TaskStatus
 from ...operations.store import OperationStore, VersionedOperation
 from ...storage.blobs import BlobMetadata, BlobStore
-from .comparison import TabularEvidenceDataset
+from .comparison import AcceptedEvidenceDatasetError, TabularEvidenceDataset
 from .controller import POSTGRESQL_QUERY_EVIDENCE_KIND, SQLITE_QUERY_EVIDENCE_KIND
 from .file_capabilities import LOCAL_FILE_READ_EVIDENCE_KIND
 
@@ -37,13 +37,12 @@ _SUPPORTED_KINDS = frozenset(
 _ARTIFACT_MEDIA_TYPE = "application/json"
 
 
-class DataEvidenceDatasetError(RuntimeError):
+class DataEvidenceDatasetError(AcceptedEvidenceDatasetError):
     """Normalized fail-closed error at the persisted-evidence trust boundary."""
 
     def __init__(self, code: str) -> None:
         if not isinstance(code, str) or _ERROR_CODE.fullmatch(code) is None:
             raise ValueError("dataset error code is invalid")
-        self.code = code
         super().__init__(code)
 
 

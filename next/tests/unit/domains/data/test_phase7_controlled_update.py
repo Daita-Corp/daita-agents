@@ -289,6 +289,14 @@ class CatalogStoreStub:
             return (self.facet,)
         return ()
 
+    async def load_incident_relationships(
+        self, agent_id, resource_id, *, relationship_kinds=(), limit=50
+    ):
+        return ()
+
+    async def load_relationships(self, agent_id, relationship_ids):
+        return ()
+
     async def search(self, request):
         raise AssertionError("not used")
 
@@ -299,6 +307,21 @@ class CatalogStoreStub:
         if agent_id == "agent-atlas" and source_id == self.registration.id:
             return self.registration
         return None
+
+    async def register_source(self, registration):
+        self.registration = registration
+        return registration
+
+    async def list_sources(self, agent_id):
+        if agent_id == "agent-atlas":
+            return (self.registration,)
+        return ()
+
+    async def detach_source(self, agent_id, source_id, detached_at):
+        if agent_id != "agent-atlas" or source_id != self.registration.id:
+            raise KeyError(source_id)
+        self.registration = self.registration.detach(detached_at)
+        return self.registration
 
 
 async def test_catalog_projects_only_full_single_column_keys_and_write_access() -> None:
@@ -375,7 +398,7 @@ async def test_catalog_projects_only_full_single_column_keys_and_write_access() 
         resource_count=1,
     )
     store = CatalogStoreStub(registration, resource, sync, facet)
-    view = CatalogDataView(store, CatalogService(store))
+    view = CatalogDataView(store, CatalogService(store, store), store)
 
     schemas = await view.resource_schemas("agent-atlas", registration.id)
 
@@ -398,6 +421,12 @@ async def test_catalog_projects_only_full_single_column_keys_and_write_access() 
         is True
     )
     assert await view.source_adapter_id("agent-atlas", registration.id) == "sqlite"
+    assert await view.resource_identity("agent-atlas", resource.id) == (
+        registration.id,
+        "table",
+        resource.current_revision,
+    )
+    assert await view.resource_identity("another-agent", resource.id) is None
     store.registration = replace(
         registration,
         configuration={"path": "/tmp/orders.sqlite3", "write_access": False},
@@ -409,11 +438,32 @@ async def test_catalog_projects_only_full_single_column_keys_and_write_access() 
         )
         is False
     )
+    store.registration = store.registration.detach(NOW)
+    assert await view.resource_identity("agent-atlas", resource.id) is None
 
 
 class CatalogReader:
+    async def source_routing_facts(self, agent_id, configuration_flags):
+        assert agent_id == "agent-atlas"
+        return (
+            FrozenJsonObject.from_mapping(
+                {
+                    "adapter_id": "sqlite",
+                    "configuration_flags": {
+                        flag: flag == "write_access" for flag in configuration_flags
+                    },
+                    "source_id": "source-orders",
+                }
+            ),
+        )
+
     async def source_adapter_id(self, agent_id, source_id):
         return "sqlite"
+
+    async def resource_identity(self, agent_id, resource_id):
+        if agent_id == "agent-atlas" and resource_id == "resource-orders":
+            return ("source-orders", "table", REVISION)
+        return None
 
     async def resource_schemas(self, agent_id, source_id):
         if agent_id == "agent-atlas" and source_id == "source-orders":
@@ -752,14 +802,17 @@ async def test_denied_update_requires_no_application_disclosure_and_impact_citat
     )
 
     assert missing_citation.allowed is False
+    assert missing_citation.code == "data.response_contract_incomplete"
     assert missing_citation.missing_facts == (
         "a citation to the accepted impact evidence for the denied update",
     )
     assert missing_disclosure.allowed is False
+    assert missing_disclosure.code == "data.response_contract_incomplete"
     assert missing_disclosure.missing_facts == (
         "an explicit statement that the update was not applied",
     )
     assert ready.allowed is True
+    assert ready.code == "data.response_contract_satisfied"
     assert backend.update_calls == []
 
 

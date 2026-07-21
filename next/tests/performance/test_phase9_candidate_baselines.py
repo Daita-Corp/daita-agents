@@ -222,7 +222,7 @@ class _BaselineDomain:
     def __init__(self, registry: CapabilityRegistry) -> None:
         self._registry = registry
 
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:
@@ -281,6 +281,9 @@ class _BaselineProvider:
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
         self._calls_by_operation: dict[str, int] = {}
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
@@ -607,7 +610,7 @@ class _TextContext:
 
 
 class _TextDomain:
-    def tool_views(
+    async def tool_views(
         self,
         operation: OperationSnapshot,
     ) -> tuple[ToolDefinition, ...]:
@@ -642,6 +645,9 @@ class _MonitorProvider:
 
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return True
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
