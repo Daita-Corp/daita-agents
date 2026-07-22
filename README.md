@@ -1,427 +1,263 @@
-# Daita Agents
+# Daita MVP
 
-**Build AI agents that can reason over real data.**
+Daita is a persistent, read-only data agent built around one direct loop:
 
-Daita Agents is a Python framework for data agents.
+```text
+user message -> model -> zero or more tool calls -> tool results -> model -> answer
+```
 
-Inspect structured sources, plan governed work, execute through declared capabilities, collect typed evidence, verify results, and leave an audit trail. The primary
-entry point is `Agent.from_db()`.
+The exact current-run transcript is the loop state. Tool errors are ordinary
+tool results, so the model can correct a call on its next step. The loop has
+only outer limits for steps, time, tokens, and estimated cost. It does not
+restore the deleted operation, session, monitor, extension, event-stream, or
+telemetry lifecycles. Explicit conversation IDs add bounded multi-turn
+continuity, including continuation after close and reopen, without changing
+that direct progression or creating a session runtime. Bounded advisory memory
+and bounded Markdown skills provide inspectable context; full skill instructions
+are loaded only when the model calls `skill_view`.
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org)
-[![PyPI](https://img.shields.io/badge/pypi-daita--agents-orange)](https://pypi.org/project/daita-agents/)
-[![Version](https://img.shields.io/pypi/v/daita-agents.svg)](https://pypi.org/project/daita-agents/)
+The MVP supports catalog-backed reads from SQLite, PostgreSQL, CSV, and JSON.
+SQLite and local-file sources are admitted through bounded adapters. SQL is
+validated against the current catalog before execution. Every model-requested
+tool call receives one ordered success or error result; one failing call does
+not suppress the others. Data access remains read-only. The only built-in side
+effects are local, file-backed memory and skill replacements proposed during a
+foreground run and guarded by an in-process approve-once callback.
 
-## Why Daita?
+## Python API
 
-- **Data native agents**: connect to SQLite or PostgreSQL and ask questions in
-  natural language.
-- **Production runtime**: operation records, persisted tasks, governance,
-  approvals, evidence, verification, resume, and audit summaries.
-- **Extension first plugins**: integrations declare capabilities, executors,
-  evidence schemas, policies, context providers, workers, and tool views.
-- **Local Python ergonomics**: install with pip, write normal async Python, and
-  add local tools with a decorator.
-- **Broad integration surface**: databases, vector stores, cloud services,
-  web search, Slack, Google Drive, memory, catalog, lineage, data quality, and
-  evals live behind optional extras.
+```python
+from daita import Agent, SQLiteSource, create_llm_provider
+from daita.llm import ModelProfile
 
-## Quickstart
+provider = create_llm_provider("openai:gpt-4.1-mini")
+profile = ModelProfile(
+    id=provider.provider_id,
+    context_window_tokens=128_000,
+    max_output_tokens=4_096,
+    supports_tools=True,
+    supports_parallel_tools=True,
+)
 
-Install the SQLite extra and set an LLM key:
+agent = await Agent.create(
+    "atlas",
+    model=provider,
+    model_profile=profile,
+)
+await agent.attach(SQLiteSource("/absolute/path/sales.db"))
+result = await agent.run("What were the top five products by revenue?")
+print(result.final_text)
+
+follow_up = await agent.run(
+    "Now only EMEA",
+    conversation_id=result.conversation_id,
+)
+turns = await agent.conversation_runs(result.conversation_id)
+print(follow_up.final_text, len(turns))
+await agent.close()
+```
+
+Omitting `conversation_id` creates a new opaque conversation. Supplying the
+returned ID appends an agent-scoped turn and projects a deterministic bounded
+tail of completed prior runs: at most 8 runs, 40 messages, and 24,000 UTF-8
+bytes, subject to the complete model-input budget and an 8,000-token current-run
+growth reserve. Failed, interrupted, unfinished, or structurally incomplete
+runs remain inspectable but are not replayed. Prior messages are never copied
+into the new run's canonical transcript. There is no current-conversation
+pointer, search, summary, compression checkpoint, or interrupted-run resume.
+
+### Advisory memory
+
+Each agent home may contain two fixed UTF-8 documents:
+
+- `MEMORY.md` holds user-confirmed durable business semantics, terminology,
+  conventions, and non-secret environment notes (at most 2,200 characters and
+  8,800 UTF-8 bytes).
+- `USER.md` holds durable user preferences and communication expectations (at
+  most 1,375 characters and 5,500 UTF-8 bytes).
+
+Use `await agent.read_memory()`, `await agent.set_memory(text)`,
+`await agent.read_user_profile()`, and `await agent.set_user_profile(text)` for
+explicit caller-controlled access. These methods do not invoke a model,
+request approval, create a tool call, or emit an observation event.
+
+The foreground model may propose a complete replacement through
+`memory_set(target, content)`, where `target` is `memory` or `user`. The same
+bounds and atomic file owner apply, but the exact frozen invocation executes
+only after the configured in-process approval callback returns `approve`.
+The callback sees the proposed content for semantic review; observation events
+never include that content.
+
+The documents are advisory context, not policy, evidence, approval,
+authorization, capability configuration, catalog truth, or current source
+truth. Current catalog structure and validated tool results remain
+authoritative within their domains. Do not store secrets or credentials, raw
+rows or copied query results, current source availability or freshness,
+catalog revisions or schema snapshots, whole messages or tool results, or
+approval or policy claims in either document.
+
+Agent identity, attached-source registrations, current catalog snapshots, and
+exact run transcripts are stored in one small SQLite database. There is no
+schema migration or backward-compatibility layer in the unreleased MVP. Memory
+content stays only in the two bounded files and is not copied into SQLite or
+persisted transcripts merely because it was included in a model request.
+
+### Procedural skills
+
+Each skill is stored only at
+`<agent-home>/skills/<skill-name>/SKILL.md`. Names match
+`[a-z][a-z0-9-]{0,63}`. An agent may have at most 32 skills; descriptions are
+single-line, already-trimmed text of at most 240 characters; instructions are
+already-trimmed LF-only text of at most 12,000 characters. A rendered skill is
+limited to 50,000 UTF-8 bytes. The complete deterministic name/description
+index is limited to 4,000 characters and 16,000 UTF-8 bytes.
+
+Use `await agent.list_skills()`, `await agent.read_skill(name)`,
+`await agent.save_skill(name, description, instructions)`, and
+`await agent.delete_skill(name)` for explicit caller-controlled access. Lists
+contain only immutable name/description summaries; reads return a full
+name/description/instructions record or `None`. Save returns whether rendered
+bytes changed, and delete returns whether the named skill was present.
+
+The default model context contains the complete shallow index, never every
+instruction body. The fixed read-only `skill_view(name)` tool progressively
+loads one full skill when requested. Skills are user-authorized procedural
+guidance, not catalog evidence, capability declarations, policy, approval,
+authorization, or permission to bypass validation. Current catalog structure,
+validated tool results, runtime checks, and the existing governance and approval
+boundaries remain authoritative. Foreground `skill_save` and `skill_delete`
+calls cross the same approval branch as `memory_set`; direct API mutations are
+already explicit caller actions and do not invoke the model or approval flow.
+
+### Approval and observation
+
+```python
+from daita import ApprovalDecision, ApprovalRequest
+
+async def approve(request: ApprovalRequest) -> ApprovalDecision:
+    # Inspect request.tool_name, request.capability_id, and the exact frozen
+    # request.arguments. The caller remains responsible for semantic review.
+    return ApprovalDecision.APPROVE
+
+agent = await Agent.create(
+    "atlas",
+    model=provider,
+    model_profile=profile,
+    approval_handler=approve,
+    observer=events.append,
+)
+```
+
+Approval is approve-once and in-process. Missing handlers, denial, callback
+failure, invalid decisions, and state changes become ordinary model-visible
+tool errors. No approval or pending invocation is persisted, and there is no
+approve-later or resume API. Read-only tool groups may execute concurrently;
+the local memory side effect is a sequential barrier. After approval, the
+runtime reacquires the same mutation lock used by direct memory and skill
+writes, revalidates current state, and rejects stale approval with
+`state_changed`. Cancellation before mutation never writes; after an atomic
+replacement starts, Daita waits for a definite outcome before propagating
+cancellation.
+
+Learning is only this visible foreground interaction: the model proposes
+`memory_set`, `skill_save`, or `skill_delete`; the caller reviews the exact
+frozen arguments; the existing tool runtime returns the approved mutation or
+error as a normal tool result; and the model continues. Daita performs no
+post-run review, auxiliary model call, curator, or background learning.
+
+One optional synchronous observer receives bounded `run.started`,
+`model.completed`, `tool.started`, `approval.requested`, `approval.decided`,
+`tool.completed`, and `run.completed` events. Events contain identifiers,
+outcomes, durations, counts, and usage—not prompts, memory content, skill
+instructions, tool arguments, results, or secrets. Observer exceptions are
+ignored; events are not persisted and are not a durable audit log. Callers
+should enqueue and return promptly if they need external telemetry work.
+This callback data is the entire event and telemetry surface: Daita does not
+persist events, collect telemetry, upload analytics, or provide an event bus,
+trace store, exporter, or delivery guarantee.
+
+An explicitly injected custom tool runtime remains caller-owned code and owns
+authorization, tool-level observation, and side-effect safety for its tools.
+
+## CLI
 
 ```bash
-pip install "daita-agents[sqlite]"
-export OPENAI_API_KEY=sk-...
+daita --root /private/tmp/daita create atlas
+daita --root /private/tmp/daita attach atlas sqlite /absolute/path/sales.db
+daita --root /private/tmp/daita run atlas "Summarize sales" \
+  --model openai:gpt-4.1-mini
+daita --root /private/tmp/daita chat atlas \
+  --model openai:gpt-4.1-mini
 ```
 
-Create `quickstart.py`:
+`run` remains the one-record JSON automation surface. `chat` is the readable
+interactive surface and keeps only the explicit current conversation ID and
+current-process usage totals. Its local `/help`, `/status`, `/conversation`,
+`/new`, `/resume <conversation-id>`, `/sources`, and `/exit` commands never
+enter the model transcript.
 
-```python
-import asyncio
-import sqlite3
-from pathlib import Path
-
-from daita import Agent
-from daita.db import DbMemoryConfig, DbSourceOptions
-
-
-DB_PATH = Path("sales.db")
-
-
-def seed_database() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executescript("""
-            DROP TABLE IF EXISTS orders;
-            CREATE TABLE orders (
-                id INTEGER PRIMARY KEY,
-                product TEXT NOT NULL,
-                revenue REAL NOT NULL
-            );
-            INSERT INTO orders (product, revenue) VALUES
-                ('Notebook', 1250.00),
-                ('Keyboard', 875.50),
-                ('Monitor', 2410.00);
-        """)
-
-
-async def main() -> None:
-    seed_database()
-
-    agent = await Agent.from_db(
-        str(DB_PATH),
-        mode="analyst",
-        source_options=DbSourceOptions(read_only=True),
-        memory=DbMemoryConfig(enabled=False),
-    )
-
-    try:
-        answer = await agent.run("What product had the most revenue?")
-        print(answer)
-    finally:
-        await agent.stop()
-
-
-asyncio.run(main())
-```
-
-Run it:
+Memory and user-profile documents can be read, replaced from a complete UTF-8
+file or stdin, or edited with `$EDITOR`:
 
 ```bash
-python quickstart.py
+daita --root /private/tmp/daita memory read atlas
+daita --root /private/tmp/daita memory read atlas --target user
+daita --root /private/tmp/daita memory set atlas --target memory --file notes.md
+printf '%s' 'Prefer concise answers.' | \
+  daita --root /private/tmp/daita memory set atlas --target user --file -
+EDITOR='code --wait' daita --root /private/tmp/daita memory edit atlas
 ```
 
-Need PostgreSQL instead?
+Omitting `--target` from `memory read` or `memory edit` selects `memory`.
+`memory set` requires an explicit `memory` or `user` target. A `-` input reads
+stdin through EOF. File and stdin content is passed in full to the public
+`Agent` method: the CLI does not truncate, normalize, or bypass the existing
+bounds and validation.
+
+Skills use the same public API:
 
 ```bash
-pip install "daita-agents[postgresql]"
-export DATABASE_URL=postgresql://user:pass@host:5432/dbname
+daita --root /private/tmp/daita skills list atlas
+daita --root /private/tmp/daita skills show atlas monthly-revenue
+daita --root /private/tmp/daita skills save atlas monthly-revenue \
+  --description 'Monthly revenue procedure.' \
+  --instructions-file monthly-revenue.md
+daita --root /private/tmp/daita skills edit atlas monthly-revenue
+daita --root /private/tmp/daita skills delete atlas monthly-revenue
 ```
 
-```python
-agent = await Agent.from_db(
-    os.environ["DATABASE_URL"],
-    mode="governed",
-    source_options=DbSourceOptions(
-        read_only=True,
-        allowed_tables=("orders", "customers", "products"),
-    ),
-)
+`$EDITOR` is parsed as a command plus arguments without a shell. Edit commands
+use a private temporary file outside the agent home and save only after the
+editor exits successfully and public validation passes. Skill editing uses this
+exact deterministic document representation, with the command-supplied name
+authoritative:
+
+```markdown
+# monthly-revenue
+
+Monthly revenue procedure.
+
+## Instructions
+
+Group paid invoices by UTC month.
 ```
 
-## What You Get Back
-
-`agent.run(...)` returns the synthesized answer string. Use
-`run_detailed(...)` when you need the operation contract, evidence, diagnostics,
-or audit identifiers.
-
-```python
-result = await agent.run_detailed("Which customers had the largest refunds?")
-
-print(result.operation_id)
-print(result.contract.required_capabilities)
-print(result.evidence)
-print(result.answer)
-```
-
-Runtime inspection is built in:
-
-```python
-inspection = await agent.describe()
-print(inspection.plugin_ids)
-print(inspection.capability_ids)
-```
-
-## `Agent.from_db()`
-
-Use `Agent.from_db()` for agents that answer questions from structured data with
-a durable operation trail.
-
-```python
-from daita.db import (
-    DbLLMConfig,
-    DbMemoryConfig,
-    DbRuntimeConfig,
-    DbRuntimeOptions,
-    DbSourceOptions,
-)
-
-agent = await Agent.from_db(
-    "postgresql://user:pass@localhost/warehouse",
-    mode="governed",
-    config=DbRuntimeConfig(profile="governed"),
-    source_options=DbSourceOptions(
-        read_only=True,
-        query_default_limit=50,
-        query_max_rows=200,
-        query_timeout=30,
-    ),
-    llm=DbLLMConfig(
-        provider="openai",
-        model="gpt-5.4-mini",
-        api_key=os.environ["OPENAI_API_KEY"],
-        temperature=0,
-    ),
-    runtime=DbRuntimeOptions(store="sqlite", store_path="runtime.sqlite"),
-    lineage=True,
-    memory=DbMemoryConfig(enabled=True, retrieval_mode="structured"),
-)
-```
-
-Current direct source support:
-
-| Source                                                 | Status                                                                    |
-| ------------------------------------------------------ | ------------------------------------------------------------------------- |
-| SQLite file path, `:memory:`, or `sqlite://...`        | Supported by `Agent.from_db()`                                            |
-| PostgreSQL URL, `postgresql://...` or `postgres://...` | Supported by `Agent.from_db()`                                            |
-| Converted `BaseDatabasePlugin` instance                | Supported by `Agent.from_db()`                                            |
-| Other database URL schemes                             | Available through plugin APIs while direct `from_db` routing is converted |
-
-Built in modes:
-
-| Mode        | Default posture                                            |
-| ----------- | ---------------------------------------------------------- |
-| `simple`    | Read-only, conservative row and character limits           |
-| `analyst`   | Default read-only analysis profile                         |
-| `governed`  | Stricter limits with lineage enabled by default            |
-| `data_team` | Broader data-team profile with quality and lineage enabled |
-
-`DbAgent` exposes:
-
-- `run(prompt)`: return the answer string.
-- `run_detailed(prompt)`: return a typed `DbOperationResult`.
-- `describe()`: inspect registered plugins, capabilities, and runtime state.
-- `operations` and `audit_log`: retained operation summaries.
-- `monitor(...)`: create durable database observations.
-- `stop()` / `teardown()`: release runtime resources.
-
-Database monitor scheduling is deliberately host-driven. The library provides
-durable one-shot passes through `DbMonitorScheduler.run_once()` (and the
-one-shot `DbRuntime.tick_monitors()` convenience); the application owns
-cadence, retry, metrics, signals, and shutdown. See
-[`docs/MONITOR_HOSTING.md`](docs/MONITOR_HOSTING.md) for the complete hosting
-contract and multi-host lease guidance.
-
-## Local Tool Agents
-
-The generic `Agent` is useful for non DB assistants, local tool calling,
-streaming, conversation history, and experiments. Data agents should usually
-start with `Agent.from_db()`.
-
-```python
-import asyncio
-from daita import Agent, tool
-
-
-@tool
-def calculate_discount(price: float, pct: float) -> float:
-    """Calculate a discounted price."""
-    return round(price * (1 - pct / 100), 2)
-
-
-async def main() -> None:
-    agent = Agent(
-        name="shopping_assistant",
-        llm_provider="openai",
-        model="gpt-4o-mini",
-        tools=[calculate_discount],
-    )
-
-    result = await agent.run(
-        "A jacket is $120 with a 15% discount. What is the final price?"
-    )
-    print(result)
-
-
-asyncio.run(main())
-```
-
-For richer diagnostics:
-
-```python
-result = await agent.run("Use the discount tool.", detailed=True)
-print(result["operation_id"])
-print(result["tool_calls"])
-```
-
-## Architecture
-
-Daita's runtime is operation centric. Runtime owned work flows through declared
-capabilities, persisted tasks, registered executors, and the shared governance
-boundary before any executor runs.
-
-```mermaid
-flowchart LR
-    User["Data question"] --> FromDB["Agent.from_db()"]
-    FromDB --> Agent["DbAgent"]
-    Agent --> Runtime["DbRuntime"]
-    Runtime --> Kernel["RuntimeKernel"]
-    Kernel --> Store["RuntimeStore"]
-    Kernel --> Registry["ExtensionRegistry"]
-    Registry --> Plugins["Plugins and skills"]
-    Plugins --> Contracts["Capabilities, executors, evidence, policies, workers"]
-    Runtime --> Catalog["Catalog plugin"]
-    Runtime --> Verify["Verification and synthesis"]
-```
-
-Ownership rules that matter:
-
-- `DbRuntime` owns DB planning, task execution, governance, approvals, resume,
-  evidence, verification, monitors, and synthesis.
-- `execute_task()` is the executor choke point.
-- The catalog plugin owns cataloging infrastructure, normalized schemas,
-  relationships, and graph traversal/search over data assets.
-- Generic `Agent` projects tools and local chat behavior; it should not grow a
-  parallel DB planner.
-
-## Integrations
-
-Install the smallest extra you need:
-
-```bash
-pip install "daita-agents[postgresql]"
-pip install "daita-agents[sqlite]"
-pip install "daita-agents[data]"
-pip install "daita-agents[websearch]"
-pip install "daita-agents[cloud]"
-```
-
-Common extras:
-
-| Area               | Extras                                                                           |
-| ------------------ | -------------------------------------------------------------------------------- |
-| LLM providers      | `anthropic`, `google`, `llm-all`                                                 |
-| Databases          | `sqlite`, `postgresql`, `mysql`, `mongodb`, `snowflake`, `bigquery`, `databases` |
-| Search and vectors | `websearch`, `exa`, `chromadb`, `pinecone`, `qdrant`, `vectordb`                 |
-| Cloud and apps     | `aws`, `azure`, `gcp`, `google-drive`, `slack`, `mcp`, `cloud`                   |
-| Data and runtime   | `data`, `memory`, `data-quality`, `lineage`, `redis`, `neo4j`, `otlp`            |
-| Bundles            | `recommended`, `complete`, `all`                                                 |
-
-Direct plugin APIs are available under `daita.plugins`:
-
-```python
-import asyncio
-from daita.plugins import sqlite
-
-
-async def main() -> None:
-    async with sqlite(path="./sales.db") as db:
-        rows = await db.query("SELECT product, revenue FROM orders LIMIT 5")
-        print(rows)
-
-
-asyncio.run(main())
-```
-
-## Skills, Memory, And Evals
-
-Skills package reusable behavior: instructions, activation rules, runtime
-effects, context providers, and optional tool views.
-
-```python
-from daita import Agent, Skill
-
-reporting = Skill(
-    name="executive_reporting",
-    description="Write concise executive summaries.",
-    instructions="Use: summary, key metrics, risks, and next actions.",
-)
-
-agent = Agent(
-    name="ops_analyst",
-    llm_provider="openai",
-    skills=[reporting],
-)
-```
-
-Tool-backed skills use `Skill.with_tools(...)`:
-
-```python
-from daita import Skill, tool
-
-
-@tool
-def normalize_region(value: str) -> str:
-    """Normalize a sales region name."""
-    return value.strip().lower().replace(" ", "_")
-
-
-region_skill = Skill.with_tools(
-    name="region_cleanup",
-    tools=[normalize_region],
-    instructions="Normalize region names before comparing reports.",
-)
-```
-
-Eval suites run agents locally or in CI and write structured artifacts such as
-`report.json`, `summary.md`, JUnit XML, per case artifacts, judge artifacts, and
-baseline comparisons. The eval API is developer-preview.
-
-## Project Layout
-
-| Path                     | Responsibility                                                                 |
-| ------------------------ | ------------------------------------------------------------------------------ |
-| `daita/agents/`          | `Agent`, `BaseAgent`, chat runtime, tools, streaming, conversation history     |
-| `daita/db/`              | `Agent.from_db()`, `DbAgent`, planning, SQL analysis, verification, synthesis  |
-| `daita/db/runtime/`      | DB operation lifecycle, tasks, governance, resume, monitors, cache, results    |
-| `daita/runtime/`         | Operations, tasks, capabilities, evidence, policies, workers, stores, kernel   |
-| `daita/plugins/`         | Extension-first connectors and domain services                                 |
-| `daita/plugins/catalog/` | Discovery, normalization, profiling, persistence, relationships, graph views   |
-| `daita/plugins/memory/`  | Semantic, keyword, graph, working-memory, contradiction, and storage helpers   |
-| `daita/skills/`          | Skill declarations, activation, discovery, runtime effects, tool adapters      |
-| `daita/llm/`             | OpenAI, Anthropic, Gemini, Grok, Ollama, OpenAI-compatible, and mock providers |
-| `daita/embeddings/`      | OpenAI, Gemini, Voyage, sentence-transformers, and mock embeddings             |
-| `daita/evals/`           | Eval suites, assertions, judges, reporters, artifacts, datasets, baselines     |
-| `examples/`              | Data-first learning path scripts and one deployment-style project template     |
-| `tests/`                 | Unit, integration, performance, fixture, mock, and live-gated tests            |
-
-## Examples
-
-- [`examples/`](examples/): numbered data first learning path from a local
-  SQLite quickstart through inspection, catalog joins, governance, persistence,
-  memory, quality, lineage, monitors, infrastructure discovery, extensions, and
-  CSV-to-SQLite ingestion.
-- [`examples/deployments/data-team-agent/`](examples/deployments/data-team-agent/):
-  production shaped local data-team template using `Agent.from_db()`,
-  `DbRuntime`, catalog, quality, lineage, memory, monitors, and a persistent
-  runtime store.
+Interactive chat additionally provides `/memory`, `/memory edit`, `/user`,
+`/user edit`, `/skills`, `/skills show <name>`, `/skills edit <name>`, and
+`/skills delete <name>`. Skill deletion asks for explicit confirmation and
+defaults to no. These direct caller actions invoke neither the model nor an
+approval callback. Model-requested memory and skill side effects still use the
+exact, once-only, in-process approval prompt in `chat`; `run` installs no
+approval handler.
 
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-pre-commit install
-pytest tests/ -m "not requires_llm and not requires_db"
+cd /path/to/daita-agents
+python3.11 -m venv .venv
+.venv/bin/python -m pip install -e ".[dev,sqlite]"
+.venv/bin/python -m pytest
 ```
 
-Useful focused targets:
-
-```bash
-pytest tests/unit/ -v
-pytest tests/unit/db/test_agent_from_db.py -v
-pytest tests/unit/core/test_skills.py -v
-```
-
-Development rules that matter most:
-
-- Optional dependencies must be imported lazily inside `connect()` or a client
-  property body.
-- Packages needed by one integration belong in an optional extra, not core
-  dependencies.
-- `asyncio_mode = "auto"` is configured globally; do not add per-test
-  `@pytest.mark.asyncio`.
-- Production DB behavior belongs in `DbRuntime`; catalog behavior belongs in
-  catalog plugins.
-
-## Resources
-
-- [Documentation](https://docs.daita-tech.io)
-- [examples/](examples/)
-- [tests/README.md](tests/README.md)
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-
-## License
-
-Apache 2.0 - see [LICENSE](LICENSE).
-
-Built by [Daita](https://daita-tech.io).
+Optional provider and database SDKs are imported lazily at their execution
+boundaries.

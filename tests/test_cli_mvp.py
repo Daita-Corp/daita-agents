@@ -1,0 +1,1556 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+from contextlib import redirect_stderr, redirect_stdout
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import sys
+import tempfile
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from daita import Agent, Skill, SkillSummary
+from daita import cli
+from daita.llm.models import (
+    FinishReason,
+    MessageRole,
+    ModelRequest,
+    ModelResponse,
+    TextBlock,
+    ToolCall,
+)
+from daita.llm.providers.mock import MockModelProvider
+
+
+class _TTYBuffer(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def _invoke(
+    argv: list[str],
+    *,
+    stdin: str = "",
+    tty: bool = False,
+) -> tuple[int, str, str]:
+    input_stream = _TTYBuffer(stdin) if tty else io.StringIO(stdin)
+    stdout = _TTYBuffer() if tty else io.StringIO()
+    stderr = _TTYBuffer() if tty else io.StringIO()
+    with (
+        patch.object(sys, "stdin", input_stream),
+        redirect_stdout(stdout),
+        redirect_stderr(stderr),
+    ):
+        try:
+            code = cli.main(argv)
+        except SystemExit as error:
+            code = error.code if isinstance(error.code, int) else 1
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def _json_lines(text: str) -> tuple[dict[str, object], ...]:
+    return tuple(json.loads(line) for line in text.splitlines() if line.strip())
+
+
+def _subcommands(
+    parser: argparse.ArgumentParser,
+) -> dict[str, argparse.ArgumentParser]:
+    action = next(
+        item for item in parser._actions if isinstance(item, argparse._SubParsersAction)
+    )
+    return dict(action.choices)
+
+
+def _surface(
+    parser: argparse.ArgumentParser,
+) -> tuple[tuple[str, ...], frozenset[str]]:
+    positionals: list[str] = []
+    options: set[str] = set()
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            continue
+        if action.option_strings:
+            options.update(action.option_strings)
+        else:
+            positionals.append(action.dest)
+    return tuple(positionals), frozenset(options)
+
+
+def _stop(text: str) -> ModelResponse:
+    return ModelResponse(finish_reason=FinishReason.STOP, text=text)
+
+
+def _call(name: str, arguments: dict[str, object]) -> ModelResponse:
+    return ModelResponse(
+        finish_reason=FinishReason.TOOL_CALLS,
+        tool_calls=(ToolCall(id="call-1", name=name, arguments=arguments),),
+    )
+
+
+def _request_text(request: ModelRequest) -> tuple[str, ...]:
+    return tuple(
+        block.text
+        for message in request.messages
+        if message.role is not MessageRole.SYSTEM
+        for block in message.content
+        if isinstance(block, TextBlock)
+    )
+
+
+async def _create_agent(root: Path, name: str) -> None:
+    agent = await Agent.create(name, root=root)
+    await agent.close()
+
+
+async def _open_and_close_agent(root: Path, name: str) -> None:
+    agent = await Agent.open(name, root=root)
+    await agent.close()
+
+
+async def _knowledge(root: Path, name: str) -> tuple[str, Skill | None]:
+    agent = await Agent.open(name, root=root)
+    try:
+        return await agent.read_memory(), await agent.read_skill("monthly-revenue")
+    finally:
+        await agent.close()
+
+
+async def _complete_knowledge(
+    root: Path,
+    name: str,
+) -> tuple[str, str, tuple[object, ...]]:
+    agent = await Agent.open(name, root=root)
+    try:
+        return (
+            await agent.read_memory(),
+            await agent.read_user_profile(),
+            await agent.list_skills(),
+        )
+    finally:
+        await agent.close()
+
+
+async def _seed_knowledge(root: Path, name: str) -> None:
+    agent = await Agent.open(name, root=root)
+    try:
+        await agent.set_memory("Initial memory")
+        await agent.set_user_profile("Initial user profile")
+        await agent.save_skill(
+            "monthly-revenue",
+            "Initial description",
+            "Initial instructions",
+        )
+    finally:
+        await agent.close()
+
+
+def _replacement_editor(
+    directory: Path,
+    replacement: str,
+    *,
+    name: str,
+) -> str:
+    replacement_path = directory / f"{name}-replacement.txt"
+    replacement_path.write_text(replacement, encoding="utf-8")
+    editor_path = directory / f"{name}-editor.py"
+    editor_path.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "target = Path(sys.argv[-1])\n"
+        "replacement = Path(sys.argv[1]).read_text(encoding='utf-8')\n"
+        "target.write_text(replacement, encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    return shlex.join((sys.executable, str(editor_path), str(replacement_path)))
+
+
+def test_current_parser_keeps_the_existing_one_shot_surface_green():
+    parser = cli.build_parser()
+    commands = _subcommands(parser)
+
+    assert _surface(parser) == ((), frozenset({"-h", "--help", "--root"}))
+    assert {"create", "attach", "sources", "run"} <= set(commands)
+    assert _surface(commands["create"]) == (
+        ("name",),
+        frozenset({"-h", "--help"}),
+    )
+    assert _surface(commands["attach"]) == (
+        ("name", "kind", "path"),
+        frozenset({"-h", "--help"}),
+    )
+    assert _surface(commands["sources"]) == (
+        ("name",),
+        frozenset({"-h", "--help"}),
+    )
+
+
+def test_current_run_writes_exactly_one_terminal_json_record_to_stdout():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        create_code, create_stdout, create_stderr = _invoke(
+            ["--root", str(root), "create", "runner"]
+        )
+        assert create_code == 0
+        assert len(_json_lines(create_stdout)) == 1
+        assert create_stderr == ""
+
+        provider = MockModelProvider((_stop("bounded answer"),))
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "run",
+                    "runner",
+                    "bounded question",
+                    "--model",
+                    "mock:scripted",
+                ]
+            )
+
+    records = _json_lines(stdout)
+    assert code == 0
+    assert len(records) == 1
+    assert stderr == ""
+    assert records[0]["status"] == "completed"
+    assert records[0]["text"] == "bounded answer"
+    assert {"run_id", "status", "reason", "text", "steps"} <= set(records[0])
+    provider.assert_consumed()
+
+
+def test_current_diagnostics_use_stderr_and_leave_stdout_empty():
+    with tempfile.TemporaryDirectory() as directory:
+        with patch.object(
+            cli,
+            "create_llm_provider",
+            side_effect=ImportError("install the mock extra"),
+        ):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    directory,
+                    "run",
+                    "runner",
+                    "question",
+                    "--model",
+                    "mock:scripted",
+                ]
+            )
+
+    assert code == 1
+    assert stdout == ""
+    assert _json_lines(stderr) == ({"error": "install the mock extra"},)
+
+
+def test_future_cli_1_parser_adds_only_explicit_run_continuation_flags():
+    run = _subcommands(cli.build_parser())["run"]
+    assert _surface(run) == (
+        ("name", "message"),
+        frozenset(
+            {
+                "-h",
+                "--help",
+                "--model",
+                "--base-url",
+                "--context-window",
+                "--max-output",
+                "--conversation-id",
+                "--events-jsonl",
+            }
+        ),
+    )
+
+
+def test_future_cli_1_run_returns_and_cold_continues_an_explicit_conversation():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "continuation"))
+        first_provider = MockModelProvider((_stop("first answer"),))
+        second_provider = MockModelProvider((_stop("follow-up answer"),))
+        with patch.object(
+            cli,
+            "create_llm_provider",
+            side_effect=(first_provider, second_provider),
+        ):
+            first_code, first_stdout, first_stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "run",
+                    "continuation",
+                    "first question",
+                    "--model",
+                    "mock:scripted",
+                ]
+            )
+            first_result = _json_lines(first_stdout)[0]
+
+            assert first_code == 0
+            assert first_stderr == ""
+            assert isinstance(first_result.get("conversation_id"), str)
+            conversation_id = str(first_result["conversation_id"])
+
+            second_code, second_stdout, second_stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "run",
+                    "continuation",
+                    "follow-up question",
+                    "--model",
+                    "mock:scripted",
+                    "--conversation-id",
+                    conversation_id,
+                ]
+            )
+
+    second_result = _json_lines(second_stdout)[0]
+    assert second_code == 0
+    assert second_stderr == ""
+    assert second_result["conversation_id"] == conversation_id
+    assert _request_text(second_provider.requests[0]) == (
+        "first question",
+        "first answer",
+        "follow-up question",
+    )
+    first_provider.assert_consumed()
+    second_provider.assert_consumed()
+
+
+def test_future_cli_1_requested_event_jsonl_uses_stderr_only():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "events"))
+        provider = MockModelProvider((_stop("event answer"),))
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "run",
+                    "events",
+                    "event question",
+                    "--model",
+                    "mock:scripted",
+                    "--events-jsonl",
+                ]
+            )
+
+    assert code == 0
+    result_records = _json_lines(stdout)
+    event_records = _json_lines(stderr)
+    assert len(result_records) == 1
+    assert isinstance(result_records[0].get("conversation_id"), str)
+    assert tuple(record["kind"] for record in event_records) == (
+        "run.started",
+        "model.completed",
+        "run.completed",
+    )
+    assert all("run_id" in record for record in event_records)
+    assert all("conversation_id" in record for record in event_records)
+    assert all("data" in record for record in event_records)
+    provider.assert_consumed()
+
+
+def test_future_cli_2_parser_adds_the_bounded_chat_surface():
+    commands = _subcommands(cli.build_parser())
+    assert "chat" in commands
+    assert _surface(commands["chat"]) == (
+        ("name",),
+        frozenset({"-h", "--help", "--model", "--conversation"}),
+    )
+
+
+def test_future_cli_2_chat_keeps_one_explicit_in_process_conversation():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "chat-agent"))
+        provider = MockModelProvider(
+            (_stop("first chat answer"), _stop("follow-up chat answer"))
+        )
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "chat-agent",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin="first chat question\nfollow-up chat question\n/exit\n",
+                tty=True,
+            )
+
+    assert code == 0
+    assert stderr == ""
+    assert "first chat answer" in stdout
+    assert "follow-up chat answer" in stdout
+    assert "Resume with:" in stdout
+    assert "--conversation" in stdout
+    assert _request_text(provider.requests[1]) == (
+        "first chat question",
+        "first chat answer",
+        "follow-up chat question",
+    )
+    provider.assert_consumed()
+
+
+def test_cli_2_chat_rejects_non_tty_streams_before_provider_or_agent_open():
+    with (
+        patch.object(cli, "create_llm_provider") as provider_factory,
+        patch.object(cli.Agent, "open", new_callable=AsyncMock) as agent_open,
+    ):
+        code, stdout, stderr = _invoke(
+            ["chat", "not-opened", "--model", "mock:scripted"]
+        )
+
+    assert code == 1
+    assert stdout == ""
+    assert _json_lines(stderr) == (
+        {
+            "error": (
+                "chat requires an interactive terminal on stdin, stdout, and stderr"
+            )
+        },
+    )
+    provider_factory.assert_not_called()
+    agent_open.assert_not_awaited()
+
+
+def test_cli_2_slash_commands_are_local_and_bounded():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "local-commands"))
+        provider = MockModelProvider(())
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "local-commands",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin=(
+                    "/help\n"
+                    "/status\n"
+                    "/conversation\n"
+                    "/sources\n"
+                    "/resume\n"
+                    "/not-a-command\n"
+                    "/exit\n"
+                ),
+                tty=True,
+            )
+
+    assert code == 0
+    assert "Commands:" in stdout
+    assert "This process: 0 turns, 0 steps, 0 tokens" in stdout
+    assert "No conversation was created." in stdout
+    assert "Usage: /resume <conversation-id>" in stderr
+    assert "Unknown command. Type /help for commands." in stderr
+    assert provider.requests == ()
+    provider.assert_consumed()
+
+
+def test_cli_2_new_clears_only_the_in_process_conversation():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "new-command"))
+        provider = MockModelProvider((_stop("first answer"), _stop("second answer")))
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "new-command",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin="first question\n/new\nsecond question\n/exit\n",
+                tty=True,
+            )
+
+    created = re.findall(r"Conversation: (conversation-[A-Za-z0-9]+)", stdout)
+    assert code == 0
+    assert stderr == ""
+    assert len(created) == 2
+    assert created[0] != created[1]
+    assert _request_text(provider.requests[0]) == ("first question",)
+    assert _request_text(provider.requests[1]) == ("second question",)
+    assert f"--conversation {created[1]}" in stdout
+    provider.assert_consumed()
+
+
+def test_cli_2_resume_validates_publicly_before_selecting_a_conversation():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "resume-command"))
+        seed_provider = MockModelProvider((_stop("seed answer"),))
+        chat_provider = MockModelProvider((_stop("continued answer"),))
+        with patch.object(
+            cli,
+            "create_llm_provider",
+            side_effect=(seed_provider, chat_provider),
+        ):
+            seed_code, seed_stdout, seed_stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "run",
+                    "resume-command",
+                    "seed question",
+                    "--model",
+                    "mock:scripted",
+                ]
+            )
+            conversation_id = str(_json_lines(seed_stdout)[0]["conversation_id"])
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "resume-command",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin=(
+                    f"/resume unknown-valid-id\n"
+                    f"/resume {conversation_id}\n"
+                    "continued question\n"
+                    "/exit\n"
+                ),
+                tty=True,
+            )
+
+    assert seed_code == 0
+    assert seed_stderr == ""
+    assert code == 0
+    assert "Cannot resume conversation: unknown conversation for this agent" in stderr
+    assert f"Conversation: {conversation_id}" in stdout
+    assert _request_text(chat_provider.requests[0]) == (
+        "seed question",
+        "seed answer",
+        "continued question",
+    )
+    seed_provider.assert_consumed()
+    chat_provider.assert_consumed()
+
+
+def test_cli_2_eof_closes_agent_and_prints_exact_shell_safe_resume_command():
+    with tempfile.TemporaryDirectory() as directory:
+        root = (Path(directory) / "state root").resolve()
+        root.mkdir()
+        asyncio.run(_create_agent(root, "eof-agent"))
+        provider = MockModelProvider((_stop("answer before EOF"),))
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "eof-agent",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin="question before EOF\n",
+                tty=True,
+            )
+
+        asyncio.run(_open_and_close_agent(root, "eof-agent"))
+
+    conversation_match = re.search(r"Conversation: (conversation-[A-Za-z0-9]+)", stdout)
+    assert conversation_match is not None
+    conversation_id = conversation_match.group(1)
+    expected = shlex.join(
+        (
+            "daita",
+            "--root",
+            str(root),
+            "chat",
+            "eof-agent",
+            "--model",
+            "mock:scripted",
+            "--conversation",
+            conversation_id,
+        )
+    )
+    assert code == 0
+    assert stderr == ""
+    assert stdout.endswith(f"Resume with:\n{expected}\n")
+    provider.assert_consumed()
+
+
+def test_cli_2_ctrl_c_closes_agent_without_creating_conversation():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "interrupt-agent"))
+        provider = MockModelProvider(())
+        with (
+            patch.object(cli, "create_llm_provider", return_value=provider),
+            patch("builtins.input", side_effect=KeyboardInterrupt),
+        ):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "interrupt-agent",
+                    "--model",
+                    "mock:scripted",
+                ],
+                tty=True,
+            )
+
+        asyncio.run(_open_and_close_agent(root, "interrupt-agent"))
+
+    assert code == 130
+    assert stderr == ""
+    assert "No conversation was created." in stdout
+    assert "Resume with:" not in stdout
+    assert provider.requests == ()
+    provider.assert_consumed()
+
+
+def test_future_cli_3_chat_uses_the_existing_exact_once_approval_path():
+    proposed = "Revenue uses paid invoice date in UTC."
+    arguments: dict[str, object] = {"target": "memory", "content": proposed}
+    provider = MockModelProvider(
+        (
+            _call("memory_set", arguments),
+            _stop("saved once"),
+            _stop("stage-two-no-handler fallback"),
+        )
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "approval-agent"))
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "approval-agent",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin="remember the corrected definition\n  Y  \n/exit\n",
+                tty=True,
+            )
+
+        memory, _ = asyncio.run(_knowledge(root, "approval-agent"))
+
+    assert code == 0
+    assert stderr == ""
+    assert "memory_set" in stdout
+    assert "memory.set" in stdout
+    assert proposed in stdout
+    assert (
+        json.dumps(
+            arguments,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        in stdout
+    )
+    assert stdout.count("Approve this exact change once? [y/N]") == 1
+    assert memory == proposed
+    assert len(provider.requests) == 2
+
+
+@pytest.mark.parametrize(
+    "approval_input",
+    (
+        "n\n/exit\n",
+        "\n/exit\n",
+        "yes\n/exit\n",
+        "",
+    ),
+    ids=("deny", "default", "unrecognized", "eof"),
+)
+def test_cli_3_chat_denies_every_answer_except_trimmed_y(approval_input: str):
+    proposed = "This must not be stored."
+    provider = MockModelProvider(
+        (
+            _call("memory_set", {"target": "memory", "content": proposed}),
+            _stop("the proposal was not saved"),
+        )
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "default-deny"))
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "default-deny",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin=f"remember this\n{approval_input}",
+                tty=True,
+            )
+
+        memory, _ = asyncio.run(_knowledge(root, "default-deny"))
+
+    assert code == 0
+    assert stderr == ""
+    assert stdout.count("Approve this exact change once? [y/N]") == 1
+    assert memory == ""
+    provider.assert_consumed()
+
+
+def test_cli_3_chat_decides_each_exact_request_independently():
+    first = "Keep the first approved definition."
+    second = "Do not replace it with this definition."
+    provider = MockModelProvider(
+        (
+            _call("memory_set", {"target": "memory", "content": first}),
+            _stop("first proposal handled"),
+            _call("memory_set", {"target": "memory", "content": second}),
+            _stop("second proposal handled"),
+        )
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "independent-approvals"))
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "independent-approvals",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin="first proposal\ny\nsecond proposal\nn\n/exit\n",
+                tty=True,
+            )
+
+        memory, _ = asyncio.run(_knowledge(root, "independent-approvals"))
+
+    assert code == 0
+    assert stderr == ""
+    assert stdout.count("Approve this exact change once? [y/N]") == 2
+    assert first in stdout
+    assert second in stdout
+    assert memory == first
+    provider.assert_consumed()
+
+
+def test_cli_3_ctrl_c_during_approval_never_writes_and_releases_the_lock():
+    proposed = "An interrupted proposal must not be stored."
+    provider = MockModelProvider(
+        (_call("memory_set", {"target": "memory", "content": proposed}),)
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "approval-interrupt"))
+        with (
+            patch.object(cli, "create_llm_provider", return_value=provider),
+            patch(
+                "builtins.input",
+                side_effect=("remember this", KeyboardInterrupt),
+            ),
+        ):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "approval-interrupt",
+                    "--model",
+                    "mock:scripted",
+                ],
+                tty=True,
+            )
+
+        memory, _ = asyncio.run(_knowledge(root, "approval-interrupt"))
+        asyncio.run(_open_and_close_agent(root, "approval-interrupt"))
+
+    assert code == 130
+    assert stderr == "Chat interrupted.\n"
+    assert proposed in stdout
+    assert memory == ""
+    provider.assert_consumed()
+
+
+def test_cli_3_run_still_installs_no_approval_handler():
+    proposed = "A one-shot run must not prompt or write."
+    provider = MockModelProvider(
+        (
+            _call("memory_set", {"target": "memory", "content": proposed}),
+            _stop("approval remains required"),
+        )
+    )
+    opened_with: list[dict[str, Any]] = []
+    original_open = cli.Agent.open
+
+    async def open_spy(*args: Any, **kwargs: Any) -> Agent:
+        opened_with.append(kwargs)
+        return await original_open(*args, **kwargs)
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "non-interactive-run"))
+        with (
+            patch.object(cli, "create_llm_provider", return_value=provider),
+            patch.object(cli.Agent, "open", side_effect=open_spy),
+        ):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "run",
+                    "non-interactive-run",
+                    "remember this",
+                    "--model",
+                    "mock:scripted",
+                ]
+            )
+
+        memory, _ = asyncio.run(_knowledge(root, "non-interactive-run"))
+
+    assert code == 0
+    assert stderr == ""
+    assert "Approve this exact change once?" not in stdout
+    assert len(opened_with) == 1
+    assert "approval_handler" not in opened_with[0]
+    assert memory == ""
+    provider.assert_consumed()
+
+
+def test_cli_3_y_and_n_remain_ordinary_messages_outside_approval():
+    provider = MockModelProvider((_stop("first answer"), _stop("second answer")))
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "ordinary-y-n"))
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "ordinary-y-n",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin="y\nn\n/exit\n",
+                tty=True,
+            )
+
+    assert code == 0
+    assert stderr == ""
+    assert "Approve this exact change once?" not in stdout
+    assert _request_text(provider.requests[0]) == ("y",)
+    assert _request_text(provider.requests[1]) == (
+        "y",
+        "first answer",
+        "n",
+    )
+    provider.assert_consumed()
+
+
+def test_future_cli_4_parser_adds_only_the_direct_knowledge_commands():
+    commands = _subcommands(cli.build_parser())
+    assert set(commands) == {
+        "create",
+        "attach",
+        "sources",
+        "run",
+        "chat",
+        "memory",
+        "skills",
+    }
+
+    memory = _subcommands(commands["memory"])
+    assert set(memory) == {"read", "edit", "set"}
+    assert _surface(memory["read"]) == (
+        ("name",),
+        frozenset({"-h", "--help", "--target"}),
+    )
+    assert _surface(memory["edit"]) == (
+        ("name",),
+        frozenset({"-h", "--help", "--target"}),
+    )
+    assert _surface(memory["set"]) == (
+        ("name",),
+        frozenset({"-h", "--help", "--target", "--file"}),
+    )
+
+    skills = _subcommands(commands["skills"])
+    assert set(skills) == {"list", "show", "edit", "save", "delete"}
+    assert _surface(skills["list"]) == (
+        ("name",),
+        frozenset({"-h", "--help"}),
+    )
+    for command in ("show", "edit", "delete"):
+        assert _surface(skills[command]) == (
+            ("name", "skill_name"),
+            frozenset({"-h", "--help"}),
+        )
+    assert _surface(skills["save"]) == (
+        ("name", "skill_name"),
+        frozenset({"-h", "--help", "--description", "--instructions-file"}),
+    )
+
+
+def test_future_cli_4_direct_knowledge_commands_survive_reopen():
+    memory_text = "Revenue excludes voided invoices."
+    instructions = "Group paid invoices by UTC month."
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "knowledge-agent"))
+        memory_file = root / "memory-input.txt"
+        skill_file = root / "skill-input.txt"
+        memory_file.write_text(memory_text, encoding="utf-8")
+        skill_file.write_text(instructions, encoding="utf-8")
+
+        memory_code, _, memory_stderr = _invoke(
+            [
+                "--root",
+                str(root),
+                "memory",
+                "set",
+                "knowledge-agent",
+                "--target",
+                "memory",
+                "--file",
+                str(memory_file),
+            ]
+        )
+        skill_code, _, skill_stderr = _invoke(
+            [
+                "--root",
+                str(root),
+                "skills",
+                "save",
+                "knowledge-agent",
+                "monthly-revenue",
+                "--description",
+                "Monthly revenue procedure.",
+                "--instructions-file",
+                str(skill_file),
+            ]
+        )
+        memory, skill = asyncio.run(_knowledge(root, "knowledge-agent"))
+
+    assert memory_code == 0
+    assert memory_stderr == ""
+    assert skill_code == 0
+    assert skill_stderr == ""
+    assert memory == memory_text
+    assert skill is not None
+    assert skill.name == "monthly-revenue"
+    assert skill.description == "Monthly revenue procedure."
+    assert skill.instructions == instructions
+
+
+def test_cli_4_memory_file_stdin_and_reads_preserve_complete_utf8_content():
+    memory_text = "Revenue uses café prices.\n\n- Keep € values exact."
+    user_text = "Prefer concise answers.\nUnicode: λ"
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "memory-io"))
+        memory_file = root / "memory.txt"
+        memory_file.write_text(memory_text, encoding="utf-8")
+
+        memory_code, _, memory_stderr = _invoke(
+            [
+                "--root",
+                str(root),
+                "memory",
+                "set",
+                "memory-io",
+                "--target",
+                "memory",
+                "--file",
+                str(memory_file),
+            ]
+        )
+        user_code, _, user_stderr = _invoke(
+            [
+                "--root",
+                str(root),
+                "memory",
+                "set",
+                "memory-io",
+                "--target",
+                "user",
+                "--file",
+                "-",
+            ],
+            stdin=user_text,
+        )
+        read_memory_code, read_memory, read_memory_stderr = _invoke(
+            ["--root", str(root), "memory", "read", "memory-io"]
+        )
+        read_user_code, read_user, read_user_stderr = _invoke(
+            [
+                "--root",
+                str(root),
+                "memory",
+                "read",
+                "memory-io",
+                "--target",
+                "user",
+            ]
+        )
+        persisted = asyncio.run(_complete_knowledge(root, "memory-io"))
+
+    assert (memory_code, user_code, read_memory_code, read_user_code) == (0, 0, 0, 0)
+    assert memory_stderr == user_stderr == ""
+    assert read_memory_stderr == read_user_stderr == ""
+    assert _json_lines(read_memory)[0]["content"] == memory_text
+    assert _json_lines(read_user)[0]["content"] == user_text
+    assert persisted[:2] == (memory_text, user_text)
+
+
+def test_cli_4_skill_list_show_save_stdin_and_delete_use_complete_content():
+    instructions = "Group paid invoices.\n\n```sql\nSELECT 'λ';\n```"
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "skill-io"))
+        save_code, save_stdout, save_stderr = _invoke(
+            [
+                "--root",
+                str(root),
+                "skills",
+                "save",
+                "skill-io",
+                "monthly-revenue",
+                "--description",
+                "Monthly revenue procedure.",
+                "--instructions-file",
+                "-",
+            ],
+            stdin=instructions,
+        )
+        list_code, list_stdout, list_stderr = _invoke(
+            ["--root", str(root), "skills", "list", "skill-io"]
+        )
+        show_code, show_stdout, show_stderr = _invoke(
+            [
+                "--root",
+                str(root),
+                "skills",
+                "show",
+                "skill-io",
+                "monthly-revenue",
+            ]
+        )
+        delete_code, delete_stdout, delete_stderr = _invoke(
+            [
+                "--root",
+                str(root),
+                "skills",
+                "delete",
+                "skill-io",
+                "monthly-revenue",
+            ]
+        )
+        persisted = asyncio.run(_complete_knowledge(root, "skill-io"))
+
+    assert (save_code, list_code, show_code, delete_code) == (0, 0, 0, 0)
+    assert save_stderr == list_stderr == show_stderr == delete_stderr == ""
+    assert _json_lines(save_stdout)[0]["changed"] is True
+    assert _json_lines(list_stdout) == (
+        [
+            {
+                "description": "Monthly revenue procedure.",
+                "name": "monthly-revenue",
+            }
+        ],
+    )
+    assert _json_lines(show_stdout)[0]["instructions"] == instructions
+    assert _json_lines(delete_stdout)[0]["deleted"] is True
+    assert persisted[2] == ()
+
+
+def test_cli_4_editor_success_updates_memory_user_and_exact_skill_document():
+    edited_memory = "Edited memory"
+    edited_user = "Edited user profile"
+    edited_skill = (
+        "# monthly-revenue\n\nEdited description\n\n"
+        "## Instructions\n\nEdited instructions\n"
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "editor-success"))
+        asyncio.run(_seed_knowledge(root, "editor-success"))
+
+        editor = _replacement_editor(root, edited_memory, name="memory")
+        with patch.dict(os.environ, {"EDITOR": editor}, clear=True):
+            memory_result = _invoke(
+                ["--root", str(root), "memory", "edit", "editor-success"]
+            )
+        editor = _replacement_editor(root, edited_user, name="user")
+        with patch.dict(os.environ, {"EDITOR": editor}, clear=True):
+            user_result = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "memory",
+                    "edit",
+                    "editor-success",
+                    "--target",
+                    "user",
+                ]
+            )
+        editor = _replacement_editor(root, edited_skill, name="skill")
+        with patch.dict(os.environ, {"EDITOR": editor}, clear=True):
+            skill_result = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "skills",
+                    "edit",
+                    "editor-success",
+                    "monthly-revenue",
+                ]
+            )
+        memory, user, _ = asyncio.run(_complete_knowledge(root, "editor-success"))
+        _, skill = asyncio.run(_knowledge(root, "editor-success"))
+
+    assert tuple(
+        result[0] for result in (memory_result, user_result, skill_result)
+    ) == (
+        0,
+        0,
+        0,
+    )
+    assert tuple(
+        result[2] for result in (memory_result, user_result, skill_result)
+    ) == (
+        "",
+        "",
+        "",
+    )
+    assert (memory, user) == (edited_memory, edited_user)
+    assert skill == Skill(
+        "monthly-revenue",
+        "Edited description",
+        "Edited instructions",
+    )
+
+
+@pytest.mark.parametrize(
+    ("editor", "expected"),
+    [
+        (None, "$EDITOR is not set"),
+        ("   ", "$EDITOR is not set"),
+        ("'unterminated", "$EDITOR is malformed"),
+        ("daita-editor-that-does-not-exist", "$EDITOR command is unavailable"),
+        (
+            shlex.join((sys.executable, "-c", "import sys; sys.exit(7)")),
+            "$EDITOR exited with status 7",
+        ),
+    ],
+)
+def test_cli_4_editor_configuration_failures_never_write_and_release_lock(
+    editor: str | None,
+    expected: str,
+):
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "editor-failure"))
+        asyncio.run(_seed_knowledge(root, "editor-failure"))
+        environment = {} if editor is None else {"EDITOR": editor}
+        with patch.dict(os.environ, environment, clear=True):
+            code, stdout, stderr = _invoke(
+                ["--root", str(root), "memory", "edit", "editor-failure"]
+            )
+        knowledge = asyncio.run(_complete_knowledge(root, "editor-failure"))
+        asyncio.run(_open_and_close_agent(root, "editor-failure"))
+
+    assert code == 1
+    assert stdout == ""
+    assert expected in stderr
+    assert knowledge[:2] == ("Initial memory", "Initial user profile")
+
+
+def test_cli_4_editor_interruption_never_writes_and_releases_lock():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "editor-interrupt"))
+        asyncio.run(_seed_knowledge(root, "editor-interrupt"))
+        with (
+            patch.dict(os.environ, {"EDITOR": "unused-editor"}, clear=True),
+            patch.object(cli.subprocess, "run", side_effect=KeyboardInterrupt),
+        ):
+            code, stdout, stderr = _invoke(
+                ["--root", str(root), "memory", "edit", "editor-interrupt"]
+            )
+        knowledge = asyncio.run(_complete_knowledge(root, "editor-interrupt"))
+        asyncio.run(_open_and_close_agent(root, "editor-interrupt"))
+
+    assert code == 130
+    assert stdout == ""
+    assert stderr == "Chat interrupted.\n"
+    assert knowledge[:2] == ("Initial memory", "Initial user profile")
+
+
+def test_cli_4_malformed_skill_edit_never_partially_writes_and_releases_lock():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "malformed-edit"))
+        asyncio.run(_seed_knowledge(root, "malformed-edit"))
+        editor = _replacement_editor(
+            root,
+            "# wrong-name\n\nChanged\n\n## Instructions\n\nChanged\n",
+            name="malformed",
+        )
+        with patch.dict(os.environ, {"EDITOR": editor}, clear=True):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "skills",
+                    "edit",
+                    "malformed-edit",
+                    "monthly-revenue",
+                ]
+            )
+        _, skill = asyncio.run(_knowledge(root, "malformed-edit"))
+        asyncio.run(_open_and_close_agent(root, "malformed-edit"))
+
+    assert code == 1
+    assert stdout == ""
+    assert "edited skill must keep the exact" in stderr
+    assert skill == Skill(
+        "monthly-revenue",
+        "Initial description",
+        "Initial instructions",
+    )
+
+
+def test_cli_4_file_and_public_validation_failures_preserve_prior_state():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "invalid-input"))
+        asyncio.run(_seed_knowledge(root, "invalid-input"))
+        invalid_utf8 = root / "invalid-utf8.txt"
+        invalid_utf8.write_bytes(b"valid-prefix\xff")
+        instructions = root / "instructions.txt"
+        instructions.write_text("Valid instructions", encoding="utf-8")
+
+        failures = (
+            _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "memory",
+                    "set",
+                    "invalid-input",
+                    "--target",
+                    "memory",
+                    "--file",
+                    str(invalid_utf8),
+                ]
+            ),
+            _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "memory",
+                    "set",
+                    "invalid-input",
+                    "--target",
+                    "memory",
+                    "--file",
+                    str(root / "missing.txt"),
+                ]
+            ),
+            _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "memory",
+                    "set",
+                    "invalid-input",
+                    "--target",
+                    "memory",
+                    "--file",
+                    "-",
+                ],
+                stdin="x" * 2_201,
+            ),
+            _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "skills",
+                    "save",
+                    "invalid-input",
+                    "INVALID_NAME",
+                    "--description",
+                    "Invalid skill",
+                    "--instructions-file",
+                    str(instructions),
+                ]
+            ),
+            _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "skills",
+                    "save",
+                    "invalid-input",
+                    "monthly-revenue",
+                    "--description",
+                    "Changed description",
+                    "--instructions-file",
+                    "-",
+                ],
+                stdin="x" * 12_001,
+            ),
+        )
+        knowledge = asyncio.run(_complete_knowledge(root, "invalid-input"))
+        asyncio.run(_open_and_close_agent(root, "invalid-input"))
+
+    assert all(code == 1 and stdout == "" for code, stdout, _ in failures)
+    assert "codec can't decode" in failures[0][2]
+    assert "No such file" in failures[1][2]
+    assert "2200 character limit" in failures[2][2]
+    assert "must match [a-z][a-z0-9-]{0,63}" in failures[3][2]
+    assert "12000 character limit" in failures[4][2]
+    assert knowledge[0] == "Initial memory"
+    assert knowledge[2] == (SkillSummary("monthly-revenue", "Initial description"),)
+
+
+def test_cli_4_chat_knowledge_commands_are_local_and_preserve_conversation():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "chat-knowledge"))
+        asyncio.run(_seed_knowledge(root, "chat-knowledge"))
+        seed_provider = MockModelProvider((_stop("seed answer"),))
+        local_provider = MockModelProvider(())
+        with patch.object(
+            cli,
+            "create_llm_provider",
+            side_effect=(seed_provider, local_provider),
+        ):
+            seed_code, seed_stdout, _ = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "run",
+                    "chat-knowledge",
+                    "seed question",
+                    "--model",
+                    "mock:scripted",
+                ]
+            )
+            conversation_id = str(_json_lines(seed_stdout)[0]["conversation_id"])
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "chat-knowledge",
+                    "--model",
+                    "mock:scripted",
+                    "--conversation",
+                    conversation_id,
+                ],
+                stdin=(
+                    "/memory\n/user\n/skills\n"
+                    "/skills show monthly-revenue\n/status\n/exit\n"
+                ),
+                tty=True,
+            )
+
+    assert seed_code == code == 0
+    assert stderr == ""
+    assert "Initial memory" in stdout
+    assert "Initial user profile" in stdout
+    assert "Initial instructions" in stdout
+    assert f"Conversation: {conversation_id}" in stdout
+    assert "This process: 0 turns, 0 steps, 0 tokens" in stdout
+    assert local_provider.requests == ()
+    seed_provider.assert_consumed()
+    local_provider.assert_consumed()
+
+
+def test_cli_4_ordinary_knowledge_words_stay_messages_and_local_commands_keep_totals():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "ordinary-knowledge"))
+        asyncio.run(_seed_knowledge(root, "ordinary-knowledge"))
+        provider = MockModelProvider((_stop("ordinary answer"),))
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "ordinary-knowledge",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin="memory\n/memory\n/status\n/exit\n",
+                tty=True,
+            )
+
+    assert code == 0
+    assert stderr == ""
+    assert _request_text(provider.requests[0]) == ("memory",)
+    assert len(provider.requests) == 1
+    assert "Initial memory" in stdout
+    assert "This process: 1 turns, 1 steps" in stdout
+    provider.assert_consumed()
+
+
+def test_cli_4_chat_skill_delete_defaults_to_no_and_requires_explicit_yes():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "chat-delete"))
+        asyncio.run(_seed_knowledge(root, "chat-delete"))
+        provider = MockModelProvider(())
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "chat-delete",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin=(
+                    "/skills delete monthly-revenue\n\n"
+                    "/skills show monthly-revenue\n"
+                    "/skills delete monthly-revenue\ny\n/exit\n"
+                ),
+                tty=True,
+            )
+        _, skill = asyncio.run(_knowledge(root, "chat-delete"))
+
+    assert code == 0
+    assert stderr == ""
+    assert "Deletion cancelled." in stdout
+    assert "Initial instructions" in stdout
+    assert "Skill 'monthly-revenue' deleted." in stdout
+    assert skill is None
+    assert provider.requests == ()
+    provider.assert_consumed()
+
+
+def test_cli_4_chat_editor_commands_are_local_and_use_public_mutations():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "chat-editor"))
+        asyncio.run(_seed_knowledge(root, "chat-editor"))
+        editor_path = root / "selective-editor.py"
+        editor_path.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "path = Path(sys.argv[-1])\n"
+            "text = path.read_text(encoding='utf-8')\n"
+            "if text.startswith('# monthly-revenue\\n'):\n"
+            "    replacement = '# monthly-revenue\\n\\nChat description\\n\\n## "
+            "Instructions\\n\\nChat instructions\\n'\n"
+            "elif text == 'Initial memory':\n"
+            "    replacement = 'Chat memory'\n"
+            "else:\n"
+            "    replacement = 'Chat user profile'\n"
+            "path.write_text(replacement, encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        editor = shlex.join((sys.executable, str(editor_path)))
+        provider = MockModelProvider(())
+        with (
+            patch.dict(os.environ, {"EDITOR": editor}, clear=True),
+            patch.object(cli, "create_llm_provider", return_value=provider),
+        ):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "chat-editor",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin=(
+                    "/memory edit\n/user edit\n" "/skills edit monthly-revenue\n/exit\n"
+                ),
+                tty=True,
+            )
+        memory, user, _ = asyncio.run(_complete_knowledge(root, "chat-editor"))
+        _, skill = asyncio.run(_knowledge(root, "chat-editor"))
+
+    assert code == 0
+    assert stderr == ""
+    assert "Memory updated." in stdout
+    assert "User updated." in stdout
+    assert "Skill 'monthly-revenue' updated." in stdout
+    assert (memory, user) == ("Chat memory", "Chat user profile")
+    assert skill == Skill(
+        "monthly-revenue",
+        "Chat description",
+        "Chat instructions",
+    )
+    assert provider.requests == ()
+    provider.assert_consumed()
+
+
+def test_cli_4_shell_mutations_delegate_through_public_agent_methods_only():
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.set_memory = AsyncMock()
+            self.save_skill = AsyncMock(return_value=True)
+            self.close = AsyncMock()
+
+    fake = FakeAgent()
+    open_agent = AsyncMock(return_value=fake)
+    with patch.object(cli.Agent, "open", open_agent):
+        memory_result = _invoke(
+            [
+                "memory",
+                "set",
+                "public-only",
+                "--target",
+                "memory",
+                "--file",
+                "-",
+            ],
+            stdin="Public memory",
+        )
+        skill_result = _invoke(
+            [
+                "skills",
+                "save",
+                "public-only",
+                "public-skill",
+                "--description",
+                "Public description",
+                "--instructions-file",
+                "-",
+            ],
+            stdin="Public instructions",
+        )
+
+    assert memory_result[0] == skill_result[0] == 0
+    fake.set_memory.assert_awaited_once_with("Public memory")
+    fake.save_skill.assert_awaited_once_with(
+        "public-skill",
+        "Public description",
+        "Public instructions",
+    )
+    assert fake.close.await_count == 2

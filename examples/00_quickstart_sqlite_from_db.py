@@ -1,96 +1,50 @@
-"""Quickstart: ask questions of a local SQLite database with Agent.from_db().
-
-Run:
-    python examples/00_quickstart_sqlite_from_db.py
-"""
+"""Ask one grounded question of a cataloged SQLite source with the MVP Agent."""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-import os
-from typing import Any
 
-from daita.agents.agent import Agent
-from daita.db import DbLLMConfig, DbMemoryConfig, DbSourceOptions
+from daita import SQLiteSource
 
-from local_sqlite_fixtures import temporary_sales_sqlite
-
-QUESTIONS = (
-    "How many customers are there?",
-    "What are the top products by revenue?",
-    "Count orders where status = complete.",
+from _shared import (
+    ScriptedModel,
+    create_offline_agent,
+    example_root,
+    final_response,
+    parser,
+    seed_sales_database,
+    tool_response,
 )
 
 
-def llm_options(use_live_llm: bool) -> dict[str, Any]:
-    """Use OpenAI only when the caller explicitly asks for live synthesis."""
-    if not use_live_llm:
-        print("Using deterministic DB runtime output. Pass --live-llm to use OpenAI.\n")
-        return {}
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("OPENAI_API_KEY is not set; using deterministic DB runtime output.\n")
-        return {}
-    return {
-        "llm": DbLLMConfig(
-            provider="openai",
-            model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"),
-            api_key=api_key,
-            temperature=0,
-        )
-    }
-
-
-def print_operation_metadata(result) -> None:
-    telemetry = result.telemetry
-    print("Operation")
-    print(f"  id: {result.operation_id}")
-    print(f"  status: {result.status.value}")
-    print(f"  intent: {result.intent.kind.value}")
-    print(f"  telemetry: {telemetry['provider']} / {telemetry['model']}")
-    print()
-
-
-async def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--setup-only",
-        action="store_true",
-        help="Seed SQLite and initialize Agent.from_db() without running prompts.",
-    )
-    parser.add_argument(
-        "--live-llm", action="store_true", help="Use OpenAI if configured."
-    )
-    args = parser.parse_args()
-
-    async with temporary_sales_sqlite() as db_path:
-        print(f"SQLite fixture: {db_path}")
-        options = llm_options(args.live_llm)
-        agent = await Agent.from_db(
-            str(db_path),
-            name="SQLiteQuickstart",
-            source_options=DbSourceOptions(cache_ttl=0),
-            memory=DbMemoryConfig(enabled=False),
-            **options,
-        )
+async def run() -> None:
+    arguments = parser(__doc__).parse_args()
+    with example_root(arguments.root, "quickstart") as root:
+        database = seed_sales_database(root / "sales.sqlite")
+        model = ScriptedModel()
+        agent = await create_offline_agent("quickstart", root, model)
         try:
-            if args.setup_only:
-                inspection = await agent.describe()
-                print(
-                    f"Ready: {inspection.source_type}, "
-                    f"{inspection.capability_count} capabilities"
-                )
-                return
-
-            for question in QUESTIONS:
-                print(f"Question: {question}")
-                result = await agent.run_detailed(question)
-                print(f"Answer: {result.answer}")
-                print_operation_metadata(result)
+            source = await agent.attach(SQLiteSource(database, name="Sales"))
+            model.extend(
+                tool_response(
+                    "count-orders",
+                    "data_query_sqlite",
+                    {
+                        "source_id": source.id,
+                        "sql": "SELECT COUNT(*) AS order_count FROM orders",
+                        "parameters": [],
+                    },
+                ),
+                final_response("There are 3 orders."),
+            )
+            result = await agent.run("How many orders are there?")
+            print(f"state root: {root}")
+            print(f"source: {source.display_name} ({source.id})")
+            print(f"answer: {result.final_text}")
+            print(f"run: {result.run_id} ({result.kind.value})")
         finally:
-            await agent.stop()
+            await agent.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run())

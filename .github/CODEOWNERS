@@ -5,14 +5,10 @@
 # Default — all files require owner approval
 * @jendala @pablo-prieto
 
-# Core framework
-daita/core/         @jendala @pablo-prieto
-daita/agents/       @jendala @pablo-prieto
-daita/llm/          @jendala @pablo-prieto
-daita/config/       @jendala @pablo-prieto
-
-# Plugins
-daita/plugins/      @jendala @pablo-prieto
+# Product package and contracts
+src/daita/          @jendala @pablo-prieto
+tests/              @jendala @pablo-prieto
+docs/               @jendala @pablo-prieto
 
 # CI and repo configuration — extra scrutiny
 .github/            @jendala @pablo-prieto

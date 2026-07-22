@@ -55,19 +55,19 @@ Open a [GitHub Issue](https://github.com/daita-tech/daita-agents/issues) with th
 
 ### Adding a New LLM Provider
 
-1. Subclass `BaseLLMProvider` from `daita.llm.base`
-2. Implement `_generate_impl()` and `_stream_impl()`
-3. Add it to `daita/llm/factory.py`
-4. Add tests in `tests/unit/`
+1. Implement the `ModelProvider` contract under `src/daita/llm/providers/`.
+2. Keep provider-native payloads and translation inside that adapter.
+3. Lazy-import the optional SDK and add it to the matching extra.
+4. Register construction in `src/daita/llm/factory.py`.
+5. Add focused provider translation and routing tests under `tests/`.
 
-### Adding a New Plugin
+### Adding a Source or Data Capability
 
-1. Create a new file in `daita/plugins/`
-2. Subclass `BasePlugin` from `daita.plugins.base`
-3. Declare a `PluginManifest`
-4. Contribute extension declarations such as capabilities, executors, policies,
-   evidence schemas, context providers, and tool views
-5. Export it from `daita/plugins/__init__.py`
+Extend the existing adapter, catalog, capability registry, and data-domain
+owners. Keep structural discovery in the catalog path, source I/O behind the
+adapter boundary, and concrete validation immediately before execution. Do not
+add a plugin hierarchy, alternate catalog, or second agent loop. See
+`AGENTS.md` for the complete architecture and test requirements.
 
 ## Code Style
 

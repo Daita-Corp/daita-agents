@@ -1,415 +1,104 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "daita-agents"
-version = "1.0.0"
-description = "Daita Agents - Data focused AI agent framework with free local use and premium hosted enterprise features"
+version = "2.0.0a0"
+description = "A transcript-driven data agent"
 readme = "README.md"
-authors = [{name = "Daita", email = "support@daita-tech.io"}]
-license = {text = "Apache-2.0"}
 requires-python = ">=3.11"
-keywords = ["ai", "agents", "llm", "automation", "workflows", "sdk"]
+license = "Apache-2.0"
+authors = [{name = "Daita", email = "support@daita-tech.io"}]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+dependencies = []
 
-# CORE - Everything needed for a working agent out of the box
-# Philosophy: Users should be able to `pip install daita-agents` and immediately run an agent
-dependencies = [
-    # Framework essentials
-    "pydantic>=2.0.0",        # Configuration models
-    "aiohttp>=3.8.0",         # HTTP client for internal framework operations
-    "python-dotenv>=1.0.0",   # Environment variable loading
-
-    # CLI (daita-cli owns all CLI and MCP concerns)
-    "daita-cli>=0.1.0",       # Standalone CLI + MCP server
-    "PyYAML>=6.0.0",          # Config file parsing (required by framework)
-    "croniter>=1.0.0",        # Cron expression parsing for scheduling
-    "aiofiles>=24.1.0",       # Async file operations (framework)
-
-    # Default LLM provider (most common starting point - enables immediate usage)
-    "openai>=1.0.0",          # Primary LLM provider
-
-    # Essential utilities (small packages used throughout framework)
-    "certifi>=2025.4.0",      # SSL certificates
-    "PyJWT>=2.10.0",          # JWT token handling
-    "numpy>=1.20.0",          # Required by memory plugin for semantic search (cosine similarity)
-
-    # Observability — OTel is the sole tracing engine (powers dashboard + Datadog/Jaeger/etc.)
-    "opentelemetry-api>=1.20.0",
-    "opentelemetry-sdk>=1.20.0",
-]
-
-[project.urls]
-Homepage = "https://daita-tech.io"
-Documentation = "https://docs.daita-tech.io"
+[project.scripts]
+daita = "daita.cli:main"
 
 [project.optional-dependencies]
-# CLI watch mode (daita test --watch)
-cli = [
-    "watchdog>=3.0.0",
-]
+anthropic = ["anthropic>=0.116.0"]
+google = ["google-genai>=1.73.1"]
+keychain = ["keyring>=25.0.0"]
+openai = ["openai>=1.99.9"]
+postgresql = ["asyncpg>=0.30.0", "sqlglot>=25.0.0"]
+sqlite = ["sqlglot>=25.0.0"]
 
-# =============================================================================
-# COMMON USE CASES - Start here for most users
-# =============================================================================
-
-# Recommended starting point - adds commonly used features
-recommended = [
-    "anthropic>=0.5.0",          # Claude (in addition to included OpenAI)
-    "pandas>=1.5.0",             # Data processing
-    "numpy>=1.20.0",             # Numerical computing
-    "beautifulsoup4>=4.13.0",    # Web scraping
-    "lxml>=5.4.0",               # XML/HTML processing
-]
-
-# Memory plugin - persistent semantic memory for agents
-memory = [
-    "openai>=1.0.0",             # Embeddings (text-embedding-3-small)
-    "networkx>=3.0",             # Optional memory graph traversal/storage mechanics
-]
-
-# Voyage AI embeddings
-voyage = [
-    "voyageai>=0.3.0",
-]
-
-# Local embeddings via HuggingFace (not supported in Daita Cloud)
-sentence-transformers = [
-    "sentence-transformers>=2.2.0",
-]
-
-# Data-focused agents (analysis, ETL, reporting)
-data = [
-    "pandas>=1.5.0",
-    "numpy>=1.20.0",
-    "openpyxl>=3.1.0",           # Excel files
-    "beautifulsoup4>=4.13.0",
-    "lxml>=5.4.0",
-    "jsonpath-ng>=1.7.0",
-    "thefuzz[speedup]>=0.22.0",
-    "psycopg2-binary>=2.9.0",    # PostgreSQL support
-    "asyncpg>=0.27.0",
-    "sqlglot>=25.0.0",           # SQL AST parsing for from_db validation
-]
-
-# Production deployment (cloud + monitoring + reliability)
-production = [
-    "boto3>=1.38.0",             # AWS integration
-    "fastapi>=0.115.0",          # API server
-    "uvicorn>=0.34.0",           # ASGI server
-]
-
-# =============================================================================
-# ADDITIONAL LLM PROVIDERS (OpenAI included by default)
-# =============================================================================
-
-anthropic = ["anthropic>=0.5.0"]
-google = ["google-genai>=1.21.0"]
-
-# OTLP exporter — for exporting spans to Datadog, Jaeger, Honeycomb, etc.
-otlp = ["opentelemetry-exporter-otlp>=1.20.0"]
-
-# Data quality plugin — advanced anomaly detection (z-score via scipy)
-data-quality = ["scipy>=1.10.0", "scipy-stubs>=1.17.0.0"]
-transformers = ["transformers>=4.51.0"]  # Local models (LARGE: 2GB+)
-
-# Convenience bundle - all LLM providers
 llm-all = [
-    "anthropic>=0.5.0",
-    "google-genai>=1.21.0",
+    "openai>=1.99.9",
+    "anthropic>=0.116.0",
+    "google-genai>=1.73.1",
 ]
-
-# =============================================================================
-# DATABASE INTEGRATIONS
-# =============================================================================
-
-# Individual database connectors
-postgresql = ["asyncpg>=0.27.0", "psycopg2-binary>=2.9.0", "sqlglot>=25.0.0"]
-mysql = ["aiomysql>=0.2.0", "SQLAlchemy>=2.0.0", "sqlglot>=25.0.0"]
-mongodb = ["motor>=3.0.0"]
-sqlite = ["aiosqlite>=0.21.0", "SQLAlchemy>=2.0.0", "sqlglot>=25.0.0"]
-snowflake = ["snowflake-connector-python>=3.0.0", "cryptography>=3.0.0", "sqlglot>=25.0.0"]
-elasticsearch = ["elasticsearch>=8.0.0"]
-opensearch = ["opensearch-py>=2.0.0"]
-github = ["httpx>=0.24.0"]
-bigquery = ["google-cloud-bigquery>=3.0.0", "sqlglot>=25.0.0"]
-
-# Convenience bundle - all traditional databases
-databases = [
-    "asyncpg>=0.27.0",
-    "psycopg2-binary>=2.9.0",
-    "aiomysql>=0.2.0",
-    "SQLAlchemy>=2.0.0",
-    "motor>=3.0.0",
-    "aiosqlite>=0.21.0",
-    "snowflake-connector-python>=3.0.0",
-    "elasticsearch>=8.0.0",
-    "google-cloud-bigquery>=3.0.0",
-    "sqlglot>=25.0.0"
+data = [
+    "asyncpg>=0.30.0",
+    "sqlglot>=25.0.0",
 ]
-
-# =============================================================================
-# VECTOR DATABASE INTEGRATIONS
-# =============================================================================
-
-chromadb = ["chromadb>=1.3.0"]
-pinecone = ["pinecone>=5.0.0"]
-qdrant = ["qdrant-client>=1.16.0"]
-
-# Convenience bundle - all vector databases
-vectordb = [
-    "chromadb>=1.3.0",
-    "pinecone>=5.0.0",
-    "qdrant-client>=1.16.0"
+cli = []
+recommended = [
+    "openai>=1.99.9",
+    "sqlglot>=25.0.0",
+    "keyring>=25.0.0",
 ]
-
-# =============================================================================
-# CLOUD & INTEGRATION SERVICES
-# =============================================================================
-
-aws = ["boto3>=1.38.0", "boto3-stubs[s3]>=1.38.0"]
-azure = [
-    "azure-identity>=1.16.0",
-    "azure-mgmt-apimanagement>=4.0.0",
-    "azure-mgmt-cosmosdb>=9.0.0",
-    "azure-mgmt-eventhub>=11.0.0",
-    "azure-mgmt-rdbms>=10.0.0",
-    "azure-mgmt-redis>=14.0.0",
-    "azure-mgmt-servicebus>=8.0.0",
-    "azure-mgmt-sql>=3.0.0",
-    "azure-mgmt-storage>=21.0.0",
-    "azure-mgmt-subscription>=3.0.0",
-    "azure-storage-blob>=12.0.0",
-]
-gcp = [
-    "google-auth>=2.0.0",
-    "google-cloud-resource-manager>=1.0.0",
-    "google-cloud-storage>=2.0.0",
-    "google-api-python-client>=2.0.0",
-    "google-cloud-firestore>=2.0.0",
-    "google-cloud-bigtable>=2.0.0",
-    "google-cloud-pubsub>=2.0.0",
-    "google-cloud-redis>=2.0.0",
-    "google-cloud-api-gateway>=1.0.0",
-    "google-cloud-bigquery>=3.0.0",
-]
-google-drive = [
-    "google-api-python-client>=2.0.0",
-    "google-api-python-client-stubs>=1.39.0",
-    "google-auth>=2.0.0",
-    "google-auth-oauthlib>=1.0.0",
-    "openpyxl>=3.1.0",
-    "types-openpyxl>=3.1.0",
-    "pypdf>=3.0.0",
-    "python-docx>=1.0.0",
-]
-slack = ["slack-sdk>=3.31.0"]
-mcp = ["mcp>=1.0.0"]  # Model Context Protocol
-neo4j = ["neo4j>=5.0.0,<5.3.0"]
-redis = ["redis>=4.0.0"]
-lineage = ["networkx>=3.0"]
-
-# Convenience bundle - cloud services
-cloud = [
-    "boto3>=1.38.0",
-    "azure-identity>=1.16.0",
-    "azure-mgmt-apimanagement>=4.0.0",
-    "azure-mgmt-cosmosdb>=9.0.0",
-    "azure-mgmt-eventhub>=11.0.0",
-    "azure-mgmt-rdbms>=10.0.0",
-    "azure-mgmt-redis>=14.0.0",
-    "azure-mgmt-servicebus>=8.0.0",
-    "azure-mgmt-sql>=3.0.0",
-    "azure-mgmt-storage>=21.0.0",
-    "azure-mgmt-subscription>=3.0.0",
-    "azure-storage-blob>=12.0.0",
-    "google-api-python-client>=2.0.0",
-    "google-auth>=2.0.0",
-    "google-auth-oauthlib>=1.0.0",
-    "google-cloud-resource-manager>=1.0.0",
-    "google-cloud-storage>=2.0.0",
-    "google-cloud-firestore>=2.0.0",
-    "google-cloud-bigtable>=2.0.0",
-    "google-cloud-pubsub>=2.0.0",
-    "google-cloud-redis>=2.0.0",
-    "google-cloud-api-gateway>=1.0.0",
-    "google-cloud-bigquery>=3.0.0",
-    "pypdf>=3.0.0",
-    "python-docx>=1.0.0",
-    "slack-sdk>=3.31.0"
-]
-
-# =============================================================================
-# WEB & API FEATURES
-# =============================================================================
-
-# Web scraping and parsing
-web = [
-    "beautifulsoup4>=4.13.0",
-    "lxml>=5.4.0",
-]
-
-# API server development (for building custom agent APIs)
-api-server = [
-    "fastapi>=0.115.0",
-    "uvicorn>=0.34.0",
-    "python-multipart>=0.0.20"
-]
-
-# Web search capabilities (AI-optimized search with Tavily)
-websearch = [
-    "tavily-python>=0.3.0",
-    "beautifulsoup4>=4.13.0",
-    "lxml>=5.4.0",
-]
-
-# Exa AI-powered search
-exa = ["exa-py>=2.0.0"]
-
-# =============================================================================
-# COMPLETE BUNDLES
-# =============================================================================
-
-# Everything most users would want (excluding heavy/niche packages)
 complete = [
-    # Additional LLM providers
-    "anthropic>=0.5.0",
-    "google-genai>=1.21.0",
-    # Databases
-    "asyncpg>=0.27.0",
-    "psycopg2-binary>=2.9.0",
-    "SQLAlchemy>=2.0.0",
-    # Data processing
-    "pandas>=1.5.0",
-    "numpy>=1.20.0",
-    "beautifulsoup4>=4.13.0",
-    "lxml>=5.4.0",
-    "jsonpath-ng>=1.7.0",
-    # Web search
-    "tavily-python>=0.3.0",
-    "exa-py>=2.0.0",
-    # Cloud & integrations
-    "boto3>=1.38.0",
-    "google-api-python-client>=2.0.0",
-    "google-auth>=2.0.0",
-    "google-auth-oauthlib>=1.0.0",
-    "pypdf>=3.0.0",
-    "python-docx>=1.0.0",
-    "slack-sdk>=3.31.0",
+    "openai>=1.99.9",
+    "anthropic>=0.116.0",
+    "google-genai>=1.73.1",
+    "asyncpg>=0.30.0",
+    "sqlglot>=25.0.0",
+    "keyring>=25.0.0",
 ]
-
-# Absolutely everything (use sparingly - very large install)
 all = [
-    # All LLM providers
-    "anthropic>=0.5.0",
-    "google-genai>=1.21.0",
-    "transformers>=4.51.0",
-    # All databases
-    "asyncpg>=0.27.0",
-    "psycopg2-binary>=2.9.0",
-    "aiomysql>=0.2.0",
-    "SQLAlchemy>=2.0.0",
-    "motor>=3.0.0",
-    "aiosqlite>=0.21.0",
-    "snowflake-connector-python>=3.0.0",
-    "cryptography>=3.0.0",
-    "elasticsearch>=8.0.0",
-    "google-cloud-bigquery>=3.0.0",
-    "opensearch-py>=2.0.0",
-    # All vector databases
-    "chromadb>=1.3.0",
-    "pinecone>=5.0.0",
-    "qdrant-client>=1.16.0",
-    # Cloud & integrations
-    "boto3>=1.38.0",
-    "httpx>=0.24.0",
-    "google-api-python-client>=2.0.0",
-    "google-auth>=2.0.0",
-    "google-auth-oauthlib>=1.0.0",
-    "google-cloud-resource-manager>=1.0.0",
-    "google-cloud-storage>=2.0.0",
-    "google-cloud-firestore>=2.0.0",
-    "google-cloud-bigtable>=2.0.0",
-    "google-cloud-pubsub>=2.0.0",
-    "google-cloud-redis>=2.0.0",
-    "google-cloud-api-gateway>=1.0.0",
-    "pypdf>=3.0.0",
-    "python-docx>=1.0.0",
-    "slack-sdk>=3.31.0",
-    "mcp>=1.0.0",
-    "neo4j>=5.0.0,<5.3.0",
-    "redis>=4.0.0",
-    "networkx>=3.0",
-    # Data processing
-    "pandas>=1.5.0",
-    "numpy>=1.20.0",
-    "openpyxl>=3.1.0",
-    "beautifulsoup4>=4.13.0",
-    "lxml>=5.4.0",
-    "jsonpath-ng>=1.7.0",
-    "thefuzz[speedup]>=0.22.0",
-    "scipy>=1.10.0",
-    # Web search
-    "tavily-python>=0.3.0",
-    "exa-py>=2.0.0",
-    # Web API
-    "fastapi>=0.115.0",
-    "uvicorn>=0.34.0",
-    "python-multipart>=0.0.20",
-    # OTLP exporter
-    "opentelemetry-exporter-otlp>=1.20.0",
+    "openai>=1.99.9",
+    "anthropic>=0.116.0",
+    "google-genai>=1.73.1",
+    "asyncpg>=0.30.0",
+    "sqlglot>=25.0.0",
+    "keyring>=25.0.0",
 ]
 
-# Development dependencies
 dev = [
+    "black>=26.1.0",
+    "build>=1.2.2",
+    "mypy>=1.15.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.26.0",
-    "pytest-cov>=4.1.0",
-    "black>=23.0.0",
-    "mypy>=1.4.0",
-    "pre-commit>=3.0.0",
-    "aiosqlite>=0.21.0",  # used by sqlite unit tests (lightweight, built-in Python SQLite)
-    "sqlglot>=25.0.0",    # SQL guardrail tests run in the default CI suite
-    "pandas>=1.5.0",      # analyst integration tools run in the default CI suite
-    "pandas-stubs>=2.2.0", # typed dataframe boundaries used by connector tests
+    "wheel>=0.45.0",
 ]
 
-[tool.setuptools.packages.find]
-include = ["daita*"]
+[tool.setuptools]
+package-dir = {"" = "src"}
 
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["daita*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 asyncio_mode = "auto"
-pythonpath = ["."]
-addopts = "--tb=short -v"
 asyncio_default_fixture_loop_scope = "function"
+addopts = "--tb=short -q"
 markers = [
-    "asyncio: Async test marker",
-    "unit: Unit tests - fast, isolated tests",
-    "integration: Integration tests - test component interactions",
-    "performance: Performance tests - measure speed and resource usage",
-    "slow: Slow tests - may take several seconds",
-    "requires_llm: Tests that require LLM API keys",
-    "requires_db: Tests that require database setup",
-    "stress: Stress tests - high load scenarios"
+    "unit: fast isolated tests",
+    "contract: portable contract tests",
+    "integration: local component integration tests",
+    "acceptance: black-box public behavior tests",
+    "requires_llm: requires live model credentials",
+    "requires_db: requires an external database",
 ]
 
 [tool.black]
 line-length = 88
-target-version = ['py311']
+target-version = ["py311"]
 
 [tool.pyright]
-include = ["daita"]
+include = ["src/daita", "tests"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false
@@ -420,5 +109,3 @@ python_version = "3.11"
 check_untyped_defs = true
 no_implicit_optional = true
 warn_unused_ignores = true
-follow_imports = "skip"
-mypy_path = "typings"
