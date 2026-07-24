@@ -23,16 +23,16 @@ from . import (
     ApprovalRequest,
     LocalDirectorySource,
     LoopExit,
+    PostgreSQLSource,
     SQLiteSource,
     Skill,
     SkillSummary,
     create_llm_provider,
 )
 from .llm import ModelProfile, ModelProvider
-
-_DEFAULT_CONTEXT_WINDOW = 128_000
-_DEFAULT_MAX_OUTPUT = 4_096
-_PARALLEL_TOOL_PROVIDERS = frozenset({"openai", "grok", "ollama"})
+from .llm.profiles import reviewed_model_profile
+from .security import SecretReference
+from .terminal import run_terminal_application
 
 
 class _SourceSummary(Protocol):
@@ -52,15 +52,36 @@ class _SourceSummary(Protocol):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="daita")
     parser.add_argument("--root", type=Path)
-    commands = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--agent", help="agent to open in terminal mode")
+    commands = parser.add_subparsers(dest="command")
 
     create = commands.add_parser("create", help="create an agent")
     create.add_argument("name")
 
     attach = commands.add_parser("attach", help="attach a read-only source")
     attach.add_argument("name")
-    attach.add_argument("kind", choices=("sqlite", "files"))
-    attach.add_argument("path", type=Path)
+    attach.add_argument("kind", choices=("sqlite", "files", "postgresql"))
+    attach.add_argument("path", type=Path, nargs="?")
+    attach.add_argument("--host")
+    attach.add_argument("--port", type=int, default=5432)
+    attach.add_argument("--database")
+    attach.add_argument("--username")
+    attach.add_argument(
+        "--password-env",
+        help="environment variable containing the PostgreSQL password",
+    )
+    attach.add_argument(
+        "--schema",
+        action="append",
+        dest="schemas",
+        help="PostgreSQL schema to attach; repeat for multiple schemas",
+    )
+    attach.add_argument(
+        "--ssl-mode",
+        choices=("disable", "prefer", "allow", "require", "verify-ca", "verify-full"),
+        default="require",
+    )
+    attach.add_argument("--source-name")
 
     sources = commands.add_parser("sources", help="list attached sources")
     sources.add_argument("name")
@@ -70,8 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("message")
     run.add_argument("--model", required=True, help="provider:model")
     run.add_argument("--base-url")
-    run.add_argument("--context-window", type=int, default=_DEFAULT_CONTEXT_WINDOW)
-    run.add_argument("--max-output", type=int, default=_DEFAULT_MAX_OUTPUT)
+    run.add_argument("--context-window", type=int)
+    run.add_argument("--max-output", type=int)
     run.add_argument("--conversation-id")
     run.add_argument("--events-jsonl", action="store_true")
 
@@ -134,20 +155,53 @@ def _model_configuration(
     model_id: str,
     *,
     base_url: str | None = None,
-    context_window: int = _DEFAULT_CONTEXT_WINDOW,
-    max_output: int = _DEFAULT_MAX_OUTPUT,
+    context_window: int | None = None,
+    max_output: int | None = None,
 ) -> tuple[ModelProvider, ModelProfile]:
+    if (context_window is None) != (max_output is None):
+        raise ValueError("--context-window and --max-output must be supplied together")
+    reviewed_profile = reviewed_model_profile(model_id)
+    provider_max_output = (
+        max_output
+        if max_output is not None
+        else (
+            reviewed_profile.max_output_tokens
+            if reviewed_profile is not None
+            else 1_024
+        )
+    )
     provider = create_llm_provider(
         model_id,
         base_url=base_url,
-        max_output_tokens=max_output,
+        max_output_tokens=provider_max_output,
     )
+    profile = reviewed_model_profile(provider.provider_id)
+    if profile is None:
+        owned_profile = getattr(provider, "model_profile", None)
+        if isinstance(owned_profile, ModelProfile):
+            profile = owned_profile
+    if profile is None or profile.id != provider.provider_id:
+        raise ValueError(
+            "unreviewed models must be configured in the interactive terminal "
+            "to prove tool support and establish explicit hard token limits"
+        )
+    if context_window is None:
+        return provider, profile
+    assert max_output is not None
+    if (
+        context_window > profile.context_window_tokens
+        or max_output > profile.max_output_tokens
+    ):
+        raise ValueError(
+            "explicit token limits cannot exceed the reviewed or provider-owned "
+            "model profile"
+        )
     return provider, ModelProfile(
-        id=provider.provider_id,
+        id=profile.id,
         context_window_tokens=context_window,
         max_output_tokens=max_output,
-        supports_tools=True,
-        supports_parallel_tools=model_id.partition(":")[0] in _PARALLEL_TOOL_PROVIDERS,
+        supports_tools=profile.supports_tools,
+        supports_parallel_tools=profile.supports_parallel_tools,
     )
 
 
@@ -157,6 +211,12 @@ def _require_chat_terminal() -> None:
         raise RuntimeError(
             "chat requires an interactive terminal on stdin, stdout, and stderr"
         )
+
+
+def _require_terminal_application() -> None:
+    streams = (sys.stdin, sys.stdout, sys.stderr)
+    if not all(stream.isatty() for stream in streams):
+        raise RuntimeError("daita requires interactive stdin, stdout, and stderr")
 
 
 def _source_lines(sources: Sequence[_SourceSummary]) -> tuple[str, ...]:
@@ -681,11 +741,7 @@ async def _execute(args: argparse.Namespace) -> object:
     agent = await Agent.open(args.name, root=args.root)
     try:
         if args.command == "attach":
-            source = (
-                SQLiteSource(args.path)
-                if args.kind == "sqlite"
-                else LocalDirectorySource(args.path)
-            )
+            source = _source_from_attach_args(args)
             registration = await agent.attach(source)
             return {
                 "source_id": registration.id,
@@ -745,19 +801,71 @@ async def _execute(args: argparse.Namespace) -> object:
         await agent.close()
 
 
+def _source_from_attach_args(
+    args: argparse.Namespace,
+) -> SQLiteSource | LocalDirectorySource | PostgreSQLSource:
+    if args.kind in {"sqlite", "files"}:
+        if args.path is None:
+            raise ValueError(f"attach {args.kind} requires a path")
+        return (
+            SQLiteSource(args.path)
+            if args.kind == "sqlite"
+            else LocalDirectorySource(args.path)
+        )
+    if args.path is not None:
+        raise ValueError("attach postgresql does not accept a path")
+    required = {
+        "--host": args.host,
+        "--database": args.database,
+        "--username": args.username,
+    }
+    missing = tuple(name for name, value in required.items() if value is None)
+    if missing:
+        raise ValueError("attach postgresql requires " + ", ".join(missing))
+    credential = (
+        None
+        if args.password_env is None
+        else SecretReference.environment(args.password_env)
+    )
+    return PostgreSQLSource(
+        host=args.host,
+        port=args.port,
+        database=args.database,
+        username=args.username,
+        credential=credential,
+        schemas=tuple(args.schemas or ("public",)),
+        ssl_mode=args.ssl_mode,
+        name=args.source_name,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
-        if args.command == "chat":
-            _require_chat_terminal()
-        result = asyncio.run(_execute(args))
+        result: object
+        if args.command is None:
+            _require_terminal_application()
+            result = asyncio.run(
+                run_terminal_application(
+                    root=args.root,
+                    agent_name=args.agent,
+                    input_stream=sys.stdin,
+                    output_stream=sys.stdout,
+                )
+            )
+        else:
+            if args.agent is not None:
+                raise ValueError("--agent is only valid without a subcommand")
+            if args.command == "chat":
+                _require_chat_terminal()
+            result = asyncio.run(_execute(args))
     except KeyboardInterrupt:
         print("Chat interrupted.", file=sys.stderr)
         return 130
     except (ValueError, RuntimeError, OSError, ImportError) as error:
         print(json.dumps({"error": str(error)}), file=sys.stderr)
         return 1
-    if args.command == "chat":
+    if args.command is None or args.command == "chat":
         assert isinstance(result, int)
         return result
     print(json.dumps(result, default=str, sort_keys=True))

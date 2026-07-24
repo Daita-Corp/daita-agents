@@ -10,6 +10,7 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from ..._json import FrozenJsonObject, canonical_json
+from ..._installation import PIPX_REPAIR_GUIDANCE
 from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from ..models import (
     CanonicalMessage,
@@ -99,8 +100,8 @@ class GeminiProvider:
                 from google import genai
             except ImportError as error:
                 raise ImportError(
-                    "google-genai is required. Install with: "
-                    "pip install 'daita-agents[google]'"
+                    "Daita's Gemini runtime dependency is unavailable. "
+                    f"{PIPX_REPAIR_GUIDANCE}"
                 ) from error
             self._client = cast(_GeminiClient, genai.Client(api_key=self._api_key))
         return self._client

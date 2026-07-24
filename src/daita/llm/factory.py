@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import re
 
-from ..security import SecretProvider, default_secret_provider
+from ..security import (
+    SecretProvider,
+    SecretResolutionError,
+    default_secret_provider,
+)
 from .errors import ModelProviderError, ProviderErrorCode
 from .models import ModelRequest, ModelResponse
 from .protocols import ModelProvider
@@ -105,9 +109,18 @@ class _LazyProvider:
             )
         if self._provider is None:
             reference = self._candidate.secret_reference
-            api_key = (
-                None if reference is None else await self._secrets.resolve(reference)
-            )
+            try:
+                api_key = (
+                    None
+                    if reference is None
+                    else await self._secrets.resolve(reference)
+                )
+            except SecretResolutionError as error:
+                raise ModelProviderError(
+                    _secret_provider_error_code(error),
+                    "The configured provider credential could not be resolved.",
+                    provider_id=self.provider_id,
+                ) from None
             self._provider = create_llm_provider(
                 self._candidate.provider_id,
                 api_key=api_key,
@@ -115,6 +128,16 @@ class _LazyProvider:
                 max_output_tokens=self._candidate.profile.max_output_tokens,
             )
         return await self._provider.generate(request)
+
+
+def _secret_provider_error_code(
+    error: SecretResolutionError,
+) -> ProviderErrorCode:
+    if error.code == "secret_not_found":
+        return ProviderErrorCode.AUTHENTICATION_ERROR
+    if error.code == "secret_provider_unavailable":
+        return ProviderErrorCode.PROVIDER_UNAVAILABLE
+    return ProviderErrorCode.CONFIGURATION_ERROR
 
 
 def create_model_route_provider(

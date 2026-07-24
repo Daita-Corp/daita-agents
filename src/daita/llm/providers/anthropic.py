@@ -11,6 +11,7 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from ..._json import FrozenJsonObject, canonical_json
+from ..._installation import PIPX_REPAIR_GUIDANCE
 from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from ..models import (
     CanonicalMessage,
@@ -107,8 +108,8 @@ class AnthropicMessagesProvider:
                 from anthropic import AsyncAnthropic
             except ImportError as error:
                 raise ImportError(
-                    "anthropic is required. Install with: "
-                    "pip install 'daita-agents[anthropic]'"
+                    "Daita's Anthropic runtime dependency is unavailable. "
+                    f"{PIPX_REPAIR_GUIDANCE}"
                 ) from error
             self._client = cast(
                 _AnthropicClient,

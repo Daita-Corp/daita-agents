@@ -9,14 +9,24 @@ from typing import Self
 
 from ._json import FrozenJsonObject
 from .adapters.models import SourceRegistration
+from .adapters.postgresql import (
+    PostgreSQLProbeResult,
+    PostgreSQLSourceError,
+)
 from .adapters.protocols import ResourceSource
-from .catalog.models import CatalogResource, CatalogSearchRequest, CatalogSearchResult
+from .catalog.models import (
+    CatalogResource,
+    CatalogSearchRequest,
+    CatalogSearchResult,
+    CatalogSummary,
+)
 from .capabilities import ApprovalHandler
 from .config import AgentConfig
 from .hosting.embedded import (
     AgentAlreadyExistsError,
     AgentHomeError,
     AgentIdentityMismatchError,
+    AgentModelConfigurationError,
     AgentNameError,
     AgentNotConfiguredError,
     AgentNotFoundError,
@@ -29,7 +39,7 @@ from .llm.routing import ModelRoute
 from .loop.driver import ContextBuilder, ToolRuntime
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
 from .observation import AgentObserver
-from .security import SecretProvider
+from .security import KeychainStore, SecretProvider, SecretReference
 from .skills import Skill, SkillSummary
 
 
@@ -38,6 +48,16 @@ class Agent:
 
     def __init__(self, embedded: EmbeddedAgent) -> None:
         self._embedded = embedded
+
+    @classmethod
+    async def list(
+        cls,
+        *,
+        root: str | Path | None = None,
+    ) -> tuple[str, ...]:
+        """Return valid agent names beneath one admitted Daita root."""
+
+        return await EmbeddedAgent.list(root=root)
 
     @classmethod
     async def create(
@@ -54,6 +74,8 @@ class Agent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        keychain: KeychainStore | None = None,
+        model_validator: ModelProvider | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
     ) -> Self:
@@ -70,6 +92,8 @@ class Agent:
                 clock=clock,
                 id_factory=id_factory,
                 secret_provider=secret_provider,
+                keychain=keychain,
+                model_validator=model_validator,
                 observer=observer,
                 approval_handler=approval_handler,
             )
@@ -90,6 +114,8 @@ class Agent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        keychain: KeychainStore | None = None,
+        model_validator: ModelProvider | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
     ) -> Self:
@@ -106,6 +132,8 @@ class Agent:
                 clock=clock,
                 id_factory=id_factory,
                 secret_provider=secret_provider,
+                keychain=keychain,
+                model_validator=model_validator,
                 observer=observer,
                 approval_handler=approval_handler,
             )
@@ -131,6 +159,40 @@ class Agent:
     def model_route(self) -> ModelRoute | None:
         return self._embedded.model_route
 
+    def model_requires_explicit_limits(self, *, provider: str, model: str) -> bool:
+        """Return whether onboarding must collect hard token limits."""
+
+        return self._embedded.model_requires_explicit_limits(
+            provider=provider,
+            model=model,
+        )
+
+    async def configure_model(
+        self,
+        *,
+        provider: str,
+        model: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        context_window_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> ModelRoute:
+        """Validate and persist one model route for the next open."""
+
+        credential = api_key
+        api_key = None
+        try:
+            return await self._embedded.configure_model(
+                provider=provider,
+                model=model,
+                api_key=credential,
+                base_url=base_url,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+            )
+        finally:
+            credential = None
+
     async def run(
         self,
         message: str,
@@ -150,6 +212,11 @@ class Agent:
         conversation_id: str,
     ) -> tuple[ConversationRun, ...]:
         return await self._embedded.conversation_runs(conversation_id)
+
+    async def conversation_exists(self, conversation_id: str) -> bool:
+        """Return whether one conversation ID belongs to this agent."""
+
+        return await self._embedded.conversation_exists(conversation_id)
 
     async def read_memory(self) -> str:
         return await self._embedded.read_memory()
@@ -183,8 +250,80 @@ class Agent:
     async def attach(self, source: ResourceSource) -> SourceRegistration:
         return await self._embedded.attach(source)
 
+    async def attach_sqlite(
+        self,
+        path: str | Path,
+        *,
+        name: str | None = None,
+    ) -> SourceRegistration:
+        return await self._embedded.attach_sqlite(path, name=name)
+
+    async def attach_local_directory(
+        self,
+        root: str | Path,
+        *,
+        name: str | None = None,
+    ) -> SourceRegistration:
+        return await self._embedded.attach_local_directory(root, name=name)
+
+    async def store_postgresql_password(self, password: str) -> SecretReference:
+        return await self._embedded.store_postgresql_password(password)
+
+    async def delete_postgresql_password(
+        self,
+        reference: SecretReference,
+    ) -> None:
+        await self._embedded.delete_postgresql_password(reference)
+
+    async def probe_postgresql(
+        self,
+        *,
+        host: str,
+        database: str,
+        username: str,
+        credential: SecretReference,
+        port: int = 5432,
+        ssl_mode: str = "require",
+    ) -> PostgreSQLProbeResult:
+        return await self._embedded.probe_postgresql(
+            host=host,
+            database=database,
+            username=username,
+            credential=credential,
+            port=port,
+            ssl_mode=ssl_mode,
+        )
+
+    async def attach_postgresql(
+        self,
+        *,
+        host: str,
+        database: str,
+        username: str,
+        credential: SecretReference,
+        schemas: tuple[str, ...],
+        port: int = 5432,
+        ssl_mode: str = "require",
+        name: str | None = None,
+    ) -> SourceRegistration:
+        return await self._embedded.attach_postgresql(
+            host=host,
+            database=database,
+            username=username,
+            credential=credential,
+            schemas=schemas,
+            port=port,
+            ssl_mode=ssl_mode,
+            name=name,
+        )
+
     async def detach(self, source_id: str) -> SourceRegistration:
         return await self._embedded.detach(source_id)
+
+    async def refresh_source(self, source_id: str) -> SourceRegistration:
+        """Refresh one registered source through its persisted admitted config."""
+
+        return await self._embedded.refresh_source(source_id)
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         return await self._embedded.list_sources()
@@ -193,6 +332,20 @@ class Agent:
         self, *, source_id: str | None = None
     ) -> tuple[CatalogResource, ...]:
         return await self._embedded.list_catalog_resources(source_id=source_id)
+
+    async def catalog_summary(self) -> CatalogSummary:
+        """Return compact facts from active current committed catalog snapshots."""
+
+        return await self._embedded.catalog_summary()
+
+    async def catalog_preview(
+        self,
+        *,
+        limit: int = 12,
+    ) -> tuple[CatalogResource, ...]:
+        """Return a bounded deterministic preview of current catalog resources."""
+
+        return await self._embedded.catalog_preview(limit=limit)
 
     async def search_catalog(
         self, request: CatalogSearchRequest
@@ -217,8 +370,12 @@ __all__ = [
     "AgentAlreadyExistsError",
     "AgentHomeError",
     "AgentIdentityMismatchError",
+    "AgentModelConfigurationError",
     "AgentNameError",
     "AgentNotConfiguredError",
     "AgentNotFoundError",
     "HostActiveError",
+    "PostgreSQLProbeResult",
+    "PostgreSQLSourceError",
+    "CatalogSummary",
 ]

@@ -28,6 +28,8 @@ from .local_files import (
 from .sqlite import SQLiteResourceAdapter, SQLiteSource, SQLiteSourceError
 from .sqlite_query import SQLiteQueryBackend, SQLiteQueryError
 from .postgresql import (
+    PostgreSQLProbeResult,
+    PostgreSQLProbeSchema,
     PostgreSQLResourceAdapter,
     PostgreSQLSource,
     PostgreSQLSourceError,
@@ -49,6 +51,8 @@ __all__ = [
     "ResourceRef",
     "ResourceSnapshot",
     "PostgreSQLResourceAdapter",
+    "PostgreSQLProbeResult",
+    "PostgreSQLProbeSchema",
     "PostgreSQLQueryBackend",
     "PostgreSQLQueryError",
     "PostgreSQLSource",

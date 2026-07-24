@@ -72,7 +72,7 @@ src/daita/
 tests/                 # deterministic product tests
 examples/              # offline examples
 docs/                  # focused design documents
-pyproject.toml         # package, extras, CLI entry point, and tool configuration
+pyproject.toml         # package dependencies, dev extra, entry point, and tools
 ```
 
 Do not recreate a directory just because the old architecture had one. Add a
@@ -165,7 +165,7 @@ a second schema graph or querying source clients for planning facts.
 `daita.adapters` owns source-specific admission, containment, discovery,
 freshness checks, and I/O. SQLite and local-file paths must be absolute,
 bounded, and resistant to symlink/path escape. PostgreSQL credentials remain
-secret references and optional SDK use stays behind the execution boundary.
+secret references and integration SDK use stays behind the execution boundary.
 
 SQL validation belongs in `daita.domains.data.sql`; connector guardrails still
 apply at execution. Do not duplicate either system in a generic policy layer.
@@ -246,7 +246,7 @@ Use an environment dedicated to this package:
 ```bash
 cd /path/to/daita-agents
 python3.11 -m venv .venv
-.venv/bin/python -m pip install -e ".[dev,sqlite]"
+.venv/bin/python -m pip install -e ".[dev]"
 ```
 
 Python 3.11 and 3.12 are the supported versions.
@@ -283,38 +283,36 @@ Before handoff, run the narrowest relevant suite and then the complete
 deterministic suite when practical. Architecture changes should also run
 `tests/test_architecture.py`.
 
-## Critical: optional dependencies stay lazy
+## Critical: default production dependencies stay lazy
 
-The dependency-free core must import without optional provider, database,
-parser, or keychain packages installed. Import an optional SDK only inside the
-provider/client property or the narrow function that first needs it—never at
-module import time.
-
-On absence, raise `ImportError` with the matching extra:
+The customer installation is the complete application:
 
 ```text
-pip install 'daita-agents[openai]'
-pip install 'daita-agents[anthropic]'
-pip install 'daita-agents[google]'
-pip install 'daita-agents[postgresql]'
-pip install 'daita-agents[sqlite]'
-pip install 'daita-agents[keychain]'
+pipx install daita-agents
+daita
 ```
 
-Use `if TYPE_CHECKING:` for type-only imports when needed. Optional packages
-belong in the matching `[project.optional-dependencies]` entry in
-`pyproject.toml`, never in core `dependencies`.
+`openai`, `anthropic`, `google-genai`, `asyncpg`, `sqlglot`, `keyring`,
+`prompt-toolkit`, and `rich` are default production dependencies. `dev` is the only
+optional dependency group; do not restore provider, keychain, database,
+parser, CLI, recommended, complete, aggregate, or other customer extras.
 
-Current extra ownership is:
+Default installation does not authorize eager imports. Import provider SDKs,
+`asyncpg`, `sqlglot`, `keyring`, `prompt_toolkit`, and Rich only inside the
+provider/client or terminal-selection boundary that first needs them—never at
+module import time. Importing `daita` or `daita.cli`, and running headless
+commands, must not load those integration packages before their execution
+boundary is used; all are still imported lazily.
 
-| Extra | Packages |
-| --- | --- |
-| `openai` | `openai` |
-| `anthropic` | `anthropic` |
-| `google` | `google-genai` |
-| `postgresql` | `asyncpg`, `sqlglot` |
-| `sqlite` | `sqlglot` |
-| `keychain` | `keyring` |
+If a default production dependency is missing or damaged, raise a normalized
+`ImportError` that points to the application repair command:
+
+```text
+pipx reinstall daita-agents
+```
+
+Do not advertise an extras-based repair. Use `if TYPE_CHECKING:` for type-only
+imports when needed.
 
 ## Change discipline
 
@@ -342,9 +340,9 @@ special cases, or defensive checks on a broken design.
 1. Implement the `ModelProvider` contract under
    `src/daita/llm/providers/`.
 2. Keep its wire models and translation inside that adapter.
-3. Lazy-import its SDK at first use and provide the matching extra hint.
+3. Lazy-import its SDK at first use and provide normalized pipx repair guidance.
 4. Register construction in `src/daita/llm/factory.py`.
-5. Add only the required optional extra in `pyproject.toml`.
+5. Add the bounded SDK version to default production dependencies when needed.
 6. Add focused provider translation/error tests and routing tests where the
    normalized failure behavior changes.
 
@@ -391,7 +389,8 @@ specific agent loop.
 - Do not create a second root-level `daita/` package or another replacement
   source tree beside `src/daita/`.
 - Do not restore deleted architecture to satisfy obsolete tests or documents.
-- Do not add top-level optional SDK imports or new core dependencies.
+- Do not add top-level integration SDK imports or unplanned dependencies.
+- Do not split supported production integrations back into customer extras.
 - Do not let untrusted catalog, file, row, memory, or skill text become runtime
   instructions or authorization.
 - Do not weaken absolute-path, symlink, containment, SQL-scope, secret, output-

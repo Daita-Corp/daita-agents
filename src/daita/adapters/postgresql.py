@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
 from importlib import import_module
+from itertools import islice
 import re
 from typing import Any
 from urllib.parse import quote
 
+from .._installation import PIPX_REPAIR_GUIDANCE
 from .._json import canonical_json
 from ..capabilities import ExtensionDeclarations
 from ..catalog.models import (
@@ -62,6 +64,9 @@ _DEFAULT_MAX_RESOURCES = 1_000
 _DEFAULT_MAX_COLUMNS = 512
 _DEFAULT_MAX_INDEXES = 256
 _DEFAULT_MAX_RELATIONSHIPS = 2_000
+_MAX_PROBE_SCHEMAS = 100
+_PROBE_QUERY_LIMIT = _MAX_PROBE_SCHEMAS + 1
+_MAX_PROBE_ROW_FIELDS = 16
 _CONNECT_TIMEOUT_SECONDS = 10.0
 _COMMAND_TIMEOUT_SECONDS = 10.0
 _CLEANUP_TIMEOUT_SECONDS = 1.0
@@ -210,6 +215,23 @@ ORDER BY src_ns.nspname, src.relname, con.conname
 LIMIT $2
 """
 
+_SCHEMA_PROBE_SQL = """
+/* daita:postgresql.schema_probe */
+SELECT
+    namespace.nspname AS schema_name,
+    EXISTS (
+        SELECT 1
+        FROM information_schema.tables AS table_info
+        WHERE table_info.table_schema = namespace.nspname
+          AND table_info.table_type = 'BASE TABLE'
+    ) AS has_base_tables
+FROM pg_namespace AS namespace
+WHERE namespace.nspname <> 'information_schema'
+  AND namespace.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+ORDER BY namespace.nspname
+LIMIT $1
+"""
+
 
 class PostgreSQLSourceError(ResourceAdapterError):
     def __init__(
@@ -220,6 +242,63 @@ class PostgreSQLSourceError(ResourceAdapterError):
         source_id: str = "postgresql:unopened",
     ) -> None:
         super().__init__(source_id, code, message)
+
+
+@dataclass(frozen=True, slots=True)
+class PostgreSQLProbeSchema:
+    """One bounded non-system schema returned by a connection probe."""
+
+    name: str
+    has_base_tables: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or _IDENTIFIER.fullmatch(self.name) is None:
+            raise ValueError("probe schema name must be a safe PostgreSQL identifier")
+        if _is_system_schema(self.name):
+            raise ValueError("probe schema cannot be a PostgreSQL system schema")
+        if not isinstance(self.has_base_tables, bool):
+            raise TypeError("probe has_base_tables must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class PostgreSQLProbeResult:
+    """Bounded control-plane facts from one non-persisting connection probe."""
+
+    schemas: tuple[PostgreSQLProbeSchema, ...]
+    truncated: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.schemas, tuple):
+            raise TypeError("probe schemas must be a tuple")
+        if not isinstance(self.truncated, bool):
+            raise TypeError("probe truncation indicator must be a boolean")
+        if len(self.schemas) > _MAX_PROBE_SCHEMAS:
+            raise ValueError("probe schema result exceeds its fixed bound")
+        if any(not isinstance(item, PostgreSQLProbeSchema) for item in self.schemas):
+            raise TypeError("probe schemas must contain probe schema records")
+        names = tuple(item.name for item in self.schemas)
+        if len(names) != len(set(names)):
+            raise ValueError("probe schema names cannot repeat")
+        if names != tuple(sorted(names)):
+            raise ValueError("probe schema names must be sorted")
+
+    @classmethod
+    def build(
+        cls,
+        schemas: Sequence[tuple[str, bool]],
+        *,
+        truncated: bool = False,
+    ) -> PostgreSQLProbeResult:
+        if isinstance(schemas, (str, bytes)):
+            raise TypeError("probe schemas must be a sequence")
+        records = tuple(
+            PostgreSQLProbeSchema(name=name, has_base_tables=has_base_tables)
+            for name, has_base_tables in schemas
+        )
+        return cls(
+            tuple(sorted(records, key=lambda item: item.name)),
+            truncated=truncated,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,16 +358,7 @@ class PostgreSQLSource:
         attached_at: datetime,
         clock: Callable[[], datetime],
     ) -> PostgreSQLResourceAdapter:
-        configuration: dict[str, object] = {
-            "database": self.database,
-            "host": self.host,
-            "port": self.port,
-            "schemas": self.schemas,
-            "ssl_mode": self.ssl_mode,
-            "username": self.username,
-        }
-        if self.credential is not None:
-            configuration["credential_ref"] = self.credential.to_uri()
+        configuration = _source_configuration(self)
         native_identity = "postgresql:" + canonical_json(
             {
                 "database": self.database,
@@ -316,6 +386,48 @@ class PostgreSQLSource:
             connection=connection,
             clock=clock,
         )
+
+    async def probe(self) -> PostgreSQLProbeResult:
+        """Test one connection and list bounded non-system schemas.
+
+        This method owns no source registration or catalog store and therefore
+        cannot persist either probe state or structural metadata.
+        """
+
+        connection = await _connect_configuration(
+            _source_configuration(self),
+            self.secret_provider,
+            source_id="postgresql:probe",
+            error_type=PostgreSQLSourceError,
+        )
+        result: PostgreSQLProbeResult | None = None
+        probe_failed = False
+        try:
+            rows = await connection.fetch(
+                _SCHEMA_PROBE_SQL,
+                _PROBE_QUERY_LIMIT,
+            )
+            result = _probe_result(rows)
+        except asyncio.CancelledError:
+            raise
+        except PostgreSQLSourceError:
+            raise
+        except Exception:
+            probe_failed = True
+        finally:
+            await _close_postgresql_connection(
+                connection,
+                timeout_seconds=_CLEANUP_TIMEOUT_SECONDS,
+            )
+        if probe_failed:
+            raise PostgreSQLSourceError(
+                "postgresql_probe_failed",
+                "PostgreSQL schema probe failed.",
+                source_id="postgresql:probe",
+            )
+        if result is None:
+            raise AssertionError("PostgreSQL probe completed without a result")
+        return result
 
 
 class PostgreSQLResourceAdapter:
@@ -894,13 +1006,79 @@ def _relationship(
     )
 
 
+def _source_configuration(source: PostgreSQLSource) -> dict[str, object]:
+    configuration: dict[str, object] = {
+        "database": source.database,
+        "host": source.host,
+        "port": source.port,
+        "schemas": source.schemas,
+        "ssl_mode": source.ssl_mode,
+        "username": source.username,
+    }
+    if source.credential is not None:
+        configuration["credential_ref"] = source.credential.to_uri()
+    return configuration
+
+
+def _probe_result(rows: Sequence[object]) -> PostgreSQLProbeResult:
+    if isinstance(rows, (str, bytes)) or len(rows) > _PROBE_QUERY_LIMIT:
+        raise PostgreSQLSourceError(
+            "postgresql_probe_result_invalid",
+            "PostgreSQL returned an invalid schema probe result.",
+            source_id="postgresql:probe",
+        )
+    schemas: list[tuple[str, bool]] = []
+    try:
+        for row in rows:
+            normalized = _probe_row_mapping(row)
+            name = _row_text(normalized, "schema_name")
+            if _is_system_schema(name):
+                continue
+            if _IDENTIFIER.fullmatch(name) is None:
+                raise ValueError("probe schema name is invalid")
+            schemas.append((name, _row_bool(normalized, "has_base_tables")))
+        truncated = len(schemas) > _MAX_PROBE_SCHEMAS
+        return PostgreSQLProbeResult.build(
+            schemas[:_MAX_PROBE_SCHEMAS],
+            truncated=truncated,
+        )
+    except PostgreSQLSourceError as error:
+        if error.code == "postgresql_probe_result_invalid":
+            raise
+    except (TypeError, ValueError):
+        pass
+    raise PostgreSQLSourceError(
+        "postgresql_probe_result_invalid",
+        "PostgreSQL returned an invalid schema probe result.",
+        source_id="postgresql:probe",
+    ) from None
+
+
+def _probe_row_mapping(row: object) -> Mapping[str, object]:
+    if isinstance(row, Mapping):
+        return row
+    items_method = getattr(row, "items", None)
+    if not callable(items_method):
+        raise TypeError("probe row must expose a mapping interface")
+    raw_items = items_method()
+    if not isinstance(raw_items, Iterable):
+        raise TypeError("probe row items must be iterable")
+    items = tuple(islice(raw_items, _MAX_PROBE_ROW_FIELDS + 1))
+    if len(items) > _MAX_PROBE_ROW_FIELDS:
+        raise ValueError("probe row contains too many fields")
+    normalized = dict(items)
+    if len(normalized) != len(items):
+        raise ValueError("probe row fields must be unique")
+    return normalized
+
+
 def _load_asyncpg() -> Any:
     try:
         return import_module("asyncpg")
     except ImportError as error:
         raise ImportError(
-            "asyncpg is required. Install with: "
-            "pip install 'daita-agents[postgresql]'"
+            "Daita's PostgreSQL runtime dependency is unavailable. "
+            f"{PIPX_REPAIR_GUIDANCE}"
         ) from error
 
 
@@ -910,8 +1088,22 @@ async def _connect(
     *,
     error_type: type[PostgreSQLSourceError] = PostgreSQLSourceError,
 ) -> Any:
+    return await _connect_configuration(
+        registration.configuration,
+        secret_provider,
+        source_id=registration.id,
+        error_type=error_type,
+    )
+
+
+async def _connect_configuration(
+    configuration: Mapping[str, object],
+    secret_provider: SecretProvider,
+    *,
+    source_id: str,
+    error_type: type[PostgreSQLSourceError],
+) -> Any:
     asyncpg = _load_asyncpg()
-    configuration = registration.configuration
     credential_ref = configuration.get("credential_ref")
     password = None
     if credential_ref is not None:
@@ -919,7 +1111,7 @@ async def _connect(
             raise error_type(
                 "postgresql_configuration_invalid",
                 "PostgreSQL source credential reference is invalid.",
-                source_id=registration.id,
+                source_id=source_id,
             )
         resolution_failed = False
         try:
@@ -937,13 +1129,13 @@ async def _connect(
             raise error_type(
                 "postgresql_credential_unavailable",
                 "PostgreSQL credential resolution failed.",
-                source_id=registration.id,
+                source_id=source_id,
             )
         if not isinstance(password, str) or not password:
             raise error_type(
                 "postgresql_credential_invalid",
                 "PostgreSQL credential resolution returned an invalid value.",
-                source_id=registration.id,
+                source_id=source_id,
             )
     ssl_mode = _configuration_text(configuration, "ssl_mode")
     connect_failed = False
@@ -969,7 +1161,7 @@ async def _connect(
         raise error_type(
             "postgresql_connect_failed",
             "PostgreSQL source could not be opened.",
-            source_id=registration.id,
+            source_id=source_id,
         )
     raise AssertionError("PostgreSQL connection attempt returned no result")
 
@@ -1123,11 +1315,14 @@ def _schemas(values: Sequence[str]) -> tuple[str, ...]:
     for schema in schemas:
         if not isinstance(schema, str) or _IDENTIFIER.fullmatch(schema) is None:
             raise ValueError("schemas must contain safe PostgreSQL identifiers")
-        if schema.casefold().startswith("pg_") or schema.casefold() in {
-            "information_schema",
-        }:
+        if _is_system_schema(schema):
             raise ValueError("system PostgreSQL schemas cannot be attached")
     return tuple(sorted(schemas))
+
+
+def _is_system_schema(value: str) -> bool:
+    folded = value.casefold()
+    return folded.startswith("pg_") or folded == "information_schema"
 
 
 def _bounded_text(value: str, name: str, *, maximum: int) -> None:
@@ -1212,6 +1407,8 @@ def _row_bool(row: Mapping[str, object], key: str) -> bool:
 
 
 __all__ = [
+    "PostgreSQLProbeResult",
+    "PostgreSQLProbeSchema",
     "PostgreSQLResourceAdapter",
     "PostgreSQLSource",
     "PostgreSQLSourceError",

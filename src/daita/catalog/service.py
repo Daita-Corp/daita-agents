@@ -12,6 +12,7 @@ from .models import (
     CatalogResource,
     CatalogSearchRequest,
     CatalogSearchResult,
+    CatalogSummary,
     CatalogTraversalRequest,
     FacetKind,
     RelationshipDirection,
@@ -38,6 +39,46 @@ class CatalogService:
             raise TypeError("sources must provide source registration reads")
         self._store = store
         self._sources = sources
+
+    async def summary(self, agent_id: str) -> CatalogSummary:
+        """Project active source counts from their current committed snapshots."""
+
+        active_source_ids = tuple(
+            sorted(
+                registration.id
+                for registration in await self._sources.list_sources(agent_id)
+                if registration.agent_id == agent_id and registration.active
+            )
+        )
+        return await self._store.summarize_catalog(agent_id, active_source_ids)
+
+    async def preview(
+        self,
+        agent_id: str,
+        *,
+        limit: int,
+    ) -> tuple[CatalogResource, ...]:
+        """Project a bounded deterministic view of active current resources."""
+
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 50
+        ):
+            raise ValueError("catalog preview limit must be from 1 through 50")
+        active_source_ids = tuple(
+            sorted(
+                registration.id
+                for registration in await self._sources.list_sources(agent_id)
+                if registration.agent_id == agent_id and registration.active
+            )
+        )
+        resources: list[CatalogResource] = []
+        for source_id in active_source_ids:
+            resources.extend(await self._store.list_resources(agent_id, source_id))
+        return tuple(
+            sorted(resources, key=lambda resource: (resource.name, resource.id))[:limit]
+        )
 
     async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
         active_source_ids = {

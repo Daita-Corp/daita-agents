@@ -1,7 +1,8 @@
-"""Daita MVP data agent."""
+"""Daita agent."""
 
 from .adapters import LocalDirectorySource, PostgreSQLSource, SQLiteSource
 from .agent import Agent
+from .catalog import CatalogSummary
 from .capabilities import ApprovalDecision, ApprovalHandler, ApprovalRequest
 from .config import AgentConfig
 from .llm import (
@@ -26,6 +27,7 @@ __all__ = [
     "ApprovalHandler",
     "ApprovalRequest",
     "ConversationRun",
+    "CatalogSummary",
     "LocalDirectorySource",
     "LoopExit",
     "LoopExitKind",

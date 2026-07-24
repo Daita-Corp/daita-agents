@@ -38,6 +38,7 @@ class ProviderErrorCode(str, Enum):
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
     MALFORMED_RESPONSE = "malformed_response"
+    CONFIGURATION_ERROR = "configuration_error"
 
 
 class ModelProviderError(LLMError):

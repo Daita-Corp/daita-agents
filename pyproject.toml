@@ -12,56 +12,27 @@ license = "Apache-2.0"
 authors = [{name = "Daita", email = "support@daita-tech.io"}]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-dependencies = []
+dependencies = [
+    "openai>=1.99.9",
+    "anthropic>=0.116.0",
+    "google-genai>=1.73.1",
+    "asyncpg>=0.30.0",
+    "sqlglot>=25.0.0",
+    "keyring>=25.0.0",
+    "prompt-toolkit>=3.0.52,<4.0.0",
+    "rich>=15.0.0,<16.0.0",
+]
 
 [project.scripts]
 daita = "daita.cli:main"
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=0.116.0"]
-google = ["google-genai>=1.73.1"]
-keychain = ["keyring>=25.0.0"]
-openai = ["openai>=1.99.9"]
-postgresql = ["asyncpg>=0.30.0", "sqlglot>=25.0.0"]
-sqlite = ["sqlglot>=25.0.0"]
-
-llm-all = [
-    "openai>=1.99.9",
-    "anthropic>=0.116.0",
-    "google-genai>=1.73.1",
-]
-data = [
-    "asyncpg>=0.30.0",
-    "sqlglot>=25.0.0",
-]
-cli = []
-recommended = [
-    "openai>=1.99.9",
-    "sqlglot>=25.0.0",
-    "keyring>=25.0.0",
-]
-complete = [
-    "openai>=1.99.9",
-    "anthropic>=0.116.0",
-    "google-genai>=1.73.1",
-    "asyncpg>=0.30.0",
-    "sqlglot>=25.0.0",
-    "keyring>=25.0.0",
-]
-all = [
-    "openai>=1.99.9",
-    "anthropic>=0.116.0",
-    "google-genai>=1.73.1",
-    "asyncpg>=0.30.0",
-    "sqlglot>=25.0.0",
-    "keyring>=25.0.0",
-]
-
 dev = [
     "black>=26.1.0",
     "build>=1.2.2",

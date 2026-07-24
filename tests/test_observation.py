@@ -355,14 +355,15 @@ async def test_cancellation_persists_then_emits_interrupted_completion():
     class HangingProvider:
         provider_id = "mock:hanging"
 
-        def supports_request_policy(self, request):
+        def supports_request_policy(self, request: ModelRequest) -> bool:
             del request
             return True
 
-        async def generate(self, request):
+        async def generate(self, request: ModelRequest) -> ModelResponse:
             del request
             entered.set()
             await asyncio.Event().wait()
+            raise AssertionError("unreachable")
 
     store = OrderingStore()
     events: list[AgentEvent] = []
@@ -473,13 +474,14 @@ async def test_outer_wall_limit_failure_emits_one_completion():
     class HangingProvider:
         provider_id = "mock:wall-limit"
 
-        def supports_request_policy(self, request):
+        def supports_request_policy(self, request: ModelRequest) -> bool:
             del request
             return True
 
-        async def generate(self, request):
+        async def generate(self, request: ModelRequest) -> ModelResponse:
             del request
             await asyncio.Event().wait()
+            raise AssertionError("unreachable")
 
     events: list[AgentEvent] = []
     loop = AgentLoop(

@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from ..._json import FrozenJsonObject, canonical_json
+from ..._installation import PIPX_REPAIR_GUIDANCE
 from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from ..models import (
     CanonicalMessage,
@@ -115,8 +116,8 @@ class OpenAICompatibleProvider:
                 from openai import AsyncOpenAI
             except ImportError as error:
                 raise ImportError(
-                    "openai is required. Install with: "
-                    "pip install 'daita-agents[openai]'"
+                    "Daita's OpenAI-compatible runtime dependency is unavailable. "
+                    f"{PIPX_REPAIR_GUIDANCE}"
                 ) from error
             self._client = cast(
                 _OpenAICompatibleClient,

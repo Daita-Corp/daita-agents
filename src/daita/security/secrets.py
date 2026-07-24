@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 import os
 import re
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, TypeVar, cast, runtime_checkable
 
+from .._installation import PIPX_REPAIR_GUIDANCE
 from ..errors import ConfigError
 
 _ENVIRONMENT_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
 _KEYCHAIN_ACCOUNT = re.compile(r"[^\s\x00-\x1f\x7f]{1,256}\Z")
 _KEYCHAIN_SERVICE = re.compile(r"[^\r\n\x00]{1,256}\Z")
+_T = TypeVar("_T")
 
 
 class SecretResolutionError(ConfigError):
@@ -80,6 +82,15 @@ class SecretProvider(Protocol):
     async def resolve(self, reference: SecretReference) -> str: ...
 
 
+@runtime_checkable
+class KeychainStore(SecretProvider, Protocol):
+    """Read and mutate only explicit keychain references."""
+
+    async def set(self, reference: SecretReference, value: str) -> None: ...
+
+    async def delete(self, reference: SecretReference) -> None: ...
+
+
 class EmptySecretProvider:
     """Explicitly configured provider that can never resolve a value."""
 
@@ -113,6 +124,15 @@ class EnvironmentSecretProvider:
 class _KeyringClient(Protocol):
     def get_password(self, service_name: str, username: str) -> str | None: ...
 
+    def set_password(
+        self,
+        service_name: str,
+        username: str,
+        password: str,
+    ) -> None: ...
+
+    def delete_password(self, service_name: str, username: str) -> None: ...
+
 
 class KeychainSecretProvider:
     """Resolve explicit keychain references through a lazily imported backend."""
@@ -142,8 +162,8 @@ class KeychainSecretProvider:
                 import keyring  # type: ignore[import-not-found]
             except ImportError:
                 raise ImportError(
-                    "keyring is required. Install with: "
-                    "pip install 'daita-agents[keychain]'"
+                    "Daita's keychain runtime dependency is unavailable. "
+                    f"{PIPX_REPAIR_GUIDANCE}"
                 ) from None
             self._client = cast(_KeyringClient, keyring)
         return self._client
@@ -183,6 +203,66 @@ class KeychainSecretProvider:
                 "The configured keychain provider returned an invalid response.",
             )
         return value
+
+    async def set(self, reference: SecretReference, value: str) -> None:
+        """Store one bounded value without retaining or exposing it."""
+
+        _keychain_reference(reference)
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value.encode("utf-8")) > 64 * 1_024
+        ):
+            raise ValueError("keychain secret must be non-empty and at most 64 KiB")
+        client = self.client
+        if not callable(getattr(client, "set_password", None)):
+            raise SecretResolutionError(
+                "secret_provider_unavailable",
+                "The configured keychain provider cannot store secrets.",
+            )
+        failed = False
+        try:
+            await _run_blocking_to_completion(
+                client.set_password,
+                self._service_name,
+                reference.name,
+                value,
+            )
+        except ImportError:
+            raise
+        except Exception:
+            failed = True
+        finally:
+            value = ""
+        if failed:
+            raise SecretResolutionError(
+                "secret_provider_unavailable",
+                "The configured keychain provider could not store the secret.",
+            )
+
+    async def delete(self, reference: SecretReference) -> None:
+        """Delete one explicit keychain account without exposing its value."""
+
+        _keychain_reference(reference)
+        client = self.client
+        if not callable(getattr(client, "delete_password", None)):
+            raise SecretResolutionError(
+                "secret_provider_unavailable",
+                "The configured keychain provider cannot delete secrets.",
+            )
+        try:
+            await _run_blocking_to_completion(
+                client.delete_password,
+                self._service_name,
+                reference.name,
+            )
+        except ImportError:
+            raise
+        except Exception:
+            raise SecretResolutionError(
+                "secret_provider_unavailable",
+                "The configured keychain provider could not delete the secret.",
+            ) from None
 
     def __repr__(self) -> str:
         return "KeychainSecretProvider()"
@@ -277,11 +357,41 @@ def _reference(reference: SecretReference) -> None:
         raise TypeError("reference must be a SecretReference")
 
 
+def _keychain_reference(reference: SecretReference) -> None:
+    _reference(reference)
+    if reference.scheme != "keychain":
+        raise SecretResolutionError(
+            "secret_scheme_unsupported",
+            "Keychain mutation requires a keychain reference.",
+        )
+
+
+async def _run_blocking_to_completion(
+    callback: Callable[..., _T],
+    *args: object,
+) -> _T:
+    """Finish an admitted keychain mutation before propagating cancellation."""
+
+    worker = asyncio.create_task(asyncio.to_thread(callback, *args))
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+    result = worker.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
 __all__ = [
     "CompositeSecretProvider",
     "EmptySecretProvider",
     "EnvironmentSecretProvider",
     "KeychainSecretProvider",
+    "KeychainStore",
     "SecretProvider",
     "SecretReference",
     "SecretResolutionError",

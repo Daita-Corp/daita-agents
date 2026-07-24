@@ -9,7 +9,6 @@ import sqlite3
 import pytest
 
 from daita import Agent, SQLiteSource
-from daita.llm.errors import ContextWindowExceeded
 from daita.llm.models import (
     FinishReason,
     MessageRole,

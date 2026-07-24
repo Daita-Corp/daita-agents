@@ -11,10 +11,9 @@ from dataclasses import dataclass, field
 import hashlib
 from typing import Any, Literal
 
+from ..._installation import PIPX_REPAIR_GUIDANCE
 from ..._json import FrozenJsonObject, canonical_json
 
-_SQLITE_INSTALL_HINT = "pip install 'daita-agents[sqlite]'"
-_POSTGRESQL_INSTALL_HINT = "pip install 'daita-agents[postgresql]'"
 _SqlDialect = Literal["sqlite", "postgresql"]
 _MAX_ISSUES = 32
 _MAX_CANDIDATES = 8
@@ -556,12 +555,12 @@ def _load_sqlglot(dialect: _SqlDialect = "sqlite") -> tuple[Any, Any]:
     except ImportError as error:
         if dialect == "postgresql":
             raise ImportError(
-                "sqlglot is required for PostgreSQL SQL validation. "
-                f"Install with: {_POSTGRESQL_INSTALL_HINT}"
+                "Daita's PostgreSQL SQL validation dependency is unavailable. "
+                f"{PIPX_REPAIR_GUIDANCE}"
             ) from error
         raise ImportError(
-            "sqlglot is required for SQLite SQL validation. "
-            f"Install with: {_SQLITE_INSTALL_HINT}"
+            "Daita's SQLite SQL validation dependency is unavailable. "
+            f"{PIPX_REPAIR_GUIDANCE}"
         ) from error
     return sqlglot, exp
 

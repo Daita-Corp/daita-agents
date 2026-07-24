@@ -11,6 +11,7 @@ from .models import (
     CatalogResourceRevision,
     CatalogSearchRequest,
     CatalogSearchResult,
+    CatalogSummary,
     CatalogSync,
     CatalogTraversalRequest,
     CatalogTraversalResult,
@@ -73,6 +74,12 @@ class CatalogStore(Protocol):
     ) -> SourceCatalogSnapshot: ...
 
     async def load_sync(self, agent_id: str, sync_id: str) -> CatalogSync | None: ...
+
+    async def summarize_catalog(
+        self,
+        agent_id: str,
+        active_source_ids: tuple[str, ...],
+    ) -> CatalogSummary: ...
 
     async def load_resource(
         self,

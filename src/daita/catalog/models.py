@@ -170,6 +170,34 @@ class CatalogSyncStatus(str, Enum):
     FAILED = "failed"
 
 
+@dataclass(frozen=True, slots=True)
+class CatalogSummary:
+    """Compact current-catalog facts for non-model public presentation."""
+
+    active_source_count: int
+    resource_count: int
+    relationship_count: int
+    latest_successful_sync_completed_at: datetime | None
+    is_empty: bool
+
+    def __post_init__(self) -> None:
+        _non_negative_int(self.active_source_count, "summary active_source_count")
+        _non_negative_int(self.resource_count, "summary resource_count")
+        _non_negative_int(
+            self.relationship_count,
+            "summary relationship_count",
+        )
+        if self.latest_successful_sync_completed_at is not None:
+            _aware(
+                self.latest_successful_sync_completed_at,
+                "summary latest_successful_sync_completed_at",
+            )
+        if not isinstance(self.is_empty, bool):
+            raise TypeError("summary is_empty must be a boolean")
+        if self.is_empty != (self.resource_count == 0):
+            raise ValueError("summary is_empty must reflect resource_count")
+
+
 class RelationshipDirection(str, Enum):
     FORWARD = "forward"
     REVERSE = "reverse"

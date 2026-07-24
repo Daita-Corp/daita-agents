@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+import threading
 from typing import Any
 
 from ..adapters.models import SourceRegistration
@@ -32,6 +33,7 @@ from ..catalog.models import (
     CatalogSearchResult,
     CatalogSync,
     CatalogSyncStatus,
+    CatalogSummary,
     CatalogTraversalRequest,
     CatalogTraversalResult,
     FacetKind,
@@ -55,6 +57,34 @@ from ..llm.models import (
 from ..loop.models import ConversationRun, LoopExit, LoopExitKind, RunInput, Transcript
 
 _SEARCH_TERM = re.compile(r"[A-Za-z0-9]+")
+
+
+class _CatalogCommitGate:
+    """Linearize task cancellation against one SQLite catalog transaction."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._started = False
+
+    def start(self, connection: sqlite3.Connection) -> bool:
+        with self._lock:
+            if self._cancelled:
+                return False
+        connection.execute("BEGIN IMMEDIATE")
+        with self._lock:
+            if self._cancelled:
+                connection.rollback()
+                return False
+            self._started = True
+            return True
+
+    def cancel_before_start(self) -> bool:
+        with self._lock:
+            if self._started:
+                return False
+            self._cancelled = True
+            return True
 
 
 class SQLiteStateStore:
@@ -188,11 +218,44 @@ class SQLiteStateStore:
         return await asyncio.to_thread(write)
 
     async def commit_snapshot(
-        self, snapshot: SourceCatalogSnapshot
+        self,
+        snapshot: SourceCatalogSnapshot,
+        *,
+        registration: SourceRegistration | None = None,
     ) -> SourceCatalogSnapshot:
-        def write() -> SourceCatalogSnapshot:
-            sync = snapshot.sync
-            with _connect(self.path) as connection:
+        sync = snapshot.sync
+        if registration is not None and (
+            registration.agent_id != sync.agent_id or registration.id != sync.source_id
+        ):
+            raise ValueError("catalog snapshot and source registration disagree")
+        gate = _CatalogCommitGate()
+
+        def write() -> SourceCatalogSnapshot | None:
+            connection = _connect(self.path)
+            try:
+                if not gate.start(connection):
+                    return None
+                if registration is not None:
+                    row = connection.execute(
+                        "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
+                        (registration.agent_id, registration.id),
+                    ).fetchone()
+                    if row is None:
+                        connection.execute(
+                            "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
+                            (
+                                registration.agent_id,
+                                registration.id,
+                                _dumps(registration),
+                            ),
+                        )
+                    else:
+                        current = _expect(_loads(row[0]), SourceRegistration)
+                        if current != registration:
+                            raise ValueError(
+                                "source registration already exists: "
+                                f"{registration.id}"
+                            )
                 connection.execute(
                     """INSERT INTO syncs(agent_id, id, source_id, data)
                        VALUES (?, ?, ?, ?)
@@ -206,9 +269,31 @@ class SQLiteStateStore:
                          sync_id = excluded.sync_id, data = excluded.data""",
                     (sync.agent_id, sync.source_id, sync.id, _dumps(snapshot)),
                 )
+                _commit_catalog_transaction(connection)
                 return snapshot
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
 
-        return await asyncio.to_thread(write)
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled_before_start = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled_before_start = (
+                    gate.cancel_before_start() or cancelled_before_start
+                )
+        committed = worker.result()
+        if cancelled_before_start:
+            if committed is not None:
+                raise AssertionError("cancelled catalog transaction committed")
+            raise asyncio.CancelledError
+        if committed is None:
+            raise AssertionError("catalog transaction stopped without cancellation")
+        return committed
 
     async def load_sync(self, agent_id: str, sync_id: str) -> CatalogSync | None:
         def read() -> CatalogSync | None:
@@ -218,6 +303,54 @@ class SQLiteStateStore:
                     (agent_id, sync_id),
                 ).fetchone()
             return None if row is None else _expect(_loads(row[0]), CatalogSync)
+
+        return await asyncio.to_thread(read)
+
+    async def summarize_catalog(
+        self,
+        agent_id: str,
+        active_source_ids: tuple[str, ...],
+    ) -> CatalogSummary:
+        """Count only current committed snapshots for the supplied active sources."""
+
+        if not isinstance(active_source_ids, tuple) or any(
+            not isinstance(source_id, str) or not source_id
+            for source_id in active_source_ids
+        ):
+            raise TypeError("active_source_ids must be a tuple of non-empty strings")
+        if len(active_source_ids) != len(set(active_source_ids)):
+            raise ValueError("active_source_ids cannot contain duplicates")
+        selected_source_ids = frozenset(active_source_ids)
+
+        def read() -> CatalogSummary:
+            with _connect(self.path) as connection:
+                rows = connection.execute(
+                    "SELECT source_id, data FROM snapshots "
+                    "WHERE agent_id = ? ORDER BY source_id",
+                    (agent_id,),
+                ).fetchall()
+            snapshots = tuple(
+                _expect(_loads(data), SourceCatalogSnapshot)
+                for source_id, data in rows
+                if source_id in selected_source_ids
+            )
+            completion_times = tuple(
+                snapshot.sync.completed_at
+                for snapshot in snapshots
+                if snapshot.sync.completed_at is not None
+            )
+            resource_count = sum(len(snapshot.resources) for snapshot in snapshots)
+            return CatalogSummary(
+                active_source_count=len(active_source_ids),
+                resource_count=resource_count,
+                relationship_count=sum(
+                    len(snapshot.relationships) for snapshot in snapshots
+                ),
+                latest_successful_sync_completed_at=(
+                    max(completion_times) if completion_times else None
+                ),
+                is_empty=resource_count == 0,
+            )
 
         return await asyncio.to_thread(read)
 
@@ -300,18 +433,22 @@ class SQLiteStateStore:
             if request.resource_kinds and resource.kind not in request.resource_kinds:
                 continue
             fields = {
+                "kind": f"{resource.kind.value} {resource.kind.value}s",
                 "name": resource.name.lower(),
                 "native_identity": resource.native_identity.lower(),
                 "external_uri": resource.external_uri.lower(),
             }
-            if terms and not all(
-                any(term in value for value in fields.values()) for term in terms
-            ):
+            matched_terms = tuple(
+                term
+                for term in terms
+                if any(term in value for value in fields.values())
+            )
+            if terms and not matched_terms:
                 continue
             matched_fields = tuple(
                 name
                 for name, value in fields.items()
-                if any(term in value for term in terms)
+                if any(term in value for term in matched_terms)
             )
             exact = bool(terms) and any(
                 request.query.lower() == value for value in fields.values()
@@ -327,7 +464,11 @@ class SQLiteStateStore:
             score = (
                 100.0
                 if exact
-                else 50.0 if prefix else float(max(1, len(matched_fields)))
+                else (
+                    50.0
+                    if prefix
+                    else float(max(1, len(matched_terms) * 2 + len(matched_fields)))
+                )
             )
             matches.append(
                 CatalogSearchHit(
@@ -566,6 +707,25 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
+    async def conversation_exists(
+        self,
+        agent_id: str,
+        conversation_id: str,
+    ) -> bool:
+        """Return one agent-scoped existence fact without loading transcript data."""
+
+        def read() -> bool:
+            with _connect(self.path) as connection:
+                row = connection.execute(
+                    """SELECT 1 FROM runs
+                       WHERE agent_id = ? AND conversation_id = ?
+                       LIMIT 1""",
+                    (agent_id, conversation_id),
+                ).fetchone()
+            return row is not None
+
+        return await asyncio.to_thread(read)
+
     async def completed_conversation_tail(
         self,
         agent_id: str,
@@ -709,6 +869,10 @@ def _connect(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=30)
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
+
+
+def _commit_catalog_transaction(connection: sqlite3.Connection) -> None:
+    connection.commit()
 
 
 _RECORD_TYPES: dict[str, type[Any]] = {

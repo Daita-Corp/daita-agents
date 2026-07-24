@@ -1,6 +1,109 @@
-# Daita MVP
+# Daita Agent
 
-Daita is a persistent, read-only data agent built around one direct loop:
+Daita is a persistent, read-only data agent for SQLite, PostgreSQL, CSV, and
+JSON. Install the complete application with pipx, then launch the interactive
+terminal:
+
+```bash
+pipx install daita-agents
+daita
+```
+
+## Start with `daita`
+
+Pipx keeps Daita in an isolated environment and exposes the `daita` command on
+your `PATH`. The default package includes every currently supported model
+provider, keychain, database driver, and SQL validation dependency; no extras
+expression or separate virtual environment is required.
+
+The first launch stays inside the terminal. It creates or selects an agent,
+uses ↑/↓ and Enter to choose a provider and one of its curated model
+suggestions, reads the API key through a hidden prompt, saves it in the OS
+keychain, and explains before making one small exact-model validation request.
+Every provider menu also offers manual model-ID entry through the same
+validation boundary. Source choices use ↑/↓ and Enter. For PostgreSQL, Daita
+tests the connection, lists non-system schemas, uses Space to toggle stable
+schema names and Enter to confirm the nonempty selection, and catalogs only
+that selection before chat begins. Escape cancels a selector without persisting
+its terminal position or incomplete onboarding state.
+
+No API key, database password, model flag, source flag, environment variable,
+or conversation ID is required on the normal first-run path. Daita persists
+only keychain references and non-secret configuration. It never accepts an API
+key or database password as a command-line argument.
+
+A ready first launch moves into a full-screen, transcript-first shell:
+
+```text
+ DAITA  atlas                                      Local PostgreSQL
+───────────────────────────────────────────────────────────────────
+
+ You
+ Which region leads paid revenue?
+
+ Daita
+ EMEA leads paid revenue with $4.2M.
+
+╭─────────────────────────────────────────────────────────────────╮
+│ › Ask a follow-up…                                              │
+╰─────────────────────────────────────────────────────────────────╯
+ atlas · gpt-5.6-sol · ● ready       1 step · 824 tokens · $0.01
+```
+
+The transcript scrolls vertically and model answers render as sanitized
+Markdown. Enter submits nonempty input, Ctrl-J inserts a newline, Ctrl-C
+cancels an active run without closing Daita, and Ctrl-D exits when the composer
+is empty. Existing slash commands continue to use their current local prompts
+and selectors. Redirected and other non-interactive streams retain the
+deterministic plain-text chat path.
+
+Run `daita` again to reopen the sole agent automatically. When several agents
+exist, Daita shows a deterministic picker; `daita --agent atlas` selects one
+explicitly. Use `daita --root /absolute/path` to keep agent homes under a
+non-default root. A returning launch retains the configured model and current
+cataloged sources, skips their completed onboarding fields, derives `Ready`
+from that current state, and starts a new terminal conversation unless the
+customer explicitly uses `/resume <conversation-id>`.
+
+### Upgrade, repair, or uninstall
+
+Use pipx for the installed application lifecycle:
+
+```bash
+pipx upgrade daita-agents
+pipx reinstall daita-agents
+pipx uninstall daita-agents
+```
+
+Reinstall repairs missing or damaged application dependencies. Uninstall
+removes the pipx-managed application environment; it does not delete Daita
+agent homes or credentials already stored in the OS keychain.
+
+### Troubleshooting onboarding
+
+- “The API key was rejected” means the provider rejected the saved credential;
+  replace it and retry. “This account cannot access `<model>`” means the exact
+  model is unavailable to that account.
+- Rate-limit, provider-unavailable, timeout, and invalid-model messages are
+  normalized at the provider boundary. They never include raw SDK responses.
+- A missing runtime dependency message means the isolated application
+  environment needs repair; run `pipx reinstall daita-agents`. Other keychain
+  messages indicate that the OS credential store could not save or read the
+  secret; unlock or repair keychain access, then retry.
+- For PostgreSQL connection failures, confirm that the database is already
+  running and verify host, port, database, reader username, password, and SSL
+  mode. Schema-inspection failures usually mean the reader role lacks catalog
+  permissions. Daita does not start or manage PostgreSQL or Docker.
+- Local SQLite and CSV/JSON paths must exist, be readable, resolve to absolute
+  paths, and pass Daita's containment and symlink checks.
+
+Setup failures leave the last committed model configuration and catalog intact.
+Provider and database availability are checked only when an operation runs;
+Daita does not persist a health or readiness claim.
+
+## Architecture
+
+Daita uses one direct model/tool loop:
 
 ```text
 user message -> model -> zero or more tool calls -> tool results -> model -> answer
@@ -16,7 +119,6 @@ that direct progression or creating a session runtime. Bounded advisory memory
 and bounded Markdown skills provide inspectable context; full skill instructions
 are loaded only when the model calls `skill_view`.
 
-The MVP supports catalog-backed reads from SQLite, PostgreSQL, CSV, and JSON.
 SQLite and local-file sources are admitted through bounded adapters. SQL is
 validated against the current catalog before execution. Every model-requested
 tool call receives one ordered success or error result; one failing call does
@@ -179,7 +281,14 @@ trace store, exporter, or delivery guarantee.
 An explicitly injected custom tool runtime remains caller-owned code and owns
 authorization, tool-level observation, and side-effect safety for its tools.
 
-## CLI
+## Advanced/headless CLI
+
+The commands below remain available for automation, scripting, and debugging.
+They are separate from the zero-argument onboarding flow. `run` emits one JSON
+record; other non-interactive commands retain their existing JSON contracts.
+Provider credentials and PostgreSQL passwords must be supplied through their
+documented environment/keychain references, never as secret command-line
+values.
 
 ```bash
 daita --root /private/tmp/daita create atlas
@@ -189,6 +298,26 @@ daita --root /private/tmp/daita run atlas "Summarize sales" \
 daita --root /private/tmp/daita chat atlas \
   --model openai:gpt-4.1-mini
 ```
+
+For a developer-owned disposable PostgreSQL source with a stable commerce
+schema and freshly randomized sample values on each initialization, start the
+repository fixture separately and attach its read-only role:
+
+```bash
+docker compose -f tests/fixtures/postgresql/compose.yaml up -d --wait
+export DAITA_FIXTURE_POSTGRES_PASSWORD=daita_fixture_password
+
+daita --root /private/tmp/daita attach atlas postgresql \
+  --host 127.0.0.1 --port 55432 \
+  --database daita_fixture --username daita_reader \
+  --password-env DAITA_FIXTURE_POSTGRES_PASSWORD \
+  --schema analytics --ssl-mode disable
+```
+
+The fixture is ephemeral and can be discarded with `docker compose -f
+tests/fixtures/postgresql/compose.yaml down`. See
+[`tests/fixtures/postgresql/README.md`](tests/fixtures/postgresql/README.md) for
+the complete live CLI and opt-in acceptance-test workflow.
 
 `run` remains the one-record JSON automation surface. `chat` is the readable
 interactive surface and keeps only the explicit current conversation ID and
@@ -255,9 +384,16 @@ approval handler.
 ```bash
 cd /path/to/daita-agents
 python3.11 -m venv .venv
-.venv/bin/python -m pip install -e ".[dev,sqlite]"
+.venv/bin/python -m pip install -e ".[dev]"
 .venv/bin/python -m pytest
+.venv/bin/python tests/pipx_lifecycle_smoke.py
 ```
 
-Optional provider and database SDKs are imported lazily at their execution
-boundaries.
+Production integration dependencies are installed by default but imported
+lazily at their execution boundaries. The release smoke builds a local wheel
+and sdist, uses temporary explicit pipx home/bin/man/cache directories,
+installs and reinstalls the local wheel, runs installed metadata and
+`daita --help` checks outside the checkout, uninstalls it, and proves separately
+located agent-home data remains. It may download declared dependencies from the
+configured package index, so run it only where that read access is authorized;
+it does not upload artifacts or change an index.

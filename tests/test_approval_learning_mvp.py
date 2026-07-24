@@ -29,6 +29,7 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
+from daita.domains.data.controller import DataToolRuntime
 from daita.memory import MEMORY_MAX_CHARACTERS, USER_MAX_CHARACTERS
 from daita.memory.capabilities import (
     MEMORY_SET_CAPABILITY_ID,
@@ -122,10 +123,10 @@ def _run(agent: Agent, run_id: str = "approval-run") -> RunInput:
     )
 
 
-def _runtime(agent: Agent):
+def _runtime(agent: Agent) -> DataToolRuntime:
     loop = agent._embedded._loop
     assert loop is not None
-    return loop._tools
+    return cast(DataToolRuntime, loop._tools)
 
 
 async def _execute(agent: Agent, *calls: ToolCall):
@@ -467,8 +468,9 @@ async def test_tool_and_approval_event_sequences_are_exact_and_content_free(tmp_
     assert completed["tool_name"] == MEMORY_SET_TOOL_NAME
     assert completed["success"] is True
     assert completed["error_code"] is None
-    assert isinstance(completed["duration_ms"], int)
-    assert completed["duration_ms"] >= 0
+    duration_ms = completed["duration_ms"]
+    assert isinstance(duration_ms, int)
+    assert duration_ms >= 0
 
 
 @pytest.mark.parametrize(

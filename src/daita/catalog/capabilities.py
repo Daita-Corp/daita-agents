@@ -145,8 +145,8 @@ def catalog_declarations(
     search = Capability(
         id=CATALOG_SEARCH_CAPABILITY_ID,
         description=(
-            "Search attached resource metadata before inspecting or querying; "
-            "inspect freshness-sensitive candidates before selecting one."
+            "Search attached metadata and kinds by any term; zero matches do not "
+            "prove an empty catalog. Inspect candidates before use."
         ),
         input_schema={
             "type": "object",

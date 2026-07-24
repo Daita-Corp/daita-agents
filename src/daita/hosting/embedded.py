@@ -3,28 +3,35 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
+from decimal import Decimal
 import errno
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import stat
 import tomllib
-from typing import Self, TypeVar
+from typing import Self, TypeVar, cast
 from uuid import uuid4
 
 from .._json import FrozenJsonObject
-from ..adapters.local_files import LocalDirectoryReadBackend
+from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySource
 from ..adapters.models import DiscoveryRequest, SourceRegistration
+from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
 from ..adapters.postgresql_query import PostgreSQLQueryBackend
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
+from ..adapters.sqlite import SQLiteSource
 from ..adapters.sqlite_query import SQLiteQueryBackend
 from ..catalog.capabilities import catalog_declarations
 from ..catalog.models import (
     CatalogResource,
     CatalogSearchRequest,
     CatalogSearchResult,
+    CatalogSummary,
     CatalogSync,
     CatalogSyncStatus,
 )
@@ -43,9 +50,25 @@ from ..domains.data.context import _project_completed_history
 from ..errors import AgentError
 from ..identity import AgentIdentity
 from ..llm.factory import create_model_route_provider
-from ..llm.models import ModelProfile
+from ..llm.models import (
+    CanonicalMessage,
+    FinishReason,
+    MessageRole,
+    ModelProfile,
+    ModelRequest,
+    ModelSensitivity,
+    TextBlock,
+    ToolDefinition,
+)
+from ..llm.profiles import reviewed_model_profile
 from ..llm.protocols import ModelProvider
-from ..llm.routing import ModelRoute
+from ..llm.routing import (
+    ModelProviderRegistration,
+    ModelRoute,
+    ModelRouteCandidate,
+    ModelRouter,
+    RetryPolicy,
+)
 from ..loop.driver import (
     AgentLoop,
     ContextBuilder,
@@ -55,13 +78,27 @@ from ..loop.models import ConversationRun, LoopExit, LoopLimits, RunInput, Trans
 from ..memory import MemoryStore
 from ..memory.capabilities import memory_set_declarations
 from ..observation import AgentObserver
-from ..security import SecretProvider
+from ..security import (
+    KeychainSecretProvider,
+    KeychainStore,
+    SecretProvider,
+    SecretReference,
+    default_secret_provider,
+)
 from ..skills import Skill, SkillStore, SkillSummary
 from ..skills.capabilities import skill_declarations
 from ..storage.sqlite import SQLiteStateStore
 
 _AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_MAX_AGENT_HOME_CANDIDATES = 256
+_MAX_DISCOVERED_AGENTS = 100
+_MODEL_CONFIG_NAME = "config.json"
+_MAX_MODEL_CONFIG_BYTES = 64 * 1_024
+_CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
+_MODEL_VALIDATION_TOOL_NAME = "daita_validate_tool_support"
+_PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+_BUILTIN_PROVIDERS = frozenset({"openai", "anthropic", "gemini", "grok", "ollama"})
 _T = TypeVar("_T")
 
 
@@ -96,6 +133,10 @@ class AgentNotFoundError(AgentHomeError):
 
 class AgentIdentityMismatchError(AgentHomeError):
     pass
+
+
+class AgentModelConfigurationError(AgentHomeError):
+    """A saved model route whose profile facts can no longer be admitted."""
 
 
 class HostActiveError(AgentHomeError):
@@ -172,6 +213,10 @@ class EmbeddedAgent:
         mutation_lock: asyncio.Lock,
         model_profile: ModelProfile | None,
         model_route: ModelRoute | None,
+        limits: LoopLimits,
+        secret_provider: SecretProvider | None,
+        keychain: KeychainStore | None,
+        model_validator: ModelProvider | None,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
     ) -> None:
@@ -179,6 +224,10 @@ class EmbeddedAgent:
         self.home = home
         self.model_profile = model_profile
         self.model_route = model_route
+        self._limits = limits
+        self._secret_provider = secret_provider
+        self._keychain = keychain or KeychainSecretProvider()
+        self._model_validator = model_validator
         self._writer_lock = writer_lock
         self._store = store
         self._loop = loop
@@ -192,6 +241,33 @@ class EmbeddedAgent:
         self._mutation_lock = mutation_lock
         self._run_lock = asyncio.Lock()
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
+        self._model_reopen_required = False
+
+    @classmethod
+    async def list(
+        cls,
+        *,
+        root: str | Path | None = None,
+    ) -> tuple[str, ...]:
+        """Return a deterministic bounded view of valid local agent homes."""
+
+        homes = await asyncio.to_thread(_candidate_agent_homes, root)
+        names: list[str] = []
+        for home in homes:
+            try:
+                manifest = await asyncio.to_thread(_read_manifest, home, home.name)
+                identity = await SQLiteStateStore(home / "state.db").load_identity()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+            if identity != manifest:
+                continue
+            names.append(manifest.display_name)
+            if len(names) == _MAX_DISCOVERED_AGENTS:
+                break
+        return tuple(names)
 
     @classmethod
     async def create(
@@ -208,6 +284,8 @@ class EmbeddedAgent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        keychain: KeychainStore | None = None,
+        model_validator: ModelProvider | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
     ) -> Self:
@@ -218,7 +296,7 @@ class EmbeddedAgent:
             model=model,
             model_profile=model_profile,
             limits=limits,
-            secret_provider=secret_provider,
+            secret_provider=secret_provider or keychain,
         )
         _validate_custom_loop(model, model_profile, context_builder, tools)
         (home, writer_lock), cancelled = await _await_sync_completion(
@@ -256,6 +334,8 @@ class EmbeddedAgent:
                 clock=resolved_clock,
                 id_factory=resolved_ids,
                 secret_provider=secret_provider,
+                keychain=keychain,
+                model_validator=model_validator,
                 observer=observer,
                 approval_handler=approval_handler,
             )
@@ -291,18 +371,34 @@ class EmbeddedAgent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        keychain: KeychainStore | None = None,
+        model_validator: ModelProvider | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
     ) -> Self:
         resolved_clock = clock or _utc_now
         resolved_ids = id_factory or _new_id
-        model, model_profile, model_route, limits = _resolve_configuration(
+        limit_override = limits
+        explicit_configuration = _configuration_was_injected(
             config,
             model=model,
             model_profile=model_profile,
-            limits=limits,
-            secret_provider=secret_provider,
+            context_builder=context_builder,
+            tools=tools,
         )
+        if explicit_configuration:
+            model, model_profile, model_route, limits = _resolve_configuration(
+                config,
+                model=model,
+                model_profile=model_profile,
+                limits=limits,
+                secret_provider=secret_provider or keychain,
+            )
+        else:
+            model = None
+            model_profile = None
+            model_route = None
+            limits = limit_override or LoopLimits()
         _validate_custom_loop(model, model_profile, context_builder, tools)
         (home, writer_lock), cancelled = await _await_sync_completion(
             lambda: _admit_agent_home(name, root, False)
@@ -323,6 +419,19 @@ class EmbeddedAgent:
                 raise AgentIdentityMismatchError(
                     "agent.toml does not match state.db identity"
                 )
+            if not explicit_configuration:
+                persisted, cancelled = await _await_sync_completion(
+                    lambda: _read_model_configuration(home, identity.id)
+                )
+                if cancelled:
+                    raise asyncio.CancelledError
+                model, model_profile, model_route, limits = _resolve_configuration(
+                    persisted,
+                    model=None,
+                    model_profile=None,
+                    limits=limit_override,
+                    secret_provider=secret_provider or keychain,
+                )
             return cls._compose(
                 identity=identity,
                 home=home,
@@ -337,6 +446,8 @@ class EmbeddedAgent:
                 clock=resolved_clock,
                 id_factory=resolved_ids,
                 secret_provider=secret_provider,
+                keychain=keychain,
+                model_validator=model_validator,
                 observer=observer,
                 approval_handler=approval_handler,
             )
@@ -363,6 +474,8 @@ class EmbeddedAgent:
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
         secret_provider: SecretProvider | None,
+        keychain: KeychainStore | None,
+        model_validator: ModelProvider | None,
         observer: AgentObserver | None,
         approval_handler: ApprovalHandler | None,
     ) -> Self:
@@ -374,7 +487,7 @@ class EmbeddedAgent:
         )
         postgresql = postgresql_query_declarations(
             identity.id,
-            PostgreSQLQueryBackend(store, data_view, secret_provider),
+            PostgreSQLQueryBackend(store, data_view, secret_provider or keychain),
         )
         local_files = local_file_read_declarations(
             identity.id, LocalDirectoryReadBackend(store, store)
@@ -460,9 +573,124 @@ class EmbeddedAgent:
             mutation_lock=mutation_lock,
             model_profile=model_profile,
             model_route=model_route,
+            limits=limits,
+            secret_provider=secret_provider or keychain,
+            keychain=keychain,
+            model_validator=model_validator,
             clock=clock,
             id_factory=id_factory,
         )
+
+    def model_requires_explicit_limits(self, *, provider: str, model: str) -> bool:
+        """Project exact release-reviewed profile admission through the facade."""
+
+        if not isinstance(provider, str) or not provider:
+            raise ValueError("provider must be non-empty text")
+        if not isinstance(model, str) or not model:
+            raise ValueError("model must be non-empty text")
+        return reviewed_model_profile(f"{provider}:{model}") is None
+
+    async def configure_model(
+        self,
+        *,
+        provider: str,
+        model: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        context_window_tokens: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> ModelRoute:
+        """Validate and atomically persist one non-secret model route.
+
+        The active loop is deliberately left unchanged. Callers close and reopen
+        the agent before using the replacement route.
+        """
+
+        provider_name, model_name, endpoint, requires_key = _admit_model_selection(
+            provider,
+            model,
+            base_url,
+        )
+        if requires_key:
+            if not isinstance(api_key, str) or not api_key:
+                raise ValueError("API key is required for this provider")
+            if len(api_key.encode("utf-8")) > 64 * 1_024:
+                raise ValueError("API key exceeds its 64 KiB bound")
+        elif api_key is not None:
+            raise ValueError("Ollama does not accept an API key during onboarding")
+
+        async with self._mutation_lock:
+            self._require_open()
+            try:
+                previous = await asyncio.to_thread(
+                    _read_model_configuration,
+                    self.home,
+                    self.identity.id,
+                )
+            except AgentModelConfigurationError:
+                # A recovery open deliberately has no active route. The rejected
+                # profile remains untouched until validation and the atomic
+                # replacement commit both succeed.
+                previous = None
+            reference: SecretReference | None = None
+            if requires_key:
+                reference = SecretReference.keychain(
+                    _credential_account(
+                        self.identity.id,
+                        provider_name,
+                        self._id_factory("credential"),
+                    )
+                )
+            route = _model_route(
+                provider_name,
+                model_name,
+                base_url=endpoint,
+                secret_reference=reference,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+            )
+            replacement = AgentConfig(model_route=route, limits=self._limits)
+            committed = False
+            try:
+                if reference is not None:
+                    assert api_key is not None
+                    credential = api_key
+                    api_key = None
+                    try:
+                        await self._keychain.set(reference, credential)
+                    finally:
+                        del credential
+                await _validate_model_route(
+                    route,
+                    secret_provider=self._secret_provider or self._keychain,
+                    injected_provider=self._model_validator,
+                )
+                await _await_sync_completion(
+                    lambda: _write_model_configuration(self.home, replacement)
+                )
+                committed = True
+                self._model_reopen_required = True
+                for provider_name, old_reference in _keychain_references(previous):
+                    if old_reference != reference and _credential_reference_is_owned(
+                        old_reference,
+                        agent_id=self.identity.id,
+                        provider=provider_name,
+                    ):
+                        try:
+                            await asyncio.wait_for(
+                                self._keychain.delete(old_reference),
+                                timeout=_CREDENTIAL_CLEANUP_TIMEOUT_SECONDS,
+                            )
+                        except BaseException:
+                            pass
+                return route
+            except BaseException:
+                if reference is not None and not committed:
+                    try:
+                        await self._keychain.delete(reference)
+                    except BaseException:
+                        pass
+                raise
 
     async def run(
         self,
@@ -472,6 +700,10 @@ class EmbeddedAgent:
     ) -> LoopExit:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
+        if self._model_reopen_required:
+            raise AgentNotConfiguredError(
+                "model configuration changed; close and reopen required"
+            )
         supplied_conversation = conversation_id is not None
         resolved_conversation = (
             self._id_factory("conversation")
@@ -525,6 +757,16 @@ class EmbeddedAgent:
             raise ValueError("unknown conversation for this agent")
         return records
 
+    async def conversation_exists(self, conversation_id: str) -> bool:
+        """Validate and check one bounded agent-scoped conversation identity."""
+
+        self._require_open()
+        _validate_conversation_id(conversation_id)
+        return await self._store.conversation_exists(
+            self.identity.id,
+            conversation_id,
+        )
+
     async def read_memory(self) -> str:
         self._require_open()
         return await self._memory_store.read_memory()
@@ -563,77 +805,236 @@ class EmbeddedAgent:
         return await self._skill_store.delete_skill(name)
 
     async def attach(self, source: ResourceSource) -> SourceRegistration:
+        return await self._attach_source(source, attached_at=self._clock())
+
+    async def _attach_source(
+        self,
+        source: ResourceSource,
+        *,
+        attached_at: datetime,
+    ) -> SourceRegistration:
         async with self._mutation_lock:
             self._require_open()
-            adapter = await source.open(
-                agent_id=self.identity.id,
-                attached_at=self._clock(),
-                clock=self._clock,
+            return await self._attach_source_locked(
+                source,
+                attached_at=attached_at,
             )
-            if not isinstance(adapter, ResourceAdapter):
-                raise TypeError("source open() must return ResourceAdapter")
-            registration = adapter.registration
-            sync: CatalogSync | None = None
-            try:
-                self._capabilities.validate_declarations(adapter.declarations())
-                sync = CatalogSync(
-                    id=self._id_factory("catalog-sync"),
+
+    async def _attach_source_locked(
+        self,
+        source: ResourceSource,
+        *,
+        attached_at: datetime,
+    ) -> SourceRegistration:
+        adapter = await source.open(
+            agent_id=self.identity.id,
+            attached_at=attached_at,
+            clock=self._clock,
+        )
+        if not isinstance(adapter, ResourceAdapter):
+            raise TypeError("source open() must return ResourceAdapter")
+        registration = adapter.registration
+        sync: CatalogSync | None = None
+        try:
+            self._capabilities.validate_declarations(adapter.declarations())
+            sync = CatalogSync(
+                id=self._id_factory("catalog-sync"),
+                agent_id=self.identity.id,
+                source_id=registration.id,
+                adapter_id=registration.adapter_id,
+                status=CatalogSyncStatus.RUNNING,
+                started_at=self._clock(),
+            )
+            await self._store.record_sync(sync)
+            discovery = await adapter.discover(
+                DiscoveryRequest(
                     agent_id=self.identity.id,
                     source_id=registration.id,
-                    adapter_id=registration.adapter_id,
-                    status=CatalogSyncStatus.RUNNING,
-                    started_at=self._clock(),
+                    sync_id=sync.id,
+                    requested_at=sync.started_at,
                 )
-                await self._store.record_sync(sync)
-                discovery = await adapter.discover(
-                    DiscoveryRequest(
-                        agent_id=self.identity.id,
-                        source_id=registration.id,
-                        sync_id=sync.id,
-                        requested_at=sync.started_at,
-                    )
-                )
-                existing = await self._store.load_source(
-                    self.identity.id, registration.id
-                )
-                if existing is None:
-                    await self._store.register_source(registration)
-                elif existing != registration:
-                    raise AgentHomeError(
-                        f"source registration already exists: {registration.id}"
-                    )
-                await self._store.commit_snapshot(discovery.snapshot)
-                return registration
-            except BaseException as error:
-                if isinstance(error, ResourceAdapterError):
-                    code = error.code
-                else:
-                    code = "source_attach_failed"
-                if sync is not None:
-                    try:
-                        await self._store.record_sync(
-                            CatalogSync(
-                                id=sync.id,
-                                agent_id=self.identity.id,
-                                source_id=registration.id,
-                                adapter_id=registration.adapter_id,
-                                status=CatalogSyncStatus.FAILED,
-                                started_at=sync.started_at,
-                                completed_at=max(self._clock(), sync.started_at),
-                                error_code=code,
-                            )
+            )
+            await self._store.commit_snapshot(
+                discovery.snapshot,
+                registration=registration,
+            )
+            return registration
+        except BaseException as error:
+            if isinstance(error, ResourceAdapterError):
+                code = error.code
+            else:
+                code = "source_attach_failed"
+            if sync is not None:
+                try:
+                    await self._store.record_sync(
+                        CatalogSync(
+                            id=sync.id,
+                            agent_id=self.identity.id,
+                            source_id=registration.id,
+                            adapter_id=registration.adapter_id,
+                            status=CatalogSyncStatus.FAILED,
+                            started_at=sync.started_at,
+                            completed_at=max(self._clock(), sync.started_at),
+                            error_code=code,
                         )
-                    except BaseException:
-                        pass
+                    )
+                except BaseException:
+                    pass
+            raise
+        finally:
+            await adapter.close()
+
+    async def attach_sqlite(
+        self,
+        path: str | Path,
+        *,
+        name: str | None = None,
+    ) -> SourceRegistration:
+        """Attach one ordinary read-only SQLite source."""
+
+        return await self.attach(SQLiteSource(path=path, name=name))
+
+    async def attach_local_directory(
+        self,
+        root: str | Path,
+        *,
+        name: str | None = None,
+    ) -> SourceRegistration:
+        """Attach one ordinary bounded CSV/JSON directory source."""
+
+        return await self.attach(LocalDirectorySource(root=root, name=name))
+
+    async def store_postgresql_password(self, password: str) -> SecretReference:
+        """Store one database password for an in-process onboarding attempt."""
+
+        if (
+            not isinstance(password, str)
+            or not password
+            or len(password.encode("utf-8")) > 64 * 1_024
+        ):
+            raise ValueError("PostgreSQL password must be non-empty and at most 64 KiB")
+        async with self._mutation_lock:
+            self._require_open()
+            reference = SecretReference.keychain(
+                _credential_account(
+                    self.identity.id,
+                    "postgresql",
+                    self._id_factory("credential"),
+                )
+            )
+            credential = password
+            password = ""
+            try:
+                await self._keychain.set(reference, credential)
+                return reference
+            except BaseException:
+                try:
+                    await self._keychain.delete(reference)
+                except BaseException:
+                    pass
                 raise
             finally:
-                await adapter.close()
+                credential = ""
+
+    async def delete_postgresql_password(
+        self,
+        reference: SecretReference,
+    ) -> None:
+        """Delete one exact credential created for this agent's source setup."""
+
+        if (
+            not isinstance(reference, SecretReference)
+            or reference.scheme != "keychain"
+            or not reference.name.startswith(
+                _credential_account_prefix(self.identity.id, "postgresql")
+            )
+        ):
+            raise ValueError(
+                "credential does not belong to this agent's PostgreSQL setup"
+            )
+        async with self._mutation_lock:
+            self._require_open()
+            await self._keychain.delete(reference)
+
+    async def probe_postgresql(
+        self,
+        *,
+        host: str,
+        database: str,
+        username: str,
+        credential: SecretReference,
+        port: int = 5432,
+        ssl_mode: str = "require",
+    ) -> PostgreSQLProbeResult:
+        """Run the adapter-owned read-only schema probe without persistence."""
+
+        self._require_open()
+        source = PostgreSQLSource(
+            host=host,
+            port=port,
+            database=database,
+            username=username,
+            credential=credential,
+            schemas=("public",),
+            ssl_mode=ssl_mode,
+            secret_provider=self._secret_provider or self._keychain,
+        )
+        return await source.probe()
+
+    async def attach_postgresql(
+        self,
+        *,
+        host: str,
+        database: str,
+        username: str,
+        credential: SecretReference,
+        schemas: tuple[str, ...],
+        port: int = 5432,
+        ssl_mode: str = "require",
+        name: str | None = None,
+    ) -> SourceRegistration:
+        """Construct and attach one ordinary selected-schema PostgreSQL source."""
+
+        return await self.attach(
+            PostgreSQLSource(
+                host=host,
+                port=port,
+                database=database,
+                username=username,
+                credential=credential,
+                schemas=schemas,
+                ssl_mode=ssl_mode,
+                name=name,
+                secret_provider=self._secret_provider or self._keychain,
+            )
+        )
 
     async def detach(self, source_id: str) -> SourceRegistration:
         async with self._mutation_lock:
             self._require_open()
             return await self._store.detach_source(
                 self.identity.id, source_id, self._clock()
+            )
+
+    async def refresh_source(self, source_id: str) -> SourceRegistration:
+        """Refresh one active source using its exact admitted registration."""
+
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        async with self._mutation_lock:
+            self._require_open()
+            registration = await self._store.load_source(self.identity.id, source_id)
+            if registration is None or not registration.active:
+                raise ValueError("unknown active source for this agent")
+            source = _source_from_registration(
+                registration,
+                secret_provider=default_secret_provider(
+                    self._secret_provider or self._keychain
+                ),
+            )
+            return await self._attach_source_locked(
+                source,
+                attached_at=registration.attached_at,
             )
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
@@ -645,6 +1046,27 @@ class EmbeddedAgent:
     ) -> tuple[CatalogResource, ...]:
         self._require_open()
         return await self._store.list_resources(self.identity.id, source_id)
+
+    async def catalog_summary(self) -> CatalogSummary:
+        """Return current committed catalog facts as one consistent projection."""
+
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._catalog_service.summary(self.identity.id)
+
+    async def catalog_preview(
+        self,
+        *,
+        limit: int = 12,
+    ) -> tuple[CatalogResource, ...]:
+        """Return a bounded deterministic preview from current catalog truth."""
+
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._catalog_service.preview(
+                self.identity.id,
+                limit=limit,
+            )
 
     async def search_catalog(
         self, request: CatalogSearchRequest
@@ -661,15 +1083,31 @@ class EmbeddedAgent:
         )
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            await self._memory_store.close()
-            await self._skill_store.close()
-            await self._store.close()
-        finally:
-            self._writer_lock.release()
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._finish_close())
+        close_task = self._close_task
+        cancelled = False
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        close_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _finish_close(self) -> None:
+        first_error: BaseException | None = None
+        for store in (self._memory_store, self._skill_store, self._store):
+            try:
+                await store.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        self._writer_lock.release()
+        if first_error is not None:
+            raise first_error
 
     def _require_loop(self) -> AgentLoop:
         self._require_open()
@@ -680,6 +1118,146 @@ class EmbeddedAgent:
     def _require_open(self) -> None:
         if self._closed:
             raise AgentHomeError("embedded agent is closed")
+
+
+def _source_from_registration(
+    registration: SourceRegistration,
+    *,
+    secret_provider: SecretProvider,
+) -> ResourceSource:
+    """Reconstruct one admitted source only at the composition boundary."""
+
+    configuration = registration.configuration
+    adapter_id = registration.adapter_id
+    if adapter_id == "sqlite":
+        _require_configuration_fields(configuration, {"path"})
+        return SQLiteSource(
+            path=_configuration_text(configuration, "path"),
+            name=registration.display_name,
+        )
+    if adapter_id == "local-directory":
+        fields = {
+            "formats",
+            "max_cell_bytes",
+            "max_columns",
+            "max_depth",
+            "max_file_bytes",
+            "max_files",
+            "max_json_depth",
+            "max_json_nodes",
+            "max_key_bytes",
+            "max_rows",
+            "max_string_bytes",
+            "root",
+            "root_device",
+            "root_inode",
+        }
+        _require_configuration_fields(configuration, fields)
+        if configuration["formats"] != ("csv", "json"):
+            raise AgentHomeError("local-directory source configuration is invalid")
+        _configuration_integer(configuration, "root_device")
+        _configuration_integer(configuration, "root_inode")
+        return LocalDirectorySource(
+            root=_configuration_text(configuration, "root"),
+            name=registration.display_name,
+            max_depth=_configuration_integer(configuration, "max_depth"),
+            max_files=_configuration_integer(configuration, "max_files"),
+            max_file_bytes=_configuration_integer(
+                configuration,
+                "max_file_bytes",
+            ),
+            max_columns=_configuration_integer(configuration, "max_columns"),
+            max_rows=_configuration_integer(configuration, "max_rows"),
+            max_json_nodes=_configuration_integer(
+                configuration,
+                "max_json_nodes",
+            ),
+            max_json_depth=_configuration_integer(
+                configuration,
+                "max_json_depth",
+            ),
+            max_key_bytes=_configuration_integer(
+                configuration,
+                "max_key_bytes",
+            ),
+            max_string_bytes=_configuration_integer(
+                configuration,
+                "max_string_bytes",
+            ),
+            max_cell_bytes=_configuration_integer(
+                configuration,
+                "max_cell_bytes",
+            ),
+        )
+    if adapter_id == "postgresql":
+        required = {
+            "database",
+            "host",
+            "port",
+            "schemas",
+            "ssl_mode",
+            "username",
+        }
+        allowed = required | {"credential_ref"}
+        fields = set(configuration)
+        if fields != required and fields != allowed:
+            raise AgentHomeError("PostgreSQL source configuration is invalid")
+        raw_schemas = configuration["schemas"]
+        if not isinstance(raw_schemas, tuple) or any(
+            not isinstance(schema, str) for schema in raw_schemas
+        ):
+            raise AgentHomeError("PostgreSQL source configuration is invalid")
+        raw_reference = configuration.get("credential_ref")
+        if raw_reference is not None and not isinstance(raw_reference, str):
+            raise AgentHomeError("PostgreSQL source configuration is invalid")
+        try:
+            reference = (
+                None if raw_reference is None else SecretReference.parse(raw_reference)
+            )
+            return PostgreSQLSource(
+                host=_configuration_text(configuration, "host"),
+                port=_configuration_integer(configuration, "port"),
+                database=_configuration_text(configuration, "database"),
+                username=_configuration_text(configuration, "username"),
+                credential=reference,
+                schemas=cast(tuple[str, ...], raw_schemas),
+                ssl_mode=_configuration_text(configuration, "ssl_mode"),
+                name=registration.display_name,
+                secret_provider=secret_provider,
+            )
+        except (TypeError, ValueError) as error:
+            raise AgentHomeError(
+                "PostgreSQL source configuration is invalid"
+            ) from error
+    raise AgentHomeError("registered source adapter cannot be refreshed")
+
+
+def _require_configuration_fields(
+    configuration: Mapping[str, object],
+    expected: set[str],
+) -> None:
+    if set(configuration) != expected:
+        raise AgentHomeError("source configuration fields are invalid")
+
+
+def _configuration_text(
+    configuration: Mapping[str, object],
+    name: str,
+) -> str:
+    value = configuration[name]
+    if not isinstance(value, str) or not value:
+        raise AgentHomeError("source configuration text is invalid")
+    return value
+
+
+def _configuration_integer(
+    configuration: Mapping[str, object],
+    name: str,
+) -> int:
+    value = configuration[name]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise AgentHomeError("source configuration integer is invalid")
+    return value
 
 
 def _resolve_configuration(
@@ -708,6 +1286,574 @@ def _resolve_configuration(
         if model.provider_id != model_profile.id:
             raise AgentNotConfiguredError("model and profile identities differ")
     return model, model_profile, route, resolved_limits
+
+
+def _configuration_was_injected(
+    config: AgentConfig | None,
+    *,
+    model: ModelProvider | None,
+    model_profile: ModelProfile | None,
+    context_builder: ContextBuilder | None,
+    tools: ToolRuntime | None,
+) -> bool:
+    return any(
+        value is not None
+        for value in (
+            config,
+            model,
+            model_profile,
+            context_builder,
+            tools,
+        )
+    )
+
+
+def _admit_model_selection(
+    provider: str,
+    model: str,
+    base_url: str | None,
+) -> tuple[str, str, str | None, bool]:
+    if not isinstance(provider, str):
+        raise TypeError("provider must be a string")
+    provider_name = provider.strip().lower()
+    if _PROVIDER_NAME.fullmatch(provider_name) is None:
+        raise ValueError("provider must be a bounded lowercase identifier")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("model identifier must be non-empty")
+    model_name = model.strip()
+    if any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in model_name
+    ):
+        raise ValueError("model identifier cannot contain whitespace or controls")
+    endpoint: str | None = None
+    if base_url is not None:
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise ValueError("base URL must be non-empty when provided")
+        endpoint = base_url.strip()
+        if (
+            len(endpoint) > 2_048
+            or any(
+                ord(character) < 32 or ord(character) == 127 for character in endpoint
+            )
+            or not endpoint.startswith(("http://", "https://"))
+        ):
+            raise ValueError("base URL must be a bounded HTTP or HTTPS URL")
+    if provider_name in _BUILTIN_PROVIDERS - {"ollama"} and endpoint is not None:
+        raise ValueError(f"{provider_name} uses its fixed endpoint")
+    if provider_name not in _BUILTIN_PROVIDERS and endpoint is None:
+        raise ValueError("custom providers require an explicit base URL")
+    provider_id = f"{provider_name}:{model_name}"
+    if len(provider_id) > 256:
+        raise ValueError("model identity exceeds its 256 character bound")
+    return provider_name, model_name, endpoint, provider_name != "ollama"
+
+
+def _model_profile(
+    provider: str,
+    model: str,
+    *,
+    context_window_tokens: int | None,
+    max_output_tokens: int | None,
+) -> ModelProfile:
+    provider_id = f"{provider}:{model}"
+    reviewed = reviewed_model_profile(provider_id)
+    if reviewed is not None:
+        if context_window_tokens is not None or max_output_tokens is not None:
+            raise ValueError("reviewed models use their canonical profile limits")
+        return reviewed
+    if context_window_tokens is None or max_output_tokens is None:
+        raise ValueError(
+            "unreviewed models require explicit context and output token limits"
+        )
+    return ModelProfile(
+        id=provider_id,
+        context_window_tokens=context_window_tokens,
+        max_output_tokens=max_output_tokens,
+        supports_tools=True,
+        supports_parallel_tools=False,
+    )
+
+
+def _model_route(
+    provider: str,
+    model: str,
+    *,
+    base_url: str | None,
+    secret_reference: SecretReference | None,
+    context_window_tokens: int | None,
+    max_output_tokens: int | None,
+) -> ModelRoute:
+    profile = _model_profile(
+        provider,
+        model,
+        context_window_tokens=context_window_tokens,
+        max_output_tokens=max_output_tokens,
+    )
+    return ModelRoute(
+        (
+            ModelRouteCandidate(
+                provider_id=profile.id,
+                profile=profile,
+                base_url=base_url,
+                secret_reference=secret_reference,
+            ),
+        )
+    )
+
+
+def _credential_account(agent_id: str, provider: str, nonce: str) -> str:
+    digest = hashlib.sha256(
+        f"{agent_id}\x00{provider}\x00{nonce}".encode("utf-8")
+    ).hexdigest()[:24]
+    return _credential_account_prefix(agent_id, provider) + digest
+
+
+def _credential_account_prefix(agent_id: str, provider: str) -> str:
+    prefix = f"{agent_id}:{provider}:"
+    if len(prefix) + 24 > 256:
+        agent_digest = hashlib.sha256(agent_id.encode("utf-8")).hexdigest()[:24]
+        prefix = f"agent-{agent_digest}:{provider}:"
+    return prefix
+
+
+def _credential_reference_is_owned(
+    reference: SecretReference,
+    *,
+    agent_id: str,
+    provider: str,
+) -> bool:
+    if reference.scheme != "keychain":
+        return False
+    prefix = _credential_account_prefix(agent_id, provider)
+    if not reference.name.startswith(prefix):
+        return False
+    suffix = reference.name[len(prefix) :]
+    return len(suffix) == 24 and all(
+        character in "0123456789abcdef" for character in suffix
+    )
+
+
+async def _validate_model_route(
+    route: ModelRoute,
+    *,
+    secret_provider: SecretProvider,
+    injected_provider: ModelProvider | None,
+) -> None:
+    validation_candidates = tuple(
+        replace(
+            candidate,
+            profile=replace(
+                candidate.profile,
+                max_output_tokens=min(
+                    16,
+                    candidate.profile.context_window_tokens - 1,
+                ),
+            ),
+        )
+        for candidate in route.candidates
+    )
+    validation_route = ModelRoute(validation_candidates, route.retry_policy)
+    if injected_provider is None:
+        provider = create_model_route_provider(
+            validation_route,
+            secret_provider=secret_provider,
+        )
+    else:
+        if len(validation_candidates) != 1:
+            raise AgentNotConfiguredError(
+                "an injected validation provider requires one route candidate"
+            )
+        candidate = validation_candidates[0]
+        if injected_provider.provider_id != candidate.profile.id:
+            raise AgentNotConfiguredError(
+                "validation provider and configured model identities differ"
+            )
+        provider = ModelRouter(
+            (
+                ModelProviderRegistration(
+                    provider=injected_provider,
+                    profile=candidate.profile,
+                    allowed_sensitivities=candidate.allowed_sensitivities,
+                ),
+            ),
+            retry_policy=validation_route.retry_policy,
+        )
+    response = await provider.generate(
+        ModelRequest(
+            messages=(
+                CanonicalMessage(
+                    role=MessageRole.USER,
+                    content=(TextBlock("Call the validation tool once."),),
+                ),
+            ),
+            tools=(
+                ToolDefinition(
+                    name=_MODEL_VALIDATION_TOOL_NAME,
+                    description="Prove native tool-call compatibility.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                ),
+            ),
+            sensitivity=ModelSensitivity.PUBLIC,
+            allow_parallel_tool_calls=False,
+        )
+    )
+    if (
+        response.finish_reason is not FinishReason.TOOL_CALLS
+        or len(response.tool_calls) != 1
+        or response.tool_calls[0].name != _MODEL_VALIDATION_TOOL_NAME
+        or response.tool_calls[0].arguments
+    ):
+        raise ValueError("model validation did not prove native tool-call support")
+
+
+def _keychain_references(
+    config: AgentConfig | None,
+) -> tuple[tuple[str, SecretReference], ...]:
+    if config is None or config.model_route is None:
+        return ()
+    return tuple(
+        (candidate.provider_id.partition(":")[0], reference)
+        for candidate in config.model_route.candidates
+        if (reference := candidate.secret_reference) is not None
+        and reference.scheme == "keychain"
+    )
+
+
+def _read_model_configuration(home: Path, agent_id: str) -> AgentConfig | None:
+    path = home / _MODEL_CONFIG_NAME
+    if path.is_symlink():
+        raise AgentHomeError("model configuration cannot be a symlink")
+    if not path.exists():
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError("configuration is not a regular file")
+            chunks: list[bytes] = []
+            size = 0
+            while size <= _MAX_MODEL_CONFIG_BYTES:
+                chunk = os.read(
+                    descriptor, min(8_192, _MAX_MODEL_CONFIG_BYTES + 1 - size)
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            if size > _MAX_MODEL_CONFIG_BYTES:
+                raise ValueError("configuration exceeds its byte bound")
+        finally:
+            os.close(descriptor)
+        value = json.loads(
+            b"".join(chunks).decode("utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant: {value}")
+            ),
+        )
+        return _decode_agent_config(value, agent_id=agent_id)
+    except AgentHomeError:
+        raise
+    except Exception:
+        raise AgentHomeError("model configuration is invalid") from None
+
+
+def _write_model_configuration(home: Path, config: AgentConfig) -> None:
+    if not isinstance(config, AgentConfig) or config.model_route is None:
+        raise ValueError("persisted model configuration requires a model route")
+    path = home / _MODEL_CONFIG_NAME
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise AgentHomeError("model configuration path is invalid")
+    data = json.dumps(
+        _encode_agent_config(config),
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(data) > _MAX_MODEL_CONFIG_BYTES:
+        raise AgentHomeError("model configuration exceeds its byte bound")
+    temporary = home / f".{_MODEL_CONFIG_NAME}.{uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+        directory = os.open(home, os.O_RDONLY)
+        try:
+            try:
+                os.fsync(directory)
+            except OSError:
+                pass
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _encode_agent_config(config: AgentConfig) -> dict[str, object]:
+    route = config.model_route
+    assert route is not None
+    return {
+        "limits": {
+            "max_estimated_cost_usd": (
+                None
+                if config.limits.max_estimated_cost_usd is None
+                else str(config.limits.max_estimated_cost_usd)
+            ),
+            "max_steps": config.limits.max_steps,
+            "max_total_tokens": config.limits.max_total_tokens,
+            "max_wall_time_seconds": config.limits.max_wall_time_seconds,
+        },
+        "model_route": {
+            "candidates": [
+                {
+                    "allowed_sensitivities": sorted(
+                        sensitivity.value
+                        for sensitivity in candidate.allowed_sensitivities
+                    ),
+                    "base_url": candidate.base_url,
+                    "profile": _encode_model_profile(candidate.profile),
+                    "provider_id": candidate.provider_id,
+                    "secret_reference": (
+                        None
+                        if candidate.secret_reference is None
+                        else candidate.secret_reference.to_uri()
+                    ),
+                }
+                for candidate in route.candidates
+            ],
+            "retry_policy": {
+                "attempts": route.retry_policy.attempts,
+                "backoff_seconds": route.retry_policy.backoff_seconds,
+            },
+        },
+    }
+
+
+def _encode_model_profile(profile: ModelProfile) -> dict[str, object]:
+    return {
+        "available": profile.available,
+        "context_window_tokens": profile.context_window_tokens,
+        "data_routing_classification": profile.data_routing_classification,
+        "healthy": profile.healthy,
+        "id": profile.id,
+        "input_cost_per_million_usd": (
+            None
+            if profile.input_cost_per_million_usd is None
+            else str(profile.input_cost_per_million_usd)
+        ),
+        "max_output_tokens": profile.max_output_tokens,
+        "output_cost_per_million_usd": (
+            None
+            if profile.output_cost_per_million_usd is None
+            else str(profile.output_cost_per_million_usd)
+        ),
+        "supports_documents": profile.supports_documents,
+        "supports_native_continuation": profile.supports_native_continuation,
+        "supports_parallel_tools": profile.supports_parallel_tools,
+        "supports_prompt_caching": profile.supports_prompt_caching,
+        "supports_reasoning": profile.supports_reasoning,
+        "supports_streaming": profile.supports_streaming,
+        "supports_structured_output": profile.supports_structured_output,
+        "supports_tools": profile.supports_tools,
+        "supports_vision": profile.supports_vision,
+    }
+
+
+def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
+    document = _strict_mapping(value, {"limits", "model_route"})
+    route_value = _strict_mapping(
+        document["model_route"],
+        {"candidates", "retry_policy"},
+    )
+    raw_candidates = route_value["candidates"]
+    if not isinstance(raw_candidates, list) or not 1 <= len(raw_candidates) <= 5:
+        raise ValueError("model route candidates are invalid")
+    candidates: list[ModelRouteCandidate] = []
+    for raw_candidate in raw_candidates:
+        candidate = _strict_mapping(
+            raw_candidate,
+            {
+                "allowed_sensitivities",
+                "base_url",
+                "profile",
+                "provider_id",
+                "secret_reference",
+            },
+        )
+        raw_allowed = candidate["allowed_sensitivities"]
+        if not isinstance(raw_allowed, list) or not raw_allowed:
+            raise ValueError("allowed sensitivities are invalid")
+        reference_value = candidate["secret_reference"]
+        if reference_value is not None and not isinstance(reference_value, str):
+            raise TypeError("secret reference must be text or null")
+        base_url = candidate["base_url"]
+        if base_url is not None and not isinstance(base_url, str):
+            raise TypeError("base URL must be text or null")
+        provider_id = candidate["provider_id"]
+        if not isinstance(provider_id, str):
+            raise TypeError("provider ID must be text")
+        profile = _decode_model_profile(candidate["profile"])
+        provider_name, separator, model_name = provider_id.partition(":")
+        if not separator:
+            raise ValueError("provider ID is incomplete")
+        _, _, admitted_url, requires_key = _admit_model_selection(
+            provider_name,
+            model_name,
+            base_url,
+        )
+        reviewed_profile = reviewed_model_profile(provider_id)
+        expected_profile = (
+            reviewed_profile
+            if reviewed_profile is not None
+            else _model_profile(
+                provider_name,
+                model_name,
+                context_window_tokens=profile.context_window_tokens,
+                max_output_tokens=profile.max_output_tokens,
+            )
+        )
+        if profile != expected_profile:
+            raise AgentModelConfigurationError(
+                "saved model configuration must be replaced"
+            )
+        reference = (
+            None if reference_value is None else SecretReference.parse(reference_value)
+        )
+        if requires_key and (reference is None or reference.scheme != "keychain"):
+            raise ValueError("persisted provider credential reference is incomplete")
+        if requires_key and (
+            reference is None
+            or not _credential_reference_is_owned(
+                reference,
+                agent_id=agent_id,
+                provider=provider_name,
+            )
+        ):
+            raise ValueError(
+                "persisted provider credential reference belongs to another agent"
+            )
+        if not requires_key and reference is not None:
+            raise ValueError("Ollama configuration cannot contain a credential")
+        allowed = tuple(ModelSensitivity(cast(str, item)) for item in raw_allowed)
+        if len(allowed) != len(set(allowed)):
+            raise ValueError("allowed sensitivities cannot repeat")
+        candidates.append(
+            ModelRouteCandidate(
+                provider_id=provider_id,
+                profile=profile,
+                base_url=admitted_url,
+                secret_reference=reference,
+                allowed_sensitivities=frozenset(allowed),
+            )
+        )
+    raw_retry = _strict_mapping(
+        route_value["retry_policy"],
+        {"attempts", "backoff_seconds"},
+    )
+    route = ModelRoute(
+        tuple(candidates),
+        RetryPolicy(
+            attempts=cast(int, raw_retry["attempts"]),
+            backoff_seconds=cast(float, raw_retry["backoff_seconds"]),
+        ),
+    )
+    raw_limits = _strict_mapping(
+        document["limits"],
+        {
+            "max_estimated_cost_usd",
+            "max_steps",
+            "max_total_tokens",
+            "max_wall_time_seconds",
+        },
+    )
+    cost = raw_limits["max_estimated_cost_usd"]
+    if cost is not None and not isinstance(cost, str):
+        raise TypeError("estimated cost must be text or null")
+    return AgentConfig(
+        model_route=route,
+        limits=LoopLimits(
+            max_steps=cast(int, raw_limits["max_steps"]),
+            max_total_tokens=cast(int, raw_limits["max_total_tokens"]),
+            max_wall_time_seconds=cast(float, raw_limits["max_wall_time_seconds"]),
+            max_estimated_cost_usd=None if cost is None else Decimal(cost),
+        ),
+    )
+
+
+def _decode_model_profile(value: object) -> ModelProfile:
+    fields = {
+        "available",
+        "context_window_tokens",
+        "data_routing_classification",
+        "healthy",
+        "id",
+        "input_cost_per_million_usd",
+        "max_output_tokens",
+        "output_cost_per_million_usd",
+        "supports_documents",
+        "supports_native_continuation",
+        "supports_parallel_tools",
+        "supports_prompt_caching",
+        "supports_reasoning",
+        "supports_streaming",
+        "supports_structured_output",
+        "supports_tools",
+        "supports_vision",
+    }
+    profile = _strict_mapping(value, fields)
+    input_cost = profile["input_cost_per_million_usd"]
+    output_cost = profile["output_cost_per_million_usd"]
+    if input_cost is not None and not isinstance(input_cost, str):
+        raise TypeError("input cost must be text or null")
+    if output_cost is not None and not isinstance(output_cost, str):
+        raise TypeError("output cost must be text or null")
+    return ModelProfile(
+        id=cast(str, profile["id"]),
+        context_window_tokens=cast(int, profile["context_window_tokens"]),
+        max_output_tokens=cast(int, profile["max_output_tokens"]),
+        supports_tools=cast(bool, profile["supports_tools"]),
+        supports_parallel_tools=cast(bool, profile["supports_parallel_tools"]),
+        supports_structured_output=cast(bool, profile["supports_structured_output"]),
+        supports_streaming=cast(bool, profile["supports_streaming"]),
+        supports_reasoning=cast(bool, profile["supports_reasoning"]),
+        supports_vision=cast(bool, profile["supports_vision"]),
+        supports_documents=cast(bool, profile["supports_documents"]),
+        supports_prompt_caching=cast(bool, profile["supports_prompt_caching"]),
+        supports_native_continuation=cast(
+            bool, profile["supports_native_continuation"]
+        ),
+        input_cost_per_million_usd=(
+            None if input_cost is None else Decimal(input_cost)
+        ),
+        output_cost_per_million_usd=(
+            None if output_cost is None else Decimal(output_cost)
+        ),
+        data_routing_classification=cast(str, profile["data_routing_classification"]),
+        available=cast(bool, profile["available"]),
+        healthy=cast(bool, profile["healthy"]),
+    )
+
+
+def _strict_mapping(value: object, fields: set[str]) -> Mapping[str, object]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("configuration object fields are invalid")
+    if any(not isinstance(key, str) for key in value):
+        raise TypeError("configuration object keys must be text")
+    return cast(Mapping[str, object], value)
 
 
 def _validate_custom_loop(
@@ -752,11 +1898,7 @@ def _admit_agent_home(
         raise AgentNameError(
             "agent name must contain 1-64 ASCII letters, digits, '_' or '-'"
         )
-    state_root = Path.home() / ".daita" if root is None else Path(root)
-    if ".." in state_root.parts:
-        raise AgentHomeError("agent state root cannot contain parent aliases")
-    state_root = Path(os.path.abspath(os.fspath(state_root)))
-    state_root = _require_unaliased_path(state_root, "agent state root")
+    state_root = _resolve_state_root(root)
     state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     agents_root = state_root / "agents"
     agents_root.mkdir(mode=0o700, exist_ok=True)
@@ -774,6 +1916,48 @@ def _admit_agent_home(
         _require_unaliased_path(path, label)
         os.chmod(path, 0o700)
     return home, _WriterLock.acquire(run / "host.lock")
+
+
+def _candidate_agent_homes(root: str | Path | None) -> tuple[Path, ...]:
+    state_root = _resolve_state_root(root)
+    if not state_root.exists():
+        return ()
+    if not state_root.is_dir():
+        raise AgentHomeError("agent state root must be a directory")
+    agents_root = state_root / "agents"
+    if not agents_root.exists():
+        return ()
+    agents_root = _require_unaliased_path(agents_root, "agents directory")
+    if not agents_root.is_dir():
+        raise AgentHomeError("agents directory must be a directory")
+    try:
+        with os.scandir(agents_root) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name)
+    except OSError as error:
+        raise AgentHomeError("cannot inspect agents directory") from error
+    candidates: list[Path] = []
+    for entry in entries[:_MAX_AGENT_HOME_CANDIDATES]:
+        if _AGENT_NAME.fullmatch(entry.name) is None:
+            continue
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            home = _require_unaliased_path(
+                agents_root / entry.name,
+                "agent home",
+            )
+        except (AgentHomeError, OSError):
+            continue
+        candidates.append(home)
+    return tuple(candidates)
+
+
+def _resolve_state_root(root: str | Path | None) -> Path:
+    state_root = Path.home() / ".daita" if root is None else Path(root)
+    if ".." in state_root.parts:
+        raise AgentHomeError("agent state root cannot contain parent aliases")
+    state_root = Path(os.path.abspath(os.fspath(state_root)))
+    return _require_unaliased_path(state_root, "agent state root")
 
 
 def _require_unaliased_path(path: Path, label: str) -> Path:
@@ -846,6 +2030,7 @@ __all__ = [
     "AgentAlreadyExistsError",
     "AgentHomeError",
     "AgentIdentityMismatchError",
+    "AgentModelConfigurationError",
     "AgentNameError",
     "AgentNotConfiguredError",
     "AgentNotFoundError",

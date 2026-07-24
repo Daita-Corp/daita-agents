@@ -50,6 +50,16 @@ def test_final_src_layout_has_one_package_owner_and_no_replacement_alias():
     assert 'daita = "daita.cli:main"' in packaging
 
 
+def test_model_suggestions_remain_terminal_only_presentation_metadata():
+    terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
+    assert "_MODEL_SUGGESTIONS" in terminal
+    assert _class_owners("_ModelSuggestion") == {"terminal.py"}
+    for owner in ("catalog", "loop", "llm", "storage"):
+        text = _python_text(PACKAGE / owner)
+        assert "_MODEL_SUGGESTIONS" not in text
+        assert "_ModelSuggestion" not in text
+
+
 def test_public_surface_is_focused():
     assert set(daita.__all__) == {
         "Agent",
@@ -61,6 +71,7 @@ def test_public_surface_is_focused():
         "ApprovalHandler",
         "ApprovalRequest",
         "ConversationRun",
+        "CatalogSummary",
         "LocalDirectorySource",
         "LoopExit",
         "LoopExitKind",
@@ -100,13 +111,10 @@ def test_stage_seven_exports_records_without_exporting_their_owners():
     )
 
 
-def test_stage_seven_survivor_docs_and_examples_describe_only_the_mvp():
+def test_survivor_docs_and_examples_describe_only_the_mvp():
     root = PACKAGE.parents[1]
     readme = (root / "README.md").read_text(encoding="utf-8")
     examples_readme = (root / "examples" / "README.md").read_text(encoding="utf-8")
-    plan = (
-        root / "docs" / "MVP_MEMORY_SKILLS_GOVERNANCE_OBSERVABILITY_PLAN_2026-07-21.md"
-    ).read_text(encoding="utf-8")
     normalized_readme = " ".join(readme.split())
     normalized_examples_readme = " ".join(examples_readme.split())
 
@@ -119,7 +127,6 @@ def test_stage_seven_survivor_docs_and_examples_describe_only_the_mvp():
         "session runtime",
     ):
         assert required in normalized_readme
-    assert "Implemented through Stage 7" in plan
     assert "bounded cold continuation" in normalized_examples_readme
     assert "best-effort non-persisted events" in normalized_examples_readme
 
@@ -421,6 +428,231 @@ def test_cli_remains_a_presentation_over_the_public_agent_api():
         and node.func.value.id == "agent"
     }
     assert agent_calls <= public_methods
+
+
+def test_terminal_application_remains_a_presentation_over_the_public_agent_api():
+    path = PACKAGE / "terminal.py"
+    text = path.read_text(encoding="utf-8")
+    tree = ast.parse(text)
+
+    forbidden_import_roots = {
+        "adapters",
+        "capabilities",
+        "catalog",
+        "domains",
+        "hosting",
+        "llm",
+        "storage",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            assert node.module.split(".")[0] not in forbidden_import_roots
+        if isinstance(node, ast.Import):
+            assert all(
+                alias.name.split(".")[0] not in {"asyncpg", "keyring", "sqlite3"}
+                for alias in node.names
+            )
+
+    for forbidden in (
+        "._embedded",
+        "AgentLoop",
+        "CapabilityRegistry",
+        "DataToolRuntime",
+        "ModelProvider",
+        "ResourceAdapter",
+        "SQLiteStateStore",
+        "agent.toml",
+        "state.db",
+    ):
+        assert forbidden not in text
+
+    public_methods = {
+        method
+        for method in _class_methods(PACKAGE / "agent.py", "Agent")
+        if not method.startswith("_")
+    }
+    agent_calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "agent"
+    }
+    assert agent_calls <= public_methods
+    assert {
+        "catalog_preview",
+        "conversation_exists",
+        "refresh_source",
+    } <= public_methods
+    assert text.count("agent.run(") == 1
+
+    terminal_classes = {
+        node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+    }
+    assert terminal_classes.isdisjoint(
+        {
+            "CommandRegistry",
+            "ConversationRuntime",
+            "ReadinessService",
+            "Session",
+            "SessionManager",
+            "Workflow",
+        }
+    )
+
+
+def test_terminal_presentation_modules_are_the_only_lazy_prompt_toolkit_owners():
+    owners = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if "prompt_toolkit" in path.read_text(encoding="utf-8")
+    }
+    assert owners == {"terminal_selection.py", "terminal_tui.py"}
+
+    for owner, loader in (
+        ("terminal_selection.py", "_load_prompt_toolkit"),
+        ("terminal_tui.py", "_load_terminal_runtime"),
+    ):
+        tree = ast.parse((PACKAGE / owner).read_text(encoding="utf-8"))
+        imported_modules = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module
+        }
+        assert not imported_modules.intersection(
+            {
+                "daita.adapters",
+                "daita.capabilities",
+                "daita.catalog",
+                "daita.domains",
+                "daita.hosting",
+                "daita.loop",
+                "daita.storage",
+            }
+        )
+        top_level_imports = {
+            node.module
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom) and node.module
+        } | {
+            alias.name
+            for node in tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        assert not any(
+            module == "prompt_toolkit" or module.startswith("prompt_toolkit.")
+            for module in top_level_imports
+        )
+        assert any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == loader
+            and any(
+                isinstance(child, ast.ImportFrom)
+                and child.module
+                and child.module.startswith("prompt_toolkit")
+                for child in ast.walk(node)
+            )
+            for node in tree.body
+        )
+
+
+def test_rich_is_lazy_and_owned_only_by_the_focused_terminal_tui():
+    owners = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if any(
+            line.lstrip().startswith(("from rich", "import rich"))
+            for line in path.read_text(encoding="utf-8").splitlines()
+        )
+    }
+    assert owners == {"terminal_tui.py"}
+
+    tree = ast.parse((PACKAGE / "terminal_tui.py").read_text(encoding="utf-8"))
+    top_level_imports = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert not any(
+        module == "rich" or module.startswith("rich.") for module in top_level_imports
+    )
+    assert any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_load_terminal_runtime"
+        and any(
+            isinstance(child, ast.ImportFrom)
+            and child.module
+            and child.module.startswith("rich.")
+            for child in ast.walk(node)
+        )
+        for node in tree.body
+    )
+
+
+def test_schema_multi_selector_has_no_data_runtime_or_persisted_state_owner():
+    selector_path = PACKAGE / "terminal_selection.py"
+    selector_tree = ast.parse(selector_path.read_text(encoding="utf-8"))
+    imported_modules = {
+        node.module
+        for node in ast.walk(selector_tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in ast.walk(selector_tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    forbidden_fragments = (
+        "adapters",
+        "capabilities",
+        "catalog",
+        "controller",
+        "executors",
+        "loop",
+        "postgresql",
+        "storage",
+    )
+    assert not any(
+        any(fragment in module.split(".") for fragment in forbidden_fragments)
+        for module in imported_modules
+    )
+    public_functions = {
+        node.name
+        for node in selector_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert {"select_one", "select_many"} <= public_functions
+
+    storage = _python_text(PACKAGE / "storage").casefold()
+    for persisted_state in (
+        "checked_state",
+        "highlight_position",
+        "onboarding_state",
+        "readiness_state",
+        "selected_schema",
+        "selector_position",
+    ):
+        assert persisted_state not in storage
+
+
+def test_stage_four_summary_is_catalog_owned_and_not_loop_or_storage_state():
+    assert _class_owners("CatalogSummary") == {"catalog/models.py"}
+    loop = _python_text(PACKAGE / "loop")
+    storage = _python_text(PACKAGE / "storage")
+    for field_name in (
+        "active_source_count",
+        "latest_successful_sync_completed_at",
+        "relationship_count",
+    ):
+        assert field_name not in loop
+    assert "readiness" not in storage.lower()
 
 
 def test_cli_adds_no_parallel_state_approval_or_observation_owner():

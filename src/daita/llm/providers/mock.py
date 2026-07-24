@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from ..models import ModelRequest, ModelResponse
+from ..models import ModelProfile, ModelRequest, ModelResponse
 
 
 class MockScriptExhausted(RuntimeError):
@@ -36,6 +36,18 @@ class MockModelProvider:
     @property
     def provider_id(self) -> str:
         return self._provider_id
+
+    @property
+    def model_profile(self) -> ModelProfile:
+        """Return deterministic provider-owned facts for offline test requests."""
+
+        return ModelProfile(
+            id=self._provider_id,
+            context_window_tokens=16_384,
+            max_output_tokens=2_048,
+            supports_tools=True,
+            supports_parallel_tools=False,
+        )
 
     @property
     def requests(self) -> tuple[ModelRequest, ...]:

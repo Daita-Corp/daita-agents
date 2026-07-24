@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from daita import Agent, Skill, SkillSummary
+from daita import Agent, PostgreSQLSource, Skill, SkillSummary
 from daita import cli
 from daita.llm.models import (
     FinishReason,
@@ -27,6 +27,7 @@ from daita.llm.models import (
     ToolCall,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.security import SecretReference
 
 
 class _TTYBuffer(io.StringIO):
@@ -175,7 +176,10 @@ def test_current_parser_keeps_the_existing_one_shot_surface_green():
     parser = cli.build_parser()
     commands = _subcommands(parser)
 
-    assert _surface(parser) == ((), frozenset({"-h", "--help", "--root"}))
+    assert _surface(parser) == (
+        (),
+        frozenset({"-h", "--help", "--root", "--agent"}),
+    )
     assert {"create", "attach", "sources", "run"} <= set(commands)
     assert _surface(commands["create"]) == (
         ("name",),
@@ -183,12 +187,268 @@ def test_current_parser_keeps_the_existing_one_shot_surface_green():
     )
     assert _surface(commands["attach"]) == (
         ("name", "kind", "path"),
-        frozenset({"-h", "--help"}),
+        frozenset(
+            {
+                "-h",
+                "--help",
+                "--host",
+                "--port",
+                "--database",
+                "--username",
+                "--password-env",
+                "--schema",
+                "--ssl-mode",
+                "--source-name",
+            }
+        ),
     )
     assert _surface(commands["sources"]) == (
         ("name",),
         frozenset({"-h", "--help"}),
     )
+
+
+def test_zero_argument_cli_dispatches_to_the_terminal_application():
+    with patch.object(
+        cli,
+        "run_terminal_application",
+        new=AsyncMock(return_value=0),
+    ) as run_terminal:
+        code, stdout, stderr = _invoke([], tty=True)
+
+    assert code == 0
+    assert stdout == ""
+    assert stderr == ""
+    run_terminal.assert_awaited_once()
+    call = run_terminal.await_args
+    assert call is not None
+    assert call.kwargs["root"] is None
+    assert call.kwargs["agent_name"] is None
+
+
+def test_zero_argument_cli_rejects_non_tty_before_terminal_dispatch():
+    with patch.object(
+        cli,
+        "run_terminal_application",
+        new=AsyncMock(return_value=0),
+    ) as run_terminal:
+        code, stdout, stderr = _invoke([])
+
+    assert code == 1
+    assert stdout == ""
+    assert _json_lines(stderr) == (
+        {"error": "daita requires interactive stdin, stdout, and stderr"},
+    )
+    run_terminal.assert_not_awaited()
+
+
+def test_zero_agents_prompts_for_and_creates_one_agent():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+
+        code, stdout, stderr = _invoke(
+            ["--root", str(root)],
+            stdin="atlas\n",
+            tty=True,
+        )
+
+        assert code == 0
+        assert stderr == ""
+        assert "Agent name: " in stdout
+        assert "Agent     atlas" in stdout
+        assert "Stage 2 status" not in stdout
+        asyncio.run(_open_and_close_agent(root, "atlas"))
+
+
+def test_one_agent_is_selected_automatically_and_its_lock_is_released():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "solo"))
+
+        code, stdout, stderr = _invoke(["--root", str(root)], tty=True)
+
+        assert code == 0
+        assert stderr == ""
+        assert "Select an agent" not in stdout
+        assert "Agent     solo" in stdout
+        asyncio.run(_open_and_close_agent(root, "solo"))
+
+
+def test_multiple_agents_render_a_deterministic_numbered_picker():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "zulu"))
+        asyncio.run(_create_agent(root, "alpha"))
+
+        code, stdout, stderr = _invoke(
+            ["--root", str(root)],
+            stdin="2\n",
+            tty=True,
+        )
+
+        assert code == 0
+        assert stderr == ""
+        assert "1. alpha\n2. zulu\n3. Create a new agent" in stdout
+        assert "Agent     zulu" in stdout
+
+
+def test_multiple_agent_picker_can_create_another_agent():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "alpha"))
+        asyncio.run(_create_agent(root, "beta"))
+
+        code, stdout, stderr = _invoke(
+            ["--root", str(root)],
+            stdin="3\ngamma\n",
+            tty=True,
+        )
+
+        assert code == 0
+        assert stderr == ""
+        assert "3. Create a new agent" in stdout
+        assert "Agent     gamma" in stdout
+        assert asyncio.run(Agent.list(root=root)) == ("alpha", "beta", "gamma")
+
+
+def test_agent_option_selects_the_exact_requested_agent():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "alpha"))
+        asyncio.run(_create_agent(root, "atlas"))
+
+        code, stdout, stderr = _invoke(
+            ["--root", str(root), "--agent", "atlas"],
+            tty=True,
+        )
+
+        assert code == 0
+        assert stderr == ""
+        assert "Select an agent" not in stdout
+        assert "Agent     atlas" in stdout
+
+
+def test_unknown_agent_option_reports_an_actionable_error():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+
+        code, stdout, stderr = _invoke(
+            ["--root", str(root), "--agent", "missing"],
+            tty=True,
+        )
+
+        assert code == 1
+        assert stdout == ""
+        error = _json_lines(stderr)[0]["error"]
+        assert isinstance(error, str)
+        assert "missing" in error
+        assert "without --agent" in error
+
+
+def test_agent_listing_omits_malformed_incomplete_and_symlinked_homes(
+    tmp_path: Path,
+):
+    asyncio.run(_create_agent(tmp_path, "valid"))
+    agents_root = tmp_path / "agents"
+    incomplete = agents_root / "incomplete"
+    incomplete.mkdir()
+    malformed = agents_root / "malformed"
+    malformed.mkdir()
+    (malformed / "agent.toml").write_text("not = [valid", encoding="utf-8")
+    (malformed / "state.db").touch()
+    (agents_root / "linked").symlink_to(
+        agents_root / "valid",
+        target_is_directory=True,
+    )
+
+    assert asyncio.run(Agent.list(root=tmp_path)) == ("valid",)
+
+
+@pytest.mark.parametrize(
+    ("input_stream", "expected_code", "expected_message"),
+    (
+        (_TTYBuffer(""), 0, "Setup cancelled."),
+        (None, 130, "Setup interrupted."),
+    ),
+)
+def test_selection_eof_and_ctrl_c_exit_without_partial_agent_creation(
+    tmp_path: Path,
+    input_stream: _TTYBuffer | None,
+    expected_code: int,
+    expected_message: str,
+):
+    class _InterruptingInput:
+        def isatty(self) -> bool:
+            return True
+
+        def readline(self, size: int = -1, /) -> str:
+            del size
+            raise KeyboardInterrupt
+
+    stream = _InterruptingInput() if input_stream is None else input_stream
+    stdout = _TTYBuffer()
+    stderr = _TTYBuffer()
+    with (
+        patch.object(sys, "stdin", stream),
+        redirect_stdout(stdout),
+        redirect_stderr(stderr),
+    ):
+        code = cli.main(["--root", str(tmp_path)])
+
+    assert code == expected_code
+    assert expected_message in stdout.getvalue()
+    assert stderr.getvalue() == ""
+    assert asyncio.run(Agent.list(root=tmp_path)) == ()
+
+
+def test_attach_parser_builds_postgresql_source_with_secret_reference():
+    args = cli.build_parser().parse_args(
+        [
+            "attach",
+            "atlas",
+            "postgresql",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "55432",
+            "--database",
+            "daita_fixture",
+            "--username",
+            "daita_reader",
+            "--password-env",
+            "DAITA_FIXTURE_POSTGRES_PASSWORD",
+            "--schema",
+            "analytics",
+            "--ssl-mode",
+            "disable",
+            "--source-name",
+            "Fixture PostgreSQL",
+        ]
+    )
+
+    source = cli._source_from_attach_args(args)
+
+    assert isinstance(source, PostgreSQLSource)
+    assert source.host == "127.0.0.1"
+    assert source.port == 55432
+    assert source.database == "daita_fixture"
+    assert source.username == "daita_reader"
+    assert source.credential == SecretReference.environment(
+        "DAITA_FIXTURE_POSTGRES_PASSWORD"
+    )
+    assert source.schemas == ("analytics",)
+    assert source.ssl_mode == "disable"
+    assert source.name == "Fixture PostgreSQL"
+
+
+def test_attach_postgresql_reports_missing_connection_fields():
+    args = cli.build_parser().parse_args(["attach", "atlas", "postgresql"])
+
+    with pytest.raises(
+        ValueError,
+        match=r"attach postgresql requires --host, --database, --username",
+    ):
+        cli._source_from_attach_args(args)
 
 
 def test_current_run_writes_exactly_one_terminal_json_record_to_stdout():
@@ -247,6 +507,67 @@ def test_current_diagnostics_use_stderr_and_leave_stdout_empty():
     assert code == 1
     assert stdout == ""
     assert _json_lines(stderr) == ({"error": "install the mock extra"},)
+
+
+def test_direct_cli_rejects_unreviewed_models_without_provider_owned_facts():
+    class UnprofiledProvider:
+        provider_id = "custom:unknown"
+
+        def supports_request_policy(self, request: ModelRequest) -> bool:
+            return True
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            raise AssertionError("an unadmitted provider must not be called")
+
+    with patch.object(
+        cli,
+        "create_llm_provider",
+        return_value=UnprofiledProvider(),
+    ):
+        with pytest.raises(
+            ValueError,
+            match="interactive terminal.*prove tool support.*hard token limits",
+        ):
+            cli._model_configuration(
+                "custom:unknown",
+                base_url="https://models.invalid/v1",
+            )
+
+
+def test_direct_cli_uses_provider_owned_profile_without_generic_defaults():
+    provider = MockModelProvider(())
+
+    with patch.object(cli, "create_llm_provider", return_value=provider):
+        configured_provider, profile = cli._model_configuration("mock:scripted")
+
+    assert configured_provider is provider
+    assert profile == provider.model_profile
+    assert profile.context_window_tokens == 16_384
+    assert profile.max_output_tokens == 2_048
+    assert not profile.supports_parallel_tools
+
+
+def test_direct_cli_requires_explicit_limit_overrides_as_a_pair():
+    with pytest.raises(
+        ValueError,
+        match="--context-window and --max-output must be supplied together",
+    ):
+        cli._model_configuration("openai:gpt-5.6-sol", context_window=4_096)
+
+
+def test_direct_cli_limits_cannot_exceed_provider_owned_profile():
+    provider = MockModelProvider(())
+
+    with patch.object(cli, "create_llm_provider", return_value=provider):
+        with pytest.raises(
+            ValueError,
+            match="cannot exceed.*provider-owned model profile",
+        ):
+            cli._model_configuration(
+                "mock:scripted",
+                context_window=16_385,
+                max_output=2_048,
+            )
 
 
 def test_future_cli_1_parser_adds_only_explicit_run_continuation_flags():

@@ -1,0 +1,3268 @@
+"""Lazy, ephemeral presentation for the ready-agent terminal shell."""
+
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+import io
+import json
+import os
+import sys
+from typing import Any, TextIO
+import unicodedata
+
+from ._installation import PIPX_REPAIR_GUIDANCE
+from ._json import freeze_json, thaw_json
+from .capabilities import ApprovalDecision, ApprovalRequest
+from .llm.models import MessageRole, ToolCall, ToolResultBlock
+from .loop.models import Transcript
+from .observation import AgentEvent, AgentEventKind
+
+MAX_COMPOSER_CHARACTERS = 16_384
+MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
+_MAX_RENDER_CHARACTERS = 16_384
+_MAX_DETAIL_UTF8_BYTES = 16 * 1_024
+_MAX_CODE_VISIBLE_LINES = 80
+_COLLAPSED_TABLE_ROWS = 10
+_COLLAPSED_TABLE_COLUMNS = 12
+_EXPANDED_TABLE_ROWS = 50
+_EXPANDED_TABLE_COLUMNS = 20
+_MAX_CELL_DISPLAY_CHARACTERS = 240
+_MIN_RENDER_WIDTH = 20
+_MAX_RENDER_WIDTH = 240
+_MIN_USABLE_COLUMNS = 32
+_MIN_READY_ROWS = 8
+_MIN_APPROVAL_ROWS = 15
+_MAX_QUEUED_EVENTS = 4_096
+_MAX_EVENT_COUNTER = 999_999_999_999
+_ANIMATION_INTERVAL_SECONDS = 0.12
+_RUNNING_GLYPHS = ("◐", "◓", "◑", "◒")
+_ASCII_RUNNING_GLYPHS = ("~", "-", "~", "+")
+_SLASH_COMMAND_SURFACE = (
+    "/model",
+    "/sources",
+    "/source add",
+    "/source refresh <id>",
+    "/catalog",
+    "/settings",
+    "/new",
+    "/resume <id>",
+    "/memory",
+    "/user",
+    "/skills",
+    "/status",
+    "/conversation",
+    "/help",
+    "/exit",
+)
+_SLASH_COMMAND_INSERTIONS = (
+    ("/model", "/model"),
+    ("/sources", "/sources"),
+    ("/source add", "/source add"),
+    ("/source refresh ", "/source refresh <id>"),
+    ("/catalog", "/catalog"),
+    ("/settings", "/settings"),
+    ("/new", "/new"),
+    ("/resume ", "/resume <id>"),
+    ("/memory", "/memory"),
+    ("/user", "/user"),
+    ("/skills", "/skills"),
+    ("/status", "/status"),
+    ("/conversation", "/conversation"),
+    ("/help", "/help"),
+    ("/exit", "/exit"),
+)
+_SENSITIVE_KEY_PARTS = (
+    "api_key",
+    "authorization",
+    "credential",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+)
+_CAPABILITY_LABELS = {
+    "catalog.search": "Search catalog",
+    "catalog.inspect": "Inspect schema",
+    "catalog.traverse": "Follow relationships",
+    "data.sqlite.query": "Query SQLite",
+    "data.postgresql.query": "Query PostgreSQL",
+    "data.file.read": "Read data file",
+    "memory.set": "Update memory",
+    "skill.view": "Read skill",
+    "skill.save": "Save skill",
+    "skill.delete": "Delete skill",
+}
+
+
+class TerminalTUIUnavailable(RuntimeError):
+    """The enhanced application could not be admitted for this terminal."""
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalCapabilities:
+    """One process-local projection of output color and character support."""
+
+    color_depth: str
+    unicode: bool
+
+    @property
+    def no_color(self) -> bool:
+        return self.color_depth == "none"
+
+    @property
+    def rich_color_system(self) -> str | None:
+        return {
+            "truecolor": "truecolor",
+            "256": "256",
+            "16": "standard",
+            "none": None,
+        }[self.color_depth]
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalGlyphs:
+    """Structural glyphs with a complete readable ASCII projection."""
+
+    top_left: str
+    top_right: str
+    bottom_left: str
+    bottom_right: str
+    horizontal: str
+    vertical: str
+    prompt: str
+    running: tuple[str, ...]
+    ready: str
+    success: str
+    failure: str
+    warning: str
+    approval: str
+    separator: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResponsiveProjection:
+    """Pure layout facts derived from the latest terminal size."""
+
+    columns: int
+    rows: int
+    mode: str
+    content_width: int
+    collapsed_preview_columns: int
+    expanded_preview_columns: int
+    bordered_cards: bool
+    stacked_metadata: bool
+    two_sided_status: bool
+    usable: bool
+    minimum_rows: int
+    transcript_rows: int
+
+
+@dataclass(frozen=True, slots=True)
+class StatusProjection:
+    """One deterministic responsive projection of status metadata."""
+
+    left: str
+    right: str
+    source_summary: str
+    collapsed: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalBlock:
+    """One disposable transcript block shown in the current process."""
+
+    kind: str
+    text: str
+    tool_card: ToolCardState | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolTablePreview:
+    """A bounded row/column projection from one recorded tool result."""
+
+    columns: tuple[str, ...]
+    rows: tuple[tuple[str, ...], ...]
+    recorded_rows: int
+    recorded_columns: int
+    total_rows: int | None = None
+    cells_truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCardDetails:
+    """Safe, bounded, process-local detail hydrated from one transcript pair."""
+
+    summary: str
+    code: str | None = None
+    code_language: str | None = None
+    arguments_text: str | None = None
+    result_text: str | None = None
+    error_message: str | None = None
+    table: ToolTablePreview | None = None
+
+
+@dataclass(slots=True)
+class ToolCardState:
+    """One bounded live projection of a model-requested tool call."""
+
+    run_id: str
+    call_id: str
+    capability_id: str | None
+    label: str
+    state: str = "queued"
+    duration_ms: int | None = None
+    error_code: str | None = None
+    approval_outcome: str | None = None
+    details: ToolCardDetails | None = None
+    expanded: bool = False
+
+
+@dataclass(slots=True)
+class ApprovalPanelState:
+    """One focused, bounded, process-local exact-approval projection."""
+
+    tool_name: str
+    capability_id: str
+    arguments_text: str
+    cursor_line: int = 0
+    rendered_line_count: int = 1
+
+    def move(self, amount: int) -> None:
+        last_line = max(0, self.rendered_line_count - 1)
+        self.cursor_line = min(last_line, max(0, self.cursor_line + amount))
+
+
+class TerminalApprovalBridge:
+    """Route the one existing approval callback to the active terminal surface."""
+
+    def __init__(
+        self,
+        fallback: Callable[[ApprovalRequest], Awaitable[ApprovalDecision]],
+    ) -> None:
+        if not callable(fallback):
+            raise TypeError("approval fallback must be callable")
+        self._fallback = fallback
+        self._presenter: (
+            Callable[[ApprovalRequest], Awaitable[ApprovalDecision]] | None
+        ) = None
+
+    async def __call__(self, request: ApprovalRequest) -> ApprovalDecision:
+        presenter = self._presenter
+        if presenter is None:
+            return await self._fallback(request)
+        try:
+            decision = await presenter(request)
+        except BaseException:
+            return ApprovalDecision.DENY
+        if not isinstance(decision, ApprovalDecision):
+            return ApprovalDecision.DENY
+        return decision
+
+    def install(
+        self,
+        presenter: Callable[[ApprovalRequest], Awaitable[ApprovalDecision]],
+    ) -> Callable[[ApprovalRequest], Awaitable[ApprovalDecision]] | None:
+        if not callable(presenter):
+            raise TypeError("approval presenter must be callable")
+        previous = self._presenter
+        self._presenter = presenter
+        return previous
+
+    def restore(
+        self,
+        previous: Callable[[ApprovalRequest], Awaitable[ApprovalDecision]] | None,
+    ) -> None:
+        self._presenter = previous
+
+
+class TerminalObserverBridge:
+    """Best-effort enqueue-only bridge from execution into terminal state."""
+
+    def __init__(self) -> None:
+        self._events: deque[AgentEvent] = deque(maxlen=_MAX_QUEUED_EVENTS)
+
+    def __call__(self, event: AgentEvent, /) -> None:
+        try:
+            self._events.append(event)
+        except Exception:
+            pass
+
+    def drain(self) -> tuple[AgentEvent, ...]:
+        pending: list[AgentEvent] = []
+        while True:
+            try:
+                pending.append(self._events.popleft())
+            except IndexError:
+                return tuple(pending)
+
+
+@dataclass(slots=True)
+class TerminalViewState:
+    """Bounded, process-local state for the focused terminal shell."""
+
+    agent_label: str
+    model_label: str
+    source_summary: str
+    conversation_id: str | None = None
+    blocks: list[TerminalBlock] = field(default_factory=list)
+    running: bool = False
+    notice: str = ""
+    steps: int = 0
+    total_tokens: int = 0
+    estimated_cost: str = "0"
+    transcript_cursor_line: int = 0
+    rendered_line_count: int = 1
+    follows_bottom: bool = True
+    active_task: asyncio.Task[Any] | None = None
+    active_run_id: str | None = None
+    run_status: str = "ready"
+    run_duration_ms: int | None = None
+    model_duration_ms: int | None = None
+    run_input_tokens: int = 0
+    run_output_tokens: int = 0
+    animation_frame: int = 0
+    tool_cards: dict[str, ToolCardState] = field(default_factory=dict)
+    approval_panel: ApprovalPanelState | None = None
+
+    def append_plain(self, kind: str, value: object) -> None:
+        safe = _sanitize_terminal_text(
+            value,
+            maximum=_MAX_RENDER_CHARACTERS,
+            preserve_lines=True,
+            fallback="",
+        )
+        if safe:
+            self.blocks.append(TerminalBlock(kind, safe))
+            self.follows_bottom = True
+            self.transcript_cursor_line = max(0, self.rendered_line_count - 1)
+
+    def append_user(self, message: str) -> None:
+        self.append_plain("user", message)
+
+    def append_local(self, presentation: str, value: object) -> None:
+        kind = (
+            f"local.{presentation}"
+            if presentation in {"status", "sources", "catalog", "settings"}
+            else "local"
+        )
+        self.append_plain(kind, value)
+
+    def apply_result(self, result: Any) -> None:
+        previous_conversation = self.conversation_id
+        candidate_conversation = getattr(result, "conversation_id", None)
+        if isinstance(candidate_conversation, str) and candidate_conversation:
+            self.conversation_id = candidate_conversation
+            if previous_conversation is None:
+                self.append_plain(
+                    "metadata",
+                    f"Conversation  {candidate_conversation}",
+                )
+
+        final_text = getattr(result, "final_text", None)
+        if final_text is not None:
+            safe_answer = _sanitize_terminal_text(
+                final_text,
+                maximum=_MAX_RENDER_CHARACTERS,
+                preserve_lines=True,
+                fallback="(empty response)",
+            )
+        else:
+            kind = getattr(getattr(result, "kind", None), "value", None)
+            reason = _sanitize_terminal_text(
+                getattr(result, "reason", None),
+                maximum=256,
+                preserve_lines=False,
+                fallback="failed",
+            )
+            safe_answer = f"{kind or 'failed'}: {reason}"
+        self.blocks.append(TerminalBlock("assistant", safe_answer))
+
+        steps = getattr(result, "steps", 0)
+        usage = getattr(result, "usage", None)
+        total_tokens = getattr(usage, "total_tokens", 0)
+        estimated_cost = getattr(usage, "estimated_cost_usd", 0)
+        self.steps = steps if isinstance(steps, int) and steps >= 0 else 0
+        self.total_tokens = (
+            total_tokens if isinstance(total_tokens, int) and total_tokens >= 0 else 0
+        )
+        self.estimated_cost = _sanitize_terminal_text(
+            str(estimated_cost),
+            maximum=32,
+            preserve_lines=False,
+            fallback="0",
+        )
+        kind = getattr(getattr(result, "kind", None), "value", None)
+        self.run_status = (
+            "ready"
+            if final_text is not None or kind == "completed"
+            else _sanitize_terminal_text(
+                kind,
+                maximum=32,
+                preserve_lines=False,
+                fallback="failed",
+            )
+        )
+        result_run_id = getattr(result, "run_id", None)
+        if (
+            isinstance(result_run_id, str)
+            and result_run_id
+            and self.active_run_id == result_run_id
+        ):
+            result_kind = (
+                kind
+                if isinstance(kind, str) and kind
+                else ("completed" if final_text is not None else "failed")
+            )
+            result_reason = _sanitize_terminal_text(
+                getattr(result, "reason", None),
+                maximum=128,
+                preserve_lines=False,
+                fallback=result_kind,
+            )
+            self._settle_run_cards(result_run_id, result_kind, result_reason)
+            self.active_run_id = None
+        self.notice = ""
+        self.follows_bottom = True
+        self.transcript_cursor_line = max(0, self.rendered_line_count - 1)
+
+    def hydrate_transcript(self, transcript: Transcript, *, run_id: str) -> None:
+        """Hydrate and canonically reorder one completed run's tool cards."""
+
+        if not isinstance(transcript, Transcript):
+            raise TypeError("completed transcript must be a Transcript")
+        if transcript.run.id != run_id:
+            raise ValueError("completed transcript belongs to a different run")
+
+        pairs = _completed_tool_pairs(transcript)
+        canonical_ids = {call.id for call, _result in pairs}
+        prior_cards = {
+            call_id: card
+            for call_id, card in self.tool_cards.items()
+            if card.run_id == run_id
+        }
+        canonical_cards: list[ToolCardState] = []
+        for call, result in pairs:
+            card = prior_cards.get(call.id)
+            capability_id = None if card is None else card.capability_id
+            label = (
+                _CAPABILITY_LABELS.get(capability_id or "")
+                if capability_id is not None
+                else None
+            )
+            if label is None:
+                label = _sanitize_terminal_text(
+                    call.name,
+                    maximum=128,
+                    preserve_lines=False,
+                    fallback="Tool call",
+                )
+            if card is None:
+                card = ToolCardState(
+                    run_id=run_id,
+                    call_id=call.id,
+                    capability_id=capability_id,
+                    label=label,
+                )
+            else:
+                card.label = label
+
+            if result is not None:
+                already_hydrated = card.details is not None
+                card.details = _project_tool_details(call, result)
+                if result.is_error:
+                    card.state = "failed"
+                    card.error_code = _tool_result_error_code(result)
+                    if not already_hydrated:
+                        card.expanded = True
+                else:
+                    card.state = "succeeded"
+                    card.error_code = None
+                    if not already_hydrated:
+                        card.expanded = False
+            canonical_cards.append(card)
+
+        target_indexes = [
+            index
+            for index, block in enumerate(self.blocks)
+            if block.kind == "tool"
+            and block.tool_card is not None
+            and block.tool_card.run_id == run_id
+        ]
+        insertion_index = min(target_indexes, default=len(self.blocks))
+        retained: list[TerminalBlock] = []
+        retained_before_insertion = 0
+        for index, block in enumerate(self.blocks):
+            is_target = (
+                block.kind == "tool"
+                and block.tool_card is not None
+                and block.tool_card.run_id == run_id
+            )
+            if is_target:
+                continue
+            if index < insertion_index:
+                retained_before_insertion += 1
+            retained.append(block)
+        canonical_blocks = [
+            TerminalBlock("tool", card.call_id, tool_card=card)
+            for card in canonical_cards
+        ]
+        self.blocks = [
+            *retained[:retained_before_insertion],
+            *canonical_blocks,
+            *retained[retained_before_insertion:],
+        ]
+
+        for call_id, card in tuple(self.tool_cards.items()):
+            if card.run_id == run_id and call_id not in canonical_ids:
+                del self.tool_cards[call_id]
+        for card in canonical_cards:
+            self.tool_cards[card.call_id] = card
+        self.follows_bottom = True
+
+    def toggle_expanded_detail(self) -> bool:
+        """Toggle the most recent completed hydrated card in this process."""
+
+        for block in reversed(self.blocks):
+            card = block.tool_card
+            if (
+                block.kind == "tool"
+                and card is not None
+                and card.state in {"succeeded", "failed"}
+                and card.details is not None
+            ):
+                card.expanded = not card.expanded
+                self.follows_bottom = True
+                return True
+        return False
+
+    def apply_event(self, event: AgentEvent) -> None:
+        """Project one bounded observation event into disposable view state."""
+
+        if not isinstance(event, AgentEvent):
+            raise TypeError("terminal event must be AgentEvent")
+        if event.kind is AgentEventKind.RUN_STARTED:
+            self.active_run_id = event.run_id
+            self.running = True
+            self.run_status = "working"
+            self.run_duration_ms = None
+            self.model_duration_ms = None
+            self.run_input_tokens = 0
+            self.run_output_tokens = 0
+            self.steps = 0
+            self.total_tokens = 0
+            self.estimated_cost = "0"
+            self.animation_frame = 0
+            return
+        if event.kind is AgentEventKind.MODEL_COMPLETED:
+            self.model_duration_ms = _event_counter(event.data.get("duration_ms"))
+            self.run_input_tokens = min(
+                _MAX_EVENT_COUNTER,
+                self.run_input_tokens
+                + (_event_counter(event.data.get("input_tokens")) or 0),
+            )
+            self.run_output_tokens = min(
+                _MAX_EVENT_COUNTER,
+                self.run_output_tokens
+                + (_event_counter(event.data.get("output_tokens")) or 0),
+            )
+            self.total_tokens = min(
+                _MAX_EVENT_COUNTER,
+                self.run_input_tokens + self.run_output_tokens,
+            )
+            if self.running:
+                self.run_status = "working"
+            return
+        if event.kind is AgentEventKind.TOOL_STARTED:
+            card = self._card_for_event(event)
+            if card is None:
+                return
+            card.state = "running"
+            card.duration_ms = None
+            card.error_code = None
+            self.run_status = "querying"
+            return
+        if event.kind is AgentEventKind.APPROVAL_REQUESTED:
+            card = self._card_for_event(event)
+            if card is None:
+                return
+            card.state = "approval"
+            card.approval_outcome = None
+            card.expanded = True
+            self.run_status = "approval"
+            return
+        if event.kind is AgentEventKind.APPROVAL_DECIDED:
+            card = self._card_for_event(event)
+            if card is None:
+                return
+            outcome = _event_text(
+                event.data.get("outcome"),
+                maximum=32,
+                fallback="failed",
+            )
+            card.approval_outcome = outcome
+            if outcome == "approved":
+                card.state = "running"
+                card.expanded = False
+                self.run_status = "querying"
+            else:
+                card.state = "failed"
+                card.expanded = True
+                card.error_code = (
+                    "approval_denied" if outcome == "denied" else "approval_failed"
+                )
+                self.run_status = "working"
+            return
+        if event.kind is AgentEventKind.TOOL_COMPLETED:
+            card = self._card_for_event(event)
+            if card is None:
+                return
+            card.duration_ms = _event_counter(event.data.get("duration_ms"))
+            success = event.data.get("success")
+            if success is True:
+                card.state = "succeeded"
+                card.error_code = None
+                card.expanded = False
+            else:
+                card.state = "failed"
+                card.expanded = True
+                card.error_code = _event_text(
+                    event.data.get("error_code"),
+                    maximum=128,
+                    fallback="tool_failed",
+                )
+            self.run_status = "working"
+            return
+        if event.kind is AgentEventKind.RUN_COMPLETED:
+            self.run_duration_ms = _event_counter(event.data.get("duration_ms"))
+            self.steps = _event_counter(event.data.get("steps")) or 0
+            self.run_input_tokens = _event_counter(event.data.get("input_tokens")) or 0
+            self.run_output_tokens = (
+                _event_counter(event.data.get("output_tokens")) or 0
+            )
+            self.total_tokens = _event_counter(event.data.get("total_tokens")) or 0
+            self.estimated_cost = _event_text(
+                event.data.get("estimated_cost_usd"),
+                maximum=32,
+                fallback="0",
+            )
+            exit_kind = _event_text(
+                event.data.get("exit_kind"),
+                maximum=32,
+                fallback="failed",
+            )
+            reason = _event_text(
+                event.data.get("reason"),
+                maximum=128,
+                fallback=exit_kind,
+            )
+            self._settle_run_cards(event.run_id, exit_kind, reason)
+            if self.active_run_id == event.run_id:
+                self.active_run_id = None
+            self.running = False
+            self.run_status = "ready" if exit_kind == "completed" else exit_kind
+
+    def settle_cancelled_run(self) -> None:
+        run_id = self.active_run_id
+        if run_id is not None:
+            self._settle_run_cards(run_id, "interrupted", "cancelled")
+            self.active_run_id = None
+            self.run_status = "interrupted"
+        self.running = False
+
+    def _card_for_event(self, event: AgentEvent) -> ToolCardState | None:
+        call_id = _event_text(
+            event.data.get("call_id"),
+            maximum=256,
+            fallback="",
+        )
+        if not call_id:
+            return None
+        capability_id = _optional_event_text(
+            event.data.get("capability_id"),
+            maximum=256,
+        )
+        tool_name = _event_text(
+            event.data.get("tool_name"),
+            maximum=128,
+            fallback="Tool call",
+        )
+        label = _CAPABILITY_LABELS.get(capability_id or "", tool_name)
+        label = _sanitize_terminal_text(
+            label,
+            maximum=128,
+            preserve_lines=False,
+            fallback="Tool call",
+        )
+        card = self.tool_cards.get(call_id)
+        if card is None or card.run_id != event.run_id:
+            card = ToolCardState(
+                run_id=event.run_id,
+                call_id=call_id,
+                capability_id=capability_id,
+                label=label,
+            )
+            self.tool_cards[call_id] = card
+            self.blocks.append(TerminalBlock("tool", call_id, tool_card=card))
+            self.follows_bottom = True
+        else:
+            if capability_id is not None:
+                card.capability_id = capability_id
+            if capability_id is not None or card.label == "Tool call":
+                card.label = label
+        return card
+
+    def _settle_run_cards(
+        self,
+        run_id: str,
+        exit_kind: str,
+        reason: str,
+    ) -> None:
+        for card in self.tool_cards.values():
+            if card.run_id != run_id or card.state not in {
+                "queued",
+                "running",
+                "approval",
+            }:
+                continue
+            card.state = "failed"
+            card.expanded = True
+            card.error_code = (
+                "cancelled"
+                if exit_kind == "interrupted" or reason == "cancelled"
+                else "observation_incomplete"
+            )
+
+    def move_transcript(self, amount: int) -> None:
+        last_line = max(0, self.rendered_line_count - 1)
+        self.transcript_cursor_line = min(
+            last_line,
+            max(0, self.transcript_cursor_line + amount),
+        )
+        self.follows_bottom = self.transcript_cursor_line >= last_line
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalCommandResult:
+    """The controller result of one suspended local slash command."""
+
+    conversation_id: str | None
+    action: str | None = None
+    output: str = ""
+    presentation: str = "local"
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalApplicationResult:
+    """The reason the focused shell yielded to its controller."""
+
+    conversation_id: str | None
+    action: str
+
+
+class TerminalSuspendBridge:
+    """Suspend the active TUI while an existing terminal prompt takes over."""
+
+    def __init__(self) -> None:
+        self._runner: (
+            Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]] | None
+        ) = None
+        self.enhanced_input: Any = None
+        self.enhanced_output: Any = None
+
+    async def run(self, action: Callable[[], Awaitable[Any]]) -> Any:
+        runner = self._runner
+        if runner is None:
+            return await action()
+        return await runner(action)
+
+    def install(
+        self,
+        runner: Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]],
+        *,
+        enhanced_input: Any,
+        enhanced_output: Any,
+    ) -> tuple[
+        Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]] | None,
+        Any,
+        Any,
+    ]:
+        previous = (self._runner, self.enhanced_input, self.enhanced_output)
+        self._runner = runner
+        self.enhanced_input = enhanced_input
+        self.enhanced_output = enhanced_output
+        return previous
+
+    def restore(
+        self,
+        previous: tuple[
+            Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]] | None,
+            Any,
+            Any,
+        ],
+    ) -> None:
+        self._runner, self.enhanced_input, self.enhanced_output = previous
+
+
+def _terminal_capabilities(
+    output: Any = None,
+    *,
+    text_stream: TextIO | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> TerminalCapabilities:
+    """Detect bounded semantic color and Unicode support without terminal I/O."""
+
+    environment = os.environ if environ is None else environ
+    if "NO_COLOR" in environment:
+        color_depth = "none"
+    else:
+        color_depth = _detected_color_depth(output, environment)
+
+    ascii_override = environment.get("DAITA_ASCII", "").strip().casefold()
+    unicode_supported = ascii_override not in {"1", "true", "yes", "on"}
+    encoding = getattr(text_stream, "encoding", None)
+    if not isinstance(encoding, str) or not encoding:
+        encoding = getattr(output, "encoding", None)
+    if not isinstance(encoding, str) or not encoding:
+        encoding = environment.get("PYTHONIOENCODING", "").partition(":")[0]
+    if isinstance(encoding, str) and encoding:
+        try:
+            "╭✓◐›●".encode(encoding)
+        except (LookupError, UnicodeEncodeError):
+            unicode_supported = False
+    locale_name = (
+        environment.get("LC_ALL")
+        or environment.get("LC_CTYPE")
+        or environment.get("LANG")
+        or ""
+    ).strip()
+    if (
+        locale_name.casefold() in {"c", "posix"}
+        and environment.get("PYTHONUTF8", "").strip() != "1"
+    ):
+        unicode_supported = False
+    return TerminalCapabilities(
+        color_depth=color_depth,
+        unicode=unicode_supported,
+    )
+
+
+def _detected_color_depth(
+    output: Any,
+    environment: Mapping[str, str],
+) -> str:
+    color_term = environment.get("COLORTERM", "").strip().casefold()
+    if color_term in {"truecolor", "24bit"}:
+        return "truecolor"
+    term = environment.get("TERM", "").strip().casefold()
+    if "direct" in term or "truecolor" in term:
+        return "truecolor"
+    if "256color" in term:
+        return "256"
+    try:
+        depth = str(output.get_default_color_depth()).casefold()
+    except (AttributeError, OSError, TypeError, ValueError):
+        depth = ""
+    if "true" in depth or "24" in depth:
+        return "truecolor"
+    if "256" in depth or "8_bit" in depth:
+        return "256"
+    if "4_bit" in depth or "16" in depth or "standard" in depth:
+        return "16"
+    if term and term not in {"dumb", "unknown"}:
+        return "16"
+    return "truecolor"
+
+
+def _terminal_glyphs(capabilities: TerminalCapabilities) -> TerminalGlyphs:
+    if capabilities.unicode:
+        return TerminalGlyphs(
+            top_left="╭",
+            top_right="╮",
+            bottom_left="╰",
+            bottom_right="╯",
+            horizontal="─",
+            vertical="│",
+            prompt="›",
+            running=_RUNNING_GLYPHS,
+            ready="●",
+            success="✓",
+            failure="!",
+            warning="!",
+            approval="!",
+            separator=" · ",
+        )
+    return TerminalGlyphs(
+        top_left="+",
+        top_right="+",
+        bottom_left="+",
+        bottom_right="+",
+        horizontal="-",
+        vertical="|",
+        prompt=">",
+        running=_ASCII_RUNNING_GLYPHS,
+        ready="OK",
+        success="OK",
+        failure="!",
+        warning="!",
+        approval="!",
+        separator=" | ",
+    )
+
+
+def _terminal_size(output: Any) -> tuple[int, int]:
+    try:
+        size = output.get_size()
+        columns = int(size.columns)
+        rows = int(size.rows)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return 80, 24
+    return max(1, columns), max(1, rows)
+
+
+def _responsive_projection(
+    columns: int,
+    rows: int,
+    *,
+    approving: bool = False,
+) -> ResponsiveProjection:
+    safe_columns = max(1, int(columns))
+    safe_rows = max(1, int(rows))
+    if safe_columns >= 100:
+        mode = "full"
+        collapsed_columns = _COLLAPSED_TABLE_COLUMNS
+        expanded_columns = _EXPANDED_TABLE_COLUMNS
+    elif safe_columns >= 70:
+        mode = "compact"
+        collapsed_columns = 8
+        expanded_columns = 12
+    else:
+        mode = "narrow"
+        collapsed_columns = 4
+        expanded_columns = 6
+    minimum_rows = _MIN_APPROVAL_ROWS if approving else _MIN_READY_ROWS
+    transcript_rows = max(0, safe_rows - minimum_rows + 1)
+    return ResponsiveProjection(
+        columns=safe_columns,
+        rows=safe_rows,
+        mode=mode,
+        content_width=max(
+            _MIN_RENDER_WIDTH,
+            min(_MAX_RENDER_WIDTH, safe_columns - 2),
+        ),
+        collapsed_preview_columns=collapsed_columns,
+        expanded_preview_columns=expanded_columns,
+        bordered_cards=mode != "narrow",
+        stacked_metadata=mode == "narrow",
+        two_sided_status=mode == "full",
+        usable=(
+            safe_columns >= _MIN_USABLE_COLUMNS
+            and safe_rows >= minimum_rows
+            and transcript_rows >= 1
+        ),
+        minimum_rows=minimum_rows,
+        transcript_rows=transcript_rows,
+    )
+
+
+def _responsive_for_output(
+    output: Any,
+    state: TerminalViewState,
+) -> ResponsiveProjection:
+    columns, rows = _terminal_size(output)
+    return _responsive_projection(
+        columns,
+        rows,
+        approving=state.approval_panel is not None,
+    )
+
+
+def _status_projection(
+    state: TerminalViewState,
+    *,
+    width: int,
+    mode: str,
+    glyphs: TerminalGlyphs,
+) -> StatusProjection:
+    """Collapse status metadata in the documented deterministic order."""
+
+    agent = _sanitize_terminal_text(
+        state.agent_label,
+        maximum=64,
+        preserve_lines=False,
+        fallback="agent",
+    )
+    model = _sanitize_terminal_text(
+        state.model_label,
+        maximum=96,
+        preserve_lines=False,
+        fallback="model",
+    )
+    source = _sanitize_terminal_text(
+        state.source_summary,
+        maximum=96,
+        preserve_lines=False,
+        fallback="",
+    )
+    if state.running:
+        state_word = _sanitize_terminal_text(
+            state.run_status,
+            maximum=32,
+            preserve_lines=False,
+            fallback="working",
+        )
+        state_glyph = glyphs.running[
+            state.animation_frame % max(1, len(glyphs.running))
+        ]
+    elif state.run_status in {"failed", "interrupted"}:
+        state_word = _sanitize_terminal_text(
+            state.run_status,
+            maximum=32,
+            preserve_lines=False,
+            fallback="failed",
+        )
+        state_glyph = glyphs.failure
+    else:
+        state_word = "ready"
+        state_glyph = glyphs.ready
+
+    show_cost = True
+    show_tokens = True
+    shortened_model = False
+    show_source = bool(source)
+    show_steps = True
+    show_model = True
+    collapsed: list[str] = []
+    budget = max(1, width - 1)
+
+    def current_text() -> tuple[str, str, str]:
+        projected_model = model
+        if shortened_model:
+            projected_model, _truncated = _truncate_display_text(
+                model,
+                18,
+                marker="..." if not glyphs.top_left.startswith("╭") else "…",
+            )
+        left_parts = [agent]
+        if show_model:
+            left_parts.append(projected_model)
+        left_parts.append(f"{state_glyph} {state_word}")
+        right_parts: list[str] = []
+        if show_steps:
+            right_parts.append(f"{state.steps} steps")
+        if show_tokens:
+            right_parts.append(f"{_format_token_count(state.total_tokens)} tokens")
+        if show_cost:
+            right_parts.append(f"${state.estimated_cost}")
+        left = glyphs.separator.join(left_parts)
+        right = glyphs.separator.join(right_parts)
+        header_source = source if show_source else ""
+        return left, right, header_source
+
+    def fits() -> bool:
+        left, right, header_source = current_text()
+        status_width = _display_width(left) + (
+            2 + _display_width(right) if right else 0
+        )
+        header_width = (
+            _display_width(" DAITA ")
+            + _display_width(agent)
+            + (2 + _display_width(header_source) if header_source else 0)
+        )
+        return max(status_width, header_width) <= budget
+
+    forced = 0
+    if mode == "compact":
+        forced = 1
+    elif mode == "narrow":
+        forced = 4
+    for index, field_name in enumerate(
+        ("cost", "tokens", "shorten_model", "source_summary"),
+        start=1,
+    ):
+        if fits() and index > forced:
+            break
+        if field_name == "cost":
+            show_cost = False
+        elif field_name == "tokens":
+            show_tokens = False
+        elif field_name == "shorten_model":
+            shortened_model = True
+        else:
+            show_source = False
+        collapsed.append(field_name)
+
+    if not fits() or mode == "narrow":
+        show_steps = False
+        collapsed.append("steps")
+    if not fits() or mode == "narrow":
+        show_model = False
+        collapsed.append("model")
+    left, right, header_source = current_text()
+    if _display_width(left) > budget:
+        available = max(
+            1,
+            budget - _display_width(f"{glyphs.separator}{state_glyph} {state_word}"),
+        )
+        agent, _truncated = _truncate_display_text(
+            agent,
+            available,
+            marker="..." if glyphs.top_left == "+" else "…",
+        )
+        left, right, header_source = current_text()
+    return StatusProjection(
+        left=left,
+        right=right,
+        source_summary=header_source,
+        collapsed=tuple(collapsed),
+    )
+
+
+def _format_token_count(value: int) -> str:
+    if value < 1_000:
+        return str(value)
+    if value < 1_000_000:
+        return f"{value / 1_000:.1f}k"
+    return f"{value / 1_000_000:.1f}m"
+
+
+def supports_terminal_tui(
+    input_stream: TextIO,
+    output_stream: TextIO,
+    *,
+    enhanced_input: Any = None,
+    enhanced_output: Any = None,
+) -> bool:
+    """Return whether the focused full-screen shell can own these streams."""
+
+    if (enhanced_input is None) != (enhanced_output is None):
+        raise ValueError("TUI input and output must be supplied together")
+    if enhanced_input is not None:
+        return True
+    if input_stream is not sys.stdin or output_stream is not sys.stdout:
+        return False
+    if os.environ.get("TERM", "").strip().casefold() in {"dumb", "unknown"}:
+        return False
+    try:
+        return (
+            input_stream.isatty()
+            and output_stream.isatty()
+            and os.isatty(input_stream.fileno())
+            and os.isatty(output_stream.fileno())
+        )
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+async def run_terminal_tui(
+    state: TerminalViewState,
+    *,
+    run_message: Callable[[str, str | None], Awaitable[Any]],
+    load_transcript: Callable[[str], Awaitable[Transcript]] | None = None,
+    handle_command: Callable[[str, str | None], Awaitable[TerminalCommandResult]],
+    input_stream: TextIO,
+    output_stream: TextIO,
+    suspend_bridge: TerminalSuspendBridge,
+    observer_bridge: TerminalObserverBridge | None = None,
+    approval_bridge: TerminalApprovalBridge | None = None,
+    enhanced_input: Any = None,
+    enhanced_output: Any = None,
+) -> TerminalApplicationResult:
+    """Run the ready-agent shell until exit or a controller-level transition."""
+
+    if not isinstance(state, TerminalViewState):
+        raise TypeError("state must be TerminalViewState")
+    if (enhanced_input is None) != (enhanced_output is None):
+        raise ValueError("TUI input and output must be supplied together")
+    observer_bridge = observer_bridge or TerminalObserverBridge()
+
+    runtime = _load_terminal_runtime()
+    owns_input = enhanced_input is None
+    if enhanced_input is None:
+        try:
+            enhanced_input = runtime["create_input"](stdin=input_stream)
+            enhanced_output = runtime["create_output"](stdout=output_stream)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+            _restore_terminal(enhanced_output)
+            try:
+                enhanced_input.close()
+            except Exception:
+                pass
+            raise TerminalTUIUnavailable(
+                "enhanced terminal admission failed"
+            ) from error
+
+    try:
+        application, approval_previous, deny_pending_approval = _create_application(
+            runtime,
+            state,
+            run_message=run_message,
+            load_transcript=load_transcript,
+            handle_command=handle_command,
+            observer_bridge=observer_bridge,
+            approval_bridge=approval_bridge,
+            enhanced_input=enhanced_input,
+            enhanced_output=enhanced_output,
+        )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        _restore_terminal(enhanced_output)
+        if owns_input:
+            try:
+                enhanced_input.close()
+            except Exception:
+                pass
+        raise TerminalTUIUnavailable("enhanced terminal admission failed") from error
+
+    async def suspend(action: Callable[[], Awaitable[Any]]) -> Any:
+        async with runtime["in_terminal"]():
+            return await action()
+
+    previous = suspend_bridge.install(
+        suspend,
+        enhanced_input=enhanced_input,
+        enhanced_output=enhanced_output,
+    )
+    event_task = asyncio.create_task(
+        _consume_observer_events(
+            observer_bridge,
+            state,
+            application,
+        )
+    )
+    try:
+        result = await _run_application(application)
+        if not isinstance(result, TerminalApplicationResult):
+            raise RuntimeError("terminal application returned an invalid result")
+        return result
+    finally:
+        deny_pending_approval()
+        await asyncio.sleep(0)
+        active = state.active_task
+        if active is not None and not active.done():
+            active.cancel()
+            try:
+                await active
+            except (asyncio.CancelledError, Exception):
+                pass
+        event_task.cancel()
+        try:
+            await event_task
+        except asyncio.CancelledError:
+            pass
+        _project_pending_events(observer_bridge, state)
+        state.settle_cancelled_run()
+        state.active_task = None
+        suspend_bridge.restore(previous)
+        if approval_bridge is not None:
+            approval_bridge.restore(approval_previous)
+        _restore_terminal(enhanced_output)
+        if owns_input:
+            try:
+                enhanced_input.close()
+            except Exception:
+                pass
+
+
+def _load_terminal_runtime() -> dict[str, Any]:
+    try:
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.application.run_in_terminal import in_terminal
+        from prompt_toolkit.completion import WordCompleter
+        from prompt_toolkit.data_structures import Point
+        from prompt_toolkit.filters import Condition
+        from prompt_toolkit.formatted_text import ANSI, FormattedText
+        from prompt_toolkit.history import InMemoryHistory
+        from prompt_toolkit.input import create_input
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import Layout
+        from prompt_toolkit.layout.containers import (
+            ConditionalContainer,
+            HSplit,
+            VSplit,
+            Window,
+        )
+        from prompt_toolkit.layout.controls import FormattedTextControl
+        from prompt_toolkit.layout.dimension import Dimension
+        from prompt_toolkit.layout.margins import ScrollbarMargin
+        from prompt_toolkit.output import create_output
+        from prompt_toolkit.styles import Style
+        from prompt_toolkit.widgets import Frame, TextArea
+        from prompt_toolkit.keys import Keys
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.syntax import Syntax
+        from rich.table import Table
+        from rich.text import Text
+        from rich.theme import Theme
+    except (AttributeError, ImportError) as error:
+        raise ImportError(
+            "Daita's terminal runtime dependency is unavailable. "
+            f"{PIPX_REPAIR_GUIDANCE}"
+        ) from error
+
+    return {
+        "ANSI": ANSI,
+        "Application": Application,
+        "Condition": Condition,
+        "ConditionalContainer": ConditionalContainer,
+        "Console": Console,
+        "Dimension": Dimension,
+        "FormattedText": FormattedText,
+        "FormattedTextControl": FormattedTextControl,
+        "Frame": Frame,
+        "HSplit": HSplit,
+        "InMemoryHistory": InMemoryHistory,
+        "KeyBindings": KeyBindings,
+        "Keys": Keys,
+        "Layout": Layout,
+        "Markdown": Markdown,
+        "Point": Point,
+        "ScrollbarMargin": ScrollbarMargin,
+        "Style": Style,
+        "Syntax": Syntax,
+        "Table": Table,
+        "TextArea": TextArea,
+        "Text": Text,
+        "Theme": Theme,
+        "VSplit": VSplit,
+        "Window": Window,
+        "WordCompleter": WordCompleter,
+        "create_input": create_input,
+        "create_output": create_output,
+        "in_terminal": in_terminal,
+    }
+
+
+def _create_application(
+    runtime: dict[str, Any],
+    state: TerminalViewState,
+    *,
+    run_message: Callable[[str, str | None], Awaitable[Any]],
+    load_transcript: Callable[[str], Awaitable[Transcript]] | None,
+    handle_command: Callable[[str, str | None], Awaitable[TerminalCommandResult]],
+    observer_bridge: TerminalObserverBridge,
+    approval_bridge: TerminalApprovalBridge | None,
+    enhanced_input: Any,
+    enhanced_output: Any,
+) -> tuple[
+    Any,
+    Callable[[ApprovalRequest], Awaitable[ApprovalDecision]] | None,
+    Callable[[], None],
+]:
+    keys = runtime["KeyBindings"]()
+    completion_display = dict(_SLASH_COMMAND_INSERTIONS)
+    composer = runtime["TextArea"](
+        multiline=True,
+        wrap_lines=True,
+        height=runtime["Dimension"](min=1, max=6),
+        prompt=runtime["FormattedText"]([("class:tui.prompt", "› ")]),
+        style="class:tui.composer",
+        name="composer",
+        completer=runtime["WordCompleter"](
+            tuple(completion_display),
+            ignore_case=True,
+            display_dict=completion_display,
+            sentence=True,
+        ),
+        complete_while_typing=False,
+        history=runtime["InMemoryHistory"](),
+    )
+    enforcing_bound = False
+    input_history: list[str] = []
+    history_position = 0
+    history_draft = ""
+
+    def enforce_bound(buffer: Any) -> None:
+        nonlocal enforcing_bound
+        if enforcing_bound or len(buffer.text) <= MAX_COMPOSER_CHARACTERS:
+            return
+        enforcing_bound = True
+        try:
+            document = buffer.document
+            bounded = document.text[:MAX_COMPOSER_CHARACTERS]
+            cursor = min(document.cursor_position, len(bounded))
+            buffer.set_document(
+                document.__class__(bounded, cursor_position=cursor),
+                bypass_readonly=True,
+            )
+            state.notice = f"Input is limited to {MAX_COMPOSER_CHARACTERS} characters."
+        finally:
+            enforcing_bound = False
+
+    composer.buffer.on_text_changed += enforce_bound
+
+    def transcript_fragments() -> list[tuple[str, str]]:
+        width = _render_width(enhanced_output)
+        fragments = _render_transcript_fragments(runtime, state, width=width)
+        state.rendered_line_count = max(
+            1,
+            sum(fragment.count("\n") for _, fragment in fragments) + 1,
+        )
+        if state.follows_bottom:
+            state.transcript_cursor_line = state.rendered_line_count - 1
+        else:
+            state.transcript_cursor_line = min(
+                state.transcript_cursor_line,
+                state.rendered_line_count - 1,
+            )
+        return fragments
+
+    transcript_control = runtime["FormattedTextControl"](
+        transcript_fragments,
+        focusable=False,
+        show_cursor=False,
+        get_cursor_position=lambda: runtime["Point"](
+            x=0,
+            y=max(0, state.transcript_cursor_line),
+        ),
+    )
+    transcript_window = runtime["Window"](
+        content=transcript_control,
+        wrap_lines=True,
+        always_hide_cursor=True,
+        right_margins=[runtime["ScrollbarMargin"](display_arrows=True)],
+    )
+    approval_waiter: asyncio.Future[ApprovalDecision] | None = None
+    approval_lock = asyncio.Lock()
+
+    def resolve_approval(decision: ApprovalDecision) -> None:
+        nonlocal approval_waiter
+        waiter = approval_waiter
+        if waiter is None or waiter.done():
+            return
+        waiter.set_result(decision)
+        state.approval_panel = None
+        state.run_status = "working" if state.running else "ready"
+        try:
+            application.layout.focus(composer)
+            application.invalidate()
+        except Exception:
+            pass
+
+    def approval_fragments() -> list[tuple[str, str]]:
+        panel = state.approval_panel
+        if panel is None:
+            return []
+        try:
+            fragments = _render_approval_panel_fragments(panel)
+        except BaseException:
+            resolve_approval(ApprovalDecision.DENY)
+            return [
+                (
+                    "class:tui.approval.failure",
+                    " Approval denied: review rendering failed.\n",
+                )
+            ]
+        panel.rendered_line_count = max(
+            1,
+            sum(text.count("\n") for _style, text in fragments) + 1,
+        )
+        panel.cursor_line = min(
+            panel.cursor_line,
+            max(0, panel.rendered_line_count - 1),
+        )
+        return fragments
+
+    approval_control = runtime["FormattedTextControl"](
+        approval_fragments,
+        focusable=True,
+        show_cursor=False,
+        get_cursor_position=lambda: runtime["Point"](
+            x=0,
+            y=(
+                state.approval_panel.cursor_line
+                if state.approval_panel is not None
+                else 0
+            ),
+        ),
+    )
+    approval_window = runtime["Window"](
+        content=approval_control,
+        wrap_lines=True,
+        always_hide_cursor=True,
+        height=runtime["Dimension"](min=7, max=14, preferred=10),
+        right_margins=[runtime["ScrollbarMargin"](display_arrows=True)],
+        style="class:tui.approval",
+    )
+    approval_filter = runtime["Condition"](lambda: state.approval_panel is not None)
+
+    async def present_approval(request: ApprovalRequest) -> ApprovalDecision:
+        nonlocal approval_waiter
+        try:
+            async with approval_lock:
+                panel = _approval_panel_for_request(request)
+                if panel is None:
+                    state.notice = (
+                        "Approval denied: exact arguments cannot be reviewed safely."
+                    )
+                    try:
+                        application.invalidate()
+                    except Exception:
+                        pass
+                    return ApprovalDecision.DENY
+                loop = asyncio.get_running_loop()
+                waiter = loop.create_future()
+                approval_waiter = waiter
+                state.approval_panel = panel
+                state.run_status = "approval"
+                try:
+                    approval_fragments()
+                    if state.approval_panel is None:
+                        return ApprovalDecision.DENY
+                    application.layout.focus(approval_window)
+                    application.invalidate()
+                    decision = await waiter
+                except BaseException:
+                    resolve_approval(ApprovalDecision.DENY)
+                    return ApprovalDecision.DENY
+                finally:
+                    if state.approval_panel is panel:
+                        state.approval_panel = None
+                    if approval_waiter is waiter:
+                        approval_waiter = None
+                    state.run_status = "working" if state.running else "ready"
+                    try:
+                        application.layout.focus(composer)
+                        application.invalidate()
+                    except Exception:
+                        pass
+                return (
+                    decision
+                    if isinstance(decision, ApprovalDecision)
+                    else ApprovalDecision.DENY
+                )
+        except BaseException:
+            return ApprovalDecision.DENY
+
+    def deny_pending_approval() -> None:
+        resolve_approval(ApprovalDecision.DENY)
+
+    def invalidate(application: Any) -> None:
+        application.invalidate()
+
+    async def execute_message(application: Any, message: str) -> None:
+        try:
+            result = await run_message(message, state.conversation_id)
+            _project_pending_events(observer_bridge, state)
+            if result is None:
+                state.settle_cancelled_run()
+                state.notice = "Run interrupted; returning to the composer."
+            else:
+                hydration_notice = ""
+                run_id = getattr(result, "run_id", None)
+                if load_transcript is not None and isinstance(run_id, str) and run_id:
+                    try:
+                        transcript = await load_transcript(run_id)
+                    except asyncio.CancelledError:
+                        _clear_current_task_cancellation()
+                        hydration_notice = (
+                            "Run completed; recorded tool details are unavailable."
+                        )
+                    except Exception:
+                        hydration_notice = (
+                            "Run completed; recorded tool details are unavailable."
+                        )
+                    else:
+                        try:
+                            state.hydrate_transcript(transcript, run_id=run_id)
+                        except Exception:
+                            hydration_notice = (
+                                "Run completed; recorded tool details are unavailable."
+                            )
+                state.apply_result(result)
+                if hydration_notice:
+                    state.notice = hydration_notice
+        except asyncio.CancelledError:
+            _project_pending_events(observer_bridge, state)
+            state.settle_cancelled_run()
+            state.notice = "Run interrupted; returning to the composer."
+        except BaseException as error:
+            application.exit(exception=error)
+            return
+        finally:
+            _project_pending_events(observer_bridge, state)
+            state.running = False
+            state.active_task = None
+            invalidate(application)
+
+    async def execute_command(application: Any, command: str) -> None:
+        try:
+            async with runtime["in_terminal"]():
+                result = await handle_command(command, state.conversation_id)
+            state.conversation_id = result.conversation_id
+            state.append_local(result.presentation, result.output)
+            if result.action is not None:
+                application.exit(
+                    result=TerminalApplicationResult(
+                        conversation_id=result.conversation_id,
+                        action=result.action,
+                    )
+                )
+                return
+            state.notice = ""
+        except BaseException as error:
+            application.exit(exception=error)
+            return
+        finally:
+            state.running = False
+            state.active_task = None
+            invalidate(application)
+
+    def start_task(application: Any, coroutine: Awaitable[None]) -> None:
+        state.running = True
+        state.run_status = "working"
+        state.notice = ""
+        state.active_task = application.create_background_task(coroutine)
+        invalidate(application)
+
+    @keys.add("c-m", eager=True)
+    def submit(event: Any) -> None:
+        nonlocal history_position, history_draft
+        if state.approval_panel is not None:
+            resolve_approval(ApprovalDecision.DENY)
+            return
+        active = state.active_task
+        if state.running or (active is not None and not active.done()):
+            state.notice = "A run is already active; Ctrl-C cancels it."
+            invalidate(event.app)
+            return
+        message = composer.buffer.text.strip()
+        if not message:
+            state.notice = "Enter a message before submitting."
+            invalidate(event.app)
+            return
+        if len(message) > MAX_COMPOSER_CHARACTERS:
+            state.notice = f"Input is limited to {MAX_COMPOSER_CHARACTERS} characters."
+            invalidate(event.app)
+            return
+        input_history.append(message)
+        history_position = len(input_history)
+        history_draft = ""
+        composer.buffer.reset(append_to_history=True)
+        if message.startswith("/"):
+            start_task(event.app, execute_command(event.app, message))
+            return
+        state.append_user(message)
+        start_task(event.app, execute_message(event.app, message))
+
+    @keys.add("c-j", eager=True)
+    def insert_newline(event: Any) -> None:
+        if state.approval_panel is not None:
+            resolve_approval(ApprovalDecision.DENY)
+            return
+        if len(composer.buffer.text) < MAX_COMPOSER_CHARACTERS:
+            composer.buffer.insert_text("\n")
+        else:
+            state.notice = f"Input is limited to {MAX_COMPOSER_CHARACTERS} characters."
+        invalidate(event.app)
+
+    @keys.add("c-c", eager=True)
+    def interrupt(event: Any) -> None:
+        if state.approval_panel is not None:
+            resolve_approval(ApprovalDecision.DENY)
+            return
+        active = state.active_task
+        if active is not None and not active.done():
+            state.notice = "Cancelling the active run…"
+            active.cancel()
+        else:
+            state.notice = "Input interrupted; composer remains active."
+        invalidate(event.app)
+
+    @keys.add("c-d", eager=True)
+    def end_of_file(event: Any) -> None:
+        if state.approval_panel is not None:
+            resolve_approval(ApprovalDecision.DENY)
+            return
+        if composer.buffer.text:
+            composer.buffer.delete()
+            return
+        active = state.active_task
+        if state.running or (active is not None and not active.done()):
+            state.notice = "A run is active; Ctrl-C cancels it."
+            invalidate(event.app)
+            return
+        event.app.exit(
+            result=TerminalApplicationResult(
+                conversation_id=state.conversation_id,
+                action="exit",
+            )
+        )
+
+    @keys.add("pageup", eager=True)
+    def page_up(event: Any) -> None:
+        panel = state.approval_panel
+        if panel is not None:
+            panel.move(-max(1, _viewport_height(approval_window)))
+            invalidate(event.app)
+            return
+        height = _viewport_height(transcript_window)
+        state.move_transcript(-height)
+        invalidate(event.app)
+
+    @keys.add("pagedown", eager=True)
+    def page_down(event: Any) -> None:
+        panel = state.approval_panel
+        if panel is not None:
+            panel.move(max(1, _viewport_height(approval_window)))
+            invalidate(event.app)
+            return
+        height = _viewport_height(transcript_window)
+        state.move_transcript(height)
+        invalidate(event.app)
+
+    @keys.add("c-o", eager=True)
+    def toggle_tool_detail(event: Any) -> None:
+        if state.approval_panel is not None:
+            resolve_approval(ApprovalDecision.DENY)
+            return
+        if state.toggle_expanded_detail():
+            state.notice = ""
+        else:
+            state.notice = "No completed tool details are available."
+        invalidate(event.app)
+
+    @keys.add("c-l", eager=True)
+    def redraw(event: Any) -> None:
+        if state.approval_panel is not None:
+            resolve_approval(ApprovalDecision.DENY)
+            return
+        event.app.renderer.clear()
+        invalidate(event.app)
+
+    @keys.add("tab", eager=True)
+    def complete_command(event: Any) -> None:
+        if state.approval_panel is not None:
+            resolve_approval(ApprovalDecision.DENY)
+            return
+        buffer = composer.buffer
+        if buffer.complete_state is None:
+            buffer.start_completion(select_first=True)
+        else:
+            buffer.complete_next()
+        invalidate(event.app)
+
+    escape_filter = runtime["Condition"](
+        lambda: state.approval_panel is not None
+        or composer.buffer.complete_state is not None
+    )
+
+    @keys.add("escape", filter=escape_filter, eager=True)
+    def escape(event: Any) -> None:
+        if state.approval_panel is not None:
+            resolve_approval(ApprovalDecision.DENY)
+            return
+        if composer.buffer.complete_state is not None:
+            composer.buffer.cancel_completion()
+            invalidate(event.app)
+
+    @keys.add("up", eager=True)
+    def move_up(event: Any) -> None:
+        nonlocal history_position, history_draft
+        panel = state.approval_panel
+        if panel is not None:
+            panel.move(-1)
+        elif composer.buffer.complete_state is not None:
+            composer.buffer.complete_previous()
+        elif composer.buffer.document.cursor_position_row > 0:
+            composer.buffer.cursor_up()
+        elif input_history:
+            if history_position >= len(input_history):
+                history_draft = composer.buffer.text
+            history_position = max(0, history_position - 1)
+            _replace_composer_text(composer.buffer, input_history[history_position])
+        invalidate(event.app)
+
+    @keys.add("down", eager=True)
+    def move_down(event: Any) -> None:
+        nonlocal history_position
+        panel = state.approval_panel
+        if panel is not None:
+            panel.move(1)
+        elif composer.buffer.complete_state is not None:
+            composer.buffer.complete_next()
+        elif (
+            composer.buffer.document.cursor_position_row
+            < composer.buffer.document.line_count - 1
+        ):
+            composer.buffer.cursor_down()
+        elif history_position < len(input_history) - 1:
+            history_position += 1
+            _replace_composer_text(composer.buffer, input_history[history_position])
+        elif history_position == len(input_history) - 1:
+            history_position = len(input_history)
+            _replace_composer_text(composer.buffer, history_draft)
+        invalidate(event.app)
+
+    @keys.add("home", filter=approval_filter, eager=True)
+    def approval_home(event: Any) -> None:
+        panel = state.approval_panel
+        if panel is not None:
+            panel.cursor_line = 0
+        invalidate(event.app)
+
+    @keys.add("end", filter=approval_filter, eager=True)
+    def approval_end(event: Any) -> None:
+        panel = state.approval_panel
+        if panel is not None:
+            panel.cursor_line = max(0, panel.rendered_line_count - 1)
+        invalidate(event.app)
+
+    @keys.add(runtime["Keys"].Any, filter=approval_filter, eager=True)
+    def approval_character(event: Any) -> None:
+        key = str(event.data).casefold()
+        resolve_approval(
+            ApprovalDecision.APPROVE if key == "a" else ApprovalDecision.DENY
+        )
+
+    header = runtime["VSplit"](
+        [
+            runtime["Window"](
+                runtime["FormattedTextControl"](
+                    lambda: [
+                        ("class:tui.identity", " DAITA "),
+                        (
+                            "class:tui.header.agent",
+                            _sanitize_terminal_text(
+                                state.agent_label,
+                                maximum=128,
+                                preserve_lines=False,
+                                fallback="agent",
+                            ),
+                        ),
+                    ]
+                ),
+                height=1,
+                dont_extend_height=True,
+            ),
+            runtime["Window"](
+                runtime["FormattedTextControl"](
+                    lambda: [
+                        (
+                            "class:tui.header.meta",
+                            _sanitize_terminal_text(
+                                state.source_summary,
+                                maximum=256,
+                                preserve_lines=False,
+                                fallback="",
+                            )
+                            + " ",
+                        )
+                    ]
+                ),
+                height=1,
+                dont_extend_height=True,
+                align="RIGHT",
+            ),
+        ],
+        height=1,
+    )
+    rule = runtime["Window"](
+        height=1,
+        char="─",
+        style="class:tui.rule",
+        dont_extend_height=True,
+    )
+    composer_frame = runtime["Frame"](
+        composer,
+        style="class:tui.composer.frame",
+    )
+    approval_container = runtime["ConditionalContainer"](
+        runtime["Frame"](
+            approval_window,
+            title="APPROVAL REQUIRED",
+            style="class:tui.approval.frame",
+        ),
+        filter=approval_filter,
+    )
+    status = runtime["VSplit"](
+        [
+            runtime["Window"](
+                runtime["FormattedTextControl"](lambda: _status_left_fragments(state)),
+                height=1,
+                dont_extend_height=True,
+            ),
+            runtime["Window"](
+                runtime["FormattedTextControl"](lambda: _status_right_fragments(state)),
+                height=1,
+                dont_extend_height=True,
+                align="RIGHT",
+            ),
+        ],
+        height=1,
+    )
+    root = runtime["HSplit"](
+        [
+            header,
+            rule,
+            transcript_window,
+            approval_container,
+            composer_frame,
+            status,
+        ]
+    )
+    application = runtime["Application"](
+        layout=runtime["Layout"](root, focused_element=composer),
+        key_bindings=keys,
+        full_screen=True,
+        erase_when_done=True,
+        mouse_support=False,
+        input=enhanced_input,
+        output=enhanced_output,
+        style=runtime["Style"].from_dict(_semantic_style_rules()),
+        terminal_size_polling_interval=0.05,
+    )
+    application.ttimeoutlen = 0.01
+    approval_previous = (
+        approval_bridge.install(present_approval)
+        if approval_bridge is not None
+        else None
+    )
+    return application, approval_previous, deny_pending_approval
+
+
+async def _run_application(application: Any) -> Any:
+    return await application.run_async()
+
+
+def _replace_composer_text(buffer: Any, value: str) -> None:
+    buffer.set_document(
+        buffer.document.__class__(value, cursor_position=len(value)),
+        bypass_readonly=True,
+    )
+
+
+async def _consume_observer_events(
+    bridge: TerminalObserverBridge,
+    state: TerminalViewState,
+    application: Any,
+) -> None:
+    while True:
+        projected = _project_pending_events(bridge, state)
+        if state.running:
+            state.animation_frame = (state.animation_frame + 1) % len(_RUNNING_GLYPHS)
+        if projected or state.running:
+            try:
+                application.invalidate()
+            except Exception:
+                pass
+        await asyncio.sleep(_ANIMATION_INTERVAL_SECONDS)
+
+
+def _project_pending_events(
+    bridge: TerminalObserverBridge,
+    state: TerminalViewState,
+) -> int:
+    try:
+        pending = bridge.drain()
+    except Exception:
+        return 0
+    projected = 0
+    for event in pending:
+        try:
+            state.apply_event(event)
+        except Exception:
+            continue
+        projected += 1
+    return projected
+
+
+def _completed_tool_pairs(
+    transcript: Transcript,
+) -> tuple[tuple[ToolCall, ToolResultBlock | None], ...]:
+    calls: list[ToolCall] = []
+    call_ids: set[str] = set()
+    results: dict[str, ToolResultBlock] = {}
+    for message in transcript.messages:
+        if message.role is MessageRole.ASSISTANT:
+            for call in message.tool_calls:
+                if call.id in call_ids:
+                    raise ValueError("completed transcript repeats a tool call ID")
+                call_ids.add(call.id)
+                calls.append(call)
+        elif message.role is MessageRole.TOOL:
+            for block in message.content:
+                if not isinstance(block, ToolResultBlock):
+                    raise TypeError("tool transcript message contains non-tool content")
+                if block.call_id in results:
+                    raise ValueError("completed transcript repeats a tool result ID")
+                results[block.call_id] = block
+    if not set(results).issubset(call_ids):
+        raise ValueError("completed transcript contains an unmatched tool result")
+    return tuple((call, results.get(call.id)) for call in calls)
+
+
+def _slash_command_completion_surface() -> tuple[str, ...]:
+    """Return the documented terminal-local completion choices."""
+
+    return _SLASH_COMMAND_SURFACE
+
+
+def _approval_panel_for_request(
+    request: ApprovalRequest,
+) -> ApprovalPanelState | None:
+    if not isinstance(request, ApprovalRequest):
+        raise TypeError("approval presentation requires ApprovalRequest")
+    arguments = request.arguments.to_dict()
+    if _contains_sensitive_key(arguments):
+        return None
+    rendered = json.dumps(
+        arguments,
+        ensure_ascii=True,
+        allow_nan=False,
+        indent=2,
+        sort_keys=True,
+    )
+    if len(rendered) > MAX_APPROVAL_DOCUMENT_CHARACTERS:
+        return None
+    return ApprovalPanelState(
+        tool_name=_sanitize_terminal_text(
+            request.tool_name,
+            maximum=256,
+            preserve_lines=False,
+            fallback="tool",
+        ),
+        capability_id=_sanitize_terminal_text(
+            request.capability_id,
+            maximum=256,
+            preserve_lines=False,
+            fallback="capability",
+        ),
+        arguments_text=rendered,
+    )
+
+
+def _contains_sensitive_key(value: object, *, key: str = "") -> bool:
+    normalized_key = key.casefold().replace("-", "_")
+    if key and any(part in normalized_key for part in _SENSITIVE_KEY_PARTS):
+        return True
+    if isinstance(value, Mapping):
+        return any(
+            _contains_sensitive_key(item, key=str(item_key))
+            for item_key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_sensitive_key(item) for item in value)
+    return False
+
+
+def _render_approval_panel_fragments(
+    panel: ApprovalPanelState,
+) -> list[tuple[str, str]]:
+    if not isinstance(panel, ApprovalPanelState):
+        raise TypeError("approval panel must be ApprovalPanelState")
+    return [
+        ("class:tui.approval.label", " Tool          "),
+        ("class:tui.approval.identity", f"{panel.tool_name}\n"),
+        ("class:tui.approval.label", " Capability    "),
+        ("class:tui.approval.identity", f"{panel.capability_id}\n\n"),
+        ("class:tui.approval.label", " Exact arguments\n"),
+        ("class:tui.approval.arguments", f"{panel.arguments_text}\n\n"),
+        (
+            "class:tui.approval.action",
+            " [A] Approve once                                      [D] Deny\n",
+        ),
+    ]
+
+
+def _project_tool_details(
+    call: ToolCall,
+    result: ToolResultBlock,
+) -> ToolCardDetails:
+    arguments = thaw_json(freeze_json(call.arguments))
+    output = thaw_json(freeze_json(result.output))
+    assert isinstance(arguments, dict)
+    assert isinstance(output, dict)
+
+    code_value = arguments.get("sql")
+    code_language = "sql"
+    if not isinstance(code_value, str):
+        code_value = arguments.get("code")
+        code_language = "text"
+
+    presented_arguments = _redact_presentation_value(arguments)
+    assert isinstance(presented_arguments, dict)
+    presented_arguments.pop("sql", None)
+    presented_arguments.pop("code", None)
+    arguments_text = (
+        _bounded_json_text(presented_arguments) if presented_arguments else None
+    )
+
+    if result.is_error:
+        error = output.get("error")
+        error_mapping = error if isinstance(error, dict) else {}
+        error_code = _sanitize_terminal_text(
+            error_mapping.get("code"),
+            maximum=128,
+            preserve_lines=False,
+            fallback="tool_failed",
+        )
+        error_message = _bounded_plain_text(
+            error_mapping.get("message"),
+            fallback="Tool execution failed.",
+        )
+        error_details = error_mapping.get("details")
+        result_text = (
+            _bounded_json_text(_redact_presentation_value(error_details))
+            if error_details not in (None, {}, [])
+            else None
+        )
+        summary = _one_logical_line(f"{error_code} · {error_message}")
+        arguments_text, fitted_error_message, result_text = _fit_detail_text_budget(
+            arguments_text,
+            error_message,
+            result_text,
+        )
+        assert fitted_error_message is not None
+        return ToolCardDetails(
+            summary=summary,
+            code=_bounded_code_text(code_value),
+            code_language=code_language if isinstance(code_value, str) else None,
+            arguments_text=arguments_text,
+            result_text=result_text,
+            error_message=fitted_error_message,
+        )
+
+    data = output.get("data")
+    data_mapping = data if isinstance(data, dict) else None
+    if not isinstance(code_value, str) and data_mapping is not None:
+        canonical_sql = data_mapping.get("canonical_sql")
+        if isinstance(canonical_sql, str):
+            code_value = canonical_sql
+            code_language = "sql"
+
+    table = _project_table_preview(data_mapping)
+    result_kind = _sanitize_terminal_text(
+        output.get("kind"),
+        maximum=256,
+        preserve_lines=False,
+        fallback="Tool result",
+    )
+    if table is not None:
+        assert data_mapping is not None
+        result_projection = {
+            key: value
+            for key, value in data_mapping.items()
+            if key not in {"rows", "columns", "canonical_sql"}
+        }
+        result_text = (
+            _bounded_json_text(_redact_presentation_value(result_projection))
+            if result_projection
+            else None
+        )
+        summary = (
+            f"{table.recorded_rows} recorded rows · "
+            f"{table.recorded_columns} columns"
+        )
+    else:
+        result_text = (
+            _bounded_json_text(_redact_presentation_value(data))
+            if data is not None
+            else None
+        )
+        summary = result_kind
+    if isinstance(code_value, str):
+        summary = _one_logical_line(code_value)
+    elif result_text is not None and summary == "Tool result":
+        summary = _one_logical_line(result_text)
+    arguments_text, _unused_error, result_text = _fit_detail_text_budget(
+        arguments_text,
+        None,
+        result_text,
+    )
+    return ToolCardDetails(
+        summary=_sanitize_terminal_text(
+            summary,
+            maximum=_MAX_RENDER_CHARACTERS,
+            preserve_lines=False,
+            fallback="Completed.",
+        ),
+        code=_bounded_code_text(code_value),
+        code_language=code_language if isinstance(code_value, str) else None,
+        arguments_text=arguments_text,
+        result_text=result_text,
+        table=table,
+    )
+
+
+def _project_table_preview(
+    data: dict[str, object] | None,
+) -> ToolTablePreview | None:
+    if data is None:
+        return None
+    raw_rows = data.get("rows")
+    if not isinstance(raw_rows, list):
+        return None
+    raw_columns = data.get("columns")
+    if isinstance(raw_columns, list) and all(
+        isinstance(column, str) for column in raw_columns
+    ):
+        columns = list(raw_columns)
+    elif raw_rows and isinstance(raw_rows[0], dict):
+        columns = list(raw_rows[0])
+    else:
+        return None
+
+    projected_columns: list[str] = []
+    for column in columns[:_EXPANDED_TABLE_COLUMNS]:
+        projected, _truncated = _truncate_display_text(
+            _sanitize_terminal_text(
+                column,
+                maximum=_MAX_CELL_DISPLAY_CHARACTERS * 2,
+                preserve_lines=False,
+                fallback="column",
+            ),
+            _MAX_CELL_DISPLAY_CHARACTERS,
+        )
+        projected_columns.append(projected)
+
+    rows: list[tuple[str, ...]] = []
+    cells_truncated = False
+    for raw_row in raw_rows[:_EXPANDED_TABLE_ROWS]:
+        if not isinstance(raw_row, dict):
+            continue
+        row: list[str] = []
+        for column in columns[:_EXPANDED_TABLE_COLUMNS]:
+            cell, truncated = _cell_text(raw_row.get(column))
+            row.append(cell)
+            cells_truncated = cells_truncated or truncated
+        rows.append(tuple(row))
+
+    total_rows = data.get("total_rows")
+    if (
+        not isinstance(total_rows, int)
+        or isinstance(total_rows, bool)
+        or total_rows < len(raw_rows)
+    ):
+        total_rows = None
+    return ToolTablePreview(
+        columns=tuple(projected_columns),
+        rows=tuple(rows),
+        recorded_rows=len(raw_rows),
+        recorded_columns=len(columns),
+        total_rows=total_rows,
+        cells_truncated=cells_truncated,
+    )
+
+
+def _redact_presentation_value(value: object, *, key: str = "") -> object:
+    normalized_key = key.casefold().replace("-", "_")
+    if key and any(part in normalized_key for part in _SENSITIVE_KEY_PARTS):
+        return "[redacted]"
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): _redact_presentation_value(item, key=str(item_key))
+            for item_key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_presentation_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_presentation_value(item) for item in value]
+    return value
+
+
+def _bounded_json_text(value: object) -> str:
+    try:
+        rendered = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=2,
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        rendered = json.dumps(
+            _sanitize_terminal_text(
+                str(value),
+                maximum=_MAX_DETAIL_UTF8_BYTES,
+                preserve_lines=True,
+                fallback="",
+            ),
+            ensure_ascii=False,
+        )
+    safe = _sanitize_terminal_text(
+        rendered,
+        maximum=max(1, len(rendered) + 1),
+        preserve_lines=True,
+        fallback="{}",
+    )
+    return _bound_utf8_detail(safe)
+
+
+def _bounded_plain_text(value: object, *, fallback: str) -> str:
+    if not isinstance(value, str):
+        return fallback
+    safe = _sanitize_terminal_text(
+        value,
+        maximum=max(1, len(value) + 1),
+        preserve_lines=True,
+        fallback=fallback,
+    )
+    return _bound_utf8_detail(safe)
+
+
+def _bounded_code_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return _sanitize_terminal_text(
+        value,
+        maximum=_MAX_CODE_VISIBLE_LINES * _MAX_RENDER_CHARACTERS,
+        preserve_lines=True,
+        fallback="",
+    )
+
+
+def _bound_utf8_detail(value: str) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= _MAX_DETAIL_UTF8_BYTES:
+        return value
+    indicator = f"\n… detail truncated at {_MAX_DETAIL_UTF8_BYTES // 1_024} KiB"
+    indicator_bytes = indicator.encode("utf-8")
+    prefix = encoded[: _MAX_DETAIL_UTF8_BYTES - len(indicator_bytes)].decode(
+        "utf-8",
+        errors="ignore",
+    )
+    return prefix + indicator
+
+
+def _fit_detail_text_budget(
+    arguments_text: str | None,
+    error_message: str | None,
+    result_text: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    values = [arguments_text, error_message, result_text]
+    combined_bytes = sum(
+        len(value.encode("utf-8")) for value in values if value is not None
+    )
+    if combined_bytes <= _MAX_DETAIL_UTF8_BYTES:
+        return arguments_text, error_message, result_text
+
+    indicator = "\n… remaining text/JSON detail omitted at 16 KiB"
+    indicator_bytes = indicator.encode("utf-8")
+    content_budget = _MAX_DETAIL_UTF8_BYTES - len(indicator_bytes)
+    projected: list[str | None] = [None, None, None]
+    used = 0
+    last_index: int | None = None
+    for index, value in enumerate(values):
+        if value is None:
+            continue
+        separator_bytes = 1 if last_index is not None else 0
+        available = content_budget - used - separator_bytes
+        if available <= 0:
+            break
+        encoded = value.encode("utf-8")
+        if len(encoded) <= available:
+            projected[index] = value
+            used += separator_bytes + len(encoded)
+            last_index = index
+            continue
+        projected[index] = encoded[:available].decode("utf-8", errors="ignore")
+        last_index = index
+        break
+    if last_index is None:
+        projected[0] = indicator.lstrip("\n")
+    else:
+        projected[last_index] = (projected[last_index] or "") + indicator
+    return projected[0], projected[1], projected[2]
+
+
+def _cell_text(value: object) -> tuple[str, bool]:
+    if isinstance(value, str):
+        rendered = value
+    else:
+        try:
+            rendered = json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError):
+            rendered = str(value)
+    safe = _sanitize_terminal_text(
+        rendered,
+        maximum=max(1, min(len(rendered) + 1, 4 * _MAX_CELL_DISPLAY_CHARACTERS)),
+        preserve_lines=False,
+        fallback="",
+    )
+    truncated_before_display = len(safe) < len(rendered)
+    projected, display_truncated = _truncate_display_text(
+        safe,
+        _MAX_CELL_DISPLAY_CHARACTERS,
+    )
+    return projected, truncated_before_display or display_truncated
+
+
+def _tool_result_error_code(result: ToolResultBlock) -> str:
+    error = result.output.get("error")
+    if isinstance(error, Mapping):
+        return _sanitize_terminal_text(
+            error.get("code"),
+            maximum=128,
+            preserve_lines=False,
+            fallback="tool_failed",
+        )
+    return "tool_failed"
+
+
+def _render_transcript_fragments(
+    runtime: dict[str, Any],
+    state: TerminalViewState,
+    *,
+    width: int,
+) -> list[tuple[str, str]]:
+    if not state.blocks:
+        return [
+            (
+                "class:tui.empty",
+                "\n  Ask Daita about the data in your current catalog.\n",
+            )
+        ]
+    fragments: list[tuple[str, str]] = [("", "\n")]
+    for block in state.blocks:
+        if block.kind == "user":
+            fragments.extend(
+                [
+                    ("class:tui.user.label", " You\n"),
+                    ("", f" {block.text}\n\n"),
+                ]
+            )
+        elif block.kind == "assistant":
+            fragments.append(("class:tui.assistant.label", " Daita\n"))
+            fragments.extend(
+                _render_markdown_fragments(runtime, block.text, width=width)
+            )
+            fragments.append(("", "\n"))
+        elif block.kind == "metadata":
+            fragments.append(("class:tui.metadata", f" {block.text}\n\n"))
+        elif block.kind in {
+            "local.status",
+            "local.sources",
+            "local.catalog",
+            "local.settings",
+        }:
+            presentation = block.kind.removeprefix("local.")
+            label = {
+                "status": "Status",
+                "sources": "Sources",
+                "catalog": "Catalog",
+                "settings": "Settings",
+            }[presentation]
+            fragments.extend(
+                [
+                    (
+                        f"class:tui.local.{presentation}.label",
+                        f" {label}\n",
+                    ),
+                    (
+                        f"class:tui.local.{presentation}",
+                        f" {block.text}\n\n",
+                    ),
+                ]
+            )
+        elif block.kind == "tool":
+            try:
+                fragments.extend(
+                    _render_tool_card_fragments(
+                        block.tool_card or state.tool_cards.get(block.text),
+                        width=width,
+                        runtime=runtime,
+                    )
+                )
+            except Exception:
+                fragments.extend(
+                    [
+                        ("class:tui.tool.failure", " ! Tool status unavailable\n"),
+                        ("", "\n"),
+                    ]
+                )
+        else:
+            fragments.extend(
+                [
+                    ("class:tui.local.label", " Local\n"),
+                    ("class:tui.local", f" {block.text}\n\n"),
+                ]
+            )
+    return fragments
+
+
+def _render_tool_card_fragments(
+    card: ToolCardState | None,
+    *,
+    width: int,
+    runtime: dict[str, Any] | None = None,
+) -> list[tuple[str, str]]:
+    if not isinstance(card, ToolCardState):
+        return [
+            ("class:tui.tool.failure", " ! Tool status unavailable\n"),
+            ("", "\n"),
+        ]
+    safe_width = max(_MIN_RENDER_WIDTH, min(width, _MAX_RENDER_WIDTH))
+    runtime = _load_terminal_runtime() if runtime is None else runtime
+    label = _sanitize_terminal_text(
+        card.label,
+        maximum=max(8, safe_width - 16),
+        preserve_lines=False,
+        fallback="Tool call",
+    )
+    if card.state == "running":
+        glyph = _RUNNING_GLYPHS[0]
+        style = "class:tui.tool.running"
+        fallback_body = "Running…"
+    elif card.state == "approval":
+        glyph = "!"
+        style = "class:tui.tool.approval"
+        fallback_body = "Approval required…"
+    elif card.state == "succeeded":
+        glyph = "✓"
+        style = "class:tui.tool.success"
+        fallback_body = "Completed."
+    else:
+        glyph = "!"
+        style = "class:tui.tool.failure"
+        fallback_body = _sanitize_terminal_text(
+            card.error_code,
+            maximum=max(8, safe_width - 8),
+            preserve_lines=False,
+            fallback="Tool failed.",
+        )
+    duration = (
+        f" · {_format_duration(card.duration_ms)}"
+        if card.duration_ms is not None
+        else ""
+    )
+    title = _sanitize_terminal_text(
+        f"{glyph} {label}{duration}",
+        maximum=max(8, safe_width - 7),
+        preserve_lines=False,
+        fallback=f"{glyph} Tool call",
+    )
+    top_fill = "─" * max(1, safe_width - _display_width(title) - 6)
+    bottom_fill = "─" * max(4, safe_width - 3)
+    fragments: list[tuple[str, str]] = [
+        (style, f" ╭─ {title} {top_fill}╮\n"),
+    ]
+    if card.details is None or card.state not in {"succeeded", "failed"}:
+        fragments.extend(
+            _card_plain_lines(
+                (
+                    _sanitize_terminal_text(
+                        fallback_body,
+                        maximum=max(8, safe_width - 7),
+                        preserve_lines=False,
+                        fallback="Status unavailable.",
+                    ),
+                ),
+                style=style,
+            )
+        )
+    else:
+        fragments.extend(
+            _render_tool_details(
+                runtime,
+                card,
+                width=max(_MIN_RENDER_WIDTH, safe_width - 6),
+                border_style=style,
+            )
+        )
+    fragments.extend(
+        [
+            (style, f" ╰{bottom_fill}╯\n"),
+            ("", "\n"),
+        ]
+    )
+    return fragments
+
+
+def _render_tool_details(
+    runtime: dict[str, Any],
+    card: ToolCardState,
+    *,
+    width: int,
+    border_style: str,
+) -> list[tuple[str, str]]:
+    details = card.details
+    if details is None:
+        return _card_plain_lines(("Status unavailable.",), style=border_style)
+
+    fragments: list[tuple[str, str]] = []
+    if not card.expanded:
+        summary, _truncated = _truncate_display_text(
+            _one_logical_line(details.summary),
+            max(8, width),
+        )
+        fragments.extend(_card_plain_lines((summary,), style=border_style))
+        if details.table is not None:
+            fragments.extend(
+                _card_rich_lines(
+                    runtime,
+                    _table_renderable(
+                        runtime,
+                        details.table,
+                        row_limit=_COLLAPSED_TABLE_ROWS,
+                        column_limit=_COLLAPSED_TABLE_COLUMNS,
+                        width=width,
+                    ),
+                    width=width,
+                    border_style=border_style,
+                )
+            )
+            fragments.extend(
+                _card_plain_lines(
+                    _table_truncation_lines(
+                        details.table,
+                        shown_rows=min(
+                            _COLLAPSED_TABLE_ROWS,
+                            len(details.table.rows),
+                        ),
+                        shown_columns=min(
+                            _COLLAPSED_TABLE_COLUMNS,
+                            len(details.table.columns),
+                        ),
+                    ),
+                    style=border_style,
+                )
+            )
+        fragments.extend(_card_plain_lines(("Ctrl+O expand",), style=border_style))
+        return fragments
+
+    if details.code is not None:
+        label = "SQL" if details.code_language == "sql" else "Code"
+        fragments.extend(_card_plain_lines((label,), style=border_style))
+        syntax = runtime["Syntax"](
+            details.code,
+            details.code_language or "text",
+            theme="ansi_dark",
+            background_color="default",
+            line_numbers=False,
+            word_wrap=True,
+        )
+        fragments.extend(
+            _card_rich_lines(
+                runtime,
+                syntax,
+                width=width,
+                border_style=border_style,
+                maximum_lines=_MAX_CODE_VISIBLE_LINES,
+                truncation_line=(
+                    f"… code truncated at {_MAX_CODE_VISIBLE_LINES} visible lines"
+                ),
+            )
+        )
+    if details.arguments_text is not None:
+        fragments.extend(_card_plain_lines(("Arguments",), style=border_style))
+        fragments.extend(
+            _card_rich_lines(
+                runtime,
+                runtime["Syntax"](
+                    details.arguments_text,
+                    "json",
+                    theme="ansi_dark",
+                    background_color="default",
+                    line_numbers=False,
+                    word_wrap=True,
+                ),
+                width=width,
+                border_style=border_style,
+            )
+        )
+    if details.error_message is not None:
+        fragments.extend(
+            _card_plain_lines(
+                ("Error", details.error_message),
+                style=border_style,
+            )
+        )
+    if details.table is not None:
+        fragments.extend(_card_plain_lines(("Recorded result",), style=border_style))
+        fragments.extend(
+            _card_rich_lines(
+                runtime,
+                _table_renderable(
+                    runtime,
+                    details.table,
+                    row_limit=_EXPANDED_TABLE_ROWS,
+                    column_limit=_EXPANDED_TABLE_COLUMNS,
+                    width=width,
+                ),
+                width=width,
+                border_style=border_style,
+            )
+        )
+        fragments.extend(
+            _card_plain_lines(
+                _table_truncation_lines(
+                    details.table,
+                    shown_rows=min(_EXPANDED_TABLE_ROWS, len(details.table.rows)),
+                    shown_columns=min(
+                        _EXPANDED_TABLE_COLUMNS,
+                        len(details.table.columns),
+                    ),
+                ),
+                style=border_style,
+            )
+        )
+    if details.result_text is not None:
+        fragments.extend(_card_plain_lines(("Result details",), style=border_style))
+        fragments.extend(
+            _card_rich_lines(
+                runtime,
+                runtime["Syntax"](
+                    details.result_text,
+                    "json",
+                    theme="ansi_dark",
+                    background_color="default",
+                    line_numbers=False,
+                    word_wrap=True,
+                ),
+                width=width,
+                border_style=border_style,
+            )
+        )
+    fragments.extend(_card_plain_lines(("Ctrl+O collapse",), style=border_style))
+    return fragments
+
+
+def _table_renderable(
+    runtime: dict[str, Any],
+    preview: ToolTablePreview,
+    *,
+    row_limit: int,
+    column_limit: int,
+    width: int,
+) -> Any:
+    table = runtime["Table"](
+        box=None,
+        show_header=True,
+        show_edge=False,
+        pad_edge=False,
+        collapse_padding=True,
+        highlight=False,
+    )
+    columns = preview.columns[:column_limit]
+    column_width = max(
+        3, (max(_MIN_RENDER_WIDTH, width) - len(columns)) // max(1, len(columns))
+    )
+    for column in columns:
+        table.add_column(
+            runtime["Text"](column, style="cyan"),
+            overflow="ellipsis",
+            no_wrap=True,
+            max_width=column_width,
+        )
+    for row in preview.rows[:row_limit]:
+        table.add_row(
+            *(runtime["Text"](cell) for cell in row[: len(columns)]),
+        )
+    return table
+
+
+def _table_truncation_lines(
+    preview: ToolTablePreview,
+    *,
+    shown_rows: int,
+    shown_columns: int,
+) -> tuple[str, ...]:
+    notices: list[str] = []
+    omitted_recorded_rows = max(0, preview.recorded_rows - shown_rows)
+    if omitted_recorded_rows:
+        notices.append(
+            f"… {omitted_recorded_rows} more rows in the recorded tool result"
+        )
+    omitted_recorded_columns = max(0, preview.recorded_columns - shown_columns)
+    if omitted_recorded_columns:
+        notices.append(
+            f"… {omitted_recorded_columns} more columns in the recorded tool result"
+        )
+    if preview.total_rows is not None and preview.total_rows > preview.recorded_rows:
+        notices.append(
+            "… "
+            f"{preview.total_rows - preview.recorded_rows} additional rows were not "
+            "recorded by the bounded tool result"
+        )
+    if preview.cells_truncated:
+        notices.append(
+            f"… cells truncated to {_MAX_CELL_DISPLAY_CHARACTERS} display characters"
+        )
+    return tuple(notices)
+
+
+def _card_plain_lines(
+    lines: Sequence[str],
+    *,
+    style: str,
+) -> list[tuple[str, str]]:
+    fragments: list[tuple[str, str]] = []
+    for line in lines:
+        safe = _sanitize_terminal_text(
+            line,
+            maximum=_MAX_RENDER_CHARACTERS,
+            preserve_lines=False,
+            fallback="",
+        )
+        if safe:
+            fragments.extend(
+                [
+                    (style, " │ "),
+                    ("", safe),
+                    (style, "\n"),
+                ]
+            )
+    return fragments
+
+
+def _card_rich_lines(
+    runtime: dict[str, Any],
+    renderable: Any,
+    *,
+    width: int,
+    border_style: str,
+    maximum_lines: int | None = None,
+    truncation_line: str = "… content truncated",
+) -> list[tuple[str, str]]:
+    lines = _render_rich_fragment_lines(runtime, renderable, width=width)
+    if maximum_lines is not None and len(lines) > maximum_lines:
+        lines = [
+            *lines[: max(0, maximum_lines - 1)],
+            [("", truncation_line)],
+        ]
+    fragments: list[tuple[str, str]] = []
+    for line in lines:
+        fragments.append((border_style, " │ "))
+        fragments.extend(line)
+        fragments.append((border_style, "\n"))
+    return fragments
+
+
+def _render_rich_fragment_lines(
+    runtime: dict[str, Any],
+    renderable: Any,
+    *,
+    width: int,
+) -> list[list[tuple[str, str]]]:
+    target = io.StringIO()
+    no_color = bool(os.environ.get("NO_COLOR"))
+    console = runtime["Console"](
+        file=target,
+        width=max(_MIN_RENDER_WIDTH, min(width, _MAX_RENDER_WIDTH)),
+        force_terminal=not no_color,
+        color_system=None if no_color else "truecolor",
+        no_color=no_color,
+        markup=False,
+        highlight=False,
+        soft_wrap=False,
+    )
+    console.print(renderable, end="")
+    formatted = runtime["ANSI"](target.getvalue()).__pt_formatted_text__()
+    lines: list[list[tuple[str, str]]] = [[]]
+    for style, text in formatted:
+        parts = text.split("\n")
+        for index, part in enumerate(parts):
+            if part:
+                lines[-1].append((style, part))
+            if index < len(parts) - 1:
+                lines.append([])
+    while len(lines) > 1 and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def _render_markdown_fragments(
+    runtime: dict[str, Any],
+    value: object,
+    *,
+    width: int,
+) -> list[tuple[str, str]]:
+    rendered = _render_markdown_ansi(runtime, value, width=width)
+    fragments = runtime["ANSI"](rendered).__pt_formatted_text__()
+    return [
+        (style, f" {text}" if index == 0 else text)
+        for index, (style, text) in enumerate(fragments)
+    ]
+
+
+def _render_markdown_ansi(
+    runtime: dict[str, Any],
+    value: object,
+    *,
+    width: int,
+) -> str:
+    safe = _sanitize_terminal_text(
+        value,
+        maximum=_MAX_RENDER_CHARACTERS,
+        preserve_lines=True,
+        fallback="(empty response)",
+    )
+    target = io.StringIO()
+    no_color = bool(os.environ.get("NO_COLOR"))
+    theme = runtime["Theme"](
+        {
+            "markdown.h1": "bold green",
+            "markdown.h2": "bold green",
+            "markdown.h3": "bold green",
+            "markdown.item.bullet": "green",
+            "markdown.code": "cyan",
+            "markdown.code_block": "cyan",
+        }
+    )
+    console = runtime["Console"](
+        file=target,
+        width=max(_MIN_RENDER_WIDTH, min(width, _MAX_RENDER_WIDTH)),
+        force_terminal=not no_color,
+        color_system=None if no_color else "truecolor",
+        no_color=no_color,
+        markup=False,
+        highlight=False,
+        soft_wrap=False,
+        theme=theme,
+    )
+    console.print(
+        runtime["Markdown"](
+            safe,
+            code_theme="ansi_dark",
+            hyperlinks=False,
+        ),
+        end="",
+    )
+    return target.getvalue()
+
+
+def _render_markdown_text(value: object, *, width: int = 80) -> str:
+    """Render sanitized Markdown without terminal control sequences for tests."""
+
+    runtime = _load_terminal_runtime()
+    target = io.StringIO()
+    safe = _sanitize_terminal_text(
+        value,
+        maximum=_MAX_RENDER_CHARACTERS,
+        preserve_lines=True,
+        fallback="(empty response)",
+    )
+    console = runtime["Console"](
+        file=target,
+        width=max(_MIN_RENDER_WIDTH, min(width, _MAX_RENDER_WIDTH)),
+        force_terminal=False,
+        color_system=None,
+        no_color=True,
+        markup=False,
+        highlight=False,
+        soft_wrap=False,
+    )
+    console.print(
+        runtime["Markdown"](safe, code_theme="ansi_dark", hyperlinks=False),
+        end="",
+    )
+    return target.getvalue()
+
+
+def _status_left_fragments(state: TerminalViewState) -> list[tuple[str, str]]:
+    agent = _sanitize_terminal_text(
+        state.agent_label,
+        maximum=64,
+        preserve_lines=False,
+        fallback="agent",
+    )
+    model = _sanitize_terminal_text(
+        state.model_label,
+        maximum=96,
+        preserve_lines=False,
+        fallback="model",
+    )
+    if state.running:
+        glyph = _RUNNING_GLYPHS[state.animation_frame % len(_RUNNING_GLYPHS)]
+        status = _sanitize_terminal_text(
+            state.run_status,
+            maximum=32,
+            preserve_lines=False,
+            fallback="working",
+        )
+        status_style = (
+            "class:tui.status.approval"
+            if status == "approval"
+            else "class:tui.status.running"
+        )
+        return [
+            ("class:tui.status", f" {agent} · {model} · "),
+            (status_style, f"{glyph} {status}"),
+        ]
+    if state.run_status in {"failed", "interrupted"}:
+        return [
+            ("class:tui.status", f" {agent} · {model} · "),
+            (
+                "class:tui.status.failure",
+                f"! {_sanitize_terminal_text(state.run_status, maximum=32, preserve_lines=False, fallback='failed')}",
+            ),
+        ]
+    return [
+        ("class:tui.status", f" {agent} · {model} · "),
+        ("class:tui.status.ready", "● ready"),
+    ]
+
+
+def _status_right_fragments(state: TerminalViewState) -> list[tuple[str, str]]:
+    if state.notice:
+        return [
+            (
+                "class:tui.status.notice",
+                _sanitize_terminal_text(
+                    state.notice,
+                    maximum=256,
+                    preserve_lines=False,
+                    fallback="",
+                )
+                + " ",
+            )
+        ]
+    return [
+        (
+            "class:tui.status.meta",
+            f"{state.steps} steps · {state.total_tokens} tokens · "
+            f"${state.estimated_cost} ",
+        )
+    ]
+
+
+def _semantic_style_rules() -> dict[str, str]:
+    no_color = bool(os.environ.get("NO_COLOR"))
+    if no_color:
+        return {
+            "tui.identity": "bold",
+            "tui.header.agent": "bold",
+            "tui.header.meta": "",
+            "tui.rule": "",
+            "tui.user.label": "bold",
+            "tui.assistant.label": "bold",
+            "tui.local.label": "bold",
+            "tui.local": "",
+            "tui.local.status.label": "bold",
+            "tui.local.status": "",
+            "tui.local.sources.label": "bold",
+            "tui.local.sources": "",
+            "tui.local.catalog.label": "bold",
+            "tui.local.catalog": "",
+            "tui.local.settings.label": "bold",
+            "tui.local.settings": "",
+            "tui.metadata": "",
+            "tui.empty": "",
+            "tui.prompt": "bold",
+            "tui.composer": "",
+            "tui.composer.frame": "",
+            "tui.approval": "",
+            "tui.approval.frame": "",
+            "tui.approval.label": "bold",
+            "tui.approval.identity": "",
+            "tui.approval.arguments": "",
+            "tui.approval.action": "bold",
+            "tui.approval.failure": "bold",
+            "frame.border": "",
+            "tui.status": "",
+            "tui.status.ready": "bold",
+            "tui.status.running": "bold",
+            "tui.status.approval": "bold",
+            "tui.status.failure": "bold",
+            "tui.status.notice": "",
+            "tui.status.meta": "",
+            "tui.tool.running": "",
+            "tui.tool.approval": "bold",
+            "tui.tool.success": "",
+            "tui.tool.failure": "bold",
+            "scrollbar.background": "",
+            "scrollbar.button": "",
+        }
+    return {
+        "tui.identity": "bold #22c55e",
+        "tui.header.agent": "bold",
+        "tui.header.meta": "#71717a",
+        "tui.rule": "#15803d",
+        "tui.user.label": "bold",
+        "tui.assistant.label": "bold #22c55e",
+        "tui.local.label": "bold #71717a",
+        "tui.local": "",
+        "tui.local.status.label": "bold #22c55e",
+        "tui.local.status": "",
+        "tui.local.sources.label": "bold #38bdf8",
+        "tui.local.sources": "",
+        "tui.local.catalog.label": "bold #38bdf8",
+        "tui.local.catalog": "",
+        "tui.local.settings.label": "bold #22c55e",
+        "tui.local.settings": "",
+        "tui.metadata": "#71717a",
+        "tui.empty": "#71717a",
+        "tui.prompt": "bold #4ade80",
+        "tui.composer": "",
+        "tui.composer.frame": "",
+        "tui.approval": "",
+        "tui.approval.frame": "#f59e0b",
+        "tui.approval.label": "bold #f59e0b",
+        "tui.approval.identity": "bold",
+        "tui.approval.arguments": "",
+        "tui.approval.action": "bold #f59e0b",
+        "tui.approval.failure": "bold #f87171",
+        "frame.border": "#4ade80",
+        "tui.status": "#71717a",
+        "tui.status.ready": "bold #22c55e",
+        "tui.status.running": "bold #15803d",
+        "tui.status.approval": "bold #f59e0b",
+        "tui.status.failure": "bold #f87171",
+        "tui.status.notice": "#f59e0b",
+        "tui.status.meta": "#71717a",
+        "tui.tool.running": "#15803d",
+        "tui.tool.approval": "#f59e0b",
+        "tui.tool.success": "#22c55e",
+        "tui.tool.failure": "#f87171",
+        "scrollbar.background": "#71717a",
+        "scrollbar.button": "#15803d",
+    }
+
+
+def _event_counter(value: object) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return min(value, _MAX_EVENT_COUNTER)
+
+
+def _event_text(value: object, *, maximum: int, fallback: str) -> str:
+    return _sanitize_terminal_text(
+        value,
+        maximum=maximum,
+        preserve_lines=False,
+        fallback=fallback,
+    )
+
+
+def _optional_event_text(value: object, *, maximum: int) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return _event_text(value, maximum=maximum, fallback="") or None
+
+
+def _format_duration(duration_ms: int) -> str:
+    if duration_ms < 1_000:
+        return f"{duration_ms}ms"
+    seconds = duration_ms / 1_000
+    if seconds < 100:
+        return f"{seconds:.1f}s"
+    return f"{int(seconds)}s"
+
+
+def _one_logical_line(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _display_width(value: str) -> int:
+    width = 0
+    for character in value:
+        if unicodedata.combining(character):
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in {"F", "W"} else 1
+    return width
+
+
+def _truncate_display_text(value: str, maximum: int) -> tuple[str, bool]:
+    if maximum < 1:
+        return "", bool(value)
+    if _display_width(value) <= maximum:
+        return value, False
+    available = max(0, maximum - 1)
+    projected: list[str] = []
+    width = 0
+    for character in value:
+        character_width = (
+            0
+            if unicodedata.combining(character)
+            else (2 if unicodedata.east_asian_width(character) in {"F", "W"} else 1)
+        )
+        if width + character_width > available:
+            break
+        projected.append(character)
+        width += character_width
+    return "".join(projected) + "…", True
+
+
+def _clear_current_task_cancellation() -> None:
+    current = asyncio.current_task()
+    if current is None:
+        return
+    while current.cancelling():
+        current.uncancel()
+
+
+def _sanitize_terminal_text(
+    value: object,
+    *,
+    maximum: int,
+    preserve_lines: bool,
+    fallback: str,
+) -> str:
+    if not isinstance(value, str):
+        return fallback
+    normalized = value.replace("\r\n", "\n")
+    projected: list[str] = []
+    for character in normalized:
+        if character == "\n" and preserve_lines:
+            projected.append(character)
+            continue
+        if character == "\t" and preserve_lines:
+            projected.append(character)
+            continue
+        category = unicodedata.category(character)
+        if (
+            character.isprintable()
+            and category not in {"Cc", "Cf", "Cs"}
+            and character != "\r"
+        ):
+            projected.append(character)
+        else:
+            projected.append("?")
+    rendered = "".join(projected)
+    if len(rendered) > maximum:
+        rendered = rendered[: max(0, maximum - 3)] + "..."
+    return rendered or fallback
+
+
+def _render_width(output: Any) -> int:
+    try:
+        return max(_MIN_RENDER_WIDTH, min(output.get_size().columns - 4, 240))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return 76
+
+
+def _viewport_height(window: Any) -> int:
+    render_info = getattr(window, "render_info", None)
+    height = getattr(render_info, "window_height", 0)
+    return max(1, height or 8)
+
+
+def _restore_terminal(output: Any) -> None:
+    for method_name in (
+        "reset_attributes",
+        "reset_cursor_key_mode",
+        "reset_cursor_shape",
+        "enable_autowrap",
+        "quit_alternate_screen",
+        "show_cursor",
+        "flush",
+    ):
+        try:
+            getattr(output, method_name)()
+        except Exception:
+            continue
+
+
+__all__ = [
+    "MAX_COMPOSER_CHARACTERS",
+    "TerminalApplicationResult",
+    "TerminalCommandResult",
+    "TerminalObserverBridge",
+    "TerminalSuspendBridge",
+    "TerminalTUIUnavailable",
+    "TerminalViewState",
+    "ToolCardDetails",
+    "ToolCardState",
+    "ToolTablePreview",
+    "run_terminal_tui",
+    "supports_terminal_tui",
+]
