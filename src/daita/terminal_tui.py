@@ -1,4 +1,4 @@
-"""Lazy, ephemeral presentation for the ready-agent terminal shell."""
+"""Lazy, inline presentation for the ready-agent terminal shell."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import io
 import json
 import os
 import sys
+import threading
 from typing import Any, TextIO
 import unicodedata
 
@@ -40,39 +41,33 @@ _MAX_EVENT_COUNTER = 999_999_999_999
 _ANIMATION_INTERVAL_SECONDS = 0.12
 _RUNNING_GLYPHS = ("◐", "◓", "◑", "◒")
 _ASCII_RUNNING_GLYPHS = ("~", "-", "~", "+")
-_SLASH_COMMAND_SURFACE = (
-    "/model",
-    "/sources",
-    "/source add",
-    "/source refresh <id>",
-    "/catalog",
-    "/settings",
-    "/new",
-    "/resume <id>",
-    "/memory",
-    "/user",
-    "/skills",
-    "/status",
-    "/conversation",
-    "/help",
-    "/exit",
+_SLASH_COMMAND_COMPLETIONS = (
+    ("/model", "/model", "Choose or validate the active model"),
+    ("/sources", "/sources", "List registered data sources"),
+    ("/source add", "/source add", "Add a data source"),
+    ("/source refresh ", "/source refresh <id>", "Refresh a source catalog"),
+    ("/catalog", "/catalog", "Show the current catalog summary"),
+    ("/settings", "/settings", "Show agent and model settings"),
+    ("/new", "/new", "Start a new conversation"),
+    ("/resume ", "/resume <id>", "Resume a previous conversation"),
+    ("/memory", "/memory", "View or edit agent memory"),
+    ("/user", "/user", "View or edit the user profile"),
+    ("/skills", "/skills", "List available skills"),
+    ("/status", "/status", "Show current agent status"),
+    ("/conversation", "/conversation", "Show the current conversation ID"),
+    ("/help", "/help", "Show command help"),
+    ("/exit", "/exit", "Exit Daita"),
 )
-_SLASH_COMMAND_INSERTIONS = (
-    ("/model", "/model"),
-    ("/sources", "/sources"),
-    ("/source add", "/source add"),
-    ("/source refresh ", "/source refresh <id>"),
-    ("/catalog", "/catalog"),
-    ("/settings", "/settings"),
-    ("/new", "/new"),
-    ("/resume ", "/resume <id>"),
-    ("/memory", "/memory"),
-    ("/user", "/user"),
-    ("/skills", "/skills"),
-    ("/status", "/status"),
-    ("/conversation", "/conversation"),
-    ("/help", "/help"),
-    ("/exit", "/exit"),
+_SLASH_COMMAND_SURFACE = tuple(
+    display for _insertion, display, _description in _SLASH_COMMAND_COMPLETIONS
+)
+_SLASH_COMMAND_INSERTIONS = tuple(
+    (insertion, display)
+    for insertion, display, _description in _SLASH_COMMAND_COMPLETIONS
+)
+_SLASH_COMMAND_DESCRIPTIONS = tuple(
+    (insertion, description)
+    for insertion, _display, description in _SLASH_COMMAND_COMPLETIONS
 )
 _SENSITIVE_KEY_PARTS = (
     "api_key",
@@ -313,9 +308,6 @@ class TerminalViewState:
     steps: int = 0
     total_tokens: int = 0
     estimated_cost: str = "0"
-    transcript_cursor_line: int = 0
-    rendered_line_count: int = 1
-    follows_bottom: bool = True
     active_task: asyncio.Task[Any] | None = None
     active_run_id: str | None = None
     run_status: str = "ready"
@@ -336,8 +328,6 @@ class TerminalViewState:
         )
         if safe:
             self.blocks.append(TerminalBlock(kind, safe))
-            self.follows_bottom = True
-            self.transcript_cursor_line = max(0, self.rendered_line_count - 1)
 
     def append_user(self, message: str) -> None:
         self.append_plain("user", message)
@@ -425,8 +415,6 @@ class TerminalViewState:
             self._settle_run_cards(result_run_id, result_kind, result_reason)
             self.active_run_id = None
         self.notice = ""
-        self.follows_bottom = True
-        self.transcript_cursor_line = max(0, self.rendered_line_count - 1)
 
     def hydrate_transcript(self, transcript: Transcript, *, run_id: str) -> None:
         """Hydrate and canonically reorder one completed run's tool cards."""
@@ -520,7 +508,6 @@ class TerminalViewState:
                 del self.tool_cards[call_id]
         for card in canonical_cards:
             self.tool_cards[card.call_id] = card
-        self.follows_bottom = True
 
     def toggle_expanded_detail(self) -> bool:
         """Toggle the most recent completed hydrated card in this process."""
@@ -534,7 +521,6 @@ class TerminalViewState:
                 and card.details is not None
             ):
                 card.expanded = not card.expanded
-                self.follows_bottom = True
                 return True
         return False
 
@@ -706,7 +692,6 @@ class TerminalViewState:
             )
             self.tool_cards[call_id] = card
             self.blocks.append(TerminalBlock("tool", call_id, tool_card=card))
-            self.follows_bottom = True
         else:
             if capability_id is not None:
                 card.capability_id = capability_id
@@ -734,14 +719,6 @@ class TerminalViewState:
                 if exit_kind == "interrupted" or reason == "cancelled"
                 else "observation_incomplete"
             )
-
-    def move_transcript(self, amount: int) -> None:
-        last_line = max(0, self.rendered_line_count - 1)
-        self.transcript_cursor_line = min(
-            last_line,
-            max(0, self.transcript_cursor_line + amount),
-        )
-        self.follows_bottom = self.transcript_cursor_line >= last_line
 
 
 @dataclass(frozen=True, slots=True)
@@ -871,6 +848,8 @@ def _detected_color_depth(
         return "256"
     if "4_bit" in depth or "16" in depth or "standard" in depth:
         return "16"
+    if "1_bit" in depth or "monochrome" in depth:
+        return "none"
     if term and term not in {"dumb", "unknown"}:
         return "16"
     return "truecolor"
@@ -920,6 +899,24 @@ def _terminal_size(output: Any) -> tuple[int, int]:
     except (AttributeError, OSError, TypeError, ValueError):
         return 80, 24
     return max(1, columns), max(1, rows)
+
+
+def _terminal_size_polling_interval(
+    *,
+    platform: str | None = None,
+    main_thread: bool | None = None,
+) -> float | None:
+    """Use polling only where prompt-toolkit cannot rely on SIGWINCH."""
+
+    current_platform = sys.platform if platform is None else platform
+    running_on_main_thread = (
+        threading.current_thread() is threading.main_thread()
+        if main_thread is None
+        else main_thread
+    )
+    if current_platform == "win32" or not running_on_main_thread:
+        return 0.5
+    return None
 
 
 def _responsive_projection(
@@ -1128,6 +1125,102 @@ def _format_token_count(value: int) -> str:
     return f"{value / 1_000_000:.1f}m"
 
 
+def _stream_is_interactive(output_stream: TextIO) -> bool:
+    if os.environ.get("TERM", "").strip().casefold() in {"dumb", "unknown"}:
+        return False
+    try:
+        return bool(output_stream.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _setup_prompt_text(
+    prompt: object,
+    output_stream: TextIO,
+) -> str:
+    safe = _sanitize_terminal_text(
+        prompt,
+        maximum=256,
+        preserve_lines=False,
+        fallback="Value: ",
+    )
+    if not _stream_is_interactive(output_stream):
+        return safe
+    capabilities = _terminal_capabilities(text_stream=output_stream)
+    glyphs = _terminal_glyphs(capabilities)
+    return f"{glyphs.prompt} {safe}"
+
+
+def _write_setup_prompt(
+    output_stream: TextIO,
+    prompt: object,
+) -> None:
+    safe = _setup_prompt_text(prompt, output_stream)
+    if not _stream_is_interactive(output_stream):
+        print(safe, end="", flush=True, file=output_stream)
+        return
+    capabilities = _terminal_capabilities(text_stream=output_stream)
+    runtime = _load_terminal_runtime()
+    console = runtime["Console"](
+        file=output_stream,
+        force_terminal=not capabilities.no_color,
+        color_system=capabilities.rich_color_system,
+        no_color=capabilities.no_color,
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+        theme=runtime["Theme"](_rich_theme_rules(capabilities)),
+    )
+    console.print(runtime["Text"](safe, style="brand"), end="")
+
+
+def _write_setup_status(
+    output_stream: TextIO,
+    value: object,
+    *,
+    role: str,
+) -> None:
+    safe = _sanitize_terminal_text(
+        value,
+        maximum=512,
+        preserve_lines=False,
+        fallback="Setup status unavailable.",
+    )
+    capabilities = _terminal_capabilities(text_stream=output_stream)
+    glyphs = _terminal_glyphs(capabilities)
+    if not capabilities.unicode:
+        for marker, replacement in (
+            ("✓ ", f"{glyphs.success} "),
+            ("… ", f"{glyphs.running[0]} "),
+            ("◐ ", f"{glyphs.running[0]} "),
+        ):
+            if safe.startswith(marker):
+                safe = replacement + safe[len(marker) :]
+                break
+    if not _stream_is_interactive(output_stream):
+        print(safe, file=output_stream)
+        return
+    runtime = _load_terminal_runtime()
+    style = {
+        "progress": "brand",
+        "success": "brand",
+        "warning": "warning",
+        "failure": "error",
+        "muted": "muted",
+    }.get(role, "")
+    console = runtime["Console"](
+        file=output_stream,
+        force_terminal=not capabilities.no_color,
+        color_system=capabilities.rich_color_system,
+        no_color=capabilities.no_color,
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+        theme=runtime["Theme"](_rich_theme_rules(capabilities)),
+    )
+    console.print(runtime["Text"](safe, style=style))
+
+
 def supports_terminal_tui(
     input_stream: TextIO,
     output_stream: TextIO,
@@ -1135,7 +1228,7 @@ def supports_terminal_tui(
     enhanced_input: Any = None,
     enhanced_output: Any = None,
 ) -> bool:
-    """Return whether the focused full-screen shell can own these streams."""
+    """Return whether the inline enhanced shell can own these streams."""
 
     if (enhanced_input is None) != (enhanced_output is None):
         raise ValueError("TUI input and output must be supplied together")
@@ -1184,7 +1277,7 @@ async def run_terminal_tui(
         try:
             enhanced_input = runtime["create_input"](stdin=input_stream)
             enhanced_output = runtime["create_output"](stdout=output_stream)
-        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        except Exception as error:
             _restore_terminal(enhanced_output)
             try:
                 enhanced_input.close()
@@ -1193,6 +1286,13 @@ async def run_terminal_tui(
             raise TerminalTUIUnavailable(
                 "enhanced terminal admission failed"
             ) from error
+        except BaseException:
+            _restore_terminal(enhanced_output)
+            try:
+                enhanced_input.close()
+            except Exception:
+                pass
+            raise
 
     try:
         application, approval_previous, deny_pending_approval = _create_application(
@@ -1206,7 +1306,7 @@ async def run_terminal_tui(
             enhanced_input=enhanced_input,
             enhanced_output=enhanced_output,
         )
-    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+    except Exception as error:
         _restore_terminal(enhanced_output)
         if owns_input:
             try:
@@ -1214,6 +1314,14 @@ async def run_terminal_tui(
             except Exception:
                 pass
         raise TerminalTUIUnavailable("enhanced terminal admission failed") from error
+    except BaseException:
+        _restore_terminal(enhanced_output)
+        if owns_input:
+            try:
+                enhanced_input.close()
+            except Exception:
+                pass
+        raise
 
     async def suspend(action: Callable[[], Awaitable[Any]]) -> Any:
         async with runtime["in_terminal"]():
@@ -1231,8 +1339,13 @@ async def run_terminal_tui(
             application,
         )
     )
+    application_failure: BaseException | None = None
     try:
-        result = await _run_application(application)
+        try:
+            result = await _run_application(application)
+        except BaseException as error:
+            application_failure = error
+            raise
         if not isinstance(result, TerminalApplicationResult):
             raise RuntimeError("terminal application returned an invalid result")
         return result
@@ -1241,11 +1354,20 @@ async def run_terminal_tui(
         await asyncio.sleep(0)
         active = state.active_task
         if active is not None and not active.done():
-            active.cancel()
-            try:
-                await active
-            except (asyncio.CancelledError, Exception):
-                pass
+            if application_failure is not None and not isinstance(
+                application_failure,
+                (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+            ):
+                try:
+                    await asyncio.shield(active)
+                except (asyncio.CancelledError, Exception):
+                    pass
+            else:
+                active.cancel()
+                try:
+                    await active
+                except (asyncio.CancelledError, Exception):
+                    pass
         event_task.cancel()
         try:
             await event_task
@@ -1269,7 +1391,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
     try:
         from prompt_toolkit.application import Application
         from prompt_toolkit.application.run_in_terminal import in_terminal
-        from prompt_toolkit.completion import WordCompleter
+        from prompt_toolkit.completion import CompleteEvent, WordCompleter
         from prompt_toolkit.data_structures import Point
         from prompt_toolkit.filters import Condition
         from prompt_toolkit.formatted_text import ANSI, FormattedText
@@ -1279,6 +1401,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
         from prompt_toolkit.layout import Layout
         from prompt_toolkit.layout.containers import (
             ConditionalContainer,
+            DynamicContainer,
             HSplit,
             VSplit,
             Window,
@@ -1287,6 +1410,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
         from prompt_toolkit.layout.dimension import Dimension
         from prompt_toolkit.layout.margins import ScrollbarMargin
         from prompt_toolkit.output import create_output
+        from prompt_toolkit.renderer import print_formatted_text
         from prompt_toolkit.styles import Style
         from prompt_toolkit.widgets import Frame, TextArea
         from prompt_toolkit.keys import Keys
@@ -1309,6 +1433,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
         "ConditionalContainer": ConditionalContainer,
         "Console": Console,
         "Dimension": Dimension,
+        "DynamicContainer": DynamicContainer,
         "FormattedText": FormattedText,
         "FormattedTextControl": FormattedTextControl,
         "Frame": Frame,
@@ -1319,6 +1444,8 @@ def _load_terminal_runtime() -> dict[str, Any]:
         "Layout": Layout,
         "Markdown": Markdown,
         "Point": Point,
+        "print_formatted_text": print_formatted_text,
+        "CompleteEvent": CompleteEvent,
         "ScrollbarMargin": ScrollbarMargin,
         "Style": Style,
         "Syntax": Syntax,
@@ -1351,28 +1478,56 @@ def _create_application(
     Callable[[ApprovalRequest], Awaitable[ApprovalDecision]] | None,
     Callable[[], None],
 ]:
+    capabilities = _terminal_capabilities(enhanced_output)
+    glyphs = _terminal_glyphs(capabilities)
     keys = runtime["KeyBindings"]()
     completion_display = dict(_SLASH_COMMAND_INSERTIONS)
+    completion_descriptions = dict(_SLASH_COMMAND_DESCRIPTIONS)
+    composer_buffer: Any = None
+
+    def slash_completion_is_active() -> bool:
+        if composer_buffer is None:
+            return False
+        text = composer_buffer.document.text_before_cursor
+        return text.startswith("/") and "\n" not in text
+
+    slash_completion_filter = runtime["Condition"](slash_completion_is_active)
     composer = runtime["TextArea"](
         multiline=True,
         wrap_lines=True,
         height=runtime["Dimension"](min=1, max=6),
-        prompt=runtime["FormattedText"]([("class:tui.prompt", "› ")]),
+        prompt=runtime["FormattedText"]([("class:tui.prompt", f"{glyphs.prompt} ")]),
         style="class:tui.composer",
         name="composer",
         completer=runtime["WordCompleter"](
             tuple(completion_display),
             ignore_case=True,
             display_dict=completion_display,
+            meta_dict=completion_descriptions,
             sentence=True,
         ),
-        complete_while_typing=False,
+        complete_while_typing=slash_completion_filter,
         history=runtime["InMemoryHistory"](),
     )
+    composer_buffer = composer.buffer
     enforcing_bound = False
     input_history: list[str] = []
     history_position = 0
     history_draft = ""
+    responsive_projection = _responsive_for_output(enhanced_output, state)
+
+    def responsive() -> ResponsiveProjection:
+        return responsive_projection
+
+    def refresh_responsive_projection(_application: Any) -> None:
+        nonlocal responsive_projection
+        responsive_projection = _responsive_for_output(enhanced_output, state)
+
+    def terminal_is_usable() -> bool:
+        return _responsive_for_output(enhanced_output, state).usable
+
+    def rendered_terminal_is_usable() -> bool:
+        return responsive().usable
 
     def enforce_bound(buffer: Any) -> None:
         nonlocal enforcing_bound
@@ -1394,36 +1549,53 @@ def _create_application(
     composer.buffer.on_text_changed += enforce_bound
 
     def transcript_fragments() -> list[tuple[str, str]]:
-        width = _render_width(enhanced_output)
-        fragments = _render_transcript_fragments(runtime, state, width=width)
-        state.rendered_line_count = max(
-            1,
-            sum(fragment.count("\n") for _, fragment in fragments) + 1,
-        )
-        if state.follows_bottom:
-            state.transcript_cursor_line = state.rendered_line_count - 1
-        else:
-            state.transcript_cursor_line = min(
-                state.transcript_cursor_line,
-                state.rendered_line_count - 1,
+        projection = responsive()
+        try:
+            fragments = _render_transcript_fragments(
+                runtime,
+                state,
+                width=projection.content_width,
+                responsive=projection,
+                capabilities=capabilities,
+                glyphs=glyphs,
             )
+        except Exception:
+            state.notice = "Some terminal content could not be rendered."
+            fragments = [
+                (
+                    "class:tui.status.failure",
+                    f"\n {glyphs.failure} Content unavailable\n",
+                )
+            ]
         return fragments
 
-    transcript_control = runtime["FormattedTextControl"](
-        transcript_fragments,
-        focusable=False,
-        show_cursor=False,
-        get_cursor_position=lambda: runtime["Point"](
-            x=0,
-            y=max(0, state.transcript_cursor_line),
-        ),
-    )
-    transcript_window = runtime["Window"](
-        content=transcript_control,
-        wrap_lines=True,
-        always_hide_cursor=True,
-        right_margins=[runtime["ScrollbarMargin"](display_arrows=True)],
-    )
+    printed_block_count = 0
+
+    def pending_transcript_fragments() -> list[tuple[str, str]]:
+        nonlocal printed_block_count
+        all_blocks = state.blocks
+        if printed_block_count >= len(all_blocks):
+            return []
+        pending_blocks = all_blocks[printed_block_count:]
+        state.blocks = list(pending_blocks)
+        try:
+            return transcript_fragments()
+        finally:
+            state.blocks = all_blocks
+            printed_block_count = len(all_blocks)
+
+    semantic_style = runtime["Style"].from_dict(_semantic_style_rules(capabilities))
+
+    def emit_pending_transcript() -> None:
+        fragments = pending_transcript_fragments()
+        if not fragments:
+            return
+        runtime["print_formatted_text"](
+            output=enhanced_output,
+            formatted_text=runtime["FormattedText"](fragments),
+            style=semantic_style,
+        )
+
     approval_waiter: asyncio.Future[ApprovalDecision] | None = None
     approval_lock = asyncio.Lock()
 
@@ -1446,7 +1618,10 @@ def _create_application(
         if panel is None:
             return []
         try:
-            fragments = _render_approval_panel_fragments(panel)
+            fragments = _render_approval_panel_fragments(
+                panel,
+                glyphs=glyphs,
+            )
         except BaseException:
             resolve_approval(ApprovalDecision.DENY)
             return [
@@ -1482,7 +1657,7 @@ def _create_application(
         content=approval_control,
         wrap_lines=True,
         always_hide_cursor=True,
-        height=runtime["Dimension"](min=7, max=14, preferred=10),
+        height=runtime["Dimension"](min=5, max=12, preferred=8),
         right_margins=[runtime["ScrollbarMargin"](display_arrows=True)],
         style="class:tui.approval",
     )
@@ -1543,6 +1718,8 @@ def _create_application(
         application.invalidate()
 
     async def execute_message(application: Any, message: str) -> None:
+        async with runtime["in_terminal"]():
+            emit_pending_transcript()
         try:
             result = await run_message(message, state.conversation_id)
             _project_pending_events(observer_bridge, state)
@@ -1585,14 +1762,18 @@ def _create_application(
             _project_pending_events(observer_bridge, state)
             state.running = False
             state.active_task = None
+            async with runtime["in_terminal"]():
+                emit_pending_transcript()
             invalidate(application)
 
     async def execute_command(application: Any, command: str) -> None:
         try:
             async with runtime["in_terminal"]():
+                emit_pending_transcript()
                 result = await handle_command(command, state.conversation_id)
-            state.conversation_id = result.conversation_id
-            state.append_local(result.presentation, result.output)
+                state.conversation_id = result.conversation_id
+                state.append_local(result.presentation, result.output)
+                emit_pending_transcript()
             if result.action is not None:
                 application.exit(
                     result=TerminalApplicationResult(
@@ -1623,6 +1804,10 @@ def _create_application(
         if state.approval_panel is not None:
             resolve_approval(ApprovalDecision.DENY)
             return
+        if not terminal_is_usable():
+            state.notice = "Resize the terminal before submitting input."
+            invalidate(event.app)
+            return
         active = state.active_task
         if state.running or (active is not None and not active.done()):
             state.notice = "A run is already active; Ctrl-C cancels it."
@@ -1641,10 +1826,10 @@ def _create_application(
         history_position = len(input_history)
         history_draft = ""
         composer.buffer.reset(append_to_history=True)
+        state.append_user(message)
         if message.startswith("/"):
             start_task(event.app, execute_command(event.app, message))
             return
-        state.append_user(message)
         start_task(event.app, execute_message(event.app, message))
 
     @keys.add("c-j", eager=True)
@@ -1691,27 +1876,19 @@ def _create_application(
             )
         )
 
-    @keys.add("pageup", eager=True)
+    @keys.add("pageup", filter=approval_filter, eager=True)
     def page_up(event: Any) -> None:
         panel = state.approval_panel
         if panel is not None:
             panel.move(-max(1, _viewport_height(approval_window)))
             invalidate(event.app)
-            return
-        height = _viewport_height(transcript_window)
-        state.move_transcript(-height)
-        invalidate(event.app)
 
-    @keys.add("pagedown", eager=True)
+    @keys.add("pagedown", filter=approval_filter, eager=True)
     def page_down(event: Any) -> None:
         panel = state.approval_panel
         if panel is not None:
             panel.move(max(1, _viewport_height(approval_window)))
             invalidate(event.app)
-            return
-        height = _viewport_height(transcript_window)
-        state.move_transcript(height)
-        invalidate(event.app)
 
     @keys.add("c-o", eager=True)
     def toggle_tool_detail(event: Any) -> None:
@@ -1739,7 +1916,14 @@ def _create_application(
             return
         buffer = composer.buffer
         if buffer.complete_state is None:
-            buffer.start_completion(select_first=True)
+            completions = tuple(
+                buffer.completer.get_completions(
+                    buffer.document,
+                    runtime["CompleteEvent"](completion_requested=True),
+                )
+            )
+            if completions:
+                buffer.apply_completion(completions[0])
         else:
             buffer.complete_next()
         invalidate(event.app)
@@ -1813,79 +1997,153 @@ def _create_application(
     @keys.add(runtime["Keys"].Any, filter=approval_filter, eager=True)
     def approval_character(event: Any) -> None:
         key = str(event.data).casefold()
+        if key == "a" and not terminal_is_usable():
+            state.notice = "Resize the terminal to review this approval."
+            invalidate(event.app)
+            return
         resolve_approval(
             ApprovalDecision.APPROVE if key == "a" else ApprovalDecision.DENY
         )
 
-    header = runtime["VSplit"](
-        [
-            runtime["Window"](
-                runtime["FormattedTextControl"](
-                    lambda: [
-                        ("class:tui.identity", " DAITA "),
-                        (
-                            "class:tui.header.agent",
-                            _sanitize_terminal_text(
-                                state.agent_label,
-                                maximum=128,
-                                preserve_lines=False,
-                                fallback="agent",
-                            ),
-                        ),
-                    ]
+    def projected_status() -> StatusProjection:
+        projection = responsive()
+        return _status_projection(
+            state,
+            width=projection.columns,
+            mode=projection.mode,
+            glyphs=glyphs,
+        )
+
+    def header_identity_fragments() -> list[tuple[str, str]]:
+        return [
+            ("class:tui.identity", " DAITA "),
+            (
+                "class:tui.header.agent",
+                _sanitize_terminal_text(
+                    state.agent_label,
+                    maximum=128,
+                    preserve_lines=False,
+                    fallback="agent",
                 ),
-                height=1,
-                dont_extend_height=True,
             ),
-            runtime["Window"](
-                runtime["FormattedTextControl"](
-                    lambda: [
-                        (
-                            "class:tui.header.meta",
-                            _sanitize_terminal_text(
-                                state.source_summary,
-                                maximum=256,
-                                preserve_lines=False,
-                                fallback="",
-                            )
-                            + " ",
+        ]
+
+    def header_source_fragments() -> list[tuple[str, str]]:
+        source = projected_status().source_summary
+        return [("class:tui.header.meta", f"{source} " if source else "")]
+
+    def border_fragments(
+        *,
+        top: bool,
+        title: str = "",
+        corners: bool = True,
+    ) -> list[tuple[str, str]]:
+        projection = responsive()
+        width = max(2, projection.columns)
+        if not corners:
+            return [("", glyphs.horizontal * width)]
+        left = glyphs.top_left if top else glyphs.bottom_left
+        right = glyphs.top_right if top else glyphs.bottom_right
+        safe_title = _sanitize_terminal_text(
+            title,
+            maximum=max(0, width - 6),
+            preserve_lines=False,
+            fallback="",
+        )
+        if safe_title:
+            middle = f"{glyphs.horizontal} {safe_title} "
+            fill = glyphs.horizontal * max(
+                0,
+                width - _display_width(middle) - 2,
+            )
+            line = left + middle + fill + right
+        else:
+            line = left + (glyphs.horizontal * max(0, width - 2)) + right
+        return [("", line)]
+
+    def bordered(
+        body: Any,
+        *,
+        title: str = "",
+        style: str = "class:tui.frame",
+        sides: bool = True,
+    ) -> Any:
+        framed_body = (
+            runtime["VSplit"](
+                [
+                    runtime["Window"](
+                        width=1,
+                        char=glyphs.vertical,
+                        style=style,
+                    ),
+                    body,
+                    runtime["Window"](
+                        width=1,
+                        char=glyphs.vertical,
+                        style=style,
+                    ),
+                ]
+            )
+            if sides
+            else body
+        )
+        return runtime["HSplit"](
+            [
+                runtime["Window"](
+                    runtime["FormattedTextControl"](
+                        lambda: border_fragments(
+                            top=True,
+                            title=title,
+                            corners=sides,
                         )
-                    ]
+                    ),
+                    height=1,
+                    dont_extend_height=True,
+                    style=style,
                 ),
-                height=1,
-                dont_extend_height=True,
-                align="RIGHT",
-            ),
-        ],
-        height=1,
-    )
-    rule = runtime["Window"](
-        height=1,
-        char="─",
-        style="class:tui.rule",
-        dont_extend_height=True,
-    )
-    composer_frame = runtime["Frame"](
-        composer,
-        style="class:tui.composer.frame",
-    )
+                framed_body,
+                runtime["Window"](
+                    runtime["FormattedTextControl"](
+                        lambda: border_fragments(
+                            top=False,
+                            corners=sides,
+                        )
+                    ),
+                    height=1,
+                    dont_extend_height=True,
+                    style=style,
+                ),
+            ]
+        )
+
+    composer_frame = bordered(composer, sides=False)
     approval_container = runtime["ConditionalContainer"](
-        runtime["Frame"](
+        bordered(
             approval_window,
             title="APPROVAL REQUIRED",
             style="class:tui.approval.frame",
         ),
         filter=approval_filter,
     )
-    status = runtime["VSplit"](
+    wide_status = runtime["VSplit"](
         [
             runtime["Window"](
-                runtime["FormattedTextControl"](lambda: _status_left_fragments(state)),
+                runtime["FormattedTextControl"](
+                    lambda: _status_left_fragments(
+                        state,
+                        projection=projected_status(),
+                    )
+                ),
                 height=1,
                 dont_extend_height=True,
             ),
             runtime["Window"](
-                runtime["FormattedTextControl"](lambda: _status_right_fragments(state)),
+                runtime["FormattedTextControl"](
+                    lambda: _status_right_fragments(
+                        state,
+                        projection=projected_status(),
+                    )
+                ),
                 height=1,
                 dont_extend_height=True,
                 align="RIGHT",
@@ -1893,26 +2151,178 @@ def _create_application(
         ],
         height=1,
     )
-    root = runtime["HSplit"](
+    compact_status = runtime["Window"](
+        runtime["FormattedTextControl"](
+            lambda: _status_single_line_fragments(
+                state,
+                projection=projected_status(),
+            )
+        ),
+        height=1,
+        dont_extend_height=True,
+    )
+    wide_status_filter = runtime["Condition"](lambda: responsive().two_sided_status)
+    compact_status_filter = runtime["Condition"](
+        lambda: not responsive().two_sided_status
+    )
+    status = runtime["HSplit"](
         [
-            header,
-            rule,
-            transcript_window,
+            runtime["ConditionalContainer"](
+                wide_status,
+                filter=wide_status_filter,
+            ),
+            runtime["ConditionalContainer"](
+                compact_status,
+                filter=compact_status_filter,
+            ),
+        ]
+    )
+
+    def command_menu_state() -> Any:
+        complete_state = composer.buffer.complete_state
+        if complete_state is None or not complete_state.completions:
+            return None
+        return complete_state
+
+    def command_menu_visible() -> bool:
+        return (
+            rendered_terminal_is_usable()
+            and state.approval_panel is None
+            and command_menu_state() is not None
+        )
+
+    def command_menu_fragments() -> list[tuple[str, str]]:
+        complete_state = command_menu_state()
+        if complete_state is None:
+            return []
+        items = tuple(
+            (completion.display_text, completion.display_meta_text)
+            for completion in complete_state.completions
+        )
+        return _slash_command_menu_fragments(
+            items,
+            selected_index=(
+                complete_state.complete_index
+                if complete_state.complete_index is not None
+                else 0
+            ),
+            width=responsive().columns,
+            glyphs=glyphs,
+        )
+
+    def command_menu_cursor() -> Any:
+        complete_state = command_menu_state()
+        selected_index = (
+            complete_state.complete_index
+            if complete_state is not None and complete_state.complete_index is not None
+            else 0
+        )
+        return runtime["Point"](x=0, y=max(0, selected_index))
+
+    command_menu_rows = runtime["Window"](
+        runtime["FormattedTextControl"](
+            command_menu_fragments,
+            focusable=False,
+            show_cursor=False,
+            get_cursor_position=command_menu_cursor,
+        ),
+        wrap_lines=False,
+        always_hide_cursor=True,
+        dont_extend_height=True,
+        style="class:tui.command-menu",
+    )
+
+    def command_menu_rule() -> Any:
+        return runtime["Window"](
+            height=1,
+            char=glyphs.horizontal,
+            style="class:tui.command-menu.rule",
+            dont_extend_height=True,
+        )
+
+    command_menu = runtime["ConditionalContainer"](
+        runtime["HSplit"](
+            [
+                command_menu_rule(),
+                command_menu_rows,
+                command_menu_rule(),
+            ]
+        ),
+        filter=runtime["Condition"](command_menu_visible),
+    )
+    ready_body = runtime["HSplit"](
+        [
             approval_container,
             composer_frame,
+        ]
+    )
+    command_palette_body = runtime["HSplit"](
+        [
+            composer_frame,
+            command_menu,
+        ]
+    )
+    active_body = runtime["DynamicContainer"](
+        lambda: (command_palette_body if command_menu_visible() else ready_body)
+    )
+    main_shell = runtime["HSplit"](
+        [
+            active_body,
             status,
         ]
     )
+    usable_filter = runtime["Condition"](rendered_terminal_is_usable)
+    resize_filter = runtime["Condition"](lambda: not rendered_terminal_is_usable())
+    resize_window = runtime["Window"](
+        runtime["FormattedTextControl"](
+            lambda: _resize_message_fragments(
+                responsive(),
+                glyphs=glyphs,
+            )
+        ),
+        wrap_lines=True,
+        always_hide_cursor=True,
+        style="class:tui.resize",
+    )
+    root = runtime["HSplit"](
+        [
+            runtime["ConditionalContainer"](
+                main_shell,
+                filter=usable_filter,
+            ),
+            runtime["ConditionalContainer"](
+                resize_window,
+                filter=resize_filter,
+            ),
+        ]
+    )
+    header_fragments = header_identity_fragments()
+    source_fragments = header_source_fragments()
+    header_fragments.extend(
+        [
+            ("", "  "),
+            *source_fragments,
+            ("class:tui.rule", "\n" + (glyphs.horizontal * responsive().columns)),
+            ("", "\n"),
+        ]
+    )
+    runtime["print_formatted_text"](
+        output=enhanced_output,
+        formatted_text=runtime["FormattedText"](header_fragments),
+        style=semantic_style,
+    )
+    emit_pending_transcript()
     application = runtime["Application"](
         layout=runtime["Layout"](root, focused_element=composer),
         key_bindings=keys,
-        full_screen=True,
+        full_screen=False,
         erase_when_done=True,
         mouse_support=False,
         input=enhanced_input,
         output=enhanced_output,
-        style=runtime["Style"].from_dict(_semantic_style_rules()),
-        terminal_size_polling_interval=0.05,
+        style=semantic_style,
+        terminal_size_polling_interval=_terminal_size_polling_interval(),
+        before_render=refresh_responsive_projection,
     )
     application.ttimeoutlen = 0.01
     approval_previous = (
@@ -1994,6 +2404,77 @@ def _completed_tool_pairs(
     return tuple((call, results.get(call.id)) for call in calls)
 
 
+def _slash_command_menu_fragments(
+    items: Sequence[tuple[str, str]],
+    *,
+    selected_index: int | None,
+    width: int,
+    glyphs: TerminalGlyphs,
+) -> list[tuple[str, str]]:
+    """Render a bounded, full-width command-and-description palette."""
+
+    safe_width = max(1, int(width))
+    marker_width = 3
+    command_width = min(24, max(16, safe_width // 4))
+    description_width = max(0, safe_width - marker_width - command_width - 2)
+    truncation_marker = "..." if glyphs.top_left == "+" else "…"
+
+    def fitted(value: object, cell_width: int, *, maximum: int) -> str:
+        safe = _sanitize_terminal_text(
+            value,
+            maximum=maximum,
+            preserve_lines=False,
+            fallback="",
+        )
+        projected, _truncated = _truncate_display_text(
+            safe,
+            max(1, cell_width),
+            marker=truncation_marker,
+        )
+        return projected + (" " * max(0, cell_width - _display_width(projected)))
+
+    fragments: list[tuple[str, str]] = []
+    for index, (command, description) in enumerate(items):
+        selected = index == selected_index
+        marker = glyphs.prompt if selected else " "
+        command_style = (
+            "class:tui.command-menu.command.current"
+            if selected
+            else "class:tui.command-menu.command"
+        )
+        description_style = (
+            "class:tui.command-menu.description.current"
+            if selected
+            else "class:tui.command-menu.description"
+        )
+        fragments.append(
+            (
+                (
+                    "class:tui.command-menu.marker.current"
+                    if selected
+                    else "class:tui.command-menu.marker"
+                ),
+                f" {marker} ",
+            )
+        )
+        fragments.append(
+            (
+                command_style,
+                fitted(command, command_width, maximum=128),
+            )
+        )
+        if description_width:
+            fragments.append(("", "  "))
+            fragments.append(
+                (
+                    description_style,
+                    fitted(description, description_width, maximum=256),
+                )
+            )
+        fragments.append(("", "\n"))
+    return fragments
+
+
 def _slash_command_completion_surface() -> tuple[str, ...]:
     """Return the documented terminal-local completion choices."""
 
@@ -2050,9 +2531,12 @@ def _contains_sensitive_key(value: object, *, key: str = "") -> bool:
 
 def _render_approval_panel_fragments(
     panel: ApprovalPanelState,
+    *,
+    glyphs: TerminalGlyphs | None = None,
 ) -> list[tuple[str, str]]:
     if not isinstance(panel, ApprovalPanelState):
         raise TypeError("approval panel must be ApprovalPanelState")
+    glyphs = glyphs or _terminal_glyphs(_terminal_capabilities())
     return [
         ("class:tui.approval.label", " Tool          "),
         ("class:tui.approval.identity", f"{panel.tool_name}\n"),
@@ -2062,7 +2546,8 @@ def _render_approval_panel_fragments(
         ("class:tui.approval.arguments", f"{panel.arguments_text}\n\n"),
         (
             "class:tui.approval.action",
-            " [A] Approve once                                      [D] Deny\n",
+            f" {glyphs.approval} [A] Approve once"
+            "                                      [D] Deny\n",
         ),
     ]
 
@@ -2413,7 +2898,13 @@ def _render_transcript_fragments(
     state: TerminalViewState,
     *,
     width: int,
+    responsive: ResponsiveProjection | None = None,
+    capabilities: TerminalCapabilities | None = None,
+    glyphs: TerminalGlyphs | None = None,
 ) -> list[tuple[str, str]]:
+    capabilities = capabilities or _terminal_capabilities()
+    glyphs = glyphs or _terminal_glyphs(capabilities)
+    responsive = responsive or _responsive_projection(width, 24)
     if not state.blocks:
         return [
             (
@@ -2433,7 +2924,12 @@ def _render_transcript_fragments(
         elif block.kind == "assistant":
             fragments.append(("class:tui.assistant.label", " Daita\n"))
             fragments.extend(
-                _render_markdown_fragments(runtime, block.text, width=width)
+                _render_markdown_fragments(
+                    runtime,
+                    block.text,
+                    width=width,
+                    capabilities=capabilities,
+                )
             )
             fragments.append(("", "\n"))
         elif block.kind == "metadata":
@@ -2470,6 +2966,9 @@ def _render_transcript_fragments(
                         block.tool_card or state.tool_cards.get(block.text),
                         width=width,
                         runtime=runtime,
+                        responsive=responsive,
+                        capabilities=capabilities,
+                        glyphs=glyphs,
                     )
                 )
             except Exception:
@@ -2494,6 +2993,9 @@ def _render_tool_card_fragments(
     *,
     width: int,
     runtime: dict[str, Any] | None = None,
+    responsive: ResponsiveProjection | None = None,
+    capabilities: TerminalCapabilities | None = None,
+    glyphs: TerminalGlyphs | None = None,
 ) -> list[tuple[str, str]]:
     if not isinstance(card, ToolCardState):
         return [
@@ -2502,6 +3004,9 @@ def _render_tool_card_fragments(
         ]
     safe_width = max(_MIN_RENDER_WIDTH, min(width, _MAX_RENDER_WIDTH))
     runtime = _load_terminal_runtime() if runtime is None else runtime
+    capabilities = capabilities or _terminal_capabilities()
+    glyphs = glyphs or _terminal_glyphs(capabilities)
+    responsive = responsive or _responsive_projection(width, 24)
     label = _sanitize_terminal_text(
         card.label,
         maximum=max(8, safe_width - 16),
@@ -2509,19 +3014,21 @@ def _render_tool_card_fragments(
         fallback="Tool call",
     )
     if card.state == "running":
-        glyph = _RUNNING_GLYPHS[0]
+        glyph = glyphs.running[0]
         style = "class:tui.tool.running"
-        fallback_body = "Running…"
+        fallback_body = "Running…" if capabilities.unicode else "Running..."
     elif card.state == "approval":
-        glyph = "!"
+        glyph = glyphs.approval
         style = "class:tui.tool.approval"
-        fallback_body = "Approval required…"
+        fallback_body = (
+            "Approval required…" if capabilities.unicode else "Approval required..."
+        )
     elif card.state == "succeeded":
-        glyph = "✓"
+        glyph = glyphs.success
         style = "class:tui.tool.success"
         fallback_body = "Completed."
     else:
-        glyph = "!"
+        glyph = glyphs.failure
         style = "class:tui.tool.failure"
         fallback_body = _sanitize_terminal_text(
             card.error_code,
@@ -2530,7 +3037,7 @@ def _render_tool_card_fragments(
             fallback="Tool failed.",
         )
     duration = (
-        f" · {_format_duration(card.duration_ms)}"
+        f"{glyphs.separator}{_format_duration(card.duration_ms)}"
         if card.duration_ms is not None
         else ""
     )
@@ -2540,11 +3047,29 @@ def _render_tool_card_fragments(
         preserve_lines=False,
         fallback=f"{glyph} Tool call",
     )
-    top_fill = "─" * max(1, safe_width - _display_width(title) - 6)
-    bottom_fill = "─" * max(4, safe_width - 3)
-    fragments: list[tuple[str, str]] = [
-        (style, f" ╭─ {title} {top_fill}╮\n"),
-    ]
+    fragments: list[tuple[str, str]]
+    if responsive.bordered_cards:
+        top_fill = glyphs.horizontal * max(
+            1,
+            safe_width - _display_width(title) - 6,
+        )
+        fragments = [
+            (
+                style,
+                " "
+                f"{glyphs.top_left}{glyphs.horizontal} {title} "
+                f"{top_fill}{glyphs.top_right}\n",
+            ),
+        ]
+    else:
+        fragments = [(style, f" {glyph} {label}\n")]
+        if card.duration_ms is not None:
+            fragments.append(
+                (
+                    "class:tui.metadata",
+                    f"   {_format_duration(card.duration_ms)}\n",
+                )
+            )
     if card.details is None or card.state not in {"succeeded", "failed"}:
         fragments.extend(
             _card_plain_lines(
@@ -2557,6 +3082,8 @@ def _render_tool_card_fragments(
                     ),
                 ),
                 style=style,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
             )
         )
     else:
@@ -2566,14 +3093,20 @@ def _render_tool_card_fragments(
                 card,
                 width=max(_MIN_RENDER_WIDTH, safe_width - 6),
                 border_style=style,
+                responsive=responsive,
+                capabilities=capabilities,
+                glyphs=glyphs,
             )
         )
-    fragments.extend(
-        [
-            (style, f" ╰{bottom_fill}╯\n"),
-            ("", "\n"),
-        ]
-    )
+    if responsive.bordered_cards:
+        bottom_fill = glyphs.horizontal * max(4, safe_width - 3)
+        fragments.append(
+            (
+                style,
+                f" {glyphs.bottom_left}{bottom_fill}{glyphs.bottom_right}\n",
+            )
+        )
+    fragments.append(("", "\n"))
     return fragments
 
 
@@ -2583,10 +3116,18 @@ def _render_tool_details(
     *,
     width: int,
     border_style: str,
+    responsive: ResponsiveProjection,
+    capabilities: TerminalCapabilities,
+    glyphs: TerminalGlyphs,
 ) -> list[tuple[str, str]]:
     details = card.details
     if details is None:
-        return _card_plain_lines(("Status unavailable.",), style=border_style)
+        return _card_plain_lines(
+            ("Status unavailable.",),
+            style=border_style,
+            glyphs=glyphs,
+            bordered=responsive.bordered_cards,
+        )
 
     fragments: list[tuple[str, str]] = []
     if not card.expanded:
@@ -2594,7 +3135,14 @@ def _render_tool_details(
             _one_logical_line(details.summary),
             max(8, width),
         )
-        fragments.extend(_card_plain_lines((summary,), style=border_style))
+        fragments.extend(
+            _card_plain_lines(
+                (summary,),
+                style=border_style,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
+            )
+        )
         if details.table is not None:
             fragments.extend(
                 _card_rich_lines(
@@ -2603,11 +3151,14 @@ def _render_tool_details(
                         runtime,
                         details.table,
                         row_limit=_COLLAPSED_TABLE_ROWS,
-                        column_limit=_COLLAPSED_TABLE_COLUMNS,
+                        column_limit=responsive.collapsed_preview_columns,
                         width=width,
                     ),
                     width=width,
                     border_style=border_style,
+                    capabilities=capabilities,
+                    glyphs=glyphs,
+                    bordered=responsive.bordered_cards,
                 )
             )
             fragments.extend(
@@ -2619,23 +3170,39 @@ def _render_tool_details(
                             len(details.table.rows),
                         ),
                         shown_columns=min(
-                            _COLLAPSED_TABLE_COLUMNS,
+                            responsive.collapsed_preview_columns,
                             len(details.table.columns),
                         ),
                     ),
                     style=border_style,
+                    glyphs=glyphs,
+                    bordered=responsive.bordered_cards,
                 )
             )
-        fragments.extend(_card_plain_lines(("Ctrl+O expand",), style=border_style))
+        fragments.extend(
+            _card_plain_lines(
+                ("Ctrl+O expand",),
+                style=border_style,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
+            )
+        )
         return fragments
 
     if details.code is not None:
         label = "SQL" if details.code_language == "sql" else "Code"
-        fragments.extend(_card_plain_lines((label,), style=border_style))
+        fragments.extend(
+            _card_plain_lines(
+                (label,),
+                style=border_style,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
+            )
+        )
         syntax = runtime["Syntax"](
             details.code,
             details.code_language or "text",
-            theme="ansi_dark",
+            theme="bw",
             background_color="default",
             line_numbers=False,
             word_wrap=True,
@@ -2647,26 +3214,40 @@ def _render_tool_details(
                 width=width,
                 border_style=border_style,
                 maximum_lines=_MAX_CODE_VISIBLE_LINES,
+                capabilities=capabilities,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
                 truncation_line=(
-                    f"… code truncated at {_MAX_CODE_VISIBLE_LINES} visible lines"
+                    ("…" if capabilities.unicode else "...") + " code truncated at "
+                    f"{_MAX_CODE_VISIBLE_LINES} visible lines"
                 ),
             )
         )
     if details.arguments_text is not None:
-        fragments.extend(_card_plain_lines(("Arguments",), style=border_style))
+        fragments.extend(
+            _card_plain_lines(
+                ("Arguments",),
+                style=border_style,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
+            )
+        )
         fragments.extend(
             _card_rich_lines(
                 runtime,
                 runtime["Syntax"](
                     details.arguments_text,
                     "json",
-                    theme="ansi_dark",
+                    theme="bw",
                     background_color="default",
                     line_numbers=False,
                     word_wrap=True,
                 ),
                 width=width,
                 border_style=border_style,
+                capabilities=capabilities,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
             )
         )
     if details.error_message is not None:
@@ -2674,10 +3255,19 @@ def _render_tool_details(
             _card_plain_lines(
                 ("Error", details.error_message),
                 style=border_style,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
             )
         )
     if details.table is not None:
-        fragments.extend(_card_plain_lines(("Recorded result",), style=border_style))
+        fragments.extend(
+            _card_plain_lines(
+                ("Recorded result",),
+                style=border_style,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
+            )
+        )
         fragments.extend(
             _card_rich_lines(
                 runtime,
@@ -2685,11 +3275,14 @@ def _render_tool_details(
                     runtime,
                     details.table,
                     row_limit=_EXPANDED_TABLE_ROWS,
-                    column_limit=_EXPANDED_TABLE_COLUMNS,
+                    column_limit=responsive.expanded_preview_columns,
                     width=width,
                 ),
                 width=width,
                 border_style=border_style,
+                capabilities=capabilities,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
             )
         )
         fragments.extend(
@@ -2698,31 +3291,50 @@ def _render_tool_details(
                     details.table,
                     shown_rows=min(_EXPANDED_TABLE_ROWS, len(details.table.rows)),
                     shown_columns=min(
-                        _EXPANDED_TABLE_COLUMNS,
+                        responsive.expanded_preview_columns,
                         len(details.table.columns),
                     ),
                 ),
                 style=border_style,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
             )
         )
     if details.result_text is not None:
-        fragments.extend(_card_plain_lines(("Result details",), style=border_style))
+        fragments.extend(
+            _card_plain_lines(
+                ("Result details",),
+                style=border_style,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
+            )
+        )
         fragments.extend(
             _card_rich_lines(
                 runtime,
                 runtime["Syntax"](
                     details.result_text,
                     "json",
-                    theme="ansi_dark",
+                    theme="bw",
                     background_color="default",
                     line_numbers=False,
                     word_wrap=True,
                 ),
                 width=width,
                 border_style=border_style,
+                capabilities=capabilities,
+                glyphs=glyphs,
+                bordered=responsive.bordered_cards,
             )
         )
-    fragments.extend(_card_plain_lines(("Ctrl+O collapse",), style=border_style))
+    fragments.extend(
+        _card_plain_lines(
+            ("Ctrl+O collapse",),
+            style=border_style,
+            glyphs=glyphs,
+            bordered=responsive.bordered_cards,
+        )
+    )
     return fragments
 
 
@@ -2748,7 +3360,7 @@ def _table_renderable(
     )
     for column in columns:
         table.add_column(
-            runtime["Text"](column, style="cyan"),
+            runtime["Text"](column, style="data"),
             overflow="ellipsis",
             no_wrap=True,
             max_width=column_width,
@@ -2794,7 +3406,10 @@ def _card_plain_lines(
     lines: Sequence[str],
     *,
     style: str,
+    glyphs: TerminalGlyphs | None = None,
+    bordered: bool = True,
 ) -> list[tuple[str, str]]:
+    glyphs = glyphs or _terminal_glyphs(_terminal_capabilities())
     fragments: list[tuple[str, str]] = []
     for line in lines:
         safe = _sanitize_terminal_text(
@@ -2804,13 +3419,8 @@ def _card_plain_lines(
             fallback="",
         )
         if safe:
-            fragments.extend(
-                [
-                    (style, " │ "),
-                    ("", safe),
-                    (style, "\n"),
-                ]
-            )
+            prefix = f" {glyphs.vertical} " if bordered else "   "
+            fragments.extend([(style, prefix), ("", safe), (style, "\n")])
     return fragments
 
 
@@ -2822,8 +3432,18 @@ def _card_rich_lines(
     border_style: str,
     maximum_lines: int | None = None,
     truncation_line: str = "… content truncated",
+    capabilities: TerminalCapabilities | None = None,
+    glyphs: TerminalGlyphs | None = None,
+    bordered: bool = True,
 ) -> list[tuple[str, str]]:
-    lines = _render_rich_fragment_lines(runtime, renderable, width=width)
+    capabilities = capabilities or _terminal_capabilities()
+    glyphs = glyphs or _terminal_glyphs(capabilities)
+    lines = _render_rich_fragment_lines(
+        runtime,
+        renderable,
+        width=width,
+        capabilities=capabilities,
+    )
     if maximum_lines is not None and len(lines) > maximum_lines:
         lines = [
             *lines[: max(0, maximum_lines - 1)],
@@ -2831,7 +3451,8 @@ def _card_rich_lines(
         ]
     fragments: list[tuple[str, str]] = []
     for line in lines:
-        fragments.append((border_style, " │ "))
+        prefix = f" {glyphs.vertical} " if bordered else "   "
+        fragments.append((border_style, prefix))
         fragments.extend(line)
         fragments.append((border_style, "\n"))
     return fragments
@@ -2842,18 +3463,20 @@ def _render_rich_fragment_lines(
     renderable: Any,
     *,
     width: int,
+    capabilities: TerminalCapabilities | None = None,
 ) -> list[list[tuple[str, str]]]:
     target = io.StringIO()
-    no_color = bool(os.environ.get("NO_COLOR"))
+    capabilities = capabilities or _terminal_capabilities()
     console = runtime["Console"](
         file=target,
         width=max(_MIN_RENDER_WIDTH, min(width, _MAX_RENDER_WIDTH)),
-        force_terminal=not no_color,
-        color_system=None if no_color else "truecolor",
-        no_color=no_color,
+        force_terminal=not capabilities.no_color,
+        color_system=capabilities.rich_color_system,
+        no_color=capabilities.no_color,
         markup=False,
         highlight=False,
         soft_wrap=False,
+        theme=runtime["Theme"](_rich_theme_rules(capabilities)),
     )
     console.print(renderable, end="")
     formatted = runtime["ANSI"](target.getvalue()).__pt_formatted_text__()
@@ -2875,8 +3498,14 @@ def _render_markdown_fragments(
     value: object,
     *,
     width: int,
+    capabilities: TerminalCapabilities | None = None,
 ) -> list[tuple[str, str]]:
-    rendered = _render_markdown_ansi(runtime, value, width=width)
+    rendered = _render_markdown_ansi(
+        runtime,
+        value,
+        width=width,
+        capabilities=capabilities,
+    )
     fragments = runtime["ANSI"](rendered).__pt_formatted_text__()
     return [
         (style, f" {text}" if index == 0 else text)
@@ -2889,6 +3518,7 @@ def _render_markdown_ansi(
     value: object,
     *,
     width: int,
+    capabilities: TerminalCapabilities | None = None,
 ) -> str:
     safe = _sanitize_terminal_text(
         value,
@@ -2897,23 +3527,14 @@ def _render_markdown_ansi(
         fallback="(empty response)",
     )
     target = io.StringIO()
-    no_color = bool(os.environ.get("NO_COLOR"))
-    theme = runtime["Theme"](
-        {
-            "markdown.h1": "bold green",
-            "markdown.h2": "bold green",
-            "markdown.h3": "bold green",
-            "markdown.item.bullet": "green",
-            "markdown.code": "cyan",
-            "markdown.code_block": "cyan",
-        }
-    )
+    capabilities = capabilities or _terminal_capabilities()
+    theme = runtime["Theme"](_rich_theme_rules(capabilities))
     console = runtime["Console"](
         file=target,
         width=max(_MIN_RENDER_WIDTH, min(width, _MAX_RENDER_WIDTH)),
-        force_terminal=not no_color,
-        color_system=None if no_color else "truecolor",
-        no_color=no_color,
+        force_terminal=not capabilities.no_color,
+        color_system=capabilities.rich_color_system,
+        no_color=capabilities.no_color,
         markup=False,
         highlight=False,
         soft_wrap=False,
@@ -2922,7 +3543,7 @@ def _render_markdown_ansi(
     console.print(
         runtime["Markdown"](
             safe,
-            code_theme="ansi_dark",
+            code_theme="bw",
             hyperlinks=False,
         ),
         end="",
@@ -2952,57 +3573,43 @@ def _render_markdown_text(value: object, *, width: int = 80) -> str:
         soft_wrap=False,
     )
     console.print(
-        runtime["Markdown"](safe, code_theme="ansi_dark", hyperlinks=False),
+        runtime["Markdown"](safe, code_theme="bw", hyperlinks=False),
         end="",
     )
     return target.getvalue()
 
 
-def _status_left_fragments(state: TerminalViewState) -> list[tuple[str, str]]:
-    agent = _sanitize_terminal_text(
-        state.agent_label,
-        maximum=64,
-        preserve_lines=False,
-        fallback="agent",
-    )
-    model = _sanitize_terminal_text(
-        state.model_label,
-        maximum=96,
-        preserve_lines=False,
-        fallback="model",
-    )
+def _status_state_style(state: TerminalViewState) -> str:
+    if state.running and state.run_status == "approval":
+        return "class:tui.status.approval"
     if state.running:
-        glyph = _RUNNING_GLYPHS[state.animation_frame % len(_RUNNING_GLYPHS)]
-        status = _sanitize_terminal_text(
-            state.run_status,
-            maximum=32,
-            preserve_lines=False,
-            fallback="working",
-        )
-        status_style = (
-            "class:tui.status.approval"
-            if status == "approval"
-            else "class:tui.status.running"
-        )
-        return [
-            ("class:tui.status", f" {agent} · {model} · "),
-            (status_style, f"{glyph} {status}"),
-        ]
+        return "class:tui.status.running"
     if state.run_status in {"failed", "interrupted"}:
-        return [
-            ("class:tui.status", f" {agent} · {model} · "),
-            (
-                "class:tui.status.failure",
-                f"! {_sanitize_terminal_text(state.run_status, maximum=32, preserve_lines=False, fallback='failed')}",
-            ),
-        ]
-    return [
-        ("class:tui.status", f" {agent} · {model} · "),
-        ("class:tui.status.ready", "● ready"),
-    ]
+        return "class:tui.status.failure"
+    return "class:tui.status.ready"
 
 
-def _status_right_fragments(state: TerminalViewState) -> list[tuple[str, str]]:
+def _status_left_fragments(
+    state: TerminalViewState,
+    *,
+    projection: StatusProjection | None = None,
+) -> list[tuple[str, str]]:
+    if projection is None:
+        glyphs = _terminal_glyphs(_terminal_capabilities())
+        projection = _status_projection(
+            state,
+            width=100,
+            mode="full",
+            glyphs=glyphs,
+        )
+    return [(_status_state_style(state), f" {projection.left}")]
+
+
+def _status_right_fragments(
+    state: TerminalViewState,
+    *,
+    projection: StatusProjection | None = None,
+) -> list[tuple[str, str]]:
     if state.notice:
         return [
             (
@@ -3016,18 +3623,73 @@ def _status_right_fragments(state: TerminalViewState) -> list[tuple[str, str]]:
                 + " ",
             )
         ]
+    if projection is None:
+        glyphs = _terminal_glyphs(_terminal_capabilities())
+        projection = _status_projection(
+            state,
+            width=100,
+            mode="full",
+            glyphs=glyphs,
+        )
     return [
         (
             "class:tui.status.meta",
-            f"{state.steps} steps · {state.total_tokens} tokens · "
-            f"${state.estimated_cost} ",
+            f"{projection.right} " if projection.right else "",
         )
     ]
 
 
-def _semantic_style_rules() -> dict[str, str]:
-    no_color = bool(os.environ.get("NO_COLOR"))
-    if no_color:
+def _status_single_line_fragments(
+    state: TerminalViewState,
+    *,
+    projection: StatusProjection,
+) -> list[tuple[str, str]]:
+    fragments = [(_status_state_style(state), f" {projection.left}")]
+    suffix = ""
+    suffix_style = "class:tui.status.meta"
+    if state.notice:
+        suffix = _sanitize_terminal_text(
+            state.notice,
+            maximum=128,
+            preserve_lines=False,
+            fallback="",
+        )
+        suffix_style = "class:tui.status.notice"
+    elif projection.right:
+        suffix = projection.right
+    if suffix:
+        fragments.append((suffix_style, f"  {suffix}"))
+    return fragments
+
+
+def _resize_message_fragments(
+    projection: ResponsiveProjection,
+    *,
+    glyphs: TerminalGlyphs,
+) -> list[tuple[str, str]]:
+    message = (
+        f"{glyphs.warning} Terminal too small "
+        f"({projection.columns}x{projection.rows}). "
+        f"Resize to at least {_MIN_USABLE_COLUMNS}x{projection.minimum_rows}."
+    )
+    maximum = max(1, min(_MAX_RENDER_CHARACTERS, projection.columns * 3))
+    safe = _sanitize_terminal_text(
+        message,
+        maximum=maximum,
+        preserve_lines=False,
+        fallback="Resize the terminal.",
+    )
+    return [
+        ("class:tui.resize", "\n"),
+        ("class:tui.resize", f" {safe}\n"),
+    ]
+
+
+def _semantic_style_rules(
+    capabilities: TerminalCapabilities | None = None,
+) -> dict[str, str]:
+    capabilities = capabilities or _terminal_capabilities()
+    if capabilities.no_color:
         return {
             "tui.identity": "bold",
             "tui.header.agent": "bold",
@@ -3050,6 +3712,16 @@ def _semantic_style_rules() -> dict[str, str]:
             "tui.prompt": "bold",
             "tui.composer": "",
             "tui.composer.frame": "",
+            "tui.frame": "",
+            "tui.resize": "bold",
+            "tui.command-menu": "",
+            "tui.command-menu.rule": "",
+            "tui.command-menu.marker": "",
+            "tui.command-menu.marker.current": "bold",
+            "tui.command-menu.command": "",
+            "tui.command-menu.command.current": "bold underline",
+            "tui.command-menu.description": "",
+            "tui.command-menu.description.current": "bold",
             "tui.approval": "",
             "tui.approval.frame": "",
             "tui.approval.label": "bold",
@@ -3071,50 +3743,157 @@ def _semantic_style_rules() -> dict[str, str]:
             "tui.tool.failure": "bold",
             "scrollbar.background": "",
             "scrollbar.button": "",
+            "selection.identity": "bold",
+            "selection.title": "bold",
+            "selection.help": "",
+            "selection.filter": "bold",
+            "selection.validation": "bold",
+            "selection.empty": "",
+            "selection.current": "bold underline",
         }
+    colors = _semantic_colors(capabilities)
     return {
-        "tui.identity": "bold #22c55e",
+        "tui.identity": f"bold {colors['brand']}",
         "tui.header.agent": "bold",
-        "tui.header.meta": "#71717a",
-        "tui.rule": "#15803d",
+        "tui.header.meta": colors["muted"],
+        "tui.rule": colors["muted_green"],
         "tui.user.label": "bold",
-        "tui.assistant.label": "bold #22c55e",
-        "tui.local.label": "bold #71717a",
+        "tui.assistant.label": f"bold {colors['brand']}",
+        "tui.local.label": f"bold {colors['muted']}",
         "tui.local": "",
-        "tui.local.status.label": "bold #22c55e",
+        "tui.local.status.label": f"bold {colors['brand']}",
         "tui.local.status": "",
-        "tui.local.sources.label": "bold #38bdf8",
+        "tui.local.sources.label": f"bold {colors['data']}",
         "tui.local.sources": "",
-        "tui.local.catalog.label": "bold #38bdf8",
+        "tui.local.catalog.label": f"bold {colors['data']}",
         "tui.local.catalog": "",
-        "tui.local.settings.label": "bold #22c55e",
+        "tui.local.settings.label": f"bold {colors['brand']}",
         "tui.local.settings": "",
-        "tui.metadata": "#71717a",
-        "tui.empty": "#71717a",
-        "tui.prompt": "bold #4ade80",
+        "tui.metadata": colors["muted"],
+        "tui.empty": colors["muted"],
+        "tui.prompt": f"bold {colors['focus']}",
         "tui.composer": "",
         "tui.composer.frame": "",
+        "tui.frame": colors["focus"],
+        "tui.resize": f"bold {colors['warning']}",
+        "tui.command-menu": "",
+        "tui.command-menu.rule": colors["muted"],
+        "tui.command-menu.marker": colors["muted"],
+        "tui.command-menu.marker.current": f"bold {colors['focus']}",
+        "tui.command-menu.command": colors["muted"],
+        "tui.command-menu.command.current": f"bold {colors['focus']}",
+        "tui.command-menu.description": colors["muted"],
+        "tui.command-menu.description.current": colors["focus"],
         "tui.approval": "",
-        "tui.approval.frame": "#f59e0b",
-        "tui.approval.label": "bold #f59e0b",
+        "tui.approval.frame": colors["warning"],
+        "tui.approval.label": f"bold {colors['warning']}",
         "tui.approval.identity": "bold",
         "tui.approval.arguments": "",
-        "tui.approval.action": "bold #f59e0b",
-        "tui.approval.failure": "bold #f87171",
-        "frame.border": "#4ade80",
-        "tui.status": "#71717a",
-        "tui.status.ready": "bold #22c55e",
-        "tui.status.running": "bold #15803d",
-        "tui.status.approval": "bold #f59e0b",
-        "tui.status.failure": "bold #f87171",
-        "tui.status.notice": "#f59e0b",
-        "tui.status.meta": "#71717a",
-        "tui.tool.running": "#15803d",
-        "tui.tool.approval": "#f59e0b",
-        "tui.tool.success": "#22c55e",
-        "tui.tool.failure": "#f87171",
-        "scrollbar.background": "#71717a",
-        "scrollbar.button": "#15803d",
+        "tui.approval.action": f"bold {colors['warning']}",
+        "tui.approval.failure": f"bold {colors['error']}",
+        "frame.border": colors["focus"],
+        "tui.status": colors["muted"],
+        "tui.status.ready": f"bold {colors['brand']}",
+        "tui.status.running": f"bold {colors['muted_green']}",
+        "tui.status.approval": f"bold {colors['warning']}",
+        "tui.status.failure": f"bold {colors['error']}",
+        "tui.status.notice": colors["warning"],
+        "tui.status.meta": colors["muted"],
+        "tui.tool.running": colors["muted_green"],
+        "tui.tool.approval": colors["warning"],
+        "tui.tool.success": colors["brand"],
+        "tui.tool.failure": colors["error"],
+        "scrollbar.background": colors["muted"],
+        "scrollbar.button": colors["muted_green"],
+        "selection.identity": f"bold {colors['brand']}",
+        "selection.title": "bold",
+        "selection.help": colors["muted"],
+        "selection.filter": f"bold {colors['data']}",
+        "selection.validation": f"bold {colors['warning']}",
+        "selection.empty": colors["muted"],
+        "selection.current": f"bold underline {colors['focus']}",
+    }
+
+
+def _semantic_colors(capabilities: TerminalCapabilities) -> dict[str, str]:
+    if capabilities.color_depth == "truecolor":
+        return {
+            "brand": "#22c55e",
+            "focus": "#4ade80",
+            "muted_green": "#15803d",
+            "data": "#38bdf8",
+            "warning": "#f59e0b",
+            "error": "#f87171",
+            "muted": "#71717a",
+        }
+    if capabilities.color_depth == "256":
+        return {
+            "brand": "ansibrightgreen",
+            "focus": "ansibrightgreen",
+            "muted_green": "ansigreen",
+            "data": "ansibrightcyan",
+            "warning": "ansiyellow",
+            "error": "ansibrightred",
+            "muted": "ansibrightblack",
+        }
+    return {
+        "brand": "ansigreen",
+        "focus": "ansibrightgreen",
+        "muted_green": "ansigreen",
+        "data": "ansicyan",
+        "warning": "ansiyellow",
+        "error": "ansired",
+        "muted": "ansibrightblack",
+    }
+
+
+def _rich_theme_rules(
+    capabilities: TerminalCapabilities,
+) -> dict[str, str]:
+    if capabilities.no_color:
+        return {
+            "brand": "bold",
+            "data": "",
+            "warning": "bold",
+            "error": "bold",
+            "muted": "",
+            "markdown.h1": "bold",
+            "markdown.h2": "bold",
+            "markdown.h3": "bold",
+            "markdown.item.bullet": "bold",
+            "markdown.code": "",
+            "markdown.code_block": "",
+        }
+    if capabilities.color_depth == "truecolor":
+        brand = "#22c55e"
+        data = "#38bdf8"
+        warning = "#f59e0b"
+        error = "#f87171"
+        muted = "#71717a"
+    elif capabilities.color_depth == "256":
+        brand = "bright_green"
+        data = "bright_cyan"
+        warning = "yellow"
+        error = "bright_red"
+        muted = "bright_black"
+    else:
+        brand = "green"
+        data = "cyan"
+        warning = "yellow"
+        error = "red"
+        muted = "bright_black"
+    return {
+        "brand": f"bold {brand}",
+        "data": data,
+        "warning": warning,
+        "error": error,
+        "muted": muted,
+        "markdown.h1": f"bold {brand}",
+        "markdown.h2": f"bold {brand}",
+        "markdown.h3": f"bold {brand}",
+        "markdown.item.bullet": brand,
+        "markdown.code": data,
+        "markdown.code_block": data,
     }
 
 
@@ -3161,12 +3940,20 @@ def _display_width(value: str) -> int:
     return width
 
 
-def _truncate_display_text(value: str, maximum: int) -> tuple[str, bool]:
+def _truncate_display_text(
+    value: str,
+    maximum: int,
+    *,
+    marker: str = "…",
+) -> tuple[str, bool]:
     if maximum < 1:
         return "", bool(value)
     if _display_width(value) <= maximum:
         return value, False
-    available = max(0, maximum - 1)
+    safe_marker = marker
+    if _display_width(safe_marker) > maximum:
+        safe_marker = safe_marker[:maximum]
+    available = max(0, maximum - _display_width(safe_marker))
     projected: list[str] = []
     width = 0
     for character in value:
@@ -3179,7 +3966,7 @@ def _truncate_display_text(value: str, maximum: int) -> tuple[str, bool]:
             break
         projected.append(character)
         width += character_width
-    return "".join(projected) + "…", True
+    return "".join(projected) + safe_marker, True
 
 
 def _clear_current_task_cancellation() -> None:
@@ -3224,10 +4011,8 @@ def _sanitize_terminal_text(
 
 
 def _render_width(output: Any) -> int:
-    try:
-        return max(_MIN_RENDER_WIDTH, min(output.get_size().columns - 4, 240))
-    except (AttributeError, OSError, TypeError, ValueError):
-        return 76
+    columns, _rows = _terminal_size(output)
+    return max(_MIN_RENDER_WIDTH, min(columns - 2, _MAX_RENDER_WIDTH))
 
 
 def _viewport_height(window: Any) -> int:
@@ -3242,7 +4027,6 @@ def _restore_terminal(output: Any) -> None:
         "reset_cursor_key_mode",
         "reset_cursor_shape",
         "enable_autowrap",
-        "quit_alternate_screen",
         "show_cursor",
         "flush",
     ):

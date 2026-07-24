@@ -322,6 +322,7 @@ def _load_prompt_toolkit() -> dict[str, Any]:
         from prompt_toolkit.layout.controls import FormattedTextControl
         from prompt_toolkit.layout.containers import Window
         from prompt_toolkit.output import create_output
+        from prompt_toolkit.styles import Style
     except ImportError as error:
         raise ImportError(
             "Daita's terminal runtime dependency is unavailable. "
@@ -333,6 +334,7 @@ def _load_prompt_toolkit() -> dict[str, Any]:
         "FormattedTextControl": FormattedTextControl,
         "KeyBindings": KeyBindings,
         "Layout": Layout,
+        "Style": Style,
         "Window": Window,
         "create_input": create_input,
         "create_output": create_output,
@@ -346,7 +348,15 @@ def _create_application(
     enhanced_input: Any,
     enhanced_output: Any,
 ) -> Any:
+    from . import terminal_tui
+
+    capabilities = terminal_tui._terminal_capabilities(enhanced_output)
+    glyphs = terminal_tui._terminal_glyphs(capabilities)
     keys = toolkit["KeyBindings"]()
+
+    def terminal_usable() -> bool:
+        columns, rows = terminal_tui._terminal_size(enhanced_output)
+        return columns >= 32 and rows >= 6
 
     def invalidate(event: Any) -> None:
         event.app.invalidate()
@@ -363,6 +373,9 @@ def _create_application(
 
     @keys.add("enter")
     def confirm(event: Any) -> None:
+        if not terminal_usable():
+            invalidate(event)
+            return
         selected = state.selected_value()
         if selected is not _NO_SELECTION:
             event.app.exit(result=selected)
@@ -396,7 +409,12 @@ def _create_application(
         invalidate(event)
 
     control = toolkit["FormattedTextControl"](
-        lambda: _render_fragments(title, state),
+        lambda: _render_fragments(
+            title,
+            state,
+            glyphs=glyphs,
+            size=terminal_tui._terminal_size(enhanced_output),
+        ),
         focusable=True,
         show_cursor=False,
     )
@@ -413,7 +431,10 @@ def _create_application(
         mouse_support=False,
         input=enhanced_input,
         output=enhanced_output,
-        terminal_size_polling_interval=0.05,
+        style=toolkit["Style"].from_dict(
+            terminal_tui._semantic_style_rules(capabilities)
+        ),
+        terminal_size_polling_interval=terminal_tui._terminal_size_polling_interval(),
     )
     application.ttimeoutlen = 0.01
     return application
@@ -426,7 +447,15 @@ def _create_multi_application(
     enhanced_input: Any,
     enhanced_output: Any,
 ) -> Any:
+    from . import terminal_tui
+
+    capabilities = terminal_tui._terminal_capabilities(enhanced_output)
+    glyphs = terminal_tui._terminal_glyphs(capabilities)
     keys = toolkit["KeyBindings"]()
+
+    def terminal_usable() -> bool:
+        columns, rows = terminal_tui._terminal_size(enhanced_output)
+        return columns >= 32 and rows >= 6
 
     def invalidate(event: Any) -> None:
         event.app.invalidate()
@@ -448,6 +477,9 @@ def _create_multi_application(
 
     @keys.add("enter")
     def confirm(event: Any) -> None:
+        if not terminal_usable():
+            invalidate(event)
+            return
         selected = state.selected_values()
         if selected is not _NO_SELECTION:
             event.app.exit(result=selected)
@@ -483,7 +515,12 @@ def _create_multi_application(
         invalidate(event)
 
     control = toolkit["FormattedTextControl"](
-        lambda: _render_multi_fragments(title, state),
+        lambda: _render_multi_fragments(
+            title,
+            state,
+            glyphs=glyphs,
+            size=terminal_tui._terminal_size(enhanced_output),
+        ),
         focusable=True,
         show_cursor=False,
     )
@@ -500,7 +537,10 @@ def _create_multi_application(
         mouse_support=False,
         input=enhanced_input,
         output=enhanced_output,
-        terminal_size_polling_interval=0.05,
+        style=toolkit["Style"].from_dict(
+            terminal_tui._semantic_style_rules(capabilities)
+        ),
+        terminal_size_polling_interval=terminal_tui._terminal_size_polling_interval(),
     )
     application.ttimeoutlen = 0.01
     return application
@@ -513,13 +553,27 @@ async def _run_application(application: Any) -> Any:
 def _render_fragments(
     title: str,
     state: _SelectionState[Any],
+    *,
+    glyphs: Any = None,
+    size: tuple[int, int] | None = None,
 ) -> list[tuple[str, str]]:
+    from . import terminal_tui
+
+    glyphs = glyphs or terminal_tui._terminal_glyphs(
+        terminal_tui._terminal_capabilities()
+    )
+    if size is not None and (size[0] < 32 or size[1] < 6):
+        return _small_terminal_fragments(size, glyphs)
+    narrow = size is not None and size[0] < 70
+    help_text = (
+        "  ↑/↓ move · Enter select · type to filter · Esc back\n"
+        if glyphs.prompt == "›"
+        else "  Up/Down move | Enter select | type to filter | Esc back\n"
+    )
     fragments = [
+        ("class:selection.identity", "DAITA SETUP\n"),
         ("class:selection.title", f"{title}\n\n"),
-        (
-            "class:selection.help",
-            "  ↑/↓ move · Enter select · type to filter · Esc back\n",
-        ),
+        ("class:selection.help", help_text),
     ]
     if state.filter_text:
         fragments.append(
@@ -535,23 +589,44 @@ def _render_fragments(
         return fragments
     state.position %= len(visible)
     for index, option in enumerate(visible):
-        prefix = "› " if index == state.position else "  "
-        description = f"   {option.description}" if option.description else ""
+        prefix = f"{glyphs.prompt} " if index == state.position else "  "
+        description = (
+            "" if narrow or not option.description else f"   {option.description}"
+        )
         style = "class:selection.current" if index == state.position else ""
         fragments.append((style, f"{prefix}{option.label}{description}\n"))
+        if narrow and option.description:
+            fragments.append(("class:selection.help", f"    {option.description}\n"))
     return fragments
 
 
 def _render_multi_fragments(
     title: str,
     state: _MultiSelectionState[Any],
+    *,
+    glyphs: Any = None,
+    size: tuple[int, int] | None = None,
 ) -> list[tuple[str, str]]:
+    from . import terminal_tui
+
+    glyphs = glyphs or terminal_tui._terminal_glyphs(
+        terminal_tui._terminal_capabilities()
+    )
+    if size is not None and (size[0] < 32 or size[1] < 6):
+        return _small_terminal_fragments(size, glyphs)
+    narrow = size is not None and size[0] < 70
+    help_text = (
+        "  ↑/↓ move · Space toggle · Enter continue · type to filter · Esc back\n"
+        if glyphs.prompt == "›"
+        else (
+            "  Up/Down move | Space toggle | Enter continue | "
+            "type to filter | Esc back\n"
+        )
+    )
     fragments = [
+        ("class:selection.identity", "DAITA SETUP\n"),
         ("class:selection.title", f"{title}\n\n"),
-        (
-            "class:selection.help",
-            "  ↑/↓ move · Space toggle · Enter continue · type to filter · Esc back\n",
-        ),
+        ("class:selection.help", help_text),
     ]
     if state.filter_text:
         fragments.append(
@@ -574,12 +649,36 @@ def _render_multi_fragments(
         return fragments
     state.position %= len(visible)
     for index, option in enumerate(visible):
-        prefix = "› " if index == state.position else "  "
+        prefix = f"{glyphs.prompt} " if index == state.position else "  "
         checked = "x" if option.identity in state.selected_identities else " "
-        description = f"   {option.description}" if option.description else ""
+        description = (
+            "" if narrow or not option.description else f"   {option.description}"
+        )
         style = "class:selection.current" if index == state.position else ""
         fragments.append((style, f"{prefix}[{checked}] {option.label}{description}\n"))
+        if narrow and option.description:
+            fragments.append(("class:selection.help", f"      {option.description}\n"))
     return fragments
+
+
+def _small_terminal_fragments(
+    size: tuple[int, int],
+    glyphs: Any,
+) -> list[tuple[str, str]]:
+    columns, rows = size
+    message = (
+        f"{glyphs.warning} Terminal too small ({columns}x{rows}). "
+        "Resize to at least 32x6."
+    )
+    safe = _safe_text(
+        message,
+        maximum=max(32, min(_MAX_VALIDATION_CHARACTERS, columns * 3)),
+        fallback="Resize the terminal.",
+    )
+    return [
+        ("class:selection.identity", "DAITA SETUP\n\n"),
+        ("class:selection.validation", f"  {safe}\n"),
+    ]
 
 
 def _select_numbered(
@@ -722,7 +821,15 @@ def _streams_support_enhanced(input_stream: TextIO, output_stream: TextIO) -> bo
 
 
 def _restore_output(output: Any) -> None:
-    for method_name in ("reset_attributes", "show_cursor", "flush"):
+    for method_name in (
+        "reset_attributes",
+        "reset_cursor_key_mode",
+        "reset_cursor_shape",
+        "enable_autowrap",
+        "quit_alternate_screen",
+        "show_cursor",
+        "flush",
+    ):
         try:
             getattr(output, method_name)()
         except Exception:

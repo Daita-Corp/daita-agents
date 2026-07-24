@@ -14,6 +14,7 @@ from prompt_toolkit.output import DummyOutput
 from daita import Agent
 from daita import terminal
 from daita import terminal_selection
+from daita import terminal_tui
 from daita.terminal_selection import (
     SelectionCancelled,
     SelectionOption,
@@ -196,7 +197,14 @@ async def test_escape_ctrl_c_and_eof_have_distinct_cancellation_outcomes(
     assert output.show_count >= 1
 
 
-async def test_terminal_size_change_triggers_redraw_before_selection():
+async def test_terminal_size_change_triggers_redraw_before_selection(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        terminal_tui,
+        "_terminal_size_polling_interval",
+        lambda: 0.01,
+    )
     output = _RecordingOutput()
     with create_pipe_input() as pipe:
         task = asyncio.create_task(
@@ -217,6 +225,65 @@ async def test_terminal_size_change_triggers_redraw_before_selection():
         assert await task == "alpha-id"
 
     assert output.size_checks > checks_before_resize
+
+
+async def test_very_small_selector_waits_for_resize_and_keeps_stable_identity(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        terminal_tui,
+        "_terminal_size_polling_interval",
+        lambda: 0.01,
+    )
+    output = _RecordingOutput()
+    output.size = Size(rows=5, columns=31)
+    with create_pipe_input() as pipe:
+        task = asyncio.create_task(
+            select_one(
+                "Choose",
+                _OPTIONS,
+                input_stream=io.StringIO(),
+                output_stream=io.StringIO(),
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        await _wait_for_output(output, "Terminal too small (31x5)")
+        pipe.send_text("\r")
+        await asyncio.sleep(0.05)
+        assert not task.done()
+
+        output.size = Size(rows=24, columns=80)
+        await asyncio.sleep(0.08)
+        pipe.send_text("\x1b[B\r")
+        selected = await task
+
+    assert selected == "beta-id"
+
+
+def test_selector_visuals_share_ascii_theme_without_changing_values():
+    state = terminal_selection._SelectionState(
+        terminal_selection._normalize_options(_OPTIONS)
+    )
+    glyphs = terminal_tui._terminal_glyphs(
+        terminal_tui.TerminalCapabilities("16", False)
+    )
+
+    rendered = "".join(
+        text
+        for _style, text in terminal_selection._render_fragments(
+            "Choose",
+            state,
+            glyphs=glyphs,
+            size=(80, 24),
+        )
+    )
+
+    assert "DAITA SETUP" in rendered
+    assert "> Alpha" in rendered
+    assert "Up/Down move" in rendered
+    assert "›" not in rendered
+    assert state.selected_value() == "alpha-id"
 
 
 async def test_labels_and_descriptions_are_sanitized_and_bounded():

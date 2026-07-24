@@ -13,7 +13,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from daita import Agent, ApprovalDecision, ApprovalRequest, SQLiteSource
-from daita import terminal
+from daita import terminal, terminal_tui
 from daita._json import FrozenJsonObject
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
@@ -161,6 +161,9 @@ async def test_ready_agent_enters_chat_and_explicitly_continues_one_conversation
     assert code == 0
     text = output.getvalue()
     assert "\nReady\n" in text
+    assert text.count("Agent     atlas") == 1
+    assert text.count("Model     OpenAI · test-model · configured") == 1
+    assert "provider health was not checked this launch" not in text
     assert "Stage 2 status" not in text
     assert "Stage 4 status" not in text
     assert "Conversation  new" in text
@@ -173,6 +176,47 @@ async def test_ready_agent_enters_chat_and_explicitly_continues_one_conversation
         "first answer",
         "follow-up question",
     )
+
+
+async def test_ready_tui_does_not_print_redundant_startup_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    keychain = _Keychain()
+    await _ready_agent(tmp_path, keychain)
+    _install_provider(
+        monkeypatch,
+        MockModelProvider((), provider_id="openai:test-model"),
+    )
+    entered: list[terminal_tui.TerminalViewState] = []
+
+    async def fake_tui(
+        state: terminal_tui.TerminalViewState,
+        **kwargs: Any,
+    ) -> terminal_tui.TerminalApplicationResult:
+        del kwargs
+        entered.append(state)
+        return terminal_tui.TerminalApplicationResult(None, "exit")
+
+    monkeypatch.setattr(terminal_tui, "run_terminal_tui", fake_tui)
+    output = io.StringIO()
+
+    code = await run_terminal_application(
+        root=tmp_path,
+        agent_name="atlas",
+        input_stream=io.StringIO(),
+        output_stream=output,
+        keychain=keychain,
+        tui_input=object(),
+        tui_output=object(),
+    )
+
+    assert code == 0
+    assert output.getvalue() == ""
+    assert len(entered) == 1
+    assert entered[0].agent_label == "atlas"
+    assert entered[0].model_label == "test-model"
+    assert entered[0].source_summary == "Ready SQLite"
 
 
 async def test_model_answers_preserve_lines_and_neutralize_terminal_controls(

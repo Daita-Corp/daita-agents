@@ -234,7 +234,13 @@ async def test_first_run_keyboard_postgresql_path_reaches_grounded_chat(
     assert "information_schema" not in selected_attachments[0]["schemas"]
     assert "pg_catalog" not in selected_attachments[0]["schemas"]
     text = output.getvalue()
+    assert "\x1b" not in text
+    assert "[bold]" not in text
+    assert "[/bold]" not in text
     assert "\nReady\n" in text
+    assert "Validating model configuration" in text
+    assert "Model configuration validated" in text
+    assert "Validating PostgreSQL connection" in text
     assert "✓ Connection validated" in text
     assert "✓ Schemas selected: analytics, reporting" in text
     assert provider.answer == "EMEA has 4200 in paid revenue."

@@ -13,6 +13,7 @@ import pytest
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.styles import Style
 
 from daita import ApprovalDecision, ApprovalRequest, terminal, terminal_tui
 from daita._json import FrozenJsonObject
@@ -44,6 +45,8 @@ class _RecordingOutput(DummyOutput):
         self.attribute_reset_count = 0
         self.autowrap_count = 0
         self.flush_count = 0
+        self.size = Size(rows=30, columns=100)
+        self.size_checks = 0
 
     def write(self, data: str) -> None:
         self.fragments.append(data)
@@ -52,7 +55,8 @@ class _RecordingOutput(DummyOutput):
         self.fragments.append(data)
 
     def get_size(self) -> Size:
-        return Size(rows=30, columns=100)
+        self.size_checks += 1
+        return self.size
 
     def show_cursor(self) -> None:
         self.show_count += 1
@@ -1173,7 +1177,7 @@ async def test_text_turn_multiline_composer_and_green_shell_render():
     assert "Revenue is higher." in rendered
     assert "ready" in output.text
     assert output.show_count >= 1
-    assert output.alternate_exit_count >= 1
+    assert output.alternate_exit_count == 0
 
 
 def test_green_identity_focus_theme_uses_semantic_styles(
@@ -1187,6 +1191,345 @@ def test_green_identity_focus_theme_uses_semantic_styles(
     assert rules["tui.prompt"] == "bold #4ade80"
     assert rules["frame.border"] == "#4ade80"
     assert rules["tui.status.running"] == "bold #15803d"
+
+
+@pytest.mark.parametrize(
+    ("width", "mode", "collapsed_columns", "expanded_columns", "bordered"),
+    (
+        (69, "narrow", 4, 6, False),
+        (70, "compact", 8, 12, True),
+        (99, "compact", 8, 12, True),
+        (100, "full", 12, 20, True),
+        (140, "full", 12, 20, True),
+    ),
+)
+def test_stage_five_width_modes_and_preview_bounds(
+    width: int,
+    mode: str,
+    collapsed_columns: int,
+    expanded_columns: int,
+    bordered: bool,
+):
+    projection = terminal_tui._responsive_projection(width, 30)
+
+    assert projection.mode == mode
+    assert projection.collapsed_preview_columns == collapsed_columns
+    assert projection.expanded_preview_columns == expanded_columns
+    assert projection.bordered_cards is bordered
+    assert projection.transcript_rows >= 1
+
+
+def test_layout_reserves_one_transcript_row_or_switches_to_resize_message():
+    idle = terminal_tui._responsive_projection(100, 8)
+    approving = terminal_tui._responsive_projection(100, 15, approving=True)
+    idle_too_short = terminal_tui._responsive_projection(100, 7)
+    approval_too_short = terminal_tui._responsive_projection(
+        100,
+        14,
+        approving=True,
+    )
+
+    assert idle.usable is True
+    assert idle.transcript_rows == 1
+    assert approving.usable is True
+    assert approving.transcript_rows == 1
+    assert idle_too_short.usable is False
+    assert approval_too_short.usable is False
+
+
+def test_terminal_size_polling_is_limited_to_platforms_without_sigwinch():
+    assert (
+        terminal_tui._terminal_size_polling_interval(
+            platform="darwin",
+            main_thread=True,
+        )
+        is None
+    )
+    assert (
+        terminal_tui._terminal_size_polling_interval(
+            platform="linux",
+            main_thread=True,
+        )
+        is None
+    )
+    assert (
+        terminal_tui._terminal_size_polling_interval(
+            platform="win32",
+            main_thread=True,
+        )
+        == 0.5
+    )
+    assert (
+        terminal_tui._terminal_size_polling_interval(
+            platform="darwin",
+            main_thread=False,
+        )
+        == 0.5
+    )
+
+
+def test_inline_shell_emits_one_scrollable_header_outside_the_active_layout():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def handle_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=run_message,
+                load_transcript=None,
+                handle_command=handle_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        root = application.layout.container
+        main_shell = root.children[0].content
+        rendered_header = output.text
+
+        output.size = Size(rows=30, columns=69)
+        application.before_render.fire()
+        output.size = Size(rows=30, columns=100)
+        application.before_render.fire()
+
+        assert application.full_screen is False
+        assert len(main_shell.children) == 2
+        assert rendered_header.count("DAITA") == 1
+        assert "atlas" in rendered_header
+        assert "source" in rendered_header
+        assert output.text == rendered_header
+
+
+def test_inline_composer_uses_only_top_and_bottom_rules():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def handle_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=run_message,
+                load_transcript=None,
+                handle_command=handle_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        main_shell = application.layout.container.children[0].content
+        ready_body = main_shell.children[0]._get_container()
+        composer_frame = ready_body.children[-1]
+        top, composer, bottom = composer_frame.children
+        glyphs = terminal_tui._terminal_glyphs(
+            terminal_tui._terminal_capabilities(output)
+        )
+
+        top_line = "".join(text for _style, text in top.content.text())
+        bottom_line = "".join(text for _style, text in bottom.content.text())
+
+        assert type(composer).__name__ == "Window"
+        assert top_line == glyphs.horizontal * output.size.columns
+        assert bottom_line == glyphs.horizontal * output.size.columns
+        assert glyphs.vertical not in top_line + bottom_line
+        assert glyphs.top_left not in top_line
+        assert glyphs.top_right not in top_line
+        assert glyphs.bottom_left not in bottom_line
+        assert glyphs.bottom_right not in bottom_line
+
+
+def test_responsive_metadata_and_status_collapse_order_are_deterministic():
+    state = TerminalViewState(
+        "atlas",
+        "gpt-5.6-sol",
+        "PostgreSQL · 3 sources",
+    )
+    state.steps = 2
+    state.total_tokens = 1_800
+    state.estimated_cost = "0.02"
+    glyphs = terminal_tui._terminal_glyphs(
+        terminal_tui.TerminalCapabilities("truecolor", True)
+    )
+
+    full = terminal_tui._status_projection(
+        state,
+        width=100,
+        mode="full",
+        glyphs=glyphs,
+    )
+    compact = terminal_tui._status_projection(
+        state,
+        width=99,
+        mode="compact",
+        glyphs=glyphs,
+    )
+    narrow = terminal_tui._status_projection(
+        state,
+        width=69,
+        mode="narrow",
+        glyphs=glyphs,
+    )
+
+    assert full.collapsed == ()
+    assert full.source_summary == "PostgreSQL · 3 sources"
+    assert full.right == "2 steps · 1.8k tokens · $0.02"
+    assert compact.collapsed == ("cost",)
+    assert compact.right == "2 steps · 1.8k tokens"
+    assert narrow.collapsed[:4] == (
+        "cost",
+        "tokens",
+        "shorten_model",
+        "source_summary",
+    )
+    assert narrow.left == "atlas · ● ready"
+    assert narrow.right == ""
+    assert narrow.source_summary == ""
+
+
+def test_no_color_and_bounded_color_depth_projection_keep_semantic_text():
+    assert (
+        terminal_tui._terminal_capabilities(
+            environ={"NO_COLOR": "1", "LANG": "en_US.UTF-8"}
+        ).color_depth
+        == "none"
+    )
+    assert (
+        terminal_tui._terminal_capabilities(
+            environ={"COLORTERM": "truecolor", "LANG": "en_US.UTF-8"}
+        ).color_depth
+        == "truecolor"
+    )
+    assert (
+        terminal_tui._terminal_capabilities(
+            environ={"TERM": "xterm-256color", "LANG": "en_US.UTF-8"}
+        ).color_depth
+        == "256"
+    )
+    assert (
+        terminal_tui._terminal_capabilities(
+            environ={"TERM": "xterm", "LANG": "en_US.UTF-8"}
+        ).color_depth
+        == "16"
+    )
+    assert (
+        terminal_tui._terminal_capabilities(
+            environ={
+                "TERM": "xterm",
+                "LANG": "en_US.UTF-8",
+                "DAITA_ASCII": "1",
+            }
+        ).unicode
+        is False
+    )
+    no_color = terminal_tui.TerminalCapabilities("none", True)
+    no_color_rules = terminal_tui._semantic_style_rules(no_color)
+
+    assert all(
+        "#" not in value and "ansi" not in value for value in no_color_rules.values()
+    )
+    state = TerminalViewState("atlas", "model", "source")
+    projection = terminal_tui._status_projection(
+        state,
+        width=100,
+        mode="full",
+        glyphs=terminal_tui._terminal_glyphs(no_color),
+    )
+    assert "atlas" in projection.left
+    assert "ready" in projection.left
+
+    for depth in ("truecolor", "256", "16"):
+        capabilities = terminal_tui.TerminalCapabilities(depth, True)
+        rules = terminal_tui._semantic_style_rules(capabilities)
+        Style.from_dict(rules)
+        assert all(
+            "blink" not in value and "bg:" not in value for value in rules.values()
+        )
+        if depth == "truecolor":
+            assert any("#22c55e" in value for value in rules.values())
+        else:
+            assert all("#" not in value for value in rules.values())
+            assert any("ansi" in value for value in rules.values())
+
+
+def test_ascii_projection_replaces_every_structural_border_and_state_glyph():
+    capabilities = terminal_tui.TerminalCapabilities("16", False)
+    glyphs = terminal_tui._terminal_glyphs(capabilities)
+    state = TerminalViewState("atlas", "model", "source")
+    state.running = True
+    state.run_status = "querying"
+    status = terminal_tui._status_projection(
+        state,
+        width=100,
+        mode="full",
+        glyphs=glyphs,
+    )
+    card = terminal_tui.ToolCardState(
+        run_id="run-ascii",
+        call_id="call-ascii",
+        capability_id="data.sqlite.query",
+        label="Query SQLite",
+        state="succeeded",
+    )
+    rendered = "".join(
+        text
+        for _style, text in terminal_tui._render_tool_card_fragments(
+            card,
+            width=100,
+            capabilities=capabilities,
+            glyphs=glyphs,
+        )
+    )
+
+    assert glyphs.top_left == "+"
+    assert glyphs.horizontal == "-"
+    assert glyphs.vertical == "|"
+    assert glyphs.prompt == ">"
+    assert glyphs.running == ("~", "-", "~", "+")
+    assert glyphs.success == "OK"
+    assert glyphs.failure == glyphs.warning == glyphs.approval == "!"
+    assert all(symbol not in rendered for symbol in "╭╮╰╯─│✓◐●›")
+    assert "+-" in rendered
+    assert "OK Query SQLite" in rendered
+    assert "querying" in status.left
+
+
+def test_ascii_setup_status_and_plain_chat_prompt_are_readable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("DAITA_ASCII", "1")
+    output = io.StringIO()
+
+    terminal_tui._write_setup_status(
+        output,
+        "✓ Connection validated",
+        role="success",
+    )
+    capabilities = terminal_tui._terminal_capabilities(text_stream=output)
+
+    assert output.getvalue() == "OK Connection validated\n"
+    assert terminal_tui._terminal_glyphs(capabilities).prompt == ">"
 
 
 async def test_composer_enforces_the_existing_input_bound():
@@ -1277,7 +1620,7 @@ async def test_ctrl_c_cancels_active_run_and_returns_to_composer():
     assert state.notice == "Run interrupted; returning to the composer."
     assert [block.kind for block in state.blocks] == ["user"]
     assert output.show_count >= 1
-    assert output.alternate_exit_count >= 1
+    assert output.alternate_exit_count == 0
 
 
 async def test_cancellation_settles_observed_run_and_live_tool_card():
@@ -1367,6 +1710,164 @@ async def test_ctrl_c_while_idle_does_not_exit_and_ctrl_d_empty_does():
     assert result == TerminalApplicationResult(None, "exit")
 
 
+async def test_very_small_terminal_blocks_submission_until_resize(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        terminal_tui,
+        "_terminal_size_polling_interval",
+        lambda: 0.01,
+    )
+    output = _RecordingOutput()
+    output.size = Size(rows=5, columns=31)
+    state = TerminalViewState("atlas", "model", "source")
+    submitted: list[str] = []
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del conversation_id
+        submitted.append(message)
+        return _result("resized")
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(pipe, output, state, run_message=run_message)
+        await _wait_until(lambda: "Terminal too small (31x5)" in output.text)
+        pipe.send_text("blocked\r")
+        await asyncio.sleep(0.05)
+        assert submitted == []
+
+        output.size = Size(rows=30, columns=100)
+        await asyncio.sleep(0.08)
+        pipe.send_text(("\x7f" * len("blocked")) + "accepted\r")
+        await _wait_until(lambda: submitted == ["accepted"] and not state.running)
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result.action == "exit"
+    assert output.show_count >= 1
+    assert output.autowrap_count >= 1
+
+
+async def test_resize_idle_running_and_approving_preserves_focus_and_view_state(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        terminal_tui,
+        "_terminal_size_polling_interval",
+        lambda: 0.01,
+    )
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    preserved_card = terminal_tui.ToolCardState(
+        run_id="preserved-run",
+        call_id="preserved-call",
+        capability_id="catalog.search",
+        label="Search catalog",
+        state="failed",
+        expanded=True,
+    )
+    state.tool_cards[preserved_card.call_id] = preserved_card
+    state.blocks.append(
+        terminal_tui.TerminalBlock(
+            "tool",
+            preserved_card.call_id,
+            tool_card=preserved_card,
+        )
+    )
+    running_started = asyncio.Event()
+    release_running = asyncio.Event()
+    approval_request = _approval_request({"name": "resize-safe"})
+    approval_decisions: list[ApprovalDecision] = []
+
+    async def fallback(unexpected: ApprovalRequest) -> ApprovalDecision:
+        raise AssertionError(unexpected)
+
+    approval_bridge = terminal_tui.TerminalApprovalBridge(fallback)
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del conversation_id
+        if message == "running":
+            running_started.set()
+            await release_running.wait()
+            return _result("run completed", run_id="run-resize")
+        if message == "approval":
+            approval_decisions.append(await approval_bridge(approval_request))
+            return _result("approval completed", run_id="run-approval")
+        raise AssertionError(message)
+
+    applications: list[Any] = []
+    original_create_application = terminal_tui._create_application
+
+    def capture_application(*args: Any, **kwargs: Any) -> Any:
+        created = original_create_application(*args, **kwargs)
+        applications.append(created[0])
+        return created
+
+    monkeypatch.setattr(
+        terminal_tui,
+        "_create_application",
+        capture_application,
+    )
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            approval_bridge=approval_bridge,
+        )
+        await _wait_until(lambda: len(applications) == 1)
+        application = applications[0]
+        idle_focus = application.layout.current_control
+        original_blocks = tuple(state.blocks)
+
+        output.size = Size(rows=30, columns=80)
+        await asyncio.sleep(0.08)
+        assert application.layout.current_control is idle_focus
+        assert tuple(state.blocks) == original_blocks
+        assert preserved_card.expanded is True
+
+        pipe.send_text("running\r")
+        await running_started.wait()
+        output.size = Size(rows=6, columns=60)
+        await asyncio.sleep(0.08)
+        assert state.running is True
+        assert preserved_card.expanded is True
+        output.size = Size(rows=30, columns=60)
+        await asyncio.sleep(0.08)
+        assert application.layout.current_control is idle_focus
+        release_running.set()
+        await _wait_until(lambda: not state.running)
+
+        output.size = Size(rows=30, columns=100)
+        pipe.send_text("approval\r")
+        await _wait_until(lambda: state.approval_panel is not None)
+        approval_focus = application.layout.current_control
+        panel = state.approval_panel
+        for width in (80, 60, 100):
+            output.size = Size(rows=30, columns=width)
+            await asyncio.sleep(0.08)
+            assert state.approval_panel is panel
+            assert approval_decisions == []
+            assert application.layout.current_control is approval_focus
+            assert preserved_card.expanded is True
+        output.size = Size(rows=10, columns=100)
+        await asyncio.sleep(0.08)
+        assert state.approval_panel is panel
+        assert approval_decisions == []
+        output.size = Size(rows=30, columns=100)
+        await asyncio.sleep(0.08)
+        assert application.layout.current_control is approval_focus
+        pipe.send_text("d")
+        await _wait_until(lambda: approval_decisions == [ApprovalDecision.DENY])
+        await _wait_until(lambda: not state.running)
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result.action == "exit"
+    assert preserved_card.expanded is True
+
+
 @pytest.mark.parametrize("error", (RuntimeError("render failed"), KeyboardInterrupt()))
 async def test_terminal_state_is_restored_after_application_exceptions(
     monkeypatch: pytest.MonkeyPatch,
@@ -1403,10 +1904,62 @@ async def test_terminal_state_is_restored_after_application_exceptions(
             )
 
     assert output.show_count >= 1
-    assert output.alternate_exit_count >= 1
+    assert output.alternate_exit_count == 0
     assert output.attribute_reset_count >= 1
     assert output.autowrap_count >= 1
     assert output.flush_count >= 1
+
+
+async def test_rendering_failure_waits_for_active_execution_without_cancelling_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    completed = False
+    cancelled = False
+
+    async def authoritative_execution() -> None:
+        nonlocal completed, cancelled
+        try:
+            await asyncio.sleep(0.02)
+            completed = True
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    async def fail(application: Any) -> Any:
+        del application
+        state.running = True
+        state.active_task = asyncio.create_task(authoritative_execution())
+        raise RuntimeError("renderer failed")
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def handle_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    monkeypatch.setattr(terminal_tui, "_run_application", fail)
+    with create_pipe_input() as pipe:
+        with pytest.raises(RuntimeError, match="renderer failed"):
+            await run_terminal_tui(
+                state,
+                run_message=run_message,
+                handle_command=handle_command,
+                input_stream=io.StringIO(),
+                output_stream=io.StringIO(),
+                suspend_bridge=TerminalSuspendBridge(),
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+
+    assert completed is True
+    assert cancelled is False
+    assert output.show_count >= 1
+    assert output.alternate_exit_count == 0
 
 
 async def test_pre_admission_application_failure_restores_output_and_falls_back(
@@ -1443,7 +1996,7 @@ async def test_pre_admission_application_failure_restores_output_and_falls_back(
             )
 
     assert output.show_count >= 1
-    assert output.alternate_exit_count >= 1
+    assert output.alternate_exit_count == 0
     assert output.attribute_reset_count >= 1
     assert output.autowrap_count >= 1
     assert output.flush_count >= 1
@@ -1513,8 +2066,37 @@ async def test_local_commands_run_while_tui_is_suspended_and_restore_the_shell()
 
     assert commands == [("/help", None)]
     assert state.blocks[-1].text == "Commands\n  /help\n"
+    assert output.text.count("Commands") == 1
     assert bridge.enhanced_input is None
     assert bridge.enhanced_output is None
+
+
+def test_tui_command_output_is_captured_without_leaking_above_the_shell():
+    terminal_stream = io.StringIO()
+    captured = terminal._TerminalCommandOutput(
+        terminal_stream,
+        passthrough=False,
+    )
+
+    print("Sources", file=captured)
+
+    assert captured.value == "Sources\n"
+    assert terminal_stream.getvalue() == ""
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "/model",
+        "/source add",
+        "/memory edit",
+        "/user edit",
+        "/skills edit forecast",
+        "/skills delete forecast",
+    ),
+)
+def test_commands_with_external_prompts_keep_terminal_passthrough(command: str):
+    assert terminal._command_uses_terminal_prompts(command) is True
 
 
 async def test_exact_approval_panel_reviews_complete_frozen_arguments_and_approves_once():
@@ -1875,6 +2457,110 @@ async def test_slash_completion_covers_the_documented_surface_and_remains_local(
         )
         pipe.send_text("/sta\t")
         await _wait_until(lambda: "/status" in output.text)
+        pipe.send_text("\r")
+        await _wait_until(lambda: commands == ["/status"])
+        pipe.send_text("\x04")
+        await task
+
+    assert state.blocks[-1].kind == "local.status"
+
+
+def test_slash_command_palette_uses_full_width_command_description_rows():
+    glyphs = terminal_tui._terminal_glyphs(
+        terminal_tui.TerminalCapabilities("truecolor", True)
+    )
+    fragments = terminal_tui._slash_command_menu_fragments(
+        (
+            ("/sources", "List registered data sources"),
+            ("/status", "Show current agent status"),
+        ),
+        selected_index=1,
+        width=80,
+        glyphs=glyphs,
+    )
+    rendered = "".join(text for _style, text in fragments)
+    lines = rendered.splitlines()
+    styles = {style for style, _text in fragments}
+
+    assert len(lines) == 2
+    assert all(terminal_tui._display_width(line) == 80 for line in lines)
+    assert "/sources" in lines[0]
+    assert "List registered data sources" in lines[0]
+    assert "› /status" in lines[1]
+    assert "Show current agent status" in lines[1]
+    assert "class:tui.command-menu.command.current" in styles
+    assert "class:tui.command-menu.description.current" in styles
+
+
+async def test_slash_dropdown_opens_filters_and_supports_arrow_navigation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    commands: list[str] = []
+    applications: list[Any] = []
+    original_create_application = terminal_tui._create_application
+
+    def capture_application(*args: Any, **kwargs: Any) -> Any:
+        created = original_create_application(*args, **kwargs)
+        applications.append(created[0])
+        return created
+
+    monkeypatch.setattr(
+        terminal_tui,
+        "_create_application",
+        capture_application,
+    )
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def handle_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        commands.append(command)
+        return TerminalCommandResult(
+            conversation_id,
+            output="Status\n  Ready\n",
+            presentation="status",
+        )
+
+    def completion_state() -> Any:
+        if not applications:
+            return None
+        return applications[0].current_buffer.complete_state
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            handle_command=handle_command,
+        )
+        pipe.send_text("/")
+        await _wait_until(
+            lambda: completion_state() is not None
+            and len(completion_state().completions)
+            == len(terminal_tui._slash_command_completion_surface())
+        )
+        completions = completion_state().completions
+        assert all(completion.display_meta_text for completion in completions)
+        await _wait_until(lambda: "Show current agent status" in output.text)
+
+        pipe.send_text("sta")
+        await _wait_until(
+            lambda: completion_state() is not None
+            and [completion.text for completion in completion_state().completions]
+            == ["/status"]
+        )
+        pipe.send_text("\x1b[B")
+        await _wait_until(
+            lambda: completion_state() is not None
+            and completion_state().complete_index == 0
+            and applications[0].current_buffer.text == "/status"
+        )
         pipe.send_text("\r")
         await _wait_until(lambda: commands == ["/status"])
         pipe.send_text("\x04")

@@ -256,7 +256,12 @@ async def run_terminal_application(
     if (tui_input is None) != (tui_output is None):
         raise ValueError("TUI input and output must be supplied together")
     read_hidden = (
-        (lambda prompt: getpass.getpass(prompt, stream=output_stream))
+        (
+            lambda prompt: getpass.getpass(
+                terminal_tui._setup_prompt_text(prompt, output_stream),
+                stream=output_stream,
+            )
+        )
         if hidden_input is None
         else hidden_input
     )
@@ -286,7 +291,6 @@ async def run_terminal_application(
             selection_input=selection_input,
             selection_output=selection_output,
         )
-        _write_selected(agent.name, output_stream)
         validated = False
         if agent.model_route is None:
             await _onboard_model(
@@ -308,7 +312,6 @@ async def run_terminal_application(
                 approval_handler=approval_handler,
                 observer=observer_bridge,
             )
-        _write_model_status(agent, output_stream, validated=validated)
         sources = tuple(
             source for source in await agent.list_sources() if source.active
         )
@@ -560,8 +563,17 @@ async def _create_agent(
             print(str(error), file=output_stream)
 
 
-def _read_line(prompt: str, input_stream: TextIO, output_stream: TextIO) -> str:
-    print(prompt, end="", flush=True, file=output_stream)
+def _read_line(
+    prompt: str,
+    input_stream: TextIO,
+    output_stream: TextIO,
+    *,
+    themed: bool = True,
+) -> str:
+    if themed:
+        terminal_tui._write_setup_prompt(output_stream, prompt)
+    else:
+        print(prompt, end="", flush=True, file=output_stream)
     value = input_stream.readline()
     if value == "":
         raise EOFError
@@ -741,6 +753,11 @@ async def _configure_selected_model(
         "Validation contacts the provider and may incur a tiny API charge.",
         file=output_stream,
     )
+    terminal_tui._write_setup_status(
+        output_stream,
+        "◐ Validating model configuration",
+        role="progress",
+    )
     try:
         try:
             await agent.configure_model(
@@ -750,6 +767,11 @@ async def _configure_selected_model(
                 base_url=base_url,
                 context_window_tokens=context_window_tokens,
                 max_output_tokens=max_output_tokens,
+            )
+            terminal_tui._write_setup_status(
+                output_stream,
+                "✓ Model configuration validated",
+                role="success",
             )
             return True
         finally:
@@ -798,6 +820,11 @@ async def _configure_selected_model(
             "Check agent-home permissions and retry.",
             file=output_stream,
         )
+    terminal_tui._write_setup_status(
+        output_stream,
+        "! Model validation failed",
+        role="failure",
+    )
     print("Choose the model configuration again.", file=output_stream)
     return False
 
@@ -908,7 +935,11 @@ async def _onboard_source(
                     ).strip()
                     or None
                 )
-                print("… Discovering tables and relationships", file=output_stream)
+                terminal_tui._write_setup_status(
+                    output_stream,
+                    "… Discovering tables and relationships",
+                    role="progress",
+                )
                 return await agent.attach_sqlite(
                     _absolute_user_path(path),
                     name=name,
@@ -927,7 +958,11 @@ async def _onboard_source(
                     ).strip()
                     or None
                 )
-                print("… Discovering tables and relationships", file=output_stream)
+                terminal_tui._write_setup_status(
+                    output_stream,
+                    "… Discovering tables and relationships",
+                    role="progress",
+                )
                 return await agent.attach_local_directory(
                     _absolute_user_path(path),
                     name=name,
@@ -984,6 +1019,11 @@ async def _onboard_source(
                 "Source setup failed without changing committed catalog truth.",
                 file=output_stream,
             )
+        terminal_tui._write_setup_status(
+            output_stream,
+            "! Source validation failed",
+            role="failure",
+        )
 
 
 async def _select_source_type(
@@ -1033,6 +1073,11 @@ async def _onboard_postgresql(
         password = None
         reference = await agent.store_postgresql_password(credential)
         credential = ""
+        terminal_tui._write_setup_status(
+            output_stream,
+            "◐ Validating PostgreSQL connection",
+            role="progress",
+        )
         probe = await agent.probe_postgresql(
             host=host,
             port=port,
@@ -1041,7 +1086,11 @@ async def _onboard_postgresql(
             credential=reference,
             ssl_mode=ssl_mode,
         )
-        print("✓ Connection validated", file=output_stream)
+        terminal_tui._write_setup_status(
+            output_stream,
+            "✓ Connection validated",
+            role="success",
+        )
         if probe.truncated:
             print(
                 "Warning: more than 100 schemas exist; showing the first 100.",
@@ -1054,12 +1103,17 @@ async def _onboard_postgresql(
             selection_input=selection_input,
             selection_output=selection_output,
         )
-        print(
+        terminal_tui._write_setup_status(
+            output_stream,
             "✓ Schemas selected: "
             + ", ".join(_safe_display(schema, fallback="schema") for schema in schemas),
-            file=output_stream,
+            role="success",
         )
-        print("… Discovering tables and relationships", file=output_stream)
+        terminal_tui._write_setup_status(
+            output_stream,
+            "… Discovering tables and relationships",
+            role="progress",
+        )
         registration = await agent.attach_postgresql(
             host=host,
             port=port,
@@ -1215,7 +1269,16 @@ async def _chat(
     )
     while True:
         try:
-            message = _read_line("You › ", input_stream, output_stream)
+            capabilities = terminal_tui._terminal_capabilities(
+                text_stream=output_stream
+            )
+            prompt = f"You {terminal_tui._terminal_glyphs(capabilities).prompt} "
+            message = _read_line(
+                prompt,
+                input_stream,
+                output_stream,
+                themed=False,
+            )
         except EOFError:
             print(file=output_stream)
             _write_resume_hint(conversation_id, output_stream)
@@ -1295,17 +1358,24 @@ async def _chat(
 
 
 class _TerminalCommandOutput:
-    def __init__(self, output_stream: TextIO) -> None:
+    def __init__(
+        self,
+        output_stream: TextIO,
+        *,
+        passthrough: bool,
+    ) -> None:
         self._output_stream = output_stream
+        self._passthrough = passthrough
         self._recording = io.StringIO()
 
     def write(self, value: str) -> int:
-        written = self._output_stream.write(value)
+        written = self._output_stream.write(value) if self._passthrough else None
         self._recording.write(value)
         return len(value) if written is None else written
 
     def flush(self) -> None:
-        self._output_stream.flush()
+        if self._passthrough:
+            self._output_stream.flush()
 
     def isatty(self) -> bool:
         return self._output_stream.isatty()
@@ -1316,6 +1386,19 @@ class _TerminalCommandOutput:
     @property
     def value(self) -> str:
         return self._recording.getvalue()
+
+
+def _command_uses_terminal_prompts(command: str) -> bool:
+    parts = command.split()
+    if not parts:
+        return False
+    if parts[0] == "/model" and len(parts) == 1:
+        return True
+    if parts[0] == "/source" and parts[1:] == ["add"]:
+        return True
+    if parts[0] in {"/memory", "/user"} and parts[1:] == ["edit"]:
+        return True
+    return parts[0] == "/skills" and len(parts) == 3 and parts[1] in {"edit", "delete"}
 
 
 async def _chat_tui(
@@ -1371,7 +1454,11 @@ async def _chat_tui(
         selected_conversation: str | None,
     ) -> terminal_tui.TerminalCommandResult:
         nonlocal agent
-        captured = _TerminalCommandOutput(output_stream)
+        passthrough = _command_uses_terminal_prompts(command)
+        captured = _TerminalCommandOutput(
+            output_stream,
+            passthrough=passthrough,
+        )
         enhanced_selection_input = (
             suspend_bridge.enhanced_input
             if suspend_bridge.enhanced_input is not None
@@ -1401,7 +1488,7 @@ async def _chat_tui(
         return terminal_tui.TerminalCommandResult(
             conversation_id=selected_conversation,
             action=action,
-            output=captured.value,
+            output="" if passthrough else captured.value,
             presentation={
                 "/status": "status",
                 "/sources": "sources",
@@ -2090,44 +2177,6 @@ def _parse_skill_editor_document(name: str, text: str) -> tuple[str, str]:
     return description, instructions
 
 
-def _write_selected(name: str, output_stream: TextIO) -> None:
-    print(file=output_stream)
-    print("Daita", file=output_stream)
-    print(file=output_stream)
-    print(
-        f"Agent     {_safe_display(name, fallback='agent')}",
-        file=output_stream,
-    )
-
-
-def _write_model_status(
-    agent: Agent,
-    output_stream: TextIO,
-    *,
-    validated: bool,
-) -> None:
-    route = agent.model_route
-    if route is None:
-        raise RuntimeError("model configuration was not loaded after replacement")
-    candidate = route.candidates[0]
-    provider = candidate.provider_id.partition(":")[0]
-    model = candidate.provider_id.partition(":")[2]
-    labels = dict(_PROVIDERS)
-    label = labels.get(provider, provider)
-    print(
-        "Model     "
-        f"{_safe_display(label, fallback='provider')} · "
-        f"{_safe_display(model, fallback='model')} · "
-        f"{'validated' if validated else 'configured'}",
-        file=output_stream,
-    )
-    if not validated:
-        print(
-            "Note      provider health was not checked this launch",
-            file=output_stream,
-        )
-
-
 def _write_catalog_phase(summary: Any, output_stream: TextIO) -> None:
     resources = _count_label(summary.resource_count, "table", "tables")
     relationships = _count_label(
@@ -2136,12 +2185,17 @@ def _write_catalog_phase(summary: Any, output_stream: TextIO) -> None:
         "relationships",
     )
     if summary.is_empty:
-        print(
+        terminal_tui._write_setup_status(
+            output_stream,
             f"! Catalog contains {resources} · {relationships}",
-            file=output_stream,
+            role="warning",
         )
     else:
-        print(f"✓ Catalog ready: {resources} · {relationships}", file=output_stream)
+        terminal_tui._write_setup_status(
+            output_stream,
+            f"✓ Catalog ready: {resources} · {relationships}",
+            role="success",
+        )
 
 
 def _write_stage_four_status(

@@ -255,7 +255,8 @@ def test_zero_agents_prompts_for_and_creates_one_agent():
         assert code == 0
         assert stderr == ""
         assert "Agent name: " in stdout
-        assert "Agent     atlas" in stdout
+        assert "Select a model provider" in stdout
+        assert "Agent     atlas" not in stdout
         assert "Stage 2 status" not in stdout
         asyncio.run(_open_and_close_agent(root, "atlas"))
 
@@ -270,7 +271,8 @@ def test_one_agent_is_selected_automatically_and_its_lock_is_released():
         assert code == 0
         assert stderr == ""
         assert "Select an agent" not in stdout
-        assert "Agent     solo" in stdout
+        assert "Select a model provider" in stdout
+        assert "Agent     solo" not in stdout
         asyncio.run(_open_and_close_agent(root, "solo"))
 
 
@@ -289,7 +291,8 @@ def test_multiple_agents_render_a_deterministic_numbered_picker():
         assert code == 0
         assert stderr == ""
         assert "1. alpha\n2. zulu\n3. Create a new agent" in stdout
-        assert "Agent     zulu" in stdout
+        assert "Select a model provider" in stdout
+        assert "Agent     zulu" not in stdout
 
 
 def test_multiple_agent_picker_can_create_another_agent():
@@ -307,7 +310,8 @@ def test_multiple_agent_picker_can_create_another_agent():
         assert code == 0
         assert stderr == ""
         assert "3. Create a new agent" in stdout
-        assert "Agent     gamma" in stdout
+        assert "Select a model provider" in stdout
+        assert "Agent     gamma" not in stdout
         assert asyncio.run(Agent.list(root=root)) == ("alpha", "beta", "gamma")
 
 
@@ -325,7 +329,8 @@ def test_agent_option_selects_the_exact_requested_agent():
         assert code == 0
         assert stderr == ""
         assert "Select an agent" not in stdout
-        assert "Agent     atlas" in stdout
+        assert "Select a model provider" in stdout
+        assert "Agent     atlas" not in stdout
 
 
 def test_unknown_agent_option_reports_an_actionable_error():

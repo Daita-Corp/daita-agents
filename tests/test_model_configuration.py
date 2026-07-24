@@ -1185,7 +1185,7 @@ async def test_terminal_onboarding_hides_key_before_stage_three_source_setup(tmp
     assert secret_prompts == ["API key: "]
     assert "terminal-secret" not in text
     assert "may incur a tiny API charge" in text
-    assert "OpenAI · gpt-test · validated" in text
+    assert "✓ Model configuration validated" in text
     assert "Select a data source" in text
     assert "terminal-secret" not in (
         tmp_path / "agents" / "atlas" / "config.json"
@@ -1208,7 +1208,7 @@ async def test_ollama_does_not_request_an_api_key(tmp_path):
     )
 
     assert result == 0
-    assert "Ollama · llama-test · validated" in output.getvalue()
+    assert "✓ Model configuration validated" in output.getvalue()
 
 
 async def test_custom_terminal_provider_requires_and_persists_base_url(tmp_path):
@@ -1232,7 +1232,7 @@ async def test_custom_terminal_provider_requires_and_persists_base_url(tmp_path)
     )
 
     assert result == 0
-    assert "acme · acme-model · validated" in output.getvalue()
+    assert "✓ Model configuration validated" in output.getvalue()
     reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
     try:
         assert reopened.model_route is not None
@@ -1262,8 +1262,10 @@ async def test_existing_persisted_route_skips_onboarding_without_health_claim(
     )
 
     assert result == 0
-    assert "OpenAI · test-model · configured" in output.getvalue()
-    assert "provider health was not checked this launch" in output.getvalue()
+    assert "Select a model provider" not in output.getvalue()
+    assert "Select a data source" in output.getvalue()
+    assert "OpenAI · test-model · configured" not in output.getvalue()
+    assert "provider health was not checked this launch" not in output.getvalue()
 
 
 async def test_custom_provider_requires_an_explicit_base_url_before_key_storage(
