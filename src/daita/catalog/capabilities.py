@@ -14,6 +14,7 @@ from ..capabilities import (
     ToolView,
 )
 from .models import (
+    CatalogSchemaRequest,
     CatalogSearchRequest,
     CatalogTraversalRequest,
     RelationshipKind,
@@ -22,9 +23,11 @@ from .models import (
 from .service import CatalogService
 
 CATALOG_SEARCH_CAPABILITY_ID = "catalog.search"
+CATALOG_SCHEMA_CAPABILITY_ID = "catalog.schema"
 CATALOG_INSPECT_CAPABILITY_ID = "catalog.inspect"
 CATALOG_TRAVERSE_CAPABILITY_ID = "catalog.traverse"
 CATALOG_SEARCH_EVIDENCE_KIND = "catalog.search_result"
+CATALOG_SCHEMA_EVIDENCE_KIND = "catalog.schema_slice"
 CATALOG_INSPECT_EVIDENCE_KIND = "catalog.resource_snapshot"
 CATALOG_TRAVERSE_EVIDENCE_KIND = "catalog.traversal_result"
 
@@ -68,6 +71,7 @@ class CatalogSearchExecutor:
                 "hits": [
                     {
                         "kind": hit.kind.value,
+                        "matched_fields": hit.matched_fields,
                         "match_reasons": hit.match_reasons,
                         "name": hit.name,
                         "resource_id": hit.resource_id,
@@ -100,6 +104,46 @@ class CatalogInspectExecutor:
         )
         return ToolOutput(
             kind=CATALOG_INSPECT_EVIDENCE_KIND,
+            data=projection,
+        )
+
+
+class CatalogSchemaExecutor:
+    executor_id = "catalog.schema.executor"
+
+    def __init__(self, agent_id: str, service: CatalogService) -> None:
+        self._agent_id = agent_id
+        self._service = service
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        query = request.arguments.get("query")
+        if query is not None and not isinstance(query, str):
+            raise TypeError("query must be a string")
+        source_id = request.arguments.get("source_id")
+        if source_id is not None and not isinstance(source_id, str):
+            raise TypeError("source_id must be a string")
+        include_relationships = request.arguments.get(
+            "include_relationships",
+            True,
+        )
+        if not isinstance(include_relationships, bool):
+            raise TypeError("include_relationships must be a boolean")
+        projection = await self._service.schema_slice(
+            CatalogSchemaRequest(
+                agent_id=self._agent_id,
+                query=query,
+                resource_ids=_string_tuple_argument(
+                    request,
+                    "resource_ids",
+                    (),
+                ),
+                source_id=source_id,
+                limit=_integer_argument(request, "limit", 12),
+                include_relationships=include_relationships,
+            )
+        )
+        return ToolOutput(
+            kind=CATALOG_SCHEMA_EVIDENCE_KIND,
             data=projection,
         )
 
@@ -140,14 +184,12 @@ def catalog_declarations(
     service: CatalogService,
 ) -> CatalogDeclarations:
     search_executor = CatalogSearchExecutor(agent_id, service)
+    schema_executor = CatalogSchemaExecutor(agent_id, service)
     inspect_executor = CatalogInspectExecutor(agent_id, service)
     traverse_executor = CatalogTraverseExecutor(agent_id, service)
     search = Capability(
         id=CATALOG_SEARCH_CAPABILITY_ID,
-        description=(
-            "Search attached metadata and kinds by any term; zero matches do not "
-            "prove an empty catalog. Inspect candidates before use."
-        ),
+        description="Find catalog IDs by name or field; use catalog_schema next.",
         input_schema={
             "type": "object",
             "properties": {
@@ -165,12 +207,29 @@ def catalog_declarations(
         access_mode=AccessMode.READ,
         side_effecting=False,
     )
+    schema = Capability(
+        id=CATALOG_SCHEMA_CAPABILITY_ID,
+        description="Get compact current schema for SQL planning.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "resource_ids": {"type": "array"},
+                "source_id": {"type": "string"},
+                "limit": {"type": "integer"},
+                "include_relationships": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+        output_kind=CATALOG_SCHEMA_EVIDENCE_KIND,
+        output_schema=_schema_output_schema(),
+        executor_id=schema_executor.executor_id,
+        access_mode=AccessMode.READ,
+        side_effecting=False,
+    )
     inspect = Capability(
         id=CATALOG_INSPECT_CAPABILITY_ID,
-        description=(
-            "Inspect current typed facets, freshness, neighbors, and incident "
-            "relationships for one catalog resource."
-        ),
+        description="Get full catalog facets, freshness, containment, or diagnostics.",
         input_schema={
             "type": "object",
             "properties": {"resource_id": {"type": "string"}},
@@ -206,10 +265,7 @@ def catalog_declarations(
     )
     traverse = Capability(
         id=CATALOG_TRAVERSE_CAPABILITY_ID,
-        description=(
-            "Find bounded current relationship paths between catalog resources "
-            "with endpoint revisions and field-pair provenance."
-        ),
+        description="Find bounded catalog relationship paths.",
         input_schema={
             "type": "object",
             "properties": {
@@ -231,13 +287,24 @@ def catalog_declarations(
         side_effecting=False,
     )
     return CatalogDeclarations(
-        capabilities=(search, inspect, traverse),
-        executors=(search_executor, inspect_executor, traverse_executor),
+        capabilities=(search, schema, inspect, traverse),
+        executors=(
+            search_executor,
+            schema_executor,
+            inspect_executor,
+            traverse_executor,
+        ),
         tool_views=(
             ToolView(
                 name="catalog_search",
                 capability_id=search.id,
                 description=search.description,
+                applicability=ToolApplicability(minimum_active_sources=1),
+            ),
+            ToolView(
+                name="catalog_schema",
+                capability_id=schema.id,
+                description=schema.description,
                 applicability=ToolApplicability(minimum_active_sources=1),
             ),
             ToolView(
@@ -271,6 +338,33 @@ def _search_output_schema() -> dict[str, object]:
             "query",
             "total_matches",
             "truncated",
+            "trust_classification",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def _schema_output_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "bounds": {"type": "object"},
+            "include_relationships": {"type": "boolean"},
+            "relationships": {"type": "array"},
+            "resources": {"type": "array"},
+            "sources": {"type": "array"},
+            "total_matches": {"type": "integer"},
+            "truncation": {"type": "object"},
+            "trust_classification": {"type": "string"},
+        },
+        "required": [
+            "bounds",
+            "include_relationships",
+            "relationships",
+            "resources",
+            "sources",
+            "total_matches",
+            "truncation",
             "trust_classification",
         ],
         "additionalProperties": False,
@@ -337,12 +431,15 @@ def _string_tuple_argument(
 __all__ = [
     "CATALOG_INSPECT_CAPABILITY_ID",
     "CATALOG_INSPECT_EVIDENCE_KIND",
+    "CATALOG_SCHEMA_CAPABILITY_ID",
+    "CATALOG_SCHEMA_EVIDENCE_KIND",
     "CATALOG_SEARCH_CAPABILITY_ID",
     "CATALOG_SEARCH_EVIDENCE_KIND",
     "CATALOG_TRAVERSE_CAPABILITY_ID",
     "CATALOG_TRAVERSE_EVIDENCE_KIND",
     "CatalogDeclarations",
     "CatalogInspectExecutor",
+    "CatalogSchemaExecutor",
     "CatalogSearchExecutor",
     "CatalogTraverseExecutor",
     "catalog_declarations",

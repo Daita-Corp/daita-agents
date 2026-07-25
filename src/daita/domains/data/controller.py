@@ -32,6 +32,7 @@ from ...observation import (
 )
 from ...catalog.capabilities import (
     CATALOG_INSPECT_CAPABILITY_ID,
+    CATALOG_SCHEMA_CAPABILITY_ID,
     CATALOG_SEARCH_CAPABILITY_ID,
     CATALOG_TRAVERSE_CAPABILITY_ID,
 )
@@ -65,6 +66,7 @@ SQLITE_UPDATE_TOOL_NAME = "data_update_sqlite"
 _MVP_CAPABILITIES = frozenset(
     {
         CATALOG_SEARCH_CAPABILITY_ID,
+        CATALOG_SCHEMA_CAPABILITY_ID,
         CATALOG_INSPECT_CAPABILITY_ID,
         CATALOG_TRAVERSE_CAPABILITY_ID,
         SQLITE_QUERY_CAPABILITY_ID,
@@ -549,6 +551,46 @@ class DataToolRuntime:
                 return (
                     "catalog_invalid_resource",
                     "Catalog inspection requires a resource_id.",
+                    {},
+                )
+        if capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
+            query = arguments.get("query")
+            resource_ids = arguments.get("resource_ids", ())
+            source_id = arguments.get("source_id")
+            limit = arguments.get("limit", 12)
+            include_relationships = arguments.get("include_relationships", True)
+            valid_query = query is None or (
+                isinstance(query, str) and bool(query.strip()) and len(query) <= 1_024
+            )
+            valid_resources = (
+                isinstance(resource_ids, tuple)
+                and len(resource_ids) <= 50
+                and len(resource_ids) == len(set(resource_ids))
+                and all(
+                    isinstance(resource_id, str) and bool(resource_id.strip())
+                    for resource_id in resource_ids
+                )
+            )
+            if (
+                not valid_query
+                or not valid_resources
+                or (query is None and not resource_ids)
+                or (
+                    source_id is not None
+                    and (not isinstance(source_id, str) or not bool(source_id.strip()))
+                )
+                or not isinstance(limit, int)
+                or isinstance(limit, bool)
+                or not 1 <= limit <= 50
+                or not isinstance(include_relationships, bool)
+            ):
+                return (
+                    "catalog_invalid_schema",
+                    (
+                        "Catalog schema requires a non-empty query or explicit "
+                        "resource IDs, optional current source scope, and a limit "
+                        "from 1 to 50."
+                    ),
                     {},
                 )
         if capability.id in {

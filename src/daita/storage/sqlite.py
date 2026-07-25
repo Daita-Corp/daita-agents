@@ -20,6 +20,7 @@ import sqlite3
 import threading
 from typing import Any
 
+from .._json import FrozenJsonObject
 from ..adapters.models import SourceRegistration
 from ..catalog.models import (
     CatalogFacet,
@@ -56,7 +57,7 @@ from ..llm.models import (
 )
 from ..loop.models import ConversationRun, LoopExit, LoopExitKind, RunInput, Transcript
 
-_SEARCH_TERM = re.compile(r"[A-Za-z0-9]+")
+_SEARCH_TERM = re.compile(r"[A-Za-z0-9_]+")
 
 
 class _CatalogCommitGate:
@@ -425,52 +426,115 @@ class SQLiteStateStore:
         return tuple(by_id[item_id] for item_id in relationship_ids if item_id in by_id)
 
     async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
-        terms = tuple(term.lower() for term in _SEARCH_TERM.findall(request.query))
-        matches: list[CatalogSearchHit] = []
-        for resource in await self.list_resources(request.agent_id):
+        query = request.query.casefold().strip()
+        terms = tuple(
+            dict.fromkeys(term.casefold() for term in _SEARCH_TERM.findall(query))
+        )
+        needles = tuple(dict.fromkeys((query, *terms))) if query else ()
+        snapshots = await self._snapshots(request.agent_id)
+        resources = tuple(
+            sorted(
+                (resource for snapshot in snapshots for resource in snapshot.resources),
+                key=lambda item: (item.name.casefold(), item.native_identity, item.id),
+            )
+        )
+        facets_by_resource: dict[str, tuple[CatalogFacet, ...]] = {}
+        relationships: list[CatalogRelationship] = []
+        for snapshot in snapshots:
+            relationships.extend(snapshot.relationships)
+            for resource in snapshot.resources:
+                facets_by_resource[resource.id] = tuple(
+                    facet
+                    for facet in snapshot.facets
+                    if facet.resource_id == resource.id
+                )
+        relationship_fields: dict[str, set[str]] = {}
+        adjacency: dict[str, list[tuple[str, CatalogRelationship]]] = {}
+        for relationship in sorted(relationships, key=lambda item: item.id):
+            adjacency.setdefault(relationship.from_resource_id, []).append(
+                (relationship.to_resource_id, relationship)
+            )
+            adjacency.setdefault(relationship.to_resource_id, []).append(
+                (relationship.from_resource_id, relationship)
+            )
+            for pair in relationship.field_pairs:
+                relationship_fields.setdefault(
+                    relationship.from_resource_id, set()
+                ).add(pair.source_field)
+                relationship_fields.setdefault(relationship.to_resource_id, set()).add(
+                    pair.target_field
+                )
+
+        eligible_by_id: dict[str, CatalogResource] = {}
+        direct: list[CatalogSearchHit] = []
+        for resource in resources:
             if request.source_ids and resource.source_id not in request.source_ids:
                 continue
             if request.resource_kinds and resource.kind not in request.resource_kinds:
                 continue
-            fields = {
-                "kind": f"{resource.kind.value} {resource.kind.value}s",
-                "name": resource.name.lower(),
-                "native_identity": resource.native_identity.lower(),
-                "external_uri": resource.external_uri.lower(),
-            }
-            matched_terms = tuple(
-                term
-                for term in terms
-                if any(term in value for value in fields.values())
+            eligible_by_id[resource.id] = resource
+            resource_names = (
+                ("name", resource.name.casefold()),
+                ("native_identity", resource.native_identity.casefold()),
             )
-            if terms and not matched_terms:
+            structural_fields: list[tuple[str, str]] = []
+            for facet in facets_by_resource.get(resource.id, ()):
+                if facet.kind is not FacetKind.TABULAR:
+                    continue
+                raw_columns = facet.payload.get("columns", ())
+                if isinstance(raw_columns, tuple):
+                    for column in raw_columns:
+                        if not isinstance(column, FrozenJsonObject):
+                            continue
+                        name = column.get("name")
+                        if isinstance(name, str):
+                            structural_fields.append(
+                                (f"column:{name}", name.casefold())
+                            )
+                raw_indexes = facet.payload.get("indexes", ())
+                if isinstance(raw_indexes, tuple):
+                    for index in raw_indexes:
+                        if not isinstance(index, FrozenJsonObject):
+                            continue
+                        columns = index.get("columns")
+                        if not isinstance(columns, tuple):
+                            continue
+                        for name in columns:
+                            if isinstance(name, str):
+                                structural_fields.append(
+                                    (f"index_field:{name}", name.casefold())
+                                )
+            structural_fields.extend(
+                (f"relationship_field:{name}", name.casefold())
+                for name in sorted(relationship_fields.get(resource.id, ()))
+            )
+            metadata_fields = (
+                (
+                    "kind",
+                    f"{resource.kind.value} {resource.kind.value}s".casefold(),
+                ),
+                ("external_uri", resource.external_uri.casefold()),
+            )
+            reason, rank = _catalog_search_reason(
+                needles,
+                resource_names,
+                tuple(structural_fields),
+                metadata_fields,
+            )
+            if reason is None:
                 continue
             matched_fields = tuple(
-                name
-                for name, value in fields.items()
-                if any(term in value for term in matched_terms)
-            )
-            exact = bool(terms) and any(
-                request.query.lower() == value for value in fields.values()
-            )
-            prefix = bool(terms) and any(
-                value.startswith(request.query.lower()) for value in fields.values()
-            )
-            reason = (
-                "lexical_exact"
-                if exact
-                else "lexical_prefix" if prefix else "lexical_contains"
-            )
-            score = (
-                100.0
-                if exact
-                else (
-                    50.0
-                    if prefix
-                    else float(max(1, len(matched_terms) * 2 + len(matched_fields)))
+                dict.fromkeys(
+                    name
+                    for name, value in (
+                        *resource_names,
+                        *structural_fields,
+                        *metadata_fields,
+                    )
+                    if any(needle in value for needle in needles)
                 )
             )
-            matches.append(
+            direct.append(
                 CatalogSearchHit(
                     resource_id=resource.id,
                     source_id=resource.source_id,
@@ -478,12 +542,50 @@ class SQLiteStateStore:
                     name=resource.name,
                     revision=resource.current_revision,
                     sensitivity=resource.sensitivity,
-                    score=score,
-                    matched_fields=matched_fields,
+                    score=float(600 - rank),
+                    matched_fields=matched_fields[:32],
                     match_reasons=(reason,),
                 )
             )
-        matches.sort(key=lambda item: (-item.score, item.name, item.resource_id))
+        direct.sort(
+            key=lambda item: (
+                -item.score,
+                item.name.casefold(),
+                item.name,
+                item.resource_id,
+            )
+        )
+        direct_ids = {item.resource_id for item in direct}
+        neighbor_by_id: dict[str, CatalogSearchHit] = {}
+        for hit in direct:
+            for neighbor_id, relationship in adjacency.get(hit.resource_id, ()):
+                neighbor = eligible_by_id.get(neighbor_id)
+                if (
+                    neighbor is None
+                    or neighbor_id in direct_ids
+                    or neighbor_id in neighbor_by_id
+                ):
+                    continue
+                neighbor_by_id[neighbor_id] = CatalogSearchHit(
+                    resource_id=neighbor.id,
+                    source_id=neighbor.source_id,
+                    kind=neighbor.kind,
+                    name=neighbor.name,
+                    revision=neighbor.current_revision,
+                    sensitivity=neighbor.sensitivity,
+                    score=0.0,
+                    matched_fields=(f"relationship:{relationship.id}",),
+                    match_reasons=("relationship_neighbor",),
+                )
+        neighbors = sorted(
+            neighbor_by_id.values(),
+            key=lambda item: (
+                item.name.casefold(),
+                item.name,
+                item.resource_id,
+            ),
+        )
+        matches = [*direct, *neighbors]
         hits = tuple(matches[: request.limit])
         return CatalogSearchResult(
             request=request,
@@ -800,6 +902,59 @@ class SQLiteStateStore:
             for snapshot in await self._snapshots(agent_id)
             for relationship in snapshot.relationships
         )
+
+
+def _catalog_search_reason(
+    needles: tuple[str, ...],
+    resource_names: tuple[tuple[str, str], ...],
+    structural_fields: tuple[tuple[str, str], ...],
+    metadata_fields: tuple[tuple[str, str], ...],
+) -> tuple[str | None, int]:
+    """Return the strongest deterministic lexical match category."""
+
+    if not needles:
+        return "metadata_contains", 5
+    for reason, rank, fields, predicate in (
+        (
+            "resource_name_exact",
+            0,
+            resource_names,
+            lambda needle, value: needle == value,
+        ),
+        (
+            "resource_name_prefix",
+            1,
+            resource_names,
+            lambda needle, value: value.startswith(needle),
+        ),
+        (
+            "resource_name_contains",
+            2,
+            resource_names,
+            lambda needle, value: needle in value,
+        ),
+        (
+            "structural_field_exact",
+            3,
+            structural_fields,
+            lambda needle, value: needle == value,
+        ),
+        (
+            "structural_field_contains",
+            4,
+            structural_fields,
+            lambda needle, value: needle in value,
+        ),
+        (
+            "metadata_contains",
+            5,
+            metadata_fields,
+            lambda needle, value: needle in value,
+        ),
+    ):
+        if any(predicate(needle, value) for needle in needles for _, value in fields):
+            return reason, rank
+    return None, 6
 
 
 def _initialize(path: Path) -> None:

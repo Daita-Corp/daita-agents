@@ -1011,6 +1011,50 @@ class SourceCatalogSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class CatalogSchemaRequest:
+    """Bounded selection criteria for one current structural schema projection."""
+
+    agent_id: str
+    query: str | None = None
+    resource_ids: tuple[str, ...] = ()
+    source_id: str | None = None
+    limit: int = 12
+    include_relationships: bool = True
+
+    def __post_init__(self) -> None:
+        _required_text(self.agent_id, "catalog schema agent_id")
+        if self.query is not None:
+            _required_text(
+                self.query,
+                "catalog schema query",
+                maximum=1_024,
+            )
+        resource_ids = _text_tuple(
+            self.resource_ids,
+            "catalog schema resource_ids",
+            maximum_items=50,
+        )
+        _optional_text(
+            self.source_id,
+            "catalog schema source_id",
+            maximum=256,
+        )
+        if self.query is None and not resource_ids:
+            raise ValueError(
+                "catalog schema requires a non-empty query or explicit resource IDs"
+            )
+        if (
+            not isinstance(self.limit, int)
+            or isinstance(self.limit, bool)
+            or not 1 <= self.limit <= 50
+        ):
+            raise ValueError("catalog schema limit must be from 1 through 50")
+        if not isinstance(self.include_relationships, bool):
+            raise TypeError("catalog schema include_relationships must be a boolean")
+        object.__setattr__(self, "resource_ids", resource_ids)
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogSearchRequest:
     agent_id: str
     query: str
@@ -1265,6 +1309,7 @@ __all__ = [
     "CatalogRelationship",
     "CatalogResource",
     "CatalogResourceRevision",
+    "CatalogSchemaRequest",
     "CatalogSearchHit",
     "CatalogSearchRequest",
     "CatalogSearchResult",

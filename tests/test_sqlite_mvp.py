@@ -41,7 +41,7 @@ async def test_public_agent_queries_sqlite_and_reopens_exact_transcript(tmp_path
     provider = MockModelProvider(())
     profile = ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=10_000,
+        context_window_tokens=12_000,
         max_output_tokens=1_000,
         supports_tools=True,
         supports_parallel_tools=True,
@@ -107,7 +107,7 @@ async def test_invalid_sql_is_a_model_visible_tool_error(tmp_path):
     provider = MockModelProvider(())
     profile = ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=10_000,
+        context_window_tokens=12_000,
         max_output_tokens=1_000,
         supports_tools=True,
     )

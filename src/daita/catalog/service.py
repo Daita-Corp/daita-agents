@@ -10,9 +10,13 @@ from .models import (
     CatalogFacet,
     CatalogRelationship,
     CatalogResource,
+    CatalogSchemaRequest,
+    CatalogSearchHit,
     CatalogSearchRequest,
     CatalogSearchResult,
     CatalogSummary,
+    CatalogSync,
+    CatalogSyncStatus,
     CatalogTraversalRequest,
     FacetKind,
     RelationshipDirection,
@@ -25,6 +29,10 @@ if TYPE_CHECKING:
     from ..adapters.protocols import SourceStore
 
 _INSPECT_INCIDENT_RELATIONSHIP_LIMIT = 50
+_SCHEMA_COLUMN_LIMIT = 256
+_SCHEMA_KEY_LIMIT = 64
+_SCHEMA_RELATIONSHIP_LIMIT = 200
+_SCHEMA_STRUCTURAL_FACT_LIMIT = 32
 
 
 class CatalogService:
@@ -126,6 +134,227 @@ class CatalogService:
             hits=hits,
             total_matches=total_matches,
             truncated=total_matches > len(hits),
+        )
+
+    async def schema_slice(
+        self,
+        request: CatalogSchemaRequest,
+    ) -> FrozenJsonObject:
+        """Project bounded current structural truth without source connector I/O."""
+
+        if not isinstance(request, CatalogSchemaRequest):
+            raise TypeError("request must be a CatalogSchemaRequest record")
+        if request.source_id is not None:
+            await self._active_source(request.agent_id, request.source_id)
+
+        match_by_resource_id: dict[str, CatalogSearchHit] = {}
+        if request.query is not None:
+            search = await self.search(
+                CatalogSearchRequest(
+                    agent_id=request.agent_id,
+                    query=request.query,
+                    source_ids=(
+                        () if request.source_id is None else (request.source_id,)
+                    ),
+                    limit=50,
+                )
+            )
+            match_by_resource_id = {hit.resource_id: hit for hit in search.hits}
+        else:
+            search = None
+
+        if request.resource_ids:
+            resources_by_id: dict[str, CatalogResource] = {}
+            for resource_id in request.resource_ids:
+                resource = await self._active_resource(
+                    request.agent_id,
+                    resource_id,
+                )
+                if (
+                    request.source_id is not None
+                    and resource.source_id != request.source_id
+                ):
+                    raise CatalogStoreError(
+                        "catalog schema resource is outside requested source scope"
+                    )
+                resources_by_id[resource.id] = resource
+            candidates = tuple(
+                sorted(
+                    resources_by_id.values(),
+                    key=lambda item: (
+                        item.native_identity.casefold(),
+                        item.native_identity,
+                        item.id,
+                    ),
+                )
+            )
+            total_matches = len(candidates)
+        else:
+            assert search is not None
+            candidates_list: list[CatalogResource] = []
+            for hit in search.hits:
+                resource = await self._active_resource(
+                    request.agent_id,
+                    hit.resource_id,
+                )
+                if (
+                    request.source_id is not None
+                    and resource.source_id != request.source_id
+                ):
+                    raise CatalogStoreError(
+                        "catalog schema search escaped requested source scope"
+                    )
+                candidates_list.append(resource)
+            candidates = tuple(candidates_list)
+            total_matches = search.total_matches
+
+        selected = candidates[: request.limit]
+        resources_cache = {resource.id: resource for resource in selected}
+        sync_by_id: dict[str, CatalogSync] = {}
+        resource_payloads: list[dict[str, object]] = []
+        columns_truncated = False
+        primary_keys_truncated = False
+        unique_keys_truncated = False
+        structural_facts_truncated = False
+        for resource in selected:
+            sync = await self._current_resource_sync(
+                request.agent_id,
+                resource,
+                sync_by_id,
+            )
+            (
+                structural,
+                resource_columns_truncated,
+                resource_primary_keys_truncated,
+                resource_unique_keys_truncated,
+            ) = await self._schema_resource_structure(
+                request.agent_id,
+                resource,
+            )
+            match_hit = match_by_resource_id.get(resource.id)
+            matched_fields = () if match_hit is None else match_hit.matched_fields
+            match_reasons = () if match_hit is None else match_hit.match_reasons
+            resource_structural_facts_truncated = (
+                len(matched_fields) > _SCHEMA_STRUCTURAL_FACT_LIMIT
+                or len(match_reasons) > _SCHEMA_STRUCTURAL_FACT_LIMIT
+            )
+            resource_payloads.append(
+                {
+                    "columns": structural["columns"],
+                    "kind": resource.kind.value,
+                    "name": resource.native_identity,
+                    "primary_key_fields": structural["primary_key_fields"],
+                    "resource_id": resource.id,
+                    "revision": resource.current_revision,
+                    "source_id": resource.source_id,
+                    "structural_facts": {
+                        "match_reasons": match_reasons[:_SCHEMA_STRUCTURAL_FACT_LIMIT],
+                        "matched_fields": matched_fields[
+                            :_SCHEMA_STRUCTURAL_FACT_LIMIT
+                        ],
+                    },
+                    "sync_id": sync.id,
+                    "unique_key_fields": structural["unique_key_fields"],
+                }
+            )
+            columns_truncated = columns_truncated or resource_columns_truncated
+            primary_keys_truncated = (
+                primary_keys_truncated or resource_primary_keys_truncated
+            )
+            unique_keys_truncated = (
+                unique_keys_truncated or resource_unique_keys_truncated
+            )
+            structural_facts_truncated = (
+                structural_facts_truncated or resource_structural_facts_truncated
+            )
+
+        relationship_payloads: list[dict[str, object]] = []
+        relationships_truncated = False
+        if request.include_relationships:
+            relationships_by_id: dict[str, CatalogRelationship] = {}
+            for resource in selected:
+                incident = await self._store.load_incident_relationships(
+                    request.agent_id,
+                    resource.id,
+                    limit=_SCHEMA_RELATIONSHIP_LIMIT + 1,
+                )
+                if len(incident) > _SCHEMA_RELATIONSHIP_LIMIT:
+                    relationships_truncated = True
+                for relationship in incident:
+                    relationships_by_id[relationship.id] = relationship
+            relationships = tuple(
+                sorted(relationships_by_id.values(), key=lambda item: item.id)
+            )
+            if len(relationships) > _SCHEMA_RELATIONSHIP_LIMIT:
+                relationships_truncated = True
+            selected_ids = set(resources_cache)
+            for relationship in relationships[:_SCHEMA_RELATIONSHIP_LIMIT]:
+                from_resource, to_resource = await self._current_relationship_endpoints(
+                    request.agent_id,
+                    relationship,
+                    resources_cache,
+                )
+                unselected_endpoints = tuple(
+                    _schema_endpoint_payload(endpoint)
+                    for endpoint in (from_resource, to_resource)
+                    if endpoint.id not in selected_ids
+                )
+                relationship_payloads.append(
+                    {
+                        "field_pairs": tuple(
+                            {
+                                "source_field": pair.source_field,
+                                "target_field": pair.target_field,
+                            }
+                            for pair in relationship.field_pairs
+                        ),
+                        "from_resource_id": relationship.from_resource_id,
+                        "from_resource_revision": from_resource.current_revision,
+                        "kind": relationship.kind.value,
+                        "provenance": relationship.provenance.value,
+                        "relationship_id": relationship.id,
+                        "to_resource_id": relationship.to_resource_id,
+                        "to_resource_revision": to_resource.current_revision,
+                        "unselected_endpoints": unselected_endpoints,
+                    }
+                )
+
+        source_payloads = tuple(
+            {
+                "source_id": sync.source_id,
+                "source_revision": sync.source_revision,
+                "sync_id": sync.id,
+            }
+            for sync in sorted(
+                sync_by_id.values(),
+                key=lambda item: (item.source_id, item.id),
+            )
+        )
+        return FrozenJsonObject.from_mapping(
+            {
+                "bounds": {
+                    "columns_per_resource": _SCHEMA_COLUMN_LIMIT,
+                    "primary_key_fields_per_resource": _SCHEMA_KEY_LIMIT,
+                    "relationships": _SCHEMA_RELATIONSHIP_LIMIT,
+                    "resources": request.limit,
+                    "structural_facts_per_resource": _SCHEMA_STRUCTURAL_FACT_LIMIT,
+                    "unique_key_fields_per_resource": _SCHEMA_KEY_LIMIT,
+                },
+                "include_relationships": request.include_relationships,
+                "relationships": relationship_payloads,
+                "resources": resource_payloads,
+                "sources": source_payloads,
+                "total_matches": total_matches,
+                "truncation": {
+                    "columns": columns_truncated,
+                    "primary_key_fields": primary_keys_truncated,
+                    "relationships": relationships_truncated,
+                    "resources": total_matches > len(selected),
+                    "structural_facts": structural_facts_truncated,
+                    "unique_key_fields": unique_keys_truncated,
+                },
+                "trust_classification": "untrusted_external_data",
+            }
         )
 
     async def inspect_resource(
@@ -327,6 +556,133 @@ class CatalogService:
             raise CatalogResourceNotFoundError(agent_id, resource_id)
         return resource
 
+    async def _active_source(self, agent_id: str, source_id: str) -> object:
+        registration = await self._sources.load_source(agent_id, source_id)
+        if (
+            registration is None
+            or registration.agent_id != agent_id
+            or registration.id != source_id
+            or not registration.active
+        ):
+            raise CatalogStoreError(
+                f"unknown active catalog source for {agent_id}: {source_id}"
+            )
+        return registration
+
+    async def _current_resource_sync(
+        self,
+        agent_id: str,
+        resource: CatalogResource,
+        sync_by_id: dict[str, CatalogSync],
+    ) -> CatalogSync:
+        sync = sync_by_id.get(resource.current_sync_id)
+        if sync is None:
+            loaded = await self._store.load_sync(
+                agent_id,
+                resource.current_sync_id,
+            )
+            if loaded is None:
+                raise CatalogStoreError("catalog resource lacks its current sync")
+            sync = loaded
+            sync_by_id[sync.id] = sync
+        if (
+            sync.agent_id != agent_id
+            or sync.source_id != resource.source_id
+            or sync.id != resource.current_sync_id
+            or sync.status is not CatalogSyncStatus.SUCCEEDED
+        ):
+            raise CatalogStoreError("catalog resource sync is not current")
+        return sync
+
+    async def _schema_resource_structure(
+        self,
+        agent_id: str,
+        resource: CatalogResource,
+    ) -> tuple[dict[str, object], bool, bool, bool]:
+        facets = await self._store.load_facets(
+            agent_id,
+            resource.id,
+            resource.current_revision,
+        )
+        tabular = next(
+            (facet for facet in facets if facet.kind is FacetKind.TABULAR),
+            None,
+        )
+        if tabular is None:
+            return (
+                {
+                    "columns": (),
+                    "primary_key_fields": (),
+                    "unique_key_fields": (),
+                },
+                False,
+                False,
+                False,
+            )
+        raw_columns = tabular.payload.get("columns", ())
+        raw_indexes = tabular.payload.get("indexes", ())
+        if not isinstance(raw_columns, tuple) or not isinstance(raw_indexes, tuple):
+            raise CatalogStoreError("catalog tabular facet has invalid structure")
+
+        columns: list[dict[str, object]] = []
+        primary_fields: list[tuple[int, str]] = []
+        for raw_column in raw_columns:
+            if not isinstance(raw_column, FrozenJsonObject):
+                raise CatalogStoreError("catalog tabular column has invalid structure")
+            name = raw_column.get("name")
+            native_type = raw_column.get("native_type")
+            nullable = raw_column.get("nullable")
+            if (
+                not isinstance(name, str)
+                or not isinstance(native_type, str)
+                or not isinstance(nullable, bool)
+            ):
+                raise CatalogStoreError("catalog tabular column is incomplete")
+            columns.append(
+                {
+                    "name": name,
+                    "nullable": nullable,
+                    "type": native_type,
+                }
+            )
+            primary_ordinal = raw_column.get("primary_key_ordinal")
+            if (
+                isinstance(primary_ordinal, int)
+                and not isinstance(primary_ordinal, bool)
+                and primary_ordinal > 0
+            ):
+                primary_fields.append((primary_ordinal, name))
+        ordered_primary = tuple(
+            name for _, name in sorted(primary_fields, key=lambda item: item)
+        )
+        unique_keys: set[tuple[str, ...]] = set()
+        for raw_index in raw_indexes:
+            if not isinstance(raw_index, FrozenJsonObject):
+                raise CatalogStoreError("catalog tabular index has invalid structure")
+            raw_fields = raw_index.get("columns")
+            if (
+                raw_index.get("unique") is not True
+                or raw_index.get("predicate") is not None
+                or not isinstance(raw_fields, tuple)
+                or not raw_fields
+                or any(not isinstance(field, str) for field in raw_fields)
+            ):
+                continue
+            fields = tuple(field for field in raw_fields if isinstance(field, str))
+            if fields != ordered_primary:
+                unique_keys.add(fields)
+        ordered_unique_keys = tuple(sorted(unique_keys))
+        return (
+            {
+                "columns": tuple(columns[:_SCHEMA_COLUMN_LIMIT]),
+                "primary_key_fields": ordered_primary[:_SCHEMA_KEY_LIMIT],
+                "unique_key_fields": ordered_unique_keys[:_SCHEMA_KEY_LIMIT],
+            },
+            len(columns) > _SCHEMA_COLUMN_LIMIT,
+            len(ordered_primary) > _SCHEMA_KEY_LIMIT,
+            len(ordered_unique_keys) > _SCHEMA_KEY_LIMIT,
+        )
+
     async def _current_relationship_endpoints(
         self,
         agent_id: str,
@@ -382,6 +738,16 @@ class CatalogService:
             for hit in result.hits
             if not resource_ids or hit.resource_id in resource_ids
         )[:limit]
+        sync_by_id: dict[str, CatalogSync] = {}
+        current_by_id: dict[str, tuple[CatalogResource, CatalogSync]] = {}
+        for hit in hits:
+            resource = await self._active_resource(agent_id, hit.resource_id)
+            sync = await self._current_resource_sync(
+                agent_id,
+                resource,
+                sync_by_id,
+            )
+            current_by_id[hit.resource_id] = (resource, sync)
         return FrozenJsonObject.from_mapping(
             {
                 "resources": [
@@ -392,6 +758,10 @@ class CatalogService:
                         "revision": hit.revision,
                         "sensitivity": hit.sensitivity.value,
                         "source_id": hit.source_id,
+                        "source_revision": current_by_id[hit.resource_id][
+                            1
+                        ].source_revision,
+                        "sync_id": current_by_id[hit.resource_id][0].current_sync_id,
                     }
                     for hit in hits
                 ],
@@ -428,17 +798,37 @@ def _facet_payload(facet: CatalogFacet) -> dict[str, object]:
 
 
 def _match_reason_rank(match_reasons: tuple[str, ...]) -> int:
-    if "lexical_exact" in match_reasons:
-        return 0
-    if "lexical_prefix" in match_reasons:
-        return 1
-    return 2
+    for reason, rank in (
+        ("resource_name_exact", 0),
+        ("resource_name_prefix", 1),
+        ("resource_name_contains", 2),
+        ("structural_field_exact", 3),
+        ("structural_field_contains", 4),
+        ("metadata_contains", 5),
+        ("relationship_neighbor", 6),
+        ("lexical_exact", 0),
+        ("lexical_prefix", 1),
+        ("lexical_contains", 5),
+    ):
+        if reason in match_reasons:
+            return rank
+    return 7
 
 
 def _neighbor_payload(resource: CatalogResource) -> dict[str, object]:
     return {
         "kind": resource.kind.value,
         "name": resource.name,
+        "resource_id": resource.id,
+        "revision": resource.current_revision,
+        "source_id": resource.source_id,
+    }
+
+
+def _schema_endpoint_payload(resource: CatalogResource) -> dict[str, object]:
+    return {
+        "kind": resource.kind.value,
+        "name": resource.native_identity,
         "resource_id": resource.id,
         "revision": resource.current_revision,
         "source_id": resource.source_id,

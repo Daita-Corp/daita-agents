@@ -1472,3 +1472,143 @@ async def test_inspection_keeps_nonreplayable_runs_but_history_excludes_them(tmp
         assert records[3].result.kind is LoopExitKind.COMPLETED
     finally:
         await reopened.close()
+
+
+async def test_historical_schema_slice_reuse_requires_current_matching_revisions():
+    resource_id = "catalog-resource:sha256:" + ("a" * 64)
+    source_id = "source:sha256:" + ("b" * 64)
+    revision = "sha256:" + ("c" * 64)
+    sync_id = "catalog-sync-current"
+    source_revision = "catalog:sha256:" + ("d" * 64)
+    schema_call = ToolCall(
+        id="schema-history-call",
+        name="catalog_schema",
+        arguments={"resource_ids": (resource_id,)},
+    )
+    record = _conversation_record(
+        0,
+        (
+            CanonicalMessage(
+                role=MessageRole.USER,
+                content=(TextBlock("Plan the paid revenue query"),),
+            ),
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                tool_calls=(schema_call,),
+            ),
+            CanonicalMessage(
+                role=MessageRole.TOOL,
+                content=(
+                    ToolResultBlock(
+                        call_id=schema_call.id,
+                        output={
+                            "kind": "catalog.schema_slice",
+                            "data": {
+                                "bounds": {"resources": 12},
+                                "include_relationships": True,
+                                "relationships": (),
+                                "resources": (
+                                    {
+                                        "columns": (
+                                            {
+                                                "name": "paid_revenue",
+                                                "nullable": False,
+                                                "type": "NUMERIC",
+                                            },
+                                        ),
+                                        "kind": "table",
+                                        "name": "analytics.orders",
+                                        "primary_key_fields": ("order_id",),
+                                        "resource_id": resource_id,
+                                        "revision": revision,
+                                        "source_id": source_id,
+                                        "structural_facts": {},
+                                        "sync_id": sync_id,
+                                        "unique_key_fields": (),
+                                    },
+                                ),
+                                "sources": (
+                                    {
+                                        "source_id": source_id,
+                                        "source_revision": source_revision,
+                                        "sync_id": sync_id,
+                                    },
+                                ),
+                                "total_matches": 1,
+                                "truncation": {"resources": False},
+                                "trust_classification": "untrusted_external_data",
+                            },
+                        },
+                    ),
+                ),
+            ),
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                content=(TextBlock("Use paid_revenue from analytics.orders."),),
+            ),
+        ),
+    )
+    prior = _project_completed_history((record,))
+    assert "catalog.schema_slice" in repr(prior)
+    assert "paid_revenue" in repr(prior)
+
+    current_resource = {
+        "kind": "table",
+        "name": "orders",
+        "resource_id": resource_id,
+        "revision": revision,
+        "sensitivity": "internal",
+        "source_id": source_id,
+        "source_revision": source_revision,
+        "sync_id": sync_id,
+    }
+    profile = ModelProfile(
+        id="mock:schema-history",
+        context_window_tokens=60_000,
+        max_output_tokens=2_000,
+        supports_tools=True,
+    )
+    run = RunInput(
+        id="schema-history-follow-up",
+        agent_id="agent-history",
+        message="Now only EMEA",
+        created_at=NOW,
+        conversation_id="history-conversation",
+    )
+    current_user = CanonicalMessage(
+        role=MessageRole.USER,
+        content=(TextBlock(run.message),),
+    )
+
+    unchanged = await DataContextBuilder(
+        CatalogSpy((current_resource,)),
+        profile=profile,
+    ).build(
+        run,
+        (*prior, current_user),
+        (),
+        step=1,
+    )
+    unchanged_text = repr(unchanged.messages)
+    assert "catalog.schema_slice" in unchanged_text
+    assert "paid_revenue" in unchanged_text
+
+    changed_resource = {
+        **current_resource,
+        "revision": "sha256:" + ("e" * 64),
+        "sync_id": "catalog-sync-refreshed",
+        "source_revision": "catalog:sha256:" + ("f" * 64),
+    }
+    changed = await DataContextBuilder(
+        CatalogSpy((changed_resource,)),
+        profile=profile,
+    ).build(
+        run,
+        (*prior, current_user),
+        (),
+        step=1,
+    )
+    changed_text = repr(changed.messages)
+    assert "catalog.schema_slice" not in changed_text
+    assert "'name', 'paid_revenue'" not in changed_text
+    assert _HISTORY_OMISSION_MARKER in changed_text

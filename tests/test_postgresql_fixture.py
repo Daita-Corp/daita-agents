@@ -5,11 +5,11 @@ from decimal import Decimal
 import io
 import os
 from pathlib import Path
-import re
 
 import pytest
 
 from daita import Agent
+from daita._json import canonical_json
 from daita.llm.models import (
     FinishReason,
     ModelRequest,
@@ -59,6 +59,13 @@ class _GroundedFixtureProvider:
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
         self.grounded_region: str | None = None
+        self.grounded_margin: Decimal | None = None
+        self.catalog_tool_call_count = 0
+        self.schema_result_bytes = 0
+        self.projected_resource_count = 0
+        self.duplicated_relationship_id_count = 0
+        self.truncation: Mapping[str, object] | None = None
+        self.schema_data: Mapping[str, object] | None = None
 
     @property
     def provider_id(self) -> str:
@@ -70,13 +77,21 @@ class _GroundedFixtureProvider:
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         if len(self.requests) == 1:
+            self.catalog_tool_call_count += 1
             return ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
                     ToolCall(
-                        id="find-regions",
-                        name="catalog_search",
-                        arguments={"query": "regions", "limit": 1},
+                        id="regional-schema",
+                        name="catalog_schema",
+                        arguments={
+                            "query": (
+                                "customers regions orders order_items products "
+                                "region_code total_amount unit_cost unit_price"
+                            ),
+                            "limit": 8,
+                            "include_relationships": True,
+                        },
                     ),
                 ),
                 provider_id=self.provider_id,
@@ -90,26 +105,50 @@ class _GroundedFixtureProvider:
         )
         if len(self.requests) == 2:
             if len(tool_results) != 1 or tool_results[0].is_error:
-                raise AssertionError("expected one successful catalog search result")
+                raise AssertionError("expected one successful catalog schema result")
             catalog_data = tool_results[0].output["data"]
             if not isinstance(catalog_data, Mapping):
-                raise AssertionError("catalog search data must be a mapping")
-            hits = catalog_data["hits"]
-            if not isinstance(hits, tuple) or len(hits) != 1:
-                raise AssertionError("catalog search must return the regions table")
-            hit = hits[0]
-            if not isinstance(hit, Mapping):
-                raise AssertionError("catalog hit must be a mapping")
-            source_id = hit["source_id"]
+                raise AssertionError("catalog schema data must be a mapping")
+            resources = catalog_data["resources"]
+            relationships = catalog_data["relationships"]
+            sources = catalog_data["sources"]
+            truncation = catalog_data["truncation"]
             if (
-                not isinstance(source_id, str)
-                or re.fullmatch(
-                    r"source:sha256:[0-9a-f]{64}",
-                    source_id,
-                )
-                is None
+                not isinstance(resources, tuple)
+                or not isinstance(relationships, tuple)
+                or not isinstance(sources, tuple)
+                or len(sources) != 1
+                or not isinstance(sources[0], Mapping)
+                or not isinstance(truncation, Mapping)
             ):
-                raise AssertionError("catalog hit did not expose the source ID")
+                raise AssertionError("catalog schema result has invalid structure")
+            names = {item["name"] for item in resources if isinstance(item, Mapping)}
+            if (
+                not {
+                    "analytics.customers",
+                    "analytics.regions",
+                    "analytics.orders",
+                    "analytics.order_items",
+                    "analytics.products",
+                }
+                <= names
+            ):
+                raise AssertionError("schema slice omitted a required join resource")
+            relationship_ids = tuple(
+                item["relationship_id"]
+                for item in relationships
+                if isinstance(item, Mapping)
+            )
+            self.schema_result_bytes = len(canonical_json(catalog_data).encode("utf-8"))
+            self.schema_data = catalog_data
+            self.projected_resource_count = len(resources)
+            self.duplicated_relationship_id_count = len(relationship_ids) - len(
+                set(relationship_ids)
+            )
+            self.truncation = truncation
+            source_id = sources[0]["source_id"]
+            if not isinstance(source_id, str):
+                raise AssertionError("schema slice did not expose the source ID")
             return ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
@@ -120,10 +159,16 @@ class _GroundedFixtureProvider:
                             "source_id": source_id,
                             "sql": (
                                 "SELECT c.region_code, "
-                                "SUM(o.total_amount) AS paid_revenue "
+                                "SUM(o.total_amount) AS paid_revenue, "
+                                "SUM(oi.line_total - "
+                                "(oi.quantity * p.unit_cost)) AS gross_margin "
                                 "FROM analytics.customers AS c "
                                 "JOIN analytics.orders AS o "
                                 "ON o.customer_id = c.customer_id "
+                                "JOIN analytics.order_items AS oi "
+                                "ON oi.order_id = o.order_id "
+                                "JOIN analytics.products AS p "
+                                "ON p.product_id = oi.product_id "
                                 "WHERE o.status = $1 "
                                 "GROUP BY c.region_code "
                                 "ORDER BY paid_revenue DESC "
@@ -152,16 +197,24 @@ class _GroundedFixtureProvider:
             raise AssertionError("query row must be a mapping")
         region = row["region_code"]
         paid_revenue = row["paid_revenue"]
-        if not isinstance(region, str) or not isinstance(paid_revenue, Mapping):
+        gross_margin = row["gross_margin"]
+        if (
+            not isinstance(region, str)
+            or not isinstance(paid_revenue, Mapping)
+            or not isinstance(gross_margin, Mapping)
+        ):
             raise AssertionError("query result has unexpected value types")
-        if paid_revenue["type"] != "decimal":
-            raise AssertionError("paid revenue must retain decimal typing")
+        if paid_revenue["type"] != "decimal" or gross_margin["type"] != "decimal":
+            raise AssertionError("financial results must retain decimal typing")
         if Decimal(str(paid_revenue["value"])) <= 0:
             raise AssertionError("paid revenue must be positive")
+        if Decimal(str(gross_margin["value"])) <= 0:
+            raise AssertionError("gross margin must be positive")
         self.grounded_region = region
+        self.grounded_margin = Decimal(str(gross_margin["value"]))
         return ModelResponse(
             finish_reason=FinishReason.STOP,
-            text=f"{region} has the most paid revenue.",
+            text=f"{region} has the most paid revenue with positive gross margin.",
             provider_id=self.provider_id,
         )
 
@@ -182,7 +235,7 @@ def _terminal_onboarding_input(port: int) -> str:
         "daita_reader",
         "disable",
         "1",  # analytics
-        "Which region has the most paid revenue?",
+        "Which region has the most paid revenue and gross margin?",
         "/exit",
     )
     return "\n".join(choices) + "\n"
@@ -240,17 +293,215 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
     assert code == 0
     assert hidden_prompts == ["API key: ", "Password: "]
     assert len([event for event in keychain.events if event[0] == "set"]) == 2
-    assert sorted(keychain.values.values()) == sorted(["fake-provider-key", password])
     text = output.getvalue()
+    assert sorted(keychain.values.values()) == sorted(
+        ["fake-provider-key", password]
+    ), text
     assert "✓ Connection validated" in text
     assert "analytics · base tables" in text
     assert "✓ Schemas selected: analytics" in text
     assert "✓ Catalog ready: 8 tables" in text
     assert provider.grounded_region in {"AMER", "EMEA", "APAC"}
-    assert f"{provider.grounded_region} has the most paid revenue." in text
+    assert provider.grounded_margin is not None and provider.grounded_margin > 0
+    assert (
+        f"{provider.grounded_region} has the most paid revenue with positive gross "
+        "margin." in text
+    )
     assert "fake-provider-key" not in text
     assert password not in text
     assert len(provider.requests) == 3
+    assert provider.catalog_tool_call_count == 1
+    assert provider.projected_resource_count == 8
+    assert provider.duplicated_relationship_id_count == 0
+    assert provider.schema_result_bytes > 0
+    assert provider.truncation is not None
+    assert provider.truncation["resources"] is False
+    assert provider.truncation["relationships"] is False
+    assert provider.schema_data is not None
+    projected_resources = provider.schema_data["resources"]
+    assert isinstance(projected_resources, tuple)
+    by_name = {
+        item["name"]: item for item in projected_resources if isinstance(item, Mapping)
+    }
+    expected_columns = {
+        "analytics.regions": (
+            ("region_code", "pg_catalog.text|text", False),
+            ("region_name", "pg_catalog.text|text", False),
+            ("currency_code", "pg_catalog.text|text", False),
+        ),
+        "analytics.customers": (
+            ("customer_id", "pg_catalog.int8|bigint", False),
+            ("customer_name", "pg_catalog.text|text", False),
+            ("email", "pg_catalog.text|text", False),
+            ("region_code", "pg_catalog.text|text", False),
+            ("segment", "pg_catalog.text|text", False),
+            (
+                "signed_up_at",
+                "pg_catalog.timestamptz|timestamp with time zone",
+                False,
+            ),
+            ("is_active", "pg_catalog.bool|boolean", False),
+        ),
+        "analytics.products": (
+            ("product_id", "pg_catalog.int8|bigint", False),
+            ("sku", "pg_catalog.text|text", False),
+            ("product_name", "pg_catalog.text|text", False),
+            ("category", "pg_catalog.text|text", False),
+            ("unit_price", "pg_catalog.numeric|numeric(12,2)", False),
+            ("unit_cost", "pg_catalog.numeric|numeric(12,2)", False),
+            ("is_active", "pg_catalog.bool|boolean", False),
+            (
+                "created_at",
+                "pg_catalog.timestamptz|timestamp with time zone",
+                False,
+            ),
+        ),
+        "analytics.orders": (
+            ("order_id", "pg_catalog.int8|bigint", False),
+            ("customer_id", "pg_catalog.int8|bigint", False),
+            (
+                "ordered_at",
+                "pg_catalog.timestamptz|timestamp with time zone",
+                False,
+            ),
+            ("status", "pg_catalog.text|text", False),
+            ("sales_channel", "pg_catalog.text|text", False),
+            ("subtotal", "pg_catalog.numeric|numeric(14,2)", False),
+            ("tax_amount", "pg_catalog.numeric|numeric(14,2)", False),
+            ("total_amount", "pg_catalog.numeric|numeric(14,2)", False),
+        ),
+        "analytics.order_items": (
+            ("order_item_id", "pg_catalog.int8|bigint", False),
+            ("order_id", "pg_catalog.int8|bigint", False),
+            ("product_id", "pg_catalog.int8|bigint", False),
+            ("quantity", "pg_catalog.int4|integer", False),
+            ("unit_price", "pg_catalog.numeric|numeric(12,2)", False),
+            (
+                "discount_percent",
+                "pg_catalog.numeric|numeric(5,2)",
+                False,
+            ),
+            ("line_total", "pg_catalog.numeric|numeric(14,2)", True),
+        ),
+        "analytics.payments": (
+            ("payment_id", "pg_catalog.int8|bigint", False),
+            ("order_id", "pg_catalog.int8|bigint", False),
+            (
+                "processed_at",
+                "pg_catalog.timestamptz|timestamp with time zone",
+                False,
+            ),
+            ("payment_method", "pg_catalog.text|text", False),
+            ("payment_status", "pg_catalog.text|text", False),
+            ("amount", "pg_catalog.numeric|numeric(14,2)", False),
+        ),
+        "analytics.shipments": (
+            ("shipment_id", "pg_catalog.int8|bigint", False),
+            ("order_id", "pg_catalog.int8|bigint", False),
+            ("warehouse_code", "pg_catalog.text|text", False),
+            ("shipment_status", "pg_catalog.text|text", False),
+            (
+                "shipped_at",
+                "pg_catalog.timestamptz|timestamp with time zone",
+                True,
+            ),
+            (
+                "delivered_at",
+                "pg_catalog.timestamptz|timestamp with time zone",
+                True,
+            ),
+        ),
+        "analytics.support_tickets": (
+            ("ticket_id", "pg_catalog.int8|bigint", False),
+            ("customer_id", "pg_catalog.int8|bigint", False),
+            ("order_id", "pg_catalog.int8|bigint", True),
+            (
+                "opened_at",
+                "pg_catalog.timestamptz|timestamp with time zone",
+                False,
+            ),
+            ("category", "pg_catalog.text|text", False),
+            ("priority", "pg_catalog.text|text", False),
+            ("ticket_status", "pg_catalog.text|text", False),
+            ("satisfaction_score", "pg_catalog.int4|integer", True),
+        ),
+    }
+    assert set(by_name) == set(expected_columns)
+    for name, expected in expected_columns.items():
+        columns = by_name[name]["columns"]
+        assert isinstance(columns, tuple)
+        assert (
+            tuple(
+                (column["name"], column["type"], column["nullable"])
+                for column in columns
+                if isinstance(column, Mapping)
+            )
+            == expected
+        )
+    expected_primary_keys = {
+        "analytics.regions": ("region_code",),
+        "analytics.customers": ("customer_id",),
+        "analytics.products": ("product_id",),
+        "analytics.orders": ("order_id",),
+        "analytics.order_items": ("order_item_id",),
+        "analytics.payments": ("payment_id",),
+        "analytics.shipments": ("shipment_id",),
+        "analytics.support_tickets": ("ticket_id",),
+    }
+    expected_unique_keys = {
+        "analytics.regions": (("region_name",),),
+        "analytics.customers": (("email",),),
+        "analytics.products": (("sku",),),
+        "analytics.orders": (),
+        "analytics.order_items": (),
+        "analytics.payments": (("order_id",),),
+        "analytics.shipments": (("order_id",),),
+        "analytics.support_tickets": (),
+    }
+    assert {
+        name: item["primary_key_fields"] for name, item in by_name.items()
+    } == expected_primary_keys
+    assert {
+        name: item["unique_key_fields"] for name, item in by_name.items()
+    } == expected_unique_keys
+    relationships = provider.schema_data["relationships"]
+    assert isinstance(relationships, tuple)
+    names_by_id = {item["resource_id"]: item["name"] for item in by_name.values()}
+    relationship_pairs = {
+        (
+            names_by_id[item["from_resource_id"]],
+            names_by_id[item["to_resource_id"]],
+            tuple(
+                (pair["source_field"], pair["target_field"])
+                for pair in item["field_pairs"]
+                if isinstance(pair, Mapping)
+            ),
+        )
+        for item in relationships
+        if isinstance(item, Mapping)
+    }
+    assert relationship_pairs == {
+        ("analytics.customers", "analytics.regions", (("region_code", "region_code"),)),
+        ("analytics.orders", "analytics.customers", (("customer_id", "customer_id"),)),
+        ("analytics.order_items", "analytics.orders", (("order_id", "order_id"),)),
+        (
+            "analytics.order_items",
+            "analytics.products",
+            (("product_id", "product_id"),),
+        ),
+        ("analytics.payments", "analytics.orders", (("order_id", "order_id"),)),
+        ("analytics.shipments", "analytics.orders", (("order_id", "order_id"),)),
+        (
+            "analytics.support_tickets",
+            "analytics.customers",
+            (("customer_id", "customer_id"),),
+        ),
+        (
+            "analytics.support_tickets",
+            "analytics.orders",
+            (("order_id", "order_id"),),
+        ),
+    }
     validator.assert_consumed()
 
     reopened = await Agent.open(
@@ -268,5 +519,20 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
         assert summary.resource_count == 8
         assert summary.relationship_count >= 7
         assert summary.is_empty is False
+        resources = await reopened.list_catalog_resources(source_id=sources[0].id)
+        inspections = tuple(
+            [
+                await reopened._embedded._catalog_service.inspect_resource(
+                    reopened.id,
+                    resource.id,
+                )
+                for resource in resources
+            ]
+        )
+        inspection_bytes = sum(
+            len(canonical_json(inspection).encode("utf-8"))
+            for inspection in inspections
+        )
+        assert provider.schema_result_bytes < inspection_bytes * 0.7
     finally:
         await reopened.close()

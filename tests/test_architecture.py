@@ -655,6 +655,29 @@ def test_stage_four_summary_is_catalog_owned_and_not_loop_or_storage_state():
     assert "readiness" not in storage.lower()
 
 
+def test_catalog_schema_slice_extends_existing_catalog_and_capability_owners():
+    assert _class_owners("CatalogSchemaRequest") == {"catalog/models.py"}
+    service_methods = _class_methods(
+        PACKAGE / "catalog" / "service.py",
+        "CatalogService",
+    )
+    assert "schema_slice" in service_methods
+    capabilities = (PACKAGE / "catalog" / "capabilities.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop")
+    assert 'name="catalog_schema"' in capabilities
+    assert 'CATALOG_SCHEMA_EVIDENCE_KIND = "catalog.schema_slice"' in capabilities
+    assert "catalog_declarations(identity.id, catalog_service)" in embedded
+    assert "catalog_schema" not in loop
+    for prohibited in (
+        "CatalogSchemaCache",
+        "CatalogSearchService",
+        "SchemaGraph",
+        "VectorStore",
+    ):
+        assert prohibited not in _python_text(PACKAGE)
+
+
 def test_cli_adds_no_parallel_state_approval_or_observation_owner():
     cli_tree = ast.parse((PACKAGE / "cli.py").read_text(encoding="utf-8"))
     cli_classes = {
