@@ -8,6 +8,7 @@ import pytest
 
 import daita
 from daita import Agent
+from daita._json import FrozenJsonObject, canonical_json
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     CanonicalMessage,
@@ -34,6 +35,8 @@ from daita.loop import (
 from daita.domains.data.context import (
     DataContextBuilder,
     _HISTORY_OMISSION_MARKER,
+    _MAXIMUM_PRIOR_UTF8_BYTES,
+    _neutral_message,
     _project_completed_history,
 )
 from daita.storage.sqlite import SQLiteStateStore
@@ -76,10 +79,66 @@ class ReplayTools:
             ToolResultBlock(
                 call_id=call.id,
                 output=(
-                    {"name": "secret-skill", "body": "SECRET SKILL BODY"}
+                    {
+                        "kind": "skill.document",
+                        "data": {
+                            "name": "secret-skill",
+                            "instructions": "SECRET SKILL BODY",
+                        },
+                    }
                     if call.name == "skill_view"
-                    else {"ok": True}
+                    else {
+                        "kind": {
+                            "memory_set": "memory.replacement",
+                            "skill_save": "skill.saved",
+                            "skill_delete": "skill.deleted",
+                        }[call.name],
+                        "data": {"ok": True},
+                    }
                 ),
+            )
+            for call in calls
+        )
+
+
+class FreshQueryTools:
+    def __init__(self):
+        self.calls = []
+
+    async def definitions(self, run):
+        del run
+        return (
+            ToolDefinition(
+                name="data_query_postgresql",
+                description="Run a fresh read-only PostgreSQL query.",
+                input_schema={"type": "object"},
+            ),
+        )
+
+    async def execute_all(self, run, calls):
+        del run
+        self.calls.extend(calls)
+        return tuple(
+            ToolResultBlock(
+                call_id=call.id,
+                output={
+                    "kind": "data.postgresql.query_result",
+                    "data": {
+                        "columns": ["segment", "paid_revenue"],
+                        "rows": [{"segment": "enterprise", "paid_revenue": 321}],
+                        "total_rows": 1,
+                        "returned_rows": 1,
+                        "truncated": False,
+                        "resource_revisions": [
+                            {
+                                "resource_id": "orders",
+                                "revision": "sha256:" + ("d" * 64),
+                            }
+                        ],
+                        "source_id": "warehouse",
+                        "source_revision": "catalog:current",
+                    },
+                },
             )
             for call in calls
         )
@@ -187,6 +246,140 @@ def _simple_conversation_record(index: int, answer: str | None = None):
             ),
         ),
     )
+
+
+def _analytical_conversation_record(
+    *,
+    oversized: bool,
+) -> tuple[ConversationRun, tuple[CanonicalMessage, ...]]:
+    user_text = (
+        "Analyze captured payments across all dates, grouped by region. Define paid "
+        "revenue as tax-exclusive merchandise revenue from captured payments, paid "
+        "order count as distinct paid orders, AOV as paid revenue divided by paid "
+        "order count, COGS as merchandise unit cost times quantity, and gross margin "
+        "as paid revenue minus COGS divided by paid revenue."
+    )
+    catalog_call = ToolCall(
+        id="catalog-native-call",
+        name="catalog_inspect",
+        arguments={"resource_id": "orders"},
+        provider_call_id="provider-catalog-call",
+    )
+    query_call = ToolCall(
+        id="query-native-call",
+        name="data_query_postgresql",
+        arguments={
+            "source_id": "warehouse",
+            "sql": (
+                "SELECT region, "
+                "SUM(quantity * merchandise_unit_price) AS paid_revenue, "
+                "COUNT(DISTINCT order_id) AS paid_order_count, "
+                "SUM(quantity * merchandise_unit_price) / "
+                "COUNT(DISTINCT order_id) AS aov, "
+                "SUM(quantity * merchandise_unit_cost) AS cogs, "
+                "(SUM(quantity * merchandise_unit_price) - "
+                "SUM(quantity * merchandise_unit_cost)) / "
+                "SUM(quantity * merchandise_unit_price) AS gross_margin "
+                "FROM captured_payments JOIN order_items USING (order_id) "
+                "GROUP BY region"
+            ),
+        },
+        provider_call_id="provider-query-call",
+    )
+    raw_rows = [
+        {
+            "region": f"region-{index}",
+            "paid_revenue": 123_456 + index,
+            "paid_order_count": 50 + index,
+            "padding": "raw-row-sentinel-" + ("x" * 700),
+        }
+        for index in range(40 if oversized else 1)
+    ]
+    messages = (
+        CanonicalMessage(role=MessageRole.USER, content=(TextBlock(user_text),)),
+        CanonicalMessage(
+            role=MessageRole.ASSISTANT,
+            tool_calls=(catalog_call,),
+            provider_id="mock:history",
+            provider_metadata={"native": "catalog"},
+        ),
+        CanonicalMessage(
+            role=MessageRole.TOOL,
+            content=(
+                ToolResultBlock(
+                    call_id=catalog_call.id,
+                    output={
+                        "kind": "catalog.resource_snapshot",
+                        "data": {
+                            "resource_id": "orders",
+                            "schema": "catalog-snapshot-sentinel-" + ("z" * 30_000),
+                        },
+                    },
+                ),
+            ),
+        ),
+        CanonicalMessage(
+            role=MessageRole.ASSISTANT,
+            tool_calls=(query_call,),
+            provider_id="mock:history",
+            provider_metadata={"native": "query"},
+        ),
+        CanonicalMessage(
+            role=MessageRole.TOOL,
+            content=(
+                ToolResultBlock(
+                    call_id=query_call.id,
+                    output={
+                        "kind": "data.postgresql.query_result",
+                        "data": {
+                            "columns": [
+                                "region",
+                                "paid_revenue",
+                                "paid_order_count",
+                                "aov",
+                                "cogs",
+                                "gross_margin",
+                            ],
+                            "rows": raw_rows,
+                            "total_rows": len(raw_rows),
+                            "returned_rows": len(raw_rows),
+                            "truncated": False,
+                            "resource_revisions": [
+                                {
+                                    "resource_id": "orders",
+                                    "revision": "sha256:" + ("a" * 64),
+                                },
+                                {
+                                    "resource_id": "order_items",
+                                    "revision": "sha256:" + ("b" * 64),
+                                },
+                            ],
+                            "source_id": "warehouse",
+                            "source_revision": "catalog:history",
+                            "trust_classification": "untrusted_external_data",
+                        },
+                    },
+                ),
+            ),
+        ),
+        CanonicalMessage(
+            role=MessageRole.ASSISTANT,
+            content=(
+                TextBlock(
+                    "Overall results use captured-payment scope across all dates with "
+                    "regional grouping. Paid revenue is tax-exclusive merchandise "
+                    "revenue; paid order count is distinct paid orders; AOV is paid "
+                    "revenue divided by paid order count; COGS is merchandise unit "
+                    "cost times quantity; gross margin is (paid revenue - COGS) / "
+                    "paid revenue. Overall paid revenue was 123456. A segment follow-up "
+                    "must compare enterprise customers with the overall results."
+                ),
+            ),
+            provider_id="mock:history",
+            provider_metadata={"native": "answer"},
+        ),
+    )
+    return _conversation_record(0, messages), messages
 
 
 def _request_text(request: ModelRequest) -> tuple[str, ...]:
@@ -512,6 +705,11 @@ async def test_historical_tools_are_rewritten_redacted_and_provider_neutral(
         all_historical_ids = [
             call.id for message in historical_assistants for call in message.tool_calls
         ]
+        assert [
+            call.name
+            for message in historical_assistants
+            for call in message.tool_calls
+        ] == ["skill_view", "skill_view"]
         assert all(call_id.startswith("hist_") for call_id in all_historical_ids)
         assert len(all_historical_ids) == len(set(all_historical_ids))
         assert all(message.provider_id is None for message in historical_assistants)
@@ -521,12 +719,9 @@ async def test_historical_tools_are_rewritten_redacted_and_provider_neutral(
             for message in historical_assistants
             for call in message.tool_calls
         )
-        assert all(
-            call.arguments.get("redacted") == "[historical knowledge document redacted]"
-            for message in historical_assistants
-            for call in message.tool_calls
-            if call.name != "skill_view"
-        )
+        assert "memory_set" not in repr(historical_assistants)
+        assert "skill_save" not in repr(historical_assistants)
+        assert "skill_delete" not in repr(historical_assistants)
 
         historical_results = [
             block
@@ -539,6 +734,7 @@ async def test_historical_tools_are_rewritten_redacted_and_provider_neutral(
             all_historical_ids
         )
         assert "SECRET SKILL BODY" not in repr(historical_results)
+        assert "[historical skill body redacted]" in repr(historical_results)
 
         # Durable per-run transcripts retain their exact canonical records.
         first_transcript = await agent.transcript(first.run_id)
@@ -552,6 +748,441 @@ async def test_historical_tools_are_rewritten_redacted_and_provider_neutral(
             assert "SECRET SKILL BODY" in repr(transcript.messages)
     finally:
         await agent.close()
+
+
+async def test_oversized_analytical_history_keeps_compact_contract_and_requeries():
+    record, durable_messages = _analytical_conversation_record(oversized=True)
+    durable_payload = canonical_json(
+        [_neutral_message(message) for message in durable_messages]
+    )
+    assert len(durable_payload.encode("utf-8")) > _MAXIMUM_PRIOR_UTF8_BYTES
+
+    prior = _project_completed_history((record,))
+    projected_payload = canonical_json([_neutral_message(message) for message in prior])
+    assert len(projected_payload.encode("utf-8")) < (
+        len(durable_payload.encode("utf-8")) // 3
+    )
+    assert len(projected_payload.encode("utf-8")) <= _MAXIMUM_PRIOR_UTF8_BYTES
+    assert record.transcript.messages == durable_messages
+
+    rendered = repr(prior)
+    for contract in (
+        "captured payments",
+        "all dates",
+        "grouped by region",
+        "paid revenue",
+        "paid order count",
+        "AOV",
+        "tax-exclusive merchandise revenue",
+        "COGS",
+        "gross margin",
+        "enterprise customers",
+        "overall results",
+    ):
+        assert contract in rendered
+    assert "catalog-snapshot-sentinel" not in rendered
+    assert "raw-row-sentinel" not in rendered
+    assert "'rows'" not in rendered
+    assert rendered.count(_HISTORY_OMISSION_MARKER) == 1
+
+    historical_calls = [
+        call
+        for message in prior
+        if message.role is MessageRole.ASSISTANT
+        for call in message.tool_calls
+    ]
+    historical_results = [
+        block
+        for message in prior
+        if message.role is MessageRole.TOOL
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert len(historical_calls) == len(historical_results) == 1
+    assert historical_calls[0].name == "data_query_postgresql"
+    assert historical_calls[0].id.startswith("hist_")
+    assert historical_calls[0].provider_call_id is None
+    assert historical_results[0].call_id == historical_calls[0].id
+    receipt = historical_results[0].output
+    assert receipt["kind"] == "data.postgresql.query_result"
+    assert receipt["historical_projection"] == "continuity"
+    assert receipt["state"] == "success"
+    data = receipt["data"]
+    assert isinstance(data, Mapping)
+    assert data["columns"] == (
+        "region",
+        "paid_revenue",
+        "paid_order_count",
+        "aov",
+        "cogs",
+        "gross_margin",
+    )
+    assert data["total_rows"] == 40
+    assert data["returned_rows"] == 40
+    assert data["truncated"] is False
+    assert data["source_revision"] == "catalog:history"
+    assert "rows" not in data
+
+    follow_up = (
+        "Now restrict that analysis to enterprise customers and compare it with "
+        "the overall results."
+    )
+    catalog = CatalogSpy()
+    profile = ModelProfile(
+        id="mock:enterprise-follow-up",
+        context_window_tokens=60_000,
+        max_output_tokens=2_000,
+        supports_tools=True,
+    )
+    builder = DataContextBuilder(catalog, profile=profile)
+    request = await builder.build(
+        RunInput(
+            id="enterprise-follow-up",
+            agent_id="agent-history",
+            message=follow_up,
+            created_at=NOW,
+            conversation_id="history-conversation",
+        ),
+        (
+            *prior,
+            CanonicalMessage(
+                role=MessageRole.USER,
+                content=(TextBlock(follow_up),),
+            ),
+        ),
+        (),
+        step=1,
+    )
+    request_rendered = repr(request.messages)
+    for contract in (
+        "captured payments",
+        "all dates",
+        "region",
+        "paid revenue",
+        "paid order count",
+        "AOV",
+        "tax-exclusive merchandise revenue",
+        "COGS",
+        "gross margin",
+        "compare it with the overall results",
+    ):
+        assert contract in request_rendered
+    current_system = request.messages[0].content[0]
+    assert isinstance(current_system, TextBlock)
+    assert "123456" not in current_system.text
+
+    provider = MockModelProvider(
+        (
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="fresh-enterprise-query",
+                        name="data_query_postgresql",
+                        arguments={
+                            "source_id": "warehouse",
+                            "sql": (
+                                "SELECT customer_segment, region, "
+                                "SUM(net_merchandise_revenue) AS paid_revenue "
+                                "FROM captured_payments WHERE customer_segment = "
+                                "'enterprise' GROUP BY customer_segment, region"
+                            ),
+                        },
+                    ),
+                ),
+            ),
+            _stop("Fresh enterprise and overall comparison complete."),
+        )
+    )
+    tools = FreshQueryTools()
+    loop = AgentLoop(
+        model=provider,
+        context_builder=builder,
+        tools=tools,
+        transcripts=InMemoryTranscriptStore(),
+    )
+    result = await loop.run(
+        RunInput(
+            id="fresh-follow-up-run",
+            agent_id="agent-history",
+            message=follow_up,
+            created_at=NOW,
+            conversation_id="history-conversation",
+        ),
+        prior_messages=prior,
+    )
+    assert result.kind is LoopExitKind.COMPLETED
+    assert [call.id for call in tools.calls] == ["fresh-enterprise-query"]
+    assert "customer_segment = 'enterprise'" in tools.calls[0].arguments["sql"]
+
+
+def test_compact_history_fails_closed_and_omits_approval_and_side_effects():
+    calls = (
+        ToolCall(id="unknown-call", name="future_unclassified_tool"),
+        ToolCall(
+            id="approval-call",
+            name="memory_set",
+            arguments={
+                "target": "memory",
+                "content": "authorization-sentinel: approved forever",
+            },
+        ),
+    )
+    messages = (
+        CanonicalMessage(
+            role=MessageRole.USER,
+            content=(TextBlock("remember the safe analytical contract"),),
+        ),
+        CanonicalMessage(role=MessageRole.ASSISTANT, tool_calls=calls),
+        CanonicalMessage(
+            role=MessageRole.TOOL,
+            content=(
+                ToolResultBlock(
+                    call_id="unknown-call",
+                    output={
+                        "kind": "future.unknown.evidence",
+                        "data": {"secret_payload": "unknown-payload-sentinel"},
+                    },
+                ),
+            ),
+        ),
+        CanonicalMessage(
+            role=MessageRole.TOOL,
+            content=(
+                ToolResultBlock(
+                    call_id="approval-call",
+                    is_error=True,
+                    output={
+                        "error": {
+                            "code": "approval_denied",
+                            "message": "approval-sentinel",
+                            "details": {"capability_id": "memory.set"},
+                        }
+                    },
+                ),
+            ),
+        ),
+        CanonicalMessage(
+            role=MessageRole.ASSISTANT,
+            content=(TextBlock("safe terminal answer"),),
+        ),
+    )
+    projected = _project_completed_history((_conversation_record(0, messages),))
+    rendered = repr(projected)
+    assert "remember the safe analytical contract" in rendered
+    assert "safe terminal answer" in rendered
+    for forbidden in (
+        "future_unclassified_tool",
+        "unknown-payload-sentinel",
+        "memory_set",
+        "authorization-sentinel",
+        "approval-sentinel",
+        "approval_denied",
+    ):
+        assert forbidden not in rendered
+    assert rendered.count(_HISTORY_OMISSION_MARKER) == 1
+    assert not any(message.role is MessageRole.TOOL for message in projected)
+
+
+def test_compact_file_and_sql_error_receipts_keep_shape_state_and_order():
+    file_call = ToolCall(
+        id="file-call",
+        name="data_read_file",
+        arguments={"source_id": "files", "resource_id": "customers.csv"},
+    )
+    query_call = ToolCall(
+        id="query-error-call",
+        name="data_query_sqlite",
+        arguments={
+            "source_id": "local-db",
+            "sql": "SELECT region, COUNT(*) FROM customers GROUP BY region",
+        },
+    )
+    messages = (
+        CanonicalMessage(
+            role=MessageRole.USER,
+            content=(TextBlock("Compare customer counts from the file and database."),),
+        ),
+        CanonicalMessage(
+            role=MessageRole.ASSISTANT,
+            tool_calls=(file_call, query_call),
+        ),
+        CanonicalMessage(
+            role=MessageRole.TOOL,
+            content=(
+                ToolResultBlock(
+                    call_id=file_call.id,
+                    output={
+                        "kind": "data.file.read_result",
+                        "data": {
+                            "source_id": "files",
+                            "source_revision": "manifest:history",
+                            "resource_id": "customers.csv",
+                            "resource_revision": "sha256:" + ("c" * 64),
+                            "freshness": {"observed_at": "2026-07-20T00:00:00Z"},
+                            "format": "csv",
+                            "encoding": "utf-8",
+                            "columns": ["customer_id", "region"],
+                            "complete": True,
+                            "rows": [
+                                {
+                                    "customer_id": index,
+                                    "region": "raw-file-row-" + ("x" * 1_000),
+                                }
+                                for index in range(10)
+                            ],
+                            "total_rows": 10,
+                            "returned_rows": 10,
+                            "row_limit": 100,
+                            "byte_limit": 65_536,
+                            "utf8_bytes": 12_000,
+                            "truncated": False,
+                            "truncation_reasons": [],
+                            "trust_classification": "untrusted_external_data",
+                        },
+                    },
+                ),
+            ),
+        ),
+        CanonicalMessage(
+            role=MessageRole.TOOL,
+            content=(
+                ToolResultBlock(
+                    call_id=query_call.id,
+                    is_error=True,
+                    output={
+                        "error": {
+                            "code": "sql_unknown_column",
+                            "message": "unbounded-error-detail-sentinel",
+                            "details": {"candidates": ["region_name"]},
+                        }
+                    },
+                ),
+            ),
+        ),
+        CanonicalMessage(
+            role=MessageRole.ASSISTANT,
+            content=(TextBlock("The file shape is known; retry the database query."),),
+        ),
+    )
+    projected = _project_completed_history((_conversation_record(0, messages),))
+    calls = [
+        call
+        for message in projected
+        if message.role is MessageRole.ASSISTANT
+        for call in message.tool_calls
+    ]
+    results = [
+        block
+        for message in projected
+        if message.role is MessageRole.TOOL
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert [call.name for call in calls] == [
+        "data_read_file",
+        "data_query_sqlite",
+    ]
+    assert [result.call_id for result in results] == [call.id for call in calls]
+    file_receipt = results[0].output
+    assert file_receipt["historical_projection"] == "continuity"
+    assert file_receipt["state"] == "success"
+    file_data = file_receipt["data"]
+    assert isinstance(file_data, Mapping)
+    assert file_data["resource_id"] == "customers.csv"
+    assert file_data["freshness"] == FrozenJsonObject.from_mapping(
+        {"observed_at": "2026-07-20T00:00:00Z"}
+    )
+    assert file_data["columns"] == ("customer_id", "region")
+    assert file_data["total_rows"] == 10
+    assert "rows" not in file_data
+    error_receipt = results[1].output
+    assert error_receipt["kind"] == "data.sqlite.query_result"
+    assert error_receipt["state"] == "error"
+    projected_error = error_receipt["error"]
+    assert isinstance(projected_error, Mapping)
+    assert projected_error["code"] == "sql_unknown_column"
+    assert "unbounded-error-detail-sentinel" not in repr(projected)
+    assert repr(projected).count(_HISTORY_OMISSION_MARKER) == 1
+
+
+def test_small_useful_query_turn_can_use_full_projection():
+    record, _ = _analytical_conversation_record(oversized=False)
+    projected = _project_completed_history((record,))
+    results = [
+        block
+        for message in projected
+        if message.role is MessageRole.TOOL
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert len(results) == 1
+    assert results[0].output["historical_projection"] == "full"
+    data = results[0].output["data"]
+    assert isinstance(data, Mapping)
+    assert data["rows"][0]["region"] == "region-0"
+    assert "catalog-snapshot-sentinel" not in repr(projected)
+
+
+async def test_whole_request_budget_downgrades_full_turn_before_dropping_it():
+    record, _ = _analytical_conversation_record(oversized=False)
+    prior = _project_completed_history((record,))
+    assert "'historical_projection', 'full'" in repr(prior)
+    builder = DataContextBuilder(
+        CatalogSpy(),
+        profile=ModelProfile(
+            id="mock:full-downgrade",
+            context_window_tokens=15_500,
+            max_output_tokens=1_000,
+            supports_tools=True,
+        ),
+    )
+    current = "current-run-message-must-remain-complete"
+    request = await builder.build(
+        RunInput(
+            id="full-downgrade-run",
+            agent_id="agent-history",
+            message=current,
+            created_at=NOW,
+            conversation_id="history-conversation",
+        ),
+        (
+            *prior,
+            CanonicalMessage(
+                role=MessageRole.USER,
+                content=(TextBlock(current),),
+            ),
+        ),
+        (),
+        step=1,
+    )
+    rendered = repr(request.messages)
+    assert "'historical_projection', 'continuity'" in rendered
+    assert "'historical_projection', 'full'" not in rendered
+    assert "Analyze captured payments" in rendered
+    assert "current-run-message-must-remain-complete" in rendered
+    assert rendered.count(_HISTORY_OMISSION_MARKER) == 1
+
+
+def test_oversized_terminal_answer_gets_deterministic_edge_projection():
+    answer = "answer-beginning-sentinel-" + ("x" * 40_000) + "-answer-ending-sentinel"
+    projected = _project_completed_history(
+        (_simple_conversation_record(0, answer=answer),)
+    )
+    rendered = repr(projected)
+    assert "history user 0" in rendered
+    assert "answer-beginning-sentinel" in rendered
+    assert "answer-ending-sentinel" in rendered
+    assert f"original UTF-8 bytes: {len(answer.encode('utf-8'))}" in rendered
+    assert rendered.count(_HISTORY_OMISSION_MARKER) == 1
+    assert (
+        len(
+            canonical_json([_neutral_message(message) for message in projected]).encode(
+                "utf-8"
+            )
+        )
+        <= _MAXIMUM_PRIOR_UTF8_BYTES
+    )
 
 
 def test_completed_history_hard_bounds_keep_newest_whole_turns():
@@ -591,9 +1222,12 @@ def test_completed_history_hard_bounds_keep_newest_whole_turns():
         ]
         message_heavy.append(_conversation_record(index, tuple(messages)))
     message_bounded = _project_completed_history(tuple(message_heavy))
-    assert len(message_bounded) == 36  # marker plus five complete seven-message turns
-    assert "message-heavy user 2" not in repr(message_bounded)
-    assert "message-heavy user 3" in repr(message_bounded)
+    # Unknown future evidence fails closed, so all eight bounded user/answer
+    # continuity pairs fit and the tool payloads are represented by one marker.
+    assert len(message_bounded) == 17
+    assert "message-heavy user 0" in repr(message_bounded)
+    assert "message-heavy user 7" in repr(message_bounded)
+    assert "name='lookup'" not in repr(message_bounded)
 
     byte_heavy = tuple(
         _simple_conversation_record(index, answer=str(index) + ("x" * 12_500))
