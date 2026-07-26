@@ -401,7 +401,7 @@ async def test_catalog_summary_is_not_persisted_or_added_to_model_state(tmp_path
     )
     profile = ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=8_192,
+        context_window_tokens=128_000,
         max_output_tokens=256,
         supports_tools=True,
     )

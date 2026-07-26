@@ -43,7 +43,7 @@ class MockModelProvider:
 
         return ModelProfile(
             id=self._provider_id,
-            context_window_tokens=16_384,
+            context_window_tokens=128_000,
             max_output_tokens=2_048,
             supports_tools=True,
             supports_parallel_tools=False,

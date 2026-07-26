@@ -547,7 +547,7 @@ def test_direct_cli_uses_provider_owned_profile_without_generic_defaults():
 
     assert configured_provider is provider
     assert profile == provider.model_profile
-    assert profile.context_window_tokens == 16_384
+    assert profile.context_window_tokens == 128_000
     assert profile.max_output_tokens == 2_048
     assert not profile.supports_parallel_tools
 
@@ -570,7 +570,7 @@ def test_direct_cli_limits_cannot_exceed_provider_owned_profile():
         ):
             cli._model_configuration(
                 "mock:scripted",
-                context_window=16_385,
+                context_window=128_001,
                 max_output=2_048,
             )
 

@@ -1279,19 +1279,21 @@ async def run_terminal_tui(
             enhanced_output = runtime["create_output"](stdout=output_stream)
         except Exception as error:
             _restore_terminal(enhanced_output)
-            try:
-                enhanced_input.close()
-            except Exception:
-                pass
+            if enhanced_input is not None:
+                try:
+                    enhanced_input.close()
+                except Exception:
+                    pass
             raise TerminalTUIUnavailable(
                 "enhanced terminal admission failed"
             ) from error
         except BaseException:
             _restore_terminal(enhanced_output)
-            try:
-                enhanced_input.close()
-            except Exception:
-                pass
+            if enhanced_input is not None:
+                try:
+                    enhanced_input.close()
+                except Exception:
+                    pass
             raise
 
     try:

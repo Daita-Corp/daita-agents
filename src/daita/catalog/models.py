@@ -22,6 +22,17 @@ _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
 _RELATIONSHIP_ID = re.compile(r"catalog-relationship:sha256:[0-9a-f]{64}\Z")
 
+CATALOG_TRAVERSAL_DEFAULT_DEPTH = 4
+CATALOG_TRAVERSAL_DEFAULT_EDGES = 200
+CATALOG_TRAVERSAL_DEFAULT_NODES = 100
+CATALOG_TRAVERSAL_DEFAULT_PATHS = 5
+CATALOG_TRAVERSAL_MAX_DEPTH = 6
+CATALOG_TRAVERSAL_MAX_EDGES = 2_000
+CATALOG_TRAVERSAL_MAX_NODES = 1_000
+CATALOG_TRAVERSAL_MAX_PATHS = 8
+CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS = 256
+CATALOG_TRAVERSAL_MAX_RESOURCE_IDS = 16
+
 _RecordT = TypeVar("_RecordT")
 
 
@@ -106,6 +117,7 @@ def _text_tuple(
     field_name: str,
     *,
     maximum_items: int,
+    maximum_characters: int = 256,
     allow_empty: bool = True,
     unique: bool = True,
 ) -> tuple[str, ...]:
@@ -117,7 +129,7 @@ def _text_tuple(
     if len(result) > maximum_items:
         raise ValueError(f"{field_name} exceeds {maximum_items} items")
     for value in result:
-        _required_text(value, field_name, maximum=256)
+        _required_text(value, field_name, maximum=maximum_characters)
     if unique and len(result) != len(set(result)):
         raise ValueError(f"{field_name} cannot contain duplicates")
     return result
@@ -1176,23 +1188,25 @@ class CatalogTraversalRequest:
     from_resource_ids: tuple[str, ...]
     to_resource_ids: tuple[str, ...]
     relationship_kinds: tuple[RelationshipKind, ...] = ()
-    max_depth: int = 4
-    max_paths: int = 5
-    max_nodes: int = 100
-    max_edges: int = 200
+    max_depth: int = CATALOG_TRAVERSAL_DEFAULT_DEPTH
+    max_paths: int = CATALOG_TRAVERSAL_DEFAULT_PATHS
+    max_nodes: int = CATALOG_TRAVERSAL_DEFAULT_NODES
+    max_edges: int = CATALOG_TRAVERSAL_DEFAULT_EDGES
 
     def __post_init__(self) -> None:
         _required_text(self.agent_id, "catalog traversal agent_id")
         from_ids = _text_tuple(
             self.from_resource_ids,
             "catalog traversal from_resource_ids",
-            maximum_items=16,
+            maximum_items=CATALOG_TRAVERSAL_MAX_RESOURCE_IDS,
+            maximum_characters=CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS,
             allow_empty=False,
         )
         to_ids = _text_tuple(
             self.to_resource_ids,
             "catalog traversal to_resource_ids",
-            maximum_items=16,
+            maximum_items=CATALOG_TRAVERSAL_MAX_RESOURCE_IDS,
+            maximum_characters=CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS,
             allow_empty=False,
         )
         if isinstance(self.relationship_kinds, (str, bytes)):
@@ -1205,10 +1219,10 @@ class CatalogTraversalRequest:
         if len(kinds) != len(set(kinds)):
             raise ValueError("catalog traversal relationship kinds cannot repeat")
         for value, name, maximum in (
-            (self.max_depth, "max_depth", 6),
-            (self.max_paths, "max_paths", 8),
-            (self.max_nodes, "max_nodes", 1_000),
-            (self.max_edges, "max_edges", 2_000),
+            (self.max_depth, "max_depth", CATALOG_TRAVERSAL_MAX_DEPTH),
+            (self.max_paths, "max_paths", CATALOG_TRAVERSAL_MAX_PATHS),
+            (self.max_nodes, "max_nodes", CATALOG_TRAVERSAL_MAX_NODES),
+            (self.max_edges, "max_edges", CATALOG_TRAVERSAL_MAX_EDGES),
         ):
             if (
                 not isinstance(value, int)

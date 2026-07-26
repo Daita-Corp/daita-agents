@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 import re
 from typing import Protocol, TypeVar
 
-from ._json import FrozenJsonObject
+from ._json import FrozenJsonObject, canonical_json
 from .llm.models import ToolDefinition
 
 _T = TypeVar("_T")
@@ -328,26 +329,65 @@ def _check_schema(schema: Mapping[str, object]) -> None:
     for name, rule in properties.items():
         if not isinstance(name, str) or not isinstance(rule, Mapping):
             raise ValueError("tool schema properties must contain object rules")
-        enum = rule.get("enum")
-        if enum is not None and (not isinstance(enum, (tuple, list)) or not enum):
-            raise ValueError("tool schema enum must be a non-empty array")
-        minimum = rule.get("minLength")
-        maximum = rule.get("maxLength")
-        for bound, label in ((minimum, "minLength"), (maximum, "maxLength")):
+        _check_rule(rule)
+
+
+def _check_rule(rule: Mapping[str, object]) -> None:
+    enum = rule.get("enum")
+    if enum is not None and (not isinstance(enum, (tuple, list)) or not enum):
+        raise ValueError("tool schema enum must be a non-empty array")
+    for minimum_name, maximum_name in (
+        ("minLength", "maxLength"),
+        ("minItems", "maxItems"),
+    ):
+        minimum = rule.get(minimum_name)
+        maximum = rule.get(maximum_name)
+        for bound, label in ((minimum, minimum_name), (maximum, maximum_name)):
             if bound is not None and (
                 not isinstance(bound, int) or isinstance(bound, bool) or bound < 0
             ):
                 raise ValueError(f"tool schema {label} must be non-negative")
-        if minimum is not None and maximum is not None and minimum > maximum:
-            raise ValueError("tool schema minLength cannot exceed maxLength")
-        pattern = rule.get("pattern")
-        if pattern is not None:
-            if not isinstance(pattern, str):
-                raise ValueError("tool schema pattern must be a string")
-            try:
-                re.compile(pattern)
-            except re.error as error:
-                raise ValueError("tool schema pattern must be valid") from error
+        if (
+            isinstance(minimum, int)
+            and not isinstance(minimum, bool)
+            and isinstance(maximum, int)
+            and not isinstance(maximum, bool)
+            and minimum > maximum
+        ):
+            raise ValueError(f"tool schema {minimum_name} cannot exceed {maximum_name}")
+    minimum = rule.get("minimum")
+    maximum = rule.get("maximum")
+    for bound, label in ((minimum, "minimum"), (maximum, "maximum")):
+        if bound is not None and (
+            not isinstance(bound, (int, float))
+            or isinstance(bound, bool)
+            or not math.isfinite(float(bound))
+        ):
+            raise ValueError(f"tool schema {label} must be a finite number")
+    if (
+        isinstance(minimum, (int, float))
+        and not isinstance(minimum, bool)
+        and isinstance(maximum, (int, float))
+        and not isinstance(maximum, bool)
+        and minimum > maximum
+    ):
+        raise ValueError("tool schema minimum cannot exceed maximum")
+    unique = rule.get("uniqueItems")
+    if unique is not None and not isinstance(unique, bool):
+        raise ValueError("tool schema uniqueItems must be a boolean")
+    pattern = rule.get("pattern")
+    if pattern is not None:
+        if not isinstance(pattern, str):
+            raise ValueError("tool schema pattern must be a string")
+        try:
+            re.compile(pattern)
+        except re.error as error:
+            raise ValueError("tool schema pattern must be valid") from error
+    items = rule.get("items")
+    if items is not None:
+        if not isinstance(items, Mapping):
+            raise ValueError("tool schema items must be an object rule")
+        _check_rule(items)
 
 
 def _validate(
@@ -387,37 +427,78 @@ def _validate(
         rule = properties.get(name)
         if not isinstance(rule, Mapping):
             continue
-        expected = rule.get("type")
-        if expected is not None and not _matches_type(item, expected):
-            if error_type is CapabilityInputError:
-                raise CapabilityInputError(
-                    "invalid_argument_type",
-                    f"Tool argument {name} must be {expected}.",
-                    {"name": name, "expected": expected},
-                )
-            raise error_type(f"output field {name} must be {expected}")
-        enum = rule.get("enum")
-        if isinstance(enum, (tuple, list)) and item not in enum:
-            _constraint_error(
-                error_type,
-                name,
-                "one of the declared enum values",
-                "enum",
+        _validate_rule(name, item, rule, error_type)
+
+
+def _validate_rule(
+    name: str,
+    item: object,
+    rule: Mapping[str, object],
+    error_type: type[ValueError] | type[RuntimeError],
+) -> None:
+    expected = rule.get("type")
+    if expected is not None and not _matches_type(item, expected):
+        if error_type is CapabilityInputError:
+            raise CapabilityInputError(
+                "invalid_argument_type",
+                f"Tool argument {name} must be {expected}.",
+                {"name": name, "expected": expected},
             )
-        if isinstance(item, str):
-            minimum = rule.get("minLength")
-            maximum = rule.get("maxLength")
-            pattern = rule.get("pattern")
-            if isinstance(minimum, int) and len(item) < minimum:
+        raise error_type(f"output field {name} must be {expected}")
+    enum = rule.get("enum")
+    if isinstance(enum, (tuple, list)) and item not in enum:
+        _constraint_error(
+            error_type,
+            name,
+            "one of the declared enum values",
+            "enum",
+        )
+    if isinstance(item, str):
+        minimum = rule.get("minLength")
+        maximum = rule.get("maxLength")
+        pattern = rule.get("pattern")
+        if isinstance(minimum, int) and len(item) < minimum:
+            _constraint_error(
+                error_type, name, f"at least {minimum} characters", "minLength"
+            )
+        if isinstance(maximum, int) and len(item) > maximum:
+            _constraint_error(
+                error_type, name, f"at most {maximum} characters", "maxLength"
+            )
+        if isinstance(pattern, str) and re.search(pattern, item) is None:
+            _constraint_error(error_type, name, "the declared pattern", "pattern")
+    if isinstance(item, (int, float)) and not isinstance(item, bool):
+        minimum = rule.get("minimum")
+        maximum = rule.get("maximum")
+        if isinstance(minimum, (int, float)) and item < minimum:
+            _constraint_error(error_type, name, f"at least {minimum}", "minimum")
+        if isinstance(maximum, (int, float)) and item > maximum:
+            _constraint_error(error_type, name, f"at most {maximum}", "maximum")
+    if isinstance(item, (tuple, list)):
+        minimum = rule.get("minItems")
+        maximum = rule.get("maxItems")
+        if isinstance(minimum, int) and len(item) < minimum:
+            _constraint_error(error_type, name, f"at least {minimum} items", "minItems")
+        if isinstance(maximum, int) and len(item) > maximum:
+            _constraint_error(error_type, name, f"at most {maximum} items", "maxItems")
+        if rule.get("uniqueItems") is True:
+            projected = tuple(canonical_json(value) for value in item)
+            if len(projected) != len(set(projected)):
                 _constraint_error(
-                    error_type, name, f"at least {minimum} characters", "minLength"
+                    error_type,
+                    name,
+                    "unique items",
+                    "uniqueItems",
                 )
-            if isinstance(maximum, int) and len(item) > maximum:
-                _constraint_error(
-                    error_type, name, f"at most {maximum} characters", "maxLength"
+        item_rule = rule.get("items")
+        if isinstance(item_rule, Mapping):
+            for index, value in enumerate(item):
+                _validate_rule(
+                    f"{name}[{index}]",
+                    value,
+                    item_rule,
+                    error_type,
                 )
-            if isinstance(pattern, str) and re.search(pattern, item) is None:
-                _constraint_error(error_type, name, "the declared pattern", "pattern")
 
 
 def _constraint_error(

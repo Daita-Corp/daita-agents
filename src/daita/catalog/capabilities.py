@@ -14,6 +14,16 @@ from ..capabilities import (
     ToolView,
 )
 from .models import (
+    CATALOG_TRAVERSAL_DEFAULT_DEPTH,
+    CATALOG_TRAVERSAL_DEFAULT_EDGES,
+    CATALOG_TRAVERSAL_DEFAULT_NODES,
+    CATALOG_TRAVERSAL_DEFAULT_PATHS,
+    CATALOG_TRAVERSAL_MAX_DEPTH,
+    CATALOG_TRAVERSAL_MAX_EDGES,
+    CATALOG_TRAVERSAL_MAX_NODES,
+    CATALOG_TRAVERSAL_MAX_PATHS,
+    CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS,
+    CATALOG_TRAVERSAL_MAX_RESOURCE_IDS,
     CatalogSchemaRequest,
     CatalogSearchRequest,
     CatalogTraversalRequest,
@@ -167,10 +177,26 @@ class CatalogTraverseExecutor:
             from_resource_ids=from_resource_ids,
             to_resource_ids=to_resource_ids,
             relationship_kinds=relationship_kinds,
-            max_depth=_integer_argument(request, "max_depth", 4),
-            max_paths=_integer_argument(request, "max_paths", 5),
-            max_nodes=_integer_argument(request, "max_nodes", 100),
-            max_edges=_integer_argument(request, "max_edges", 200),
+            max_depth=_integer_argument(
+                request,
+                "max_depth",
+                CATALOG_TRAVERSAL_DEFAULT_DEPTH,
+            ),
+            max_paths=_integer_argument(
+                request,
+                "max_paths",
+                CATALOG_TRAVERSAL_DEFAULT_PATHS,
+            ),
+            max_nodes=_integer_argument(
+                request,
+                "max_nodes",
+                CATALOG_TRAVERSAL_DEFAULT_NODES,
+            ),
+            max_edges=_integer_argument(
+                request,
+                "max_edges",
+                CATALOG_TRAVERSAL_DEFAULT_EDGES,
+            ),
         )
         projection = await self._service.traverse(traversal_request)
         return ToolOutput(
@@ -209,7 +235,11 @@ def catalog_declarations(
     )
     schema = Capability(
         id=CATALOG_SCHEMA_CAPABILITY_ID,
-        description="Get compact current schema for SQL planning.",
+        description=(
+            "Use first for SQL planning. Returns columns, keys, and direct "
+            "relationship field pairs. Do not call catalog_traverse in the same "
+            "response."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -265,17 +295,69 @@ def catalog_declarations(
     )
     traverse = Capability(
         id=CATALOG_TRAVERSE_CAPABILITY_ID,
-        description="Find bounded catalog relationship paths.",
+        description=(
+            "Use on a later step only when a prior catalog_schema result leaves a "
+            "multi-hop path unresolved. Do not call alongside catalog_schema."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "from_resource_ids": {"type": "array"},
-                "to_resource_ids": {"type": "array"},
-                "relationship_kinds": {"type": "array"},
-                "max_depth": {"type": "integer"},
-                "max_paths": {"type": "integer"},
-                "max_nodes": {"type": "integer"},
-                "max_edges": {"type": "integer"},
+                "from_resource_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS,
+                    },
+                    "minItems": 1,
+                    "maxItems": CATALOG_TRAVERSAL_MAX_RESOURCE_IDS,
+                    "uniqueItems": True,
+                },
+                "to_resource_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS,
+                    },
+                    "minItems": 1,
+                    "maxItems": CATALOG_TRAVERSAL_MAX_RESOURCE_IDS,
+                    "uniqueItems": True,
+                },
+                "relationship_kinds": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [kind.value for kind in RelationshipKind],
+                    },
+                    "maxItems": len(RelationshipKind),
+                    "uniqueItems": True,
+                    "default": [],
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": CATALOG_TRAVERSAL_MAX_DEPTH,
+                    "default": CATALOG_TRAVERSAL_DEFAULT_DEPTH,
+                },
+                "max_paths": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": CATALOG_TRAVERSAL_MAX_PATHS,
+                    "default": CATALOG_TRAVERSAL_DEFAULT_PATHS,
+                },
+                "max_nodes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": CATALOG_TRAVERSAL_MAX_NODES,
+                    "default": CATALOG_TRAVERSAL_DEFAULT_NODES,
+                },
+                "max_edges": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": CATALOG_TRAVERSAL_MAX_EDGES,
+                    "default": CATALOG_TRAVERSAL_DEFAULT_EDGES,
+                },
             },
             "required": ["from_resource_ids", "to_resource_ids"],
             "additionalProperties": False,
