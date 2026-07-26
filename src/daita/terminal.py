@@ -1351,7 +1351,7 @@ async def _chat(
         print(file=output_stream)
         print(
             f"{result.steps} steps · {result.usage.total_tokens} tokens · "
-            f"${result.usage.estimated_cost_usd}",
+            f"{result.usage.cost_estimate.render()}",
             file=output_stream,
         )
         print(file=output_stream)

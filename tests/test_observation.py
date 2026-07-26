@@ -25,6 +25,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.llm.pricing import CostBasis, CostEstimate
 from daita.loop import (
     AgentLoop,
     InMemoryTranscriptStore,
@@ -190,7 +191,11 @@ async def test_text_run_order_payloads_and_durable_boundaries():
         reasoning_tokens=2,
         cache_read_tokens=3,
         cache_write_tokens=1,
-        estimated_cost_usd=Decimal("0.0100"),
+        cost_estimate=CostEstimate.complete(
+            Decimal("0.0100"),
+            basis=CostBasis.PUBLIC_LIST,
+            rate_schedule_id="test-schedule-2026-07",
+        ),
     )
     store = OrderingStore()
     events: list[AgentEvent] = []
@@ -251,10 +256,92 @@ async def test_text_run_order_payloads_and_durable_boundaries():
         "cache_read_tokens": 3,
         "cache_write_tokens": 1,
         "total_tokens": 12,
-        "estimated_cost_usd": "0.01",
+        "cost_status": "complete",
+        "cost_amount_usd": "0.01",
+        "cost_basis": "public_list",
+        "cost_rate_schedule_id": "test-schedule-2026-07",
+        "cost_code": None,
+        "cost_display": "$0.01 estimated at public list rates",
     }
     assert isinstance(completed_data["duration_ms"], int)
     assert completed_data["duration_ms"] >= 0
+
+
+@pytest.mark.parametrize(
+    ("estimate", "expected"),
+    (
+        (
+            CostEstimate.complete(
+                Decimal("0"),
+                basis=CostBasis.PROVIDER_REPORTED,
+                rate_schedule_id="provider-report:test",
+            ),
+            {
+                "cost_status": "complete",
+                "cost_amount_usd": "0",
+                "cost_basis": "provider_reported",
+                "cost_rate_schedule_id": "provider-report:test",
+                "cost_code": None,
+                "cost_display": "$0 explicit estimate as reported by the provider",
+            },
+        ),
+        (
+            CostEstimate.partial(
+                Decimal("0.12"),
+                code="unpriced_attempt",
+                basis=CostBasis.PUBLIC_LIST,
+                rate_schedule_id="public:test",
+            ),
+            {
+                "cost_status": "partial",
+                "cost_amount_usd": "0.12",
+                "cost_basis": "public_list",
+                "cost_rate_schedule_id": "public:test",
+                "cost_code": "unpriced_attempt",
+                "cost_display": "≥$0.12 estimated; some attempts were unpriced",
+            },
+        ),
+        (
+            CostEstimate.unavailable("pricing_schedule_unavailable"),
+            {
+                "cost_status": "unavailable",
+                "cost_amount_usd": None,
+                "cost_basis": None,
+                "cost_rate_schedule_id": None,
+                "cost_code": "pricing_schedule_unavailable",
+                "cost_display": "cost unavailable",
+            },
+        ),
+    ),
+)
+async def test_run_observation_projects_bounded_cost_semantics(estimate, expected):
+    events: list[AgentEvent] = []
+    loop = AgentLoop(
+        model=MockModelProvider(
+            (
+                _stop(
+                    usage=ModelUsage(
+                        input_tokens=1,
+                        output_tokens=1,
+                        cost_estimate=estimate,
+                    )
+                ),
+            )
+        ),
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools(),
+        observer=events.append,
+        clock=lambda: NOW,
+    )
+
+    await loop.run(_run(run_id=f"run-{estimate.status.value}"))
+
+    data = events[-1].data.to_dict()
+    assert {key: data[key] for key in expected} == expected
+    assert "estimated_cost_usd" not in data
+    assert all(
+        not isinstance(value, str) or len(value) <= 256 for value in expected.values()
+    )
 
 
 async def test_tool_run_has_only_loop_level_events_and_no_raw_content():

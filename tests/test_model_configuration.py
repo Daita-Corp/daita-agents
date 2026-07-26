@@ -155,6 +155,10 @@ async def test_model_configuration_round_trips_without_persisting_the_key(tmp_pa
     config_path = tmp_path / "agents" / "atlas" / "config.json"
     persisted = config_path.read_text(encoding="utf-8")
     assert "secret-value" not in persisted
+    document = json.loads(persisted)
+    stored_profile = document["model_route"]["candidates"][0]["profile"]
+    assert stored_profile["input_cost_per_million_usd"] is None
+    assert stored_profile["output_cost_per_million_usd"] is None
     assert route.candidates[0].secret_reference is not None
     assert route.candidates[0].secret_reference.to_uri() in persisted
 

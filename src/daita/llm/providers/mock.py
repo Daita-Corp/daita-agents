@@ -22,13 +22,17 @@ class MockModelProvider:
         script: Iterable[ScriptItem],
         *,
         provider_id: str = "mock:scripted",
+        complete_pricing: bool = False,
     ) -> None:
         if not isinstance(provider_id, str) or not provider_id.strip():
             raise ValueError("provider_id must be a non-empty string")
         items = tuple(script)
         if any(not isinstance(item, (ModelResponse, Exception)) for item in items):
             raise TypeError("mock script items must be ModelResponse or Exception")
+        if not isinstance(complete_pricing, bool):
+            raise TypeError("complete_pricing must be a boolean")
         self._provider_id = provider_id
+        self._complete_pricing = complete_pricing
         self._script = items
         self._cursor = 0
         self._requests: list[ModelRequest] = []
@@ -57,6 +61,11 @@ class MockModelProvider:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         return True
+
+    def has_complete_pricing(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return self._complete_pricing
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):

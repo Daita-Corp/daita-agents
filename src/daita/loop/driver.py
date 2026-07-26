@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import Protocol, TypeVar
 
 from .._json import FrozenJsonObject
@@ -22,7 +21,14 @@ from ..llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from ..llm.protocols import ModelProvider
+from ..llm.protocols import ModelProvider, provider_has_complete_pricing
+from ..llm.pricing import (
+    CostEstimate,
+    CostEstimateStatus,
+    aggregate_cost_estimates,
+    canonical_decimal,
+    format_cost_estimate,
+)
 from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 from .models import LoopExit, LoopExitKind, LoopLimits, RunInput, Transcript
 
@@ -155,7 +161,7 @@ class AgentLoop:
             )
         messages = (*prior_messages, *transcript.messages)
         current_start = len(prior_messages)
-        usage = ModelUsage()
+        usage = ModelUsage(cost_estimate=CostEstimate.unavailable("no_model_attempts"))
 
         try:
             user = CanonicalMessage(
@@ -186,6 +192,15 @@ class AgentLoop:
                         step=step,
                     ),
                 )
+                if not self._cost_limit_allows_request(request):
+                    return await self._finish(
+                        run,
+                        LoopExitKind.FAILED,
+                        "cost_limit_unpriced_route",
+                        step - 1,
+                        usage,
+                        run_started,
+                    )
                 model_started = (
                     asyncio.get_running_loop().time()
                     if self._observer is not None
@@ -236,6 +251,15 @@ class AgentLoop:
 
                 budget_reason = self._usage_limit_reason(usage)
                 if budget_reason is not None:
+                    if budget_reason.startswith("cost_limit_"):
+                        return await self._finish(
+                            run,
+                            LoopExitKind.FAILED,
+                            budget_reason,
+                            step,
+                            usage,
+                            run_started,
+                        )
                     return await self._wrap_up(
                         run,
                         messages,
@@ -284,6 +308,7 @@ class AgentLoop:
                 run_started,
             )
         except ModelProviderError as error:
+            usage = _add_usage(usage, error.usage)
             return await self._finish(
                 run,
                 LoopExitKind.FAILED,
@@ -317,6 +342,15 @@ class AgentLoop:
                 final=True,
             ),
         )
+        if not self._cost_limit_allows_request(request):
+            return await self._finish(
+                run,
+                LoopExitKind.FAILED,
+                "cost_limit_unpriced_route",
+                steps,
+                usage,
+                run_started,
+            )
         try:
             model_started = (
                 asyncio.get_running_loop().time()
@@ -324,7 +358,8 @@ class AgentLoop:
                 else None
             )
             response = await _before(deadline, self._model.generate(request))
-        except ModelProviderError:
+        except ModelProviderError as error:
+            usage = _add_usage(usage, error.usage)
             return await self._finish(
                 run, LoopExitKind.FAILED, reason, steps, usage, run_started
             )
@@ -388,9 +423,22 @@ class AgentLoop:
                     "cache_read_tokens": result.usage.cache_read_tokens,
                     "cache_write_tokens": result.usage.cache_write_tokens,
                     "total_tokens": result.usage.total_tokens,
-                    "estimated_cost_usd": _canonical_decimal(
-                        result.usage.estimated_cost_usd
+                    "cost_status": result.usage.cost_estimate.status.value,
+                    "cost_amount_usd": (
+                        None
+                        if result.usage.cost_estimate.amount_usd is None
+                        else canonical_decimal(result.usage.cost_estimate.amount_usd)
                     ),
+                    "cost_basis": (
+                        None
+                        if result.usage.cost_estimate.basis is None
+                        else result.usage.cost_estimate.basis.value
+                    ),
+                    "cost_rate_schedule_id": (
+                        result.usage.cost_estimate.rate_schedule_id
+                    ),
+                    "cost_code": result.usage.cost_estimate.code,
+                    "cost_display": format_cost_estimate(result.usage.cost_estimate),
                 },
             )
         return result
@@ -439,12 +487,22 @@ class AgentLoop:
             >= self._limits.max_wall_time_seconds
         )
 
+    def _cost_limit_allows_request(self, request: ModelRequest) -> bool:
+        if self._limits.max_estimated_cost_usd is None:
+            return True
+        return provider_has_complete_pricing(self._model, request)
+
     def _usage_limit_reason(self, usage: ModelUsage) -> str | None:
         if usage.total_tokens >= self._limits.max_total_tokens:
             return "token_limit_reached"
         cost_limit = self._limits.max_estimated_cost_usd
-        if cost_limit is not None and usage.estimated_cost_usd >= cost_limit:
-            return "cost_limit_reached"
+        if cost_limit is not None:
+            estimate = usage.cost_estimate
+            if estimate.status is not CostEstimateStatus.COMPLETE:
+                return "cost_limit_unpriced_route"
+            assert estimate.amount_usd is not None
+            if estimate.amount_usd >= cost_limit:
+                return "cost_limit_reached"
         return None
 
 
@@ -460,14 +518,23 @@ def _assistant_message(response: ModelResponse) -> CanonicalMessage:
 
 
 def _add_usage(left: ModelUsage, right: ModelUsage) -> ModelUsage:
+    if (
+        left.total_tokens == 0
+        and left.reasoning_tokens == 0
+        and left.cache_read_tokens == 0
+        and left.cache_write_tokens == 0
+        and left.cost_estimate.code == "no_model_attempts"
+    ):
+        return right
     return ModelUsage(
         input_tokens=left.input_tokens + right.input_tokens,
         output_tokens=left.output_tokens + right.output_tokens,
         reasoning_tokens=left.reasoning_tokens + right.reasoning_tokens,
         cache_read_tokens=left.cache_read_tokens + right.cache_read_tokens,
         cache_write_tokens=left.cache_write_tokens + right.cache_write_tokens,
-        estimated_cost_usd=Decimal(left.estimated_cost_usd)
-        + Decimal(right.estimated_cost_usd),
+        cost_estimate=aggregate_cost_estimates(
+            (left.cost_estimate, right.cost_estimate)
+        ),
     )
 
 
@@ -478,13 +545,6 @@ def _completed_steps(messages: tuple[CanonicalMessage, ...]) -> int:
 def _duration_ms(started: float) -> int:
     elapsed = asyncio.get_running_loop().time() - started
     return max(0, int(elapsed * 1_000))
-
-
-def _canonical_decimal(value: Decimal) -> str:
-    rendered = format(value, "f")
-    if "." in rendered:
-        rendered = rendered.rstrip("0").rstrip(".")
-    return rendered or "0"
 
 
 async def _before(deadline: float, awaitable: Awaitable[_T]) -> _T:

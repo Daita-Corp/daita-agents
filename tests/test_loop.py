@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from daita.llm.models import (
     FinishReason,
@@ -184,3 +185,30 @@ async def test_wall_limit_interrupts_a_hanging_model_call():
 
     assert result.kind is LoopExitKind.FAILED
     assert result.reason == "wall_time_exhausted"
+
+
+async def test_cost_limit_rejects_unpriced_provider_before_generate():
+    provider = MockModelProvider(
+        (ModelResponse(finish_reason=FinishReason.STOP, text="must not execute"),)
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools({}),
+        limits=LoopLimits(max_estimated_cost_usd=Decimal("1")),
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(
+        RunInput(
+            id="run-unpriced",
+            agent_id="agent-1",
+            message="question",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "cost_limit_unpriced_route"
+    assert provider.requests == ()
+    assert result.usage.cost_estimate.amount_usd is None

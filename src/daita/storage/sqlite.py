@@ -55,6 +55,12 @@ from ..llm.models import (
     ToolCall,
     ToolResultBlock,
 )
+from ..llm.pricing import (
+    CostBasis,
+    CostComponent,
+    CostEstimate,
+    CostEstimateStatus,
+)
 from ..loop.models import ConversationRun, LoopExit, LoopExitKind, RunInput, Transcript
 
 _SEARCH_TERM = re.compile(r"[A-Za-z0-9_]+")
@@ -1049,6 +1055,8 @@ _RECORD_TYPES: dict[str, type[Any]] = {
         ToolResultBlock,
         CanonicalMessage,
         ModelUsage,
+        CostComponent,
+        CostEstimate,
     )
 }
 _ENUM_TYPES: dict[str, type[Enum]] = {
@@ -1063,6 +1071,8 @@ _ENUM_TYPES: dict[str, type[Enum]] = {
         Sensitivity,
         LoopExitKind,
         MessageRole,
+        CostBasis,
+        CostEstimateStatus,
     )
 }
 

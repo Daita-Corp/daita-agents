@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass
-from decimal import Decimal
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -29,7 +28,13 @@ from . import (
     SkillSummary,
     create_llm_provider,
 )
-from .llm import ModelProfile, ModelProvider
+from .llm import (
+    CostEstimate,
+    ModelProfile,
+    ModelProvider,
+    aggregate_cost_estimates,
+    format_cost_estimate,
+)
 from .llm.profiles import reviewed_model_profile
 from .security import SecretReference
 from .terminal import run_terminal_application
@@ -272,13 +277,22 @@ class _ChatTotals:
     turns: int = 0
     steps: int = 0
     tokens: int = 0
-    estimated_cost_usd: Decimal = Decimal("0")
+    cost_estimate: CostEstimate = field(
+        default_factory=lambda: CostEstimate.unavailable("no_model_attempts")
+    )
 
     def add(self, result: LoopExit) -> None:
+        prior_turns = self.turns
         self.turns += 1
         self.steps += result.steps
         self.tokens += result.usage.total_tokens
-        self.estimated_cost_usd += result.usage.estimated_cost_usd
+        self.cost_estimate = (
+            result.usage.cost_estimate
+            if prior_turns == 0
+            else aggregate_cost_estimates(
+                (self.cost_estimate, result.usage.cost_estimate)
+            )
+        )
 
 
 def _write_startup(
@@ -577,7 +591,7 @@ async def _handle_chat_command(
         print(f"Conversation: {conversation_id or 'new'}")
         print(
             f"This process: {totals.turns} turns, {totals.steps} steps, "
-            f"{totals.tokens} tokens, ${totals.estimated_cost_usd}"
+            f"{totals.tokens} tokens, {format_cost_estimate(totals.cost_estimate)}"
         )
         return False, conversation_id
     if name == "/conversation" and len(parts) == 1:
@@ -683,7 +697,7 @@ async def _chat(args: argparse.Namespace) -> int:
             print()
             print(
                 f"{result.steps} steps · {result.usage.total_tokens} tokens · "
-                f"${result.usage.estimated_cost_usd}"
+                f"{format_cost_estimate(result.usage.cost_estimate)}"
             )
             print()
 

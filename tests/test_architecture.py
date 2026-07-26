@@ -726,6 +726,19 @@ def test_loop_has_no_cross_cutting_lifecycle_responsibilities():
         assert term not in text
 
 
+def test_pricing_semantics_have_one_provider_neutral_owner():
+    assert _class_owners("CostEstimate") == {"llm/pricing.py"}
+    assert _class_owners("CostComponent") == {"llm/pricing.py"}
+    models = (PACKAGE / "llm" / "models.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop").lower()
+    pricing = (PACKAGE / "llm" / "pricing.py").read_text(encoding="utf-8").lower()
+    assert "estimated_cost_usd" not in models
+    assert "cost_per_million" not in models
+    for provider in ("openai", "anthropic", "gemini", "grok", "ollama"):
+        assert provider not in loop
+        assert provider not in pricing
+
+
 def test_new_mvp_owners_have_no_version_or_compatibility_framework():
     candidates = [PACKAGE / "loop", PACKAGE / "hosting", PACKAGE / "storage"]
     candidates.extend(

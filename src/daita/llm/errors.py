@@ -12,6 +12,7 @@ from ..errors import (
     LLMError,
     RateLimitError,
 )
+from .models import ModelUsage
 
 
 class ContextWindowExceeded(LLMError):
@@ -51,8 +52,9 @@ class ModelProviderError(LLMError):
         *,
         provider_id: str | None = None,
         retry_after_seconds: float | None = None,
+        usage: ModelUsage = ModelUsage(),
     ) -> ModelProviderError:
-        del message, provider_id, retry_after_seconds
+        del message, provider_id, retry_after_seconds, usage
         concrete: type[ModelProviderError] = cls
         if cls is ModelProviderError:
             if code is ProviderErrorCode.RATE_LIMIT_ERROR:
@@ -68,6 +70,7 @@ class ModelProviderError(LLMError):
         *,
         provider_id: str | None = None,
         retry_after_seconds: float | None = None,
+        usage: ModelUsage = ModelUsage(),
     ) -> None:
         if not isinstance(code, ProviderErrorCode):
             raise TypeError("code must be a ProviderErrorCode")
@@ -90,6 +93,9 @@ class ModelProviderError(LLMError):
                 raise ValueError("retry_after_seconds must be finite and non-negative")
             retry_after_seconds = float(retry_after_seconds)
         self.retry_after_seconds: float | None = retry_after_seconds
+        if not isinstance(usage, ModelUsage):
+            raise TypeError("usage must be a ModelUsage record")
+        self.usage = usage
         retryability = (
             ErrorRetryability.TRANSIENT
             if code

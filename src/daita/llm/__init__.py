@@ -21,6 +21,14 @@ from .models import (
     ToolResultBlock,
 )
 from .protocols import ModelProvider, StreamingModelProvider
+from .pricing import (
+    CostBasis,
+    CostComponent,
+    CostEstimate,
+    CostEstimateStatus,
+    aggregate_cost_estimates,
+    format_cost_estimate,
+)
 from .providers import (
     AnthropicProvider,
     GeminiProvider,
@@ -40,6 +48,10 @@ from .routing import (
 __all__ = [
     "AnthropicProvider",
     "CanonicalMessage",
+    "CostBasis",
+    "CostComponent",
+    "CostEstimate",
+    "CostEstimateStatus",
     "FinishReason",
     "GeminiProvider",
     "GrokProvider",
@@ -69,6 +81,8 @@ __all__ = [
     "ToolCall",
     "ToolDefinition",
     "ToolResultBlock",
+    "aggregate_cost_estimates",
     "create_llm_provider",
     "create_model_route_provider",
+    "format_cost_estimate",
 ]

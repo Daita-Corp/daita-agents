@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from decimal import Decimal
 from enum import Enum
 import re
 
 from .._json import FrozenJsonObject, canonical_json
+from .pricing import CostEstimate
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -39,8 +39,6 @@ class ModelProfile:
     supports_documents: bool = False
     supports_prompt_caching: bool = False
     supports_native_continuation: bool = False
-    input_cost_per_million_usd: Decimal | None = None
-    output_cost_per_million_usd: Decimal | None = None
     data_routing_classification: str = "standard"
     available: bool = True
     healthy: bool = True
@@ -85,16 +83,6 @@ class ModelProfile:
                 raise TypeError(f"{field_name} must be a boolean")
         if self.supports_parallel_tools and not self.supports_tools:
             raise ValueError("parallel tool support requires native tool support")
-        for cost_value, field_name in (
-            (self.input_cost_per_million_usd, "input_cost_per_million_usd"),
-            (self.output_cost_per_million_usd, "output_cost_per_million_usd"),
-        ):
-            if cost_value is None:
-                continue
-            if not isinstance(cost_value, Decimal):
-                raise TypeError(f"{field_name} must be a Decimal or None")
-            if not cost_value.is_finite() or cost_value < 0:
-                raise ValueError(f"{field_name} must be finite and non-negative")
         _required_text(
             self.data_routing_classification,
             "data_routing_classification",
@@ -265,7 +253,7 @@ class ModelUsage:
     reasoning_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
-    estimated_cost_usd: Decimal = Decimal("0")
+    cost_estimate: CostEstimate = field(default_factory=CostEstimate.unavailable)
 
     def __post_init__(self) -> None:
         token_fields = (
@@ -280,10 +268,8 @@ class ModelUsage:
             for value in token_fields
         ):
             raise ValueError("token counts must be non-negative integers")
-        if not isinstance(self.estimated_cost_usd, Decimal):
-            raise TypeError("estimated_cost_usd must be a Decimal")
-        if not self.estimated_cost_usd.is_finite() or self.estimated_cost_usd < 0:
-            raise ValueError("estimated_cost_usd must be a finite non-negative Decimal")
+        if not isinstance(self.cost_estimate, CostEstimate):
+            raise TypeError("cost_estimate must be a CostEstimate")
 
     @property
     def total_tokens(self) -> int:

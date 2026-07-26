@@ -75,7 +75,11 @@ def _bounded_identifier(value: object, field_name: str) -> None:
 
 
 def _validate_data(value: FrozenJsonValue, *, key: str | None = None) -> None:
-    if key is not None and key.endswith("_id"):
+    if (
+        key is not None
+        and key.endswith("_id")
+        and not (key == "cost_rate_schedule_id" and value is None)
+    ):
         _bounded_identifier(value, f"event data {key}")
     if key == "duration_ms" and (
         not isinstance(value, int) or isinstance(value, bool) or value < 0

@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass
-from decimal import Decimal
+from dataclasses import dataclass, replace
 
 from ..security import SecretReference
 from .errors import ModelProviderError, ProviderErrorCode
-from .models import ModelProfile, ModelRequest, ModelResponse, ModelSensitivity
-from .protocols import ModelProvider
+from .models import (
+    ModelProfile,
+    ModelRequest,
+    ModelResponse,
+    ModelSensitivity,
+    ModelUsage,
+)
+from .pricing import aggregate_cost_estimates
+from .protocols import ModelProvider, provider_has_complete_pricing
 
 _TRANSIENT = frozenset(
     {
@@ -126,12 +132,6 @@ class ModelRoute:
             supports_reasoning=all(item.supports_reasoning for item in profiles),
             supports_vision=all(item.supports_vision for item in profiles),
             supports_documents=all(item.supports_documents for item in profiles),
-            input_cost_per_million_usd=_max_cost(
-                item.input_cost_per_million_usd for item in profiles
-            ),
-            output_cost_per_million_usd=_max_cost(
-                item.output_cost_per_million_usd for item in profiles
-            ),
         )
 
 
@@ -187,18 +187,26 @@ class ModelRouter:
     def supports_request_policy(self, request: ModelRequest) -> bool:
         return any(_eligible(item, request) for item in self._candidates)
 
+    def has_complete_pricing(self, request: ModelRequest) -> bool:
+        eligible = tuple(item for item in self._candidates if _eligible(item, request))
+        return bool(eligible) and all(
+            provider_has_complete_pricing(item.provider, request) for item in eligible
+        )
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         last_error: ModelProviderError | None = None
+        attempt_usage: list[ModelUsage] = []
         for registration in self._candidates:
             if not _eligible(registration, request):
                 continue
             for attempt in range(self._retry_policy.attempts):
                 try:
-                    return await registration.provider.generate(request)
+                    response = await registration.provider.generate(request)
                 except asyncio.CancelledError:
                     raise
                 except ModelProviderError as error:
                     last_error = error
+                    attempt_usage.append(error.usage)
                     if error.code not in _TRANSIENT:
                         break
                     if attempt + 1 < self._retry_policy.attempts:
@@ -209,8 +217,20 @@ class ModelRouter:
                         )
                         if delay:
                             await self._sleep(delay)
+                else:
+                    attempt_usage.append(response.usage)
+                    return replace(
+                        response,
+                        usage=_aggregate_usage(attempt_usage),
+                    )
         if last_error is not None:
-            raise last_error
+            raise ModelProviderError(
+                last_error.code,
+                str(last_error),
+                provider_id=last_error.provider_id,
+                retry_after_seconds=last_error.retry_after_seconds,
+                usage=_aggregate_usage(attempt_usage),
+            )
         raise ModelProviderError(
             ProviderErrorCode.INVALID_REQUEST,
             "no configured provider can handle this request",
@@ -230,12 +250,15 @@ def _eligible(registration: ModelProviderRegistration, request: ModelRequest) ->
     return registration.provider.supports_request_policy(request) is True
 
 
-def _max_cost(values: Iterable[Decimal | None]) -> Decimal | None:
-    costs = tuple(values)
-    return (
-        None
-        if any(item is None for item in costs)
-        else max(item for item in costs if item is not None)
+def _aggregate_usage(items: Iterable[ModelUsage]) -> ModelUsage:
+    usage = tuple(items)
+    return ModelUsage(
+        input_tokens=sum(item.input_tokens for item in usage),
+        output_tokens=sum(item.output_tokens for item in usage),
+        reasoning_tokens=sum(item.reasoning_tokens for item in usage),
+        cache_read_tokens=sum(item.cache_read_tokens for item in usage),
+        cache_write_tokens=sum(item.cache_write_tokens for item in usage),
+        cost_estimate=aggregate_cost_estimates(item.cost_estimate for item in usage),
     )
 
 

@@ -21,4 +21,18 @@ class StreamingModelProvider(ModelProvider, Protocol):
     def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]: ...
 
 
-__all__ = ["ModelProvider", "StreamingModelProvider"]
+def provider_has_complete_pricing(
+    provider: object,
+    request: ModelRequest,
+) -> bool:
+    """Fail closed for providers without an admitted pricing preflight."""
+
+    probe = getattr(provider, "has_complete_pricing", None)
+    return callable(probe) and probe(request) is True
+
+
+__all__ = [
+    "ModelProvider",
+    "StreamingModelProvider",
+    "provider_has_complete_pricing",
+]

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal
 import ipaddress
 import json
 import re
@@ -108,6 +107,11 @@ class OpenAICompatibleProvider:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         return True
+
+    def has_complete_pricing(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return False
 
     @property
     def client(self) -> _OpenAICompatibleClient:
@@ -608,7 +612,6 @@ def _decode_usage(value: object) -> ModelUsage:
             _field(prompt_details, "cached_tokens", 0),
             "cached tokens",
         ),
-        estimated_cost_usd=Decimal("0"),
     )
 
 

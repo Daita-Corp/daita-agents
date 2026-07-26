@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from decimal import Decimal
 from typing import Protocol, cast
 from uuid import uuid4
 
@@ -92,6 +91,11 @@ class GeminiProvider:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         return request.allow_parallel_tool_calls is None
+
+    def has_complete_pricing(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return False
 
     @property
     def client(self) -> _GeminiClient:
@@ -834,7 +838,6 @@ def _decode_usage(value: object) -> ModelUsage:
             _field(value, "cached_content_token_count", 0),
             "cached tokens",
         ),
-        estimated_cost_usd=Decimal("0"),
     )
 
 

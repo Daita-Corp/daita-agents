@@ -1650,17 +1650,9 @@ def _encode_model_profile(profile: ModelProfile) -> dict[str, object]:
         "data_routing_classification": profile.data_routing_classification,
         "healthy": profile.healthy,
         "id": profile.id,
-        "input_cost_per_million_usd": (
-            None
-            if profile.input_cost_per_million_usd is None
-            else str(profile.input_cost_per_million_usd)
-        ),
+        "input_cost_per_million_usd": None,
         "max_output_tokens": profile.max_output_tokens,
-        "output_cost_per_million_usd": (
-            None
-            if profile.output_cost_per_million_usd is None
-            else str(profile.output_cost_per_million_usd)
-        ),
+        "output_cost_per_million_usd": None,
         "supports_documents": profile.supports_documents,
         "supports_native_continuation": profile.supports_native_continuation,
         "supports_parallel_tools": profile.supports_parallel_tools,
@@ -1815,12 +1807,11 @@ def _decode_model_profile(value: object) -> ModelProfile:
         "supports_vision",
     }
     profile = _strict_mapping(value, fields)
-    input_cost = profile["input_cost_per_million_usd"]
-    output_cost = profile["output_cost_per_million_usd"]
-    if input_cost is not None and not isinstance(input_cost, str):
-        raise TypeError("input cost must be text or null")
-    if output_cost is not None and not isinstance(output_cost, str):
-        raise TypeError("output cost must be text or null")
+    if (
+        profile["input_cost_per_million_usd"] is not None
+        or profile["output_cost_per_million_usd"] is not None
+    ):
+        raise ValueError("model profile cannot contain pricing")
     return ModelProfile(
         id=cast(str, profile["id"]),
         context_window_tokens=cast(int, profile["context_window_tokens"]),
@@ -1835,12 +1826,6 @@ def _decode_model_profile(value: object) -> ModelProfile:
         supports_prompt_caching=cast(bool, profile["supports_prompt_caching"]),
         supports_native_continuation=cast(
             bool, profile["supports_native_continuation"]
-        ),
-        input_cost_per_million_usd=(
-            None if input_cost is None else Decimal(input_cost)
-        ),
-        output_cost_per_million_usd=(
-            None if output_cost is None else Decimal(output_cost)
         ),
         data_routing_classification=cast(str, profile["data_routing_classification"]),
         available=cast(bool, profile["available"]),

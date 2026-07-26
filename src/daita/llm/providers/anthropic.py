@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal
 import json
 from typing import Protocol, cast
 from uuid import uuid4
@@ -100,6 +99,11 @@ class AnthropicMessagesProvider:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         return request.allow_parallel_tool_calls is None
+
+    def has_complete_pricing(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return False
 
     @property
     def client(self) -> _AnthropicClient:
@@ -502,7 +506,6 @@ class _AnthropicStreamDecoder:
                 output_tokens=self._output_tokens,
                 cache_read_tokens=self._cache_read_tokens,
                 cache_write_tokens=self._cache_write_tokens,
-                estimated_cost_usd=Decimal("0"),
             ),
             provider_id=self._provider_id,
             provider_response_id=self._response_id,
@@ -952,7 +955,6 @@ def _decode_usage(value: object) -> ModelUsage:
         ),
         cache_read_tokens=cache_read,
         cache_write_tokens=cache_write,
-        estimated_cost_usd=Decimal("0"),
     )
 
 

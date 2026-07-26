@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 from datetime import datetime, timezone
+from decimal import Decimal
 import io
 import inspect
 import json
@@ -24,6 +25,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
+from daita.llm.pricing import CostBasis, CostEstimate
 from daita.loop.models import RunInput, Transcript
 from daita.observation import AgentEvent, AgentEventKind
 from daita.terminal_tui import (
@@ -85,6 +87,7 @@ def _result(
     conversation_id: str = "conversation-one",
     steps: int = 1,
     tokens: int = 24,
+    cost_estimate: CostEstimate | None = None,
 ) -> Any:
     return SimpleNamespace(
         run_id=run_id,
@@ -93,7 +96,10 @@ def _result(
         kind=SimpleNamespace(value="completed"),
         reason="completed",
         steps=steps,
-        usage=SimpleNamespace(total_tokens=tokens, estimated_cost_usd="0.01"),
+        usage=SimpleNamespace(
+            total_tokens=tokens,
+            cost_estimate=(cost_estimate or CostEstimate.complete(Decimal("0.01"))),
+        ),
     )
 
 
@@ -477,7 +483,12 @@ def test_all_seven_observation_events_project_live_and_final_states():
                 "cache_read_tokens": 0,
                 "cache_write_tokens": 0,
                 "total_tokens": 16,
-                "estimated_cost_usd": "0.02",
+                "cost_status": "complete",
+                "cost_amount_usd": "0.02",
+                "cost_basis": None,
+                "cost_rate_schedule_id": None,
+                "cost_code": None,
+                "cost_display": "$0.02 estimated",
             },
         )
     )
@@ -489,7 +500,7 @@ def test_all_seven_observation_events_project_live_and_final_states():
     assert state.run_duration_ms == 75
     assert state.steps == 2
     assert state.total_tokens == 16
-    assert state.estimated_cost == "0.02"
+    assert state.estimated_cost == "$0.02 estimated"
 
 
 def test_concurrent_tool_completion_preserves_start_order_and_sibling_failure():
@@ -651,7 +662,10 @@ def test_loop_result_settles_live_state_when_a_completion_event_is_unavailable()
         kind=SimpleNamespace(value="completed"),
         reason="completed",
         steps=2,
-        usage=SimpleNamespace(total_tokens=12, estimated_cost_usd="0.01"),
+        usage=SimpleNamespace(
+            total_tokens=12,
+            cost_estimate=CostEstimate.complete(Decimal("0.01")),
+        ),
     )
 
     state.apply_result(result)
@@ -661,6 +675,42 @@ def test_loop_result_settles_live_state_when_a_completion_event_is_unavailable()
     assert state.tool_cards["call-live"].state == "failed"
     assert state.tool_cards["call-live"].error_code == "observation_incomplete"
     assert state.blocks[-1].text == "authoritative answer"
+
+
+@pytest.mark.parametrize(
+    ("estimate", "rendered"),
+    (
+        (
+            CostEstimate.complete(
+                Decimal("0.02"),
+                basis=CostBasis.PUBLIC_LIST,
+                rate_schedule_id="public:test",
+            ),
+            "$0.02 estimated at public list rates",
+        ),
+        (
+            CostEstimate.partial(
+                Decimal("0.01"),
+                code="unpriced_attempt",
+            ),
+            "≥$0.01 estimated; some attempts were unpriced",
+        ),
+        (
+            CostEstimate.unavailable(),
+            "cost unavailable",
+        ),
+        (
+            CostEstimate.complete(Decimal("0")),
+            "$0 explicit estimate",
+        ),
+    ),
+)
+def test_terminal_view_renders_every_cost_state(estimate, rendered):
+    state = TerminalViewState("atlas", "model", "source")
+
+    state.apply_result(_result("answer", cost_estimate=estimate))
+
+    assert state.estimated_cost == rendered
 
 
 async def test_controller_loads_only_the_exact_completed_transcript_for_hydration(
@@ -1368,7 +1418,7 @@ def test_responsive_metadata_and_status_collapse_order_are_deterministic():
     )
     state.steps = 2
     state.total_tokens = 1_800
-    state.estimated_cost = "0.02"
+    state.estimated_cost = "$0.02 estimated"
     glyphs = terminal_tui._terminal_glyphs(
         terminal_tui.TerminalCapabilities("truecolor", True)
     )
@@ -1394,7 +1444,7 @@ def test_responsive_metadata_and_status_collapse_order_are_deterministic():
 
     assert full.collapsed == ()
     assert full.source_summary == "PostgreSQL · 3 sources"
-    assert full.right == "2 steps · 1.8k tokens · $0.02"
+    assert full.right == "2 steps · 1.8k tokens · $0.02 estimated"
     assert compact.collapsed == ("cost",)
     assert compact.right == "2 steps · 1.8k tokens"
     assert narrow.collapsed[:4] == (
@@ -1660,7 +1710,12 @@ async def test_cancellation_settles_observed_run_and_live_tool_card():
                         "cache_read_tokens": 0,
                         "cache_write_tokens": 0,
                         "total_tokens": 2,
-                        "estimated_cost_usd": "0",
+                        "cost_status": "unavailable",
+                        "cost_amount_usd": None,
+                        "cost_basis": None,
+                        "cost_rate_schedule_id": None,
+                        "cost_code": "pricing_schedule_unavailable",
+                        "cost_display": "cost unavailable",
                     },
                 )
             )

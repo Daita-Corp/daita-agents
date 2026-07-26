@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import redirect_stderr, redirect_stdout
+from decimal import Decimal
 import io
 import json
 import os
@@ -23,10 +24,12 @@ from daita.llm.models import (
     MessageRole,
     ModelRequest,
     ModelResponse,
+    ModelUsage,
     TextBlock,
     ToolCall,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.llm.pricing import CostBasis, CostEstimate
 from daita.security import SecretReference
 
 
@@ -84,8 +87,12 @@ def _surface(
     return tuple(positionals), frozenset(options)
 
 
-def _stop(text: str) -> ModelResponse:
-    return ModelResponse(finish_reason=FinishReason.STOP, text=text)
+def _stop(text: str, *, usage: ModelUsage | None = None) -> ModelResponse:
+    return ModelResponse(
+        finish_reason=FinishReason.STOP,
+        text=text,
+        usage=usage or ModelUsage(),
+    )
 
 
 def _call(name: str, arguments: dict[str, object]) -> ModelResponse:
@@ -786,6 +793,73 @@ def test_cli_2_slash_commands_are_local_and_bounded():
     assert "Unknown command. Type /help for commands." in stderr
     assert provider.requests == ()
     provider.assert_consumed()
+
+
+@pytest.mark.parametrize(
+    ("estimate", "rendered"),
+    (
+        (
+            CostEstimate.complete(
+                Decimal("0.02"),
+                basis=CostBasis.PUBLIC_LIST,
+                rate_schedule_id="public:test",
+            ),
+            "$0.02 estimated at public list rates",
+        ),
+        (
+            CostEstimate.partial(
+                Decimal("0.01"),
+                code="unpriced_attempt",
+                basis=CostBasis.PUBLIC_LIST,
+                rate_schedule_id="public:test",
+            ),
+            "≥$0.01 estimated; some attempts were unpriced",
+        ),
+        (
+            CostEstimate.unavailable(),
+            "cost unavailable",
+        ),
+        (
+            CostEstimate.complete(
+                Decimal("0"),
+                basis=CostBasis.PROVIDER_REPORTED,
+                rate_schedule_id="provider:test",
+            ),
+            "$0 explicit estimate as reported by the provider",
+        ),
+    ),
+)
+def test_cli_2_chat_renders_every_cost_state(estimate, rendered):
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "cost-states"))
+        provider = MockModelProvider(
+            (
+                _stop(
+                    "answer",
+                    usage=ModelUsage(cost_estimate=estimate),
+                ),
+            )
+        )
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "cost-states",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin="question\n/exit\n",
+                tty=True,
+            )
+
+    assert code == 0
+    assert stderr == ""
+    assert rendered in stdout
+    if estimate.amount_usd is None:
+        assert "$0" not in stdout
 
 
 def test_cli_2_new_clears_only_the_in_process_conversation():

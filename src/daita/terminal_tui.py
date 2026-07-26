@@ -18,6 +18,7 @@ from ._installation import PIPX_REPAIR_GUIDANCE
 from ._json import freeze_json, thaw_json
 from .capabilities import ApprovalDecision, ApprovalRequest
 from .llm.models import MessageRole, ToolCall, ToolResultBlock
+from .llm.pricing import CostEstimate, format_cost_estimate
 from .loop.models import Transcript
 from .observation import AgentEvent, AgentEventKind
 
@@ -307,7 +308,7 @@ class TerminalViewState:
     notice: str = ""
     steps: int = 0
     total_tokens: int = 0
-    estimated_cost: str = "0"
+    estimated_cost: str = "cost unavailable"
     active_task: asyncio.Task[Any] | None = None
     active_run_id: str | None = None
     run_status: str = "ready"
@@ -373,16 +374,20 @@ class TerminalViewState:
         steps = getattr(result, "steps", 0)
         usage = getattr(result, "usage", None)
         total_tokens = getattr(usage, "total_tokens", 0)
-        estimated_cost = getattr(usage, "estimated_cost_usd", 0)
+        cost_estimate = getattr(usage, "cost_estimate", None)
         self.steps = steps if isinstance(steps, int) and steps >= 0 else 0
         self.total_tokens = (
             total_tokens if isinstance(total_tokens, int) and total_tokens >= 0 else 0
         )
         self.estimated_cost = _sanitize_terminal_text(
-            str(estimated_cost),
-            maximum=32,
+            (
+                format_cost_estimate(cost_estimate)
+                if isinstance(cost_estimate, CostEstimate)
+                else "cost unavailable"
+            ),
+            maximum=96,
             preserve_lines=False,
-            fallback="0",
+            fallback="cost unavailable",
         )
         kind = getattr(getattr(result, "kind", None), "value", None)
         self.run_status = (
@@ -539,7 +544,7 @@ class TerminalViewState:
             self.run_output_tokens = 0
             self.steps = 0
             self.total_tokens = 0
-            self.estimated_cost = "0"
+            self.estimated_cost = "cost unavailable"
             self.animation_frame = 0
             return
         if event.kind is AgentEventKind.MODEL_COMPLETED:
@@ -630,9 +635,9 @@ class TerminalViewState:
             )
             self.total_tokens = _event_counter(event.data.get("total_tokens")) or 0
             self.estimated_cost = _event_text(
-                event.data.get("estimated_cost_usd"),
-                maximum=32,
-                fallback="0",
+                event.data.get("cost_display"),
+                maximum=96,
+                fallback="cost unavailable",
             )
             exit_kind = _event_text(
                 event.data.get("exit_kind"),
@@ -1052,7 +1057,7 @@ def _status_projection(
         if show_tokens:
             right_parts.append(f"{_format_token_count(state.total_tokens)} tokens")
         if show_cost:
-            right_parts.append(f"${state.estimated_cost}")
+            right_parts.append(state.estimated_cost)
         left = glyphs.separator.join(left_parts)
         right = glyphs.separator.join(right_parts)
         header_source = source if show_source else ""
