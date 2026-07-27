@@ -120,9 +120,9 @@ async def test_terminal_onboards_local_sources_and_renders_polished_ready_screen
     assert "Agent     atlas" in text
     assert "Model     OpenAI · test-model · configured" in text
     assert "Source    Fixture" in text and " · cataloged" in text
-    expected_tables = "1 table" if source_kind == "sqlite" else "2 tables"
-    assert "Catalog   " in text and expected_tables in text
-    assert "\nReady\n" in text
+    expected_resources = "1 resource" if source_kind == "sqlite" else "2 resources"
+    assert "Catalog   " in text and expected_resources in text
+    assert "Status" in text and "Ready" in text
     assert "Conversation  new" in text
     assert "You › " in text
     reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
@@ -539,7 +539,7 @@ async def test_terminal_skips_source_onboarding_when_an_active_source_exists(
     assert "Select a data source" not in output.getvalue()
     assert "Existing" in output.getvalue()
     assert "Stage 4 status" not in output.getvalue()
-    assert "\nReady\n" in output.getvalue()
+    assert "Status" in output.getvalue() and "Ready" in output.getvalue()
 
 
 async def test_empty_attachment_enters_repair_and_never_reports_ready(tmp_path: Path):
@@ -600,8 +600,8 @@ async def test_empty_repair_can_add_another_source_and_recompute_readiness(
     text = output.getvalue()
     assert "Not ready" in text
     assert "Sources   2 cataloged" in text
-    assert "Catalog   1 table" in text
-    assert "\nReady\n" in text
+    assert "Catalog   1 resource" in text
+    assert "Status" in text and "Ready" in text
 
 
 async def test_stage_four_sanitizes_and_bounds_untrusted_source_labels(tmp_path: Path):
@@ -630,7 +630,7 @@ async def test_stage_four_sanitizes_and_bounds_untrusted_source_labels(tmp_path:
     assert "\x1b" not in text
     assert "\u202e" not in text
     assert "x" * 129 not in text
-    assert "\nReady\n" in text
+    assert "Status" in text and "Ready" in text
 
 
 async def test_repair_eof_releases_lock_and_commits_no_extra_catalog_truth(

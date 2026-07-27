@@ -237,7 +237,8 @@ async def test_first_run_keyboard_postgresql_path_reaches_grounded_chat(
     assert "\x1b" not in text
     assert "[bold]" not in text
     assert "[/bold]" not in text
-    assert "\nReady\n" in text
+    assert "Status" in text and "Ready" in text
+    assert "Ask a question about your data" in text
     assert "Validating model configuration" in text
     assert "Model configuration validated" in text
     assert "Validating PostgreSQL connection" in text
@@ -370,7 +371,8 @@ async def test_returning_keyboard_selection_skips_onboarding_and_writes_no_dupli
     assert "Agent     customer" in text
     assert "Model     OpenAI · returning-model · configured" in text
     assert "Source    Retained source · cataloged" in text
-    assert "\nReady\n" in text
+    assert "Status" in text and "Ready" in text
+    assert "Ask a question about your data" in text
     assert "returning answer" in text
     assert "Agent name:" not in text
     assert "Select a model provider" not in text

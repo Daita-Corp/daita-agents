@@ -7,6 +7,7 @@ from decimal import Decimal
 import io
 import inspect
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast, TextIO
 
@@ -43,6 +44,7 @@ class _RecordingOutput(DummyOutput):
     def __init__(self) -> None:
         self.fragments: list[str] = []
         self.show_count = 0
+        self.alternate_enter_count = 0
         self.alternate_exit_count = 0
         self.attribute_reset_count = 0
         self.autowrap_count = 0
@@ -62,6 +64,9 @@ class _RecordingOutput(DummyOutput):
 
     def show_cursor(self) -> None:
         self.show_count += 1
+
+    def enter_alternate_screen(self) -> None:
+        self.alternate_enter_count += 1
 
     def quit_alternate_screen(self) -> None:
         self.alternate_exit_count += 1
@@ -120,6 +125,7 @@ async def _run_shell(
     suspend_bridge: TerminalSuspendBridge | None = None,
     observer_bridge: TerminalObserverBridge | None = None,
     approval_bridge: terminal_tui.TerminalApprovalBridge | None = None,
+    command_requires_suspension: Any = None,
 ) -> asyncio.Task[TerminalApplicationResult]:
     async def no_commands(
         command: str,
@@ -133,6 +139,7 @@ async def _run_shell(
             run_message=run_message,
             load_transcript=load_transcript,
             handle_command=handle_command or no_commands,
+            command_requires_suspension=command_requires_suspension,
             input_stream=io.StringIO(),
             output_stream=io.StringIO(),
             suspend_bridge=suspend_bridge or TerminalSuspendBridge(),
@@ -222,6 +229,8 @@ async def test_ready_agent_enters_the_focused_tui(
         assert kwargs["run_message"]
         assert kwargs["load_transcript"]
         assert kwargs["handle_command"]
+        assert kwargs["command_requires_suspension"]("/model") is True
+        assert kwargs["command_requires_suspension"]("/help") is False
         assert isinstance(kwargs["observer_bridge"], TerminalObserverBridge)
         return TerminalApplicationResult(None, "exit")
 
@@ -229,12 +238,16 @@ async def test_ready_agent_enters_the_focused_tui(
 
     class _FakeAgent:
         name = "atlas"
+        home = Path("/tmp/daita/agents/atlas")
         model_route = SimpleNamespace(
             candidates=(SimpleNamespace(provider_id="openai:gpt-5.6-sol"),)
         )
 
         async def list_sources(self) -> tuple[Any, ...]:
             return (SimpleNamespace(active=True, display_name="Warehouse"),)
+
+        async def catalog_summary(self) -> Any:
+            return SimpleNamespace(resource_count=1, relationship_count=0)
 
     marker_input = object()
     marker_output = object()
@@ -262,6 +275,249 @@ async def test_ready_agent_enters_the_focused_tui(
     assert entered[0].agent_label == "atlas"
     assert entered[0].model_label == "gpt-5.6-sol"
     assert entered[0].source_summary == "Warehouse"
+    assert entered[0].startup is not None
+    assert entered[0].startup.agent_home == "/tmp/daita/agents/atlas"
+
+
+async def test_ready_tui_emits_startup_before_any_transcript_blocks():
+    output = _RecordingOutput()
+    state = TerminalViewState(
+        "atlas",
+        "gpt-5.6-sol",
+        "Warehouse",
+        startup=terminal_tui.TerminalStartupInfo(
+            version="2.0.0a0",
+            provider_label="OpenAI",
+            model_status="configured",
+            agent_home="/tmp/daita/atlas",
+            source_count=1,
+            source_types=("SQLite",),
+            source_names=("Warehouse",),
+            resource_count=12,
+            relationship_count=2,
+            read_capabilities=(
+                "Catalog search & inspection",
+                "SQLite queries",
+            ),
+        ),
+    )
+
+    async def no_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=no_message,
+        )
+        await _wait_until(lambda: "Ask a question about your data" in output.text)
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result == TerminalApplicationResult(None, "exit")
+    assert state.blocks == []
+    assert "████▄" in output.text
+    assert "OpenAI · gpt-5.6-sol · configured" in output.text
+    assert "12 resources · 2 relationships" in output.text
+    assert "Quick actions: /sources  /catalog  /help" in output.text
+
+
+def test_ready_tui_reflows_live_startup_when_terminal_width_changes():
+    output = _RecordingOutput()
+    state = TerminalViewState(
+        "atlas",
+        "gpt-5.6-sol",
+        "Warehouse",
+        startup=terminal_tui.TerminalStartupInfo(
+            version="2.0.0a0",
+            provider_label="OpenAI",
+            model_status="configured",
+            agent_home="/tmp/daita/agents/atlas",
+            source_count=1,
+            source_types=("SQLite",),
+            source_names=("Warehouse",),
+            resource_count=12,
+            relationship_count=2,
+            read_capabilities=(
+                "Catalog search & inspection",
+                "SQLite queries",
+            ),
+        ),
+    )
+
+    async def no_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=no_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        root = application.layout.container
+        main_shell = root.children[0].content
+        startup_window = main_shell.children[0]
+
+        def rendered_startup() -> str:
+            return "".join(text for _style, text in startup_window.content.text())
+
+        initial = rendered_startup()
+        assert "████▄" in initial
+        assert (
+            max(terminal_tui._display_width(line) for line in initial.splitlines())
+            <= 100
+        )
+
+        output.size = Size(rows=30, columns=60)
+        application.before_render.fire()
+        narrow = rendered_startup()
+        assert "DAITA  2.0.0a0" in narrow
+        assert "████▄" not in narrow
+        assert (
+            max(terminal_tui._display_width(line) for line in narrow.splitlines()) <= 60
+        )
+
+        output.size = Size(rows=30, columns=120)
+        application.before_render.fire()
+        wide = rendered_startup()
+        assert "████▄" in wide
+        assert (
+            max(terminal_tui._display_width(line) for line in wide.splitlines()) <= 120
+        )
+        assert wide != narrow
+
+
+async def test_full_screen_resize_repaints_without_leaving_alternate_screen():
+    output = _RecordingOutput()
+    state = TerminalViewState(
+        "atlas",
+        "gpt-5.6-sol",
+        "Warehouse",
+        startup=terminal_tui.TerminalStartupInfo(
+            version="2.0.0a0",
+            provider_label="OpenAI",
+            model_status="configured",
+            agent_home="/tmp/daita/agents/atlas",
+            source_count=1,
+            source_types=("SQLite",),
+            source_names=("Warehouse",),
+            resource_count=12,
+            relationship_count=2,
+            read_capabilities=("Catalog search & inspection", "SQLite queries"),
+        ),
+    )
+
+    async def no_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=no_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+
+        output.size = Size(rows=24, columns=60)
+        application._on_resize()
+        await _wait_until(lambda: application.renderer._last_size == output.size)
+
+        assert output.alternate_enter_count == 1
+        assert output.alternate_exit_count == 0
+
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result == TerminalApplicationResult(None, "exit")
+    assert output.alternate_enter_count == 1
+    assert output.alternate_exit_count == 1
+
+
+async def test_full_screen_transcript_uses_page_keys_for_internal_scrolling():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    for index in range(50):
+        state.blocks.append(
+            terminal_tui.TerminalBlock(
+                "assistant",
+                f"Transcript row {index:02d}",
+            )
+        )
+
+    async def no_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=no_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        content_window = application.layout.container.children[0].content.children[0]
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+
+        initial_content = content_window.content.create_content(98, None)
+        initial_cursor_row = initial_content.cursor_position.y
+        render_counter = application.render_counter
+        pipe.send_text("\x1b[5~")
+        await _wait_until(lambda: application.render_counter > render_counter)
+        page_up_content = content_window.content.create_content(98, None)
+        assert page_up_content.cursor_position.y < initial_cursor_row
+
+        render_counter = application.render_counter
+        pipe.send_text("\x1b[6~")
+        await _wait_until(lambda: application.render_counter > render_counter)
+        page_down_content = content_window.content.create_content(98, None)
+        assert page_down_content.cursor_position.y == initial_cursor_row
+
+        pipe.send_text("\x04")
+        await task
 
 
 async def test_terminal_controller_projects_themed_local_command_results(
@@ -769,6 +1025,9 @@ async def test_controller_loads_only_the_exact_completed_transcript_for_hydratio
             calls["sources"] += 1
             return (SimpleNamespace(active=True, display_name="Warehouse"),)
 
+        async def catalog_summary(self) -> Any:
+            return SimpleNamespace(resource_count=1, relationship_count=0)
+
         async def run(
             self,
             message: str,
@@ -1246,7 +1505,8 @@ async def test_text_turn_multiline_composer_and_green_shell_render():
     assert "Revenue is higher." in rendered
     assert "ready" in output.text
     assert output.show_count >= 1
-    assert output.alternate_exit_count == 0
+    assert output.alternate_enter_count == 1
+    assert output.alternate_exit_count == 1
 
 
 def test_green_identity_focus_theme_uses_semantic_styles(
@@ -1337,7 +1597,7 @@ def test_terminal_size_polling_is_limited_to_platforms_without_sigwinch():
     )
 
 
-def test_inline_shell_emits_one_scrollable_header_outside_the_active_layout():
+def test_full_screen_shell_keeps_header_inside_the_active_layout():
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
 
@@ -1366,22 +1626,28 @@ def test_inline_shell_emits_one_scrollable_header_outside_the_active_layout():
         )
         root = application.layout.container
         main_shell = root.children[0].content
-        rendered_header = output.text
+        content_window = main_shell.children[0]
+
+        def rendered_header() -> str:
+            return "".join(text for _style, text in content_window.content.text())
 
         output.size = Size(rows=30, columns=69)
         application.before_render.fire()
+        narrow = rendered_header()
         output.size = Size(rows=30, columns=100)
         application.before_render.fire()
+        wide = rendered_header()
 
-        assert application.full_screen is False
-        assert len(main_shell.children) == 2
-        assert rendered_header.count("DAITA") == 1
-        assert "atlas" in rendered_header
-        assert "source" in rendered_header
-        assert output.text == rendered_header
+        assert application.full_screen is True
+        assert len(main_shell.children) == 5
+        assert narrow.count("DAITA") == 1
+        assert wide.count("DAITA") == 1
+        assert "atlas" in wide
+        assert "source" in wide
+        assert output.text == ""
 
 
-def test_inline_composer_uses_only_top_and_bottom_rules():
+def test_full_screen_has_no_embedded_scrollbars_and_composer_starts_one_line():
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
 
@@ -1409,8 +1675,9 @@ def test_inline_composer_uses_only_top_and_bottom_rules():
             )
         )
         main_shell = application.layout.container.children[0].content
-        ready_body = main_shell.children[0]._get_container()
-        composer_frame = ready_body.children[-1]
+        transcript = main_shell.children[0]
+        approval = main_shell.children[1].content.children[1].children[1]
+        composer_frame = main_shell.children[2]
         top, composer, bottom = composer_frame.children
         glyphs = terminal_tui._terminal_glyphs(
             terminal_tui._terminal_capabilities(output)
@@ -1419,7 +1686,13 @@ def test_inline_composer_uses_only_top_and_bottom_rules():
         top_line = "".join(text for _style, text in top.content.text())
         bottom_line = "".join(text for _style, text in bottom.content.text())
 
+        assert transcript.right_margins == []
+        assert approval.right_margins == []
         assert type(composer).__name__ == "Window"
+        assert composer.wrap_lines() is True
+        assert composer.dont_extend_height() is True
+        assert composer.height.min == 1
+        assert composer.height.max == terminal_tui._MAX_COMPOSER_ROWS
         assert top_line == glyphs.horizontal * output.size.columns
         assert bottom_line == glyphs.horizontal * output.size.columns
         assert glyphs.vertical not in top_line + bottom_line
@@ -1427,6 +1700,79 @@ def test_inline_composer_uses_only_top_and_bottom_rules():
         assert glyphs.top_right not in top_line
         assert glyphs.bottom_left not in bottom_line
         assert glyphs.bottom_right not in bottom_line
+
+
+async def test_composer_expands_and_shrinks_for_typed_wrapping_but_not_paste():
+    output = _RecordingOutput()
+    output.size = Size(rows=30, columns=40)
+    state = TerminalViewState("atlas", "model", "source")
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def handle_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=run_message,
+                load_transcript=None,
+                handle_command=handle_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        composer = (
+            application.layout.container.children[0].content.children[2].children[1]
+        )
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(
+            lambda: composer.render_info is not None
+            and composer.render_info.window_height == 1
+        )
+
+        pipe.send_text("x" * 39)
+        await _wait_until(
+            lambda: composer.render_info is not None
+            and composer.render_info.window_height == 2
+        )
+
+        output.size = Size(rows=30, columns=60)
+        application._on_resize()
+        await _wait_until(
+            lambda: composer.render_info is not None
+            and composer.render_info.window_height == 1
+        )
+        output.size = Size(rows=30, columns=40)
+        application._on_resize()
+        await _wait_until(
+            lambda: composer.render_info is not None
+            and composer.render_info.window_height == 2
+        )
+
+        pipe.send_text("\x7f" * 2)
+        await _wait_until(
+            lambda: composer.render_info is not None
+            and composer.render_info.window_height == 1
+        )
+        application.current_buffer.reset()
+
+        pipe.send_text(f"\x1b[200~{'p' * 39}\x1b[201~")
+        await _wait_until(lambda: application.current_buffer.text == "[Pasted Text #1]")
+        assert composer.render_info is not None
+        assert composer.render_info.window_height == 1
+
+        application.current_buffer.reset()
+        pipe.send_text("\x04")
+        await task
 
 
 def test_responsive_metadata_and_status_collapse_order_are_deterministic():
@@ -1622,6 +1968,181 @@ async def test_composer_enforces_the_existing_input_bound():
     assert len(submitted[0]) == MAX_COMPOSER_CHARACTERS
 
 
+async def test_bracketed_paste_uses_live_row_width_and_numbered_placeholders():
+    output = _RecordingOutput()
+    output.size = Size(rows=30, columns=40)
+    state = TerminalViewState("atlas", "model", "source")
+    submitted: list[str] = []
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del conversation_id
+        submitted.append(message)
+        return _result(f"answer-{len(submitted)}")
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    def bracketed(value: str) -> str:
+        return f"\x1b[200~{value}\x1b[201~"
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=run_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+
+        exact_row = "x" * 38
+        pipe.send_text(bracketed(exact_row))
+        await _wait_until(lambda: application.current_buffer.text == exact_row)
+        assert "[Pasted Text #" not in application.current_buffer.text
+        application.current_buffer.reset()
+
+        output.size = Size(rows=30, columns=60)
+        application._on_resize()
+        await _wait_until(lambda: application.renderer._last_size == output.size)
+        wider_row = "y" * 50
+        pipe.send_text(bracketed(wider_row))
+        await _wait_until(lambda: application.current_buffer.text == wider_row)
+        application.current_buffer.reset()
+
+        output.size = Size(rows=30, columns=40)
+        application._on_resize()
+        await _wait_until(lambda: application.renderer._last_size == output.size)
+        first_paste = "a" * 50
+        second_paste = "second\r\npaste"
+        pipe.send_text(bracketed(first_paste))
+        await _wait_until(lambda: application.current_buffer.text == "[Pasted Text #1]")
+        pipe.send_text(" ")
+        pipe.send_text(bracketed(second_paste))
+        display_message = "[Pasted Text #1] [Pasted Text #2]"
+        await _wait_until(lambda: application.current_buffer.text == display_message)
+
+        pipe.send_text("\r")
+        await _wait_until(lambda: len(submitted) == 1 and not state.running)
+        assert submitted == [f"{first_paste} second\npaste"]
+        assert state.blocks[0].text == display_message
+
+        pipe.send_text("\x1b[A")
+        await _wait_until(lambda: application.current_buffer.text == display_message)
+        pipe.send_text("\r")
+        await _wait_until(lambda: len(submitted) == 2 and not state.running)
+        pipe.send_text("\x04")
+        await task
+
+    assert submitted == [
+        f"{first_paste} second\npaste",
+        f"{first_paste} second\npaste",
+    ]
+
+
+async def test_hidden_paste_preserves_the_existing_message_bound():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    submitted: list[str] = []
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del conversation_id
+        submitted.append(message)
+        return _result("bounded paste")
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(pipe, output, state, run_message=run_message)
+        pasted = "x" * (MAX_COMPOSER_CHARACTERS + 100)
+        pipe.send_text(f"\x1b[200~{pasted}\x1b[201~")
+        await _wait_until(lambda: "[Pasted Text #1]" in output.text)
+        pipe.send_text("\r")
+        await _wait_until(lambda: bool(submitted))
+        pipe.send_text("\x04")
+        await task
+
+    assert len(submitted) == 1
+    assert submitted[0] == "x" * MAX_COMPOSER_CHARACTERS
+
+
+async def test_deleting_paste_placeholder_purges_draft_and_recalled_history():
+    output = _RecordingOutput()
+    output.size = Size(rows=30, columns=40)
+    state = TerminalViewState("atlas", "model", "source")
+    submitted: list[str] = []
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del conversation_id
+        submitted.append(message)
+        return _result(f"answer-{len(submitted)}")
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=run_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+        pasted = "hidden" * 10
+        placeholder = "[Pasted Text #1]"
+        pipe.send_text("keep ")
+        pipe.send_text(f"\x1b[200~{pasted}\x1b[201~")
+        await _wait_until(
+            lambda: application.current_buffer.text == f"keep {placeholder}"
+        )
+        pipe.send_text("\r")
+        await _wait_until(lambda: len(submitted) == 1 and not state.running)
+        assert submitted == [f"keep {pasted}"]
+
+        pipe.send_text("\x1b[A")
+        await _wait_until(
+            lambda: application.current_buffer.text == f"keep {placeholder}"
+        )
+        pipe.send_text("\x7f" * len(placeholder))
+        await _wait_until(lambda: application.current_buffer.text == "keep ")
+
+        pipe.send_text("\x1b[B")
+        await _wait_until(lambda: application.current_buffer.text == "")
+        pipe.send_text("\x1b[A")
+        await _wait_until(lambda: application.current_buffer.text == "keep ")
+        pipe.send_text(placeholder)
+        await _wait_until(
+            lambda: application.current_buffer.text == f"keep {placeholder}"
+        )
+        pipe.send_text("\r")
+        await _wait_until(lambda: len(submitted) == 2 and not state.running)
+        pipe.send_text("\x04")
+        await task
+
+    assert submitted == [
+        f"keep {pasted}",
+        f"keep {placeholder}",
+    ]
+
+
 def test_model_output_preserves_unicode_lines_and_neutralizes_terminal_controls():
     unsafe = (
         "Summary:\r\n"
@@ -1689,7 +2210,8 @@ async def test_ctrl_c_cancels_active_run_and_returns_to_composer():
     assert state.notice == "Run interrupted; returning to the composer."
     assert [block.kind for block in state.blocks] == ["user"]
     assert output.show_count >= 1
-    assert output.alternate_exit_count == 0
+    assert output.alternate_enter_count == 1
+    assert output.alternate_exit_count == 1
 
 
 async def test_cancellation_settles_observed_run_and_live_tool_card():
@@ -2103,11 +2625,12 @@ async def test_conversation_continuation_passes_the_selected_id_to_each_run():
     ]
 
 
-async def test_local_commands_run_while_tui_is_suspended_and_restore_the_shell():
+async def test_captured_local_commands_render_without_suspending_the_shell():
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
     bridge = TerminalSuspendBridge()
     commands: list[tuple[str, str | None]] = []
+    suspension_checks: list[str] = []
 
     async def run_message(message: str, conversation_id: str | None) -> Any:
         raise AssertionError((message, conversation_id))
@@ -2124,6 +2647,10 @@ async def test_local_commands_run_while_tui_is_suspended_and_restore_the_shell()
             output="Commands\n  /help\n",
         )
 
+    def command_stays_in_shell(command: str) -> bool:
+        suspension_checks.append(command)
+        return False
+
     with create_pipe_input() as pipe:
         task = await _run_shell(
             pipe,
@@ -2132,17 +2659,55 @@ async def test_local_commands_run_while_tui_is_suspended_and_restore_the_shell()
             run_message=run_message,
             handle_command=handle_command,
             suspend_bridge=bridge,
+            command_requires_suspension=command_stays_in_shell,
         )
         pipe.send_text("/help\r")
-        await _wait_until(lambda: any(block.kind == "local" for block in state.blocks))
+        await _wait_until(lambda: "Commands" in output.text)
         pipe.send_text("\x04")
         await task
 
     assert commands == [("/help", None)]
+    assert suspension_checks == ["/help"]
     assert state.blocks[-1].text == "Commands\n  /help\n"
     assert output.text.count("Commands") == 1
+    assert output.alternate_enter_count == 1
+    assert output.alternate_exit_count == 1
     assert bridge.enhanced_input is None
     assert bridge.enhanced_output is None
+
+
+async def test_external_prompt_commands_temporarily_suspend_full_screen():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def handle_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        return TerminalCommandResult(
+            conversation_id,
+            output="Prompt completed\n",
+        )
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            handle_command=handle_command,
+            command_requires_suspension=lambda command: command == "/model",
+        )
+        pipe.send_text("/model\r")
+        await _wait_until(lambda: "Prompt completed" in output.text)
+        pipe.send_text("\x04")
+        await task
+
+    assert output.alternate_enter_count == 2
+    assert output.alternate_exit_count == 2
 
 
 def test_tui_command_output_is_captured_without_leaking_above_the_shell():

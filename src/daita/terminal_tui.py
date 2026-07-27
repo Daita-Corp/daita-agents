@@ -1,4 +1,4 @@
-"""Lazy, inline presentation for the ready-agent terminal shell."""
+"""Lazy, full-screen presentation for the ready-agent terminal shell."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import io
 import json
 import os
+import re
 import sys
 import threading
 from typing import Any, TextIO
@@ -24,6 +25,7 @@ from .observation import AgentEvent, AgentEventKind
 
 MAX_COMPOSER_CHARACTERS = 16_384
 MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
+_MAX_COMPOSER_ROWS = 6
 _MAX_RENDER_CHARACTERS = 16_384
 _MAX_DETAIL_UTF8_BYTES = 16 * 1_024
 _MAX_CODE_VISIBLE_LINES = 80
@@ -42,6 +44,12 @@ _MAX_EVENT_COUNTER = 999_999_999_999
 _ANIMATION_INTERVAL_SECONDS = 0.12
 _RUNNING_GLYPHS = ("◐", "◓", "◑", "◒")
 _ASCII_RUNNING_GLYPHS = ("~", "-", "~", "+")
+_STARTUP_WORDMARK = (
+    "████▄    █████   █████  ████████  █████ ",
+    "██  ██  ██   ██    ██      ██    ██   ██",
+    "██  ██  ███████    ██      ██    ███████",
+    "████▀   ██   ██  █████     ██    ██   ██",
+)
 _SLASH_COMMAND_COMPLETIONS = (
     ("/model", "/model", "Choose or validate the active model"),
     ("/sources", "/sources", "List registered data sources"),
@@ -70,6 +78,11 @@ _SLASH_COMMAND_DESCRIPTIONS = tuple(
     (insertion, description)
     for insertion, _display, description in _SLASH_COMMAND_COMPLETIONS
 )
+_STARTUP_QUICK_ACTIONS = tuple(
+    command
+    for command in ("/sources", "/catalog", "/help")
+    if command in _SLASH_COMMAND_SURFACE
+)[:3]
 _SENSITIVE_KEY_PARTS = (
     "api_key",
     "authorization",
@@ -79,6 +92,11 @@ _SENSITIVE_KEY_PARTS = (
     "secret",
     "token",
 )
+_STARTUP_SECRET_PATTERN = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|credential|password|"
+    r"private[_-]?key|secret|token)\b(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|\S+)"
+)
+_PASTED_TEXT_PLACEHOLDER_PATTERN = re.compile(r"\[Pasted Text #[1-9][0-9]*\]")
 _CAPABILITY_LABELS = {
     "catalog.search": "Search catalog",
     "catalog.inspect": "Inspect schema",
@@ -167,12 +185,54 @@ class StatusProjection:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalStartupInfo:
+    """Safe runtime facts rendered once when the focused shell opens."""
+
+    version: str
+    provider_label: str
+    model_status: str
+    agent_home: str
+    source_count: int
+    source_types: tuple[str, ...]
+    source_names: tuple[str, ...]
+    resource_count: int
+    relationship_count: int
+    read_capabilities: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in ("source_count", "resource_count", "relationship_count"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"startup {name} must be non-negative")
+        for name in (
+            "source_types",
+            "source_names",
+            "read_capabilities",
+            "warnings",
+        ):
+            values = tuple(getattr(self, name))
+            if any(not isinstance(value, str) for value in values):
+                raise TypeError(f"startup {name} must contain strings")
+            object.__setattr__(self, name, values)
+
+
+@dataclass(frozen=True, slots=True)
 class TerminalBlock:
     """One disposable transcript block shown in the current process."""
 
     kind: str
     text: str
     tool_card: ToolCardState | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ComposerDraft:
+    """One process-local composer history entry with hidden pasted text."""
+
+    text: str
+    pasted_texts: tuple[tuple[str, str], ...] = ()
+    next_paste_number: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +363,7 @@ class TerminalViewState:
     model_label: str
     source_summary: str
     conversation_id: str | None = None
+    startup: TerminalStartupInfo | None = None
     blocks: list[TerminalBlock] = field(default_factory=list)
     running: bool = False
     notice: str = ""
@@ -1139,6 +1200,17 @@ def _stream_is_interactive(output_stream: TextIO) -> bool:
         return False
 
 
+def _text_stream_width(output_stream: TextIO) -> int:
+    try:
+        columns = os.get_terminal_size(output_stream.fileno()).columns
+    except (AttributeError, OSError, TypeError, ValueError):
+        try:
+            columns = int(os.environ.get("COLUMNS", "80"))
+        except ValueError:
+            columns = 80
+    return max(1, min(_MAX_RENDER_WIDTH, columns))
+
+
 def _setup_prompt_text(
     prompt: object,
     output_stream: TextIO,
@@ -1233,7 +1305,7 @@ def supports_terminal_tui(
     enhanced_input: Any = None,
     enhanced_output: Any = None,
 ) -> bool:
-    """Return whether the inline enhanced shell can own these streams."""
+    """Return whether the full-screen enhanced shell can own these streams."""
 
     if (enhanced_input is None) != (enhanced_output is None):
         raise ValueError("TUI input and output must be supplied together")
@@ -1260,6 +1332,7 @@ async def run_terminal_tui(
     run_message: Callable[[str, str | None], Awaitable[Any]],
     load_transcript: Callable[[str], Awaitable[Transcript]] | None = None,
     handle_command: Callable[[str, str | None], Awaitable[TerminalCommandResult]],
+    command_requires_suspension: Callable[[str], bool] | None = None,
     input_stream: TextIO,
     output_stream: TextIO,
     suspend_bridge: TerminalSuspendBridge,
@@ -1274,6 +1347,10 @@ async def run_terminal_tui(
         raise TypeError("state must be TerminalViewState")
     if (enhanced_input is None) != (enhanced_output is None):
         raise ValueError("TUI input and output must be supplied together")
+    if command_requires_suspension is not None and not callable(
+        command_requires_suspension
+    ):
+        raise TypeError("command_requires_suspension must be callable")
     observer_bridge = observer_bridge or TerminalObserverBridge()
 
     runtime = _load_terminal_runtime()
@@ -1308,6 +1385,7 @@ async def run_terminal_tui(
             run_message=run_message,
             load_transcript=load_transcript,
             handle_command=handle_command,
+            command_requires_suspension=command_requires_suspension,
             observer_bridge=observer_bridge,
             approval_bridge=approval_bridge,
             enhanced_input=enhanced_input,
@@ -1408,16 +1486,13 @@ def _load_terminal_runtime() -> dict[str, Any]:
         from prompt_toolkit.layout import Layout
         from prompt_toolkit.layout.containers import (
             ConditionalContainer,
-            DynamicContainer,
             HSplit,
             VSplit,
             Window,
         )
         from prompt_toolkit.layout.controls import FormattedTextControl
         from prompt_toolkit.layout.dimension import Dimension
-        from prompt_toolkit.layout.margins import ScrollbarMargin
         from prompt_toolkit.output import create_output
-        from prompt_toolkit.renderer import print_formatted_text
         from prompt_toolkit.styles import Style
         from prompt_toolkit.widgets import Frame, TextArea
         from prompt_toolkit.keys import Keys
@@ -1440,7 +1515,6 @@ def _load_terminal_runtime() -> dict[str, Any]:
         "ConditionalContainer": ConditionalContainer,
         "Console": Console,
         "Dimension": Dimension,
-        "DynamicContainer": DynamicContainer,
         "FormattedText": FormattedText,
         "FormattedTextControl": FormattedTextControl,
         "Frame": Frame,
@@ -1451,9 +1525,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
         "Layout": Layout,
         "Markdown": Markdown,
         "Point": Point,
-        "print_formatted_text": print_formatted_text,
         "CompleteEvent": CompleteEvent,
-        "ScrollbarMargin": ScrollbarMargin,
         "Style": Style,
         "Syntax": Syntax,
         "Table": Table,
@@ -1476,6 +1548,7 @@ def _create_application(
     run_message: Callable[[str, str | None], Awaitable[Any]],
     load_transcript: Callable[[str], Awaitable[Transcript]] | None,
     handle_command: Callable[[str, str | None], Awaitable[TerminalCommandResult]],
+    command_requires_suspension: Callable[[str], bool] | None = None,
     observer_bridge: TerminalObserverBridge,
     approval_bridge: TerminalApprovalBridge | None,
     enhanced_input: Any,
@@ -1502,7 +1575,8 @@ def _create_application(
     composer = runtime["TextArea"](
         multiline=True,
         wrap_lines=True,
-        height=runtime["Dimension"](min=1, max=6),
+        height=runtime["Dimension"](min=1, max=_MAX_COMPOSER_ROWS),
+        dont_extend_height=True,
         prompt=runtime["FormattedText"]([("class:tui.prompt", f"{glyphs.prompt} ")]),
         style="class:tui.composer",
         name="composer",
@@ -1518,9 +1592,15 @@ def _create_application(
     )
     composer_buffer = composer.buffer
     enforcing_bound = False
-    input_history: list[str] = []
+    last_valid_composer_document = composer.buffer.document
+    pasted_texts: dict[str, str] = {}
+    next_paste_number = 1
+    input_history: list[_ComposerDraft] = []
     history_position = 0
-    history_draft = ""
+    history_draft = _ComposerDraft("")
+    transcript_scroll_offset = 0
+    content_line_count = 1
+    content_last_line_width = 0
     responsive_projection = _responsive_for_output(enhanced_output, state)
 
     def responsive() -> ResponsiveProjection:
@@ -1536,17 +1616,56 @@ def _create_application(
     def rendered_terminal_is_usable() -> bool:
         return responsive().usable
 
+    def current_composer_draft(*, text: str | None = None) -> _ComposerDraft:
+        return _ComposerDraft(
+            composer.buffer.text if text is None else text,
+            tuple(pasted_texts.items()),
+            next_paste_number,
+        )
+
+    def restore_composer_draft(draft: _ComposerDraft) -> None:
+        nonlocal pasted_texts, next_paste_number
+        pasted_texts = dict(draft.pasted_texts)
+        next_paste_number = draft.next_paste_number
+        _replace_composer_text(composer.buffer, draft.text)
+
+    def composer_inline_capacity() -> int:
+        columns, _rows = _terminal_size(enhanced_output)
+        prompt_width = _display_width(f"{glyphs.prompt} ")
+        return max(1, columns - prompt_width)
+
+    def prune_unreferenced_pasted_texts(buffer: Any) -> None:
+        active_placeholders = set(_PASTED_TEXT_PLACEHOLDER_PATTERN.findall(buffer.text))
+        removed = tuple(
+            placeholder
+            for placeholder in pasted_texts
+            if placeholder not in active_placeholders
+        )
+        if not removed:
+            return
+        for placeholder in removed:
+            del pasted_texts[placeholder]
+
     def enforce_bound(buffer: Any) -> None:
-        nonlocal enforcing_bound
-        if enforcing_bound or len(buffer.text) <= MAX_COMPOSER_CHARACTERS:
+        nonlocal enforcing_bound, last_valid_composer_document
+        if enforcing_bound:
+            return
+        prune_unreferenced_pasted_texts(buffer)
+        if (
+            len(buffer.text) <= MAX_COMPOSER_CHARACTERS
+            and len(_materialize_pasted_texts(buffer.text, pasted_texts))
+            <= MAX_COMPOSER_CHARACTERS
+        ):
+            if history_position < len(input_history):
+                input_history[history_position] = current_composer_draft(
+                    text=buffer.text
+                )
+            last_valid_composer_document = buffer.document
             return
         enforcing_bound = True
         try:
-            document = buffer.document
-            bounded = document.text[:MAX_COMPOSER_CHARACTERS]
-            cursor = min(document.cursor_position, len(bounded))
             buffer.set_document(
-                document.__class__(bounded, cursor_position=cursor),
+                last_valid_composer_document,
                 bypass_readonly=True,
             )
             state.notice = f"Input is limited to {MAX_COMPOSER_CHARACTERS} characters."
@@ -1576,32 +1695,7 @@ def _create_application(
             ]
         return fragments
 
-    printed_block_count = 0
-
-    def pending_transcript_fragments() -> list[tuple[str, str]]:
-        nonlocal printed_block_count
-        all_blocks = state.blocks
-        if printed_block_count >= len(all_blocks):
-            return []
-        pending_blocks = all_blocks[printed_block_count:]
-        state.blocks = list(pending_blocks)
-        try:
-            return transcript_fragments()
-        finally:
-            state.blocks = all_blocks
-            printed_block_count = len(all_blocks)
-
     semantic_style = runtime["Style"].from_dict(_semantic_style_rules(capabilities))
-
-    def emit_pending_transcript() -> None:
-        fragments = pending_transcript_fragments()
-        if not fragments:
-            return
-        runtime["print_formatted_text"](
-            output=enhanced_output,
-            formatted_text=runtime["FormattedText"](fragments),
-            style=semantic_style,
-        )
 
     approval_waiter: asyncio.Future[ApprovalDecision] | None = None
     approval_lock = asyncio.Lock()
@@ -1665,7 +1759,6 @@ def _create_application(
         wrap_lines=True,
         always_hide_cursor=True,
         height=runtime["Dimension"](min=5, max=12, preferred=8),
-        right_margins=[runtime["ScrollbarMargin"](display_arrows=True)],
         style="class:tui.approval",
     )
     approval_filter = runtime["Condition"](lambda: state.approval_panel is not None)
@@ -1725,8 +1818,6 @@ def _create_application(
         application.invalidate()
 
     async def execute_message(application: Any, message: str) -> None:
-        async with runtime["in_terminal"]():
-            emit_pending_transcript()
         try:
             result = await run_message(message, state.conversation_id)
             _project_pending_events(observer_bridge, state)
@@ -1769,18 +1860,19 @@ def _create_application(
             _project_pending_events(observer_bridge, state)
             state.running = False
             state.active_task = None
-            async with runtime["in_terminal"]():
-                emit_pending_transcript()
             invalidate(application)
 
     async def execute_command(application: Any, command: str) -> None:
         try:
-            async with runtime["in_terminal"]():
-                emit_pending_transcript()
+            if command_requires_suspension is not None and command_requires_suspension(
+                command
+            ):
+                async with runtime["in_terminal"]():
+                    result = await handle_command(command, state.conversation_id)
+            else:
                 result = await handle_command(command, state.conversation_id)
-                state.conversation_id = result.conversation_id
-                state.append_local(result.presentation, result.output)
-                emit_pending_transcript()
+            state.conversation_id = result.conversation_id
+            state.append_local(result.presentation, result.output)
             if result.action is not None:
                 application.exit(
                     result=TerminalApplicationResult(
@@ -1807,7 +1899,8 @@ def _create_application(
 
     @keys.add("c-m", eager=True)
     def submit(event: Any) -> None:
-        nonlocal history_position, history_draft
+        nonlocal history_position, history_draft, transcript_scroll_offset
+        nonlocal pasted_texts, next_paste_number
         if state.approval_panel is not None:
             resolve_approval(ApprovalDecision.DENY)
             return
@@ -1820,7 +1913,15 @@ def _create_application(
             state.notice = "A run is already active; Ctrl-C cancels it."
             invalidate(event.app)
             return
-        message = composer.buffer.text.strip()
+        display_message = composer.buffer.text.strip()
+        if not display_message:
+            state.notice = "Enter a message before submitting."
+            invalidate(event.app)
+            return
+        message = _materialize_pasted_texts(
+            display_message,
+            pasted_texts,
+        ).strip()
         if not message:
             state.notice = "Enter a message before submitting."
             invalidate(event.app)
@@ -1829,12 +1930,15 @@ def _create_application(
             state.notice = f"Input is limited to {MAX_COMPOSER_CHARACTERS} characters."
             invalidate(event.app)
             return
-        input_history.append(message)
+        input_history.append(current_composer_draft(text=display_message))
         history_position = len(input_history)
-        history_draft = ""
+        history_draft = _ComposerDraft("")
+        transcript_scroll_offset = 0
         composer.buffer.reset(append_to_history=True)
-        state.append_user(message)
-        if message.startswith("/"):
+        pasted_texts = {}
+        next_paste_number = 1
+        state.append_user(display_message)
+        if display_message.startswith("/"):
             start_task(event.app, execute_command(event.app, message))
             return
         start_task(event.app, execute_message(event.app, message))
@@ -1848,6 +1952,67 @@ def _create_application(
             composer.buffer.insert_text("\n")
         else:
             state.notice = f"Input is limited to {MAX_COMPOSER_CHARACTERS} characters."
+        invalidate(event.app)
+
+    @keys.add(runtime["Keys"].BracketedPaste, eager=True)
+    def paste(event: Any) -> None:
+        nonlocal next_paste_number
+        if state.approval_panel is not None:
+            resolve_approval(ApprovalDecision.DENY)
+            return
+        data = event.data.replace("\r\n", "\n").replace("\r", "\n")
+        if not data:
+            return
+        buffer = composer.buffer
+        document = buffer.document
+        current_line = (
+            document.current_line_before_cursor
+            + data
+            + document.current_line_after_cursor
+        )
+        if (
+            "\n" not in data
+            and _display_width(current_line) <= composer_inline_capacity()
+        ):
+            buffer.insert_text(data)
+            invalidate(event.app)
+            return
+
+        placeholder = f"[Pasted Text #{next_paste_number}]"
+        while placeholder in buffer.text or placeholder in pasted_texts:
+            next_paste_number += 1
+            placeholder = f"[Pasted Text #{next_paste_number}]"
+        if len(buffer.text) + len(placeholder) > MAX_COMPOSER_CHARACTERS:
+            state.notice = f"Input is limited to {MAX_COMPOSER_CHARACTERS} characters."
+            invalidate(event.app)
+            return
+
+        cursor = document.cursor_position
+        candidate_display = (
+            document.text[:cursor] + placeholder + document.text[cursor:]
+        )
+        candidate_pastes = dict(pasted_texts)
+        candidate_pastes[placeholder] = ""
+        base_characters = len(
+            _materialize_pasted_texts(candidate_display, candidate_pastes)
+        )
+        available_characters = MAX_COMPOSER_CHARACTERS - base_characters
+        if available_characters <= 0:
+            state.notice = f"Input is limited to {MAX_COMPOSER_CHARACTERS} characters."
+            invalidate(event.app)
+            return
+
+        stored = data[:available_characters]
+        pasted_texts[placeholder] = stored
+        next_paste_number += 1
+        buffer.insert_text(placeholder)
+        if len(stored) < len(data):
+            state.notice = (
+                f"{placeholder} was limited to "
+                f"{MAX_COMPOSER_CHARACTERS} message characters."
+            )
+        else:
+            state.notice = f"Stored as {placeholder}."
         invalidate(event.app)
 
     @keys.add("c-c", eager=True)
@@ -1883,19 +2048,31 @@ def _create_application(
             )
         )
 
-    @keys.add("pageup", filter=approval_filter, eager=True)
+    @keys.add("pageup", eager=True)
     def page_up(event: Any) -> None:
+        nonlocal transcript_scroll_offset
         panel = state.approval_panel
         if panel is not None:
             panel.move(-max(1, _viewport_height(approval_window)))
-            invalidate(event.app)
+        else:
+            transcript_scroll_offset = min(
+                max(0, content_line_count - 1),
+                transcript_scroll_offset + _viewport_height(content_window),
+            )
+        invalidate(event.app)
 
-    @keys.add("pagedown", filter=approval_filter, eager=True)
+    @keys.add("pagedown", eager=True)
     def page_down(event: Any) -> None:
+        nonlocal transcript_scroll_offset
         panel = state.approval_panel
         if panel is not None:
             panel.move(max(1, _viewport_height(approval_window)))
-            invalidate(event.app)
+        else:
+            transcript_scroll_offset = max(
+                0,
+                transcript_scroll_offset - _viewport_height(content_window),
+            )
+        invalidate(event.app)
 
     @keys.add("c-o", eager=True)
     def toggle_tool_detail(event: Any) -> None:
@@ -1961,9 +2138,9 @@ def _create_application(
             composer.buffer.cursor_up()
         elif input_history:
             if history_position >= len(input_history):
-                history_draft = composer.buffer.text
+                history_draft = current_composer_draft()
             history_position = max(0, history_position - 1)
-            _replace_composer_text(composer.buffer, input_history[history_position])
+            restore_composer_draft(input_history[history_position])
         invalidate(event.app)
 
     @keys.add("down", eager=True)
@@ -1981,10 +2158,10 @@ def _create_application(
             composer.buffer.cursor_down()
         elif history_position < len(input_history) - 1:
             history_position += 1
-            _replace_composer_text(composer.buffer, input_history[history_position])
+            restore_composer_draft(input_history[history_position])
         elif history_position == len(input_history) - 1:
             history_position = len(input_history)
-            _replace_composer_text(composer.buffer, history_draft)
+            restore_composer_draft(history_draft)
         invalidate(event.app)
 
     @keys.add("home", filter=approval_filter, eager=True)
@@ -2020,24 +2197,6 @@ def _create_application(
             mode=projection.mode,
             glyphs=glyphs,
         )
-
-    def header_identity_fragments() -> list[tuple[str, str]]:
-        return [
-            ("class:tui.identity", " DAITA "),
-            (
-                "class:tui.header.agent",
-                _sanitize_terminal_text(
-                    state.agent_label,
-                    maximum=128,
-                    preserve_lines=False,
-                    fallback="agent",
-                ),
-            ),
-        ]
-
-    def header_source_fragments() -> list[tuple[str, str]]:
-        source = projected_status().source_summary
-        return [("class:tui.header.meta", f"{source} " if source else "")]
 
     def border_fragments(
         *,
@@ -2257,24 +2416,76 @@ def _create_application(
         ),
         filter=runtime["Condition"](command_menu_visible),
     )
-    ready_body = runtime["HSplit"](
-        [
-            approval_container,
-            composer_frame,
+
+    def empty_shell_fragments() -> list[tuple[str, str]]:
+        agent = _sanitize_terminal_text(
+            state.agent_label,
+            maximum=128,
+            preserve_lines=False,
+            fallback="agent",
+        )
+        source = _sanitize_terminal_text(
+            state.source_summary,
+            maximum=128,
+            preserve_lines=False,
+            fallback="",
+        )
+        return [
+            ("class:tui.identity", f"\n DAITA  {agent}\n"),
+            ("class:tui.header.meta", f" {source}\n" if source else ""),
+            (
+                "class:tui.rule",
+                glyphs.horizontal * responsive().content_width + "\n",
+            ),
+            (
+                "class:tui.empty",
+                "\n Ask a question about your data, or type /help for commands.\n",
+            ),
         ]
-    )
-    command_palette_body = runtime["HSplit"](
-        [
-            composer_frame,
-            command_menu,
-        ]
-    )
-    active_body = runtime["DynamicContainer"](
-        lambda: (command_palette_body if command_menu_visible() else ready_body)
+
+    def shell_content_fragments() -> list[tuple[str, str]]:
+        nonlocal content_last_line_width, content_line_count
+        if state.startup is not None and not state.blocks:
+            fragments = _render_startup_fragments(
+                state,
+                width=responsive().content_width,
+                capabilities=capabilities,
+                glyphs=glyphs,
+            )
+        elif state.blocks:
+            fragments = transcript_fragments()
+        else:
+            fragments = empty_shell_fragments()
+        rendered = "".join(text for _style, text in fragments)
+        lines = rendered.split("\n")
+        content_line_count = max(1, len(lines))
+        content_last_line_width = len(lines[-1])
+        return fragments
+
+    def shell_content_cursor() -> Any:
+        return runtime["Point"](
+            x=(content_last_line_width if transcript_scroll_offset == 0 else 0),
+            y=max(0, content_line_count - 1 - transcript_scroll_offset),
+        )
+
+    content_window = runtime["Window"](
+        runtime["FormattedTextControl"](
+            shell_content_fragments,
+            focusable=False,
+            show_cursor=False,
+            get_cursor_position=shell_content_cursor,
+        ),
+        wrap_lines=False,
+        always_hide_cursor=True,
+        height=runtime["Dimension"](weight=1),
+        style="class:tui.transcript",
     )
     main_shell = runtime["HSplit"](
         [
-            active_body,
+            content_window,
+            approval_container,
+            composer_frame,
+            command_menu,
             status,
         ]
     )
@@ -2303,26 +2514,10 @@ def _create_application(
             ),
         ]
     )
-    header_fragments = header_identity_fragments()
-    source_fragments = header_source_fragments()
-    header_fragments.extend(
-        [
-            ("", "  "),
-            *source_fragments,
-            ("class:tui.rule", "\n" + (glyphs.horizontal * responsive().columns)),
-            ("", "\n"),
-        ]
-    )
-    runtime["print_formatted_text"](
-        output=enhanced_output,
-        formatted_text=runtime["FormattedText"](header_fragments),
-        style=semantic_style,
-    )
-    emit_pending_transcript()
     application = runtime["Application"](
         layout=runtime["Layout"](root, focused_element=composer),
         key_bindings=keys,
-        full_screen=False,
+        full_screen=True,
         erase_when_done=True,
         mouse_support=False,
         input=enhanced_input,
@@ -2348,6 +2543,16 @@ def _replace_composer_text(buffer: Any, value: str) -> None:
     buffer.set_document(
         buffer.document.__class__(value, cursor_position=len(value)),
         bypass_readonly=True,
+    )
+
+
+def _materialize_pasted_texts(
+    text: str,
+    pasted_texts: Mapping[str, str],
+) -> str:
+    return _PASTED_TEXT_PLACEHOLDER_PATTERN.sub(
+        lambda match: pasted_texts.get(match.group(0), match.group(0)),
+        text,
     )
 
 
@@ -2900,6 +3105,367 @@ def _tool_result_error_code(result: ToolResultBlock) -> str:
     return "tool_failed"
 
 
+def _render_startup_fragments(
+    state: TerminalViewState,
+    *,
+    width: int,
+    capabilities: TerminalCapabilities | None = None,
+    glyphs: TerminalGlyphs | None = None,
+) -> list[tuple[str, str]]:
+    """Render one compact, width-bounded startup projection."""
+
+    startup = state.startup
+    if startup is None:
+        return [
+            (
+                "class:tui.empty",
+                "\n  Ask a question about your data, or type /help for commands.\n",
+            )
+        ]
+    capabilities = capabilities or _terminal_capabilities()
+    glyphs = glyphs or _terminal_glyphs(capabilities)
+    safe_width = max(1, min(_MAX_RENDER_WIDTH, int(width)))
+    marker = "…" if capabilities.unicode else "..."
+    agent = _startup_safe_text(state.agent_label, fallback="agent")
+    provider = _startup_safe_text(startup.provider_label, fallback="provider")
+    model = _startup_safe_text(state.model_label, fallback="model")
+    model_status = _startup_safe_text(startup.model_status, fallback="configured")
+    version = _startup_safe_text(startup.version, fallback="unknown")
+    home = _startup_safe_text(startup.agent_home, fallback="unavailable")
+    conversation = _startup_safe_text(
+        state.conversation_id,
+        fallback="new",
+    )
+    sources = _startup_sources_text(startup, separator=glyphs.separator)
+    catalog = (
+        f"{startup.resource_count} "
+        f"{'resource' if startup.resource_count == 1 else 'resources'}"
+        f"{glyphs.separator}{startup.relationship_count} "
+        f"{'relationship' if startup.relationship_count == 1 else 'relationships'}"
+    )
+    read_only = (
+        glyphs.separator.join(
+            _startup_safe_text(value, fallback="read")
+            for value in startup.read_capabilities
+        )
+        if startup.read_capabilities
+        else "None until a source is added"
+    )
+    warnings = tuple(
+        _startup_safe_text(value, fallback="Configuration needs attention")
+        for value in startup.warnings[:2]
+    )
+    model_text = f"{provider}{glyphs.separator}{model}{glyphs.separator}{model_status}"
+    fragments: list[tuple[str, str]] = [("", "\n")]
+
+    if safe_width >= 80 and capabilities.unicode:
+        for line in _STARTUP_WORDMARK:
+            fragments.append(
+                (
+                    "class:tui.identity",
+                    _truncate_display_text(line, safe_width, marker=marker)[0] + "\n",
+                )
+            )
+        version_line = f"DAITA {version}"
+        fragments.append(("class:tui.metadata", f"{version_line}\n\n"))
+    else:
+        heading = _truncate_display_text(
+            f"DAITA  {version}",
+            safe_width,
+            marker=marker,
+        )[0]
+        fragments.append(("class:tui.identity", f"{heading}\n\n"))
+
+    if safe_width < 60:
+        essential = (
+            ("class:tui.status.ready", f"{glyphs.ready} Ready"),
+            ("", f"{agent}{glyphs.separator}{model_text}"),
+            ("class:tui.metadata", sources),
+            ("class:tui.metadata", catalog),
+            ("class:tui.metadata", f"Read-only: {read_only}"),
+        )
+        for style, text in essential:
+            bounded = _truncate_display_text(text, safe_width, marker=marker)[0]
+            fragments.append((style, f"{bounded}\n"))
+        if warnings:
+            warning = f"{glyphs.warning} {warnings[0]}"
+            bounded = _truncate_display_text(
+                warning,
+                safe_width,
+                marker=marker,
+            )[0]
+            fragments.append(("class:tui.status.notice", f"{bounded}\n"))
+    else:
+        card_width = safe_width
+        inner_width = max(1, card_width - 4)
+        fragments.append(
+            (
+                "class:tui.rule",
+                glyphs.top_left
+                + glyphs.horizontal * max(0, card_width - 2)
+                + glyphs.top_right
+                + "\n",
+            )
+        )
+        if safe_width >= 120:
+            left_rows = (
+                ("Status", f"{glyphs.ready} Ready"),
+                ("Agent", agent),
+                ("Model", model_text),
+                ("Home", _truncate_middle_display_text(home, 40, marker=marker)),
+            )
+            right_rows = (
+                ("Sources", sources),
+                ("Catalog", catalog),
+                ("Version", version),
+                ("Conversation", conversation),
+            )
+            gap = 3
+            left_width = max(1, (inner_width - gap) // 2)
+            right_width = max(1, inner_width - gap - left_width)
+            for index, (
+                (left_label, left_value),
+                (right_label, right_value),
+            ) in enumerate(zip(left_rows, right_rows, strict=True)):
+                left = _startup_cell(
+                    left_label,
+                    left_value,
+                    left_width,
+                    marker=marker,
+                )
+                right = _startup_cell(
+                    right_label,
+                    right_value,
+                    right_width,
+                    marker=marker,
+                )
+                style = "class:tui.status.ready" if index == 0 else "class:tui.startup"
+                fragments.append(
+                    (
+                        style,
+                        f"{glyphs.vertical} {left}{' ' * gap}{right} "
+                        f"{glyphs.vertical}\n",
+                    )
+                )
+            read_cell = _startup_cell(
+                "Read-only",
+                read_only,
+                inner_width,
+                marker=marker,
+            )
+            fragments.append(
+                (
+                    "class:tui.startup",
+                    f"{glyphs.vertical} {read_cell} {glyphs.vertical}\n",
+                )
+            )
+        else:
+            source_label = "Source" if startup.source_count == 1 else "Sources"
+            rows = (
+                ("Status", f"{glyphs.ready} Ready"),
+                ("Agent", agent),
+                ("Model", model_text),
+                ("Home", _truncate_middle_display_text(home, 120, marker=marker)),
+                (source_label, sources),
+                ("Catalog", catalog),
+                ("Read-only", read_only),
+                ("Conversation", conversation),
+            )
+            for index, (label, value) in enumerate(rows):
+                cell = _startup_cell(label, value, inner_width, marker=marker)
+                style = (
+                    "class:tui.status.ready"
+                    if index == 0
+                    else (
+                        "class:tui.metadata"
+                        if label in {"Home", "Conversation"}
+                        else "class:tui.startup"
+                    )
+                )
+                fragments.append(
+                    (
+                        style,
+                        f"{glyphs.vertical} {cell} {glyphs.vertical}\n",
+                    )
+                )
+        for warning in warnings:
+            warning_lines = _wrap_display_text(
+                f"{glyphs.warning} Warning: {warning}",
+                inner_width,
+                maximum_lines=2,
+                marker=marker,
+            )
+            for warning_line in warning_lines:
+                fragments.append(
+                    (
+                        "class:tui.status.notice",
+                        f"{glyphs.vertical} "
+                        f"{_pad_display_text(warning_line, inner_width)} "
+                        f"{glyphs.vertical}\n",
+                    )
+                )
+        fragments.append(
+            (
+                "class:tui.rule",
+                glyphs.bottom_left
+                + glyphs.horizontal * max(0, card_width - 2)
+                + glyphs.bottom_right
+                + "\n",
+            )
+        )
+
+    welcome = "Ask a question about your data, or type /help for commands."
+    welcome = _truncate_display_text(welcome, safe_width, marker=marker)[0]
+    fragments.extend(
+        [
+            ("class:tui.startup", f"\n{welcome}\n"),
+            (
+                "class:tui.prompt",
+                _truncate_display_text(
+                    "Quick actions: " + "  ".join(_STARTUP_QUICK_ACTIONS),
+                    safe_width,
+                    marker=marker,
+                )[0]
+                + "\n",
+            ),
+        ]
+    )
+    return fragments
+
+
+def _render_startup_text(
+    state: TerminalViewState,
+    *,
+    width: int,
+    capabilities: TerminalCapabilities | None = None,
+) -> str:
+    capabilities = capabilities or _terminal_capabilities()
+    return "".join(
+        text
+        for _style, text in _render_startup_fragments(
+            state,
+            width=width,
+            capabilities=capabilities,
+            glyphs=_terminal_glyphs(capabilities),
+        )
+    )
+
+
+def _startup_sources_text(
+    startup: TerminalStartupInfo,
+    *,
+    separator: str,
+) -> str:
+    count = startup.source_count
+    if count == 0:
+        return f"0 cataloged{separator}none attached"
+    source_types = ", ".join(
+        _startup_safe_text(value, fallback="source") for value in startup.source_types
+    )
+    names = [
+        _startup_safe_text(value, fallback="source")
+        for value in startup.source_names[:3]
+    ]
+    if count > len(names):
+        names.append(f"+{count - len(names)} more")
+    if count == 1:
+        primary = names[0] if names else "1 source"
+        details = tuple(value for value in ("cataloged", source_types) if value)
+        return primary + separator + separator.join(details)
+    details = tuple(value for value in (source_types, ", ".join(names)) if value)
+    suffix = separator + separator.join(details) if details else ""
+    return f"{count} cataloged{suffix}"
+
+
+def _startup_cell(
+    label: str,
+    value: str,
+    width: int,
+    *,
+    marker: str,
+) -> str:
+    label_width = min(width, max(10, len(label) + 2))
+    safe_label = _truncate_display_text(label, label_width, marker=marker)[0]
+    prefix = _pad_display_text(safe_label, label_width)
+    value_width = max(0, width - label_width)
+    safe_value = _truncate_display_text(value, value_width, marker=marker)[0]
+    return _pad_display_text(prefix + safe_value, width)
+
+
+def _startup_safe_text(value: object, *, fallback: str) -> str:
+    safe = _sanitize_terminal_text(
+        value,
+        maximum=2_048,
+        preserve_lines=False,
+        fallback=fallback,
+    )
+    return _STARTUP_SECRET_PATTERN.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+        safe,
+    )
+
+
+def _wrap_display_text(
+    value: str,
+    width: int,
+    *,
+    maximum_lines: int,
+    marker: str,
+) -> tuple[str, ...]:
+    if width <= 0 or maximum_lines <= 0:
+        return ()
+    remaining = _one_logical_line(value).strip()
+    lines: list[str] = []
+    while remaining and len(lines) < maximum_lines:
+        if _display_width(remaining) <= width:
+            lines.append(remaining)
+            remaining = ""
+            break
+        prefix, _truncated = _truncate_display_text(remaining, width, marker="")
+        split_at = prefix.rfind(" ")
+        if split_at >= max(1, len(prefix) // 3):
+            prefix = prefix[:split_at]
+        consumed = len(prefix)
+        lines.append(prefix.rstrip())
+        remaining = remaining[consumed:].lstrip()
+    if remaining and lines:
+        combined = f"{lines[-1]} {remaining}".strip()
+        lines[-1] = _truncate_display_text(
+            combined,
+            width,
+            marker=marker,
+        )[0]
+    return tuple(lines or ("",))
+
+
+def _pad_display_text(value: str, width: int) -> str:
+    return value + " " * max(0, width - _display_width(value))
+
+
+def _truncate_middle_display_text(
+    value: str,
+    width: int,
+    *,
+    marker: str,
+) -> str:
+    if width <= 0:
+        return ""
+    if _display_width(value) <= width:
+        return value
+    marker_width = _display_width(marker)
+    if marker_width >= width:
+        return _truncate_display_text(marker, width, marker="")[0]
+    left_width = (width - marker_width + 1) // 2
+    right_width = width - marker_width - left_width
+    left = _truncate_display_text(value, left_width, marker="")[0]
+    reversed_right = _truncate_display_text(
+        value[::-1],
+        right_width,
+        marker="",
+    )[0]
+    return left + marker + reversed_right[::-1]
+
+
 def _render_transcript_fragments(
     runtime: dict[str, Any],
     state: TerminalViewState,
@@ -2913,12 +3479,12 @@ def _render_transcript_fragments(
     glyphs = glyphs or _terminal_glyphs(capabilities)
     responsive = responsive or _responsive_projection(width, 24)
     if not state.blocks:
-        return [
-            (
-                "class:tui.empty",
-                "\n  Ask Daita about the data in your current catalog.\n",
-            )
-        ]
+        return _render_startup_fragments(
+            state,
+            width=width,
+            capabilities=capabilities,
+            glyphs=glyphs,
+        )
     fragments: list[tuple[str, str]] = [("", "\n")]
     for block in state.blocks:
         if block.kind == "user":
@@ -3748,8 +4314,6 @@ def _semantic_style_rules(
             "tui.tool.approval": "bold",
             "tui.tool.success": "",
             "tui.tool.failure": "bold",
-            "scrollbar.background": "",
-            "scrollbar.button": "",
             "selection.identity": "bold",
             "selection.title": "bold",
             "selection.help": "",
@@ -3810,8 +4374,6 @@ def _semantic_style_rules(
         "tui.tool.approval": colors["warning"],
         "tui.tool.success": colors["brand"],
         "tui.tool.failure": colors["error"],
-        "scrollbar.background": colors["muted"],
-        "scrollbar.button": colors["muted_green"],
         "selection.identity": f"bold {colors['brand']}",
         "selection.title": "bold",
         "selection.help": colors["muted"],
@@ -4048,6 +4610,7 @@ __all__ = [
     "TerminalApplicationResult",
     "TerminalCommandResult",
     "TerminalObserverBridge",
+    "TerminalStartupInfo",
     "TerminalSuspendBridge",
     "TerminalTUIUnavailable",
     "TerminalViewState",

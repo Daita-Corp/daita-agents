@@ -17,7 +17,7 @@ import tempfile
 from typing import Any, cast, TextIO
 import unicodedata
 
-from . import ApprovalDecision, ApprovalRequest
+from . import ApprovalDecision, ApprovalRequest, __version__
 from .agent import (
     Agent,
     AgentAlreadyExistsError,
@@ -231,6 +231,16 @@ _MAX_DISPLAY_CHARACTERS = 16_384
 _MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
 _MAX_CATALOG_PREVIEW = 12
 _MAX_SOURCE_PREVIEW = 8
+_SOURCE_TYPE_LABELS = {
+    "local-directory": "CSV/JSON",
+    "postgresql": "PostgreSQL",
+    "sqlite": "SQLite",
+}
+_SOURCE_READ_CAPABILITIES = {
+    "local-directory": "CSV/JSON reads",
+    "postgresql": "PostgreSQL queries",
+    "sqlite": "SQLite queries",
+}
 
 
 async def run_terminal_application(
@@ -1421,21 +1431,10 @@ async def _chat_tui(
     observer_bridge: terminal_tui.TerminalObserverBridge,
     approval_bridge: terminal_tui.TerminalApprovalBridge | None,
 ) -> tuple[Agent, str | None, str]:
-    route = agent.model_route
-    if route is None:
-        raise RuntimeError("ready chat requires a configured model")
-    candidate = route.candidates[0]
-    _provider, _, model = candidate.provider_id.partition(":")
-    sources = tuple(source for source in await agent.list_sources() if source.active)
-    if len(sources) == 1:
-        source_summary = _safe_display(sources[0].display_name, fallback="1 source")
-    else:
-        source_summary = _count_label(len(sources), "source", "sources")
-    state = terminal_tui.TerminalViewState(
-        agent_label=_safe_display(agent.name, fallback="agent"),
-        model_label=_safe_display(model, fallback="model"),
-        source_summary=source_summary,
+    state = await _ready_view_state(
+        agent,
         conversation_id=conversation_id,
+        validated=validated,
     )
 
     async def run_message(message: str, selected_conversation: str | None) -> Any:
@@ -1502,6 +1501,7 @@ async def _chat_tui(
         run_message=run_message,
         load_transcript=load_transcript,
         handle_command=handle_command,
+        command_requires_suspension=_command_uses_terminal_prompts,
         input_stream=input_stream,
         output_stream=output_stream,
         suspend_bridge=suspend_bridge,
@@ -1747,59 +1747,107 @@ async def _write_ready_screen(
     conversation_id: str | None,
     validated: bool,
 ) -> None:
+    state = await _ready_view_state(
+        agent,
+        conversation_id=conversation_id,
+        validated=validated,
+    )
+    interactive = terminal_tui._stream_is_interactive(output_stream)
+    detected = terminal_tui._terminal_capabilities(text_stream=output_stream)
+    capabilities = (
+        detected
+        if interactive
+        else terminal_tui.TerminalCapabilities("none", detected.unicode)
+    )
+    output_stream.write(
+        terminal_tui._render_startup_text(
+            state,
+            width=terminal_tui._text_stream_width(output_stream),
+            capabilities=capabilities,
+        )
+    )
+    output_stream.flush()
+
+
+async def _ready_view_state(
+    agent: Agent,
+    *,
+    conversation_id: str | None,
+    validated: bool,
+) -> terminal_tui.TerminalViewState:
+    """Assemble only safe, public runtime facts for terminal presentation."""
+
     route = agent.model_route
     if route is None:
         raise RuntimeError("ready chat requires a configured model")
     candidate = route.candidates[0]
     provider, _, model = candidate.provider_id.partition(":")
-    label = dict(_PROVIDERS).get(provider, provider)
+    provider_label = dict(_PROVIDERS).get(provider, provider)
     sources = tuple(source for source in await agent.list_sources() if source.active)
     summary = await agent.catalog_summary()
-    print(file=output_stream)
-    print("Daita", file=output_stream)
-    print(file=output_stream)
-    print(
-        f"Agent     {_safe_display(agent.name, fallback='agent')}",
-        file=output_stream,
-    )
-    print(
-        "Model     "
-        f"{_safe_display(label, fallback='provider')} · "
-        f"{_safe_display(model, fallback='model')} · "
-        f"{'validated' if validated else 'configured'}",
-        file=output_stream,
-    )
     if len(sources) == 1:
-        print(
-            "Source    " f"{_safe_display(sources[0].display_name)} · cataloged",
-            file=output_stream,
+        source_summary = _safe_display(
+            sources[0].display_name,
+            fallback="1 source",
         )
     else:
-        labels = ", ".join(_safe_display(source.display_name) for source in sources[:3])
-        if len(sources) > 3:
-            labels += f", +{len(sources) - 3} more"
-        source_text = f"{len(sources)} cataloged"
-        if labels:
-            source_text += f" · {labels}"
-        print(f"Sources   {source_text}", file=output_stream)
-    print(
-        "Catalog   "
-        f"{_count_label(summary.resource_count, 'table', 'tables')} · "
-        f"{_count_label(summary.relationship_count, 'relationship', 'relationships')}",
-        file=output_stream,
-    )
-    if summary.latest_successful_sync_completed_at is not None:
-        print(
-            "Sync      " f"{summary.latest_successful_sync_completed_at.isoformat()}",
-            file=output_stream,
+        source_summary = _count_label(len(sources), "source", "sources")
+    adapter_counts: dict[str, int] = {}
+    for source in sources:
+        adapter_id = _safe_display(
+            getattr(source, "adapter_id", None),
+            fallback="source",
         )
-    print(
-        "Conversation  " f"{_safe_display(conversation_id, fallback='new')}",
-        file=output_stream,
+        adapter_counts[adapter_id] = adapter_counts.get(adapter_id, 0) + 1
+    source_types = tuple(
+        (
+            f"{count} {_SOURCE_TYPE_LABELS.get(adapter_id, adapter_id)}"
+            if count > 1
+            else _SOURCE_TYPE_LABELS.get(adapter_id, adapter_id)
+        )
+        for adapter_id, count in sorted(adapter_counts.items())
     )
-    print(file=output_stream)
-    print("Ready", file=output_stream)
-    print(file=output_stream)
+    read_capabilities: list[str] = []
+    if sources:
+        read_capabilities.append("Catalog search & inspection")
+    read_capabilities.extend(
+        _SOURCE_READ_CAPABILITIES[adapter_id]
+        for adapter_id in sorted(adapter_counts)
+        if adapter_id in _SOURCE_READ_CAPABILITIES
+    )
+    warnings: list[str] = []
+    if not sources:
+        warnings.append("No data sources. Use /source add to attach one.")
+    elif getattr(summary, "is_empty", summary.resource_count == 0):
+        warnings.append(
+            "Catalog is empty. Use /source refresh <id> after checking source access."
+        )
+    agent_home = getattr(agent, "home", None)
+    return terminal_tui.TerminalViewState(
+        agent_label=_safe_display(agent.name, fallback="agent"),
+        model_label=_safe_display(model, fallback="model"),
+        source_summary=source_summary,
+        conversation_id=conversation_id,
+        startup=terminal_tui.TerminalStartupInfo(
+            version=__version__,
+            provider_label=_safe_display(provider_label, fallback="provider"),
+            model_status="validated" if validated else "configured",
+            agent_home=_safe_display(
+                (str(agent_home) if isinstance(agent_home, (str, Path)) else None),
+                fallback="unavailable",
+            ),
+            source_count=len(sources),
+            source_types=source_types,
+            source_names=tuple(
+                _safe_display(source.display_name, fallback="source")
+                for source in sources[:3]
+            ),
+            resource_count=summary.resource_count,
+            relationship_count=summary.relationship_count,
+            read_capabilities=tuple(read_capabilities),
+            warnings=tuple(warnings),
+        ),
+    )
 
 
 async def _write_sources(agent: Agent, output_stream: TextIO) -> None:

@@ -50,12 +50,22 @@ A ready first launch moves into a full-screen, transcript-first shell:
  atlas · gpt-5.6-sol · ● ready       1 step · 824 tokens · $0.01
 ```
 
-The transcript scrolls vertically and model answers render as sanitized
-Markdown. Enter submits nonempty input, Ctrl-J inserts a newline, Ctrl-C
-cancels an active run without closing Daita, and Ctrl-D exits when the composer
-is empty. Existing slash commands continue to use their current local prompts
-and selectors. Redirected and other non-interactive streams retain the
-deterministic plain-text chat path.
+The shell uses the terminal's alternate screen, so responsive redraws do not
+accumulate in native scrollback and the prior shell screen returns on exit.
+The transcript has no embedded scrollbar and moves vertically with Page
+Up/Page Down. The composer starts at one visible row and grows to as many as
+six rows when keyboard-typed input wraps, shrinking again when text is deleted
+or the terminal widens. A paste that would cross the current row boundary, or
+that contains multiple lines, appears as `[Pasted Text #1]`, `[Pasted Text #2]`,
+and so on rather than expanding the composer; Daita restores the exact bounded
+contents when the message is submitted. Deleting or editing a placeholder
+immediately purges its hidden contents from the current draft and recalled
+composer history. The row boundary follows terminal resizes. Model answers
+render as sanitized Markdown. Enter submits nonempty input, Ctrl-J inserts a
+newline, Ctrl-C cancels an active run without closing Daita, and Ctrl-D exits
+when the composer is empty. Existing slash commands continue to use their
+current local prompts and selectors. Redirected and other non-interactive
+streams retain the deterministic plain-text chat path.
 
 Run `daita` again to reopen the sole agent automatically. When several agents
 exist, Daita shows a deterministic picker; `daita --agent atlas` selects one
