@@ -49,6 +49,9 @@ package-dir = {"" = "src"}
 where = ["src"]
 include = ["daita*"]
 
+[tool.setuptools.package-data]
+"daita.llm" = ["pricing_schedules.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

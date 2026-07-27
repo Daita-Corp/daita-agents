@@ -1,0 +1,1026 @@
+{
+  "schedules": [
+    {
+      "schedule_id": "openai.responses.gpt-5.6-sol.default.global.short.2026-07-26",
+      "basis": "public_list",
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "endpoint": "responses",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "default",
+        "region": "global"
+      },
+      "usage_range": {
+        "metric": "request_input_tokens",
+        "minimum_inclusive": 0,
+        "maximum_inclusive": 272000
+      },
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "5.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.50"
+        },
+        {
+          "metric": "input_cache_write_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "6.25"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "30.00"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://developers.openai.com/api/docs/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://developers.openai.com/api/docs/guides/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "openai.responses.gpt-5.6-sol.default.global.long.2026-07-26",
+      "basis": "public_list",
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "endpoint": "responses",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "default",
+        "region": "global"
+      },
+      "usage_range": {
+        "metric": "request_input_tokens",
+        "minimum_inclusive": 272001,
+        "maximum_inclusive": null
+      },
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "10.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "1.00"
+        },
+        {
+          "metric": "input_cache_write_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "12.50"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "45.00"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://developers.openai.com/api/docs/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://developers.openai.com/api/docs/guides/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "openai.responses.gpt-5.6-terra.default.global.short.2026-07-26",
+      "basis": "public_list",
+      "provider": "openai",
+      "model": "gpt-5.6-terra",
+      "endpoint": "responses",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "default",
+        "region": "global"
+      },
+      "usage_range": {
+        "metric": "request_input_tokens",
+        "minimum_inclusive": 0,
+        "maximum_inclusive": 272000
+      },
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "2.50"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.25"
+        },
+        {
+          "metric": "input_cache_write_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "3.125"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "15.00"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://developers.openai.com/api/docs/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://developers.openai.com/api/docs/guides/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "openai.responses.gpt-5.6-terra.default.global.long.2026-07-26",
+      "basis": "public_list",
+      "provider": "openai",
+      "model": "gpt-5.6-terra",
+      "endpoint": "responses",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "default",
+        "region": "global"
+      },
+      "usage_range": {
+        "metric": "request_input_tokens",
+        "minimum_inclusive": 272001,
+        "maximum_inclusive": null
+      },
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "5.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.50"
+        },
+        {
+          "metric": "input_cache_write_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "6.25"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "22.50"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://developers.openai.com/api/docs/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://developers.openai.com/api/docs/guides/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "openai.responses.gpt-5.6-luna.default.global.short.2026-07-26",
+      "basis": "public_list",
+      "provider": "openai",
+      "model": "gpt-5.6-luna",
+      "endpoint": "responses",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "default",
+        "region": "global"
+      },
+      "usage_range": {
+        "metric": "request_input_tokens",
+        "minimum_inclusive": 0,
+        "maximum_inclusive": 272000
+      },
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "1.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.10"
+        },
+        {
+          "metric": "input_cache_write_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "1.25"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "6.00"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://developers.openai.com/api/docs/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://developers.openai.com/api/docs/guides/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "openai.responses.gpt-5.6-luna.default.global.long.2026-07-26",
+      "basis": "public_list",
+      "provider": "openai",
+      "model": "gpt-5.6-luna",
+      "endpoint": "responses",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "default",
+        "region": "global"
+      },
+      "usage_range": {
+        "metric": "request_input_tokens",
+        "minimum_inclusive": 272001,
+        "maximum_inclusive": null
+      },
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "2.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.20"
+        },
+        {
+          "metric": "input_cache_write_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "2.50"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "9.00"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://developers.openai.com/api/docs/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://developers.openai.com/api/docs/guides/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "anthropic.messages.claude-opus-4-8.standard.global.2026-07-26",
+      "basis": "public_list",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "endpoint": "messages",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "standard",
+        "inference_geo": "global"
+      },
+      "usage_range": null,
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "5.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.50"
+        },
+        {
+          "metric": "input_cache_write_5m_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "6.25"
+        },
+        {
+          "metric": "input_cache_write_1h_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "10.00"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "25.00"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "cache_semantics",
+          "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://platform.claude.com/docs/en/api/messages/batches",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "anthropic.messages.claude-opus-4-8.standard.us.2026-07-26",
+      "basis": "public_list",
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "endpoint": "messages",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "standard",
+        "inference_geo": "us"
+      },
+      "usage_range": null,
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "5.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.50"
+        },
+        {
+          "metric": "input_cache_write_5m_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "6.25"
+        },
+        {
+          "metric": "input_cache_write_1h_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "10.00"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "25.00"
+        }
+      ],
+      "modifiers": [
+        {
+          "name": "data_residency",
+          "multiplier": "1.10"
+        }
+      ],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "cache_semantics",
+          "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://platform.claude.com/docs/en/api/messages/batches",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "anthropic.messages.claude-sonnet-5.standard.global.introductory.2026-07-26",
+      "basis": "public_list",
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "endpoint": "messages",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": "2026-09-01T00:00:00Z",
+      "qualifiers": {
+        "service_tier": "standard",
+        "inference_geo": "global"
+      },
+      "usage_range": null,
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "2.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.20"
+        },
+        {
+          "metric": "input_cache_write_5m_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "2.50"
+        },
+        {
+          "metric": "input_cache_write_1h_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "4.00"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "10.00"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "cache_semantics",
+          "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://platform.claude.com/docs/en/api/messages/batches",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "anthropic.messages.claude-sonnet-5.standard.us.introductory.2026-07-26",
+      "basis": "public_list",
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "endpoint": "messages",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": "2026-09-01T00:00:00Z",
+      "qualifiers": {
+        "service_tier": "standard",
+        "inference_geo": "us"
+      },
+      "usage_range": null,
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "2.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.20"
+        },
+        {
+          "metric": "input_cache_write_5m_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "2.50"
+        },
+        {
+          "metric": "input_cache_write_1h_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "4.00"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "10.00"
+        }
+      ],
+      "modifiers": [
+        {
+          "name": "data_residency",
+          "multiplier": "1.10"
+        }
+      ],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "cache_semantics",
+          "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://platform.claude.com/docs/en/api/messages/batches",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "anthropic.messages.claude-sonnet-5.standard.global.2026-09-01",
+      "basis": "public_list",
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "endpoint": "messages",
+      "effective_from": "2026-09-01T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "standard",
+        "inference_geo": "global"
+      },
+      "usage_range": null,
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "3.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.30"
+        },
+        {
+          "metric": "input_cache_write_5m_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "3.75"
+        },
+        {
+          "metric": "input_cache_write_1h_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "6.00"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "15.00"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "cache_semantics",
+          "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://platform.claude.com/docs/en/api/messages/batches",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "anthropic.messages.claude-sonnet-5.standard.us.2026-09-01",
+      "basis": "public_list",
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "endpoint": "messages",
+      "effective_from": "2026-09-01T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "standard",
+        "inference_geo": "us"
+      },
+      "usage_range": null,
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "3.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.30"
+        },
+        {
+          "metric": "input_cache_write_5m_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "3.75"
+        },
+        {
+          "metric": "input_cache_write_1h_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "6.00"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "15.00"
+        }
+      ],
+      "modifiers": [
+        {
+          "name": "data_residency",
+          "multiplier": "1.10"
+        }
+      ],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "cache_semantics",
+          "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://platform.claude.com/docs/en/api/messages/batches",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "anthropic.messages.claude-haiku-4-5-20251001.standard.2026-07-26",
+      "basis": "public_list",
+      "provider": "anthropic",
+      "model": "claude-haiku-4-5-20251001",
+      "endpoint": "messages",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "standard"
+      },
+      "usage_range": null,
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "1.00"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.10"
+        },
+        {
+          "metric": "input_cache_write_5m_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "1.25"
+        },
+        {
+          "metric": "input_cache_write_1h_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "2.00"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "5.00"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "cache_semantics",
+          "url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://platform.claude.com/docs/en/api/messages/batches",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "gemini.generate-content.gemini-3.6-flash.standard.2026-07-26",
+      "basis": "public_list",
+      "provider": "gemini",
+      "model": "gemini-3.6-flash",
+      "endpoint": "generate_content",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "standard"
+      },
+      "usage_range": null,
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "1.50"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.15"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "7.50"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://ai.google.dev/api/generate-content",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "gemini.generate-content.gemini-3.5-flash.standard.2026-07-26",
+      "basis": "public_list",
+      "provider": "gemini",
+      "model": "gemini-3.5-flash",
+      "endpoint": "generate_content",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "standard"
+      },
+      "usage_range": null,
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "1.50"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.15"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "9.00"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://ai.google.dev/api/generate-content",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    },
+    {
+      "schedule_id": "gemini.generate-content.gemini-3.5-flash-lite.standard.2026-07-26",
+      "basis": "public_list",
+      "provider": "gemini",
+      "model": "gemini-3.5-flash-lite",
+      "endpoint": "generate_content",
+      "effective_from": "2026-07-26T00:00:00Z",
+      "effective_until": null,
+      "qualifiers": {
+        "service_tier": "standard"
+      },
+      "usage_range": null,
+      "rates": [
+        {
+          "metric": "input_uncached_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.30"
+        },
+        {
+          "metric": "input_cache_read_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "0.03"
+        },
+        {
+          "metric": "output_tokens",
+          "unit": "token",
+          "unit_size": 1000000,
+          "price_usd": "2.50"
+        }
+      ],
+      "modifiers": [],
+      "sources": [
+        {
+          "purpose": "rates",
+          "url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "model_semantics",
+          "url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite",
+          "reviewed_on": "2026-07-26"
+        },
+        {
+          "purpose": "usage_semantics",
+          "url": "https://ai.google.dev/api/generate-content",
+          "reviewed_on": "2026-07-26"
+        }
+      ]
+    }
+  ]
+}

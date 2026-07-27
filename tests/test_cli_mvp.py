@@ -29,7 +29,11 @@ from daita.llm.models import (
     ToolCall,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.llm.pricing import CostBasis, CostEstimate
+from daita.llm.pricing import (
+    CostBasis,
+    CostEstimate,
+    provider_reported_cost_estimate,
+)
 from daita.security import SecretReference
 
 
@@ -820,12 +824,12 @@ def test_cli_2_slash_commands_are_local_and_bounded():
             "cost unavailable",
         ),
         (
-            CostEstimate.complete(
+            provider_reported_cost_estimate(
                 Decimal("0"),
-                basis=CostBasis.PROVIDER_REPORTED,
-                rate_schedule_id="provider:test",
+                currency="USD",
+                unit="request",
             ),
-            "$0 explicit estimate as reported by the provider",
+            "provider API charge $0; local compute not estimated",
         ),
     ),
 )

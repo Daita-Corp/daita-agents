@@ -308,7 +308,7 @@ class TerminalViewState:
     notice: str = ""
     steps: int = 0
     total_tokens: int = 0
-    estimated_cost: str = "cost unavailable"
+    estimated_cost: str = "$0"
     active_task: asyncio.Task[Any] | None = None
     active_run_id: str | None = None
     run_status: str = "ready"

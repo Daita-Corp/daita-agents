@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
+from datetime import datetime, timezone
+from decimal import Decimal
 import json
 from typing import Protocol, cast
 from uuid import uuid4
@@ -26,6 +29,15 @@ from ..models import (
     ToolCall,
     ToolResultBlock,
 )
+from ..pricing import (
+    BillableQuantity,
+    CostEstimate,
+    PricingSchedule,
+    calculate_cost_estimate,
+    has_complete_pricing_coverage,
+    load_bundled_pricing_schedules,
+    validate_pricing_schedules,
+)
 
 
 class _ResponsesResource(Protocol):
@@ -41,6 +53,10 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class OpenAIResponsesProvider:
     """Translate canonical requests to the OpenAI Responses API only."""
 
@@ -52,6 +68,10 @@ class OpenAIResponsesProvider:
         max_output_tokens: int | None = None,
         client: _OpenAIClient | None = None,
         id_factory: Callable[[str], str] | None = None,
+        service_tier: str = "default",
+        region: str = "global",
+        pricing_schedules: Iterable[PricingSchedule] | None = None,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a non-empty string")
@@ -65,11 +85,25 @@ class OpenAIResponsesProvider:
             or max_output_tokens < 1
         ):
             raise ValueError("max_output_tokens must be a positive integer")
-        self.model = model
+        if service_tier != "default":
+            raise ValueError("only the default OpenAI service tier is admitted")
+        if region != "global":
+            raise ValueError("only the global OpenAI endpoint is admitted")
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        self.model = model.strip()
         self._api_key = api_key
         self._max_output_tokens = max_output_tokens
         self._client = client
         self._id_factory = _new_id if id_factory is None else id_factory
+        self._service_tier = service_tier
+        self._region = region
+        self._pricing_schedules = (
+            load_bundled_pricing_schedules()
+            if pricing_schedules is None
+            else validate_pricing_schedules(pricing_schedules)
+        )
+        self._clock = clock
 
     @property
     def provider_id(self) -> str:
@@ -83,7 +117,24 @@ class OpenAIResponsesProvider:
     def has_complete_pricing(self, request: ModelRequest) -> bool:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
-        return False
+        return has_complete_pricing_coverage(
+            self._pricing_schedules,
+            provider="openai",
+            model=self.model,
+            endpoint="responses",
+            requested_at=self._clock(),
+            qualifiers={
+                "service_tier": self._service_tier,
+                "region": self._region,
+            },
+            required_metrics=(
+                "input_uncached_tokens",
+                "input_cache_read_tokens",
+                "input_cache_write_tokens",
+                "output_tokens",
+            ),
+            usage_range_metric="request_input_tokens",
+        )
 
     @property
     def client(self) -> _OpenAIClient:
@@ -123,6 +174,7 @@ class OpenAIResponsesProvider:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         arguments = self._request_arguments(request)
+        requested_at = self._clock()
         try:
             response = await self.client.responses.create(**arguments)
         except asyncio.CancelledError:
@@ -134,7 +186,7 @@ class OpenAIResponsesProvider:
         except Exception as error:
             raise _normalize_error(error) from error
         try:
-            return self._decode_response(response)
+            return self._decode_response(response, requested_at=requested_at)
         except ModelProviderError:
             raise
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -176,6 +228,7 @@ class OpenAIResponsesProvider:
             raise TypeError("request must be a canonical ModelRequest")
         arguments = self._request_arguments(request)
         arguments["stream"] = True
+        requested_at = self._clock()
         try:
             stream = await self.client.responses.create(**arguments)
         except asyncio.CancelledError:
@@ -254,6 +307,7 @@ class OpenAIResponsesProvider:
                 }:
                     response = self._decode_response(
                         _field(event, "response"),
+                        requested_at=requested_at,
                         canonical_ids_by_index=canonical_ids_by_index,
                         canonical_ids_by_provider_call_id=(
                             canonical_ids_by_provider_call_id
@@ -294,6 +348,7 @@ class OpenAIResponsesProvider:
             "model": self.model,
             "input": _response_input(request.messages, self.provider_id),
             "include": ["reasoning.encrypted_content"],
+            "service_tier": self._service_tier,
             "store": False,
         }
         if self._max_output_tokens is not None:
@@ -330,6 +385,7 @@ class OpenAIResponsesProvider:
         self,
         response: object,
         *,
+        requested_at: datetime | None = None,
         canonical_ids_by_index: Mapping[int, str] | None = None,
         canonical_ids_by_provider_call_id: Mapping[str, str] | None = None,
     ) -> ModelResponse:
@@ -416,14 +472,58 @@ class OpenAIResponsesProvider:
             raise ValueError("response contains neither text nor function calls")
 
         response_id = _optional_text(_field(response, "id", None), "response id")
+        response_model = _required_text(
+            _field(response, "model"),
+            "response model",
+        )
+        service_tier = _optional_text(
+            _field(response, "service_tier", None),
+            "response service tier",
+        )
         provider_metadata: dict[str, object] = {}
         if replay_items:
             provider_metadata["openai_replay_items"] = replay_items
+        provider_metadata["pricing_dimensions"] = {
+            "response_model": response_model,
+            "service_tier": service_tier,
+            "region": self._region,
+        }
+        usage_value = _field(response, "usage", None)
+        usage = _decode_usage(usage_value)
+        if usage_value is not None:
+            if not _has_complete_billing_dimensions(usage_value):
+                usage = replace(
+                    usage,
+                    cost_estimate=CostEstimate.unavailable(
+                        "billing_dimensions_incomplete"
+                    ),
+                )
+            else:
+                qualifiers = (
+                    {"service_tier": service_tier, "region": self._region}
+                    if service_tier is not None
+                    else {"region": self._region}
+                )
+                usage = replace(
+                    usage,
+                    cost_estimate=calculate_cost_estimate(
+                        self._pricing_schedules,
+                        provider="openai",
+                        model=response_model,
+                        endpoint="responses",
+                        requested_at=requested_at or self._clock(),
+                        qualifiers=qualifiers,
+                        usage_values={
+                            "request_input_tokens": Decimal(usage.input_tokens)
+                        },
+                        quantities=_billable_quantities(usage),
+                    ),
+                )
         return ModelResponse(
             finish_reason=finish_reason,
             text=normalized_text,
             tool_calls=tuple(calls),
-            usage=_decode_usage(_field(response, "usage", None)),
+            usage=usage,
             provider_id=self.provider_id,
             provider_response_id=response_id,
             provider_metadata=provider_metadata,
@@ -542,16 +642,75 @@ def _decode_usage(value: object) -> ModelUsage:
         return ModelUsage()
     input_details = _field(value, "input_tokens_details", None)
     output_details = _field(value, "output_tokens_details", None)
+    input_tokens = _nonnegative_int(
+        _field(value, "input_tokens"),
+        "input tokens",
+    )
+    output_tokens = _nonnegative_int(
+        _field(value, "output_tokens"),
+        "output tokens",
+    )
+    reasoning_tokens = _nonnegative_int(
+        _field(output_details, "reasoning_tokens", 0),
+        "reasoning tokens",
+    )
+    cache_read_tokens = _nonnegative_int(
+        _field(input_details, "cached_tokens", 0),
+        "cached tokens",
+    )
+    cache_write_tokens = _nonnegative_int(
+        _field(input_details, "cache_write_tokens", 0),
+        "cache write tokens",
+    )
+    if cache_read_tokens + cache_write_tokens > input_tokens:
+        raise ValueError("OpenAI cache token subsets exceed total input tokens")
+    if reasoning_tokens > output_tokens:
+        raise ValueError("OpenAI reasoning tokens exceed total output tokens")
     return ModelUsage(
-        input_tokens=_nonnegative_int(_field(value, "input_tokens", 0), "input tokens"),
-        output_tokens=_nonnegative_int(
-            _field(value, "output_tokens", 0), "output tokens"
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+    )
+
+
+def _has_complete_billing_dimensions(value: object) -> bool:
+    input_details = _field(value, "input_tokens_details", None)
+    output_details = _field(value, "output_tokens_details", None)
+    return (
+        input_details is not None
+        and output_details is not None
+        and _field(input_details, "cached_tokens", _MISSING) is not _MISSING
+        and _field(input_details, "cache_write_tokens", _MISSING) is not _MISSING
+        and _field(output_details, "reasoning_tokens", _MISSING) is not _MISSING
+    )
+
+
+def _billable_quantities(usage: ModelUsage) -> tuple[BillableQuantity, ...]:
+    uncached = usage.input_tokens - usage.cache_read_tokens - usage.cache_write_tokens
+    if uncached < 0 or usage.reasoning_tokens > usage.output_tokens:
+        raise ValueError("OpenAI usage counters are internally inconsistent")
+    return (
+        BillableQuantity(
+            "input_uncached_tokens",
+            Decimal(uncached),
+            "token",
         ),
-        reasoning_tokens=_nonnegative_int(
-            _field(output_details, "reasoning_tokens", 0), "reasoning tokens"
+        BillableQuantity(
+            "input_cache_read_tokens",
+            Decimal(usage.cache_read_tokens),
+            "token",
         ),
-        cache_read_tokens=_nonnegative_int(
-            _field(input_details, "cached_tokens", 0), "cached tokens"
+        BillableQuantity(
+            "input_cache_write_tokens",
+            Decimal(usage.cache_write_tokens),
+            "token",
+        ),
+        BillableQuantity(
+            "output_tokens",
+            Decimal(usage.output_tokens),
+            "token",
         ),
     )
 

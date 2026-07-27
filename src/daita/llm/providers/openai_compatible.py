@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from decimal import Decimal
 import ipaddress
 import json
 import re
@@ -30,6 +32,15 @@ from ..models import (
     ToolCall,
     ToolResultBlock,
 )
+from ..pricing import (
+    BillableQuantity,
+    CostBasis,
+    PricingQualifier,
+    PricingSchedule,
+    calculate_cost_estimate,
+    has_complete_pricing_coverage,
+    validate_pricing_schedules,
+)
 
 _PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _CONTINUATION_KEY = "openai_compatible_continuation"
@@ -53,6 +64,10 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 @dataclass(slots=True)
 class _StreamedToolCall:
     canonical_id: str
@@ -74,6 +89,9 @@ class OpenAICompatibleProvider:
         max_tokens: int = 1_024,
         client: _OpenAICompatibleClient | None = None,
         id_factory: Callable[[str], str] | None = None,
+        pricing_schedules: Iterable[PricingSchedule] = (),
+        pricing_qualifiers: Mapping[str, str] | None = None,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a non-empty string")
@@ -91,6 +109,26 @@ class OpenAICompatibleProvider:
             raise ValueError("max_tokens must be a positive integer")
         if id_factory is not None and not callable(id_factory):
             raise TypeError("id_factory must be callable")
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        if pricing_qualifiers is not None and not isinstance(
+            pricing_qualifiers, Mapping
+        ):
+            raise TypeError("pricing_qualifiers must be a mapping or None")
+        if pricing_qualifiers is not None and len(pricing_qualifiers) > 16:
+            raise ValueError("pricing_qualifiers exceed their bound")
+        admitted_schedules = validate_pricing_schedules(pricing_schedules)
+        if any(
+            schedule.basis is not CostBasis.CONFIGURED_CONTRACT
+            for schedule in admitted_schedules
+        ):
+            raise ValueError(
+                "compatible endpoint schedules must use configured_contract"
+            )
+        qualifier_values = {} if pricing_qualifiers is None else pricing_qualifiers
+        admitted_qualifiers = tuple(
+            PricingQualifier(name, value) for name, value in qualifier_values.items()
+        )
         self.model = model.strip()
         self.provider = provider
         self.base_url = _validate_base_url(base_url)
@@ -98,6 +136,9 @@ class OpenAICompatibleProvider:
         self._max_tokens = max_tokens
         self._client = client
         self._id_factory = _new_id if id_factory is None else id_factory
+        self._pricing_schedules = admitted_schedules
+        self._pricing_qualifiers = admitted_qualifiers
+        self._clock = clock
 
     @property
     def provider_id(self) -> str:
@@ -111,7 +152,21 @@ class OpenAICompatibleProvider:
     def has_complete_pricing(self, request: ModelRequest) -> bool:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
-        return False
+        return has_complete_pricing_coverage(
+            self._pricing_schedules,
+            provider=self.provider,
+            model=self.model,
+            endpoint="chat_completions",
+            requested_at=self._clock(),
+            qualifiers=self._pricing_qualifiers,
+            required_metrics=(
+                "input_uncached_tokens",
+                "input_cache_read_tokens",
+                "input_cache_write_tokens",
+                "output_tokens",
+            ),
+            usage_range_metric="request_input_tokens",
+        )
 
     @property
     def client(self) -> _OpenAICompatibleClient:
@@ -154,6 +209,7 @@ class OpenAICompatibleProvider:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         arguments = self._request_arguments(request)
+        requested_at = self._clock()
         try:
             response = await self.client.chat.completions.create(**arguments)
         except asyncio.CancelledError:
@@ -165,7 +221,7 @@ class OpenAICompatibleProvider:
         except Exception as error:
             raise _normalize_error(error, self.provider) from error
         try:
-            return self._decode_response(response)
+            return self._decode_response(response, requested_at=requested_at)
         except ModelProviderError:
             raise
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -209,6 +265,7 @@ class OpenAICompatibleProvider:
         arguments = self._request_arguments(request)
         arguments["stream"] = True
         arguments["stream_options"] = {"include_usage": True}
+        requested_at = self._clock()
         try:
             raw_stream = await self.client.chat.completions.create(**arguments)
         except asyncio.CancelledError:
@@ -231,6 +288,8 @@ class OpenAICompatibleProvider:
         finish_reason: str | None = None
         usage_value: object | None = None
         response_id: str | None = None
+        response_model: str | None = None
+        service_tier: str | None = None
         iterator = cast(AsyncIterator[object], iterator_method())
         while True:
             try:
@@ -249,6 +308,22 @@ class OpenAICompatibleProvider:
                     if response_id is not None and response_id != chunk_id:
                         raise ValueError("stream response ID changed")
                     response_id = chunk_id
+                chunk_model = _optional_text(
+                    _field(chunk, "model", None),
+                    "stream response model",
+                )
+                if chunk_model is not None:
+                    if response_model is not None and response_model != chunk_model:
+                        raise ValueError("stream response model changed")
+                    response_model = chunk_model
+                chunk_service_tier = _optional_text(
+                    _field(chunk, "service_tier", None),
+                    "stream service tier",
+                )
+                if chunk_service_tier is not None:
+                    if service_tier is not None and service_tier != chunk_service_tier:
+                        raise ValueError("stream service tier changed")
+                    service_tier = chunk_service_tier
                 chunk_usage = _field(chunk, "usage", None)
                 if chunk_usage is not None:
                     usage_value = chunk_usage
@@ -382,11 +457,20 @@ class OpenAICompatibleProvider:
                 finish_reason=canonical_finish,
                 text=text,
                 tool_calls=tuple(calls),
-                usage=_decode_usage(usage_value),
+                usage=self._decode_priced_usage(
+                    usage_value,
+                    response_model=response_model,
+                    service_tier=service_tier,
+                    requested_at=requested_at,
+                ),
                 provider_id=self.provider_id,
                 provider_response_id=response_id,
                 provider_metadata={
-                    _CONTINUATION_KEY: {"provider_id": self.provider_id}
+                    _CONTINUATION_KEY: {"provider_id": self.provider_id},
+                    "pricing_dimensions": {
+                        "response_model": response_model,
+                        "service_tier": service_tier,
+                    },
                 },
             )
         except ModelProviderError:
@@ -441,7 +525,12 @@ class OpenAICompatibleProvider:
                 "canonical request cannot be translated for compatible chat",
             ) from error
 
-    def _decode_response(self, response: object) -> ModelResponse:
+    def _decode_response(
+        self,
+        response: object,
+        *,
+        requested_at: datetime | None = None,
+    ) -> ModelResponse:
         choices = _sequence(_field(response, "choices"), "response choices")
         if len(choices) != 1:
             raise ValueError("response must contain exactly one choice")
@@ -499,14 +588,66 @@ class OpenAICompatibleProvider:
             )
         finish_reason = _finish_reason(native_finish)
         response_id = _optional_text(_field(response, "id", None), "response id")
+        response_model = _optional_text(
+            _field(response, "model", None),
+            "response model",
+        )
+        service_tier = _optional_text(
+            _field(response, "service_tier", None),
+            "response service tier",
+        )
         return ModelResponse(
             finish_reason=finish_reason,
             text=content,
             tool_calls=tuple(calls),
-            usage=_decode_usage(_field(response, "usage", None)),
+            usage=self._decode_priced_usage(
+                _field(response, "usage", None),
+                response_model=response_model,
+                service_tier=service_tier,
+                requested_at=requested_at or self._clock(),
+            ),
             provider_id=self.provider_id,
             provider_response_id=response_id,
-            provider_metadata={_CONTINUATION_KEY: {"provider_id": self.provider_id}},
+            provider_metadata={
+                _CONTINUATION_KEY: {"provider_id": self.provider_id},
+                "pricing_dimensions": {
+                    "response_model": response_model,
+                    "service_tier": service_tier,
+                },
+            },
+        )
+
+    def _decode_usage(self, value: object) -> ModelUsage:
+        """Decode compatible usage; fixed providers may refine native semantics."""
+
+        return _decode_usage(value)
+
+    def _decode_priced_usage(
+        self,
+        value: object,
+        *,
+        response_model: str | None,
+        service_tier: str | None,
+        requested_at: datetime,
+    ) -> ModelUsage:
+        usage = self._decode_usage(value)
+        if value is None or not self._pricing_schedules:
+            return usage
+        qualifiers = {item.name: item.value for item in self._pricing_qualifiers}
+        if service_tier is not None and "service_tier" in qualifiers:
+            qualifiers["service_tier"] = service_tier
+        return replace(
+            usage,
+            cost_estimate=calculate_cost_estimate(
+                self._pricing_schedules,
+                provider=self.provider,
+                model=response_model or self.model,
+                endpoint="chat_completions",
+                requested_at=requested_at,
+                qualifiers=qualifiers,
+                usage_values={"request_input_tokens": Decimal(usage.input_tokens)},
+                quantities=_billable_quantities(usage),
+            ),
         )
 
 
@@ -595,22 +736,63 @@ def _decode_usage(value: object) -> ModelUsage:
         return ModelUsage()
     prompt_details = _field(value, "prompt_tokens_details", None)
     completion_details = _field(value, "completion_tokens_details", None)
+    input_tokens = _usage_int(
+        _field(value, "prompt_tokens"),
+        "prompt tokens",
+    )
+    output_tokens = _usage_int(
+        _field(value, "completion_tokens"),
+        "completion tokens",
+    )
+    reasoning_tokens = _usage_int(
+        _field(completion_details, "reasoning_tokens", 0),
+        "reasoning tokens",
+    )
+    cache_read_tokens = _usage_int(
+        _field(prompt_details, "cached_tokens", 0),
+        "cached tokens",
+    )
+    cache_write_tokens = _usage_int(
+        _field(prompt_details, "cache_write_tokens", 0),
+        "cache write tokens",
+    )
+    if cache_read_tokens + cache_write_tokens > input_tokens:
+        raise ValueError("compatible cache token subsets exceed total prompt tokens")
+    if reasoning_tokens > output_tokens:
+        raise ValueError("compatible reasoning tokens exceed completion tokens")
     return ModelUsage(
-        input_tokens=_usage_int(
-            _field(value, "prompt_tokens", 0),
-            "prompt tokens",
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+    )
+
+
+def _billable_quantities(usage: ModelUsage) -> tuple[BillableQuantity, ...]:
+    uncached = usage.input_tokens - usage.cache_read_tokens - usage.cache_write_tokens
+    if uncached < 0 or usage.reasoning_tokens > usage.output_tokens:
+        raise ValueError("compatible usage counters are internally inconsistent")
+    return (
+        BillableQuantity(
+            "input_uncached_tokens",
+            Decimal(uncached),
+            "token",
         ),
-        output_tokens=_usage_int(
-            _field(value, "completion_tokens", 0),
-            "completion tokens",
+        BillableQuantity(
+            "input_cache_read_tokens",
+            Decimal(usage.cache_read_tokens),
+            "token",
         ),
-        reasoning_tokens=_usage_int(
-            _field(completion_details, "reasoning_tokens", 0),
-            "reasoning tokens",
+        BillableQuantity(
+            "input_cache_write_tokens",
+            Decimal(usage.cache_write_tokens),
+            "token",
         ),
-        cache_read_tokens=_usage_int(
-            _field(prompt_details, "cached_tokens", 0),
-            "cached tokens",
+        BillableQuantity(
+            "output_tokens",
+            Decimal(usage.output_tokens),
+            "token",
         ),
     )
 

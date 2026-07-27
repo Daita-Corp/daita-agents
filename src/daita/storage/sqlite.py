@@ -60,6 +60,8 @@ from ..llm.pricing import (
     CostComponent,
     CostEstimate,
     CostEstimateStatus,
+    PricingModifier,
+    PricingUsageRange,
 )
 from ..loop.models import ConversationRun, LoopExit, LoopExitKind, RunInput, Transcript
 
@@ -1055,6 +1057,8 @@ _RECORD_TYPES: dict[str, type[Any]] = {
         ToolResultBlock,
         CanonicalMessage,
         ModelUsage,
+        PricingModifier,
+        PricingUsageRange,
         CostComponent,
         CostEstimate,
     )

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from decimal import Decimal
 import json
 from typing import Protocol, cast
 from uuid import uuid4
@@ -26,6 +28,14 @@ from ..models import (
     TextBlock,
     ToolCall,
     ToolResultBlock,
+)
+from ..pricing import (
+    BillableQuantity,
+    CostEstimate,
+    PricingSchedule,
+    calculate_cost_estimate,
+    load_bundled_pricing_schedules,
+    validate_pricing_schedules,
 )
 
 _CONTINUATION_KEY = "anthropic_continuation"
@@ -59,6 +69,10 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class AnthropicMessagesProvider:
     """Translate canonical requests to Anthropic's Messages API only."""
 
@@ -70,6 +84,8 @@ class AnthropicMessagesProvider:
         api_key: str | None = None,
         client: _AnthropicClient | None = None,
         id_factory: Callable[[str], str] | None = None,
+        pricing_schedules: Iterable[PricingSchedule] | None = None,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a non-empty string")
@@ -85,11 +101,19 @@ class AnthropicMessagesProvider:
             raise ValueError("api_key must be a non-empty string when provided")
         if id_factory is not None and not callable(id_factory):
             raise TypeError("id_factory must be callable")
-        self.model = model
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        self.model = model.strip()
         self.max_tokens = max_tokens
         self._api_key = api_key
         self._client = client
         self._id_factory = _new_id if id_factory is None else id_factory
+        self._pricing_schedules = (
+            load_bundled_pricing_schedules()
+            if pricing_schedules is None
+            else validate_pricing_schedules(pricing_schedules)
+        )
+        self._clock = clock
 
     @property
     def provider_id(self) -> str:
@@ -103,6 +127,9 @@ class AnthropicMessagesProvider:
     def has_complete_pricing(self, request: ModelRequest) -> bool:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        # The current request surface does not pin the actual service tier or
+        # workspace inference geography. Price the returned dimensions, but do
+        # not claim a complete preflight estimate before Anthropic responds.
         return False
 
     @property
@@ -147,6 +174,7 @@ class AnthropicMessagesProvider:
             raise TypeError("request must be a canonical ModelRequest")
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
+        requested_at = self._clock()
         try:
             response = await self.client.messages.create(**arguments)
         except asyncio.CancelledError:
@@ -158,7 +186,7 @@ class AnthropicMessagesProvider:
         except Exception as error:
             raise _normalize_error(error) from error
         try:
-            return self._decode_response(response)
+            return self._decode_response(response, requested_at=requested_at)
         except ModelProviderError:
             raise
         except (KeyError, TypeError, ValueError) as error:
@@ -198,6 +226,7 @@ class AnthropicMessagesProvider:
             raise TypeError("request must be a canonical ModelRequest")
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
+        requested_at = self._clock()
         decoder = _AnthropicStreamDecoder(
             provider_id=self.provider_id,
             id_factory=self._id_factory,
@@ -216,6 +245,12 @@ class AnthropicMessagesProvider:
                         yield canonical_event
             try:
                 response = decoder.finish()
+                response = self._with_priced_usage(
+                    response,
+                    billing=decoder.billing_usage(),
+                    response_model=decoder.response_model,
+                    requested_at=requested_at,
+                )
             except ModelProviderError:
                 raise
             except (KeyError, TypeError, ValueError) as error:
@@ -268,7 +303,12 @@ class AnthropicMessagesProvider:
             }
         return arguments
 
-    def _decode_response(self, response: object) -> ModelResponse:
+    def _decode_response(
+        self,
+        response: object,
+        *,
+        requested_at: datetime | None = None,
+    ) -> ModelResponse:
         response_type = _required_text(_field(response, "type"), "response type")
         if response_type != "message":
             raise ValueError("response type must be message")
@@ -341,6 +381,16 @@ class AnthropicMessagesProvider:
                 raise ValueError("response contains an unsupported stop_reason")
 
         provider_metadata: dict[str, object] = {}
+        response_model = _optional_text(
+            _field(response, "model", None),
+            "response model",
+        )
+        billing = _decode_anthropic_billing_usage(_field(response, "usage", None))
+        provider_metadata["pricing_dimensions"] = {
+            "response_model": response_model,
+            "service_tier": billing.service_tier,
+            "inference_geo": billing.inference_geo,
+        }
         if replay_blocks or calls:
             provider_metadata[_CONTINUATION_KEY] = {
                 "provider_id": self.provider_id,
@@ -350,14 +400,127 @@ class AnthropicMessagesProvider:
             finish_reason=finish_reason,
             text=text,
             tool_calls=tuple(calls),
-            usage=_decode_usage(_field(response, "usage", None)),
+            usage=self._priced_usage(
+                billing,
+                response_model=response_model,
+                requested_at=requested_at or self._clock(),
+            ),
             provider_id=self.provider_id,
             provider_response_id=response_id,
             provider_metadata=provider_metadata,
         )
 
+    def _with_priced_usage(
+        self,
+        response: ModelResponse,
+        *,
+        billing: _AnthropicBillingUsage,
+        response_model: str | None,
+        requested_at: datetime,
+    ) -> ModelResponse:
+        metadata = dict(response.provider_metadata)
+        metadata["pricing_dimensions"] = {
+            "response_model": response_model,
+            "service_tier": billing.service_tier,
+            "inference_geo": billing.inference_geo,
+        }
+        return replace(
+            response,
+            usage=self._priced_usage(
+                billing,
+                response_model=response_model,
+                requested_at=requested_at,
+            ),
+            provider_metadata=metadata,
+        )
+
+    def _priced_usage(
+        self,
+        billing: _AnthropicBillingUsage,
+        *,
+        response_model: str | None,
+        requested_at: datetime,
+    ) -> ModelUsage:
+        usage = billing.usage
+        if (
+            response_model is None
+            or billing.service_tier is None
+            or not billing.token_counts_complete
+            or not billing.cache_write_breakdown_complete
+        ):
+            return replace(
+                usage,
+                cost_estimate=CostEstimate.unavailable("billing_dimensions_incomplete"),
+            )
+        qualifiers = {"service_tier": billing.service_tier}
+        if response_model in {"claude-opus-4-8", "claude-sonnet-5"}:
+            if billing.inference_geo is None:
+                return replace(
+                    usage,
+                    cost_estimate=CostEstimate.unavailable(
+                        "billing_dimensions_incomplete"
+                    ),
+                )
+            qualifiers["inference_geo"] = billing.inference_geo
+        return replace(
+            usage,
+            cost_estimate=calculate_cost_estimate(
+                self._pricing_schedules,
+                provider="anthropic",
+                model=response_model,
+                endpoint="messages",
+                requested_at=requested_at,
+                qualifiers=qualifiers,
+                usage_values={
+                    "request_input_tokens": Decimal(usage.input_tokens),
+                },
+                quantities=(
+                    BillableQuantity(
+                        "input_uncached_tokens",
+                        Decimal(
+                            usage.input_tokens
+                            - usage.cache_read_tokens
+                            - usage.cache_write_tokens
+                        ),
+                        "token",
+                    ),
+                    BillableQuantity(
+                        "input_cache_read_tokens",
+                        Decimal(usage.cache_read_tokens),
+                        "token",
+                    ),
+                    BillableQuantity(
+                        "input_cache_write_5m_tokens",
+                        Decimal(billing.cache_write_5m_tokens),
+                        "token",
+                    ),
+                    BillableQuantity(
+                        "input_cache_write_1h_tokens",
+                        Decimal(billing.cache_write_1h_tokens),
+                        "token",
+                    ),
+                    BillableQuantity(
+                        "output_tokens",
+                        Decimal(usage.output_tokens),
+                        "token",
+                    ),
+                ),
+            ),
+        )
+
 
 AnthropicProvider = AnthropicMessagesProvider
+
+
+@dataclass(frozen=True, slots=True)
+class _AnthropicBillingUsage:
+    usage: ModelUsage
+    token_counts_complete: bool
+    cache_write_5m_tokens: int
+    cache_write_1h_tokens: int
+    cache_write_breakdown_complete: bool
+    service_tier: str | None
+    inference_geo: str | None
 
 
 @dataclass(slots=True)
@@ -391,6 +554,7 @@ class _AnthropicStreamDecoder:
         self._terminal = False
         self._message_delta_seen = False
         self._response_id: str | None = None
+        self._response_model: str | None = None
         self._stop_reason: str | None = None
         self._blocks: dict[int, _StreamBlockState] = {}
         self._calls: list[ToolCall] = []
@@ -400,7 +564,52 @@ class _AnthropicStreamDecoder:
         self._uncached_input_tokens = 0
         self._cache_read_tokens = 0
         self._cache_write_tokens = 0
+        self._cache_write_5m_tokens = 0
+        self._cache_write_1h_tokens = 0
+        self._cache_write_breakdown_seen = False
         self._output_tokens = 0
+        self._reasoning_tokens = 0
+        self._service_tier: str | None = None
+        self._inference_geo: str | None = None
+        self._usage_fields_seen: set[str] = set()
+
+    @property
+    def response_model(self) -> str | None:
+        return self._response_model
+
+    def billing_usage(self) -> _AnthropicBillingUsage:
+        breakdown_complete = (
+            self._cache_write_tokens == 0 and not self._cache_write_breakdown_seen
+        ) or (
+            self._cache_write_breakdown_seen
+            and self._cache_write_5m_tokens + self._cache_write_1h_tokens
+            == self._cache_write_tokens
+        )
+        return _AnthropicBillingUsage(
+            usage=ModelUsage(
+                input_tokens=(
+                    self._uncached_input_tokens
+                    + self._cache_read_tokens
+                    + self._cache_write_tokens
+                ),
+                output_tokens=self._output_tokens,
+                reasoning_tokens=self._reasoning_tokens,
+                cache_read_tokens=self._cache_read_tokens,
+                cache_write_tokens=self._cache_write_tokens,
+            ),
+            token_counts_complete={
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "output_tokens",
+            }
+            <= self._usage_fields_seen,
+            cache_write_5m_tokens=self._cache_write_5m_tokens,
+            cache_write_1h_tokens=self._cache_write_1h_tokens,
+            cache_write_breakdown_complete=breakdown_complete,
+            service_tier=self._service_tier,
+            inference_geo=self._inference_geo,
+        )
 
     def consume(
         self,
@@ -504,6 +713,7 @@ class _AnthropicStreamDecoder:
                     + self._cache_write_tokens
                 ),
                 output_tokens=self._output_tokens,
+                reasoning_tokens=self._reasoning_tokens,
                 cache_read_tokens=self._cache_read_tokens,
                 cache_write_tokens=self._cache_write_tokens,
             ),
@@ -534,6 +744,10 @@ class _AnthropicStreamDecoder:
         self._response_id = _required_text(
             _field(message, "id"),
             "stream message id",
+        )
+        self._response_model = _optional_text(
+            _field(message, "model", None),
+            "stream response model",
         )
         self._update_usage(_field(message, "usage", None))
         self._started = True
@@ -754,6 +968,30 @@ class _AnthropicStreamDecoder:
             value = _field(usage, name, _STREAM_MISSING)
             if value is not _STREAM_MISSING:
                 setattr(self, attribute, _usage_int(value, label))
+                self._usage_fields_seen.add(name)
+        cache_creation = _field(usage, "cache_creation", _STREAM_MISSING)
+        if cache_creation is not _STREAM_MISSING and cache_creation is not None:
+            self._cache_write_5m_tokens = _usage_int(
+                _field(cache_creation, "ephemeral_5m_input_tokens"),
+                "5-minute cache creation input tokens",
+            )
+            self._cache_write_1h_tokens = _usage_int(
+                _field(cache_creation, "ephemeral_1h_input_tokens"),
+                "1-hour cache creation input tokens",
+            )
+            self._cache_write_breakdown_seen = True
+        output_details = _field(usage, "output_tokens_details", _STREAM_MISSING)
+        if output_details is not _STREAM_MISSING and output_details is not None:
+            self._reasoning_tokens = _usage_int(
+                _field(output_details, "thinking_tokens", 0),
+                "thinking tokens",
+            )
+        service_tier = _field(usage, "service_tier", _STREAM_MISSING)
+        if service_tier is not _STREAM_MISSING and service_tier is not None:
+            self._service_tier = _anthropic_service_tier(service_tier)
+        inference_geo = _field(usage, "inference_geo", _STREAM_MISSING)
+        if inference_geo is not _STREAM_MISSING and inference_geo is not None:
+            self._inference_geo = _anthropic_inference_geo(inference_geo)
 
 
 def _message_input(
@@ -933,8 +1171,22 @@ def _validate_opaque_block(block: Mapping[str, object], block_type: str) -> None
 
 
 def _decode_usage(value: object) -> ModelUsage:
+    return _decode_anthropic_billing_usage(value).usage
+
+
+def _decode_anthropic_billing_usage(
+    value: object,
+) -> _AnthropicBillingUsage:
     if value is None:
-        return ModelUsage()
+        return _AnthropicBillingUsage(
+            usage=ModelUsage(),
+            token_counts_complete=False,
+            cache_write_5m_tokens=0,
+            cache_write_1h_tokens=0,
+            cache_write_breakdown_complete=True,
+            service_tier=None,
+            inference_geo=None,
+        )
     uncached_input = _usage_int(
         _field(value, "input_tokens", 0),
         "input tokens",
@@ -947,15 +1199,94 @@ def _decode_usage(value: object) -> ModelUsage:
         _field(value, "cache_creation_input_tokens", 0),
         "cache creation input tokens",
     )
-    return ModelUsage(
+    output_tokens = _usage_int(
+        _field(value, "output_tokens", 0),
+        "output tokens",
+    )
+    output_details = _field(value, "output_tokens_details", None)
+    reasoning_tokens = _usage_int(
+        _field(output_details, "thinking_tokens", 0),
+        "thinking tokens",
+    )
+    if reasoning_tokens > output_tokens:
+        raise ValueError("Anthropic thinking tokens exceed total output tokens")
+    cache_creation = _field(value, "cache_creation", None)
+    cache_write_5m = (
+        0
+        if cache_creation is None
+        else _usage_int(
+            _field(cache_creation, "ephemeral_5m_input_tokens"),
+            "5-minute cache creation input tokens",
+        )
+    )
+    cache_write_1h = (
+        0
+        if cache_creation is None
+        else _usage_int(
+            _field(cache_creation, "ephemeral_1h_input_tokens"),
+            "1-hour cache creation input tokens",
+        )
+    )
+    cache_breakdown_complete = (cache_write == 0 and cache_creation is None) or (
+        cache_creation is not None and cache_write_5m + cache_write_1h == cache_write
+    )
+    usage = ModelUsage(
         input_tokens=uncached_input + cache_read + cache_write,
-        output_tokens=_usage_int(
-            _field(value, "output_tokens", 0),
-            "output tokens",
-        ),
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
         cache_read_tokens=cache_read,
         cache_write_tokens=cache_write,
     )
+    missing = object()
+    token_counts_complete = all(
+        _field(value, name, missing) is not missing
+        for name in (
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "output_tokens",
+        )
+    )
+    service_tier_value = _field(value, "service_tier", None)
+    inference_geo_value = _field(value, "inference_geo", None)
+    return _AnthropicBillingUsage(
+        usage=usage,
+        token_counts_complete=token_counts_complete,
+        cache_write_5m_tokens=cache_write_5m,
+        cache_write_1h_tokens=cache_write_1h,
+        cache_write_breakdown_complete=cache_breakdown_complete,
+        service_tier=(
+            None
+            if service_tier_value is None
+            else _anthropic_service_tier(service_tier_value)
+        ),
+        inference_geo=(
+            None
+            if inference_geo_value is None
+            else _anthropic_inference_geo(inference_geo_value)
+        ),
+    )
+
+
+def _anthropic_service_tier(value: object) -> str:
+    if not isinstance(value, str):
+        native = getattr(value, "value", value)
+        if not isinstance(native, str):
+            raise ValueError("Anthropic service tier must be text")
+        value = native
+    normalized = value.strip().casefold()
+    if normalized not in {"standard", "priority", "batch"}:
+        raise ValueError("Anthropic service tier is unknown")
+    return normalized
+
+
+def _anthropic_inference_geo(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Anthropic inference geo must be text")
+    normalized = value.strip().casefold()
+    if normalized not in {"global", "us"}:
+        raise ValueError("Anthropic inference geo is unknown")
+    return normalized
 
 
 def _malformed_stream(error: Exception) -> ModelProviderError:
@@ -1094,6 +1425,12 @@ def _required_text(value: object, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must be a non-empty string")
     return value
+
+
+def _optional_text(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    return _required_text(value, label)
 
 
 def _text_value(value: object, label: str) -> str:

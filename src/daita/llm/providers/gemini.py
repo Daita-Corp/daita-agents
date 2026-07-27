@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Protocol, cast
 from uuid import uuid4
 
@@ -25,6 +28,15 @@ from ..models import (
     TextBlock,
     ToolCall,
     ToolResultBlock,
+)
+from ..pricing import (
+    BillableQuantity,
+    CostEstimate,
+    PricingSchedule,
+    calculate_cost_estimate,
+    has_complete_pricing_coverage,
+    load_bundled_pricing_schedules,
+    validate_pricing_schedules,
 )
 
 _CONTINUATION_KEY = "gemini_continuation"
@@ -51,6 +63,10 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class GeminiProvider:
     """Translate canonical requests to native Gemini generate-content calls."""
 
@@ -62,6 +78,8 @@ class GeminiProvider:
         max_output_tokens: int = 1_024,
         client: _GeminiClient | None = None,
         id_factory: Callable[[str], str] | None = None,
+        pricing_schedules: Iterable[PricingSchedule] | None = None,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a non-empty string")
@@ -77,11 +95,19 @@ class GeminiProvider:
             raise ValueError("max_output_tokens must be a positive integer")
         if id_factory is not None and not callable(id_factory):
             raise TypeError("id_factory must be callable")
+        if not callable(clock):
+            raise TypeError("clock must be callable")
         self.model = model.strip()
         self._api_key = api_key
         self._max_output_tokens = max_output_tokens
         self._client = client
         self._id_factory = _new_id if id_factory is None else id_factory
+        self._pricing_schedules = (
+            load_bundled_pricing_schedules()
+            if pricing_schedules is None
+            else validate_pricing_schedules(pricing_schedules)
+        )
+        self._clock = clock
 
     @property
     def provider_id(self) -> str:
@@ -95,7 +121,20 @@ class GeminiProvider:
     def has_complete_pricing(self, request: ModelRequest) -> bool:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
-        return False
+        return has_complete_pricing_coverage(
+            self._pricing_schedules,
+            provider="gemini",
+            model=self.model,
+            endpoint="generate_content",
+            requested_at=self._clock(),
+            qualifiers={"service_tier": "standard"},
+            required_metrics=(
+                "input_uncached_tokens",
+                "input_cache_read_tokens",
+                "output_tokens",
+            ),
+            usage_range_metric="request_input_tokens",
+        )
 
     @property
     def client(self) -> _GeminiClient:
@@ -136,6 +175,7 @@ class GeminiProvider:
             raise TypeError("request must be a canonical ModelRequest")
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
+        requested_at = self._clock()
         try:
             response = await self.client.aio.models.generate_content(**arguments)
         except asyncio.CancelledError:
@@ -147,7 +187,7 @@ class GeminiProvider:
         except Exception as error:
             raise _normalize_error(error) from error
         try:
-            return self._decode_response(response)
+            return self._decode_response(response, requested_at=requested_at)
         except ModelProviderError:
             raise
         except (KeyError, TypeError, ValueError) as error:
@@ -190,6 +230,7 @@ class GeminiProvider:
             raise TypeError("request must be a canonical ModelRequest")
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
+        requested_at = self._clock()
         try:
             raw_stream = await self.client.aio.models.generate_content_stream(
                 **arguments
@@ -215,6 +256,7 @@ class GeminiProvider:
         finish_reason: str | None = None
         usage_value: object | None = None
         response_id: str | None = None
+        model_version: str | None = None
         iterator = cast(AsyncIterator[object], iterator_method())
         while True:
             try:
@@ -228,6 +270,14 @@ class GeminiProvider:
             except Exception as error:
                 raise _normalize_error(error) from error
             try:
+                chunk_model = _optional_text(
+                    _field(chunk, "model_version", None),
+                    "stream model version",
+                )
+                if chunk_model is not None:
+                    if model_version is not None and model_version != chunk_model:
+                        raise ValueError("stream model version changed")
+                    model_version = chunk_model
                 chunk_id = _optional_text(
                     _field(chunk, "response_id", None),
                     "stream response id",
@@ -399,8 +449,10 @@ class GeminiProvider:
                     ],
                     "prompt_feedback": None,
                     "usage_metadata": usage_value,
+                    "model_version": model_version,
                 },
                 canonical_call_ids=canonical_call_ids,
+                requested_at=requested_at,
             )
         except ModelProviderError:
             raise
@@ -467,6 +519,7 @@ class GeminiProvider:
         response: object,
         *,
         canonical_call_ids: Sequence[str] | None = None,
+        requested_at: datetime | None = None,
     ) -> ModelResponse:
         feedback = _field(response, "prompt_feedback", None)
         block_reason = _enum_value(_field(feedback, "block_reason", None))
@@ -577,6 +630,17 @@ class GeminiProvider:
         mapped_finish = _finish_reason(native_finish)
         finish_reason = FinishReason.TOOL_CALLS if calls else mapped_finish
         metadata: dict[str, object] = {}
+        model_version = _optional_text(
+            _field(response, "model_version", None),
+            "model version",
+        )
+        usage_value = _field(response, "usage_metadata", None)
+        service_tier = _gemini_service_tier(_field(usage_value, "service_tier", None))
+        metadata["pricing_dimensions"] = {
+            "requested_model": self.model,
+            "response_model": model_version,
+            "service_tier": service_tier,
+        }
         if has_signature or calls:
             continuation: dict[str, object] = {
                 "provider_id": self.provider_id,
@@ -588,13 +652,48 @@ class GeminiProvider:
             finish_reason=finish_reason,
             text=text,
             tool_calls=tuple(calls),
-            usage=_decode_usage(_field(response, "usage_metadata", None)),
+            usage=self._decode_priced_usage(
+                usage_value,
+                requested_at=requested_at or self._clock(),
+                service_tier=service_tier,
+            ),
             provider_id=self.provider_id,
             provider_response_id=_optional_text(
                 _field(response, "response_id", None),
                 "response id",
             ),
             provider_metadata=metadata,
+        )
+
+    def _decode_priced_usage(
+        self,
+        value: object,
+        *,
+        requested_at: datetime,
+        service_tier: str,
+    ) -> ModelUsage:
+        usage = _decode_usage(value)
+        if value is None:
+            return usage
+        if not _has_complete_gemini_billing_dimensions(value):
+            return replace(
+                usage,
+                cost_estimate=CostEstimate.unavailable("billing_dimensions_incomplete"),
+            )
+        return replace(
+            usage,
+            cost_estimate=calculate_cost_estimate(
+                self._pricing_schedules,
+                provider="gemini",
+                model=self.model,
+                endpoint="generate_content",
+                requested_at=requested_at,
+                qualifiers={"service_tier": service_tier},
+                usage_values={
+                    "request_input_tokens": Decimal(usage.input_tokens),
+                },
+                quantities=_gemini_billable_quantities(usage),
+            ),
         )
 
 
@@ -821,22 +920,91 @@ def _decode_signature(value: object) -> bytes:
 def _decode_usage(value: object) -> ModelUsage:
     if value is None:
         return ModelUsage()
+    prompt_tokens = _usage_int(
+        _field(value, "prompt_token_count", 0),
+        "prompt tokens",
+    )
+    candidate_tokens = _usage_int(
+        _field(value, "candidates_token_count", 0),
+        "candidate tokens",
+    )
+    thought_tokens = _usage_int(
+        _field(value, "thoughts_token_count", 0),
+        "thought tokens",
+    )
+    cached_tokens = _usage_int(
+        _field(value, "cached_content_token_count", 0),
+        "cached tokens",
+    )
+    tool_use_tokens = _usage_int(
+        _field(value, "tool_use_prompt_token_count", 0),
+        "tool-use prompt tokens",
+    )
+    if cached_tokens > prompt_tokens:
+        raise ValueError("Gemini cached tokens exceed total prompt tokens")
+    total_tokens = prompt_tokens + tool_use_tokens + candidate_tokens + thought_tokens
+    missing = object()
+    reported_total = _field(value, "total_token_count", missing)
+    if reported_total is not missing and reported_total is not None:
+        if _usage_int(reported_total, "total tokens") != total_tokens:
+            raise ValueError("Gemini token counters do not match total tokens")
     return ModelUsage(
-        input_tokens=_usage_int(
-            _field(value, "prompt_token_count", 0),
-            "prompt tokens",
+        input_tokens=prompt_tokens + tool_use_tokens,
+        output_tokens=candidate_tokens + thought_tokens,
+        reasoning_tokens=thought_tokens,
+        cache_read_tokens=cached_tokens,
+    )
+
+
+def _has_complete_gemini_billing_dimensions(value: object) -> bool:
+    missing = object()
+    return all(
+        _field(value, name, missing) is not missing
+        for name in (
+            "prompt_token_count",
+            "candidates_token_count",
+            "total_token_count",
+        )
+    )
+
+
+def _gemini_service_tier(value: object) -> str:
+    native = _enum_value(value)
+    if native is None:
+        return "standard"
+    if not isinstance(native, str):
+        raise ValueError("Gemini service tier must be text")
+    normalized = native.strip().casefold()
+    if normalized.startswith("service_tier_"):
+        normalized = normalized.removeprefix("service_tier_")
+    if normalized in {"", "unspecified"}:
+        return "standard"
+    if normalized not in {"standard", "flex", "priority"}:
+        raise ValueError("Gemini service tier is unknown")
+    return normalized
+
+
+def _gemini_billable_quantities(
+    usage: ModelUsage,
+) -> tuple[BillableQuantity, ...]:
+    uncached = usage.input_tokens - usage.cache_read_tokens
+    if uncached < 0 or usage.reasoning_tokens > usage.output_tokens:
+        raise ValueError("Gemini usage counters are internally inconsistent")
+    return (
+        BillableQuantity(
+            "input_uncached_tokens",
+            Decimal(uncached),
+            "token",
         ),
-        output_tokens=_usage_int(
-            _field(value, "candidates_token_count", 0),
-            "candidate tokens",
+        BillableQuantity(
+            "input_cache_read_tokens",
+            Decimal(usage.cache_read_tokens),
+            "token",
         ),
-        reasoning_tokens=_usage_int(
-            _field(value, "thoughts_token_count", 0),
-            "thought tokens",
-        ),
-        cache_read_tokens=_usage_int(
-            _field(value, "cached_content_token_count", 0),
-            "cached tokens",
+        BillableQuantity(
+            "output_tokens",
+            Decimal(usage.output_tokens),
+            "token",
         ),
     )
 

@@ -169,7 +169,7 @@ def test_cost_rendering_distinguishes_every_semantic_state():
     )
 
 
-def test_current_providers_have_no_admitted_complete_pricing():
+def test_unknown_pricing_identities_fail_closed_while_xai_reports_exact_cost():
     request = _request()
     providers = (
         OpenAIProvider("test-model"),
@@ -180,13 +180,13 @@ def test_current_providers_have_no_admitted_complete_pricing():
             provider="custom",
             base_url="https://example.com/v1",
         ),
-        GrokProvider("test-model"),
         OllamaProvider("test-model"),
         MockModelProvider(()),
     )
     assert all(
         provider.has_complete_pricing(request) is False for provider in providers
     )
+    assert GrokProvider("test-model").has_complete_pricing(request) is True
 
     decoded = (
         decode_openai_usage({"input_tokens": 1, "output_tokens": 2}),

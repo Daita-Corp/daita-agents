@@ -25,7 +25,11 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.llm.pricing import CostBasis, CostEstimate
+from daita.llm.pricing import (
+    CostBasis,
+    CostEstimate,
+    provider_reported_cost_estimate,
+)
 from daita.loop import (
     AgentLoop,
     InMemoryTranscriptStore,
@@ -271,18 +275,18 @@ async def test_text_run_order_payloads_and_durable_boundaries():
     ("estimate", "expected"),
     (
         (
-            CostEstimate.complete(
+            provider_reported_cost_estimate(
                 Decimal("0"),
-                basis=CostBasis.PROVIDER_REPORTED,
-                rate_schedule_id="provider-report:test",
+                currency="USD",
+                unit="request",
             ),
             {
                 "cost_status": "complete",
                 "cost_amount_usd": "0",
                 "cost_basis": "provider_reported",
-                "cost_rate_schedule_id": "provider-report:test",
+                "cost_rate_schedule_id": None,
                 "cost_code": None,
-                "cost_display": "$0 explicit estimate as reported by the provider",
+                "cost_display": ("provider API charge $0; local compute not estimated"),
             },
         ),
         (

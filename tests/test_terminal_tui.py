@@ -389,6 +389,25 @@ def test_observer_bridge_only_enqueues_until_the_tui_consumes_events():
     assert bridge.drain() == (started,)
 
 
+def test_initial_status_reports_zero_cost_before_the_first_run():
+    state = TerminalViewState("atlas", "gpt-5.6-sol", "source")
+    glyphs = terminal_tui._terminal_glyphs(
+        terminal_tui.TerminalCapabilities("truecolor", True)
+    )
+
+    projected = terminal_tui._status_projection(
+        state,
+        width=120,
+        mode="full",
+        glyphs=glyphs,
+    )
+
+    assert state.steps == 0
+    assert state.total_tokens == 0
+    assert state.estimated_cost == "$0"
+    assert projected.right == "0 steps · 0 tokens · $0"
+
+
 def test_all_seven_observation_events_project_live_and_final_states():
     bridge = TerminalObserverBridge()
     state = TerminalViewState("atlas", "model", "source")
