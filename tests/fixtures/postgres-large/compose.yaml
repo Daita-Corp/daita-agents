@@ -1,0 +1,24 @@
+name: daita-postgres-large-fixture
+
+services:
+  postgres:
+    image: postgres:16.14-alpine
+    environment:
+      POSTGRES_DB: daita_large_fixture
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: fixture_admin_password
+    ports:
+      - "127.0.0.1:${DAITA_LARGE_POSTGRES_PORT:-55433}:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/001-daita-large-fixture.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "psql -U postgres -d daita_large_fixture -tAc 'SELECT ready FROM private.fixture_status' | grep -qx t",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+    tmpfs:
+      - /var/lib/postgresql/data

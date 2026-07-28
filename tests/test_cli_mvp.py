@@ -1791,6 +1791,138 @@ def test_cli_4_chat_knowledge_commands_are_local_and_preserve_conversation():
     local_provider.assert_consumed()
 
 
+def test_cli_4_chat_skill_alias_and_fallback_are_ordinary_model_runs():
+    for invocation in (
+        "/monthly-revenue investigate June",
+        "/skills use monthly-revenue investigate June",
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            asyncio.run(_create_agent(root, "chat-invocation"))
+            asyncio.run(_seed_knowledge(root, "chat-invocation"))
+            provider = MockModelProvider(
+                (
+                    _call("skill_view", {"name": "monthly-revenue"}),
+                    _stop("investigation complete"),
+                )
+            )
+            with patch.object(cli, "create_llm_provider", return_value=provider):
+                code, stdout, stderr = _invoke(
+                    [
+                        "--root",
+                        str(root),
+                        "chat",
+                        "chat-invocation",
+                        "--model",
+                        "mock:scripted",
+                    ],
+                    stdin=f"{invocation}\n/exit\n",
+                    tty=True,
+                )
+
+        assert code == 0
+        assert stderr == ""
+        assert _request_text(provider.requests[0]) == (invocation,)
+        assert "investigation complete" in stdout
+        provider.assert_consumed()
+
+
+def test_cli_4_chat_skill_create_is_local_and_create_only():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "chat-create"))
+        editor_path = root / "skill-editor.py"
+        editor_path.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "path = Path(sys.argv[-1])\n"
+            "path.write_text(\n"
+            "    '# customer-health-investigation\\n\\n'\n"
+            "    'Investigate customer health.\\n\\n'\n"
+            "    '## Instructions\\n\\n'\n"
+            "    'Compare account, support, and usage signals.\\n',\n"
+            "    encoding='utf-8',\n"
+            ")\n",
+            encoding="utf-8",
+        )
+        editor = shlex.join((sys.executable, str(editor_path)))
+        provider = MockModelProvider(())
+        with (
+            patch.dict(os.environ, {"EDITOR": editor}, clear=True),
+            patch.object(cli, "create_llm_provider", return_value=provider),
+        ):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "chat-create",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin="/skills create customer-health-investigation\n/exit\n",
+                tty=True,
+            )
+        knowledge = asyncio.run(_complete_knowledge(root, "chat-create"))
+
+    assert code == 0
+    assert stderr == ""
+    assert "Invoke it with /customer-health-investigation" in stdout
+    assert (
+        SkillSummary(
+            "customer-health-investigation",
+            "Investigate customer health.",
+        )
+        in knowledge[2]
+    )
+    assert provider.requests == ()
+    provider.assert_consumed()
+
+
+def test_cli_4_chat_skill_create_without_name_runs_guided_flow():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "chat-create-wizard"))
+        provider = MockModelProvider(())
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "chat-create-wizard",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin=(
+                    "/skills create\n"
+                    "customer-health-investigation\n"
+                    "Investigate customer health.\n"
+                    "Inspect the aggregate snapshot.\n"
+                    "Validate it against current evidence.\n"
+                    ".\n"
+                    "/exit\n"
+                ),
+                tty=True,
+            )
+        knowledge = asyncio.run(_complete_knowledge(root, "chat-create-wizard"))
+
+    assert code == 0
+    assert stderr == ""
+    assert "Name:" in stdout
+    assert "Description:" in stdout
+    assert "finish with a single . on its own line" in stdout
+    assert (
+        SkillSummary(
+            "customer-health-investigation",
+            "Investigate customer health.",
+        )
+        in knowledge[2]
+    )
+    assert provider.requests == ()
+    provider.assert_consumed()
+
+
 def test_cli_4_ordinary_knowledge_words_stay_messages_and_local_commands_keep_totals():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory).resolve()

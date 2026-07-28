@@ -166,7 +166,7 @@ async def test_terminal_postgresql_probe_selects_only_requested_schemas(
     result = await run_terminal_application(
         root=tmp_path,
         input_stream=io.StringIO(
-            "3\nWarehouse\ndb.example.test\n5432\nwarehouse\nreader\n\n1,3\n"
+            "3\n2\nWarehouse\ndb.example.test\n5432\nwarehouse\nreader\n\n1,3\n"
         ),
         output_stream=output,
         hidden_input=lambda prompt: "database-secret",
@@ -187,6 +187,198 @@ async def test_terminal_postgresql_probe_selects_only_requested_schemas(
     assert "Schemas selected" in text
     assert "Discovering tables and relationships" in text
     assert "Stage 4 status" not in text
+
+
+def test_postgresql_connection_url_parser_normalizes_supported_fields():
+    connection = terminal._parse_postgresql_connection_url(
+        "postgresql://reader%24:p%40ss%2Fword@[2001:db8::1]:6543/"
+        "warehouse?sslmode=verify-full"
+    )
+
+    assert connection == (
+        "2001:db8::1",
+        6543,
+        "warehouse",
+        "reader$",
+        "p@ss/word",
+        "verify-full",
+    )
+    assert terminal._parse_postgresql_connection_url(
+        "postgres://reader@db.example.test/warehouse"
+    ) == (
+        "db.example.test",
+        5432,
+        "warehouse",
+        "reader",
+        None,
+        "require",
+    )
+
+
+@pytest.mark.parametrize(
+    "connection_url",
+    (
+        "mysql://reader:secret@db.example.test/warehouse",
+        "postgresql://reader:secret@db.example.test/",
+        "postgresql://reader:secret@db.example.test:0/warehouse",
+        "postgresql://reader:secret@db.example.test:99999/warehouse",
+        "postgresql://reader:secret@one.example,two.example/warehouse",
+        "postgresql://reader:secret@db.example.test/warehouse#fragment",
+        "postgresql://reader:secret@db.example.test/warehouse?connect_timeout=10",
+        "postgresql://reader:secret@db.example.test/warehouse?sslmode=invalid",
+        "postgresql://reader:secret@db.example.test/warehouse"
+        "?sslmode=require&sslmode=disable",
+        "postgresql://reader:%ZZ@db.example.test/warehouse",
+        "postgresql://reader:p%FF@db.example.test/warehouse",
+    ),
+)
+def test_postgresql_connection_url_parser_rejects_unsupported_input(
+    connection_url: str,
+):
+    with pytest.raises(ValueError, match="PostgreSQL connection URL is invalid"):
+        terminal._parse_postgresql_connection_url(connection_url)
+
+
+def test_postgresql_connection_url_prompt_retries_without_echoing_input():
+    invalid_url = (
+        "postgresql://reader:do-not-echo@db.example.test/warehouse"
+        "?connect_timeout=10"
+    )
+    valid_url = "postgresql://reader@db.example.test/warehouse"
+    answers = iter((invalid_url, valid_url))
+    output = io.StringIO()
+
+    connection = terminal._read_postgresql_connection_url(
+        lambda prompt: next(answers),
+        output,
+    )
+
+    assert connection == (
+        "db.example.test",
+        5432,
+        "warehouse",
+        "reader",
+        None,
+        "require",
+    )
+    assert output.getvalue() == terminal._POSTGRESQL_CONNECTION_URL_ERROR + "\n"
+    assert invalid_url not in output.getvalue()
+
+
+async def test_terminal_postgresql_connection_url_uses_existing_secure_attach_flow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    keychain = _Keychain()
+    agent = await _configured_agent(tmp_path, keychain)
+    await agent.close()
+    probes: list[dict[str, Any]] = []
+    attached: list[dict[str, Any]] = []
+
+    async def fake_probe(self: Agent, **kwargs: Any) -> PostgreSQLProbeResult:
+        del self
+        probes.append(kwargs)
+        return PostgreSQLProbeResult.build(
+            (
+                ("analytics", True),
+                ("reporting", True),
+            )
+        )
+
+    async def fake_attach(self: Agent, **kwargs: Any):
+        del self
+        attached.append(kwargs)
+        return SimpleNamespace(display_name=kwargs["name"])
+
+    monkeypatch.setattr(Agent, "probe_postgresql", fake_probe)
+    monkeypatch.setattr(Agent, "attach_postgresql", fake_attach)
+    output = io.StringIO()
+    connection_url = (
+        "postgresql://reader%24:p%40ss%2Fword@db.example.test:6543/"
+        "warehouse?sslmode=verify-full"
+    )
+    hidden_prompts: list[str] = []
+
+    def hidden_input(prompt: str) -> str:
+        hidden_prompts.append(prompt)
+        return connection_url
+
+    result = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO("3\n1\nWarehouse\n1,2\n"),
+        output_stream=output,
+        hidden_input=hidden_input,
+        keychain=keychain,
+    )
+
+    assert result == 0
+    assert hidden_prompts == ["Connection URL: "]
+    assert len(probes) == 1
+    assert len(attached) == 1
+    for arguments in (probes[0], attached[0]):
+        assert arguments["host"] == "db.example.test"
+        assert arguments["port"] == 6543
+        assert arguments["database"] == "warehouse"
+        assert arguments["username"] == "reader$"
+        assert arguments["ssl_mode"] == "verify-full"
+    assert attached[0]["schemas"] == ("analytics", "reporting")
+    assert attached[0]["name"] == "Warehouse"
+    reference = attached[0]["credential"]
+    assert isinstance(reference, SecretReference)
+    assert probes[0]["credential"] == reference
+    assert keychain.values[reference.name] == "p@ss/word"
+    text = output.getvalue()
+    assert connection_url not in text
+    assert "p@ss/word" not in text
+    assert "Connection URL" in text
+    assert "Connection validated" in text
+
+
+async def test_terminal_postgresql_url_without_password_prompts_for_password(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    keychain = _Keychain()
+    agent = await _configured_agent(tmp_path, keychain)
+    await agent.close()
+    attached: list[dict[str, Any]] = []
+
+    async def fake_probe(self: Agent, **kwargs: Any) -> PostgreSQLProbeResult:
+        del self, kwargs
+        return PostgreSQLProbeResult.build((("analytics", True),))
+
+    async def fake_attach(self: Agent, **kwargs: Any):
+        del self
+        attached.append(kwargs)
+        return SimpleNamespace(display_name=kwargs["name"])
+
+    monkeypatch.setattr(Agent, "probe_postgresql", fake_probe)
+    monkeypatch.setattr(Agent, "attach_postgresql", fake_attach)
+    answers = iter(
+        (
+            "postgresql://reader@db.example.test/warehouse",
+            "separate-password",
+        )
+    )
+    hidden_prompts: list[str] = []
+
+    def hidden_input(prompt: str) -> str:
+        hidden_prompts.append(prompt)
+        return next(answers)
+
+    result = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO("3\n1\nWarehouse\n1\n"),
+        output_stream=io.StringIO(),
+        hidden_input=hidden_input,
+        keychain=keychain,
+    )
+
+    assert result == 0
+    assert hidden_prompts == ["Connection URL: ", "Password: "]
+    assert len(attached) == 1
+    reference = attached[0]["credential"]
+    assert keychain.values[reference.name] == "separate-password"
 
 
 async def test_enhanced_postgresql_schema_toggling_attaches_stable_names_only(
@@ -219,7 +411,7 @@ async def test_enhanced_postgresql_schema_toggling_attaches_stable_names_only(
 
     try:
         with create_pipe_input() as pipe:
-            pipe.send_text(" \x1b[B\x1b[B \r")
+            pipe.send_text("\x1b[B\r \x1b[B\x1b[B \r")
             await terminal._onboard_postgresql(
                 agent,
                 input_stream=io.StringIO(
@@ -326,7 +518,7 @@ async def test_enhanced_postgresql_schema_cancellation_cleans_up_and_allows_reop
                 selection_output=DummyOutput(),
             )
         )
-        pipe.send_text("\x1b[B\x1b[B\r")
+        pipe.send_text("\x1b[B\x1b[B\r\x1b[B\r")
         for _ in range(100):
             if "Connection validated" in output.getvalue():
                 break
@@ -391,14 +583,13 @@ async def test_terminal_postgresql_probe_failure_cleans_secret_and_persists_noth
 
     monkeypatch.setattr(Agent, "probe_postgresql", failed_probe)
     output = io.StringIO()
+    connection_url = "postgresql://reader:database-secret@db.example.test/warehouse"
 
     result = await run_terminal_application(
         root=tmp_path,
-        input_stream=io.StringIO(
-            "3\nWarehouse\ndb.example.test\n5432\nwarehouse\nreader\n\n"
-        ),
+        input_stream=io.StringIO("3\n1\nWarehouse\n"),
         output_stream=output,
-        hidden_input=lambda prompt: "database-secret",
+        hidden_input=lambda prompt: connection_url,
         keychain=keychain,
     )
 
@@ -406,6 +597,7 @@ async def test_terminal_postgresql_probe_failure_cleans_secret_and_persists_noth
     assert "Could not connect to PostgreSQL" in output.getvalue()
     assert diagnostic not in output.getvalue()
     assert "database-secret" not in output.getvalue()
+    assert connection_url not in output.getvalue()
     assert all("postgresql" not in account for account in keychain.values)
     reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
     try:
@@ -432,7 +624,7 @@ async def test_terminal_postgresql_selection_eof_cleans_secret_and_releases_lock
     result = await run_terminal_application(
         root=tmp_path,
         input_stream=io.StringIO(
-            "3\nWarehouse\ndb.example.test\n5432\nwarehouse\nreader\n\n"
+            "3\n2\nWarehouse\ndb.example.test\n5432\nwarehouse\nreader\n\n"
         ),
         output_stream=io.StringIO(),
         hidden_input=lambda prompt: "database-secret",
@@ -455,7 +647,7 @@ async def test_terminal_postgresql_hidden_password_interrupt_stores_nothing(
     result = await run_terminal_application(
         root=tmp_path,
         input_stream=io.StringIO(
-            "3\nWarehouse\ndb.example.test\n5432\nwarehouse\nreader\n\n"
+            "3\n2\nWarehouse\ndb.example.test\n5432\nwarehouse\nreader\n\n"
         ),
         output_stream=io.StringIO(),
         hidden_input=lambda prompt: (_ for _ in ()).throw(KeyboardInterrupt),
@@ -491,7 +683,7 @@ async def test_terminal_normalizes_database_keychain_failure_without_raw_diagnos
     result = await run_terminal_application(
         root=tmp_path,
         input_stream=io.StringIO(
-            "3\nWarehouse\ndb.example.test\n5432\nwarehouse\nreader\n\n"
+            "3\n2\nWarehouse\ndb.example.test\n5432\nwarehouse\nreader\n\n"
         ),
         output_stream=output,
         hidden_input=lambda prompt: "database-secret",

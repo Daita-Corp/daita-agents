@@ -37,7 +37,29 @@ from .llm import (
 )
 from .llm.profiles import reviewed_model_profile
 from .security import SecretReference
+from .skills import validate_skill_name
 from .terminal import run_terminal_application
+
+_SKILL_DESCRIPTION_PLACEHOLDER = "Describe when the agent should use this skill."
+_SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
+_BUILTIN_CHAT_COMMANDS = frozenset(
+    {
+        "/catalog",
+        "/conversation",
+        "/exit",
+        "/help",
+        "/memory",
+        "/model",
+        "/new",
+        "/resume",
+        "/settings",
+        "/source",
+        "/sources",
+        "/skills",
+        "/status",
+        "/user",
+    }
+)
 
 
 class _SourceSummary(Protocol):
@@ -326,8 +348,11 @@ def _write_help() -> None:
     print("  /user edit")
     print("  /skills")
     print("  /skills show <name>")
+    print("  /skills create [name]")
     print("  /skills edit <name>")
     print("  /skills delete <name>")
+    print("  /skills use <name> [request]")
+    print("  /<skill-name> [request]")
     print("  /exit")
 
 
@@ -455,7 +480,7 @@ def _write_skills(skills: Sequence[SkillSummary]) -> None:
         print("  (none)")
         return
     for skill in skills:
-        print(f"  {skill.name}: {skill.description}")
+        print(f"  /{skill.name}: {skill.description}")
 
 
 def _write_skill(skill: Skill) -> None:
@@ -483,6 +508,122 @@ async def _edit_skill(agent: Agent, name: str) -> bool:
     edited = _edit_document(document, agent_home=agent.home)
     description, instructions = _parse_skill_editor_document(name, edited)
     return await agent.save_skill(name, description, instructions)
+
+
+async def _create_skill(agent: Agent, name: str) -> bool:
+    validate_skill_name(name)
+    if await agent.read_skill(name) is not None:
+        raise ValueError(f"skill already exists: {name}")
+    seed = _render_skill_editor_document(
+        name,
+        _SKILL_DESCRIPTION_PLACEHOLDER,
+        _SKILL_INSTRUCTIONS_PLACEHOLDER,
+    )
+    draft = seed
+    while True:
+        edited = _edit_document(draft, agent_home=agent.home)
+        if edited == seed:
+            print("Skill creation cancelled; template was unchanged.")
+            return False
+        try:
+            description, instructions = _parse_skill_editor_document(name, edited)
+            if description == _SKILL_DESCRIPTION_PLACEHOLDER:
+                raise ValueError("replace the description placeholder")
+            if instructions == _SKILL_INSTRUCTIONS_PLACEHOLDER:
+                raise ValueError("replace the instructions placeholder")
+            Skill(name, description, instructions)
+        except ValueError as error:
+            _write_local_diagnostic(f"Skill document is invalid: {error}")
+            draft = edited
+            try:
+                answer = input("Reopen editor? [Y/n]")
+            except EOFError:
+                print()
+                answer = "n"
+            if answer.strip().casefold() in {"n", "no"}:
+                print("Skill creation cancelled.")
+                return False
+            continue
+        if await agent.read_skill(name) is not None:
+            raise ValueError(f"skill already exists: {name}")
+        changed = await agent.save_skill(name, description, instructions)
+        if not changed:
+            raise RuntimeError("new skill was not persisted")
+        print(f"Skill {name!r} created. Invoke it with /{name}.")
+        return True
+
+
+async def _create_skill_wizard(agent: Agent) -> bool:
+    print("Create skill")
+    print("Enter /cancel at any prompt to stop.")
+    while True:
+        try:
+            name = input("Name:").strip()
+        except EOFError:
+            print()
+            print("Skill creation cancelled.")
+            return False
+        if name.casefold() == "/cancel":
+            print("Skill creation cancelled.")
+            return False
+        try:
+            validate_skill_name(name)
+            if await agent.read_skill(name) is not None:
+                raise ValueError(f"skill already exists: {name}")
+        except ValueError as error:
+            _write_local_diagnostic(f"Invalid name: {error}")
+            continue
+        break
+
+    while True:
+        try:
+            description = input("Description:").strip()
+        except EOFError:
+            print()
+            print("Skill creation cancelled.")
+            return False
+        if description.casefold() == "/cancel":
+            print("Skill creation cancelled.")
+            return False
+        try:
+            Skill(name, description, _SKILL_INSTRUCTIONS_PLACEHOLDER)
+        except ValueError as error:
+            _write_local_diagnostic(f"Invalid description: {error}")
+            continue
+        break
+
+    while True:
+        print("Instructions (finish with a single . on its own line):")
+        instruction_lines: list[str] = []
+        while True:
+            try:
+                line = input(">")
+            except EOFError:
+                print()
+                print("Skill creation cancelled.")
+                return False
+            if line.casefold() == "/cancel":
+                print("Skill creation cancelled.")
+                return False
+            if line == ".":
+                break
+            instruction_lines.append(line)
+        instructions = "\n".join(instruction_lines).strip()
+        try:
+            Skill(name, description, instructions)
+        except ValueError as error:
+            _write_local_diagnostic(f"Invalid instructions: {error}")
+            print("Re-enter the instructions body.")
+            continue
+        break
+
+    if await agent.read_skill(name) is not None:
+        raise ValueError(f"skill already exists: {name}")
+    changed = await agent.save_skill(name, description, instructions)
+    if not changed:
+        raise RuntimeError("new skill was not persisted")
+    print(f"Skill {name!r} created. Invoke it with /{name}.")
+    return True
 
 
 async def _confirm_skill_deletion(name: str) -> bool:
@@ -517,6 +658,12 @@ async def _handle_knowledge_chat_command(parts: list[str], agent: Agent) -> bool
             raise ValueError(f"skill not found: {parts[2]}")
         _write_skill(skill)
         return True
+    if len(parts) == 2 and parts[1] == "create":
+        await _create_skill_wizard(agent)
+        return True
+    if len(parts) == 3 and parts[1] == "create":
+        await _create_skill(agent, parts[2])
+        return True
     if len(parts) == 3 and parts[1] == "edit":
         changed = await _edit_skill(agent, parts[2])
         print(f"Skill {parts[2]!r} {'updated' if changed else 'unchanged'}.")
@@ -528,8 +675,39 @@ async def _handle_knowledge_chat_command(parts: list[str], agent: Agent) -> bool
         deleted = await agent.delete_skill(parts[2])
         print(f"Skill {parts[2]!r} {'deleted' if deleted else 'not found'}.")
         return True
-    _write_local_diagnostic("Usage: /skills [show <name>|edit <name>|delete <name>]")
+    _write_local_diagnostic(
+        "Usage: /skills [show <name>|create [name]|edit <name>|"
+        "delete <name>|use <name> [request]]"
+    )
     return True
+
+
+async def _skill_invocation_message(agent: Agent, message: str) -> str | None:
+    parts = message.split()
+    if not parts:
+        return None
+    command = parts[0]
+    if command == "/skills" and len(parts) >= 2 and parts[1] == "use":
+        if len(parts) < 3:
+            raise ValueError("usage: /skills use <name> [request]")
+        skill_name = parts[2]
+        try:
+            skill = await agent.read_skill(skill_name)
+        except ValueError as error:
+            raise ValueError(f"invalid skill name {skill_name!r}: {error}") from error
+        if skill is None:
+            raise ValueError(f"skill not found: {skill_name}")
+        return message
+    if command in _BUILTIN_CHAT_COMMANDS or not command.startswith("/"):
+        return None
+    skill_name = command[1:]
+    if not skill_name:
+        return None
+    try:
+        skill = await agent.read_skill(skill_name)
+    except ValueError:
+        return None
+    return message if skill is not None else None
 
 
 async def _prompt_for_exact_approval(
@@ -669,17 +847,23 @@ async def _chat(args: argparse.Namespace) -> int:
             if not message:
                 continue
             if message.startswith("/"):
-                should_exit, conversation_id = await _handle_chat_command(
-                    message,
-                    agent=agent,
-                    model_id=args.model,
-                    state_root=state_root,
-                    conversation_id=conversation_id,
-                    totals=totals,
-                )
-                if should_exit:
-                    break
-                continue
+                try:
+                    skill_invocation = await _skill_invocation_message(agent, message)
+                except ValueError as error:
+                    _write_local_diagnostic(f"Skill invocation failed: {error}")
+                    continue
+                if skill_invocation is None:
+                    should_exit, conversation_id = await _handle_chat_command(
+                        message,
+                        agent=agent,
+                        model_id=args.model,
+                        state_root=state_root,
+                        conversation_id=conversation_id,
+                        totals=totals,
+                    )
+                    if should_exit:
+                        break
+                    continue
 
             creates_conversation = conversation_id is None
             result = await agent.run(message, conversation_id=conversation_id)

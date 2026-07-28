@@ -53,6 +53,8 @@ _STARTUP_WORDMARK = (
 _SLASH_COMMAND_COMPLETIONS = (
     ("/model", "/model", "Choose or validate the active model"),
     ("/sources", "/sources", "List registered data sources"),
+    ("/source", "/source", "Choose the active query source"),
+    ("/source use ", "/source use <name>", "Use a source for new conversations"),
     ("/source add", "/source add", "Add a data source"),
     ("/source refresh ", "/source refresh <id>", "Refresh a source catalog"),
     ("/catalog", "/catalog", "Show the current catalog summary"),
@@ -62,6 +64,12 @@ _SLASH_COMMAND_COMPLETIONS = (
     ("/memory", "/memory", "View or edit agent memory"),
     ("/user", "/user", "View or edit the user profile"),
     ("/skills", "/skills", "List available skills"),
+    ("/skills create", "/skills create", "Start guided skill creation"),
+    (
+        "/skills use ",
+        "/skills use <name> [request]",
+        "Invoke a skill by name",
+    ),
     ("/status", "/status", "Show current agent status"),
     ("/conversation", "/conversation", "Show the current conversation ID"),
     ("/help", "/help", "Show command help"),
@@ -77,6 +85,10 @@ _SLASH_COMMAND_INSERTIONS = tuple(
 _SLASH_COMMAND_DESCRIPTIONS = tuple(
     (insertion, description)
     for insertion, _display, description in _SLASH_COMMAND_COMPLETIONS
+)
+_BUILTIN_SLASH_COMMAND_ROOTS = frozenset(
+    display.split(maxsplit=1)[0]
+    for _insertion, display, _description in _SLASH_COMMAND_COMPLETIONS
 )
 _STARTUP_QUICK_ACTIONS = tuple(
     command
@@ -96,6 +108,23 @@ _STARTUP_SECRET_PATTERN = re.compile(
     r"(?i)\b(api[_-]?key|authorization|credential|password|"
     r"private[_-]?key|secret|token)\b(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|\S+)"
 )
+
+
+def _slash_completion_maps(
+    skill_completions: Sequence[tuple[str, str]],
+) -> tuple[dict[str, str], dict[str, str]]:
+    display = dict(_SLASH_COMMAND_INSERTIONS)
+    descriptions = dict(_SLASH_COMMAND_DESCRIPTIONS)
+    for name, description in skill_completions:
+        command = f"/{name}"
+        if command in _BUILTIN_SLASH_COMMAND_ROOTS:
+            continue
+        insertion = f"{command} "
+        display[insertion] = command
+        descriptions[insertion] = description
+    return display, descriptions
+
+
 _PASTED_TEXT_PLACEHOLDER_PATTERN = re.compile(r"\[Pasted Text #[1-9][0-9]*\]")
 _CAPABILITY_LABELS = {
     "catalog.search": "Search catalog",
@@ -113,6 +142,10 @@ _CAPABILITY_LABELS = {
 
 class TerminalTUIUnavailable(RuntimeError):
     """The enhanced application could not be admitted for this terminal."""
+
+
+class TerminalUserInputError(ValueError):
+    """One recoverable composer input error that should not close the shell."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -795,6 +828,8 @@ class TerminalCommandResult:
     action: str | None = None
     output: str = ""
     presentation: str = "local"
+    source_summary: str | None = None
+    model_message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1094,6 +1129,7 @@ def _status_projection(
     show_cost = True
     show_tokens = True
     shortened_model = False
+    source_limit = 96
     show_source = bool(source)
     show_steps = True
     show_model = True
@@ -1108,7 +1144,14 @@ def _status_projection(
                 18,
                 marker="..." if not glyphs.top_left.startswith("╭") else "…",
             )
+        projected_source, _source_truncated = _truncate_display_text(
+            source,
+            source_limit,
+            marker="..." if not glyphs.top_left.startswith("╭") else "…",
+        )
         left_parts = [agent]
+        if show_source:
+            left_parts.append(f"source: {projected_source}")
         if show_model:
             left_parts.append(projected_model)
         left_parts.append(f"{state_glyph} {state_word}")
@@ -1121,7 +1164,7 @@ def _status_projection(
             right_parts.append(state.estimated_cost)
         left = glyphs.separator.join(left_parts)
         right = glyphs.separator.join(right_parts)
-        header_source = source if show_source else ""
+        header_source = projected_source if show_source else ""
         return left, right, header_source
 
     def fits() -> bool:
@@ -1140,9 +1183,9 @@ def _status_projection(
     if mode == "compact":
         forced = 1
     elif mode == "narrow":
-        forced = 4
+        forced = 5
     for index, field_name in enumerate(
-        ("cost", "tokens", "shorten_model", "source_summary"),
+        ("cost", "tokens", "shorten_model", "model", "steps", "shorten_source"),
         start=1,
     ):
         if fits() and index > forced:
@@ -1153,22 +1196,28 @@ def _status_projection(
             show_tokens = False
         elif field_name == "shorten_model":
             shortened_model = True
+        elif field_name == "model":
+            show_model = False
+        elif field_name == "steps":
+            show_steps = False
         else:
-            show_source = False
+            source_limit = min(source_limit, 24)
         collapsed.append(field_name)
 
-    if not fits() or mode == "narrow":
-        show_steps = False
-        collapsed.append("steps")
-    if not fits() or mode == "narrow":
-        show_model = False
-        collapsed.append("model")
     left, right, header_source = current_text()
-    if _display_width(left) > budget:
-        available = max(
-            1,
-            budget - _display_width(f"{glyphs.separator}{state_glyph} {state_word}"),
+    if _display_width(left) > budget and show_source:
+        fixed = (
+            _display_width(agent)
+            + _display_width(f"{glyphs.separator}source: ")
+            + _display_width(f"{glyphs.separator}{state_glyph} {state_word}")
+            + (_display_width(f"{glyphs.separator}{model}") if show_model else 0)
         )
+        source_limit = max(1, budget - fixed)
+        if "shorten_source" not in collapsed:
+            collapsed.append("shorten_source")
+        left, right, header_source = current_text()
+    if _display_width(left) > budget:
+        available = max(1, budget - (_display_width(left) - _display_width(agent)))
         agent, _truncated = _truncate_display_text(
             agent,
             available,
@@ -1333,6 +1382,10 @@ async def run_terminal_tui(
     load_transcript: Callable[[str], Awaitable[Transcript]] | None = None,
     handle_command: Callable[[str, str | None], Awaitable[TerminalCommandResult]],
     command_requires_suspension: Callable[[str], bool] | None = None,
+    skill_completions: Sequence[tuple[str, str]] = (),
+    load_skill_completions: (
+        Callable[[], Awaitable[Sequence[tuple[str, str]]]] | None
+    ) = None,
     input_stream: TextIO,
     output_stream: TextIO,
     suspend_bridge: TerminalSuspendBridge,
@@ -1386,6 +1439,8 @@ async def run_terminal_tui(
             load_transcript=load_transcript,
             handle_command=handle_command,
             command_requires_suspension=command_requires_suspension,
+            skill_completions=skill_completions,
+            load_skill_completions=load_skill_completions,
             observer_bridge=observer_bridge,
             approval_bridge=approval_bridge,
             enhanced_input=enhanced_input,
@@ -1549,6 +1604,10 @@ def _create_application(
     load_transcript: Callable[[str], Awaitable[Transcript]] | None,
     handle_command: Callable[[str, str | None], Awaitable[TerminalCommandResult]],
     command_requires_suspension: Callable[[str], bool] | None = None,
+    skill_completions: Sequence[tuple[str, str]] = (),
+    load_skill_completions: (
+        Callable[[], Awaitable[Sequence[tuple[str, str]]]] | None
+    ) = None,
     observer_bridge: TerminalObserverBridge,
     approval_bridge: TerminalApprovalBridge | None,
     enhanced_input: Any,
@@ -1561,8 +1620,9 @@ def _create_application(
     capabilities = _terminal_capabilities(enhanced_output)
     glyphs = _terminal_glyphs(capabilities)
     keys = runtime["KeyBindings"]()
-    completion_display = dict(_SLASH_COMMAND_INSERTIONS)
-    completion_descriptions = dict(_SLASH_COMMAND_DESCRIPTIONS)
+    completion_display, completion_descriptions = _slash_completion_maps(
+        skill_completions
+    )
     composer_buffer: Any = None
 
     def slash_completion_is_active() -> bool:
@@ -1591,6 +1651,26 @@ def _create_application(
         history=runtime["InMemoryHistory"](),
     )
     composer_buffer = composer.buffer
+
+    def set_skill_completions(values: Sequence[tuple[str, str]]) -> None:
+        display, descriptions = _slash_completion_maps(values)
+        composer.buffer.completer = runtime["WordCompleter"](
+            tuple(display),
+            ignore_case=True,
+            display_dict=display,
+            meta_dict=descriptions,
+            sentence=True,
+        )
+
+    async def refresh_skill_completions() -> None:
+        if load_skill_completions is None:
+            return
+        try:
+            values = await load_skill_completions()
+        except (asyncio.CancelledError, Exception):
+            return
+        set_skill_completions(values)
+
     enforcing_bound = False
     last_valid_composer_document = composer.buffer.document
     pasted_texts: dict[str, str] = {}
@@ -1817,7 +1897,12 @@ def _create_application(
     def invalidate(application: Any) -> None:
         application.invalidate()
 
-    async def execute_message(application: Any, message: str) -> None:
+    async def execute_message(
+        application: Any,
+        message: str,
+        *,
+        settle_task: bool = True,
+    ) -> None:
         try:
             result = await run_message(message, state.conversation_id)
             _project_pending_events(observer_bridge, state)
@@ -1853,14 +1938,19 @@ def _create_application(
             _project_pending_events(observer_bridge, state)
             state.settle_cancelled_run()
             state.notice = "Run interrupted; returning to the composer."
+        except TerminalUserInputError as error:
+            state.append_plain("local", str(error))
+            state.run_status = "ready"
         except BaseException as error:
             application.exit(exception=error)
             return
         finally:
-            _project_pending_events(observer_bridge, state)
-            state.running = False
-            state.active_task = None
-            invalidate(application)
+            if settle_task:
+                await refresh_skill_completions()
+                _project_pending_events(observer_bridge, state)
+                state.running = False
+                state.active_task = None
+                invalidate(application)
 
     async def execute_command(application: Any, command: str) -> None:
         try:
@@ -1872,6 +1962,20 @@ def _create_application(
             else:
                 result = await handle_command(command, state.conversation_id)
             state.conversation_id = result.conversation_id
+            if result.source_summary is not None:
+                state.source_summary = _sanitize_terminal_text(
+                    result.source_summary,
+                    maximum=128,
+                    preserve_lines=False,
+                    fallback="source",
+                )
+            if result.model_message is not None:
+                await execute_message(
+                    application,
+                    result.model_message,
+                    settle_task=False,
+                )
+                return
             state.append_local(result.presentation, result.output)
             if result.action is not None:
                 application.exit(
@@ -1886,6 +1990,8 @@ def _create_application(
             application.exit(exception=error)
             return
         finally:
+            await refresh_skill_completions()
+            _project_pending_events(observer_bridge, state)
             state.running = False
             state.active_task = None
             invalidate(application)
@@ -4613,6 +4719,7 @@ __all__ = [
     "TerminalStartupInfo",
     "TerminalSuspendBridge",
     "TerminalTUIUnavailable",
+    "TerminalUserInputError",
     "TerminalViewState",
     "ToolCardDetails",
     "ToolCardState",

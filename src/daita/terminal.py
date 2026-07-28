@@ -16,6 +16,7 @@ import sys
 import tempfile
 from typing import Any, cast, TextIO
 import unicodedata
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from . import ApprovalDecision, ApprovalRequest, __version__
 from .agent import (
@@ -26,10 +27,12 @@ from .agent import (
     AgentNotFoundError,
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
+    SourceSelectionError,
 )
 from .config import AgentConfig
 from .errors import ConfigError, LLMError
 from .security import KeychainStore
+from .skills import Skill, validate_skill_name
 from . import terminal_tui
 from .terminal_selection import (
     SelectionCancelled,
@@ -170,6 +173,9 @@ _VALIDATION_ERRORS = {
     "provider_unavailable": "The provider could not be reached.",
     "timeout": "The provider did not respond before the timeout.",
     "invalid_request": "The provider rejected this model configuration.",
+    "output_limit": (
+        "The model exhausted its validation output budget before calling the tool."
+    ),
 }
 _MODEL_SETUP_ERRORS = {
     "secret_provider_unavailable": (
@@ -192,6 +198,10 @@ _SOURCE_TYPES = (
     ("sqlite", "SQLite file"),
     ("directory", "Local CSV/JSON directory"),
     ("postgresql", "PostgreSQL"),
+)
+_POSTGRESQL_CONNECTION_METHODS = (
+    ("url", "Connection URL"),
+    ("fields", "Individual fields"),
 )
 _POSTGRESQL_ERRORS = {
     "postgresql_connect_failed": (
@@ -226,11 +236,37 @@ _SOURCE_SETUP_ERRORS = {
 _SSL_MODES = frozenset(
     {"disable", "prefer", "allow", "require", "verify-ca", "verify-full"}
 )
+_MAX_POSTGRESQL_CONNECTION_URL_BYTES = 64 * 1_024
+_POSTGRESQL_CONNECTION_URL_ERROR = (
+    "Enter a valid postgres:// or postgresql:// URL with a username, host, "
+    "and database. Only the sslmode query parameter is supported."
+)
 _MAX_CHAT_INPUT_CHARACTERS = 16_384
 _MAX_DISPLAY_CHARACTERS = 16_384
 _MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
+_MAX_SOURCE_PICKER_OPTIONS = 128
 _MAX_CATALOG_PREVIEW = 12
 _MAX_SOURCE_PREVIEW = 8
+_SKILL_DESCRIPTION_PLACEHOLDER = "Describe when the agent should use this skill."
+_SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
+_BUILTIN_SLASH_COMMANDS = frozenset(
+    {
+        "/catalog",
+        "/conversation",
+        "/exit",
+        "/help",
+        "/memory",
+        "/model",
+        "/new",
+        "/resume",
+        "/settings",
+        "/source",
+        "/sources",
+        "/skills",
+        "/status",
+        "/user",
+    }
+)
 _SOURCE_TYPE_LABELS = {
     "local-directory": "CSV/JSON",
     "postgresql": "PostgreSQL",
@@ -341,6 +377,15 @@ async def run_terminal_application(
             )
         else:
             summary = await agent.catalog_summary()
+
+        if len(sources) > 1 and await agent.active_source() is None:
+            await _select_query_source(
+                agent,
+                input_stream,
+                output_stream,
+                selection_input=selection_input,
+                selection_output=selection_output,
+            )
 
         conversation_id: str | None = None
         while True:
@@ -1056,6 +1101,126 @@ async def _select_source_type(
     )
 
 
+async def _select_query_source(
+    agent: Agent,
+    input_stream: TextIO,
+    output_stream: TextIO,
+    *,
+    conversation_id: str | None = None,
+    selection_input: Any = None,
+    selection_output: Any = None,
+) -> Any:
+    sources = tuple(source for source in await agent.list_sources() if source.active)
+    if not sources:
+        raise SourceSelectionError(
+            "No data sources are attached. Use /source add first."
+        )
+    current = await _active_source_for(
+        agent,
+        conversation_id=conversation_id,
+    )
+    ordered_sources = tuple(
+        sorted(
+            sources,
+            key=lambda source: (
+                current is None or source.id != current.id,
+                source.display_name.casefold(),
+                source.id,
+            ),
+        )
+    )
+    if len(ordered_sources) > _MAX_SOURCE_PICKER_OPTIONS:
+        print(
+            f"Showing {_MAX_SOURCE_PICKER_OPTIONS} sources. Use "
+            "/source use <name> for another source.",
+            file=output_stream,
+        )
+    selected_id = await select_one(
+        "Select query source",
+        tuple(
+            SelectionOption(
+                source.id,
+                source.display_name,
+                description=(
+                    f"{_SOURCE_TYPE_LABELS.get(source.adapter_id, source.adapter_id)}"
+                    + (
+                        " · current"
+                        if current is not None and source.id == current.id
+                        else ""
+                    )
+                ),
+                search_terms=(source.adapter_id, source.id),
+            )
+            for source in ordered_sources[:_MAX_SOURCE_PICKER_OPTIONS]
+        ),
+        input_stream=input_stream,
+        output_stream=output_stream,
+        enhanced_input=selection_input,
+        enhanced_output=selection_output,
+    )
+    return await agent.select_source(selected_id)
+
+
+async def _active_source_for(
+    agent: Agent,
+    *,
+    conversation_id: str | None,
+    sources: tuple[Any, ...] | None = None,
+) -> Any:
+    active_source = getattr(agent, "active_source", None)
+    if callable(active_source):
+        return await active_source(conversation_id=conversation_id)
+    resolved_sources = (
+        tuple(source for source in await agent.list_sources() if source.active)
+        if sources is None
+        else sources
+    )
+    return resolved_sources[0] if len(resolved_sources) == 1 else None
+
+
+async def _source_status_label(
+    agent: Agent,
+    *,
+    conversation_id: str | None,
+    sources: tuple[Any, ...] | None = None,
+) -> str:
+    selected = await _active_source_for(
+        agent,
+        conversation_id=conversation_id,
+        sources=sources,
+    )
+    if selected is not None:
+        return _safe_display(selected.display_name, fallback="source")
+    resolved_sources = (
+        tuple(source for source in await agent.list_sources() if source.active)
+        if sources is None
+        else sources
+    )
+    if len(resolved_sources) == 1:
+        return _safe_display(resolved_sources[0].display_name, fallback="source")
+    return "select source" if resolved_sources else "none"
+
+
+async def _message_source_override(
+    agent: Agent,
+    message: str,
+) -> tuple[str, str | None]:
+    selector_token, separator, remainder = message.partition(" ")
+    if not selector_token.startswith("@") or len(selector_token) == 1:
+        return message, None
+    selector = selector_token[1:]
+    try:
+        source = await agent.resolve_source(selector)
+    except SourceSelectionError as error:
+        raise terminal_tui.TerminalUserInputError(str(error)) from error
+    question = remainder.strip() if separator else ""
+    if not question:
+        raise terminal_tui.TerminalUserInputError(
+            "A source override must be followed by a question."
+        )
+    return question, source.id
+
+
 async def _onboard_postgresql(
     agent: Agent,
     *,
@@ -1065,17 +1230,32 @@ async def _onboard_postgresql(
     selection_input: Any = None,
     selection_output: Any = None,
 ) -> Any:
+    connection_method = await _select_postgresql_connection_method(
+        input_stream,
+        output_stream,
+        selection_input=selection_input,
+        selection_output=selection_output,
+    )
     name = _read_required("Display name: ", input_stream, output_stream)
-    host = _read_required("Host: ", input_stream, output_stream)
-    port = _read_postgresql_port(input_stream, output_stream)
-    database = _read_required("Database: ", input_stream, output_stream)
-    username = _read_required("Username: ", input_stream, output_stream)
-    password: str | None = None
+    password: str | None
+    if connection_method == "url":
+        host, port, database, username, password, ssl_mode = (
+            _read_postgresql_connection_url(
+                hidden_input,
+                output_stream,
+            )
+        )
+    else:
+        host = _read_required("Host: ", input_stream, output_stream)
+        port = _read_postgresql_port(input_stream, output_stream)
+        database = _read_required("Database: ", input_stream, output_stream)
+        username = _read_required("Username: ", input_stream, output_stream)
+        password = None
+        ssl_mode = _read_ssl_mode(input_stream, output_stream)
     while not password:
         password = hidden_input("Password: ")
         if not password:
             print("Password cannot be empty.", file=output_stream)
-    ssl_mode = _read_ssl_mode(input_stream, output_stream)
     reference = None
     attached = False
     try:
@@ -1140,6 +1320,124 @@ async def _onboard_postgresql(
         password = None
         if reference is not None and not attached:
             await agent.delete_postgresql_password(reference)
+
+
+async def _select_postgresql_connection_method(
+    input_stream: TextIO,
+    output_stream: TextIO,
+    *,
+    selection_input: Any = None,
+    selection_output: Any = None,
+) -> str:
+    print(file=output_stream)
+    return await select_one(
+        "How do you want to connect?",
+        tuple(
+            SelectionOption(method, label)
+            for method, label in _POSTGRESQL_CONNECTION_METHODS
+        ),
+        input_stream=input_stream,
+        output_stream=output_stream,
+        enhanced_input=selection_input,
+        enhanced_output=selection_output,
+    )
+
+
+def _read_postgresql_connection_url(
+    hidden_input: Callable[[str], str],
+    output_stream: TextIO,
+) -> tuple[str, int, str, str, str | None, str]:
+    while True:
+        value = hidden_input("Connection URL: ")
+        try:
+            return _parse_postgresql_connection_url(value)
+        except ValueError:
+            print(_POSTGRESQL_CONNECTION_URL_ERROR, file=output_stream)
+        finally:
+            value = ""
+
+
+def _parse_postgresql_connection_url(
+    value: str,
+) -> tuple[str, int, str, str, str | None, str]:
+    if not isinstance(value, str):
+        raise ValueError("PostgreSQL connection URL must be text")
+    try:
+        encoded_length = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise ValueError("PostgreSQL connection URL is invalid") from None
+    if (
+        not value
+        or encoded_length > _MAX_POSTGRESQL_CONNECTION_URL_BYTES
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError("PostgreSQL connection URL is invalid")
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = 5432 if parsed.port is None else parsed.port
+        raw_username = parsed.username
+        raw_password = parsed.password
+    except (TypeError, ValueError):
+        raise ValueError("PostgreSQL connection URL is invalid") from None
+    if (
+        parsed.scheme not in {"postgres", "postgresql"}
+        or parsed.fragment
+        or host is None
+        or not host
+        or "," in host
+        or not 1 <= port <= 65_535
+        or raw_username is None
+        or not raw_username
+        or not parsed.path.startswith("/")
+        or parsed.path == "/"
+    ):
+        raise ValueError("PostgreSQL connection URL is invalid")
+    username = _decode_postgresql_url_component(raw_username)
+    database = _decode_postgresql_url_component(parsed.path[1:])
+    password = (
+        None
+        if raw_password is None or not raw_password
+        else _decode_postgresql_url_component(raw_password)
+    )
+    ssl_mode = "require"
+    if parsed.query:
+        try:
+            parameters = parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+                max_num_fields=2,
+            )
+        except ValueError:
+            raise ValueError("PostgreSQL connection URL is invalid") from None
+        if (
+            len(parameters) != 1
+            or parameters[0][0] != "sslmode"
+            or parameters[0][1] not in _SSL_MODES
+        ):
+            raise ValueError("PostgreSQL connection URL is invalid")
+        ssl_mode = parameters[0][1]
+    return host, port, database, username, password, ssl_mode
+
+
+def _decode_postgresql_url_component(value: str) -> str:
+    position = value.find("%")
+    while position >= 0:
+        if (
+            position + 2 >= len(value)
+            or value[position + 1] not in "0123456789abcdefABCDEF"
+            or value[position + 2] not in "0123456789abcdefABCDEF"
+        ):
+            raise ValueError("PostgreSQL connection URL is invalid")
+        position = value.find("%", position + 3)
+    try:
+        decoded = unquote(value, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise ValueError("PostgreSQL connection URL is invalid") from None
+    if not decoded:
+        raise ValueError("PostgreSQL connection URL is invalid")
+    return decoded
 
 
 def _read_postgresql_port(input_stream: TextIO, output_stream: TextIO) -> int:
@@ -1307,33 +1605,50 @@ async def _chat(
             )
             continue
         if message.startswith("/"):
-            agent, conversation_id, action = await _handle_local_command(
-                message,
-                agent=agent,
-                root=root,
-                input_stream=input_stream,
-                output_stream=output_stream,
-                hidden_input=hidden_input,
-                keychain=keychain,
-                model_validator=model_validator,
-                approval_handler=approval_handler,
-                conversation_id=conversation_id,
-                validated=validated,
-                selection_input=selection_input,
-                selection_output=selection_output,
-                observer_bridge=observer_bridge,
-            )
-            if action is not None:
-                return agent, conversation_id, action
-            continue
+            try:
+                skill_invocation = await _skill_invocation_message(agent, message)
+            except ValueError as error:
+                print(
+                    "Skill invocation failed: "
+                    + _safe_display(str(error), fallback="invalid invocation"),
+                    file=output_stream,
+                )
+                continue
+            if skill_invocation is None:
+                agent, conversation_id, action = await _handle_local_command(
+                    message,
+                    agent=agent,
+                    root=root,
+                    input_stream=input_stream,
+                    output_stream=output_stream,
+                    hidden_input=hidden_input,
+                    keychain=keychain,
+                    model_validator=model_validator,
+                    approval_handler=approval_handler,
+                    conversation_id=conversation_id,
+                    validated=validated,
+                    selection_input=selection_input,
+                    selection_output=selection_output,
+                    observer_bridge=observer_bridge,
+                )
+                if action is not None:
+                    return agent, conversation_id, action
+                continue
 
         creates_conversation = conversation_id is None
-        result = await _run_message(
-            agent,
-            message,
-            conversation_id=conversation_id,
-            output_stream=output_stream,
-        )
+        try:
+            result = await _run_message(
+                agent,
+                message,
+                conversation_id=conversation_id,
+                output_stream=output_stream,
+            )
+        except terminal_tui.TerminalUserInputError as error:
+            print(
+                _safe_display(str(error), fallback="Invalid source selection."),
+                file=output_stream,
+            )
+            continue
         if result is None:
             continue
         conversation_id = result.conversation_id
@@ -1404,11 +1719,19 @@ def _command_uses_terminal_prompts(command: str) -> bool:
         return False
     if parts[0] == "/model" and len(parts) == 1:
         return True
+    if parts[0] == "/source" and parts[1:] in ([], ["use"]):
+        return True
     if parts[0] == "/source" and parts[1:] == ["add"]:
         return True
     if parts[0] in {"/memory", "/user"} and parts[1:] == ["edit"]:
         return True
-    return parts[0] == "/skills" and len(parts) == 3 and parts[1] in {"edit", "delete"}
+    if parts[0] == "/skills" and parts[1:] == ["create"]:
+        return True
+    return (
+        parts[0] == "/skills"
+        and len(parts) == 3
+        and parts[1] in {"create", "edit", "delete"}
+    )
 
 
 async def _chat_tui(
@@ -1448,11 +1771,43 @@ async def _chat_tui(
     async def load_transcript(run_id: str) -> Any:
         return await agent.transcript(run_id)
 
+    async def load_skill_completions() -> tuple[tuple[str, str], ...]:
+        list_skills = getattr(agent, "list_skills", None)
+        if not callable(list_skills):
+            return ()
+        return tuple(
+            (summary.name, summary.description) for summary in await list_skills()
+        )
+
     async def handle_command(
         command: str,
         selected_conversation: str | None,
     ) -> terminal_tui.TerminalCommandResult:
         nonlocal agent
+        try:
+            skill_invocation = await _skill_invocation_message(agent, command)
+        except ValueError as error:
+            return terminal_tui.TerminalCommandResult(
+                conversation_id=selected_conversation,
+                output=(
+                    "Skill invocation failed: "
+                    + _safe_display(str(error), fallback="invalid invocation")
+                    + "\n"
+                ),
+                source_summary=await _source_status_label(
+                    agent,
+                    conversation_id=selected_conversation,
+                ),
+            )
+        if skill_invocation is not None:
+            return terminal_tui.TerminalCommandResult(
+                conversation_id=selected_conversation,
+                model_message=skill_invocation,
+                source_summary=await _source_status_label(
+                    agent,
+                    conversation_id=selected_conversation,
+                ),
+            )
         passthrough = _command_uses_terminal_prompts(command)
         captured = _TerminalCommandOutput(
             output_stream,
@@ -1494,6 +1849,10 @@ async def _chat_tui(
                 "/catalog": "catalog",
                 "/settings": "settings",
             }.get(command.split(maxsplit=1)[0], "local"),
+            source_summary=await _source_status_label(
+                agent,
+                conversation_id=selected_conversation,
+            ),
         )
 
     result = await terminal_tui.run_terminal_tui(
@@ -1502,6 +1861,8 @@ async def _chat_tui(
         load_transcript=load_transcript,
         handle_command=handle_command,
         command_requires_suspension=_command_uses_terminal_prompts,
+        skill_completions=await load_skill_completions(),
+        load_skill_completions=load_skill_completions,
         input_stream=input_stream,
         output_stream=output_stream,
         suspend_bridge=suspend_bridge,
@@ -1523,14 +1884,19 @@ async def _run_message(
     conversation_id: str | None,
     output_stream: TextIO | None,
 ) -> Any:
-    run = asyncio.create_task(
-        agent.run(
-            message,
-            conversation_id=conversation_id,
-        )
+    effective_message, override_source_id = await _message_source_override(
+        agent,
+        message,
     )
+    run_arguments: dict[str, Any] = {"conversation_id": conversation_id}
+    if override_source_id is not None:
+        run_arguments["source_id"] = override_source_id
+    run_request = agent.run(effective_message, **run_arguments)
+    run = asyncio.create_task(run_request)
     try:
         return await run
+    except SourceSelectionError as error:
+        raise terminal_tui.TerminalUserInputError(str(error)) from error
     except (asyncio.CancelledError, KeyboardInterrupt):
         run.cancel()
         while not run.done():
@@ -1598,7 +1964,11 @@ async def _handle_local_command(
         )
         return agent, candidate, None
     if name == "/sources" and len(parts) == 1:
-        await _write_sources(agent, output_stream)
+        await _write_sources(
+            agent,
+            output_stream,
+            conversation_id=conversation_id,
+        )
         return agent, conversation_id, None
     if name == "/catalog" and len(parts) == 1:
         await _write_catalog_preview(agent, output_stream)
@@ -1619,6 +1989,66 @@ async def _handle_local_command(
             "Conversation  " f"{_safe_display(conversation_id, fallback='new')}",
             file=output_stream,
         )
+        return agent, conversation_id, None
+    if name == "/source" and (len(parts) == 1 or parts[1:] == ["use"]):
+        prior = await _active_source_for(
+            agent,
+            conversation_id=conversation_id,
+        )
+        try:
+            selected = await _select_query_source(
+                agent,
+                input_stream,
+                output_stream,
+                conversation_id=conversation_id,
+                selection_input=selection_input,
+                selection_output=selection_output,
+            )
+        except SelectionCancelled:
+            print("Source selection cancelled; returning to chat.", file=output_stream)
+            return agent, conversation_id, None
+        except SourceSelectionError as error:
+            print(
+                _safe_display(str(error), fallback="Source selection failed."),
+                file=output_stream,
+            )
+            return agent, conversation_id, None
+        changed = prior is None or prior.id != selected.id
+        print(
+            f"Source  {_safe_display(selected.display_name, fallback='source')}",
+            file=output_stream,
+        )
+        if changed and conversation_id is not None:
+            print(
+                "Started a new conversation to keep source context isolated.",
+                file=output_stream,
+            )
+            conversation_id = None
+        return agent, conversation_id, None
+    if name == "/source" and len(parts) >= 3 and parts[1] == "use":
+        prior = await _active_source_for(
+            agent,
+            conversation_id=conversation_id,
+        )
+        try:
+            selected = await agent.select_source(" ".join(parts[2:]))
+        except SourceSelectionError as error:
+            print(
+                _safe_display(str(error), fallback="Source selection failed."),
+                file=output_stream,
+            )
+            return agent, conversation_id, None
+        changed = prior is None or prior.id != selected.id
+        print(
+            f"Source  {_safe_display(selected.display_name, fallback='source')}",
+            file=output_stream,
+        )
+        if changed and conversation_id is not None:
+            print(
+                "Started a new conversation to keep source context isolated.",
+                file=output_stream,
+            )
+            conversation_id = None
         return agent, conversation_id, None
     if name == "/source" and parts[1:] == ["add"]:
         try:
@@ -1722,7 +2152,11 @@ async def _handle_local_command(
     if name == "/resume":
         print("Usage: /resume <conversation-id>", file=output_stream)
     elif name == "/source":
-        print("Usage: /source add | /source refresh <source-id>", file=output_stream)
+        print(
+            "Usage: /source | /source use <name> | /source add | "
+            "/source refresh <source-id>",
+            file=output_stream,
+        )
     elif name in {
         "/exit",
         "/help",
@@ -1785,13 +2219,11 @@ async def _ready_view_state(
     provider_label = dict(_PROVIDERS).get(provider, provider)
     sources = tuple(source for source in await agent.list_sources() if source.active)
     summary = await agent.catalog_summary()
-    if len(sources) == 1:
-        source_summary = _safe_display(
-            sources[0].display_name,
-            fallback="1 source",
-        )
-    else:
-        source_summary = _count_label(len(sources), "source", "sources")
+    source_summary = await _source_status_label(
+        agent,
+        conversation_id=conversation_id,
+        sources=sources,
+    )
     adapter_counts: dict[str, int] = {}
     for source in sources:
         adapter_id = _safe_display(
@@ -1818,6 +2250,8 @@ async def _ready_view_state(
     warnings: list[str] = []
     if not sources:
         warnings.append("No data sources. Use /source add to attach one.")
+    elif source_summary == "select source":
+        warnings.append("Select a query source with /source before asking a question.")
     elif getattr(summary, "is_empty", summary.resource_count == 0):
         warnings.append(
             "Catalog is empty. Use /source refresh <id> after checking source access."
@@ -1850,15 +2284,24 @@ async def _ready_view_state(
     )
 
 
-async def _write_sources(agent: Agent, output_stream: TextIO) -> None:
+async def _write_sources(
+    agent: Agent,
+    output_stream: TextIO,
+    *,
+    conversation_id: str | None,
+) -> None:
     sources = tuple(source for source in await agent.list_sources() if source.active)
+    selected = await _active_source_for(
+        agent,
+        conversation_id=conversation_id,
+    )
     summary = await agent.catalog_summary()
     print("Sources", file=output_stream)
     if not sources:
         print("  (none)", file=output_stream)
     for source in sources[:_MAX_SOURCE_PREVIEW]:
         print(
-            "  "
+            f"  {'●' if selected is not None and source.id == selected.id else '○'} "
             f"{_safe_display(source.display_name)} · "
             f"{_safe_display(source.adapter_id, fallback='adapter')} · "
             f"{_safe_display(source.id, fallback='source')}",
@@ -1950,6 +2393,8 @@ def _write_chat_help(output_stream: TextIO) -> None:
     for line in (
         "/model",
         "/sources",
+        "/source",
+        "/source use <name>",
         "/source add",
         "/source refresh <id>",
         "/catalog",
@@ -1959,6 +2404,9 @@ def _write_chat_help(output_stream: TextIO) -> None:
         "/memory [edit]",
         "/user [edit]",
         "/skills [show|edit|delete <name>]",
+        "/skills create [name]",
+        "/skills use <name> [request]",
+        "/<skill-name> [request]",
         "/status",
         "/conversation",
         "/help",
@@ -2071,12 +2519,27 @@ async def _handle_knowledge_command(
         for summary in skills[:50]:
             print(
                 "  "
-                f"{_safe_display(summary.name, fallback='skill')}: "
+                f"/{_safe_display(summary.name, fallback='skill')}: "
                 f"{_safe_display(summary.description, fallback='description', maximum=512)}",
                 file=output_stream,
             )
         if len(skills) > 50:
             print(f"  +{len(skills) - 50} more", file=output_stream)
+        return True
+    if len(parts) == 2 and parts[1] == "create":
+        await _create_skill_wizard(
+            agent,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
+        return True
+    if len(parts) == 3 and parts[1] == "create":
+        await _create_skill(
+            agent,
+            parts[2],
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
         return True
     if len(parts) == 3 and parts[1] == "show":
         selected_skill = await agent.read_skill(parts[2])
@@ -2146,9 +2609,202 @@ async def _handle_knowledge_command(
         )
         return True
     print(
-        "Usage: /skills [show <name>|edit <name>|delete <name>]",
+        "Usage: /skills [show <name>|create [name]|edit <name>|"
+        "delete <name>|use <name> [request]]",
         file=output_stream,
     )
+    return True
+
+
+async def _skill_invocation_message(agent: Agent, message: str) -> str | None:
+    parts = message.split()
+    if not parts:
+        return None
+    command = parts[0]
+    if command == "/skills" and len(parts) >= 2 and parts[1] == "use":
+        if len(parts) < 3:
+            raise ValueError("usage: /skills use <name> [request]")
+        skill_name = parts[2]
+        try:
+            skill = await agent.read_skill(skill_name)
+        except ValueError as error:
+            raise ValueError(f"invalid skill name {skill_name!r}: {error}") from error
+        if skill is None:
+            raise ValueError(f"skill not found: {skill_name}")
+        return message
+    if command in _BUILTIN_SLASH_COMMANDS or not command.startswith("/"):
+        return None
+    skill_name = command[1:]
+    if not skill_name:
+        return None
+    try:
+        skill = await agent.read_skill(skill_name)
+    except ValueError:
+        return None
+    return message if skill is not None else None
+
+
+async def _create_skill(
+    agent: Agent,
+    name: str,
+    *,
+    input_stream: TextIO,
+    output_stream: TextIO,
+) -> bool:
+    validate_skill_name(name)
+    if await agent.read_skill(name) is not None:
+        raise ValueError(f"skill already exists: {name}")
+    seed = _render_skill_editor_document(
+        name,
+        _SKILL_DESCRIPTION_PLACEHOLDER,
+        _SKILL_INSTRUCTIONS_PLACEHOLDER,
+    )
+    draft = seed
+    while True:
+        edited = _edit_document(draft, agent_home=agent.home)
+        if edited == seed:
+            print(
+                "Skill creation cancelled; template was unchanged.", file=output_stream
+            )
+            return False
+        try:
+            description, instructions = _parse_skill_editor_document(name, edited)
+            if description == _SKILL_DESCRIPTION_PLACEHOLDER:
+                raise ValueError("replace the description placeholder")
+            if instructions == _SKILL_INSTRUCTIONS_PLACEHOLDER:
+                raise ValueError("replace the instructions placeholder")
+            Skill(name, description, instructions)
+        except ValueError as error:
+            print(
+                "Skill document is invalid: "
+                + _safe_display(str(error), fallback="invalid document"),
+                file=output_stream,
+            )
+            draft = edited
+            try:
+                answer = _read_line(
+                    "Reopen editor? [Y/n] ",
+                    input_stream,
+                    output_stream,
+                )
+            except EOFError:
+                print(file=output_stream)
+                answer = "n"
+            if answer.strip().casefold() in {"n", "no"}:
+                print("Skill creation cancelled.", file=output_stream)
+                return False
+            continue
+        if await agent.read_skill(name) is not None:
+            raise ValueError(f"skill already exists: {name}")
+        changed = await agent.save_skill(name, description, instructions)
+        if not changed:
+            raise RuntimeError("new skill was not persisted")
+        print(f"Skill {name!r} created. Invoke it with /{name}.", file=output_stream)
+        return True
+
+
+async def _create_skill_wizard(
+    agent: Agent,
+    *,
+    input_stream: TextIO,
+    output_stream: TextIO,
+) -> bool:
+    print("Create skill", file=output_stream)
+    print("Enter /cancel at any prompt to stop.", file=output_stream)
+    while True:
+        try:
+            name = _read_line(
+                "Name: ",
+                input_stream,
+                output_stream,
+            ).strip()
+        except EOFError:
+            print(file=output_stream)
+            print("Skill creation cancelled.", file=output_stream)
+            return False
+        if name.casefold() == "/cancel":
+            print("Skill creation cancelled.", file=output_stream)
+            return False
+        try:
+            validate_skill_name(name)
+            if await agent.read_skill(name) is not None:
+                raise ValueError(f"skill already exists: {name}")
+        except ValueError as error:
+            print(
+                "Invalid name: "
+                + _safe_display(str(error), fallback="invalid skill name"),
+                file=output_stream,
+            )
+            continue
+        break
+
+    while True:
+        try:
+            description = _read_line(
+                "Description: ",
+                input_stream,
+                output_stream,
+            ).strip()
+        except EOFError:
+            print(file=output_stream)
+            print("Skill creation cancelled.", file=output_stream)
+            return False
+        if description.casefold() == "/cancel":
+            print("Skill creation cancelled.", file=output_stream)
+            return False
+        try:
+            Skill(name, description, _SKILL_INSTRUCTIONS_PLACEHOLDER)
+        except ValueError as error:
+            print(
+                "Invalid description: "
+                + _safe_display(str(error), fallback="invalid description"),
+                file=output_stream,
+            )
+            continue
+        break
+
+    while True:
+        print(
+            "Instructions (finish with a single . on its own line):",
+            file=output_stream,
+        )
+        instruction_lines: list[str] = []
+        while True:
+            try:
+                line = _read_line(
+                    "> ",
+                    input_stream,
+                    output_stream,
+                )
+            except EOFError:
+                print(file=output_stream)
+                print("Skill creation cancelled.", file=output_stream)
+                return False
+            if line.casefold() == "/cancel":
+                print("Skill creation cancelled.", file=output_stream)
+                return False
+            if line == ".":
+                break
+            instruction_lines.append(line)
+        instructions = "\n".join(instruction_lines).strip()
+        try:
+            Skill(name, description, instructions)
+        except ValueError as error:
+            print(
+                "Invalid instructions: "
+                + _safe_display(str(error), fallback="invalid instructions"),
+                file=output_stream,
+            )
+            print("Re-enter the instructions body.", file=output_stream)
+            continue
+        break
+
+    if await agent.read_skill(name) is not None:
+        raise ValueError(f"skill already exists: {name}")
+    changed = await agent.save_skill(name, description, instructions)
+    if not changed:
+        raise RuntimeError("new skill was not persisted")
+    print(f"Skill {name!r} created. Invoke it with /{name}.", file=output_stream)
     return True
 
 

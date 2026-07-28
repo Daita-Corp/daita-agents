@@ -126,6 +126,8 @@ async def _run_shell(
     observer_bridge: TerminalObserverBridge | None = None,
     approval_bridge: terminal_tui.TerminalApprovalBridge | None = None,
     command_requires_suspension: Any = None,
+    skill_completions: tuple[tuple[str, str], ...] = (),
+    load_skill_completions: Any = None,
 ) -> asyncio.Task[TerminalApplicationResult]:
     async def no_commands(
         command: str,
@@ -140,6 +142,8 @@ async def _run_shell(
             load_transcript=load_transcript,
             handle_command=handle_command or no_commands,
             command_requires_suspension=command_requires_suspension,
+            skill_completions=skill_completions,
+            load_skill_completions=load_skill_completions,
             input_stream=io.StringIO(),
             output_stream=io.StringIO(),
             suspend_bridge=suspend_bridge or TerminalSuspendBridge(),
@@ -1807,20 +1811,22 @@ def test_responsive_metadata_and_status_collapse_order_are_deterministic():
         glyphs=glyphs,
     )
 
-    assert full.collapsed == ()
+    assert full.collapsed == ("cost",)
     assert full.source_summary == "PostgreSQL · 3 sources"
-    assert full.right == "2 steps · 1.8k tokens · $0.02 estimated"
+    assert "source: PostgreSQL · 3 sources" in full.left
+    assert full.right == "2 steps · 1.8k tokens"
     assert compact.collapsed == ("cost",)
     assert compact.right == "2 steps · 1.8k tokens"
-    assert narrow.collapsed[:4] == (
+    assert narrow.collapsed == (
         "cost",
         "tokens",
         "shorten_model",
-        "source_summary",
+        "model",
+        "steps",
     )
-    assert narrow.left == "atlas · ● ready"
+    assert narrow.left == "atlas · source: PostgreSQL · 3 sources · ● ready"
     assert narrow.right == ""
-    assert narrow.source_summary == ""
+    assert narrow.source_summary == "PostgreSQL · 3 sources"
 
 
 def test_no_color_and_bounded_color_depth_projection_keep_semantic_text():
@@ -2727,11 +2733,15 @@ def test_tui_command_output_is_captured_without_leaking_above_the_shell():
     "command",
     (
         "/model",
+        "/source",
+        "/source use",
         "/source add",
         "/memory edit",
         "/user edit",
         "/skills edit forecast",
         "/skills delete forecast",
+        "/skills create forecast",
+        "/skills create",
     ),
 )
 def test_commands_with_external_prompts_keep_terminal_passthrough(command: str):
@@ -3054,6 +3064,8 @@ async def test_slash_completion_covers_the_documented_surface_and_remains_local(
     assert terminal_tui._slash_command_completion_surface() == (
         "/model",
         "/sources",
+        "/source",
+        "/source use <name>",
         "/source add",
         "/source refresh <id>",
         "/catalog",
@@ -3063,6 +3075,8 @@ async def test_slash_completion_covers_the_documented_surface_and_remains_local(
         "/memory",
         "/user",
         "/skills",
+        "/skills create",
+        "/skills use <name> [request]",
         "/status",
         "/conversation",
         "/help",
@@ -3102,6 +3116,158 @@ async def test_slash_completion_covers_the_documented_surface_and_remains_local(
         await task
 
     assert state.blocks[-1].kind == "local.status"
+
+
+def test_dynamic_skill_completion_adds_alias_and_preserves_builtin_priority():
+    display, descriptions = terminal_tui._slash_completion_maps(
+        (
+            (
+                "customer-health-investigation",
+                "Investigate customer health.",
+            ),
+            ("status", "A colliding skill."),
+        )
+    )
+
+    assert display["/customer-health-investigation "] == (
+        "/customer-health-investigation"
+    )
+    assert descriptions["/customer-health-investigation "] == (
+        "Investigate customer health."
+    )
+    assert display["/status"] == "/status"
+    assert "/status " not in display
+
+
+async def test_skill_completion_refreshes_after_a_local_skill_mutation():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    commands: list[str] = []
+    skills: list[tuple[str, str]] = []
+    refreshes = 0
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def load_skill_completions() -> tuple[tuple[str, str], ...]:
+        nonlocal refreshes
+        refreshes += 1
+        return tuple(skills)
+
+    async def handle_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        commands.append(command)
+        if command == "/skills":
+            skills.append(
+                (
+                    "customer-health-investigation",
+                    "Investigate customer health.",
+                )
+            )
+            return TerminalCommandResult(conversation_id, output="Skill created.\n")
+        assert command == "/customer-health-investigation"
+        return TerminalCommandResult(conversation_id, action="exit")
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            handle_command=handle_command,
+            load_skill_completions=load_skill_completions,
+        )
+        pipe.send_text("/skills\r")
+        await _wait_until(lambda: commands == ["/skills"] and refreshes >= 1)
+        pipe.send_text("/cus\t\r")
+        result = await task
+
+    assert commands == ["/skills", "/customer-health-investigation"]
+    assert result.action == "exit"
+
+
+async def test_skill_command_result_delegates_exact_message_to_ordinary_model_run():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    invocation = "/customer-health-investigation inspect account 42"
+    messages: list[tuple[str, str | None]] = []
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        messages.append((message, conversation_id))
+        return _result("Investigation complete.")
+
+    async def handle_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        assert command == invocation
+        return TerminalCommandResult(
+            conversation_id,
+            model_message=command,
+        )
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            handle_command=handle_command,
+        )
+        pipe.send_text(f"{invocation}\r")
+        await _wait_until(lambda: messages == [(invocation, None)])
+        await _wait_until(lambda: "Investigation complete." in output.text)
+        pipe.send_text("\x04")
+        await task
+
+    assert state.conversation_id == "conversation-one"
+    assert state.blocks[0].kind == "user"
+    assert state.blocks[-1].kind == "assistant"
+
+
+async def test_source_command_updates_the_pinned_status_source():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "First source")
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def handle_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        assert command == "/source use Second source"
+        return TerminalCommandResult(
+            conversation_id,
+            output="Source  Second source\n",
+            source_summary="Second source",
+        )
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            handle_command=handle_command,
+        )
+        pipe.send_text("/source use Second source\r")
+        await _wait_until(lambda: state.source_summary == "Second source")
+        pipe.send_text("\x04")
+        await task
+
+    glyphs = terminal_tui._terminal_glyphs(
+        terminal_tui.TerminalCapabilities("truecolor", True)
+    )
+    status = terminal_tui._status_projection(
+        state,
+        width=100,
+        mode="full",
+        glyphs=glyphs,
+    )
+    assert "atlas · source: Second source · model" in status.left
 
 
 def test_slash_command_palette_uses_full_width_command_description_rows():

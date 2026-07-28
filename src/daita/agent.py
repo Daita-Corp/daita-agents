@@ -32,6 +32,7 @@ from .hosting.embedded import (
     AgentNotFoundError,
     EmbeddedAgent,
     HostActiveError,
+    SourceSelectionError,
 )
 from .llm.models import ModelProfile
 from .llm.protocols import ModelProvider
@@ -198,10 +199,12 @@ class Agent:
         message: str,
         *,
         conversation_id: str | None = None,
+        source_id: str | None = None,
     ) -> LoopExit:
         return await self._embedded.run(
             message,
             conversation_id=conversation_id,
+            source_id=source_id,
         )
 
     async def transcript(self, run_id: str) -> Transcript:
@@ -217,6 +220,25 @@ class Agent:
         """Return whether one conversation ID belongs to this agent."""
 
         return await self._embedded.conversation_exists(conversation_id)
+
+    async def active_source(
+        self,
+        *,
+        conversation_id: str | None = None,
+    ) -> SourceRegistration | None:
+        """Return the default or conversation-pinned active source."""
+
+        return await self._embedded.active_source(conversation_id=conversation_id)
+
+    async def resolve_source(self, selector: str) -> SourceRegistration:
+        """Resolve one active source ID, display name, or display-name alias."""
+
+        return await self._embedded.resolve_source(selector)
+
+    async def select_source(self, selector: str) -> SourceRegistration:
+        """Persist one source as the default for subsequent conversations."""
+
+        return await self._embedded.select_source(selector)
 
     async def read_memory(self) -> str:
         return await self._embedded.read_memory()
@@ -377,5 +399,6 @@ __all__ = [
     "HostActiveError",
     "PostgreSQLProbeResult",
     "PostgreSQLSourceError",
+    "SourceSelectionError",
     "CatalogSummary",
 ]

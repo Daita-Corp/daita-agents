@@ -34,6 +34,8 @@ class RunInput:
     message: str
     created_at: datetime
     conversation_id: str | None = None
+    source_id: str | None = None
+    conversation_source_id: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.id, "run id")
@@ -42,6 +44,13 @@ class RunInput:
         _aware(self.created_at, "run created_at")
         if self.conversation_id is not None:
             _required_text(self.conversation_id, "run conversation_id")
+        if self.source_id is not None:
+            _required_text(self.source_id, "run source_id")
+        if self.conversation_source_id is not None:
+            _required_text(
+                self.conversation_source_id,
+                "run conversation_source_id",
+            )
 
 
 @dataclass(frozen=True, slots=True)

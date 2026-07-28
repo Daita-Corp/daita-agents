@@ -38,6 +38,7 @@ class ProviderErrorCode(str, Enum):
     CONTENT_BLOCKED = "content_blocked"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
+    OUTPUT_LIMIT = "output_limit"
     MALFORMED_RESPONSE = "malformed_response"
     CONFIGURATION_ERROR = "configuration_error"
 

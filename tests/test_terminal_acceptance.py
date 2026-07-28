@@ -200,6 +200,7 @@ async def test_first_run_keyboard_postgresql_path_reaches_grounded_chat(
             "\r"  # OpenAI
             "\x1b[B\x1b[B\x1b[B\r"  # manual model entry
             "\x1b[B\x1b[B\r"  # PostgreSQL
+            "\x1b[B\r"  # individual connection fields
             " \x1b[B\x1b[B \r"  # analytics and reporting
         )
         code = await run_terminal_application(

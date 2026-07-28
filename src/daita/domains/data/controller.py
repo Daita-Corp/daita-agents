@@ -93,9 +93,16 @@ class CatalogDataReader(CatalogSchemaReader, Protocol):
         self,
         agent_id: str,
         configuration_flags: tuple[str, ...],
+        source_ids: tuple[str, ...] = (),
     ) -> tuple[Mapping[str, object], ...]: ...
 
     async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None: ...
+
+    async def resource_identity(
+        self,
+        agent_id: str,
+        resource_id: str,
+    ) -> tuple[str, str, str] | None: ...
 
     async def is_current_tabular_file(
         self,
@@ -206,6 +213,7 @@ class DataToolRuntime:
                 self._emit_tool_completed(run, call, result, started)
                 return result
             arguments = self._registry.validate_arguments(capability.id, call.arguments)
+            arguments = self._apply_source_scope(run, capability, arguments)
             validation_error = await self._validate(run, capability, arguments)
             if validation_error is not None:
                 code, message, details = validation_error
@@ -501,6 +509,13 @@ class DataToolRuntime:
         capability: Capability,
         arguments: Mapping[str, object],
     ) -> tuple[str, str, Mapping[str, object]] | None:
+        source_scope_error = await self._validate_source_scope(
+            run,
+            capability,
+            arguments,
+        )
+        if source_scope_error is not None:
+            return source_scope_error
         if capability.access_mode is AccessMode.WRITE:
             if (
                 capability.id
@@ -615,6 +630,76 @@ class DataToolRuntime:
                 )
         return None
 
+    def _apply_source_scope(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+    ) -> FrozenJsonObject:
+        if (
+            run.source_id is None
+            or capability.id
+            not in {
+                CATALOG_SEARCH_CAPABILITY_ID,
+                CATALOG_SCHEMA_CAPABILITY_ID,
+            }
+            or arguments.get("source_id") is not None
+        ):
+            return arguments
+        scoped = arguments.to_dict()
+        scoped["source_id"] = run.source_id
+        return self._registry.validate_arguments(capability.id, scoped)
+
+    async def _validate_source_scope(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> tuple[str, str, Mapping[str, object]] | None:
+        selected_source_id = run.source_id
+        if selected_source_id is None:
+            return None
+        supplied_source_id = arguments.get("source_id")
+        if supplied_source_id is not None and supplied_source_id != selected_source_id:
+            return (
+                "source_scope_violation",
+                "This run can only access the source selected by the user.",
+                {
+                    "selected_source_id": selected_source_id,
+                    "requested_source_id": supplied_source_id,
+                },
+            )
+        resource_ids: tuple[object, ...] = ()
+        if capability.id == CATALOG_INSPECT_CAPABILITY_ID:
+            resource_ids = (arguments.get("resource_id"),)
+        elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
+            value = arguments.get("resource_ids", ())
+            resource_ids = value if isinstance(value, tuple) else ()
+        elif capability.id == CATALOG_TRAVERSE_CAPABILITY_ID:
+            from_ids = arguments.get("from_resource_ids", ())
+            to_ids = arguments.get("to_resource_ids", ())
+            resource_ids = (
+                *(from_ids if isinstance(from_ids, tuple) else ()),
+                *(to_ids if isinstance(to_ids, tuple) else ()),
+            )
+        for resource_id in resource_ids:
+            if not isinstance(resource_id, str):
+                continue
+            identity = await self._catalog.resource_identity(
+                run.agent_id,
+                resource_id,
+            )
+            if identity is None or identity[0] != selected_source_id:
+                return (
+                    "source_scope_violation",
+                    "This run can only access resources from the selected source.",
+                    {
+                        "resource_id": resource_id,
+                        "selected_source_id": selected_source_id,
+                    },
+                )
+        return None
+
     async def _validate_sql(
         self,
         run: RunInput,
@@ -690,8 +775,18 @@ class DataToolRuntime:
                 continue
             candidates.append((name, view.applicability))
             required_flags.update(view.applicability.required_configuration_flags)
-        facts = await self._catalog.source_routing_facts(
-            run.agent_id, tuple(sorted(required_flags))
+        required = tuple(sorted(required_flags))
+        facts = (
+            await self._catalog.source_routing_facts(
+                run.agent_id,
+                required,
+                (run.source_id,),
+            )
+            if run.source_id is not None
+            else await self._catalog.source_routing_facts(
+                run.agent_id,
+                required,
+            )
         )
         return tuple(
             name

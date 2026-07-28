@@ -66,6 +66,11 @@ from ..llm.pricing import (
 from ..loop.models import ConversationRun, LoopExit, LoopExitKind, RunInput, Transcript
 
 _SEARCH_TERM = re.compile(r"[A-Za-z0-9_]+")
+_ACTIVE_SOURCE_KEY_PREFIX = "active_source:"
+
+
+def _active_source_key(agent_id: str) -> str:
+    return f"{_ACTIVE_SOURCE_KEY_PREFIX}{agent_id}"
 
 
 class _CatalogCommitGate:
@@ -190,11 +195,69 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
+    async def load_active_source_id(self, agent_id: str) -> str | None:
+        def read() -> str | None:
+            with _connect(self.path) as connection:
+                row = connection.execute(
+                    "SELECT data FROM metadata WHERE key = ?",
+                    (_active_source_key(agent_id),),
+                ).fetchone()
+            if row is None:
+                return None
+            source_id = _loads(row[0])
+            if not isinstance(source_id, str) or not source_id:
+                raise ValueError("stored active source id is invalid")
+            return source_id
+
+        return await asyncio.to_thread(read)
+
+    async def set_active_source_id(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> SourceRegistration:
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("agent_id must be a non-empty string")
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+
+        def write() -> SourceRegistration:
+            with _connect(self.path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
+                    (agent_id, source_id),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("unknown active source for this agent")
+                registration = _expect(_loads(row[0]), SourceRegistration)
+                if not registration.active:
+                    raise ValueError("unknown active source for this agent")
+                connection.execute(
+                    """INSERT INTO metadata(key, data) VALUES (?, ?)
+                       ON CONFLICT(key) DO UPDATE SET data = excluded.data""",
+                    (_active_source_key(agent_id), _dumps(source_id)),
+                )
+                return registration
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+        registration = worker.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return registration
+
     async def detach_source(
         self, agent_id: str, source_id: str, detached_at: datetime
     ) -> SourceRegistration:
         def write() -> SourceRegistration:
             with _connect(self.path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
                     (agent_id, source_id),
@@ -209,6 +272,32 @@ class SQLiteStateStore:
                     "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
                     (_dumps(detached), agent_id, source_id),
                 )
+                selection = connection.execute(
+                    "SELECT data FROM metadata WHERE key = ?",
+                    (_active_source_key(agent_id),),
+                ).fetchone()
+                selected_id = None if selection is None else _loads(selection[0])
+                if selected_id == source_id:
+                    connection.execute(
+                        "DELETE FROM metadata WHERE key = ?",
+                        (_active_source_key(agent_id),),
+                    )
+                    remaining: list[SourceRegistration] = []
+                    for (data,) in connection.execute(
+                        "SELECT data FROM sources WHERE agent_id = ? ORDER BY id",
+                        (agent_id,),
+                    ).fetchall():
+                        candidate = _expect(_loads(data), SourceRegistration)
+                        if candidate.active:
+                            remaining.append(candidate)
+                    if len(remaining) == 1:
+                        connection.execute(
+                            "INSERT INTO metadata(key, data) VALUES (?, ?)",
+                            (
+                                _active_source_key(agent_id),
+                                _dumps(remaining[0].id),
+                            ),
+                        )
                 return detached
 
         return await asyncio.to_thread(write)
@@ -265,6 +354,18 @@ class SQLiteStateStore:
                                 "source registration already exists: "
                                 f"{registration.id}"
                             )
+                    selection = connection.execute(
+                        "SELECT 1 FROM metadata WHERE key = ?",
+                        (_active_source_key(registration.agent_id),),
+                    ).fetchone()
+                    if selection is None:
+                        connection.execute(
+                            "INSERT INTO metadata(key, data) VALUES (?, ?)",
+                            (
+                                _active_source_key(registration.agent_id),
+                                _dumps(registration.id),
+                            ),
+                        )
                 connection.execute(
                     """INSERT INTO syncs(agent_id, id, source_id, data)
                        VALUES (?, ?, ?, ?)
@@ -833,6 +934,29 @@ class SQLiteStateStore:
                     (agent_id, conversation_id),
                 ).fetchone()
             return row is not None
+
+        return await asyncio.to_thread(read)
+
+    async def conversation_source_id(
+        self,
+        agent_id: str,
+        conversation_id: str,
+    ) -> str | None:
+        """Return the sticky source captured by the first run in a conversation."""
+
+        def read() -> str | None:
+            with _connect(self.path) as connection:
+                row = connection.execute(
+                    """SELECT input FROM runs
+                       WHERE agent_id = ? AND conversation_id = ?
+                       ORDER BY turn_index
+                       LIMIT 1""",
+                    (agent_id, conversation_id),
+                ).fetchone()
+            if row is None:
+                return None
+            run = _expect(_loads(row[0]), RunInput)
+            return run.conversation_source_id or run.source_id
 
         return await asyncio.to_thread(read)
 

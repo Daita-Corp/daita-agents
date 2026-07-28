@@ -40,12 +40,14 @@ class CatalogDataView:
         self,
         agent_id: str,
         configuration_flags: tuple[str, ...],
+        source_ids: tuple[str, ...] = (),
     ) -> tuple[FrozenJsonObject, ...]:
         """Project only active, declared source-routing control facts."""
 
         requested_flags = ToolApplicability(
             required_configuration_flags=configuration_flags
         ).required_configuration_flags
+        selected_source_ids = frozenset(source_ids)
         registrations = await self._sources.list_sources(agent_id)
         return tuple(
             FrozenJsonObject.from_mapping(
@@ -62,7 +64,9 @@ class CatalogDataView:
                 registrations,
                 key=lambda item: (item.id, item.adapter_id),
             )
-            if registration.agent_id == agent_id and registration.active
+            if registration.agent_id == agent_id
+            and registration.active
+            and (not selected_source_ids or registration.id in selected_source_ids)
         )
 
     async def resource_schemas(

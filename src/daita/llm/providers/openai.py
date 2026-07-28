@@ -469,6 +469,16 @@ class OpenAIResponsesProvider:
         elif normalized_text is not None:
             finish_reason = FinishReason.STOP
         else:
+            incomplete_details = _field(response, "incomplete_details", None)
+            incomplete_reason = _optional_text(
+                _field(incomplete_details, "reason", None),
+                "incomplete reason",
+            )
+            if status == "incomplete" and incomplete_reason == "max_output_tokens":
+                raise ModelProviderError(
+                    ProviderErrorCode.OUTPUT_LIMIT,
+                    "OpenAI exhausted the output token limit",
+                )
             raise ValueError("response contains neither text nor function calls")
 
         response_id = _optional_text(_field(response, "id", None), "response id")

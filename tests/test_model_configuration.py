@@ -386,6 +386,10 @@ async def test_manual_model_retains_explicit_limits_and_disables_parallel_tools(
             ProviderErrorCode.INVALID_REQUEST,
             "The provider rejected this model configuration.",
         ),
+        (
+            ProviderErrorCode.OUTPUT_LIMIT,
+            "The model exhausted its validation output budget before calling the tool.",
+        ),
     ),
 )
 async def test_terminal_maps_normalized_validation_errors(tmp_path, code, message):
@@ -437,6 +441,7 @@ async def test_suggested_model_is_exactly_validated_and_only_route_is_persisted(
     assert expected_profile.max_output_tokens == 65_536
     assert expected_profile.supports_tools is True
     assert expected_profile.supports_parallel_tools is False
+    assert expected_profile.supports_reasoning is True
     reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
     try:
         assert reopened.model_profile == expected_profile
@@ -461,6 +466,7 @@ async def test_reviewed_openai_suggestions_use_authoritative_profile_facts(tmp_p
         assert profile.max_output_tokens == 128_000
         assert profile.supports_tools is True
         assert profile.supports_parallel_tools is False
+        assert profile.supports_reasoning is True
 
 
 async def test_unreviewed_suggestion_requires_explicit_limits_before_validation(

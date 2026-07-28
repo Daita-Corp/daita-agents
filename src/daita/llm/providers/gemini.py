@@ -629,6 +629,11 @@ class GeminiProvider:
         text = "\n".join(text_parts).strip() or None
         mapped_finish = _finish_reason(native_finish)
         finish_reason = FinishReason.TOOL_CALLS if calls else mapped_finish
+        if not calls and text is None and mapped_finish is FinishReason.LENGTH:
+            raise ModelProviderError(
+                ProviderErrorCode.OUTPUT_LIMIT,
+                "Gemini exhausted the output token limit",
+            )
         metadata: dict[str, object] = {}
         model_version = _optional_text(
             _field(response, "model_version", None),

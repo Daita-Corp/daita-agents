@@ -17,36 +17,42 @@ _REVIEWED_MODEL_PROFILES = {
             context_window_tokens=1_050_000,
             max_output_tokens=128_000,
             supports_tools=True,
+            supports_reasoning=True,
         ),
         ModelProfile(
             id="openai:gpt-5.6-terra",
             context_window_tokens=1_050_000,
             max_output_tokens=128_000,
             supports_tools=True,
+            supports_reasoning=True,
         ),
         ModelProfile(
             id="openai:gpt-5.6-luna",
             context_window_tokens=1_050_000,
             max_output_tokens=128_000,
             supports_tools=True,
+            supports_reasoning=True,
         ),
         ModelProfile(
             id="gemini:gemini-3.6-flash",
             context_window_tokens=1_048_576,
             max_output_tokens=65_536,
             supports_tools=True,
+            supports_reasoning=True,
         ),
         ModelProfile(
             id="gemini:gemini-3.5-flash",
             context_window_tokens=1_048_576,
             max_output_tokens=65_536,
             supports_tools=True,
+            supports_reasoning=True,
         ),
         ModelProfile(
             id="gemini:gemini-3.5-flash-lite",
             context_window_tokens=1_048_576,
             max_output_tokens=65_536,
             supports_tools=True,
+            supports_reasoning=True,
         ),
     )
 }

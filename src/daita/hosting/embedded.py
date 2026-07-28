@@ -49,6 +49,7 @@ from ..domains.data import (
 from ..domains.data.context import _project_completed_history
 from ..errors import AgentError
 from ..identity import AgentIdentity
+from ..llm.errors import ModelProviderError, ProviderErrorCode
 from ..llm.factory import create_model_route_provider
 from ..llm.models import (
     CanonicalMessage,
@@ -97,7 +98,10 @@ _MODEL_CONFIG_NAME = "config.json"
 _MAX_MODEL_CONFIG_BYTES = 64 * 1_024
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
 _MODEL_VALIDATION_TOOL_NAME = "daita_validate_tool_support"
+_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 16
+_REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 25_000
 _PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+_SOURCE_ALIAS_SEPARATOR = re.compile(r"[^a-z0-9]+")
 _BUILTIN_PROVIDERS = frozenset({"openai", "anthropic", "gemini", "grok", "ollama"})
 _T = TypeVar("_T")
 
@@ -113,6 +117,47 @@ def _new_id(prefix: str) -> str:
 def _validate_conversation_id(value: str) -> None:
     if not isinstance(value, str) or _CONVERSATION_ID.fullmatch(value) is None:
         raise ValueError("conversation_id must match [A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+
+def _source_alias(value: str) -> str:
+    return _SOURCE_ALIAS_SEPARATOR.sub("-", value.casefold()).strip("-")
+
+
+def _resolve_source_selector(
+    selector: str,
+    sources: tuple[SourceRegistration, ...],
+) -> SourceRegistration:
+    if not isinstance(selector, str) or not (candidate := selector.strip()):
+        raise SourceSelectionError("Source selector must be non-empty terminal text.")
+    try:
+        encoded_length = len(candidate.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise SourceSelectionError(
+            "Source selector must be non-empty terminal text."
+        ) from None
+    if encoded_length > 1_024 or any(
+        ord(character) < 32 or ord(character) == 127 for character in candidate
+    ):
+        raise SourceSelectionError("Source selector must be non-empty terminal text.")
+    exact_id = tuple(source for source in sources if source.id == candidate)
+    if exact_id:
+        return exact_id[0]
+    folded = candidate.casefold()
+    matches = {
+        source.id: source
+        for source in sources
+        if source.display_name.casefold() == folded
+        or _source_alias(source.display_name) == folded
+    }
+    if not matches:
+        raise SourceSelectionError(
+            "No active source matches that name. Use /sources to list choices."
+        )
+    if len(matches) > 1:
+        raise SourceSelectionError(
+            "That source name is ambiguous. Use /source to choose one."
+        )
+    return next(iter(matches.values()))
 
 
 class AgentHomeError(AgentError):
@@ -145,6 +190,10 @@ class HostActiveError(AgentHomeError):
 
 class AgentNotConfiguredError(AgentHomeError):
     pass
+
+
+class SourceSelectionError(AgentError, ValueError):
+    """A requested source is missing, ambiguous, or outside current admission."""
 
 
 class _WriterLock:
@@ -697,9 +746,14 @@ class EmbeddedAgent:
         message: str,
         *,
         conversation_id: str | None = None,
+        source_id: str | None = None,
     ) -> LoopExit:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
+        if source_id is not None and (
+            not isinstance(source_id, str) or not source_id.strip()
+        ):
+            raise ValueError("source_id must be a non-empty string or None")
         if self._model_reopen_required:
             raise AgentNotConfiguredError(
                 "model configuration changed; close and reopen required"
@@ -724,9 +778,45 @@ class EmbeddedAgent:
                 raise ValueError("unknown conversation for this agent")
             if not supplied_conversation and conversation_exists:
                 raise ValueError("generated conversation id already exists")
+            conversation_source_id = (
+                await self._store.conversation_source_id(
+                    self.identity.id,
+                    resolved_conversation,
+                )
+                if supplied_conversation
+                else await self._store.load_active_source_id(self.identity.id)
+            )
+            active_sources = tuple(
+                source
+                for source in await self._store.list_sources(self.identity.id)
+                if source.active
+            )
+            if conversation_source_id is None and len(active_sources) == 1:
+                conversation_source_id = active_sources[0].id
+            effective_source_id = (
+                source_id.strip() if source_id is not None else conversation_source_id
+            )
+            if active_sources and effective_source_id is None:
+                raise SourceSelectionError(
+                    "Multiple data sources are attached. Select one with /source "
+                    "before asking a question."
+                )
+            if effective_source_id is not None and not any(
+                source.id == effective_source_id for source in active_sources
+            ):
+                raise SourceSelectionError(
+                    "The selected data source is not active for this agent."
+                )
+            scoped_conversation = tuple(
+                item
+                for item in conversation
+                if item.transcript.run.source_id == effective_source_id
+            )
             prior_messages = _project_completed_history(
-                conversation,
-                older_history_exists=older_history_exists,
+                scoped_conversation,
+                older_history_exists=(
+                    older_history_exists or len(scoped_conversation) < len(conversation)
+                ),
             )
             return await loop.run(
                 RunInput(
@@ -735,6 +825,8 @@ class EmbeddedAgent:
                     message=message.strip(),
                     created_at=self._clock(),
                     conversation_id=resolved_conversation,
+                    source_id=effective_source_id,
+                    conversation_source_id=conversation_source_id,
                 ),
                 prior_messages=prior_messages,
             )
@@ -766,6 +858,61 @@ class EmbeddedAgent:
             self.identity.id,
             conversation_id,
         )
+
+    async def active_source(
+        self,
+        *,
+        conversation_id: str | None = None,
+    ) -> SourceRegistration | None:
+        """Return the persisted default or one conversation's sticky source."""
+
+        self._require_open()
+        if conversation_id is not None:
+            _validate_conversation_id(conversation_id)
+            source_id = await self._store.conversation_source_id(
+                self.identity.id,
+                conversation_id,
+            )
+        else:
+            source_id = await self._store.load_active_source_id(self.identity.id)
+        active_sources = tuple(
+            source
+            for source in await self._store.list_sources(self.identity.id)
+            if source.active
+        )
+        if source_id is None:
+            return active_sources[0] if len(active_sources) == 1 else None
+        return next(
+            (source for source in active_sources if source.id == source_id),
+            None,
+        )
+
+    async def resolve_source(self, selector: str) -> SourceRegistration:
+        """Resolve one exact ID, display name, or stable display-name alias."""
+
+        self._require_open()
+        sources = tuple(
+            source
+            for source in await self._store.list_sources(self.identity.id)
+            if source.active
+        )
+        return _resolve_source_selector(selector, sources)
+
+    async def select_source(self, selector: str) -> SourceRegistration:
+        """Persist one active source as the default for subsequent conversations."""
+
+        async with self._mutation_lock:
+            self._require_open()
+            sources = tuple(
+                source
+                for source in await self._store.list_sources(self.identity.id)
+                if source.active
+            )
+            selected = _resolve_source_selector(selector, sources)
+            return await self._store.set_active_source_id(
+                self.identity.id,
+                selected.id,
+            )
 
     async def read_memory(self) -> str:
         self._require_open()
@@ -1446,7 +1593,12 @@ async def _validate_model_route(
             profile=replace(
                 candidate.profile,
                 max_output_tokens=min(
-                    16,
+                    (
+                        _REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS
+                        if candidate.profile.supports_reasoning
+                        else _MODEL_VALIDATION_MAX_OUTPUT_TOKENS
+                    ),
+                    candidate.profile.max_output_tokens,
                     candidate.profile.context_window_tokens - 1,
                 ),
             ),
@@ -1502,6 +1654,11 @@ async def _validate_model_route(
             allow_parallel_tool_calls=False,
         )
     )
+    if response.finish_reason is FinishReason.LENGTH:
+        raise ModelProviderError(
+            ProviderErrorCode.OUTPUT_LIMIT,
+            "model exhausted the validation output budget",
+        )
     if (
         response.finish_reason is not FinishReason.TOOL_CALLS
         or len(response.tool_calls) != 1
@@ -2021,4 +2178,5 @@ __all__ = [
     "AgentNotFoundError",
     "EmbeddedAgent",
     "HostActiveError",
+    "SourceSelectionError",
 ]

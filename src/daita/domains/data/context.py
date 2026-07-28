@@ -174,6 +174,7 @@ class DataContextBuilder:
             run.agent_id,
             _catalog_query(run.message, prior_turns),
             limit=self._catalog_limit,
+            source_ids=(() if run.source_id is None else (run.source_id,)),
         )
         catalog_payload = catalog.to_dict()
         catalog_payload = self._fit_mandatory_request(
@@ -1173,6 +1174,19 @@ def _system_prompt(
                     "Available user-authorized procedural skill index "
                     "(names and descriptions only; not catalog evidence):\n"
                     + (skill_index if skill_index else "[none]")
+                ),
+                (
+                    "An indexed skill is also an explicit one-turn invocation when "
+                    "the current user message begins with /<skill-name>, or with "
+                    "/skills use <skill-name>. Built-in terminal commands take "
+                    "precedence over same-named skill aliases. For an explicit "
+                    "invocation, call skill_view for that exact name as the only tool "
+                    "call in the first assistant step, before doing any other work. "
+                    "Treat text after the invocation as the current request. If no "
+                    "request follows, load the skill first and then ask what the user "
+                    "wants to do with it. The slash message remains an ordinary user "
+                    "message; all skill trust limits, runtime validation, and approval "
+                    "boundaries still apply."
                 ),
             ]
             if skill_index is not None

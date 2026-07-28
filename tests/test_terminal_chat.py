@@ -12,7 +12,7 @@ import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from daita import Agent, ApprovalDecision, ApprovalRequest, SQLiteSource
+from daita import Agent, ApprovalDecision, ApprovalRequest, Skill, SQLiteSource
 from daita import terminal, terminal_tui
 from daita._json import FrozenJsonObject
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
@@ -417,7 +417,7 @@ async def test_live_chat_schema_escape_removes_temporary_credential(
                     selection_output=DummyOutput(),
                 )
             )
-            pipe.send_text("\x1b[B\x1b[B\r")
+            pipe.send_text("\x1b[B\x1b[B\r\x1b[B\r")
             for _ in range(100):
                 if "Connection validated" in output.getvalue():
                     break
@@ -601,6 +601,60 @@ async def test_source_add_recomputes_catalog_before_returning_to_prompt(
     assert "2 resources" in text
     assert text.count("You › ") >= 2
     assert provider.requests == ()
+
+
+async def test_source_use_and_one_question_override_are_local_and_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    keychain = _Keychain()
+    await _ready_agent(tmp_path, keychain)
+    second = tmp_path / "second.sqlite"
+    _database(second, "second_table")
+    setup = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    try:
+        second_source = await setup.attach(SQLiteSource(second, name="Second source"))
+    finally:
+        await setup.close()
+    provider = MockModelProvider(
+        (
+            _stop("first answer"),
+            _stop("second answer"),
+            _stop("override answer"),
+        ),
+        provider_id="openai:test-model",
+    )
+    _install_provider(monkeypatch, provider)
+    output = io.StringIO()
+
+    code = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO(
+            "first question\n"
+            "/source use Second source\n"
+            "/sources\n"
+            "second question\n"
+            "@ready-sqlite override question\n"
+            "/exit\n"
+        ),
+        output_stream=output,
+        keychain=keychain,
+    )
+
+    assert code == 0
+    text = output.getvalue()
+    assert "Source  Second source" in text
+    assert "Started a new conversation to keep source context isolated." in text
+    assert "● Second source" in text
+    assert "○ Ready SQLite" in text
+    assert _request_text(provider.requests[0]) == ("first question",)
+    assert _request_text(provider.requests[1]) == ("second question",)
+    assert _request_text(provider.requests[2]) == ("override question",)
+    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    try:
+        assert await reopened.active_source() == second_source
+    finally:
+        await reopened.close()
 
 
 async def test_source_refresh_commits_new_truth_before_the_next_model_request(
@@ -848,6 +902,229 @@ async def test_approval_and_knowledge_commands_reuse_existing_local_behavior(
         )
     finally:
         await reopened.close()
+
+
+async def test_skills_create_opens_canonical_template_and_saves_without_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    keychain = _Keychain()
+    await _ready_agent(tmp_path, keychain)
+    provider = MockModelProvider((), provider_id="openai:test-model")
+    _install_provider(monkeypatch, provider)
+    edited_document = (
+        "# customer-health-investigation\n\n"
+        "Investigate customer health using the attached warehouse.\n\n"
+        "## Instructions\n\n"
+        "Start with account scope, then compare support and usage signals.\n"
+    )
+    opened: list[str] = []
+
+    def edit_document(seed: str, *, agent_home: Path) -> str:
+        assert agent_home.name == "atlas"
+        opened.append(seed)
+        return edited_document
+
+    monkeypatch.setattr(terminal, "_edit_document", edit_document)
+    output = io.StringIO()
+
+    code = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO(
+            "/skills create customer-health-investigation\n/skills\n/exit\n"
+        ),
+        output_stream=output,
+        keychain=keychain,
+    )
+
+    assert code == 0
+    assert provider.requests == ()
+    assert opened == [
+        "# customer-health-investigation\n\n"
+        "Describe when the agent should use this skill.\n\n"
+        "## Instructions\n\n"
+        "Write the reusable procedure here.\n"
+    ]
+    assert "Invoke it with /customer-health-investigation" in output.getvalue()
+    assert "/customer-health-investigation:" in output.getvalue()
+    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    try:
+        skill = await reopened.read_skill("customer-health-investigation")
+        assert skill is not None
+        assert skill.description == (
+            "Investigate customer health using the attached warehouse."
+        )
+    finally:
+        await reopened.close()
+
+
+async def test_skills_create_without_name_runs_guided_creation_flow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    keychain = _Keychain()
+    await _ready_agent(tmp_path, keychain)
+    provider = MockModelProvider((), provider_id="openai:test-model")
+    _install_provider(monkeypatch, provider)
+    output = io.StringIO()
+
+    code = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO(
+            "/skills create\n"
+            "customer-health-investigation\n"
+            "Investigate customer health using cross-schema evidence.\n"
+            "Inspect the health snapshot first.\n"
+            "Validate it against orders, billing, and support.\n"
+            ".\n"
+            "/exit\n"
+        ),
+        output_stream=output,
+        keychain=keychain,
+    )
+
+    assert code == 0
+    assert provider.requests == ()
+    text = output.getvalue()
+    assert "Name: " in text
+    assert "Description: " in text
+    assert "finish with a single . on its own line" in text
+    assert "Invoke it with /customer-health-investigation" in text
+    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    try:
+        skill = await reopened.read_skill("customer-health-investigation")
+        assert skill == Skill(
+            "customer-health-investigation",
+            "Investigate customer health using cross-schema evidence.",
+            (
+                "Inspect the health snapshot first.\n"
+                "Validate it against orders, billing, and support."
+            ),
+        )
+    finally:
+        await reopened.close()
+
+
+async def test_skills_create_reopens_invalid_draft_without_losing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    agent = await Agent.create("draft-retry", root=tmp_path)
+    invalid = (
+        "# customer-health-investigation\n\n"
+        "Investigate customer health.\n\n"
+        "## Instructions\n\n"
+        "Missing the required final newline."
+    )
+    valid = f"{invalid}\n"
+    opened: list[str] = []
+
+    def edit_document(seed: str, *, agent_home: Path) -> str:
+        del agent_home
+        opened.append(seed)
+        return invalid if len(opened) == 1 else valid
+
+    monkeypatch.setattr(terminal, "_edit_document", edit_document)
+    output = io.StringIO()
+    try:
+        created = await terminal._create_skill(
+            agent,
+            "customer-health-investigation",
+            input_stream=io.StringIO("\n"),
+            output_stream=output,
+        )
+        skill = await agent.read_skill("customer-health-investigation")
+    finally:
+        await agent.close()
+
+    assert created is True
+    assert opened[1] == invalid
+    assert "Skill document is invalid" in output.getvalue()
+    assert skill is not None
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    (
+        "/customer-health-investigation investigate account 42",
+        "/skills use customer-health-investigation investigate account 42",
+    ),
+)
+async def test_skill_slash_invocation_is_an_exact_ordinary_run_that_loads_skill_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invocation: str,
+):
+    keychain = _Keychain()
+    await _ready_agent(tmp_path, keychain)
+    agent = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    await agent.save_skill(
+        "customer-health-investigation",
+        "Investigate customer health.",
+        "Compare account, support, and usage evidence.",
+    )
+    await agent.close()
+    provider = MockModelProvider(
+        (
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="skill-load",
+                        name="skill_view",
+                        arguments={"name": "customer-health-investigation"},
+                    ),
+                ),
+                provider_id="openai:test-model",
+            ),
+            _stop("Investigation complete."),
+        ),
+        provider_id="openai:test-model",
+    )
+    _install_provider(monkeypatch, provider)
+    output = io.StringIO()
+
+    code = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO(f"{invocation}\n/exit\n"),
+        output_stream=output,
+        keychain=keychain,
+    )
+
+    assert code == 0
+    assert _request_text(provider.requests[0]) == (invocation,)
+    system_text = cast(TextBlock, provider.requests[0].messages[0].content[0]).text
+    assert "only tool call in the first assistant step" in system_text
+    assert provider.requests[1].messages[-1].role is MessageRole.TOOL
+    conversation_match = re.search(
+        r"Conversation  (conversation-[A-Za-z0-9]+)",
+        output.getvalue(),
+    )
+    assert conversation_match is not None
+    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    try:
+        run = (await reopened.conversation_runs(conversation_match.group(1)))[0]
+        transcript = await reopened.transcript(run.transcript.run.id)
+        first = cast(TextBlock, transcript.messages[0].content[0])
+        assert first.text == invocation
+    finally:
+        await reopened.close()
+
+
+async def test_builtin_command_wins_skill_alias_and_explicit_fallback_remains_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    keychain = _Keychain()
+    await _ready_agent(tmp_path, keychain)
+    agent = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    try:
+        await agent.save_skill("status", "Custom status procedure.", "Inspect status.")
+        assert await terminal._skill_invocation_message(agent, "/status") is None
+        fallback = "/skills use status inspect customer 42"
+        assert await terminal._skill_invocation_message(agent, fallback) == fallback
+    finally:
+        await agent.close()
 
 
 class _CancelledProvider:

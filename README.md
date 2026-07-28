@@ -241,6 +241,24 @@ boundaries remain authoritative. Foreground `skill_save` and `skill_delete`
 calls cross the same approval branch as `memory_set`; direct API mutations are
 already explicit caller actions and do not invoke the model or approval flow.
 
+In the terminal, `/skills create` starts a guided flow for the name, one-line
+description, and multiline instructions. Finish the instructions with `.` on
+its own line, or enter `/cancel` at any step. `/skills create <name>` remains an
+editor shortcut: Daita opens `$EDITOR` on the canonical `SKILL.md`, validates
+the complete document, and saves it only when the name is new. An unchanged
+template cancels editor creation; invalid content can be reopened without
+losing the draft. Both forms are local caller actions, so neither enters the
+conversation nor asks the model or approval handler to perform the write.
+
+Each installed skill is exposed as `/<skill-name> [request]`. Use
+`/skills use <name> [request]` when a skill name collides with a built-in
+command; built-ins always win the short form. Invocation is an ordinary Daita
+run, and the exact slash message is persisted as the user message. The model
+loads the selected procedure through `skill_view` as its only first-step tool
+call before continuing. A bare invocation loads the skill and asks what the
+user wants to do. The terminal never injects a skill body into the transcript
+or bypasses the existing trust, validation, or approval boundaries.
+
 ### Approval and observation
 
 ```python
@@ -335,6 +353,12 @@ current-process usage totals. Its local `/help`, `/status`, `/conversation`,
 `/new`, `/resume <conversation-id>`, `/sources`, and `/exit` commands never
 enter the model transcript.
 
+In the zero-argument terminal, `/source` opens the active-source picker and
+`/source use <name>` selects directly. The selection is persisted and pinned in
+the status line. Prefix one question with a display-name alias such as
+`@postgres-large` to override that source without changing the conversation
+selection.
+
 Memory and user-profile documents can be read, replaced from a complete UTF-8
 file or stdin, or edited with `$EDITOR`:
 
@@ -382,12 +406,14 @@ Group paid invoices by UTC month.
 ```
 
 Interactive chat additionally provides `/memory`, `/memory edit`, `/user`,
-`/user edit`, `/skills`, `/skills show <name>`, `/skills edit <name>`, and
-`/skills delete <name>`. Skill deletion asks for explicit confirmation and
-defaults to no. These direct caller actions invoke neither the model nor an
-approval callback. Model-requested memory and skill side effects still use the
-exact, once-only, in-process approval prompt in `chat`; `run` installs no
-approval handler.
+`/user edit`, `/skills`, `/skills show <name>`, `/skills create [name]`,
+`/skills edit <name>`, `/skills delete <name>`,
+`/skills use <name> [request]`, and `/<skill-name> [request]`. Skill deletion
+asks for explicit confirmation and defaults to no. These direct caller actions
+invoke neither the model nor an approval callback. Skill invocations do enter
+the model transcript as ordinary user requests. Model-requested memory and
+skill side effects still use the exact, once-only, in-process approval prompt
+in `chat`; `run` installs no approval handler.
 
 ## Development
 

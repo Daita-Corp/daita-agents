@@ -367,6 +367,16 @@ class AnthropicMessagesProvider:
             finish_reason = FinishReason.TOOL_CALLS
         else:
             if text is None:
+                if stop_reason == "max_tokens":
+                    raise ModelProviderError(
+                        ProviderErrorCode.OUTPUT_LIMIT,
+                        "Anthropic exhausted the output token limit",
+                    )
+                if stop_reason == "model_context_window_exceeded":
+                    raise ModelProviderError(
+                        ProviderErrorCode.CONTEXT_OVERFLOW,
+                        "Anthropic exhausted the context window",
+                    )
                 raise ValueError("response contains neither text nor tool calls")
             if stop_reason in {"end_turn", "stop_sequence"}:
                 finish_reason = FinishReason.STOP
@@ -673,6 +683,16 @@ class _AnthropicStreamDecoder:
             finish_reason = FinishReason.TOOL_CALLS
         else:
             if text is None:
+                if self._stop_reason == "max_tokens":
+                    raise ModelProviderError(
+                        ProviderErrorCode.OUTPUT_LIMIT,
+                        "Anthropic exhausted the output token limit",
+                    )
+                if self._stop_reason == "model_context_window_exceeded":
+                    raise ModelProviderError(
+                        ProviderErrorCode.CONTEXT_OVERFLOW,
+                        "Anthropic exhausted the context window",
+                    )
                 raise ValueError("stream contains neither text nor tool calls")
             if self._stop_reason in {"end_turn", "stop_sequence"}:
                 finish_reason = FinishReason.STOP

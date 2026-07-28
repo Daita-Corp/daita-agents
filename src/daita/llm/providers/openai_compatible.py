@@ -453,6 +453,11 @@ class OpenAICompatibleProvider:
             if calls and canonical_finish is not FinishReason.TOOL_CALLS:
                 raise ValueError("stream tool calls require tool_calls finish")
             text = "".join(text_fragments).strip() or None
+            if not calls and text is None and canonical_finish is FinishReason.LENGTH:
+                raise ModelProviderError(
+                    ProviderErrorCode.OUTPUT_LIMIT,
+                    f"{self.provider} exhausted the output token limit",
+                )
             response = ModelResponse(
                 finish_reason=canonical_finish,
                 text=text,
@@ -587,6 +592,11 @@ class OpenAICompatibleProvider:
                 f"{self.provider} blocked the response",
             )
         finish_reason = _finish_reason(native_finish)
+        if not calls and content is None and finish_reason is FinishReason.LENGTH:
+            raise ModelProviderError(
+                ProviderErrorCode.OUTPUT_LIMIT,
+                f"{self.provider} exhausted the output token limit",
+            )
         response_id = _optional_text(_field(response, "id", None), "response id")
         response_model = _optional_text(
             _field(response, "model", None),
