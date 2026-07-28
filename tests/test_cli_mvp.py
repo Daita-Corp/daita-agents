@@ -1827,6 +1827,38 @@ def test_cli_4_chat_skill_alias_and_fallback_are_ordinary_model_runs():
         provider.assert_consumed()
 
 
+def test_cli_4_chat_learn_routes_to_an_ordinary_foreground_run():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        asyncio.run(_create_agent(root, "chat-learn"))
+        material = "Always give me the summary before the detail."
+        provider = MockModelProvider((_stop("I can propose that preference."),))
+        with patch.object(cli, "create_llm_provider", return_value=provider):
+            code, stdout, stderr = _invoke(
+                [
+                    "--root",
+                    str(root),
+                    "chat",
+                    "chat-learn",
+                    "--model",
+                    "mock:scripted",
+                ],
+                stdin=f"/learn {material}\n/exit\n",
+                tty=True,
+            )
+
+    assert code == 0
+    assert stderr == ""
+    routed = _request_text(provider.requests[0])
+    assert len(routed) == 1
+    assert routed[0].startswith("Treat the following as an explicit teaching request.")
+    assert "approval card is the only confirmation" in routed[0]
+    assert "never ask the user for a typed approval phrase" in routed[0]
+    assert routed[0].endswith(material)
+    assert "I can propose that preference." in stdout
+    provider.assert_consumed()
+
+
 def test_cli_4_chat_skill_create_is_local_and_create_only():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory).resolve()

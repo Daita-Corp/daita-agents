@@ -3072,6 +3072,7 @@ async def test_slash_completion_covers_the_documented_surface_and_remains_local(
         "/settings",
         "/new",
         "/resume <id>",
+        "/learn <material>",
         "/memory",
         "/user",
         "/skills",

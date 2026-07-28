@@ -85,9 +85,12 @@ def memory_set_declarations(store: MemoryStore) -> MemoryDeclarations:
     capability = Capability(
         id=MEMORY_SET_CAPABILITY_ID,
         description=(
-            "Replace one complete bounded advisory memory document after exact "
-            "caller approval. Do not store secrets, raw rows, query results, "
-            "schemas, transient status, or approval claims."
+            "Replace complete bounded MEMORY.md or USER.md via the sole approval card. "
+            "USER.md(target=user)=durable preferences; "
+            "MEMORY.md(target=memory)=schema-independent definitions/conventions; "
+            "SKILL.md=procedures. Text ends run: call first. Preserve unrelated content; "
+            "replace duplicates. Exclude results, schema/transient values, secrets, "
+            "permissions, and assumptions."
         ),
         input_schema={
             "type": "object",

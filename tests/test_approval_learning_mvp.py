@@ -89,15 +89,19 @@ def _skill_save_call(
     name: str = "reusable-workflow",
     description: str = "Apply one reusable workflow.",
     instructions: str = "Follow the verified steps and report assumptions.",
+    expected_sha256: str | None = None,
 ) -> ToolCall:
+    arguments = {
+        "name": name,
+        "description": description,
+        "instructions": instructions,
+    }
+    if expected_sha256 is not None:
+        arguments["expected_sha256"] = expected_sha256
     return ToolCall(
         id=call_id,
         name=SKILL_SAVE_TOOL_NAME,
-        arguments={
-            "name": name,
-            "description": description,
-            "instructions": instructions,
-        },
+        arguments=arguments,
     )
 
 
@@ -131,6 +135,12 @@ def _runtime(agent: Agent) -> DataToolRuntime:
 
 async def _execute(agent: Agent, *calls: ToolCall):
     return await _runtime(agent).execute_all(_run(agent), calls)
+
+
+async def _skill_digest(agent: Agent, name: str) -> str:
+    skill, digest = await agent._embedded._skill_store.read_skill_with_digest(name)
+    assert skill is not None
+    return digest
 
 
 def _error_code(result: ToolResultBlock) -> str:
@@ -560,7 +570,7 @@ async def test_read_groups_are_parallel_and_side_effects_are_ordered_barriers(
             await agent.save_skill(name, name, "body")
         store = agent._embedded._skill_store
         memory_store = agent._embedded._memory_store
-        original_read = store.read_skill
+        original_read = store.read_skill_with_digest
         original_replace = memory_store.replace_from_tool
         initial_started: set[str] = set()
         release_reads = asyncio.Event()
@@ -587,7 +597,7 @@ async def test_read_groups_are_parallel_and_side_effects_are_ordered_barriers(
             actions.append("write-done")
             write_done.set()
 
-        monkeypatch.setattr(store, "read_skill", controlled_read)
+        monkeypatch.setattr(store, "read_skill_with_digest", controlled_read)
         monkeypatch.setattr(memory_store, "replace_from_tool", controlled_replace)
         results = await asyncio.wait_for(
             _execute(
@@ -872,8 +882,10 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
             {"target": "memory", "replaced": True}
         )
         prompt = _system_text(provider.requests[0])
-        assert "Save only facts likely to matter in future runs" in prompt
-        assert "Memory and skill writes require user approval" in prompt
+        assert "explicit durable definitions/preferences/corrections" in prompt
+        assert "ordinary text ends run" in prompt
+        assert "Approval card alone confirms" in prompt
+        assert "never ask typed approval" in prompt
     finally:
         await agent.close()
 
@@ -915,10 +927,141 @@ async def test_explicit_reusable_workflow_is_one_approved_foreground_skill(tmp_p
             {"name": "monthly-revenue", "changed": True}
         )
         prompt = _system_text(provider.requests[0])
-        assert (
-            "reusable procedure, correction, or verified non-obvious workflow" in prompt
+        assert "SKILL.md=procedures" in prompt
+        assert "Replace, do not duplicate" in prompt
+    finally:
+        await agent.close()
+
+
+async def test_weak_learning_signal_stays_in_transcript_without_a_write(tmp_path):
+    approvals: list[ApprovalRequest] = []
+
+    async def approve(request):
+        approvals.append(request)
+        return ApprovalDecision.APPROVE
+
+    provider = MockModelProvider((_stop("That is the current result."),))
+    agent = await Agent.create(
+        "weak-learning-signal",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        approval_handler=approve,
+    )
+    try:
+        result = await agent.run("Revenue happened to be 42 in this one result.")
+        assert result.final_text == "That is the current result."
+        assert await agent.read_memory() == ""
+        assert await agent.read_user_profile() == ""
+        assert await agent.list_skills() == ()
+        assert approvals == []
+        prompt = _system_text(provider.requests[0])
+        assert "inference/one-offs are weak" in prompt
+        assert "Never learn raw results" in prompt
+        assert "Approval card alone confirms" in prompt
+        assert "never ask typed approval" in prompt
+    finally:
+        await agent.close()
+
+
+async def test_learning_tool_descriptions_route_documents_and_require_write_first(
+    tmp_path,
+):
+    agent = await _agent(tmp_path, "learning-tool-routing")
+    try:
+        definitions = {
+            definition.name: definition
+            for definition in await _runtime(agent).definitions(_run(agent))
+        }
+        memory_description = definitions[MEMORY_SET_TOOL_NAME].description
+        skill_view_description = definitions["skill_view"].description
+        skill_save_description = definitions[SKILL_SAVE_TOOL_NAME].description
+
+        assert "USER.md(target=user)=durable preferences" in memory_description
+        assert "MEMORY.md(target=memory)=schema-independent" in (memory_description)
+        assert "SKILL.md=procedures" in memory_description
+        assert "Text ends run: call first" in memory_description
+        assert "replace duplicates" in memory_description
+        assert "sole approval card" in memory_description
+        assert "current_sha256" in skill_view_description
+        assert "reusable validated steps with use, verification, and failure" in (
+            skill_save_description
         )
-        assert "prefer improving an existing skill" in prompt
+        assert "Text ends run: call first" in skill_save_description
+        assert "expected_sha256" in skill_save_description
+        assert "sole approval card" in skill_save_description
+    finally:
+        await agent.close()
+
+
+async def test_loaded_skill_is_replaced_instead_of_duplicated(tmp_path):
+    bootstrap = await Agent.create("replace-not-duplicate", root=tmp_path)
+    try:
+        await bootstrap.save_skill(
+            "monthly-revenue",
+            "Use for monthly booked-revenue reporting.",
+            "Use the invoice date.",
+        )
+        expected_sha256 = await _skill_digest(bootstrap, "monthly-revenue")
+    finally:
+        await bootstrap.close()
+
+    replacement = _skill_save_call(
+        "replace",
+        name="monthly-revenue",
+        description=(
+            "Use for monthly booked-revenue reporting, excluding voided invoices."
+        ),
+        instructions=(
+            "Use the paid invoice date. Exclude voided invoices. Verify the month total."
+        ),
+        expected_sha256=expected_sha256,
+    )
+    provider = MockModelProvider(
+        (
+            _call(
+                ToolCall(
+                    id="view",
+                    name="skill_view",
+                    arguments={"name": "monthly-revenue"},
+                )
+            ),
+            _call(replacement),
+            _stop("I updated the existing workflow."),
+        )
+    )
+    approvals: list[ApprovalRequest] = []
+
+    async def approve(request):
+        approvals.append(request)
+        return ApprovalDecision.APPROVE
+
+    agent = await Agent.open(
+        "replace-not-duplicate",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        approval_handler=approve,
+    )
+    try:
+        result = await agent.run(
+            "Correct the monthly revenue workflow: use paid date and exclude voids."
+        )
+        assert result.final_text == "I updated the existing workflow."
+        assert tuple(summary.name for summary in await agent.list_skills()) == (
+            "monthly-revenue",
+        )
+        current = await agent.read_skill("monthly-revenue")
+        assert current is not None
+        assert current.instructions == replacement.arguments["instructions"]
+        assert len(approvals) == 1
+        assert approvals[0].arguments["name"] == "monthly-revenue"
+        assert approvals[0].arguments["expected_sha256"] == expected_sha256
+
+        viewed = _tool_results(provider)[0]
+        viewed_data = viewed.output["data"]
+        assert isinstance(viewed_data, Mapping)
+        assert viewed_data["current_sha256"] == expected_sha256
     finally:
         await agent.close()
 
@@ -966,11 +1109,16 @@ async def test_denied_skill_save_and_delete_never_mutate(tmp_path, operation):
 
     agent = await _agent(tmp_path, f"deny-skill-{operation}", approval_handler=deny)
     try:
+        await agent.save_skill("target", "Original", "Keep this exact skill.")
         if operation == "delete":
-            await agent.save_skill("target", "Original", "Keep this exact skill.")
             call = _skill_delete_call(name="target")
         else:
-            call = _skill_save_call(name="target")
+            call = _skill_save_call(
+                name="target",
+                description="Denied replacement",
+                instructions="This replacement must not be persisted.",
+                expected_sha256=await _skill_digest(agent, "target"),
+            )
         before = agent.home / "skills" / "target" / "SKILL.md"
         before_bytes = before.read_bytes() if before.exists() else None
         result = (await _execute(agent, call))[0]
@@ -978,6 +1126,53 @@ async def test_denied_skill_save_and_delete_never_mutate(tmp_path, operation):
         after_bytes = before.read_bytes() if before.exists() else None
         assert after_bytes == before_bytes
         assert len(approvals) == 1
+    finally:
+        await agent.close()
+
+
+async def test_blind_and_stale_skill_replacements_fail_before_approval(tmp_path):
+    approvals: list[ApprovalRequest] = []
+
+    async def approve(request):
+        approvals.append(request)
+        return ApprovalDecision.APPROVE
+
+    agent = await _agent(
+        tmp_path,
+        "blind-stale-replacement",
+        approval_handler=approve,
+    )
+    try:
+        await agent.save_skill("target", "Original", "Original instructions.")
+        path = agent.home / "skills/target/SKILL.md"
+        before = path.read_bytes()
+
+        blind = (
+            await _execute(
+                agent,
+                _skill_save_call(
+                    "blind",
+                    name="target",
+                    instructions="Blind replacement.",
+                ),
+            )
+        )[0]
+        stale = (
+            await _execute(
+                agent,
+                _skill_save_call(
+                    "stale",
+                    name="target",
+                    instructions="Stale replacement.",
+                    expected_sha256="0" * 64,
+                ),
+            )
+        )[0]
+
+        assert _error_code(blind) == "skill_expected_sha256_required"
+        assert _error_code(stale) == "skill_stale_replacement"
+        assert approvals == []
+        assert path.read_bytes() == before
     finally:
         await agent.close()
 
@@ -1150,7 +1345,18 @@ async def test_skill_preflight_fingerprints_document_state_and_complete_index(
         assert index_changed["index_sha256"] != initial["index_sha256"]
         assert index_changed["current_sha256"] == initial["current_sha256"]
         await agent.save_skill("target", "Existing target.", "Current body.")
-        selected_changed = await cast(SideEffectExecutor, executor).preflight(execution)
+        replacement_call = _skill_save_call(
+            name="target",
+            expected_sha256=await _skill_digest(agent, "target"),
+        )
+        replacement_execution = ToolExecution(
+            run_id=request.run_id,
+            capability_id=request.capability_id,
+            arguments=FrozenJsonObject.from_mapping(dict(replacement_call.arguments)),
+        )
+        selected_changed = await cast(SideEffectExecutor, executor).preflight(
+            replacement_execution
+        )
         assert selected_changed["exists"] is True
         assert selected_changed["current_sha256"] != initial["current_sha256"]
         assert selected_changed["state_sha256"] != initial["state_sha256"]
@@ -1181,6 +1387,7 @@ async def test_selected_skill_change_during_approval_returns_state_changed(
                 name="target",
                 description="Model",
                 instructions="Stale model content.",
+                expected_sha256=await _skill_digest(agent, "target"),
             )
             if change == "replace"
             else _skill_delete_call(name="target")
@@ -1236,9 +1443,18 @@ async def test_approved_identical_save_reports_unchanged_without_replacement(tmp
             "instructions": "Same instructions.",
         }
         assert await agent.save_skill(**arguments) is True
+        expected_sha256 = await _skill_digest(agent, "target")
         path = agent.home / "skills" / "target" / "SKILL.md"
         before = path.stat()
-        result = (await _execute(agent, _skill_save_call(**arguments)))[0]
+        result = (
+            await _execute(
+                agent,
+                _skill_save_call(
+                    **arguments,
+                    expected_sha256=expected_sha256,
+                ),
+            )
+        )[0]
         after = path.stat()
         assert not result.is_error
         assert result.output["data"] == FrozenJsonObject.from_mapping(
@@ -1263,11 +1479,25 @@ async def test_changed_skill_arguments_require_another_exact_callback(tmp_path):
 
     agent = await _agent(tmp_path, "changed-arguments", approval_handler=approve)
     try:
-        results = await _execute(
-            agent,
-            _skill_save_call("one", name="target", instructions="First version."),
-            _skill_save_call("two", name="target", instructions="Second version."),
-        )
+        first = (
+            await _execute(
+                agent,
+                _skill_save_call("one", name="target", instructions="First version."),
+            )
+        )[0]
+        expected_sha256 = await _skill_digest(agent, "target")
+        second = (
+            await _execute(
+                agent,
+                _skill_save_call(
+                    "two",
+                    name="target",
+                    instructions="Second version.",
+                    expected_sha256=expected_sha256,
+                ),
+            )
+        )[0]
+        results = (first, second)
         assert all(not result.is_error for result in results)
         assert len(approvals) == 2
         assert approvals[0].arguments["instructions"] == "First version."
@@ -1449,10 +1679,15 @@ async def test_reopen_starts_no_learning_work_and_persists_no_skill_approval(tmp
     try:
         assert reopened_provider.requests == ()
         assert await reopened.read_skill("persisted") is not None
+        expected_sha256 = await _skill_digest(reopened, "persisted")
         result = (
             await _execute(
                 reopened,
-                _skill_save_call(name="persisted", instructions="Not approved."),
+                _skill_save_call(
+                    name="persisted",
+                    instructions="Not approved.",
+                    expected_sha256=expected_sha256,
+                ),
             )
         )[0]
         assert _error_code(result) == "approval_required"

@@ -255,6 +255,7 @@ _BUILTIN_SLASH_COMMANDS = frozenset(
         "/conversation",
         "/exit",
         "/help",
+        "/learn",
         "/memory",
         "/model",
         "/new",
@@ -1606,34 +1607,46 @@ async def _chat(
             continue
         if message.startswith("/"):
             try:
-                skill_invocation = await _skill_invocation_message(agent, message)
+                learning_invocation = _learning_invocation_message(message)
             except ValueError as error:
                 print(
-                    "Skill invocation failed: "
-                    + _safe_display(str(error), fallback="invalid invocation"),
+                    "Learning command failed: "
+                    + _safe_display(str(error), fallback="invalid teaching request"),
                     file=output_stream,
                 )
                 continue
-            if skill_invocation is None:
-                agent, conversation_id, action = await _handle_local_command(
-                    message,
-                    agent=agent,
-                    root=root,
-                    input_stream=input_stream,
-                    output_stream=output_stream,
-                    hidden_input=hidden_input,
-                    keychain=keychain,
-                    model_validator=model_validator,
-                    approval_handler=approval_handler,
-                    conversation_id=conversation_id,
-                    validated=validated,
-                    selection_input=selection_input,
-                    selection_output=selection_output,
-                    observer_bridge=observer_bridge,
-                )
-                if action is not None:
-                    return agent, conversation_id, action
-                continue
+            if learning_invocation is not None:
+                message = learning_invocation
+            else:
+                try:
+                    skill_invocation = await _skill_invocation_message(agent, message)
+                except ValueError as error:
+                    print(
+                        "Skill invocation failed: "
+                        + _safe_display(str(error), fallback="invalid invocation"),
+                        file=output_stream,
+                    )
+                    continue
+                if skill_invocation is None:
+                    agent, conversation_id, action = await _handle_local_command(
+                        message,
+                        agent=agent,
+                        root=root,
+                        input_stream=input_stream,
+                        output_stream=output_stream,
+                        hidden_input=hidden_input,
+                        keychain=keychain,
+                        model_validator=model_validator,
+                        approval_handler=approval_handler,
+                        conversation_id=conversation_id,
+                        validated=validated,
+                        selection_input=selection_input,
+                        selection_output=selection_output,
+                        observer_bridge=observer_bridge,
+                    )
+                    if action is not None:
+                        return agent, conversation_id, action
+                    continue
 
         creates_conversation = conversation_id is None
         try:
@@ -1784,6 +1797,33 @@ async def _chat_tui(
         selected_conversation: str | None,
     ) -> terminal_tui.TerminalCommandResult:
         nonlocal agent
+        try:
+            learning_invocation = _learning_invocation_message(command)
+        except ValueError as error:
+            return terminal_tui.TerminalCommandResult(
+                conversation_id=selected_conversation,
+                output=(
+                    "Learning command failed: "
+                    + _safe_display(
+                        str(error),
+                        fallback="invalid teaching request",
+                    )
+                    + "\n"
+                ),
+                source_summary=await _source_status_label(
+                    agent,
+                    conversation_id=selected_conversation,
+                ),
+            )
+        if learning_invocation is not None:
+            return terminal_tui.TerminalCommandResult(
+                conversation_id=selected_conversation,
+                model_message=learning_invocation,
+                source_summary=await _source_status_label(
+                    agent,
+                    conversation_id=selected_conversation,
+                ),
+            )
         try:
             skill_invocation = await _skill_invocation_message(agent, command)
         except ValueError as error:
@@ -2401,6 +2441,7 @@ def _write_chat_help(output_stream: TextIO) -> None:
         "/settings",
         "/new",
         "/resume <id>",
+        "/learn <material>",
         "/memory [edit]",
         "/user [edit]",
         "/skills [show|edit|delete <name>]",
@@ -2642,6 +2683,25 @@ async def _skill_invocation_message(agent: Agent, message: str) -> str | None:
     except ValueError:
         return None
     return message if skill is not None else None
+
+
+def _learning_invocation_message(message: str) -> str | None:
+    parts = message.split(maxsplit=1)
+    if not parts or parts[0] != "/learn":
+        return None
+    if len(parts) == 1 or not parts[1].strip():
+        raise ValueError("usage: /learn <material>")
+    material = parts[1].strip()
+    return (
+        "Treat the following as an explicit teaching request. Determine whether it "
+        "belongs in stable user preferences, agent-wide business memory, or a "
+        "reusable procedural skill. Apply the normal foreground-learning safety "
+        "rules and inspect existing memory or skills when needed. Call the smallest "
+        "fitting learning tool immediately; its approval card is the only confirmation, "
+        "so never ask the user for a typed approval phrase. Do not claim that a workflow "
+        "is verified unless it was executed successfully or the user explicitly "
+        "confirmed it.\n\nTeaching material:\n" + material
+    )
 
 
 async def _create_skill(

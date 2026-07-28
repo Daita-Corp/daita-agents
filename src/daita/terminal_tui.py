@@ -61,6 +61,7 @@ _SLASH_COMMAND_COMPLETIONS = (
     ("/settings", "/settings", "Show agent and model settings"),
     ("/new", "/new", "Start a new conversation"),
     ("/resume ", "/resume <id>", "Resume a previous conversation"),
+    ("/learn ", "/learn <material>", "Teach durable knowledge or a procedure"),
     ("/memory", "/memory", "View or edit agent memory"),
     ("/user", "/user", "View or edit the user profile"),
     ("/skills", "/skills", "List available skills"),

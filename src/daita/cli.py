@@ -38,7 +38,7 @@ from .llm import (
 from .llm.profiles import reviewed_model_profile
 from .security import SecretReference
 from .skills import validate_skill_name
-from .terminal import run_terminal_application
+from .terminal import _learning_invocation_message, run_terminal_application
 
 _SKILL_DESCRIPTION_PLACEHOLDER = "Describe when the agent should use this skill."
 _SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
@@ -48,6 +48,7 @@ _BUILTIN_CHAT_COMMANDS = frozenset(
         "/conversation",
         "/exit",
         "/help",
+        "/learn",
         "/memory",
         "/model",
         "/new",
@@ -342,6 +343,7 @@ def _write_help() -> None:
     print("  /new")
     print("  /resume <conversation-id>")
     print("  /sources")
+    print("  /learn <material>")
     print("  /memory")
     print("  /memory edit")
     print("  /user")
@@ -848,22 +850,32 @@ async def _chat(args: argparse.Namespace) -> int:
                 continue
             if message.startswith("/"):
                 try:
-                    skill_invocation = await _skill_invocation_message(agent, message)
+                    learning_invocation = _learning_invocation_message(message)
                 except ValueError as error:
-                    _write_local_diagnostic(f"Skill invocation failed: {error}")
+                    _write_local_diagnostic(f"Learning command failed: {error}")
                     continue
-                if skill_invocation is None:
-                    should_exit, conversation_id = await _handle_chat_command(
-                        message,
-                        agent=agent,
-                        model_id=args.model,
-                        state_root=state_root,
-                        conversation_id=conversation_id,
-                        totals=totals,
-                    )
-                    if should_exit:
-                        break
-                    continue
+                if learning_invocation is not None:
+                    message = learning_invocation
+                else:
+                    try:
+                        skill_invocation = await _skill_invocation_message(
+                            agent, message
+                        )
+                    except ValueError as error:
+                        _write_local_diagnostic(f"Skill invocation failed: {error}")
+                        continue
+                    if skill_invocation is None:
+                        should_exit, conversation_id = await _handle_chat_command(
+                            message,
+                            agent=agent,
+                            model_id=args.model,
+                            state_root=state_root,
+                            conversation_id=conversation_id,
+                            totals=totals,
+                        )
+                        if should_exit:
+                            break
+                        continue
 
             creates_conversation = conversation_id is None
             result = await agent.run(message, conversation_id=conversation_id)

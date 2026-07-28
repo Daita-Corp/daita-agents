@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import Mapping
 from dataclasses import fields
 from datetime import datetime, timezone
+from hashlib import sha256
 import os
 from pathlib import Path
 import sqlite3
@@ -534,11 +535,23 @@ async def test_progressive_view_returns_full_skill_but_initial_prompt_is_shallow
         assert result_block.output["kind"] == SKILL_VIEW_OUTPUT_KIND
         data = result_block.output["data"]
         assert isinstance(data, Mapping)
+        exists, preflight_sha256, _state, _index = (
+            await agent._embedded._skill_store.preflight_save(
+                "monthly-revenue",
+                "Analyze monthly revenue.",
+                instructions,
+            )
+        )
+        assert exists is True
         assert dict(data) == {
             "name": "monthly-revenue",
             "description": "Analyze monthly revenue.",
             "instructions": instructions,
+            "current_sha256": sha256(
+                (agent.home / "skills/monthly-revenue/SKILL.md").read_bytes()
+            ).hexdigest(),
         }
+        assert data["current_sha256"] == preflight_sha256
         transcript = await agent.transcript(result.run_id)
         assert instructions in repr(transcript.messages)
     finally:
@@ -762,7 +775,7 @@ async def test_parallel_skill_and_data_reads_start_together_and_keep_order(
         runtime = loop._tools
         skill_store = agent._embedded._skill_store
         catalog_service = agent._embedded._catalog_service
-        original_read = skill_store.read_skill
+        original_read = skill_store.read_skill_with_digest
         original_search = catalog_service.search
         started: set[str] = set()
         release = asyncio.Event()
@@ -781,7 +794,7 @@ async def test_parallel_skill_and_data_reads_start_together_and_keep_order(
             await release.wait()
             return await original_search(request)
 
-        monkeypatch.setattr(skill_store, "read_skill", slow_read)
+        monkeypatch.setattr(skill_store, "read_skill_with_digest", slow_read)
         monkeypatch.setattr(catalog_service, "search", slow_search)
         run = RunInput(
             id="parallel-run",

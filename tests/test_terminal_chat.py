@@ -1043,6 +1043,40 @@ async def test_skills_create_reopens_invalid_draft_without_losing_it(
     assert skill is not None
 
 
+async def test_learn_command_routes_material_into_one_ordinary_foreground_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    keychain = _Keychain()
+    await _ready_agent(tmp_path, keychain)
+    material = "Prefer a table followed by a two-sentence summary."
+    provider = MockModelProvider(
+        (_stop("I can propose that preference for approval."),),
+        provider_id="openai:test-model",
+    )
+    _install_provider(monkeypatch, provider)
+    output = io.StringIO()
+
+    code = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO(f"/learn {material}\n/exit\n"),
+        output_stream=output,
+        keychain=keychain,
+    )
+
+    assert code == 0
+    routed = _request_text(provider.requests[0])
+    assert len(routed) == 1
+    assert routed[0].startswith("Treat the following as an explicit teaching request.")
+    assert "Call the smallest fitting learning tool immediately" in routed[0]
+    assert "approval card is the only confirmation" in routed[0]
+    assert "never ask the user for a typed approval phrase" in routed[0]
+    assert routed[0].endswith(material)
+    assert terminal._learning_invocation_message("Remember this naturally.") is None
+    with pytest.raises(ValueError, match=r"usage: /learn <material>"):
+        terminal._learning_invocation_message("/learn")
+
+
 @pytest.mark.parametrize(
     "invocation",
     (

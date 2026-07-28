@@ -101,6 +101,15 @@ class SkillStore:
         validate_skill_name(name)
         return await self._run_locked(lambda: self._read_sync(name))
 
+    async def read_skill_with_digest(self, name: str) -> tuple[Skill | None, str]:
+        """Read one skill and its preflight rendered-document digest atomically."""
+
+        validate_skill_name(name)
+        inspected = await self._run_locked(
+            lambda: self._inspect_sync(name, None, False)
+        )
+        return inspected[0], inspected[2]
+
     async def skill_index(self) -> str:
         skills = await self._run_locked(self._list_sync)
         return render_skill_index(item.summary for item in skills)
@@ -129,24 +138,26 @@ class SkillStore:
 
         skill = Skill(name, description, instructions)
         self._require_open()
-        return await asyncio.to_thread(
-            self._preflight_sync,
+        _selected, exists, digest, state_digest, index_digest = await asyncio.to_thread(
+            self._inspect_sync,
             name,
             skill,
             False,
         )
+        return exists, digest, state_digest, index_digest
 
     async def preflight_delete(self, name: str) -> tuple[bool, str, str, str]:
         """Validate one deletion and fingerprint its document and complete index."""
 
         validate_skill_name(name)
         self._require_open()
-        return await asyncio.to_thread(
-            self._preflight_sync,
+        _selected, exists, digest, state_digest, index_digest = await asyncio.to_thread(
+            self._inspect_sync,
             name,
             None,
             True,
         )
+        return exists, digest, state_digest, index_digest
 
     async def save_from_tool(
         self,
@@ -221,12 +232,12 @@ class SkillStore:
         finally:
             os.close(home)
 
-    def _preflight_sync(
+    def _inspect_sync(
         self,
         name: str,
         candidate: Skill | None,
         require_present: bool,
-    ) -> tuple[bool, str, str, str]:
+    ) -> tuple[Skill | None, bool, str, str, str]:
         home = self._open_home()
         try:
             root, root_state = _open_directory(home, _SKILLS_DIRECTORY, required=False)
@@ -235,6 +246,7 @@ class SkillStore:
                     raise SkillNotFoundError(name)
                 current: tuple[Skill, ...] = ()
                 current_index = render_skill_index(())
+                selected = None
                 selected_bytes = b""
                 selected_state = "absent"
             else:
@@ -283,8 +295,9 @@ class SkillStore:
                 render_skill_index(item.summary for item in proposed.values())
 
             return (
+                selected,
                 bool(selected_bytes),
-                sha256(selected_bytes).hexdigest(),
+                _rendered_document_sha256(selected_bytes),
                 selected_state,
                 sha256(current_index.encode("utf-8")).hexdigest(),
             )
@@ -555,6 +568,12 @@ def _render_skill(skill: Skill) -> bytes:
             "rendered SKILL.md exceeds the 50000 UTF-8 byte limit"
         )
     return data
+
+
+def _rendered_document_sha256(data: bytes) -> str:
+    """Return the one digest used by skill view and replacement preflight."""
+
+    return sha256(data).hexdigest()
 
 
 def _parse_skill(data: bytes, expected_name: str) -> Skill:

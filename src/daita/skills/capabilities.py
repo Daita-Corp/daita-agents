@@ -61,7 +61,7 @@ class SkillViewExecutor:
     async def execute(self, request: ToolExecution) -> ToolOutput:
         name = request.arguments["name"]
         assert isinstance(name, str)
-        skill = await self._store.read_skill(name)
+        skill, current_sha256 = await self._store.read_skill_with_digest(name)
         if skill is None:
             raise SkillNotFoundError(name)
         return ToolOutput(
@@ -70,6 +70,7 @@ class SkillViewExecutor:
                 "name": skill.name,
                 "description": skill.description,
                 "instructions": skill.instructions,
+                "current_sha256": current_sha256,
             },
         )
 
@@ -83,7 +84,7 @@ class SkillSaveExecutor:
         self._store = store
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        name, description, instructions = _save_arguments(request)
+        name, description, instructions, expected_sha256 = _save_arguments(request)
         try:
             exists, document_digest, state_digest, index_digest = (
                 await self._store.preflight_save(name, description, instructions)
@@ -100,6 +101,12 @@ class SkillSaveExecutor:
                 "The skill collection is unavailable or invalid.",
                 {"name": name},
             ) from error
+        _validate_replacement_digest(
+            name,
+            exists=exists,
+            current_sha256=document_digest,
+            expected_sha256=expected_sha256,
+        )
         return _fingerprint(
             name,
             exists,
@@ -109,7 +116,7 @@ class SkillSaveExecutor:
         )
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        name, description, instructions = _save_arguments(request)
+        name, description, instructions, _expected_sha256 = _save_arguments(request)
         changed = await self._store.save_from_tool(
             name,
             description,
@@ -176,8 +183,8 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
         Capability(
             id=SKILL_VIEW_CAPABILITY_ID,
             description=(
-                "Load one complete user-authorized procedural skill by its indexed "
-                "name."
+                "Load one complete procedural skill and current_sha256; use that digest "
+                "as skill_save.expected_sha256 when replacing it."
             ),
             input_schema=_name_input_schema(),
             output_kind=SKILL_VIEW_OUTPUT_KIND,
@@ -187,8 +194,17 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                     "name": {"type": "string"},
                     "description": {"type": "string"},
                     "instructions": {"type": "string"},
+                    "current_sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                    },
                 },
-                "required": ["name", "description", "instructions"],
+                "required": [
+                    "name",
+                    "description",
+                    "instructions",
+                    "current_sha256",
+                ],
                 "additionalProperties": False,
             },
             executor_id=view.executor_id,
@@ -198,9 +214,12 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
         Capability(
             id=SKILL_SAVE_CAPABILITY_ID,
             description=(
-                "Create or replace one bounded reusable procedural skill after exact "
-                "caller approval. Prefer improving an existing skill over creating a "
-                "near-duplicate."
+                "Create/replace complete bounded procedural SKILL.md via the sole "
+                "approval card. Use for reusable validated steps with use, verification, "
+                "and failure guidance—not one-off results/schema. Description states "
+                "when, process/sources, exclusions, and result. Text ends run: call "
+                "first. Replace via skill_view current_sha256 as expected_sha256; "
+                "blind/stale fails."
             ),
             input_schema={
                 "type": "object",
@@ -219,6 +238,12 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": SKILL_INSTRUCTIONS_MAX_CHARACTERS,
+                    },
+                    "expected_sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "minLength": 64,
+                        "maxLength": 64,
                     },
                 },
                 "required": ["name", "description", "instructions"],
@@ -240,10 +265,7 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
         ),
         Capability(
             id=SKILL_DELETE_CAPABILITY_ID,
-            description=(
-                "Delete one exact procedural skill after caller approval. The skill "
-                "must exist when approval is requested."
-            ),
+            description="Delete one existing skill after exact approval.",
             input_schema=_name_input_schema(),
             output_kind=SKILL_DELETE_OUTPUT_KIND,
             output_schema={
@@ -298,19 +320,47 @@ def _name_input_schema() -> dict[str, object]:
     }
 
 
-def _save_arguments(request: ToolExecution) -> tuple[str, str, str]:
+def _save_arguments(request: ToolExecution) -> tuple[str, str, str, str | None]:
     if request.capability_id != SKILL_SAVE_CAPABILITY_ID:
         raise ValueError("skill save executor received another capability")
     name = request.arguments["name"]
     description = request.arguments["description"]
     instructions = request.arguments["instructions"]
+    expected_sha256 = request.arguments.get("expected_sha256")
     if (
         not isinstance(name, str)
         or not isinstance(description, str)
         or not isinstance(instructions, str)
+        or (expected_sha256 is not None and not isinstance(expected_sha256, str))
     ):
         raise TypeError("skill save arguments must be text")
-    return name, description, instructions
+    return name, description, instructions, expected_sha256
+
+
+def _validate_replacement_digest(
+    name: str,
+    *,
+    exists: bool,
+    current_sha256: str,
+    expected_sha256: str | None,
+) -> None:
+    if exists and expected_sha256 is None:
+        raise CapabilityInputError(
+            "skill_expected_sha256_required",
+            (
+                "Replacing an existing skill requires expected_sha256 from a current "
+                "skill_view result."
+            ),
+            {"name": name},
+        )
+    if (exists and expected_sha256 != current_sha256) or (
+        not exists and expected_sha256 is not None
+    ):
+        raise CapabilityInputError(
+            "skill_stale_replacement",
+            "The skill changed or disappeared; load it again with skill_view.",
+            {"name": name},
+        )
 
 
 def _delete_arguments(request: ToolExecution) -> str:
