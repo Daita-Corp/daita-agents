@@ -36,8 +36,24 @@ from ...catalog.capabilities import (
     CATALOG_SEARCH_CAPABILITY_ID,
     CATALOG_TRAVERSE_CAPABILITY_ID,
 )
-from ...llm.models import ToolCall, ToolDefinition, ToolResultBlock
-from ...loop.models import RunInput
+from ...llm.models import MessageRole, ToolCall, ToolDefinition, ToolResultBlock
+from ...loop.models import RunInput, Transcript
+from ...semantics import (
+    SEMANTIC_DELETE_CAPABILITY_ID,
+    SEMANTIC_LIST_CAPABILITY_ID,
+    SEMANTIC_SAVE_CAPABILITY_ID,
+    SEMANTIC_VIEW_CAPABILITY_ID,
+    SemanticAnnotation,
+    SemanticAnnotationState,
+    SemanticAnnotationView,
+    SemanticDigestMismatchError,
+    SemanticEvidenceKind,
+    SemanticNotFoundError,
+    SemanticResourceFact,
+    SemanticValidationError,
+    inspect_semantic_annotations,
+    semantic_annotation_from_mapping,
+)
 from ...skills.capabilities import (
     SKILL_DELETE_CAPABILITY_ID,
     SKILL_SAVE_CAPABILITY_ID,
@@ -49,7 +65,10 @@ from ...skills.store import (
     SkillValidationError,
     validate_skill_name,
 )
-from .file_capabilities import LOCAL_FILE_READ_CAPABILITY_ID
+from .file_capabilities import (
+    LOCAL_FILE_READ_CAPABILITY_ID,
+    LOCAL_FILE_READ_EVIDENCE_KIND,
+)
 from .sql import ResourceSchema, validate_postgresql_read, validate_sqlite_read
 
 SQLITE_QUERY_CAPABILITY_ID = "data.sqlite.query"
@@ -76,7 +95,38 @@ _MVP_CAPABILITIES = frozenset(
         SKILL_SAVE_CAPABILITY_ID,
         SKILL_DELETE_CAPABILITY_ID,
         MEMORY_SET_CAPABILITY_ID,
+        SEMANTIC_LIST_CAPABILITY_ID,
+        SEMANTIC_VIEW_CAPABILITY_ID,
+        SEMANTIC_SAVE_CAPABILITY_ID,
+        SEMANTIC_DELETE_CAPABILITY_ID,
     }
+)
+_SEMANTIC_CAPABILITIES = frozenset(
+    {
+        SEMANTIC_LIST_CAPABILITY_ID,
+        SEMANTIC_VIEW_CAPABILITY_ID,
+        SEMANTIC_SAVE_CAPABILITY_ID,
+        SEMANTIC_DELETE_CAPABILITY_ID,
+    }
+)
+_SEMANTIC_MANAGEMENT_SIGNALS = (
+    "business meaning",
+    "correct the definition",
+    "define ",
+    "definition",
+    "explicit teaching request",
+    "learn ",
+    " means ",
+    "remember ",
+    "replace ",
+    "resource/field-scoped semantic annotation",
+    "semantic",
+    "should mean",
+    "supersede",
+    "teach ",
+    "teaching material:",
+    "we mean",
+    "when we say",
 )
 
 
@@ -111,6 +161,21 @@ class CatalogDataReader(CatalogSchemaReader, Protocol):
         resource_id: str,
     ) -> bool: ...
 
+    async def semantic_resource_facts(
+        self,
+        agent_id: str,
+        resource_ids: tuple[str, ...],
+    ) -> tuple[SemanticResourceFact, ...]: ...
+
+
+class TranscriptReader(Protocol):
+    async def load(self, run_id: str) -> Transcript: ...
+
+    async def list_semantic_annotations(
+        self,
+        agent_id: str,
+    ) -> tuple[SemanticAnnotation, ...]: ...
+
 
 class DataToolRuntime:
     """Project, authorize, and execute built-in MVP tools."""
@@ -124,6 +189,7 @@ class DataToolRuntime:
         mutation_lock: asyncio.Lock | None = None,
         observer: AgentObserver | None = None,
         clock: Callable[[], datetime] | None = None,
+        transcripts: TranscriptReader | None = None,
     ) -> None:
         if not isinstance(registry, CapabilityRegistry):
             raise TypeError("registry must be CapabilityRegistry")
@@ -137,16 +203,33 @@ class DataToolRuntime:
             raise TypeError("observer must be callable or None")
         if clock is not None and not callable(clock):
             raise TypeError("clock must be callable or None")
+        if transcripts is not None and not callable(getattr(transcripts, "load", None)):
+            raise TypeError("transcripts must provide load")
         self._registry = registry
         self._catalog = catalog
         self._approval_handler = approval_handler
         self._mutation_lock = mutation_lock or asyncio.Lock()
         self._observer = observer
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._transcripts = transcripts
 
     async def definitions(self, run: RunInput) -> tuple[ToolDefinition, ...]:
         names = await self._projected_tool_names(run)
         return tuple(self._registry.tool_definition(name) for name in names)
+
+    async def validate_semantic_annotation(
+        self,
+        agent_id: str,
+        annotation: SemanticAnnotation,
+    ) -> None:
+        """Validate direct public semantic content against current authoritative state."""
+
+        if not isinstance(annotation, SemanticAnnotation):
+            raise TypeError("annotation must be SemanticAnnotation")
+        issue = await self._semantic_annotation_issue(agent_id, annotation)
+        if issue is not None:
+            _code, message, _details = issue
+            raise SemanticValidationError(message)
 
     async def execute_all(
         self,
@@ -212,7 +295,15 @@ class DataToolRuntime:
                 )
                 self._emit_tool_completed(run, call, result, started)
                 return result
-            arguments = self._registry.validate_arguments(capability.id, call.arguments)
+            raw_arguments = (
+                _without_runtime_owned_semantic_evidence(call.arguments)
+                if capability.id == SEMANTIC_SAVE_CAPABILITY_ID
+                else call.arguments
+            )
+            arguments = self._registry.validate_arguments(
+                capability.id,
+                raw_arguments,
+            )
             arguments = self._apply_source_scope(run, capability, arguments)
             validation_error = await self._validate(run, capability, arguments)
             if validation_error is not None:
@@ -220,6 +311,11 @@ class DataToolRuntime:
                 result = _error(call, code, message, details)
                 self._emit_tool_completed(run, call, result, started)
                 return result
+            if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
+                arguments = await self._bind_current_semantic_evidence(
+                    run,
+                    arguments,
+                )
             resolved_capability, executor = self._registry.resolve_execution(
                 capability.id
             )
@@ -240,6 +336,15 @@ class DataToolRuntime:
                 )
             else:
                 candidate = await executor.execute(execution)
+                if capability.id == SEMANTIC_VIEW_CAPABILITY_ID:
+                    await self._require_current_semantic_view(run, arguments)
+                elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:
+                    self._registry.validate_output(capability.id, candidate)
+                    candidate = await self._filter_semantic_list(
+                        run,
+                        arguments,
+                        candidate,
+                    )
                 output = self._registry.validate_output(capability.id, candidate)
                 result = _success(call, output)
         except CapabilityInputError as error:
@@ -276,6 +381,27 @@ class DataToolRuntime:
                 "skill_unavailable",
                 "The requested skill document is unavailable or invalid.",
             )
+        except SemanticNotFoundError:
+            result = _error(
+                call,
+                "semantic_not_found",
+                "The requested semantic annotation is not available.",
+                {"id": call.arguments.get("id")},
+            )
+        except SemanticDigestMismatchError as error:
+            code = (
+                "semantic_expected_sha256_required"
+                if "requires expected_sha256" in str(error)
+                else "semantic_stale_digest"
+            )
+            result = _error(call, code, str(error), {"id": call.arguments.get("id")})
+        except SemanticValidationError as error:
+            result = _error(
+                call,
+                "semantic_invalid_annotation",
+                str(error),
+                {"id": call.arguments.get("id")},
+            )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -309,6 +435,7 @@ class DataToolRuntime:
         fingerprint = await side_effect.preflight(execution)
         if not isinstance(fingerprint, FrozenJsonObject):
             raise ValueError("side-effect preflight must return FrozenJsonObject")
+        await self._validate_semantic_preflight(run, capability, fingerprint)
         if self._approval_handler is None:
             return (
                 _error(
@@ -371,9 +498,16 @@ class DataToolRuntime:
         async with self._mutation_lock:
             try:
                 current = await side_effect.preflight(execution)
+                await self._validate_semantic_preflight(run, capability, current)
             except asyncio.CancelledError:
                 raise
-            except (CapabilityInputError, SkillNotFoundError):
+            except (
+                CapabilityInputError,
+                SemanticDigestMismatchError,
+                SemanticNotFoundError,
+                SemanticValidationError,
+                SkillNotFoundError,
+            ):
                 return (
                     _error(
                         call,
@@ -405,6 +539,405 @@ class DataToolRuntime:
                 return _exception_result(call, execution_error), cancelled
             output = self._registry.validate_output(capability.id, candidate)
             return _success(call, output), cancelled
+
+    async def _validate_semantic_preflight(
+        self,
+        run: RunInput,
+        capability: Capability,
+        fingerprint: FrozenJsonObject,
+    ) -> None:
+        if capability.id != SEMANTIC_SAVE_CAPABILITY_ID:
+            return
+        raw_annotation = fingerprint.get("annotation")
+        if not isinstance(raw_annotation, Mapping):
+            raise ValueError("semantic preflight omitted its candidate annotation")
+        annotation = semantic_annotation_from_mapping(raw_annotation)
+        if annotation.agent_id != run.agent_id:
+            raise CapabilityInputError(
+                "semantic_foreign_agent",
+                "The semantic annotation belongs to another agent.",
+            )
+        issue = await self._semantic_annotation_issue(run.agent_id, annotation)
+        if issue is not None:
+            code, message, details = issue
+            raise CapabilityInputError(code, message, details)
+
+    async def _bind_current_semantic_evidence(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+    ) -> FrozenJsonObject:
+        """Replace model-authored provenance with exact current transcript facts."""
+
+        if self._transcripts is None:
+            raise CapabilityInputError(
+                "semantic_evidence_unavailable",
+                "Semantic evidence validation is unavailable.",
+            )
+        try:
+            transcript = await self._transcripts.load(run.id)
+        except KeyError as error:
+            raise CapabilityInputError(
+                "semantic_invalid_evidence",
+                "The current semantic write transcript is unavailable.",
+                {"run_id": run.id},
+            ) from error
+        if transcript.run.id != run.id or transcript.run.agent_id != run.agent_id:
+            raise CapabilityInputError(
+                "semantic_invalid_evidence",
+                "The current semantic write transcript identity does not match.",
+                {"run_id": run.id},
+            )
+
+        raw_evidence = arguments.get("evidence")
+        if not isinstance(raw_evidence, tuple):
+            raise CapabilityInputError(
+                "semantic_invalid_evidence",
+                "Semantic evidence must be a bounded array.",
+            )
+        user_positions = tuple(
+            position
+            for position, message in enumerate(transcript.messages)
+            if message.role is MessageRole.USER
+        )
+        bound: list[dict[str, object]] = []
+        for item in raw_evidence:
+            if not isinstance(item, Mapping):
+                raise CapabilityInputError(
+                    "semantic_invalid_evidence",
+                    "Semantic evidence entries must be objects.",
+                )
+            kind_value = item.get("kind")
+            try:
+                kind = SemanticEvidenceKind(kind_value)
+            except (TypeError, ValueError) as error:
+                raise CapabilityInputError(
+                    "semantic_invalid_evidence",
+                    "Semantic evidence kind is not supported.",
+                ) from error
+            note = item.get("note")
+            entry: dict[str, object] = {
+                "kind": kind.value,
+                "run_id": run.id,
+            }
+            if note is not None:
+                entry["note"] = note
+            if kind in {
+                SemanticEvidenceKind.USER_ASSERTION,
+                SemanticEvidenceKind.USER_CONFIRMATION,
+            }:
+                if len(user_positions) != 1:
+                    raise CapabilityInputError(
+                        "semantic_invalid_evidence",
+                        "Current-run user evidence must resolve to exactly one message.",
+                        {"run_id": run.id},
+                    )
+                entry["message_position"] = user_positions[0]
+            else:
+                tool_call_id = item.get("tool_call_id")
+                if not isinstance(tool_call_id, str):
+                    raise CapabilityInputError(
+                        "semantic_invalid_evidence",
+                        "Tool-result evidence requires a tool_call_id.",
+                    )
+                result_positions = tuple(
+                    position
+                    for position, message in enumerate(transcript.messages)
+                    if message.role is MessageRole.TOOL
+                    and any(
+                        isinstance(block, ToolResultBlock)
+                        and block.call_id == tool_call_id
+                        for block in message.content
+                    )
+                )
+                if len(result_positions) != 1:
+                    raise CapabilityInputError(
+                        "semantic_invalid_evidence",
+                        (
+                            "Tool-result evidence must reference exactly one result "
+                            "from an earlier completed tool step in the current run."
+                        ),
+                        {"run_id": run.id, "tool_call_id": tool_call_id},
+                    )
+                entry["message_position"] = result_positions[0]
+                entry["tool_call_id"] = tool_call_id
+            bound.append(entry)
+
+        normalized = (
+            arguments.to_dict()
+            if isinstance(arguments, FrozenJsonObject)
+            else dict(arguments)
+        )
+        normalized["evidence"] = bound
+        return FrozenJsonObject.from_mapping(normalized)
+
+    async def _require_current_semantic_view(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+    ) -> None:
+        annotation_id = arguments.get("id")
+        if not isinstance(annotation_id, str):
+            raise CapabilityInputError(
+                "semantic_invalid_id",
+                "Semantic view requires an annotation id.",
+            )
+        selected = next(
+            (
+                view
+                for view in await self._current_semantic_views(run.agent_id)
+                if view.annotation.id == annotation_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise SemanticNotFoundError(annotation_id)
+        if selected.state is not SemanticAnnotationState.ACTIVE:
+            raise CapabilityInputError(
+                "semantic_not_current",
+                (
+                    "The semantic annotation is stale, conflicting, or superseded; "
+                    "inspect it through /memory before using it."
+                ),
+                {"id": annotation_id, "state": selected.state.value},
+            )
+
+    async def _filter_semantic_list(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        output: ToolOutput,
+    ) -> ToolOutput:
+        raw = output.data.get("annotations")
+        if not isinstance(raw, tuple):
+            raise ToolOutputValidationError(
+                "semantic list output annotations must be an array"
+            )
+        source_id = arguments.get("source_id")
+        resource_id = arguments.get("resource_id")
+        kind = arguments.get("kind")
+        limit = arguments.get("limit", 24)
+        assert source_id is None or isinstance(source_id, str)
+        assert resource_id is None or isinstance(resource_id, str)
+        assert kind is None or isinstance(kind, str)
+        assert isinstance(limit, int) and not isinstance(limit, bool)
+        active = tuple(
+            view
+            for view in await self._current_semantic_views(run.agent_id)
+            if view.state is SemanticAnnotationState.ACTIVE
+            and (source_id is None or source_id in view.annotation.subject.source_ids)
+            and (
+                resource_id is None
+                or resource_id in view.annotation.subject.resource_ids
+            )
+            and (kind is None or view.annotation.kind.value == kind)
+        )[:limit]
+        annotations = tuple(
+            {
+                "id": view.annotation.id,
+                "kind": view.annotation.kind.value,
+                "resource_ids": view.annotation.subject.resource_ids,
+                "field_count": len(view.annotation.subject.fields),
+                "statement_preview": view.annotation.statement[:240],
+                "current_sha256": view.sha256,
+            }
+            for view in active
+        )
+        return ToolOutput(
+            kind=output.kind,
+            data={"annotations": annotations, "count": len(annotations)},
+        )
+
+    async def _current_semantic_views(
+        self,
+        agent_id: str,
+    ) -> tuple[SemanticAnnotationView, ...]:
+        if self._transcripts is None:
+            raise CapabilityInputError(
+                "semantic_state_unavailable",
+                "Semantic state validation is unavailable.",
+            )
+        annotations = await self._transcripts.list_semantic_annotations(agent_id)
+        resource_ids = tuple(
+            sorted(
+                {
+                    resource_id
+                    for annotation in annotations
+                    for resource_id in annotation.subject.resource_ids
+                }
+            )
+        )
+        facts = await self._catalog.semantic_resource_facts(agent_id, resource_ids)
+        return inspect_semantic_annotations(annotations, facts)
+
+    async def _semantic_annotation_issue(
+        self,
+        agent_id: str,
+        annotation: SemanticAnnotation,
+    ) -> tuple[str, str, Mapping[str, object]] | None:
+        if annotation.agent_id != agent_id:
+            return (
+                "semantic_foreign_agent",
+                "The semantic annotation belongs to another agent.",
+                {"annotation_id": annotation.id},
+            )
+        facts = await self._catalog.semantic_resource_facts(
+            agent_id,
+            annotation.subject.resource_ids,
+        )
+        fact_by_id = {item.resource_id: item for item in facts}
+        for resource_id in annotation.subject.resource_ids:
+            if resource_id not in fact_by_id:
+                return (
+                    "semantic_unknown_resource",
+                    "A semantic subject resource is not current for this agent.",
+                    {"resource_id": resource_id},
+                )
+        actual_sources = tuple(
+            sorted(
+                {fact_by_id[item].source_id for item in annotation.subject.resource_ids}
+            )
+        )
+        if actual_sources != annotation.subject.source_ids:
+            return (
+                "semantic_source_mismatch",
+                "Semantic source scope does not match the current catalog resources.",
+                {
+                    "actual_source_ids": actual_sources,
+                    "subject_source_ids": annotation.subject.source_ids,
+                },
+            )
+        revisions = {
+            item.resource_id: item.revision for item in annotation.catalog_revisions
+        }
+        for resource_id in annotation.subject.resource_ids:
+            current_revision = fact_by_id[resource_id].revision
+            if revisions[resource_id] != current_revision:
+                return (
+                    "semantic_stale_revision",
+                    "A semantic revision binding does not match the current catalog.",
+                    {
+                        "current_revision": current_revision,
+                        "resource_id": resource_id,
+                        "requested_revision": revisions[resource_id],
+                    },
+                )
+        for field in annotation.subject.fields:
+            if field.field_name not in fact_by_id[field.resource_id].field_names:
+                return (
+                    "semantic_unknown_field",
+                    "A semantic subject field is not current for its resource.",
+                    {
+                        "field_name": field.field_name,
+                        "resource_id": field.resource_id,
+                    },
+                )
+        return await self._semantic_evidence_issue(agent_id, annotation)
+
+    async def _semantic_evidence_issue(
+        self,
+        agent_id: str,
+        annotation: SemanticAnnotation,
+    ) -> tuple[str, str, Mapping[str, object]] | None:
+        if self._transcripts is None:
+            return (
+                "semantic_evidence_unavailable",
+                "Semantic evidence validation is unavailable.",
+                {"annotation_id": annotation.id},
+            )
+        for evidence in annotation.evidence:
+            position = evidence.message_position
+            assert position is not None
+            try:
+                transcript = await self._transcripts.load(evidence.run_id)
+            except KeyError:
+                return (
+                    "semantic_invalid_evidence",
+                    "Semantic evidence references an unknown run.",
+                    {"run_id": evidence.run_id},
+                )
+            if transcript.run.agent_id != agent_id:
+                return (
+                    "semantic_invalid_evidence",
+                    "Semantic evidence references a run owned by another agent.",
+                    {"run_id": evidence.run_id},
+                )
+            if position >= len(transcript.messages):
+                return (
+                    "semantic_invalid_evidence",
+                    "Semantic evidence references a missing transcript message.",
+                    {
+                        "message_position": evidence.message_position,
+                        "run_id": evidence.run_id,
+                    },
+                )
+            message = transcript.messages[position]
+            if evidence.kind in {
+                SemanticEvidenceKind.USER_ASSERTION,
+                SemanticEvidenceKind.USER_CONFIRMATION,
+            }:
+                if message.role is not MessageRole.USER:
+                    return (
+                        "semantic_invalid_evidence",
+                        "User semantic evidence must reference an exact user message.",
+                        {
+                            "message_position": evidence.message_position,
+                            "run_id": evidence.run_id,
+                        },
+                    )
+                continue
+            if message.role is not MessageRole.TOOL:
+                return (
+                    "semantic_invalid_evidence",
+                    "Tool-result evidence must reference an exact tool-result message.",
+                    {
+                        "message_position": evidence.message_position,
+                        "run_id": evidence.run_id,
+                    },
+                )
+            result = next(
+                (
+                    block
+                    for block in message.content
+                    if isinstance(block, ToolResultBlock)
+                    and block.call_id == evidence.tool_call_id
+                ),
+                None,
+            )
+            if (
+                result is None
+                or result.is_error
+                or result.output.get("kind")
+                not in {
+                    SQLITE_QUERY_EVIDENCE_KIND,
+                    POSTGRESQL_QUERY_EVIDENCE_KIND,
+                    LOCAL_FILE_READ_EVIDENCE_KIND,
+                }
+            ):
+                return (
+                    "semantic_invalid_evidence",
+                    "Tool-result evidence must reference a successful validated data read.",
+                    {
+                        "run_id": evidence.run_id,
+                        "tool_call_id": evidence.tool_call_id,
+                    },
+                )
+            call_exists = any(
+                call.id == evidence.tool_call_id
+                for prior in transcript.messages[: evidence.message_position]
+                if prior.role is MessageRole.ASSISTANT
+                for call in prior.tool_calls
+            )
+            if not call_exists:
+                return (
+                    "semantic_invalid_evidence",
+                    "Tool-result evidence has no matching prior tool call.",
+                    {
+                        "run_id": evidence.run_id,
+                        "tool_call_id": evidence.tool_call_id,
+                    },
+                )
+        return None
 
     def _is_side_effecting(
         self,
@@ -521,6 +1054,8 @@ class DataToolRuntime:
                 capability.id
                 in {
                     MEMORY_SET_CAPABILITY_ID,
+                    SEMANTIC_SAVE_CAPABILITY_ID,
+                    SEMANTIC_DELETE_CAPABILITY_ID,
                     SKILL_SAVE_CAPABILITY_ID,
                     SKILL_DELETE_CAPABILITY_ID,
                 }
@@ -544,6 +1079,8 @@ class DataToolRuntime:
                     "Skill names must match [a-z][a-z0-9-]{0,63}.",
                     {},
                 )
+        if capability.id == SEMANTIC_VIEW_CAPABILITY_ID:
+            await self._require_current_semantic_view(run, arguments)
         if capability.id == CATALOG_SEARCH_CAPABILITY_ID:
             query = arguments.get("query")
             limit = arguments.get("limit", 12)
@@ -773,6 +1310,11 @@ class DataToolRuntime:
             view, capability = self._registry.resolve_tool(name)
             if capability.id not in _MVP_CAPABILITIES:
                 continue
+            if (
+                capability.id in _SEMANTIC_CAPABILITIES
+                and not _semantic_management_requested(run.message)
+            ):
+                continue
             candidates.append((name, view.applicability))
             required_flags.update(view.applicability.required_configuration_flags)
         required = tuple(sorted(required_flags))
@@ -793,6 +1335,35 @@ class DataToolRuntime:
             for name, applicability in candidates
             if _applicable(applicability, facts)
         )
+
+
+def _semantic_management_requested(message: str) -> bool:
+    normalized = " ".join(message.casefold().split())
+    return any(signal in normalized for signal in _SEMANTIC_MANAGEMENT_SIGNALS)
+
+
+def _without_runtime_owned_semantic_evidence(
+    arguments: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Remove provenance fields that only the runtime is allowed to establish."""
+
+    raw_evidence = arguments.get("evidence")
+    if not isinstance(raw_evidence, tuple):
+        return arguments
+    normalized = dict(arguments)
+    normalized["evidence"] = [
+        (
+            {
+                key: value
+                for key, value in item.items()
+                if key not in {"run_id", "message_position"}
+            }
+            if isinstance(item, Mapping)
+            else item
+        )
+        for item in raw_evidence
+    ]
+    return normalized
 
 
 async def _execute_definitely(

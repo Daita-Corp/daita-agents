@@ -80,7 +80,18 @@ def test_public_surface_is_focused():
         "ModelRouteCandidate",
         "PostgreSQLSource",
         "RetryPolicy",
+        "ResourceRevisionBinding",
         "SQLiteSource",
+        "SemanticAnnotation",
+        "SemanticAnnotationState",
+        "SemanticAnnotationView",
+        "SemanticDigestMismatchError",
+        "SemanticEvidence",
+        "SemanticEvidenceKind",
+        "SemanticFieldReference",
+        "SemanticKind",
+        "SemanticSubject",
+        "SemanticValidationError",
         "Skill",
         "SkillSummary",
         "Transcript",
@@ -99,6 +110,8 @@ def test_stage_seven_exports_records_without_exporting_their_owners():
     assert daita.ApprovalHandler.__module__ == "daita.capabilities"
     assert daita.Skill.__module__ == "daita.skills.store"
     assert daita.SkillSummary.__module__ == "daita.skills.store"
+    assert daita.SemanticAnnotation.__module__ == "daita.semantics"
+    assert daita.SemanticAnnotationView.__module__ == "daita.semantics"
 
     assert set(daita.__all__).isdisjoint(
         {
@@ -298,6 +311,53 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
     assert "historical skill body redacted" in context
 
 
+def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners():
+    semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+        encoding="utf-8"
+    )
+    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
+
+    assert _class_owners("SemanticAnnotation") == {"semantics.py"}
+    assert _class_owners("SemanticSubject") == {"semantics.py"}
+    assert 'SEMANTIC_SAVE_TOOL_NAME = "semantic_save"' in semantics
+    assert 'SEMANTIC_DELETE_TOOL_NAME = "semantic_delete"' in semantics
+    assert "CREATE TABLE IF NOT EXISTS semantic_annotations" in storage
+    assert "semantic_resource_facts" in controller
+    assert "semantic_annotation_issue" in controller
+    assert "bind_current_semantic_evidence" in controller
+    assert "without_runtime_owned_semantic_evidence" in controller
+    assert "render_semantic_recall" in context
+    assert "semantic_declarations(identity.id, store)" in embedded
+    assert "mutation_lock=mutation_lock" in embedded
+    assert "/memory [edit|show <id>|delete <id>]" in terminal
+    assert "/knowledge" not in _python_text(PACKAGE)
+
+    expected = {
+        "list_semantic_annotations",
+        "read_semantic_annotation",
+        "save_semantic_annotation",
+        "delete_semantic_annotation",
+    }
+    assert expected <= _class_methods(PACKAGE / "agent.py", "Agent")
+    assert expected <= _class_methods(
+        PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
+    )
+    for forbidden in (
+        "BackgroundAgentLoop",
+        "KnowledgeGraph",
+        "LearningRuntime",
+        "MemoryProvider",
+        "SemanticExecutorKernel",
+        "VectorStore",
+        "reviewed_document",
+    ):
+        assert forbidden not in _python_text(PACKAGE)
+
+
 async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branch(
     tmp_path,
 ):
@@ -313,7 +373,13 @@ async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branc
             _, executor = registry.resolve_execution(capability.id)
             assert capability.side_effecting is True
             assert callable(getattr(executor, "preflight", None))
-        assert write_tools == {"memory_set", "skill_save", "skill_delete"}
+        assert write_tools == {
+            "memory_set",
+            "semantic_delete",
+            "semantic_save",
+            "skill_save",
+            "skill_delete",
+        }
     finally:
         await agent.close()
 
@@ -791,6 +857,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "messages",
             "metadata",
             "runs",
+            "semantic_annotations",
             "snapshots",
             "sources",
             "syncs",
@@ -806,6 +873,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
                 "input",
                 "result",
             ),
+            "semantic_annotations": ("agent_id", "id", "data"),
             "snapshots": ("agent_id", "source_id", "sync_id", "data"),
             "sources": ("agent_id", "id", "data"),
             "syncs": ("agent_id", "id", "source_id", "data"),

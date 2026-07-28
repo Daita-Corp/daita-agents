@@ -41,6 +41,12 @@ from .loop.driver import ContextBuilder, ToolRuntime
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
 from .observation import AgentObserver
 from .security import KeychainStore, SecretProvider, SecretReference
+from .semantics import (
+    SemanticAnnotation,
+    SemanticAnnotationState,
+    SemanticAnnotationView,
+    SemanticKind,
+)
 from .skills import Skill, SkillSummary
 
 
@@ -251,6 +257,49 @@ class Agent:
 
     async def set_user_profile(self, text: str) -> None:
         await self._embedded.set_user_profile(text)
+
+    async def list_semantic_annotations(
+        self,
+        *,
+        source_id: str | None = None,
+        resource_id: str | None = None,
+        kind: SemanticKind | None = None,
+        state: SemanticAnnotationState | None = None,
+    ) -> tuple[SemanticAnnotationView, ...]:
+        return await self._embedded.list_semantic_annotations(
+            source_id=source_id,
+            resource_id=resource_id,
+            kind=kind,
+            state=state,
+        )
+
+    async def read_semantic_annotation(
+        self,
+        annotation_id: str,
+    ) -> SemanticAnnotationView | None:
+        return await self._embedded.read_semantic_annotation(annotation_id)
+
+    async def save_semantic_annotation(
+        self,
+        annotation: SemanticAnnotation,
+        *,
+        expected_sha256: str | None = None,
+    ) -> bool:
+        return await self._embedded.save_semantic_annotation(
+            annotation,
+            expected_sha256=expected_sha256,
+        )
+
+    async def delete_semantic_annotation(
+        self,
+        annotation_id: str,
+        *,
+        expected_sha256: str,
+    ) -> bool:
+        return await self._embedded.delete_semantic_annotation(
+            annotation_id,
+            expected_sha256=expected_sha256,
+        )
 
     async def list_skills(self) -> tuple[SkillSummary, ...]:
         return await self._embedded.list_skills()

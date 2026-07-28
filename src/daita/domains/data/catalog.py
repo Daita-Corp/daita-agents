@@ -9,6 +9,7 @@ from ...capabilities import ToolApplicability
 from ...catalog.models import FacetKind, ResourceKind
 from ...catalog.protocols import CatalogStore
 from ...catalog.service import CatalogService
+from ...semantics import SemanticResourceFact
 from .sql import ResourceSchema
 
 if TYPE_CHECKING:
@@ -213,6 +214,42 @@ class CatalogDataView:
             resource.source_id,
             resource.kind.value,
             resource.current_revision,
+        )
+
+    async def semantic_resource_facts(
+        self,
+        agent_id: str,
+        resource_ids: tuple[str, ...],
+    ) -> tuple[SemanticResourceFact, ...]:
+        """Project current bounded structure for semantic validation and recall."""
+
+        requested = tuple(sorted(set(resource_ids)))
+        if len(requested) > 2_048 or any(
+            not isinstance(item, str) or not item for item in requested
+        ):
+            raise ValueError("semantic resource IDs must be bounded non-empty strings")
+        registrations = {
+            item.id: item
+            for item in await self._sources.list_sources(agent_id)
+            if item.agent_id == agent_id and item.active
+        }
+        resources = {
+            item.id: item
+            for item in await self._store.list_resources(agent_id)
+            if item.id in requested and item.source_id in registrations
+        }
+        fields_by_id: dict[str, tuple[str, ...]] = {}
+        for source_id in sorted({item.source_id for item in resources.values()}):
+            for schema in await self.resource_schemas(agent_id, source_id):
+                fields_by_id[schema.resource_id] = schema.columns
+        return tuple(
+            SemanticResourceFact(
+                resource_id=resource.id,
+                source_id=resource.source_id,
+                revision=resource.current_revision,
+                field_names=fields_by_id.get(resource.id, ()),
+            )
+            for resource in sorted(resources.values(), key=lambda item: item.id)
         )
 
     async def is_writable_sqlite_source(

@@ -388,6 +388,16 @@ def _check_rule(rule: Mapping[str, object]) -> None:
         if not isinstance(items, Mapping):
             raise ValueError("tool schema items must be an object rule")
         _check_rule(items)
+    properties = rule.get("properties")
+    if properties is not None:
+        if not isinstance(properties, Mapping):
+            raise ValueError("tool schema nested properties must be an object")
+        for name, nested in properties.items():
+            if not isinstance(name, str) or not isinstance(nested, Mapping):
+                raise ValueError(
+                    "tool schema nested properties must contain object rules"
+                )
+            _check_rule(nested)
 
 
 def _validate(
@@ -499,6 +509,8 @@ def _validate_rule(
                     item_rule,
                     error_type,
                 )
+    if isinstance(item, Mapping) and expected == "object":
+        _validate(rule, item, error_type)
 
 
 def _constraint_error(

@@ -18,7 +18,13 @@ from typing import Any, cast, TextIO
 import unicodedata
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-from . import ApprovalDecision, ApprovalRequest, __version__
+from . import (
+    ApprovalDecision,
+    ApprovalRequest,
+    SemanticAnnotationState,
+    SemanticAnnotationView,
+    __version__,
+)
 from .agent import (
     Agent,
     AgentAlreadyExistsError,
@@ -2442,7 +2448,7 @@ def _write_chat_help(output_stream: TextIO) -> None:
         "/new",
         "/resume <id>",
         "/learn <material>",
-        "/memory [edit]",
+        "/memory [edit|show <id>|delete <id>]",
         "/user [edit]",
         "/skills [show|edit|delete <name>]",
         "/skills create [name]",
@@ -2526,15 +2532,40 @@ async def _handle_knowledge_command(
                 if target == "memory"
                 else await agent.read_user_profile()
             )
-            print(f"{target.capitalize()}:", file=output_stream)
-            print(
-                _safe_display(
-                    content,
-                    fallback="(empty)",
-                    maximum=_MAX_DISPLAY_CHARACTERS,
-                ),
-                file=output_stream,
+            if target == "memory":
+                await _write_memory_surface(agent, content, output_stream)
+            else:
+                print("User:", file=output_stream)
+                print(
+                    _safe_display(
+                        content,
+                        fallback="(empty)",
+                        maximum=_MAX_DISPLAY_CHARACTERS,
+                    ),
+                    file=output_stream,
+                )
+        elif target == "memory" and len(parts) == 3 and parts[1] == "show":
+            view = await agent.read_semantic_annotation(parts[2])
+            if view is None:
+                raise ValueError(f"semantic annotation not found: {parts[2]}")
+            _write_semantic_view(view, output_stream)
+        elif target == "memory" and len(parts) == 3 and parts[1] == "delete":
+            view = await agent.read_semantic_annotation(parts[2])
+            if view is None:
+                raise ValueError(f"semantic annotation not found: {parts[2]}")
+            answer = _read_line(
+                f"Delete semantic annotation {parts[2]!r}? [y/N] ",
+                input_stream,
+                output_stream,
             )
+            if answer.strip().lower() != "y":
+                print("Deletion cancelled.", file=output_stream)
+                return True
+            await agent.delete_semantic_annotation(
+                parts[2],
+                expected_sha256=view.sha256,
+            )
+            print(f"Semantic annotation {parts[2]!r} deleted.", file=output_stream)
         elif len(parts) == 2 and parts[1] == "edit":
             current = (
                 await agent.read_memory()
@@ -2548,7 +2579,12 @@ async def _handle_knowledge_command(
                 await agent.set_user_profile(edited)
             print(f"{target.capitalize()} updated.", file=output_stream)
         else:
-            print(f"Usage: {name} [edit]", file=output_stream)
+            usage = (
+                "/memory [edit|show <id>|delete <id>]"
+                if target == "memory"
+                else "/user [edit]"
+            )
+            print(f"Usage: {usage}", file=output_stream)
         return True
     if name != "/skills":
         return False
@@ -2657,6 +2693,118 @@ async def _handle_knowledge_command(
     return True
 
 
+async def _write_memory_surface(
+    agent: Agent,
+    memory_text: str,
+    output_stream: TextIO,
+) -> None:
+    print("Memory", file=output_stream)
+    print(file=output_stream)
+    print("Global memory:", file=output_stream)
+    print(
+        _safe_display(
+            memory_text,
+            fallback="(empty)",
+            maximum=_MAX_DISPLAY_CHARACTERS,
+        ),
+        file=output_stream,
+    )
+    views = await agent.list_semantic_annotations()
+    for heading, state in (
+        ("Active data semantics", SemanticAnnotationState.ACTIVE),
+        ("Stale definitions", SemanticAnnotationState.STALE),
+        ("Conflicts", SemanticAnnotationState.CONFLICTING),
+    ):
+        print(file=output_stream)
+        print(f"{heading}:", file=output_stream)
+        selected = tuple(view for view in views if view.state is state)
+        if not selected:
+            print("  (none)", file=output_stream)
+            continue
+        for view in selected:
+            annotation = view.annotation
+            detail = ""
+            if view.stale_reasons:
+                detail = " · " + ", ".join(view.stale_reasons)
+            elif view.conflicting_ids:
+                detail = " · conflicts with " + ", ".join(view.conflicting_ids)
+            print(
+                "  "
+                f"{_safe_display(annotation.id, fallback='annotation')} "
+                f"[{annotation.kind.value}] "
+                f"{_safe_display(annotation.statement, fallback='definition', maximum=512)}"
+                f"{detail}",
+                file=output_stream,
+            )
+
+
+def _write_semantic_view(
+    view: SemanticAnnotationView,
+    output_stream: TextIO,
+) -> None:
+    annotation = view.annotation
+    print(f"Semantic annotation: {annotation.id}", file=output_stream)
+    print(f"State: {view.state.value}", file=output_stream)
+    print(f"Kind: {annotation.kind.value}", file=output_stream)
+    print(
+        f"Resources: {', '.join(annotation.subject.resource_ids)}",
+        file=output_stream,
+    )
+    fields = ", ".join(
+        f"{field.resource_id}.{field.field_name}" for field in annotation.subject.fields
+    )
+    print(f"Fields: {fields or '(resource scoped)'}", file=output_stream)
+    print(
+        "Verified revisions: "
+        + ", ".join(
+            f"{binding.resource_id}@{binding.revision}"
+            for binding in annotation.catalog_revisions
+        ),
+        file=output_stream,
+    )
+    print(
+        f"Confirmed: {annotation.confirmed_at.isoformat()} "
+        f"by {annotation.confirmed_by}",
+        file=output_stream,
+    )
+    print(f"Current SHA-256: {view.sha256}", file=output_stream)
+    if view.stale_reasons:
+        print(f"Stale reasons: {', '.join(view.stale_reasons)}", file=output_stream)
+    if view.conflicting_ids:
+        print(
+            f"Conflicts with: {', '.join(view.conflicting_ids)}",
+            file=output_stream,
+        )
+    if view.superseded_by_id is not None:
+        print(f"Superseded by: {view.superseded_by_id}", file=output_stream)
+    print("Statement:", file=output_stream)
+    print(
+        _safe_display(
+            annotation.statement,
+            fallback="(empty)",
+            maximum=_MAX_DISPLAY_CHARACTERS,
+        ),
+        file=output_stream,
+    )
+    print("Evidence:", file=output_stream)
+    for evidence in annotation.evidence:
+        tool = (
+            f", tool call {evidence.tool_call_id}"
+            if evidence.tool_call_id is not None
+            else ""
+        )
+        note = (
+            f": {_safe_display(evidence.note, fallback='note', maximum=512)}"
+            if evidence.note is not None
+            else ""
+        )
+        print(
+            f"  {evidence.kind.value} in run {evidence.run_id}, "
+            f"message {evidence.message_position}{tool}{note}",
+            file=output_stream,
+        )
+
+
 async def _skill_invocation_message(agent: Agent, message: str) -> str | None:
     parts = message.split()
     if not parts:
@@ -2694,9 +2842,10 @@ def _learning_invocation_message(message: str) -> str | None:
     material = parts[1].strip()
     return (
         "Treat the following as an explicit teaching request. Determine whether it "
-        "belongs in stable user preferences, agent-wide business memory, or a "
-        "reusable procedural skill. Apply the normal foreground-learning safety "
-        "rules and inspect existing memory or skills when needed. Call the smallest "
+        "belongs in stable user preferences, agent-wide business memory, a current "
+        "resource/field-scoped semantic annotation, or a reusable procedural skill. "
+        "Apply the normal foreground-learning safety rules and inspect current catalog "
+        "scope and existing memory, semantics, or skills when needed. Call the smallest "
         "fitting learning tool immediately; its approval card is the only confirmation, "
         "so never ask the user for a typed approval phrase. Do not claim that a workflow "
         "is verified unless it was executed successfully or the user explicitly "

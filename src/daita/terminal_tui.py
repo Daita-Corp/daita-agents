@@ -62,7 +62,7 @@ _SLASH_COMMAND_COMPLETIONS = (
     ("/new", "/new", "Start a new conversation"),
     ("/resume ", "/resume <id>", "Resume a previous conversation"),
     ("/learn ", "/learn <material>", "Teach durable knowledge or a procedure"),
-    ("/memory", "/memory", "View or edit agent memory"),
+    ("/memory", "/memory", "Inspect global, active, stale, and conflicting memory"),
     ("/user", "/user", "View or edit the user profile"),
     ("/skills", "/skills", "List available skills"),
     ("/skills create", "/skills create", "Start guided skill creation"),

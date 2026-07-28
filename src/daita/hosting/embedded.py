@@ -86,6 +86,14 @@ from ..security import (
     SecretReference,
     default_secret_provider,
 )
+from ..semantics import (
+    SemanticAnnotation,
+    SemanticAnnotationState,
+    SemanticAnnotationView,
+    SemanticKind,
+    inspect_semantic_annotations,
+    semantic_declarations,
+)
 from ..skills import Skill, SkillStore, SkillSummary
 from ..skills.capabilities import skill_declarations
 from ..storage.sqlite import SQLiteStateStore
@@ -257,6 +265,8 @@ class EmbeddedAgent:
         transcripts: SQLiteStateStore,
         capabilities: CapabilityRegistry,
         catalog_service: CatalogService,
+        data_view: CatalogDataView,
+        data_tool_runtime: DataToolRuntime,
         memory_store: MemoryStore,
         skill_store: SkillStore,
         mutation_lock: asyncio.Lock,
@@ -283,6 +293,8 @@ class EmbeddedAgent:
         self._transcripts = transcripts
         self._capabilities = capabilities
         self._catalog_service = catalog_service
+        self._data_view = data_view
+        self._data_tool_runtime = data_tool_runtime
         self._memory_store = memory_store
         self._skill_store = skill_store
         self._clock = clock
@@ -546,6 +558,7 @@ class EmbeddedAgent:
         skill_store = SkillStore(home, mutation_lock)
         memory = memory_set_declarations(memory_store)
         skills = skill_declarations(skill_store)
+        semantics = semantic_declarations(identity.id, store)
         capabilities = CapabilityRegistry(
             capabilities=(
                 *catalog.capabilities,
@@ -554,6 +567,7 @@ class EmbeddedAgent:
                 *local_files.capabilities,
                 *memory.capabilities,
                 *skills.capabilities,
+                *semantics.capabilities,
             ),
             executors=(
                 *catalog.executors,
@@ -562,6 +576,7 @@ class EmbeddedAgent:
                 *local_files.executors,
                 *memory.executors,
                 *skills.executors,
+                *semantics.executors,
             ),
             tool_views=(
                 *catalog.tool_views,
@@ -570,7 +585,17 @@ class EmbeddedAgent:
                 *local_files.tool_views,
                 *memory.tool_views,
                 *skills.tool_views,
+                *semantics.tool_views,
             ),
+        )
+        data_tool_runtime = DataToolRuntime(
+            capabilities,
+            data_view,
+            approval_handler=approval_handler,
+            mutation_lock=mutation_lock,
+            observer=observer,
+            clock=clock,
+            transcripts=store,
         )
         resolved_context = context_builder
         resolved_tools = tools
@@ -585,15 +610,9 @@ class EmbeddedAgent:
                 profile=model_profile,
                 memory=memory_store,
                 skills=skill_store,
+                semantics=store,
             )
-            resolved_tools = DataToolRuntime(
-                capabilities,
-                data_view,
-                approval_handler=approval_handler,
-                mutation_lock=mutation_lock,
-                observer=observer,
-                clock=clock,
-            )
+            resolved_tools = data_tool_runtime
         transcripts = store
         loop = (
             None
@@ -617,6 +636,8 @@ class EmbeddedAgent:
             transcripts=transcripts,
             capabilities=capabilities,
             catalog_service=catalog_service,
+            data_view=data_view,
+            data_tool_runtime=data_tool_runtime,
             memory_store=memory_store,
             skill_store=skill_store,
             mutation_lock=mutation_lock,
@@ -929,6 +950,107 @@ class EmbeddedAgent:
     async def set_user_profile(self, text: str) -> None:
         self._require_open()
         await self._memory_store.set_user_profile(text)
+
+    async def list_semantic_annotations(
+        self,
+        *,
+        source_id: str | None = None,
+        resource_id: str | None = None,
+        kind: SemanticKind | None = None,
+        state: SemanticAnnotationState | None = None,
+    ) -> tuple[SemanticAnnotationView, ...]:
+        self._require_open()
+        for value, field_name in (
+            (source_id, "source_id"),
+            (resource_id, "resource_id"),
+        ):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{field_name} must be non-empty text or None")
+        if kind is not None and not isinstance(kind, SemanticKind):
+            raise TypeError("kind must be SemanticKind or None")
+        if state is not None and not isinstance(state, SemanticAnnotationState):
+            raise TypeError("state must be SemanticAnnotationState or None")
+        views = await self._semantic_views()
+        return tuple(
+            view
+            for view in views
+            if (source_id is None or source_id in view.annotation.subject.source_ids)
+            and (
+                resource_id is None
+                or resource_id in view.annotation.subject.resource_ids
+            )
+            and (kind is None or view.annotation.kind is kind)
+            and (state is None or view.state is state)
+        )
+
+    async def read_semantic_annotation(
+        self,
+        annotation_id: str,
+    ) -> SemanticAnnotationView | None:
+        self._require_open()
+        if not isinstance(annotation_id, str) or not annotation_id:
+            raise ValueError("annotation_id must be non-empty text")
+        return next(
+            (
+                view
+                for view in await self._semantic_views()
+                if view.annotation.id == annotation_id
+            ),
+            None,
+        )
+
+    async def save_semantic_annotation(
+        self,
+        annotation: SemanticAnnotation,
+        *,
+        expected_sha256: str | None = None,
+    ) -> bool:
+        if not isinstance(annotation, SemanticAnnotation):
+            raise TypeError("annotation must be SemanticAnnotation")
+        async with self._mutation_lock:
+            self._require_open()
+            if annotation.agent_id != self.identity.id:
+                raise ValueError("semantic annotation belongs to another agent")
+            await self._data_tool_runtime.validate_semantic_annotation(
+                self.identity.id,
+                annotation,
+            )
+            return await self._store.save_semantic_annotation(
+                self.identity.id,
+                annotation,
+                expected_sha256=expected_sha256,
+            )
+
+    async def delete_semantic_annotation(
+        self,
+        annotation_id: str,
+        *,
+        expected_sha256: str,
+    ) -> bool:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._store.delete_semantic_annotation(
+                self.identity.id,
+                annotation_id,
+                expected_sha256=expected_sha256,
+            )
+
+    async def _semantic_views(self) -> tuple[SemanticAnnotationView, ...]:
+        annotations = await self._store.list_semantic_annotations(self.identity.id)
+        resource_ids = tuple(
+            sorted(
+                {
+                    resource_id
+                    for annotation in annotations
+                    for resource_id in annotation.subject.resource_ids
+                }
+            )
+        )
+        facts = await self._data_view.semantic_resource_facts(
+            self.identity.id,
+            resource_ids,
+        )
+        return inspect_semantic_annotations(annotations, facts)
 
     async def list_skills(self) -> tuple[SkillSummary, ...]:
         self._require_open()

@@ -13,6 +13,19 @@ from .llm import (
 )
 from .loop import ConversationRun, LoopExit, LoopExitKind, LoopLimits, Transcript
 from .observation import AgentEvent, AgentEventKind, AgentObserver
+from .semantics import (
+    ResourceRevisionBinding,
+    SemanticAnnotation,
+    SemanticAnnotationState,
+    SemanticAnnotationView,
+    SemanticDigestMismatchError,
+    SemanticEvidence,
+    SemanticEvidenceKind,
+    SemanticFieldReference,
+    SemanticKind,
+    SemanticSubject,
+    SemanticValidationError,
+)
 from .skills import Skill, SkillSummary
 
 __version__ = "2.0.0a0"
@@ -36,7 +49,18 @@ __all__ = [
     "ModelRouteCandidate",
     "PostgreSQLSource",
     "RetryPolicy",
+    "ResourceRevisionBinding",
     "SQLiteSource",
+    "SemanticAnnotation",
+    "SemanticAnnotationState",
+    "SemanticAnnotationView",
+    "SemanticDigestMismatchError",
+    "SemanticEvidence",
+    "SemanticEvidenceKind",
+    "SemanticFieldReference",
+    "SemanticKind",
+    "SemanticSubject",
+    "SemanticValidationError",
     "Skill",
     "SkillSummary",
     "Transcript",

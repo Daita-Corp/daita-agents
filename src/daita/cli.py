@@ -38,7 +38,12 @@ from .llm import (
 from .llm.profiles import reviewed_model_profile
 from .security import SecretReference
 from .skills import validate_skill_name
-from .terminal import _learning_invocation_message, run_terminal_application
+from .terminal import (
+    _learning_invocation_message,
+    _write_memory_surface,
+    _write_semantic_view,
+    run_terminal_application,
+)
 
 _SKILL_DESCRIPTION_PLACEHOLDER = "Describe when the agent should use this skill."
 _SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
@@ -346,6 +351,8 @@ def _write_help() -> None:
     print("  /learn <material>")
     print("  /memory")
     print("  /memory edit")
+    print("  /memory show <annotation-id>")
+    print("  /memory delete <annotation-id>")
     print("  /user")
     print("  /user edit")
     print("  /skills")
@@ -642,12 +649,43 @@ async def _handle_knowledge_chat_command(parts: list[str], agent: Agent) -> bool
     if name in {"/memory", "/user"}:
         target = "memory" if name == "/memory" else "user"
         if len(parts) == 1:
-            _write_memory(target, await _read_memory_target(agent, target))
+            content = await _read_memory_target(agent, target)
+            if target == "memory":
+                await _write_memory_surface(agent, content, sys.stdout)
+            else:
+                _write_memory(target, content)
+        elif target == "memory" and len(parts) == 3 and parts[1] == "show":
+            view = await agent.read_semantic_annotation(parts[2])
+            if view is None:
+                raise ValueError(f"semantic annotation not found: {parts[2]}")
+            _write_semantic_view(view, sys.stdout)
+        elif target == "memory" and len(parts) == 3 and parts[1] == "delete":
+            view = await agent.read_semantic_annotation(parts[2])
+            if view is None:
+                raise ValueError(f"semantic annotation not found: {parts[2]}")
+            try:
+                answer = input(f"Delete semantic annotation {parts[2]!r}? [y/N]")
+            except EOFError:
+                print()
+                answer = ""
+            if answer.strip().lower() != "y":
+                print("Deletion cancelled.")
+                return True
+            await agent.delete_semantic_annotation(
+                parts[2],
+                expected_sha256=view.sha256,
+            )
+            print(f"Semantic annotation {parts[2]!r} deleted.")
         elif len(parts) == 2 and parts[1] == "edit":
             await _edit_memory_target(agent, target)
             print(f"{target.capitalize()} updated.")
         else:
-            _write_local_diagnostic(f"Usage: {name} [edit]")
+            usage = (
+                "/memory [edit|show <id>|delete <id>]"
+                if target == "memory"
+                else "/user [edit]"
+            )
+            _write_local_diagnostic(f"Usage: {usage}")
         return True
     if name != "/skills":
         return False

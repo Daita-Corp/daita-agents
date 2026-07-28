@@ -928,6 +928,7 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
             "messages",
             "metadata",
             "runs",
+            "semantic_annotations",
             "snapshots",
             "sources",
             "syncs",
