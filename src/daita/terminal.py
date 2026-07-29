@@ -2712,8 +2712,10 @@ async def _write_memory_surface(
     views = await agent.list_semantic_annotations()
     for heading, state in (
         ("Active data semantics", SemanticAnnotationState.ACTIVE),
+        ("Exact duplicates", SemanticAnnotationState.DUPLICATE),
         ("Stale definitions", SemanticAnnotationState.STALE),
         ("Conflicts", SemanticAnnotationState.CONFLICTING),
+        ("Superseded definitions", SemanticAnnotationState.SUPERSEDED),
     ):
         print(file=output_stream)
         print(f"{heading}:", file=output_stream)
@@ -2728,6 +2730,12 @@ async def _write_memory_surface(
                 detail = " · " + ", ".join(view.stale_reasons)
             elif view.conflicting_ids:
                 detail = " · conflicts with " + ", ".join(view.conflicting_ids)
+            elif view.duplicate_of_id is not None:
+                detail = " · duplicate of " + view.duplicate_of_id
+            elif view.duplicate_ids:
+                detail = " · duplicates collapsed: " + ", ".join(view.duplicate_ids)
+            elif view.superseded_by_id is not None:
+                detail = " · superseded by " + view.superseded_by_id
             print(
                 "  "
                 f"{_safe_display(annotation.id, fallback='annotation')} "
@@ -2775,6 +2783,13 @@ def _write_semantic_view(
             f"Conflicts with: {', '.join(view.conflicting_ids)}",
             file=output_stream,
         )
+    if view.duplicate_ids:
+        print(
+            f"Exact duplicates: {', '.join(view.duplicate_ids)}",
+            file=output_stream,
+        )
+    if view.duplicate_of_id is not None:
+        print(f"Duplicate of: {view.duplicate_of_id}", file=output_stream)
     if view.superseded_by_id is not None:
         print(f"Superseded by: {view.superseded_by_id}", file=output_stream)
     print("Statement:", file=output_stream)

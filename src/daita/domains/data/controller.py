@@ -53,6 +53,7 @@ from ...semantics import (
     SemanticValidationError,
     inspect_semantic_annotations,
     semantic_annotation_from_mapping,
+    semantic_maintenance_intersects,
 )
 from ...skills.capabilities import (
     SKILL_DELETE_CAPABILITY_ID,
@@ -139,6 +140,16 @@ class CatalogSchemaReader(Protocol):
 
 
 class CatalogDataReader(CatalogSchemaReader, Protocol):
+    async def catalog_context(
+        self,
+        agent_id: str,
+        query: str,
+        *,
+        limit: int,
+        source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] = (),
+    ) -> FrozenJsonObject: ...
+
     async def source_routing_facts(
         self,
         agent_id: str,
@@ -337,7 +348,11 @@ class DataToolRuntime:
             else:
                 candidate = await executor.execute(execution)
                 if capability.id == SEMANTIC_VIEW_CAPABILITY_ID:
-                    await self._require_current_semantic_view(run, arguments)
+                    candidate = await self._decorate_semantic_view(
+                        run,
+                        arguments,
+                        candidate,
+                    )
                 elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:
                     self._registry.validate_output(capability.id, candidate)
                     candidate = await self._filter_semantic_list(
@@ -671,11 +686,12 @@ class DataToolRuntime:
         normalized["evidence"] = bound
         return FrozenJsonObject.from_mapping(normalized)
 
-    async def _require_current_semantic_view(
+    async def _decorate_semantic_view(
         self,
         run: RunInput,
         arguments: Mapping[str, object],
-    ) -> None:
+        output: ToolOutput,
+    ) -> ToolOutput:
         annotation_id = arguments.get("id")
         if not isinstance(annotation_id, str):
             raise CapabilityInputError(
@@ -692,15 +708,24 @@ class DataToolRuntime:
         )
         if selected is None:
             raise SemanticNotFoundError(annotation_id)
-        if selected.state is not SemanticAnnotationState.ACTIVE:
+        if output.data.get("current_sha256") != selected.sha256:
             raise CapabilityInputError(
-                "semantic_not_current",
-                (
-                    "The semantic annotation is stale, conflicting, or superseded; "
-                    "inspect it through /memory before using it."
-                ),
-                {"id": annotation_id, "state": selected.state.value},
+                "semantic_state_changed",
+                "The semantic annotation changed during inspection; view it again.",
+                {"id": annotation_id},
             )
+        data = dict(output.data)
+        data["maintenance"] = {
+            "state": selected.state.value,
+            "usable_as_current_meaning": selected.usable_as_current_meaning,
+            "requires_revalidation": selected.requires_revalidation,
+            "stale_reasons": selected.stale_reasons,
+            "conflicting_ids": selected.conflicting_ids,
+            "duplicate_ids": selected.duplicate_ids,
+            "duplicate_of_id": selected.duplicate_of_id,
+            "superseded_by_id": selected.superseded_by_id,
+        }
+        return ToolOutput(kind=output.kind, data=data)
 
     async def _filter_semantic_list(
         self,
@@ -1079,8 +1104,6 @@ class DataToolRuntime:
                     "Skill names must match [a-z][a-z0-9-]{0,63}.",
                     {},
                 )
-        if capability.id == SEMANTIC_VIEW_CAPABILITY_ID:
-            await self._require_current_semantic_view(run, arguments)
         if capability.id == CATALOG_SEARCH_CAPABILITY_ID:
             query = arguments.get("query")
             limit = arguments.get("limit", 12)
@@ -1306,14 +1329,14 @@ class DataToolRuntime:
     async def _projected_tool_names(self, run: RunInput) -> tuple[str, ...]:
         candidates: list[tuple[str, ToolApplicability]] = []
         required_flags: set[str] = set()
+        semantic_requested = _semantic_management_requested(run.message)
+        if not semantic_requested:
+            semantic_requested = await self._semantic_maintenance_requested(run)
         for name in sorted(self._registry.tool_names):
             view, capability = self._registry.resolve_tool(name)
             if capability.id not in _MVP_CAPABILITIES:
                 continue
-            if (
-                capability.id in _SEMANTIC_CAPABILITIES
-                and not _semantic_management_requested(run.message)
-            ):
+            if capability.id in _SEMANTIC_CAPABILITIES and not semantic_requested:
                 continue
             candidates.append((name, view.applicability))
             required_flags.update(view.applicability.required_configuration_flags)
@@ -1334,6 +1357,38 @@ class DataToolRuntime:
             name
             for name, applicability in candidates
             if _applicable(applicability, facts)
+        )
+
+    async def _semantic_maintenance_requested(self, run: RunInput) -> bool:
+        if self._transcripts is None:
+            return False
+        views = await self._current_semantic_views(run.agent_id)
+        if not any(
+            view.requires_revalidation
+            or view.state is SemanticAnnotationState.DUPLICATE
+            or bool(view.duplicate_ids)
+            for view in views
+        ):
+            return False
+        catalog = await self._catalog.catalog_context(
+            run.agent_id,
+            run.message[:4_000],
+            limit=12,
+            source_ids=(() if run.source_id is None else (run.source_id,)),
+        )
+        resources = catalog.get("resources")
+        if not isinstance(resources, tuple):
+            return False
+        selected_resource_ids = tuple(
+            resource_id
+            for resource in resources
+            if isinstance(resource, FrozenJsonObject)
+            and isinstance((resource_id := resource.get("resource_id")), str)
+        )
+        return semantic_maintenance_intersects(
+            views,
+            selected_resource_ids=selected_resource_ids,
+            query=run.message,
         )
 
 

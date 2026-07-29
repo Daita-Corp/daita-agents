@@ -133,8 +133,8 @@ SQLite and local-file sources are admitted through bounded adapters. SQL is
 validated against the current catalog before execution. Every model-requested
 tool call receives one ordered success or error result; one failing call does
 not suppress the others. Data access remains read-only. The only built-in side
-effects are local, file-backed memory and skill replacements proposed during a
-foreground run and guarded by an in-process approve-once callback.
+effects are local memory, semantic-annotation, and skill mutations proposed
+during a foreground run and guarded by an in-process approve-once callback.
 
 ## Python API
 
@@ -290,10 +290,21 @@ replacement starts, Daita waits for a definite outcome before propagating
 cancellation.
 
 Learning is only this visible foreground interaction: the model proposes
-`memory_set`, `skill_save`, or `skill_delete`; the caller reviews the exact
-frozen arguments; the existing tool runtime returns the approved mutation or
-error as a normal tool result; and the model continues. Daita performs no
-post-run review, auxiliary model call, curator, or background learning.
+`memory_set`, `semantic_save`, `semantic_delete`, `skill_save`, or
+`skill_delete`; the caller reviews the exact frozen arguments; the existing
+tool runtime returns the approved mutation or error as a normal tool result;
+and the model continues. Daita performs no post-run review, auxiliary model
+call, curator, or background learning.
+
+Semantic maintenance is derived without mutation whenever current knowledge is
+read or recalled. Missing resources or fields, revision mismatches, conflicts,
+supersession, and exact normalized duplicates remain inspectable. Ordinary
+recall excludes stale and conflicting statements, collapses each exact
+duplicate group to its lowest-ID representative, and requires the complete
+scope of multi-resource meaning to be selected. Related requests receive only
+bounded review notices with annotation IDs, resource IDs, and reasons. The
+ordinary foreground model can inspect the affected record and propose an exact
+digest-protected correction through the same approval boundary.
 
 One optional synchronous observer receives bounded `run.started`,
 `model.completed`, `tool.started`, `approval.requested`, `approval.decided`,
@@ -305,6 +316,30 @@ should enqueue and return promptly if they need external telemetry work.
 This callback data is the entire event and telemetry surface: Daita does not
 persist events, collect telemetry, upload analytics, or provide an event bus,
 trace store, exporter, or delivery guarantee.
+
+`daita.evaluation` provides a caller-owned, in-memory benchmark and reporting
+harness. Callers supply human labels plus bounded observer-derived counters;
+the deterministic report makes baseline-versus-learned correctness, safety,
+and efficiency differences explicit. Reports contain no prompts, rows, tool
+arguments, semantic statements, skill bodies, credentials, or secrets, and
+stored artifact counts are not treated as evidence of improvement.
+
+Learning evaluation has two deliberately separate gates. The required offline
+gate uses scripted model responses but executes the real agent loop, SQLite
+adapter, approval path, semantic persistence, close/reopen lifecycle, automatic
+recall, denial, observer measurement, and report rendering:
+
+```bash
+.venv/bin/python -m pytest tests/test_learning_evaluation_phase3.py -v
+```
+
+The optional live confidence gate uses the disposable PostgreSQL fixture and
+one explicitly selected release-reviewed model. It is excluded from default
+tests, requires both `requires_llm` and `requires_db`, enforces an explicit
+per-run cost ceiling, and writes only content-free JSON and Markdown reports to
+the caller-selected output directory. See
+[`tests/fixtures/postgresql/README.md`](tests/fixtures/postgresql/README.md) for
+the complete authorized command.
 
 An explicitly injected custom tool runtime remains caller-owned code and owns
 authorization, tool-level observation, and side-effect safety for its tools.
@@ -364,6 +399,7 @@ file or stdin, or edited with `$EDITOR`:
 
 ```bash
 daita --root /private/tmp/daita memory read atlas
+daita --root /private/tmp/daita memory inspect atlas
 daita --root /private/tmp/daita memory read atlas --target user
 daita --root /private/tmp/daita memory set atlas --target memory --file notes.md
 printf '%s' 'Prefer concise answers.' | \
@@ -404,6 +440,9 @@ Monthly revenue procedure.
 
 Group paid invoices by UTC month.
 ```
+
+`memory inspect` returns bounded global-memory and semantic-maintenance state,
+including stale, conflicting, duplicate, superseded, and revalidation fields.
 
 Interactive chat additionally provides `/memory`, `/memory edit`, `/user`,
 `/user edit`, `/skills`, `/skills show <name>`, `/skills create [name]`,

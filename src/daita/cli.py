@@ -144,6 +144,11 @@ def build_parser() -> argparse.ArgumentParser:
             choices=("memory", "user"),
             default="memory",
         )
+    memory_inspect = memory_commands.add_parser(
+        "inspect",
+        help="inspect bounded global and resource-scoped memory state",
+    )
+    memory_inspect.add_argument("name")
     memory_set = memory_commands.add_parser("set")
     memory_set.add_argument("name")
     memory_set.add_argument("--target", choices=("memory", "user"), required=True)
@@ -1001,6 +1006,27 @@ async def _execute(args: argparse.Namespace) -> object:
                 return {
                     "target": args.target,
                     "content": await _read_memory_target(agent, args.target),
+                }
+            if args.memory_command == "inspect":
+                return {
+                    "global_memory": await agent.read_memory(),
+                    "annotations": [
+                        {
+                            "id": view.annotation.id,
+                            "kind": view.annotation.kind.value,
+                            "state": view.state.value,
+                            "source_ids": view.annotation.subject.source_ids,
+                            "resource_ids": view.annotation.subject.resource_ids,
+                            "field_count": len(view.annotation.subject.fields),
+                            "stale_reasons": view.stale_reasons,
+                            "conflicting_ids": view.conflicting_ids,
+                            "duplicate_ids": view.duplicate_ids,
+                            "duplicate_of_id": view.duplicate_of_id,
+                            "superseded_by_id": view.superseded_by_id,
+                            "requires_revalidation": view.requires_revalidation,
+                        }
+                        for view in await agent.list_semantic_annotations()
+                    ],
                 }
             if args.memory_command == "edit":
                 await _edit_memory_target(agent, args.target)

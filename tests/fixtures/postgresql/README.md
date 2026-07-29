@@ -105,6 +105,41 @@ selection, catalog summary, and one grounded read-only query. Its model
 provider and OS keychain boundaries are fakes: it makes no live provider call
 and writes no real keychain entry. Only PostgreSQL I/O goes to the fixture.
 
+## Optional live learning confidence gate
+
+The required learning exit gate remains offline:
+
+```bash
+.venv/bin/python -m pytest tests/test_learning_evaluation_phase3.py -v
+```
+
+After that gate passes, one explicitly authorized live test measures whether a
+real model recognizes an ordinary-language definition without `/learn`, uses
+the exact approval path, persists it, recalls it after close/reopen, and applies
+the learned paid-order formula against this fixture. Start the fixture first,
+then provide an exact release-reviewed model identity, its API key, an absolute
+external report directory, and the maximum estimated cost allowed for each
+agent run:
+
+```bash
+export DAITA_RUN_LIVE_LEARNING_EVAL=1
+export DAITA_EVAL_MODEL_ID=openai:gpt-5.6-terra
+export DAITA_EVAL_LLM_API_KEY='<provider API key>'
+export DAITA_FIXTURE_POSTGRES_PASSWORD=daita_fixture_password
+export DAITA_EVAL_OUTPUT_DIR=/private/tmp/daita-learning-evaluation
+export DAITA_EVAL_MAX_COST_USD=0.50
+
+.venv/bin/python -m pytest tests/test_learning_evaluation_live.py \
+  -m "requires_llm and requires_db" -v -s
+```
+
+`DAITA_RUN_LIVE_LEARNING_EVAL=1` is the explicit authorization for both the
+external database and paid model calls. The test is never selected by the
+default deterministic command. The generated JSON and Markdown contain
+judgments, aggregate counters, token usage, duration, cost, and verdicts only;
+they exclude prompts, rows, SQL/tool arguments, semantic statements, skill
+bodies, credentials, and secrets. The agent home itself remains temporary.
+
 Stop and discard the fixture:
 
 ```bash

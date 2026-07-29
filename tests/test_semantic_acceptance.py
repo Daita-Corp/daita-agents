@@ -409,10 +409,14 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
                 ),
             )
         )[0]
-        assert conflict_view.is_error
-        conflict_error = conflict_view.output["error"]
-        assert isinstance(conflict_error, Mapping)
-        assert conflict_error["code"] == "semantic_not_current"
+        assert not conflict_view.is_error
+        conflict_output = conflict_view.output["data"]
+        assert isinstance(conflict_output, Mapping)
+        conflict_maintenance = conflict_output["maintenance"]
+        assert isinstance(conflict_maintenance, Mapping)
+        assert conflict_maintenance["state"] == "conflicting"
+        assert conflict_maintenance["usable_as_current_meaning"] is False
+        assert conflict_maintenance["requires_revalidation"] is True
 
         output = io.StringIO()
         handled = await _handle_knowledge_command(
@@ -457,6 +461,6 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
             for item in terminal_tui._SLASH_COMMAND_COMPLETIONS
             if item[0] == "/memory"
         )
-        assert "active, stale, and conflicting" in memory_completion[2]
+        assert "duplicate, stale, conflicting, and superseded" in memory_completion[2]
     finally:
         await agent.close()

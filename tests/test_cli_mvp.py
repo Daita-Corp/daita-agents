@@ -1283,7 +1283,7 @@ def test_future_cli_4_parser_adds_only_the_direct_knowledge_commands():
     }
 
     memory = _subcommands(commands["memory"])
-    assert set(memory) == {"read", "edit", "set"}
+    assert set(memory) == {"read", "edit", "inspect", "set"}
     assert _surface(memory["read"]) == (
         ("name",),
         frozenset({"-h", "--help", "--target"}),
@@ -1295,6 +1295,10 @@ def test_future_cli_4_parser_adds_only_the_direct_knowledge_commands():
     assert _surface(memory["set"]) == (
         ("name",),
         frozenset({"-h", "--help", "--target", "--file"}),
+    )
+    assert _surface(memory["inspect"]) == (
+        ("name",),
+        frozenset({"-h", "--help"}),
     )
 
     skills = _subcommands(commands["skills"])
@@ -1352,12 +1356,26 @@ def test_future_cli_4_direct_knowledge_commands_survive_reopen():
                 str(skill_file),
             ]
         )
+        inspect_code, inspect_stdout, inspect_stderr = _invoke(
+            [
+                "--root",
+                str(root),
+                "memory",
+                "inspect",
+                "knowledge-agent",
+            ]
+        )
         memory, skill = asyncio.run(_knowledge(root, "knowledge-agent"))
 
     assert memory_code == 0
     assert memory_stderr == ""
     assert skill_code == 0
     assert skill_stderr == ""
+    assert inspect_code == 0
+    assert inspect_stderr == ""
+    assert _json_lines(inspect_stdout) == (
+        {"annotations": [], "global_memory": memory_text},
+    )
     assert memory == memory_text
     assert skill is not None
     assert skill.name == "monthly-revenue"

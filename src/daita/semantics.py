@@ -9,6 +9,7 @@ from enum import Enum
 from hashlib import sha256
 from html import escape
 import re
+import unicodedata
 from typing import Protocol
 
 from ._json import FrozenJsonObject, canonical_json
@@ -34,6 +35,7 @@ SEMANTIC_MAX_EVIDENCE = 16
 SEMANTIC_MAX_REVISION_BINDINGS = 8
 SEMANTIC_RECALL_MAX_ANNOTATIONS = 24
 SEMANTIC_RECALL_MAX_UTF8_BYTES = 8_000
+SEMANTIC_MAINTENANCE_MAX_NOTICES = 12
 
 _IDENTIFIER_MAX_CHARACTERS = 128
 _IDENTIFIER_MAX_UTF8_BYTES = 512
@@ -103,6 +105,7 @@ class SemanticAnnotationState(str, Enum):
     ACTIVE = "active"
     STALE = "stale"
     CONFLICTING = "conflicting"
+    DUPLICATE = "duplicate"
     SUPERSEDED = "superseded"
 
 
@@ -394,6 +397,8 @@ class SemanticAnnotationView:
     state: SemanticAnnotationState
     stale_reasons: tuple[str, ...] = ()
     conflicting_ids: tuple[str, ...] = ()
+    duplicate_ids: tuple[str, ...] = ()
+    duplicate_of_id: str | None = None
     superseded_by_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -405,8 +410,34 @@ class SemanticAnnotationView:
             raise TypeError("semantic view state must be SemanticAnnotationState")
         stale_reasons = tuple(sorted(self.stale_reasons))
         conflicting_ids = tuple(sorted(self.conflicting_ids))
+        duplicate_ids = tuple(sorted(self.duplicate_ids))
+        if self.annotation.id in duplicate_ids:
+            raise ValueError("semantic view duplicate_ids cannot contain its own id")
+        if (
+            self.duplicate_of_id is not None
+            and self.duplicate_of_id not in duplicate_ids
+        ):
+            raise ValueError(
+                "semantic view duplicate_of_id must identify a duplicate peer"
+            )
         object.__setattr__(self, "stale_reasons", stale_reasons)
         object.__setattr__(self, "conflicting_ids", conflicting_ids)
+        object.__setattr__(self, "duplicate_ids", duplicate_ids)
+
+    @property
+    def usable_as_current_meaning(self) -> bool:
+        """Whether ordinary recall may use this exact stored record."""
+
+        return self.state is SemanticAnnotationState.ACTIVE
+
+    @property
+    def requires_revalidation(self) -> bool:
+        """Whether current business meaning must be clarified or revalidated."""
+
+        return self.state in {
+            SemanticAnnotationState.STALE,
+            SemanticAnnotationState.CONFLICTING,
+        }
 
 
 def semantic_annotation_to_mapping(
@@ -613,6 +644,37 @@ def semantic_annotation_sha256(annotation: SemanticAnnotation) -> str:
     return sha256(render_semantic_annotation(annotation).encode("utf-8")).hexdigest()
 
 
+def semantic_duplicate_identity(annotation: SemanticAnnotation) -> str:
+    """Return the deterministic identity of exact normalized semantic meaning."""
+
+    if not isinstance(annotation, SemanticAnnotation):
+        raise TypeError("annotation must be SemanticAnnotation")
+    normalized = {
+        "kind": annotation.kind.value,
+        "scope": {
+            "source_ids": annotation.subject.source_ids,
+            "resource_ids": annotation.subject.resource_ids,
+        },
+        "subject": {
+            "fields": tuple(
+                (field.resource_id, field.field_name)
+                for field in annotation.subject.fields
+            ),
+        },
+        "statement": _normalized_statement(annotation.statement),
+        "catalog_revisions": tuple(
+            (binding.resource_id, binding.revision)
+            for binding in annotation.catalog_revisions
+            if binding.resource_id in annotation.subject.resource_ids
+        ),
+    }
+    return sha256(canonical_json(normalized).encode("utf-8")).hexdigest()
+
+
+def _normalized_statement(statement: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", statement).casefold().split())
+
+
 def inspect_semantic_annotations(
     annotations: tuple[SemanticAnnotation, ...],
     resources: tuple[SemanticResourceFact, ...],
@@ -657,19 +719,72 @@ def inspect_semantic_annotations(
             if prior is None or annotation.id < prior:
                 superseded_by[annotation.supersedes_id] = annotation.id
 
-    conflict_ids: dict[str, set[str]] = {}
-    groups: dict[tuple[SemanticSubject, SemanticKind], list[SemanticAnnotation]] = {}
-    for annotation in current.values():
+    effective = tuple(
+        annotation
+        for annotation in current.values()
+        if annotation.id not in superseded_by
+    )
+    all_duplicate_groups: dict[str, list[SemanticAnnotation]] = {}
+    for annotation in annotations:
         if annotation.id in superseded_by:
             continue
-        groups.setdefault((annotation.subject, annotation.kind), []).append(annotation)
-    for group in groups.values():
-        normalized = {item.statement.casefold().strip() for item in group}
-        if len(group) < 2 or len(normalized) < 2:
+        all_duplicate_groups.setdefault(
+            semantic_duplicate_identity(annotation), []
+        ).append(annotation)
+    duplicate_ids: dict[str, set[str]] = {}
+    for group in all_duplicate_groups.values():
+        if len(group) < 2:
             continue
         ids = {item.id for item in group}
         for annotation in group:
-            conflict_ids[annotation.id] = ids - {annotation.id}
+            duplicate_ids[annotation.id] = ids - {annotation.id}
+
+    effective_duplicate_groups: dict[str, list[SemanticAnnotation]] = {}
+    for annotation in effective:
+        effective_duplicate_groups.setdefault(
+            semantic_duplicate_identity(annotation), []
+        ).append(annotation)
+    duplicate_representative: dict[str, str] = {}
+    for group in effective_duplicate_groups.values():
+        if len(group) < 2:
+            continue
+        effective_ids = tuple(sorted(item.id for item in group))
+        representative = effective_ids[0]
+        for annotation_id in effective_ids:
+            duplicate_representative[annotation_id] = representative
+
+    representatives = tuple(
+        annotation
+        for annotation in effective
+        if duplicate_representative.get(annotation.id, annotation.id) == annotation.id
+    )
+    representative_conflicts: dict[str, set[str]] = {}
+    for index, left in enumerate(representatives):
+        for right in representatives[index + 1 :]:
+            if (
+                left.kind is not right.kind
+                or _normalized_statement(left.statement)
+                == _normalized_statement(right.statement)
+                or left.subject != right.subject
+            ):
+                continue
+            representative_conflicts.setdefault(left.id, set()).add(right.id)
+            representative_conflicts.setdefault(right.id, set()).add(left.id)
+
+    members_by_representative: dict[str, set[str]] = {}
+    for annotation in effective:
+        representative = duplicate_representative.get(annotation.id, annotation.id)
+        members_by_representative.setdefault(representative, set()).add(annotation.id)
+    conflict_ids: dict[str, set[str]] = {}
+    for annotation in effective:
+        representative = duplicate_representative.get(annotation.id, annotation.id)
+        conflicting: set[str] = set()
+        for conflicting_representative in representative_conflicts.get(
+            representative, set()
+        ):
+            conflicting.update(members_by_representative[conflicting_representative])
+        if conflicting:
+            conflict_ids[annotation.id] = conflicting
 
     views: list[SemanticAnnotationView] = []
     for annotation in annotations:
@@ -680,8 +795,13 @@ def inspect_semantic_annotations(
             state = SemanticAnnotationState.SUPERSEDED
         elif annotation.id in conflict_ids:
             state = SemanticAnnotationState.CONFLICTING
+        elif (
+            duplicate_representative.get(annotation.id, annotation.id) != annotation.id
+        ):
+            state = SemanticAnnotationState.DUPLICATE
         else:
             state = SemanticAnnotationState.ACTIVE
+        selected_representative = duplicate_representative.get(annotation.id)
         views.append(
             SemanticAnnotationView(
                 annotation=annotation,
@@ -689,6 +809,13 @@ def inspect_semantic_annotations(
                 state=state,
                 stale_reasons=stale_reasons,
                 conflicting_ids=tuple(sorted(conflict_ids.get(annotation.id, set()))),
+                duplicate_ids=tuple(sorted(duplicate_ids.get(annotation.id, set()))),
+                duplicate_of_id=(
+                    selected_representative
+                    if selected_representative is not None
+                    and selected_representative != annotation.id
+                    else None
+                ),
                 superseded_by_id=superseded_by.get(annotation.id),
             )
         )
@@ -704,16 +831,21 @@ def render_semantic_recall(
     """Select and bound current resource-specific advisory meaning."""
 
     selected = frozenset(selected_resource_ids)
-    if not selected:
-        return ""
     active = [
         view
         for view in views
         if view.state is SemanticAnnotationState.ACTIVE
-        and selected.intersection(view.annotation.subject.resource_ids)
+        and _complete_scope_selected(view.annotation, selected)
     ]
     active.sort(key=lambda view: _recall_rank(view.annotation, selected, query))
-    entries = [
+    entries = list(
+        _semantic_maintenance_entries(
+            views,
+            selected_resource_ids=selected,
+            query=query,
+        )
+    )
+    entries.extend(
         (
             f'<semantic-annotation id="{view.annotation.id}" '
             f'kind="{view.annotation.kind.value}" '
@@ -723,33 +855,6 @@ def render_semantic_recall(
             "</semantic-annotation>"
         )
         for view in active[:SEMANTIC_RECALL_MAX_ANNOTATIONS]
-    ]
-
-    conflict_groups: dict[tuple[SemanticSubject, SemanticKind], set[str]] = {}
-    for view in views:
-        if view.state is SemanticAnnotationState.CONFLICTING and selected.intersection(
-            view.annotation.subject.resource_ids
-        ):
-            conflict_groups.setdefault(
-                (view.annotation.subject, view.annotation.kind), set()
-            ).add(view.annotation.id)
-    entries.extend(
-        (
-            "<semantic-conflict "
-            f'kind="{kind.value}" '
-            f'resources="{",".join(subject.resource_ids)}" '
-            f'annotation_ids="{",".join(sorted(ids))}">'
-            "Conflicting current definitions are withheld; ask for clarification."
-            "</semantic-conflict>"
-        )
-        for (subject, kind), ids in sorted(
-            conflict_groups.items(),
-            key=lambda item: (
-                item[0][1].value,
-                item[0][0].resource_ids,
-                tuple(sorted(item[1])),
-            ),
-        )
     )
     if not entries:
         return ""
@@ -764,6 +869,110 @@ def render_semantic_recall(
             continue
         retained.append(entry)
     return prefix + "\n".join(retained) if retained else ""
+
+
+def semantic_maintenance_intersects(
+    views: tuple[SemanticAnnotationView, ...],
+    *,
+    selected_resource_ids: tuple[str, ...],
+    query: str,
+) -> bool:
+    """Return whether review-only maintenance intersects the current request."""
+
+    return bool(
+        _semantic_maintenance_entries(
+            views,
+            selected_resource_ids=frozenset(selected_resource_ids),
+            query=query,
+        )
+    )
+
+
+def _semantic_maintenance_entries(
+    views: tuple[SemanticAnnotationView, ...],
+    *,
+    selected_resource_ids: frozenset[str],
+    query: str,
+) -> tuple[str, ...]:
+    lowered_query = query.casefold()
+    notices: list[str] = []
+    seen_groups: set[tuple[str, ...]] = set()
+    for view in sorted(views, key=lambda item: item.annotation.id):
+        annotation = view.annotation
+        if not _maintenance_relevant(
+            annotation,
+            selected_resource_ids,
+            lowered_query,
+        ):
+            continue
+        if view.state is SemanticAnnotationState.SUPERSEDED:
+            continue
+        reason: str | None = None
+        annotation_ids: tuple[str, ...] = (annotation.id,)
+        details: tuple[str, ...] = ()
+        if view.state is SemanticAnnotationState.STALE:
+            reason = "stale"
+            details = view.stale_reasons
+        elif view.state is SemanticAnnotationState.CONFLICTING:
+            reason = "conflict"
+            annotation_ids = tuple(sorted({annotation.id, *view.conflicting_ids}))
+        elif view.state is SemanticAnnotationState.DUPLICATE or view.duplicate_ids:
+            reason = "exact_duplicate"
+            annotation_ids = tuple(sorted({annotation.id, *view.duplicate_ids}))
+            details = (
+                "representative:"
+                + (
+                    view.duplicate_of_id
+                    if view.duplicate_of_id is not None
+                    else annotation.id
+                ),
+            )
+        if reason is None or annotation_ids in seen_groups:
+            continue
+        seen_groups.add(annotation_ids)
+        notices.append(
+            "<semantic-maintenance "
+            f'reason="{reason}" '
+            f'annotation_ids="{",".join(annotation_ids)}" '
+            f'resources="{",".join(annotation.subject.resource_ids)}"'
+            + (f' details="{escape(",".join(details), quote=True)}"' if details else "")
+            + ">"
+            "Review-only notice: affected statements are not settled business "
+            "meaning. Inspect current catalog facts and clarify or propose an exact "
+            "semantic correction through the normal approval boundary."
+            "</semantic-maintenance>"
+        )
+        if len(notices) >= SEMANTIC_MAINTENANCE_MAX_NOTICES:
+            break
+    return tuple(notices)
+
+
+def _maintenance_relevant(
+    annotation: SemanticAnnotation,
+    selected: frozenset[str],
+    lowered_query: str,
+) -> bool:
+    if _complete_scope_selected(annotation, selected):
+        return True
+    if len(annotation.subject.source_ids) == 1 and selected.intersection(
+        annotation.subject.resource_ids
+    ):
+        return True
+    return bool(
+        not selected
+        and any(
+            resource_id.casefold() in lowered_query
+            for resource_id in annotation.subject.resource_ids
+        )
+    )
+
+
+def _complete_scope_selected(
+    annotation: SemanticAnnotation,
+    selected: frozenset[str],
+) -> bool:
+    resources = frozenset(annotation.subject.resource_ids)
+    return bool(resources) and resources <= selected
 
 
 def _recall_rank(
@@ -1142,7 +1351,10 @@ def semantic_declarations(
             id=SEMANTIC_VIEW_CAPABILITY_ID,
             description=(
                 "Load one complete semantic annotation and current_sha256 before "
-                "replacement, supersession, or deletion."
+                "replacement, supersession, deletion, or foreground revalidation. "
+                "The maintenance state says whether its statement is usable as "
+                "current meaning; stale, conflicting, duplicate, and superseded "
+                "content is review-only."
             ),
             input_schema=_id_input_schema(),
             output_kind=SEMANTIC_VIEW_OUTPUT_KIND,
@@ -1155,8 +1367,46 @@ def semantic_declarations(
                         "type": "string",
                         "maxLength": _SEMANTIC_RENDER_MAX_CHARACTERS,
                     },
+                    "maintenance": {
+                        "type": "object",
+                        "properties": {
+                            "state": {
+                                "type": "string",
+                                "enum": [
+                                    item.value for item in SemanticAnnotationState
+                                ],
+                            },
+                            "usable_as_current_meaning": {"type": "boolean"},
+                            "requires_revalidation": {"type": "boolean"},
+                            "stale_reasons": {"type": "array"},
+                            "conflicting_ids": {"type": "array"},
+                            "duplicate_ids": {"type": "array"},
+                            "duplicate_of_id": {
+                                "type": ["string", "null"],
+                            },
+                            "superseded_by_id": {
+                                "type": ["string", "null"],
+                            },
+                        },
+                        "required": [
+                            "state",
+                            "usable_as_current_meaning",
+                            "requires_revalidation",
+                            "stale_reasons",
+                            "conflicting_ids",
+                            "duplicate_ids",
+                            "duplicate_of_id",
+                            "superseded_by_id",
+                        ],
+                        "additionalProperties": False,
+                    },
                 },
-                "required": ["annotation", "current_sha256", "rendered"],
+                "required": [
+                    "annotation",
+                    "current_sha256",
+                    "rendered",
+                    "maintenance",
+                ],
                 "additionalProperties": False,
             },
             executor_id=view.executor_id,
@@ -1401,6 +1651,7 @@ __all__ = [
     "SEMANTIC_MAX_FIELDS",
     "SEMANTIC_MAX_RESOURCES",
     "SEMANTIC_MAX_REVISION_BINDINGS",
+    "SEMANTIC_MAINTENANCE_MAX_NOTICES",
     "SEMANTIC_RECALL_MAX_ANNOTATIONS",
     "SEMANTIC_RECALL_MAX_UTF8_BYTES",
     "SEMANTIC_SAVE_CAPABILITY_ID",
@@ -1429,6 +1680,8 @@ __all__ = [
     "inspect_semantic_annotations",
     "render_semantic_annotation",
     "render_semantic_recall",
+    "semantic_duplicate_identity",
+    "semantic_maintenance_intersects",
     "semantic_annotation_from_mapping",
     "semantic_annotation_sha256",
     "semantic_annotation_to_mapping",

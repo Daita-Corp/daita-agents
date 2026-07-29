@@ -1292,6 +1292,13 @@ def _system_prompt(
         "Do not invent rows, columns, relationships, or query results.",
     ]
     if semantic_text:
+        instructions.append(
+            "Semantic maintenance notices and semantic_view records marked unusable "
+            "are review material only. Never use stale, conflicting, duplicate, or "
+            "superseded statements as settled business meaning. Revalidate against "
+            "current catalog and validated tool evidence, then use semantic_save and "
+            "the existing approval card for any exact correction."
+        )
         instructions.append(semantic_text)
     if memory_text:
         instructions.append(

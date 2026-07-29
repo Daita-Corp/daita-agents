@@ -358,6 +358,51 @@ def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners(
         assert forbidden not in _python_text(PACKAGE)
 
 
+def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only():
+    semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+        encoding="utf-8"
+    )
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    evaluation = (PACKAGE / "evaluation.py").read_text(encoding="utf-8")
+    package_text = _python_text(PACKAGE)
+
+    assert _class_owners("AgentLoop") == {"loop/driver.py"}
+    assert _class_owners("DataToolRuntime") == {"domains/data/controller.py"}
+    assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
+    assert "semantic_duplicate_identity" in semantics
+    assert "SEMANTIC_MAINTENANCE_MAX_NOTICES" in semantics
+    assert "semantic-maintenance" in semantics
+    assert "review material only" in context
+    assert "_decorate_semantic_view" in controller
+    assert "_semantic_management_requested" in controller
+    assert "_semantic_maintenance_requested" in controller
+    assert "capability.id in _SEMANTIC_CAPABILITIES" in controller
+    assert "semantic_annotations" in storage
+    assert "evaluation" not in storage.lower()
+    assert "telemetry" not in storage.lower()
+    assert "from .storage" not in evaluation
+    assert "import sqlite3" not in evaluation.lower()
+    assert "raw_prompt" not in evaluation.lower()
+    assert "tool_arguments" not in evaluation.lower()
+
+    for forbidden in (
+        "class BackgroundReviewer",
+        "class CandidateStore",
+        "class LearningRuntime",
+        "class ReviewScheduler",
+        "class SemanticExecutorKernel",
+        "class TelemetryStore",
+        "class VectorRetriever",
+        "CREATE TABLE learning_candidates",
+        "CREATE TABLE telemetry",
+        "/review-learning",
+        "/knowledge",
+    ):
+        assert forbidden not in package_text
+
+
 async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branch(
     tmp_path,
 ):

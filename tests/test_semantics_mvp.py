@@ -238,7 +238,7 @@ def test_effective_state_supersession_conflicts_staleness_and_recall_are_bounded
     assert "Use paid time." not in recalled
     assert "Use settlement time." not in recalled
     assert "Status C means cancelled." not in recalled
-    assert "<semantic-conflict" in recalled
+    assert '<semantic-maintenance reason="conflict"' in recalled
     assert len(recalled.encode("utf-8")) <= SEMANTIC_RECALL_MAX_UTF8_BYTES
 
     many = tuple(
