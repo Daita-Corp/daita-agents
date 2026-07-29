@@ -359,6 +359,7 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
             )
         }
         assert tables == {
+            "learning_candidates",
             "messages",
             "metadata",
             "runs",

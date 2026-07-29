@@ -63,9 +63,15 @@ _SLASH_COMMAND_COMPLETIONS = (
     ("/resume ", "/resume <id>", "Resume a previous conversation"),
     ("/learn ", "/learn <material>", "Teach durable knowledge or a procedure"),
     (
+        "/review",
+        "/review [cost-usd]",
+        "Review recent runs for memory or skill suggestions",
+    ),
+    (
         "/memory",
         "/memory",
-        "Inspect active, duplicate, stale, conflicting, and superseded memory",
+        "Inspect global memory, semantics, learning candidates, and "
+        "duplicate, stale, conflicting, and superseded states",
     ),
     ("/user", "/user", "View or edit the user profile"),
     ("/skills", "/skills", "List available skills"),

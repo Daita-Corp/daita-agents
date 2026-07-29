@@ -11,11 +11,19 @@ from dataclasses import dataclass, field, fields
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 import re
+from typing import cast
 
+from .learning_candidates import (
+    LEARNING_REVIEW_MAX_MODEL_CALLS,
+    LEARNING_REVIEW_MAX_PROPOSALS,
+    LEARNING_REVIEW_MAX_TOTAL_TOKENS,
+    LEARNING_REVIEW_MAX_WALL_TIME_SECONDS,
+)
 from .observation import AgentEvent, AgentEventKind
 
 EVALUATION_MAX_CASES = 256
 EVALUATION_MAX_EVENTS_PER_OUTCOME = 8_192
+_LEARNING_REVIEW_MAX_DURATION_MS = int(LEARNING_REVIEW_MAX_WALL_TIME_SECONDS * 1_000)
 
 _CASE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _CATALOG_TOOLS = frozenset(
@@ -162,6 +170,155 @@ class RunMeasurement:
             raise ValueError(
                 "cost_complete must be true exactly when estimated cost is available"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateReviewMeasurement:
+    """Caller-provided content-free measurements for one bounded review outcome."""
+
+    proposed_candidates: int = 0
+    accepted_candidates: int = 0
+    rejected_candidates: int = 0
+    false_positive_candidates: int = 0
+    duplicate_candidates_suppressed: int = 0
+    background_model_calls: int = 0
+    background_total_tokens: int = 0
+    background_duration_ms: int = 0
+    background_estimated_cost_usd: Decimal | None = None
+    background_cost_complete: bool = False
+    stale_activation_count: int = 0
+    conflicting_claim_selection_count: int = 0
+    cross_source_leakage_count: int = 0
+
+    def __post_init__(self) -> None:
+        for item in fields(self):
+            value = getattr(self, item.name)
+            if item.name == "background_estimated_cost_usd":
+                if value is not None and (
+                    not isinstance(value, Decimal) or not value.is_finite() or value < 0
+                ):
+                    raise ValueError(
+                        "background_estimated_cost_usd must be finite and "
+                        "non-negative or None"
+                    )
+                continue
+            if item.name == "background_cost_complete":
+                if not isinstance(value, bool):
+                    raise TypeError("background_cost_complete must be a boolean")
+                continue
+            _non_negative_integer(value, item.name)
+        if self.background_cost_complete != (
+            self.background_estimated_cost_usd is not None
+        ):
+            raise ValueError(
+                "background_cost_complete must agree with estimated cost availability"
+            )
+        if (
+            self.accepted_candidates + self.rejected_candidates
+            > self.proposed_candidates
+        ):
+            raise ValueError("candidate decisions cannot exceed proposed candidates")
+        if self.false_positive_candidates > self.proposed_candidates:
+            raise ValueError(
+                "candidate false positives cannot exceed proposed candidates"
+            )
+        if self.proposed_candidates > LEARNING_REVIEW_MAX_PROPOSALS:
+            raise ValueError(
+                "proposed_candidates exceeds the per-review proposal bound"
+            )
+        if self.duplicate_candidates_suppressed > LEARNING_REVIEW_MAX_PROPOSALS:
+            raise ValueError(
+                "duplicate_candidates_suppressed exceeds the per-review "
+                "proposal bound"
+            )
+        if self.background_model_calls > LEARNING_REVIEW_MAX_MODEL_CALLS:
+            raise ValueError(
+                "background_model_calls exceeds the per-review model-call bound"
+            )
+        if self.background_total_tokens > LEARNING_REVIEW_MAX_TOTAL_TOKENS:
+            raise ValueError(
+                "background_total_tokens exceeds the per-review token bound"
+            )
+        if self.background_duration_ms > _LEARNING_REVIEW_MAX_DURATION_MS:
+            raise ValueError(
+                "background_duration_ms exceeds the per-review wall-time bound"
+            )
+
+    @property
+    def hard_safety_passed(self) -> bool:
+        return (
+            self.stale_activation_count == 0
+            and self.conflicting_claim_selection_count == 0
+            and self.cross_source_leakage_count == 0
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateReviewReport:
+    """Pure aggregate over bounded caller-owned candidate review outcomes."""
+
+    measurements: tuple[CandidateReviewMeasurement, ...]
+
+    def __post_init__(self) -> None:
+        values = tuple(self.measurements)
+        if not values or len(values) > EVALUATION_MAX_CASES:
+            raise ValueError(
+                f"candidate review report requires 1 to {EVALUATION_MAX_CASES} "
+                "measurements"
+            )
+        if any(not isinstance(item, CandidateReviewMeasurement) for item in values):
+            raise TypeError(
+                "candidate review report requires CandidateReviewMeasurement records"
+            )
+        object.__setattr__(self, "measurements", values)
+
+    def to_mapping(self) -> dict[str, object]:
+        totals = _candidate_review_totals(self.measurements)
+        proposed = cast(int, totals["proposed_candidates"])
+        accepted = cast(int, totals["accepted_candidates"])
+        rejected = cast(int, totals["rejected_candidates"])
+        decided = accepted + rejected
+        false_positives = cast(int, totals["false_positive_candidates"])
+        totals["candidate_precision"] = (
+            _rate(proposed - false_positives, proposed) if proposed else None
+        )
+        totals["acceptance_rate"] = _rate(accepted, decided) if decided else None
+        totals["rejection_rate"] = _rate(rejected, decided) if decided else None
+        totals["hard_safety_passed"] = all(
+            item.hard_safety_passed for item in self.measurements
+        )
+        return totals
+
+    def render_markdown(self) -> str:
+        data = self.to_mapping()
+        rows = (
+            ("Proposed candidates", "proposed_candidates"),
+            ("Accepted candidates", "accepted_candidates"),
+            ("Rejected candidates", "rejected_candidates"),
+            ("False positives", "false_positive_candidates"),
+            ("Candidate precision", "candidate_precision"),
+            ("Acceptance rate", "acceptance_rate"),
+            ("Rejection rate", "rejection_rate"),
+            ("Duplicates suppressed", "duplicate_candidates_suppressed"),
+            ("Background model calls", "background_model_calls"),
+            ("Background tokens", "background_total_tokens"),
+            ("Background duration (ms)", "background_duration_ms"),
+            ("Background estimated cost (USD)", "background_estimated_cost_usd"),
+            ("Stale activations", "stale_activation_count"),
+            ("Conflicting claims selected", "conflicting_claim_selection_count"),
+            ("Cross-source leakage", "cross_source_leakage_count"),
+            ("Hard safety passed", "hard_safety_passed"),
+        )
+        lines = [
+            "# Candidate Review Evaluation",
+            "",
+            "| Metric | Value |",
+            "| --- | ---: |",
+        ]
+        lines.extend(
+            f"| {label} | {_summary_value(data.get(key))} |" for label, key in rows
+        )
+        return "\n".join(lines) + "\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -653,7 +810,53 @@ def _non_negative_integer(value: object, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a non-negative integer")
 
 
+def _candidate_review_totals(
+    measurements: tuple[CandidateReviewMeasurement, ...],
+) -> dict[str, object]:
+    integer_fields = (
+        "proposed_candidates",
+        "accepted_candidates",
+        "rejected_candidates",
+        "false_positive_candidates",
+        "duplicate_candidates_suppressed",
+        "background_model_calls",
+        "background_total_tokens",
+        "background_duration_ms",
+        "stale_activation_count",
+        "conflicting_claim_selection_count",
+        "cross_source_leakage_count",
+    )
+    result: dict[str, object] = {
+        field_name: sum(cast(int, getattr(item, field_name)) for item in measurements)
+        for field_name in integer_fields
+    }
+    if all(item.background_cost_complete for item in measurements):
+        result["background_estimated_cost_usd"] = format(
+            sum(
+                (
+                    cast(Decimal, item.background_estimated_cost_usd)
+                    for item in measurements
+                ),
+                Decimal("0"),
+            ),
+            "f",
+        )
+        result["background_cost_complete"] = True
+    else:
+        result["background_estimated_cost_usd"] = None
+        result["background_cost_complete"] = False
+    return result
+
+
+def _rate(numerator: int, denominator: int) -> str:
+    if denominator <= 0 or numerator < 0 or numerator > denominator:
+        raise ValueError("candidate evaluation rate inputs are invalid")
+    return format(Decimal(numerator) / Decimal(denominator), ".6f")
+
+
 __all__ = [
+    "CandidateReviewMeasurement",
+    "CandidateReviewReport",
     "BenchmarkComparison",
     "BenchmarkJudgment",
     "BenchmarkOutcome",

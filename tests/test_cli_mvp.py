@@ -1283,7 +1283,19 @@ def test_future_cli_4_parser_adds_only_the_direct_knowledge_commands():
     }
 
     memory = _subcommands(commands["memory"])
-    assert set(memory) == {"read", "edit", "inspect", "set"}
+    assert set(memory) == {
+        "accept-candidate",
+        "clear-rejected",
+        "edit",
+        "edit-candidate",
+        "inspect",
+        "list-candidates",
+        "read",
+        "reject-candidate",
+        "review",
+        "set",
+        "show-candidate",
+    }
     assert _surface(memory["read"]) == (
         ("name",),
         frozenset({"-h", "--help", "--target"}),
@@ -1374,7 +1386,7 @@ def test_future_cli_4_direct_knowledge_commands_survive_reopen():
     assert inspect_code == 0
     assert inspect_stderr == ""
     assert _json_lines(inspect_stdout) == (
-        {"annotations": [], "global_memory": memory_text},
+        {"annotations": [], "candidates": [], "global_memory": memory_text},
     )
     assert memory == memory_text
     assert skill is not None

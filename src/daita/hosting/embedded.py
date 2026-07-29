@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -70,6 +70,16 @@ from ..llm.routing import (
     ModelRouter,
     RetryPolicy,
 )
+from ..learning_candidates import (
+    LEARNING_REVIEW_MAX_TOTAL_TOKENS,
+    LearningCandidate,
+    LearningCandidateContent,
+    LearningCandidateRejectionReason,
+    LearningCandidateStatus,
+    LearningCandidateView,
+    LearningReviewResult,
+    OneShotCandidateReviewer,
+)
 from ..loop.driver import (
     AgentLoop,
     ContextBuilder,
@@ -108,6 +118,7 @@ _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
 _MODEL_VALIDATION_TOOL_NAME = "daita_validate_tool_support"
 _MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 16
 _REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 25_000
+_CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS = LEARNING_REVIEW_MAX_TOTAL_TOKENS // 4
 _PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _SOURCE_ALIAS_SEPARATOR = re.compile(r"[^a-z0-9]+")
 _BUILTIN_PROVIDERS = frozenset({"openai", "anthropic", "gemini", "grok", "ollama"})
@@ -269,6 +280,9 @@ class EmbeddedAgent:
         data_tool_runtime: DataToolRuntime,
         memory_store: MemoryStore,
         skill_store: SkillStore,
+        candidate_reviewer: OneShotCandidateReviewer,
+        data_context_builder: DataContextBuilder | None,
+        candidate_acceptance_supported: bool,
         mutation_lock: asyncio.Lock,
         model_profile: ModelProfile | None,
         model_route: ModelRoute | None,
@@ -297,6 +311,9 @@ class EmbeddedAgent:
         self._data_tool_runtime = data_tool_runtime
         self._memory_store = memory_store
         self._skill_store = skill_store
+        self._candidate_reviewer = candidate_reviewer
+        self._data_context_builder = data_context_builder
+        self._candidate_acceptance_supported = candidate_acceptance_supported
         self._clock = clock
         self._id_factory = id_factory
         self._mutation_lock = mutation_lock
@@ -347,6 +364,9 @@ class EmbeddedAgent:
         secret_provider: SecretProvider | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
+        reviewer_model: ModelProvider | None = None,
+        reviewer_profile: ModelProfile | None = None,
+        reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
     ) -> Self:
@@ -397,6 +417,9 @@ class EmbeddedAgent:
                 secret_provider=secret_provider,
                 keychain=keychain,
                 model_validator=model_validator,
+                reviewer_model=reviewer_model,
+                reviewer_profile=reviewer_profile,
+                reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
             )
@@ -434,6 +457,9 @@ class EmbeddedAgent:
         secret_provider: SecretProvider | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
+        reviewer_model: ModelProvider | None = None,
+        reviewer_profile: ModelProfile | None = None,
+        reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
     ) -> Self:
@@ -509,6 +535,9 @@ class EmbeddedAgent:
                 secret_provider=secret_provider,
                 keychain=keychain,
                 model_validator=model_validator,
+                reviewer_model=reviewer_model,
+                reviewer_profile=reviewer_profile,
+                reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
             )
@@ -537,6 +566,9 @@ class EmbeddedAgent:
         secret_provider: SecretProvider | None,
         keychain: KeychainStore | None,
         model_validator: ModelProvider | None,
+        reviewer_model: ModelProvider | None,
+        reviewer_profile: ModelProfile | None,
+        reviewer_max_estimated_cost_usd: Decimal | None,
         observer: AgentObserver | None,
         approval_handler: ApprovalHandler | None,
     ) -> Self:
@@ -556,6 +588,36 @@ class EmbeddedAgent:
         mutation_lock = asyncio.Lock()
         memory_store = MemoryStore(home, mutation_lock)
         skill_store = SkillStore(home, mutation_lock)
+        resolved_reviewer_model = reviewer_model
+        resolved_reviewer_profile = reviewer_profile
+        if (
+            resolved_reviewer_model is None
+            and resolved_reviewer_profile is None
+            and reviewer_max_estimated_cost_usd is not None
+            and model_route is not None
+        ):
+            (
+                resolved_reviewer_model,
+                resolved_reviewer_profile,
+            ) = _candidate_reviewer_from_route(
+                model_route,
+                secret_provider=secret_provider or keychain,
+            )
+        resolved_reviewer_profile = _resolve_candidate_reviewer_profile(
+            resolved_reviewer_model,
+            resolved_reviewer_profile,
+        )
+        candidate_reviewer = OneShotCandidateReviewer(
+            agent_id=identity.id,
+            store=store,
+            memory=memory_store,
+            skills=skill_store,
+            catalog=data_view,
+            model=resolved_reviewer_model,
+            profile=resolved_reviewer_profile,
+            max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
+            clock=clock,
+        )
         memory = memory_set_declarations(memory_store)
         skills = skill_declarations(skill_store)
         semantics = semantic_declarations(identity.id, store)
@@ -640,6 +702,16 @@ class EmbeddedAgent:
             data_tool_runtime=data_tool_runtime,
             memory_store=memory_store,
             skill_store=skill_store,
+            candidate_reviewer=candidate_reviewer,
+            data_context_builder=(
+                resolved_context
+                if isinstance(resolved_context, DataContextBuilder)
+                else None
+            ),
+            candidate_acceptance_supported=(
+                isinstance(resolved_context, DataContextBuilder)
+                and resolved_tools is data_tool_runtime
+            ),
             mutation_lock=mutation_lock,
             model_profile=model_profile,
             model_route=model_route,
@@ -769,6 +841,71 @@ class EmbeddedAgent:
         conversation_id: str | None = None,
         source_id: str | None = None,
     ) -> LoopExit:
+        return await self._run(
+            message,
+            conversation_id=conversation_id,
+            source_id=source_id,
+        )
+
+    async def _run(
+        self,
+        message: str,
+        *,
+        conversation_id: str | None = None,
+        source_id: str | None = None,
+        learning_candidate_id: str | None = None,
+        learning_candidate_text: str | None = None,
+        learning_candidate: LearningCandidate | None = None,
+    ) -> LoopExit:
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("message must be a non-empty string")
+        if source_id is not None and (
+            not isinstance(source_id, str) or not source_id.strip()
+        ):
+            raise ValueError("source_id must be a non-empty string or None")
+        if learning_candidate_id is not None and (
+            not isinstance(learning_candidate_id, str)
+            or not learning_candidate_id.strip()
+        ):
+            raise ValueError("learning_candidate_id must be a non-empty string or None")
+        if not (
+            (learning_candidate_id is None)
+            == (learning_candidate_text is None)
+            == (learning_candidate is None)
+        ):
+            raise ValueError(
+                "learning candidate guard, id, and rendered content must be set together"
+            )
+        if self._model_reopen_required:
+            raise AgentNotConfiguredError(
+                "model configuration changed; close and reopen required"
+            )
+        loop = self._require_loop()
+        async with self._run_lock:
+            return await self._run_locked(
+                loop,
+                message,
+                conversation_id=conversation_id,
+                source_id=source_id,
+                learning_candidate_id=learning_candidate_id,
+                learning_candidate_text=learning_candidate_text,
+                learning_candidate=learning_candidate,
+            )
+
+    async def _run_locked(
+        self,
+        loop: AgentLoop,
+        message: str,
+        *,
+        conversation_id: str | None,
+        source_id: str | None,
+        learning_candidate_id: str | None,
+        learning_candidate_text: str | None,
+        learning_candidate: LearningCandidate | None,
+        run_id: str | None = None,
+    ) -> LoopExit:
+        """Run once while the caller owns the foreground lifecycle lock."""
+
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
         if source_id is not None and (
@@ -779,6 +916,7 @@ class EmbeddedAgent:
             raise AgentNotConfiguredError(
                 "model configuration changed; close and reopen required"
             )
+        self._require_open()
         supplied_conversation = conversation_id is not None
         resolved_conversation = (
             self._id_factory("conversation")
@@ -786,71 +924,89 @@ class EmbeddedAgent:
             else conversation_id
         )
         _validate_conversation_id(resolved_conversation)
-        loop = self._require_loop()
-        async with self._run_lock:
-            self._require_open()
-            conversation_exists, conversation, older_history_exists = (
-                await self._store.completed_conversation_tail(
-                    self.identity.id,
-                    resolved_conversation,
+        conversation_exists, conversation, older_history_exists = (
+            await self._store.completed_conversation_tail(
+                self.identity.id,
+                resolved_conversation,
+            )
+        )
+        if supplied_conversation and not conversation_exists:
+            raise ValueError("unknown conversation for this agent")
+        if not supplied_conversation and conversation_exists:
+            raise ValueError("generated conversation id already exists")
+        conversation_source_id = (
+            await self._store.conversation_source_id(
+                self.identity.id,
+                resolved_conversation,
+            )
+            if supplied_conversation
+            else await self._store.load_active_source_id(self.identity.id)
+        )
+        active_sources = tuple(
+            source
+            for source in await self._store.list_sources(self.identity.id)
+            if source.active
+        )
+        if conversation_source_id is None and len(active_sources) == 1:
+            conversation_source_id = active_sources[0].id
+        effective_source_id = (
+            source_id.strip() if source_id is not None else conversation_source_id
+        )
+        if active_sources and effective_source_id is None:
+            raise SourceSelectionError(
+                "Multiple data sources are attached. Select one with /source "
+                "before asking a question."
+            )
+        if effective_source_id is not None and not any(
+            source.id == effective_source_id for source in active_sources
+        ):
+            raise SourceSelectionError(
+                "The selected data source is not active for this agent."
+            )
+        scoped_conversation = tuple(
+            item
+            for item in conversation
+            if item.transcript.run.source_id == effective_source_id
+        )
+        prior_messages = _project_completed_history(
+            scoped_conversation,
+            older_history_exists=(
+                older_history_exists or len(scoped_conversation) < len(conversation)
+            ),
+        )
+        run_input = RunInput(
+            id=run_id or self._id_factory("run"),
+            agent_id=self.identity.id,
+            message=message.strip(),
+            created_at=self._clock(),
+            conversation_id=resolved_conversation,
+            source_id=effective_source_id,
+            conversation_source_id=conversation_source_id,
+        )
+        if learning_candidate_id is not None:
+            if self._data_context_builder is None:
+                raise AgentHomeError(
+                    "learning candidate acceptance requires DataContextBuilder"
                 )
+            self._data_context_builder.select_learning_candidate(
+                run_input.id,
+                learning_candidate_id,
+                cast(str, learning_candidate_text),
             )
-            if supplied_conversation and not conversation_exists:
-                raise ValueError("unknown conversation for this agent")
-            if not supplied_conversation and conversation_exists:
-                raise ValueError("generated conversation id already exists")
-            conversation_source_id = (
-                await self._store.conversation_source_id(
-                    self.identity.id,
-                    resolved_conversation,
-                )
-                if supplied_conversation
-                else await self._store.load_active_source_id(self.identity.id)
+            self._data_tool_runtime.select_learning_candidate(
+                run_input.id,
+                cast(LearningCandidate, learning_candidate),
             )
-            active_sources = tuple(
-                source
-                for source in await self._store.list_sources(self.identity.id)
-                if source.active
-            )
-            if conversation_source_id is None and len(active_sources) == 1:
-                conversation_source_id = active_sources[0].id
-            effective_source_id = (
-                source_id.strip() if source_id is not None else conversation_source_id
-            )
-            if active_sources and effective_source_id is None:
-                raise SourceSelectionError(
-                    "Multiple data sources are attached. Select one with /source "
-                    "before asking a question."
-                )
-            if effective_source_id is not None and not any(
-                source.id == effective_source_id for source in active_sources
-            ):
-                raise SourceSelectionError(
-                    "The selected data source is not active for this agent."
-                )
-            scoped_conversation = tuple(
-                item
-                for item in conversation
-                if item.transcript.run.source_id == effective_source_id
-            )
-            prior_messages = _project_completed_history(
-                scoped_conversation,
-                older_history_exists=(
-                    older_history_exists or len(scoped_conversation) < len(conversation)
-                ),
-            )
+        try:
             return await loop.run(
-                RunInput(
-                    id=self._id_factory("run"),
-                    agent_id=self.identity.id,
-                    message=message.strip(),
-                    created_at=self._clock(),
-                    conversation_id=resolved_conversation,
-                    source_id=effective_source_id,
-                    conversation_source_id=conversation_source_id,
-                ),
+                run_input,
                 prior_messages=prior_messages,
             )
+        finally:
+            if learning_candidate_id is not None:
+                assert self._data_context_builder is not None
+                self._data_context_builder.clear_learning_candidate(run_input.id)
+                self._data_tool_runtime.clear_learning_candidate(run_input.id)
 
     async def transcript(self, run_id: str) -> Transcript:
         self._require_open()
@@ -950,6 +1106,150 @@ class EmbeddedAgent:
     async def set_user_profile(self, text: str) -> None:
         self._require_open()
         await self._memory_store.set_user_profile(text)
+
+    async def review_learning_candidates(
+        self,
+        *,
+        max_estimated_cost_usd: Decimal | None = None,
+    ) -> LearningReviewResult:
+        """Explicitly trigger one bounded auxiliary review request."""
+
+        self._require_open()
+        if max_estimated_cost_usd is None or self._candidate_reviewer.enabled:
+            return await self._candidate_reviewer.review(
+                max_estimated_cost_usd=max_estimated_cost_usd,
+            )
+        if self.model_route is None:
+            return await self._candidate_reviewer.review()
+        model, profile = _candidate_reviewer_from_route(
+            self.model_route,
+            secret_provider=self._secret_provider or self._keychain,
+        )
+        return await self._candidate_reviewer.review_with_model(
+            model=model,
+            profile=profile,
+            max_estimated_cost_usd=max_estimated_cost_usd,
+        )
+
+    async def list_learning_candidates(
+        self,
+        *,
+        status: LearningCandidateStatus | None = None,
+    ) -> tuple[LearningCandidateView, ...]:
+        self._require_open()
+        return await self._candidate_reviewer.list_candidates(status=status)
+
+    async def read_learning_candidate(
+        self,
+        candidate_id: str,
+    ) -> LearningCandidateView | None:
+        self._require_open()
+        return await self._candidate_reviewer.read_candidate(candidate_id)
+
+    async def edit_learning_candidate(
+        self,
+        candidate_id: str,
+        content: LearningCandidateContent,
+    ) -> LearningCandidateView:
+        async with self._run_lock:
+            self._require_open()
+            return await self._candidate_reviewer.edit_candidate(candidate_id, content)
+
+    async def reject_learning_candidate(
+        self,
+        candidate_id: str,
+        reason: LearningCandidateRejectionReason,
+    ) -> LearningCandidateView:
+        async with self._run_lock:
+            self._require_open()
+            return await self._candidate_reviewer.reject_candidate(candidate_id, reason)
+
+    async def clear_rejected_learning_candidates(self) -> int:
+        async with self._run_lock:
+            self._require_open()
+            return await self._candidate_reviewer.clear_rejected()
+
+    async def accept_learning_candidate(
+        self,
+        candidate_id: str,
+        *,
+        conversation_id: str | None = None,
+        source_id: str | None = None,
+    ) -> LoopExit:
+        """Start a fresh ordinary foreground run for one selected candidate."""
+
+        async with self._run_lock:
+            self._require_open()
+            if not self._candidate_acceptance_supported:
+                raise AgentHomeError(
+                    "learning candidate acceptance requires the built-in data "
+                    "context and tool runtime"
+                )
+            view = await self._candidate_reviewer.read_candidate(candidate_id)
+            if view is None:
+                raise ValueError(f"learning candidate not found: {candidate_id}")
+            if view.status is not LearningCandidateStatus.AWAITING_REVIEW:
+                raise ValueError(
+                    f"learning candidate is not awaiting review: {view.status.value}"
+                )
+            candidate = view.candidate
+            effective_source_id = source_id
+            if candidate.source_ids:
+                bound_source_id = candidate.source_ids[0]
+                if source_id is not None and source_id != bound_source_id:
+                    raise ValueError(
+                        "learning candidate acceptance must use its bound source"
+                    )
+                effective_source_id = bound_source_id
+            candidate_text = await self._candidate_reviewer.acceptance_context(
+                self.identity.id,
+                candidate.id,
+                effective_source_id,
+            )
+            loop = self._require_loop()
+            run_id = self._id_factory("run")
+            result: LoopExit | None = None
+            run_error: BaseException | None = None
+            try:
+                result = await self._run_locked(
+                    loop,
+                    (
+                        "Review the explicitly selected inactive learning candidate "
+                        "against current catalog and active knowledge. If it remains "
+                        "correct, durable, grounded, scoped, and non-duplicate, "
+                        "propose the exact matching existing mutation before "
+                        "returning text. Otherwise do not mutate active knowledge."
+                    ),
+                    conversation_id=conversation_id,
+                    source_id=effective_source_id,
+                    learning_candidate_id=candidate.id,
+                    learning_candidate_text=candidate_text,
+                    learning_candidate=candidate,
+                    run_id=run_id,
+                )
+            except BaseException as error:
+                run_error = error
+
+            finalization_cancelled = False
+            try:
+                if self._data_tool_runtime.learning_candidate_mutation_succeeded(
+                    run_id
+                ):
+                    _, finalization_cancelled = await _await_async_completion(
+                        lambda: self._candidate_reviewer.mark_accepted(
+                            candidate.id,
+                            expected_fingerprint=candidate.candidate_fingerprint,
+                        )
+                    )
+            finally:
+                self._data_tool_runtime.clear_learning_candidate_outcome(run_id)
+
+            if run_error is not None:
+                raise run_error.with_traceback(run_error.__traceback__)
+            if finalization_cancelled:
+                raise asyncio.CancelledError
+            assert result is not None
+            return result
 
     async def list_semantic_annotations(
         self,
@@ -1368,7 +1668,12 @@ class EmbeddedAgent:
 
     async def _finish_close(self) -> None:
         first_error: BaseException | None = None
-        for store in (self._memory_store, self._skill_store, self._store):
+        for store in (
+            self._candidate_reviewer,
+            self._memory_store,
+            self._skill_store,
+            self._store,
+        ):
             try:
                 await store.close()
             except BaseException as error:
@@ -1499,6 +1804,70 @@ def _source_from_registration(
                 "PostgreSQL source configuration is invalid"
             ) from error
     raise AgentHomeError("registered source adapter cannot be refreshed")
+
+
+def _resolve_candidate_reviewer_profile(
+    model: ModelProvider | None,
+    profile: ModelProfile | None,
+) -> ModelProfile | None:
+    """Admit one direct provider profile without retry or fallback."""
+
+    if model is None:
+        if profile is not None:
+            raise ValueError("reviewer_profile requires reviewer_model")
+        return None
+    if isinstance(model, ModelRouter):
+        raise ValueError(
+            "candidate reviewer requires one direct provider without fallback"
+        )
+    resolved = profile
+    if resolved is None:
+        candidate = getattr(model, "model_profile", None)
+        if isinstance(candidate, ModelProfile):
+            resolved = candidate
+    if not isinstance(resolved, ModelProfile):
+        raise ValueError("candidate reviewer requires an explicit bounded ModelProfile")
+    if resolved.max_output_tokens >= LEARNING_REVIEW_MAX_TOTAL_TOKENS:
+        raise ValueError(
+            "candidate reviewer profile output limit exceeds review token budget"
+        )
+    return resolved
+
+
+def _candidate_reviewer_from_route(
+    route: ModelRoute,
+    *,
+    secret_provider: SecretProvider | None,
+) -> tuple[ModelProvider, ModelProfile]:
+    """Derive one bounded, direct reviewer from the persisted primary route."""
+
+    primary = route.candidates[0]
+    profile = replace(
+        primary.profile,
+        max_output_tokens=min(
+            primary.profile.max_output_tokens,
+            _CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS,
+        ),
+    )
+    direct_route = ModelRoute(
+        (
+            ModelRouteCandidate(
+                provider_id=primary.provider_id,
+                profile=profile,
+                base_url=primary.base_url,
+                secret_reference=primary.secret_reference,
+                allowed_sensitivities=primary.allowed_sensitivities,
+            ),
+        ),
+        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+    )
+    return (
+        create_model_route_provider(
+            direct_route,
+            secret_provider=secret_provider,
+        ),
+        profile,
+    )
 
 
 def _require_configuration_fields(
@@ -2143,6 +2512,20 @@ def _require_value(value: _T | None) -> _T:
 
 async def _await_sync_completion(callback: Callable[[], _T]) -> tuple[_T, bool]:
     worker = asyncio.create_task(asyncio.to_thread(callback))
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+            continue
+    return worker.result(), cancelled
+
+
+async def _await_async_completion(
+    callback: Callable[[], Awaitable[_T]],
+) -> tuple[_T, bool]:
+    worker = asyncio.ensure_future(callback())
     cancelled = False
     while not worker.done():
         try:

@@ -12,6 +12,20 @@ from .llm import (
     create_llm_provider,
 )
 from .loop import ConversationRun, LoopExit, LoopExitKind, LoopLimits, Transcript
+from .learning_candidates import (
+    DocumentCandidateContent,
+    LearningCandidate,
+    LearningCandidateAction,
+    LearningCandidateError,
+    LearningCandidateRejectionReason,
+    LearningCandidateStatus,
+    LearningCandidateTarget,
+    LearningCandidateView,
+    LearningReviewResult,
+    LearningReviewStatus,
+    SemanticCandidateContent,
+    SkillCandidateContent,
+)
 from .observation import AgentEvent, AgentEventKind, AgentObserver
 from .semantics import (
     ResourceRevisionBinding,
@@ -42,6 +56,16 @@ __all__ = [
     "ConversationRun",
     "CatalogSummary",
     "LocalDirectorySource",
+    "DocumentCandidateContent",
+    "LearningCandidate",
+    "LearningCandidateAction",
+    "LearningCandidateError",
+    "LearningCandidateRejectionReason",
+    "LearningCandidateStatus",
+    "LearningCandidateTarget",
+    "LearningCandidateView",
+    "LearningReviewResult",
+    "LearningReviewStatus",
     "LoopExit",
     "LoopExitKind",
     "LoopLimits",
@@ -61,7 +85,9 @@ __all__ = [
     "SemanticKind",
     "SemanticSubject",
     "SemanticValidationError",
+    "SemanticCandidateContent",
     "Skill",
+    "SkillCandidateContent",
     "SkillSummary",
     "Transcript",
     "__version__",

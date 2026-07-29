@@ -627,7 +627,7 @@ def test_terminal_controller_injects_one_named_bridge_at_every_agent_path():
         and node.func.attr in {"create", "open"}
     ]
 
-    assert len(construction_calls) == 5
+    assert len(construction_calls) == 6
     for call in construction_calls:
         observer = next(
             (keyword.value for keyword in call.keywords if keyword.arg == "observer"),
@@ -2737,6 +2737,7 @@ def test_tui_command_output_is_captured_without_leaking_above_the_shell():
         "/source use",
         "/source add",
         "/memory edit",
+        "/review",
         "/user edit",
         "/skills edit forecast",
         "/skills delete forecast",
@@ -3073,6 +3074,7 @@ async def test_slash_completion_covers_the_documented_surface_and_remains_local(
         "/new",
         "/resume <id>",
         "/learn <material>",
+        "/review [cost-usd]",
         "/memory",
         "/user",
         "/skills",
@@ -3353,7 +3355,6 @@ async def test_slash_dropdown_opens_filters_and_supports_arrow_navigation(
         )
         completions = completion_state().completions
         assert all(completion.display_meta_text for completion in completions)
-        await _wait_until(lambda: "Show current agent status" in output.text)
 
         pipe.send_text("sta")
         await _wait_until(
@@ -3361,6 +3362,7 @@ async def test_slash_dropdown_opens_filters_and_supports_arrow_navigation(
             and [completion.text for completion in completion_state().completions]
             == ["/status"]
         )
+        await _wait_until(lambda: "Show current agent status" in output.text)
         pipe.send_text("\x1b[B")
         await _wait_until(
             lambda: completion_state() is not None

@@ -23,7 +23,7 @@ from ...capabilities import (
     ToolOutput,
     ToolOutputValidationError,
 )
-from ...memory.capabilities import MEMORY_SET_CAPABILITY_ID
+from ...memory.capabilities import MEMORY_SET_CAPABILITY_ID, MEMORY_SET_TOOL_NAME
 from ...observation import (
     AgentEvent,
     AgentEventKind,
@@ -37,11 +37,21 @@ from ...catalog.capabilities import (
     CATALOG_TRAVERSE_CAPABILITY_ID,
 )
 from ...llm.models import MessageRole, ToolCall, ToolDefinition, ToolResultBlock
+from ...learning_candidates import (
+    LearningCandidate,
+    LearningCandidateAction,
+    LearningCandidateTarget,
+    SemanticCandidateContent,
+    SkillCandidateContent,
+    candidate_matches_mutation_call,
+)
 from ...loop.models import RunInput, Transcript
 from ...semantics import (
     SEMANTIC_DELETE_CAPABILITY_ID,
+    SEMANTIC_DELETE_TOOL_NAME,
     SEMANTIC_LIST_CAPABILITY_ID,
     SEMANTIC_SAVE_CAPABILITY_ID,
+    SEMANTIC_SAVE_TOOL_NAME,
     SEMANTIC_VIEW_CAPABILITY_ID,
     SemanticAnnotation,
     SemanticAnnotationState,
@@ -57,7 +67,9 @@ from ...semantics import (
 )
 from ...skills.capabilities import (
     SKILL_DELETE_CAPABILITY_ID,
+    SKILL_DELETE_TOOL_NAME,
     SKILL_SAVE_CAPABILITY_ID,
+    SKILL_SAVE_TOOL_NAME,
     SKILL_VIEW_CAPABILITY_ID,
 )
 from ...skills.store import (
@@ -223,6 +235,35 @@ class DataToolRuntime:
         self._observer = observer
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._transcripts = transcripts
+        self._selected_learning_candidates: dict[str, LearningCandidate] = {}
+        self._successful_learning_candidate_mutations: set[str] = set()
+
+    def select_learning_candidate(
+        self,
+        run_id: str,
+        candidate: LearningCandidate,
+    ) -> None:
+        """Narrow one acceptance run to its exact candidate mutation."""
+
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("candidate guard run_id must be non-empty text")
+        if not isinstance(candidate, LearningCandidate):
+            raise TypeError("candidate guard requires LearningCandidate")
+        if self._selected_learning_candidates:
+            raise RuntimeError("candidate mutation guard exceeds its live bound")
+        self._successful_learning_candidate_mutations.discard(run_id)
+        self._selected_learning_candidates[run_id] = candidate
+
+    def clear_learning_candidate(self, run_id: str) -> None:
+        self._selected_learning_candidates.pop(run_id, None)
+
+    def learning_candidate_mutation_succeeded(self, run_id: str) -> bool:
+        """Return whether this guarded run completed its exact active mutation."""
+
+        return run_id in self._successful_learning_candidate_mutations
+
+    def clear_learning_candidate_outcome(self, run_id: str) -> None:
+        self._successful_learning_candidate_mutations.discard(run_id)
 
     async def definitions(self, run: RunInput) -> tuple[ToolDefinition, ...]:
         names = await self._projected_tool_names(run)
@@ -443,6 +484,21 @@ class DataToolRuntime:
             or not capability.side_effecting
         ):
             raise ValueError("side-effect execution requires a write capability")
+        selected_candidate = self._selected_learning_candidates.get(run.id)
+        if selected_candidate is not None and not candidate_matches_mutation_call(
+            selected_candidate,
+            call,
+        ):
+            return (
+                _error(
+                    call,
+                    "candidate_mismatch",
+                    "This acceptance run may mutate only the explicitly selected "
+                    "candidate's exact target content.",
+                    {"candidate_id": selected_candidate.id},
+                ),
+                False,
+            )
         preflight = getattr(executor, "preflight", None)
         if not callable(preflight):
             raise ValueError("side-effecting executor must provide preflight")
@@ -552,6 +608,8 @@ class DataToolRuntime:
                 if isinstance(execution_error, asyncio.CancelledError):
                     raise execution_error
                 return _exception_result(call, execution_error), cancelled
+            if selected_candidate is not None:
+                self._successful_learning_candidate_mutations.add(run.id)
             output = self._registry.validate_output(capability.id, candidate)
             return _success(call, output), cancelled
 
@@ -1202,6 +1260,7 @@ class DataToolRuntime:
             not in {
                 CATALOG_SEARCH_CAPABILITY_ID,
                 CATALOG_SCHEMA_CAPABILITY_ID,
+                SEMANTIC_LIST_CAPABILITY_ID,
             }
             or arguments.get("source_id") is not None
         ):
@@ -1229,6 +1288,13 @@ class DataToolRuntime:
                     "requested_source_id": supplied_source_id,
                 },
             )
+        semantic_scope_error = await self._validate_semantic_source_scope(
+            run,
+            capability,
+            arguments,
+        )
+        if semantic_scope_error is not None:
+            return semantic_scope_error
         resource_ids: tuple[object, ...] = ()
         if capability.id == CATALOG_INSPECT_CAPABILITY_ID:
             resource_ids = (arguments.get("resource_id"),)
@@ -1255,6 +1321,67 @@ class DataToolRuntime:
                     "This run can only access resources from the selected source.",
                     {
                         "resource_id": resource_id,
+                        "selected_source_id": selected_source_id,
+                    },
+                )
+        return None
+
+    async def _validate_semantic_source_scope(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> tuple[str, str, Mapping[str, object]] | None:
+        selected_source_id = run.source_id
+        if selected_source_id is None or capability.id not in _SEMANTIC_CAPABILITIES:
+            return None
+        if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
+            subject = arguments.get("subject")
+            source_ids = (
+                subject.get("source_ids") if isinstance(subject, Mapping) else None
+            )
+            if source_ids != (selected_source_id,):
+                return (
+                    "source_scope_violation",
+                    "A semantic write must stay within the source selected by "
+                    "the user.",
+                    {"selected_source_id": selected_source_id},
+                )
+        referenced_ids: tuple[object, ...] = ()
+        if capability.id in {
+            SEMANTIC_VIEW_CAPABILITY_ID,
+            SEMANTIC_DELETE_CAPABILITY_ID,
+        }:
+            referenced_ids = (arguments.get("id"),)
+        elif capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
+            referenced_ids = (
+                arguments.get("id"),
+                arguments.get("supersedes_id"),
+            )
+        annotation_ids = tuple(item for item in referenced_ids if isinstance(item, str))
+        if not annotation_ids:
+            return None
+        if self._transcripts is None:
+            return (
+                "semantic_state_unavailable",
+                "Semantic source-scope validation is unavailable.",
+                {},
+            )
+        current = {
+            item.id: item
+            for item in await self._transcripts.list_semantic_annotations(run.agent_id)
+        }
+        for annotation_id in annotation_ids:
+            annotation = current.get(annotation_id)
+            if annotation is not None and annotation.subject.source_ids != (
+                selected_source_id,
+            ):
+                return (
+                    "source_scope_violation",
+                    "This run can only access semantic annotations from the "
+                    "source selected by the user.",
+                    {
+                        "annotation_id": annotation_id,
                         "selected_source_id": selected_source_id,
                     },
                 )
@@ -1329,6 +1456,12 @@ class DataToolRuntime:
     async def _projected_tool_names(self, run: RunInput) -> tuple[str, ...]:
         candidates: list[tuple[str, ToolApplicability]] = []
         required_flags: set[str] = set()
+        selected_candidate = self._selected_learning_candidates.get(run.id)
+        candidate_mutation_tool = (
+            None
+            if selected_candidate is None
+            else _learning_candidate_mutation_tool(selected_candidate)
+        )
         semantic_requested = _semantic_management_requested(run.message)
         if not semantic_requested:
             semantic_requested = await self._semantic_maintenance_requested(run)
@@ -1336,7 +1469,17 @@ class DataToolRuntime:
             view, capability = self._registry.resolve_tool(name)
             if capability.id not in _MVP_CAPABILITIES:
                 continue
-            if capability.id in _SEMANTIC_CAPABILITIES and not semantic_requested:
+            if (
+                candidate_mutation_tool is not None
+                and capability.side_effecting
+                and name != candidate_mutation_tool
+            ):
+                continue
+            if (
+                capability.id in _SEMANTIC_CAPABILITIES
+                and not semantic_requested
+                and name != candidate_mutation_tool
+            ):
                 continue
             candidates.append((name, view.applicability))
             required_flags.update(view.applicability.required_configuration_flags)
@@ -1390,6 +1533,29 @@ class DataToolRuntime:
             selected_resource_ids=selected_resource_ids,
             query=run.message,
         )
+
+
+def _learning_candidate_mutation_tool(candidate: LearningCandidate) -> str:
+    """Resolve one trusted candidate record to its sole eligible write tool."""
+
+    if candidate.target in {
+        LearningCandidateTarget.MEMORY,
+        LearningCandidateTarget.USER,
+    }:
+        return MEMORY_SET_TOOL_NAME
+    if candidate.target is LearningCandidateTarget.SKILL:
+        skill_content = cast(SkillCandidateContent, candidate.content)
+        return (
+            SKILL_DELETE_TOOL_NAME
+            if skill_content.action is LearningCandidateAction.DELETE
+            else SKILL_SAVE_TOOL_NAME
+        )
+    semantic_content = cast(SemanticCandidateContent, candidate.content)
+    return (
+        SEMANTIC_DELETE_TOOL_NAME
+        if semantic_content.action is LearningCandidateAction.DELETE
+        else SEMANTIC_SAVE_TOOL_NAME
+    )
 
 
 def _semantic_management_requested(message: str) -> bool:

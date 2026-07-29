@@ -72,6 +72,16 @@ def test_public_surface_is_focused():
         "ApprovalRequest",
         "ConversationRun",
         "CatalogSummary",
+        "DocumentCandidateContent",
+        "LearningCandidate",
+        "LearningCandidateAction",
+        "LearningCandidateError",
+        "LearningCandidateRejectionReason",
+        "LearningCandidateStatus",
+        "LearningCandidateTarget",
+        "LearningCandidateView",
+        "LearningReviewResult",
+        "LearningReviewStatus",
         "LocalDirectorySource",
         "LoopExit",
         "LoopExitKind",
@@ -92,7 +102,9 @@ def test_public_surface_is_focused():
         "SemanticKind",
         "SemanticSubject",
         "SemanticValidationError",
+        "SemanticCandidateContent",
         "Skill",
+        "SkillCandidateContent",
         "SkillSummary",
         "Transcript",
         "__version__",
@@ -333,7 +345,7 @@ def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners(
     assert "render_semantic_recall" in context
     assert "semantic_declarations(identity.id, store)" in embedded
     assert "mutation_lock=mutation_lock" in embedded
-    assert "/memory [edit|show <id>|delete <id>]" in terminal
+    assert "/memory [list|show <id>|edit [id]|accept <id>|" in terminal
     assert "/knowledge" not in _python_text(PACKAGE)
 
     expected = {
@@ -366,6 +378,7 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
     )
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
     evaluation = (PACKAGE / "evaluation.py").read_text(encoding="utf-8")
+    candidates = (PACKAGE / "learning_candidates.py").read_text(encoding="utf-8")
     package_text = _python_text(PACKAGE)
 
     assert _class_owners("AgentLoop") == {"loop/driver.py"}
@@ -380,6 +393,12 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
     assert "_semantic_maintenance_requested" in controller
     assert "capability.id in _SEMANTIC_CAPABILITIES" in controller
     assert "semantic_annotations" in storage
+    assert "CREATE TABLE IF NOT EXISTS learning_candidates" in storage
+    assert "tools=()" in candidates
+    assert "AgentLoop" not in candidates
+    assert "DataToolRuntime" not in candidates
+    assert "data_query_sqlite" not in candidates
+    assert "data_query_postgresql" not in candidates
     assert "evaluation" not in storage.lower()
     assert "telemetry" not in storage.lower()
     assert "from .storage" not in evaluation
@@ -395,7 +414,6 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
         "class SemanticExecutorKernel",
         "class TelemetryStore",
         "class VectorRetriever",
-        "CREATE TABLE learning_candidates",
         "CREATE TABLE telemetry",
         "/review-learning",
         "/knowledge",
@@ -899,6 +917,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
         }
 
         assert tables == {
+            "learning_candidates",
             "messages",
             "metadata",
             "runs",
@@ -908,6 +927,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "syncs",
         }
         assert columns == {
+            "learning_candidates": ("agent_id", "id", "data"),
             "messages": ("run_id", "position", "data"),
             "metadata": ("key", "data"),
             "runs": (

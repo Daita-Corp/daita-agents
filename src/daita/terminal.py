@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import getpass
 import io
 import json
@@ -37,6 +38,16 @@ from .agent import (
 )
 from .config import AgentConfig
 from .errors import ConfigError, LLMError
+from .learning_candidates import (
+    LEARNING_CANDIDATE_MAX_RECORDS,
+    LearningCandidateRejectionReason,
+    LearningCandidateStatus,
+    LearningCandidateView,
+    LearningReviewResult,
+    LearningReviewStatus,
+    learning_candidate_content_from_mapping,
+    learning_candidate_content_to_mapping,
+)
 from .security import KeychainStore
 from .skills import Skill, validate_skill_name
 from . import terminal_tui
@@ -253,6 +264,7 @@ _MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
 _MAX_SOURCE_PICKER_OPTIONS = 128
 _MAX_CATALOG_PREVIEW = 12
 _MAX_SOURCE_PREVIEW = 8
+_DEFAULT_CANDIDATE_REVIEW_COST_LIMIT_USD = Decimal("0.05")
 _SKILL_DESCRIPTION_PLACEHOLDER = "Describe when the agent should use this skill."
 _SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
 _BUILTIN_SLASH_COMMANDS = frozenset(
@@ -265,6 +277,7 @@ _BUILTIN_SLASH_COMMANDS = frozenset(
         "/memory",
         "/model",
         "/new",
+        "/review",
         "/resume",
         "/settings",
         "/source",
@@ -286,10 +299,20 @@ _SOURCE_READ_CAPABILITIES = {
 }
 
 
+def _validate_candidate_review_cost_limit(value: Decimal | None) -> None:
+    if value is not None and (
+        not isinstance(value, Decimal) or not value.is_finite() or value < 0
+    ):
+        raise ValueError(
+            "candidate review cost ceiling must be finite and non-negative"
+        )
+
+
 async def run_terminal_application(
     *,
     root: str | Path | None = None,
     agent_name: str | None = None,
+    reviewer_max_estimated_cost_usd: Decimal | None = None,
     input_stream: TextIO | None = None,
     output_stream: TextIO | None = None,
     hidden_input: Callable[[str], str] | None = None,
@@ -302,6 +325,7 @@ async def run_terminal_application(
 ) -> int:
     """Select one agent, derive readiness, and run integrated terminal chat."""
 
+    _validate_candidate_review_cost_limit(reviewer_max_estimated_cost_usd)
     input_stream = sys.stdin if input_stream is None else input_stream
     output_stream = sys.stdout if output_stream is None else output_stream
     assert input_stream is not None
@@ -364,6 +388,16 @@ async def run_terminal_application(
                 model_validator=model_validator,
                 approval_handler=approval_handler,
                 observer=observer_bridge,
+            )
+        if reviewer_max_estimated_cost_usd is not None:
+            agent = await _reopen_with_candidate_reviewer(
+                agent,
+                root=root,
+                keychain=keychain,
+                model_validator=model_validator,
+                approval_handler=approval_handler,
+                observer_bridge=observer_bridge,
+                max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
             )
         sources = tuple(
             source for source in await agent.list_sources() if source.active
@@ -458,6 +492,16 @@ async def run_terminal_application(
                 return 0
             if action == "model":
                 validated = True
+                if reviewer_max_estimated_cost_usd is not None:
+                    agent = await _reopen_with_candidate_reviewer(
+                        agent,
+                        root=root,
+                        keychain=keychain,
+                        model_validator=model_validator,
+                        approval_handler=approval_handler,
+                        observer_bridge=observer_bridge,
+                        max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
+                    )
             summary = await agent.catalog_summary()
             sources = tuple(
                 source for source in await agent.list_sources() if source.active
@@ -623,6 +667,34 @@ async def _create_agent(
             )
         except (AgentNameError, AgentAlreadyExistsError) as error:
             print(str(error), file=output_stream)
+
+
+async def _reopen_with_candidate_reviewer(
+    agent: Agent,
+    *,
+    root: str | Path | None,
+    keychain: KeychainStore | None,
+    model_validator: Any,
+    approval_handler: Any,
+    observer_bridge: terminal_tui.TerminalObserverBridge | None,
+    max_estimated_cost_usd: Decimal,
+) -> Agent:
+    """Reopen one selected agent with an explicitly enabled direct reviewer."""
+
+    route = agent.model_route
+    if route is None:
+        raise RuntimeError("candidate review requires a configured model route")
+    name = agent.name
+    await agent.close()
+    return await Agent.open(
+        name,
+        root=root,
+        keychain=keychain,
+        model_validator=model_validator,
+        reviewer_max_estimated_cost_usd=max_estimated_cost_usd,
+        approval_handler=approval_handler,
+        observer=observer_bridge,
+    )
 
 
 def _read_line(
@@ -1744,6 +1816,10 @@ def _command_uses_terminal_prompts(command: str) -> bool:
         return True
     if parts[0] in {"/memory", "/user"} and parts[1:] == ["edit"]:
         return True
+    if parts[0] == "/review" and len(parts) == 1:
+        return True
+    if parts[0] == "/memory" and len(parts) == 3 and parts[1] == "edit":
+        return True
     if parts[0] == "/skills" and parts[1:] == ["create"]:
         return True
     return (
@@ -2448,7 +2524,8 @@ def _write_chat_help(output_stream: TextIO) -> None:
         "/new",
         "/resume <id>",
         "/learn <material>",
-        "/memory [edit|show <id>|delete <id>]",
+        "/review [cost-usd]",
+        "/memory [list|show|edit|accept|reject <id>|clear-rejected]",
         "/user [edit]",
         "/skills [show|edit|delete <name>]",
         "/skills create [name]",
@@ -2516,6 +2593,85 @@ async def _prompt_for_exact_approval(
     return ApprovalDecision.DENY
 
 
+def _parse_candidate_review_cost_limit(value: str) -> Decimal:
+    try:
+        limit = Decimal(value)
+    except (InvalidOperation, ValueError):
+        raise ValueError(
+            "candidate review cost ceiling must be a finite non-negative decimal"
+        ) from None
+    _validate_candidate_review_cost_limit(limit)
+    return limit
+
+
+async def _review_learning_candidates_from_terminal(
+    agent: Agent,
+    *,
+    requested_cost_limit: str | None,
+    input_stream: TextIO,
+    output_stream: TextIO,
+) -> None:
+    if requested_cost_limit is None:
+        result = await agent.review_learning_candidates()
+        if result.status not in {
+            LearningReviewStatus.DISABLED,
+            LearningReviewStatus.COST_LIMIT_REQUIRED,
+        }:
+            _write_learning_review_result(result, output_stream)
+            return
+
+        print("Candidate review needs one-time authorization.", file=output_stream)
+        print(
+            "It can make one model call and only adds suggestions to your "
+            "review inbox; memory and skills do not change until you accept one.",
+            file=output_stream,
+        )
+        print(
+            "The limit is checked against the model's reported estimate after "
+            "the call; provider charges can still apply.",
+            file=output_stream,
+        )
+        while True:
+            try:
+                answer = _read_line(
+                    "Maximum accepted estimated cost in USD "
+                    f"[{_DEFAULT_CANDIDATE_REVIEW_COST_LIMIT_USD}] "
+                    "(or /cancel): ",
+                    input_stream,
+                    output_stream,
+                ).strip()
+            except EOFError:
+                print(file=output_stream)
+                print("Learning review cancelled.", file=output_stream)
+                return
+            if answer.lower() in {"/cancel", "cancel", "n", "no", "q", "quit"}:
+                print("Learning review cancelled.", file=output_stream)
+                return
+            try:
+                cost_limit = _parse_candidate_review_cost_limit(
+                    answer or str(_DEFAULT_CANDIDATE_REVIEW_COST_LIMIT_USD)
+                )
+            except ValueError:
+                print(
+                    "Enter a finite non-negative USD amount, or /cancel.",
+                    file=output_stream,
+                )
+                continue
+            break
+    else:
+        cost_limit = _parse_candidate_review_cost_limit(requested_cost_limit)
+
+    result = await agent.review_learning_candidates(
+        max_estimated_cost_usd=cost_limit,
+    )
+    _write_learning_review_result(result, output_stream)
+    if result.status is LearningReviewStatus.DISABLED:
+        print(
+            "Review is unavailable for this agent's current model configuration.",
+            file=output_stream,
+        )
+
+
 async def _handle_knowledge_command(
     parts: list[str],
     *,
@@ -2524,6 +2680,17 @@ async def _handle_knowledge_command(
     output_stream: TextIO,
 ) -> bool:
     name = parts[0] if parts else ""
+    if name == "/review":
+        if len(parts) not in {1, 2}:
+            print("Usage: /review [cost-usd]", file=output_stream)
+            return True
+        await _review_learning_candidates_from_terminal(
+            agent,
+            requested_cost_limit=parts[1] if len(parts) == 2 else None,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
+        return True
     if name in {"/memory", "/user"}:
         target = "memory" if name == "/memory" else "user"
         if len(parts) == 1:
@@ -2544,11 +2711,50 @@ async def _handle_knowledge_command(
                     ),
                     file=output_stream,
                 )
+        elif target == "memory" and parts[1:] == ["list"]:
+            _write_learning_candidate_list(
+                await agent.list_learning_candidates(),
+                output_stream,
+            )
         elif target == "memory" and len(parts) == 3 and parts[1] == "show":
-            view = await agent.read_semantic_annotation(parts[2])
-            if view is None:
-                raise ValueError(f"semantic annotation not found: {parts[2]}")
-            _write_semantic_view(view, output_stream)
+            candidate = await agent.read_learning_candidate(parts[2])
+            if candidate is not None:
+                _write_learning_candidate_view(candidate, output_stream)
+            else:
+                view = await agent.read_semantic_annotation(parts[2])
+                if view is None:
+                    raise ValueError(f"memory record not found: {parts[2]}")
+                _write_semantic_view(view, output_stream)
+        elif target == "memory" and len(parts) == 3 and parts[1] == "edit":
+            await _edit_learning_candidate(agent, parts[2])
+            print(f"Learning candidate {parts[2]!r} updated.", file=output_stream)
+        elif target == "memory" and len(parts) == 3 and parts[1] == "accept":
+            result = await agent.accept_learning_candidate(parts[2])
+            print("Candidate acceptance run:", file=output_stream)
+            print(
+                _render_model_answer(
+                    result.final_text,
+                    fallback=f"{result.kind.value}: {result.reason}",
+                ),
+                file=output_stream,
+            )
+        elif target == "memory" and len(parts) in {3, 4} and parts[1] == "reject":
+            reason = (
+                LearningCandidateRejectionReason.USER_DECLINED
+                if len(parts) == 3
+                else LearningCandidateRejectionReason(parts[3])
+            )
+            rejected = await agent.reject_learning_candidate(parts[2], reason)
+            print(
+                f"Learning candidate {rejected.candidate.id!r} rejected.",
+                file=output_stream,
+            )
+        elif target == "memory" and parts[1:] == ["clear-rejected"]:
+            cleared = await agent.clear_rejected_learning_candidates()
+            print(
+                f"Cleared {_count_label(cleared, 'rejected candidate', 'rejected candidates')}.",
+                file=output_stream,
+            )
         elif target == "memory" and len(parts) == 3 and parts[1] == "delete":
             view = await agent.read_semantic_annotation(parts[2])
             if view is None:
@@ -2580,7 +2786,8 @@ async def _handle_knowledge_command(
             print(f"{target.capitalize()} updated.", file=output_stream)
         else:
             usage = (
-                "/memory [edit|show <id>|delete <id>]"
+                "/memory [list|show <id>|edit [id]|accept <id>|"
+                "reject <id> [reason]|clear-rejected|delete <semantic-id>]"
                 if target == "memory"
                 else "/user [edit]"
             )
@@ -2709,6 +2916,35 @@ async def _write_memory_surface(
         ),
         file=output_stream,
     )
+    candidates = await agent.list_learning_candidates()
+    print(file=output_stream)
+    print("Pending candidates:", file=output_stream)
+    if not candidates:
+        print("  (none)", file=output_stream)
+    else:
+        counts = {
+            status: sum(item.status is status for item in candidates)
+            for status in LearningCandidateStatus
+        }
+        print(
+            "  "
+            + " · ".join(
+                f"{status.value}={counts[status]}"
+                for status in LearningCandidateStatus
+                if counts[status]
+            ),
+            file=output_stream,
+        )
+        for view in candidates[:12]:
+            print(
+                "  "
+                f"{_safe_display(view.candidate.id, fallback='candidate')} "
+                f"[{view.status.value}/{view.candidate.target.value}] "
+                f"{_learning_candidate_summary(view)}",
+                file=output_stream,
+            )
+        if len(candidates) > 12:
+            print(f"  +{len(candidates) - 12} more", file=output_stream)
     views = await agent.list_semantic_annotations()
     for heading, state in (
         ("Active data semantics", SemanticAnnotationState.ACTIVE),
@@ -2719,23 +2955,27 @@ async def _write_memory_surface(
     ):
         print(file=output_stream)
         print(f"{heading}:", file=output_stream)
-        selected = tuple(view for view in views if view.state is state)
+        selected = tuple(
+            semantic_view for semantic_view in views if semantic_view.state is state
+        )
         if not selected:
             print("  (none)", file=output_stream)
             continue
-        for view in selected:
-            annotation = view.annotation
+        for semantic_view in selected:
+            annotation = semantic_view.annotation
             detail = ""
-            if view.stale_reasons:
-                detail = " · " + ", ".join(view.stale_reasons)
-            elif view.conflicting_ids:
-                detail = " · conflicts with " + ", ".join(view.conflicting_ids)
-            elif view.duplicate_of_id is not None:
-                detail = " · duplicate of " + view.duplicate_of_id
-            elif view.duplicate_ids:
-                detail = " · duplicates collapsed: " + ", ".join(view.duplicate_ids)
-            elif view.superseded_by_id is not None:
-                detail = " · superseded by " + view.superseded_by_id
+            if semantic_view.stale_reasons:
+                detail = " · " + ", ".join(semantic_view.stale_reasons)
+            elif semantic_view.conflicting_ids:
+                detail = " · conflicts with " + ", ".join(semantic_view.conflicting_ids)
+            elif semantic_view.duplicate_of_id is not None:
+                detail = " · duplicate of " + semantic_view.duplicate_of_id
+            elif semantic_view.duplicate_ids:
+                detail = " · duplicates collapsed: " + ", ".join(
+                    semantic_view.duplicate_ids
+                )
+            elif semantic_view.superseded_by_id is not None:
+                detail = " · superseded by " + semantic_view.superseded_by_id
             print(
                 "  "
                 f"{_safe_display(annotation.id, fallback='annotation')} "
@@ -2744,6 +2984,122 @@ async def _write_memory_surface(
                 f"{detail}",
                 file=output_stream,
             )
+
+
+def _write_learning_candidate_list(
+    views: tuple[LearningCandidateView, ...],
+    output_stream: TextIO,
+) -> None:
+    print("Learning candidates", file=output_stream)
+    if not views:
+        print("  (none)", file=output_stream)
+        return
+    for view in views[:LEARNING_CANDIDATE_MAX_RECORDS]:
+        print(
+            "  "
+            f"{_safe_display(view.candidate.id, fallback='candidate')} "
+            f"[{view.status.value}/{view.candidate.target.value}] "
+            f"{_learning_candidate_summary(view)}",
+            file=output_stream,
+        )
+
+
+def _write_learning_candidate_view(
+    view: LearningCandidateView,
+    output_stream: TextIO,
+) -> None:
+    candidate = view.candidate
+    print(f"Learning candidate: {_safe_display(candidate.id)}", file=output_stream)
+    print(f"Status: {view.status.value}", file=output_stream)
+    print(f"Target: {candidate.target.value}", file=output_stream)
+    print(
+        "Source scope: "
+        + (
+            ", ".join(_safe_display(item) for item in candidate.source_ids)
+            if candidate.source_ids
+            else "(global)"
+        ),
+        file=output_stream,
+    )
+    print(
+        "Supporting runs: "
+        + ", ".join(_safe_display(item) for item in candidate.supporting_run_ids),
+        file=output_stream,
+    )
+    if view.obsolete_reasons:
+        print(
+            "Obsolete: "
+            + ", ".join(
+                _safe_display(item, maximum=256) for item in view.obsolete_reasons
+            ),
+            file=output_stream,
+        )
+    content = learning_candidate_content_to_mapping(candidate.content)
+    print("Proposed content:", file=output_stream)
+    print(
+        _safe_display(
+            json.dumps(content.to_dict(), indent=2, sort_keys=True),
+            fallback="(invalid)",
+            maximum=_MAX_DISPLAY_CHARACTERS,
+        ),
+        file=output_stream,
+    )
+
+
+def _write_learning_review_result(
+    result: LearningReviewResult,
+    output_stream: TextIO,
+) -> None:
+    print("Learning review", file=output_stream)
+    print(f"  Status: {result.status.value}", file=output_stream)
+    print(
+        f"  Reviewed runs: {len(result.reviewed_run_ids)}",
+        file=output_stream,
+    )
+    print(
+        f"  New candidates: {len(result.candidates)}",
+        file=output_stream,
+    )
+    print(f"  Model calls: {result.model_calls}", file=output_stream)
+    if result.skipped_run_count:
+        print(
+            f"  Skipped unreadable runs: {result.skipped_run_count}",
+            file=output_stream,
+        )
+    if result.candidates:
+        _write_learning_candidate_list(result.candidates, output_stream)
+
+
+async def _edit_learning_candidate(agent: Agent, candidate_id: str) -> None:
+    view = await agent.read_learning_candidate(candidate_id)
+    if view is None:
+        raise ValueError(f"learning candidate not found: {candidate_id}")
+    if view.status is not LearningCandidateStatus.AWAITING_REVIEW:
+        raise ValueError(f"learning candidate is not editable: {view.status.value}")
+    mapping = learning_candidate_content_to_mapping(view.candidate.content)
+    current = json.dumps(mapping.to_dict(), indent=2, sort_keys=True) + "\n"
+    edited = _edit_document(current, agent_home=agent.home)
+    try:
+        value = json.loads(edited)
+    except json.JSONDecodeError as error:
+        raise ValueError("edited candidate content must be valid JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError("edited candidate content must be one JSON object")
+    content = learning_candidate_content_from_mapping(
+        view.candidate.target,
+        value,
+    )
+    await agent.edit_learning_candidate(candidate_id, content)
+
+
+def _learning_candidate_summary(view: LearningCandidateView) -> str:
+    content = view.candidate.content
+    values = learning_candidate_content_to_mapping(content)
+    for key in ("text", "statement", "description", "name", "annotation_id"):
+        value = values.get(key)
+        if isinstance(value, str) and value:
+            return _safe_display(value, fallback="candidate", maximum=256)
+    return "(bounded proposal)"
 
 
 def _write_semantic_view(

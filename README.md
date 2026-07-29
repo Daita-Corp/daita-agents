@@ -259,6 +259,78 @@ call before continuing. A bare invocation loads the skill and asks what the
 user wants to do. The terminal never injects a skill body into the transcript
 or bypasses the existing trust, validation, or approval boundaries.
 
+### Optional learning-candidate review
+
+Candidate review is disabled by default. It runs only when a caller explicitly
+invokes `await agent.review_learning_candidates()` or `/review` and
+provides one-call or process-level cost authorization. Ordinary `Agent.run()`
+calls never start, wait for, or depend on candidate review, and Daita has no
+review scheduler, inactivity daemon, or retry worker.
+
+One review makes at most one tool-free model request outside `AgentLoop`. It
+uses one direct provider with no retry or fallback, receives bounded projections
+of at most eight completed runs and 40 messages, and can return at most four
+proposals. Projected transcript material is limited to 24,000 UTF-8 bytes; the
+whole request is limited to 60 seconds and 24,000 model tokens. The reviewer has
+no source clients, SQL tools, mutation tools, approval authority, or external
+side effects. Paid routes require an explicit finite non-negative estimated-cost
+ceiling. Invoking review can incur one provider charge; the ceiling is checked
+against the returned usage estimate and is not a prepaid billing guarantee.
+
+Each agent retains at most 64 candidate records in the state database.
+Candidates are bounded, inactive review records with stable record IDs,
+immutable review provenance, editable proposed content, exact supporting-run
+references, and an effective status of `awaiting_review`, `accepted`,
+`rejected`, or `obsolete`. They are untrusted and inactive: they do not enter
+ordinary context, alter memory or skills, establish semantic or catalog truth,
+select a source, expand a tool, or authorize a write.
+
+Review history is a best-effort advisory projection. A bounded historical run
+that cannot be decoded is preserved in storage, excluded from review input, and
+reported in `skipped_run_count`; it cannot suppress compatible newer runs or be
+misreported as a provider failure. If the bounded tail contains no readable
+runs, review returns `history_unavailable` without making a model call. Daita
+does not rewrite historical records or add a migration runtime for this
+unreleased state format.
+
+`/memory` displays the bounded inbox and status counts. The actions
+`/memory list`, `/memory show <id>`, `/memory edit <id>`,
+`/memory reject <id> [reason]`, and `/memory clear-rejected` operate on inactive
+records. `/memory accept <id>` handles exactly one candidate by starting a fresh
+ordinary foreground run. Only a matching mutation that passes current
+validation and the existing exact approval prompt marks that candidate
+accepted. Denial, model refusal, validation failure, changed catalog/artifact
+state, or interruption before execution leaves active knowledge unchanged. If
+cancellation arrives only after the exact mutation has definitely completed,
+Daita finalizes the candidate as accepted before propagating cancellation so
+active state and candidate status cannot split. There is no bulk acceptance.
+
+In the zero-argument terminal, `/review` asks for one-time cost
+authorization when review is disabled. Press Enter to use the displayed
+default, enter a different finite non-negative USD amount, or enter `/cancel`.
+The equivalent expert form is `/review 0.02`. Authorization applies
+only to that review and is not persisted. Review can make at most one model
+call and only adds inactive suggestions to the inbox; memory and skills still
+change only after explicit acceptance. The ceiling is checked against the
+model's reported estimate after the response, so provider charges can still
+apply when a result is rejected for exceeding it.
+
+To preauthorize manually triggered reviews for one terminal process and skip
+that prompt, set a cost ceiling before launch:
+
+```bash
+DAITA_CANDIDATE_REVIEW_MAX_COST_USD=0.05 daita
+```
+
+The terminal derives a bounded, direct, no-retry reviewer from the primary
+persisted model route. Candidate review is disabled by default, and Daita never
+runs it periodically or in the background. The public
+`Agent.review_learning_candidates(max_estimated_cost_usd=...)` method provides
+the same one-call authorization. `Agent.create()` and `Agent.open()` also offer
+host-controlled `reviewer_model`, `reviewer_profile`, and
+`reviewer_max_estimated_cost_usd` arguments; the reviewer profile must be
+explicitly bounded below the 24,000-token total review budget.
+
 ### Approval and observation
 
 ```python
@@ -289,12 +361,14 @@ writes, revalidates current state, and rejects stale approval with
 replacement starts, Daita waits for a definite outcome before propagating
 cancellation.
 
-Learning is only this visible foreground interaction: the model proposes
-`memory_set`, `semantic_save`, `semantic_delete`, `skill_save`, or
+Active learning is only this visible foreground interaction: the model
+proposes `memory_set`, `semantic_save`, `semantic_delete`, `skill_save`, or
 `skill_delete`; the caller reviews the exact frozen arguments; the existing
 tool runtime returns the approved mutation or error as a normal tool result;
-and the model continues. Daita performs no post-run review, auxiliary model
-call, curator, or background learning.
+and the model continues. Daita never performs implicit post-run review or
+background learning. The optional candidate reviewer described above is an
+explicit, synchronous, one-request operation that can create only inactive
+review material.
 
 Semantic maintenance is derived without mutation whenever current knowledge is
 read or recalled. Missing resources or fields, revision mismatches, conflicts,
@@ -358,7 +432,8 @@ daita --root /private/tmp/daita create atlas
 daita --root /private/tmp/daita attach atlas sqlite /absolute/path/sales.db
 daita --root /private/tmp/daita run atlas "Summarize sales" \
   --model openai:gpt-4.1-mini
-daita --root /private/tmp/daita chat atlas \
+DAITA_CANDIDATE_REVIEW_MAX_COST_USD=0.05 \
+  daita --root /private/tmp/daita chat atlas \
   --model openai:gpt-4.1-mini
 ```
 
@@ -413,6 +488,31 @@ stdin through EOF. File and stdin content is passed in full to the public
 `Agent` method: the CLI does not truncate, normalize, or bypass the existing
 bounds and validation.
 
+Candidate review and the inactive inbox use the same `memory` namespace:
+
+```bash
+daita --root /private/tmp/daita memory review atlas \
+  --model openai:gpt-4.1-mini \
+  --cost-limit 0.05
+daita --root /private/tmp/daita memory list-candidates atlas \
+  --status awaiting_review
+daita --root /private/tmp/daita memory show-candidate atlas <candidate-id>
+EDITOR='code --wait' \
+  daita --root /private/tmp/daita memory edit-candidate atlas <candidate-id>
+daita --root /private/tmp/daita memory accept-candidate atlas <candidate-id> \
+  --model openai:gpt-4.1-mini
+daita --root /private/tmp/daita memory reject-candidate atlas <candidate-id> \
+  --reason user_declined
+daita --root /private/tmp/daita memory clear-rejected atlas
+```
+
+`memory review` is the only command above that invokes the auxiliary reviewer;
+it always requires both an explicit direct model and an estimated-cost ceiling.
+Listing, showing, editing, rejecting, and clearing candidates are bounded local
+operations. `accept-candidate` handles one candidate through a fresh foreground
+model run and the normal exact approval prompt; it is not approval of a stored
+tool invocation.
+
 Skills use the same public API:
 
 ```bash
@@ -444,15 +544,19 @@ Group paid invoices by UTC month.
 `memory inspect` returns bounded global-memory and semantic-maintenance state,
 including stale, conflicting, duplicate, superseded, and revalidation fields.
 
-Interactive chat additionally provides `/memory`, `/memory edit`, `/user`,
+Interactive chat additionally provides `/review`, `/memory`, `/memory edit`,
+`/memory list`, `/memory show <id>`,
+`/memory edit <candidate-id>`, `/memory accept <candidate-id>`,
+`/memory reject <candidate-id> [reason]`, `/memory clear-rejected`, `/user`,
 `/user edit`, `/skills`, `/skills show <name>`, `/skills create [name]`,
 `/skills edit <name>`, `/skills delete <name>`,
 `/skills use <name> [request]`, and `/<skill-name> [request]`. Skill deletion
 asks for explicit confirmation and defaults to no. These direct caller actions
-invoke neither the model nor an approval callback. Skill invocations do enter
-the model transcript as ordinary user requests. Model-requested memory and
-skill side effects still use the exact, once-only, in-process approval prompt
-in `chat`; `run` installs no approval handler.
+invoke neither the model nor an approval callback except for explicit
+`/review` and individual candidate acceptance. Skill invocations do enter the
+model transcript as ordinary user requests. Model-requested memory and skill
+side effects still use the exact, once-only, in-process approval prompt in
+`chat`; `run` installs no approval handler.
 
 ## Development
 
