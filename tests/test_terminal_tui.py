@@ -12,8 +12,9 @@ from types import SimpleNamespace
 from typing import Any, cast, TextIO
 
 import pytest
-from prompt_toolkit.data_structures import Size
+from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.styles import Style
 
@@ -48,6 +49,8 @@ class _RecordingOutput(DummyOutput):
         self.alternate_exit_count = 0
         self.attribute_reset_count = 0
         self.autowrap_count = 0
+        self.mouse_enable_count = 0
+        self.mouse_disable_count = 0
         self.flush_count = 0
         self.size = Size(rows=30, columns=100)
         self.size_checks = 0
@@ -76,6 +79,12 @@ class _RecordingOutput(DummyOutput):
 
     def enable_autowrap(self) -> None:
         self.autowrap_count += 1
+
+    def enable_mouse_support(self) -> None:
+        self.mouse_enable_count += 1
+
+    def disable_mouse_support(self) -> None:
+        self.mouse_disable_count += 1
 
     def flush(self) -> None:
         self.flush_count += 1
@@ -472,7 +481,7 @@ async def test_full_screen_resize_repaints_without_leaving_alternate_screen():
     assert output.alternate_exit_count == 1
 
 
-async def test_full_screen_transcript_uses_page_keys_for_internal_scrolling():
+async def test_full_screen_transcript_uses_page_keys_and_mouse_wheel_for_scrolling():
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
     for index in range(50):
@@ -509,6 +518,8 @@ async def test_full_screen_transcript_uses_page_keys_for_internal_scrolling():
         content_window = application.layout.container.children[0].content.children[0]
         task = asyncio.create_task(terminal_tui._run_application(application))
         await _wait_until(lambda: output.alternate_enter_count == 1)
+        assert application.mouse_support() is True
+        assert output.mouse_enable_count == 1
 
         initial_content = content_window.content.create_content(98, None)
         initial_cursor_row = initial_content.cursor_position.y
@@ -524,8 +535,31 @@ async def test_full_screen_transcript_uses_page_keys_for_internal_scrolling():
         page_down_content = content_window.content.create_content(98, None)
         assert page_down_content.cursor_position.y == initial_cursor_row
 
+        scroll_up = MouseEvent(
+            position=Point(x=1, y=1),
+            event_type=MouseEventType.SCROLL_UP,
+            button=MouseButton.NONE,
+            modifiers=frozenset(),
+        )
+        assert content_window.content.mouse_handler(scroll_up) is None
+        mouse_up_content = content_window.content.create_content(98, None)
+        assert mouse_up_content.cursor_position.y == (
+            initial_cursor_row - terminal_tui._MOUSE_SCROLL_LINES
+        )
+
+        scroll_down = MouseEvent(
+            position=Point(x=1, y=1),
+            event_type=MouseEventType.SCROLL_DOWN,
+            button=MouseButton.NONE,
+            modifiers=frozenset(),
+        )
+        assert content_window.content.mouse_handler(scroll_down) is None
+        mouse_down_content = content_window.content.create_content(98, None)
+        assert mouse_down_content.cursor_position.y == initial_cursor_row
+
         pipe.send_text("\x04")
         await task
+        assert output.mouse_disable_count == 1
 
 
 async def test_terminal_controller_projects_themed_local_command_results(
@@ -1517,6 +1551,48 @@ async def test_text_turn_multiline_composer_and_green_shell_render():
     assert output.alternate_exit_count == 1
 
 
+def test_conversation_display_preserves_complete_messages_and_wraps_user_text():
+    runtime = terminal_tui._load_terminal_runtime()
+    capabilities = terminal_tui.TerminalCapabilities("none", True)
+    user_message = "USER_START_" + ("x" * 20_000) + "_USER_END"
+    answer = "ASSISTANT_START\n" + ("y" * 20_000) + "\nASSISTANT_END"
+    state = TerminalViewState("atlas", "model", "source")
+
+    state.append_user(user_message)
+    state.apply_result(_result(answer))
+
+    assert state.blocks[0].text == user_message
+    assert state.blocks[-1].text == answer
+
+    user_rendered = "".join(
+        text
+        for _style, text in terminal_tui._render_user_message_fragments(
+            runtime,
+            state.blocks[0].text,
+            width=40,
+            capabilities=capabilities,
+        )
+    )
+    user_lines = user_rendered.splitlines()
+    assert user_lines
+    assert all(terminal_tui._display_width(line) <= 40 for line in user_lines)
+    assert "".join(line[1:] for line in user_lines) == user_message
+
+    transcript = "".join(
+        text
+        for _style, text in terminal_tui._render_transcript_fragments(
+            runtime,
+            state,
+            width=40,
+            capabilities=capabilities,
+        )
+    )
+    assert "USER_START_" in transcript
+    assert "_USER_END" in transcript
+    assert "ASSISTANT_START" in transcript
+    assert "ASSISTANT_END" in transcript
+
+
 def test_green_identity_focus_theme_uses_semantic_styles(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -2048,7 +2124,7 @@ async def test_bracketed_paste_uses_live_row_width_and_numbered_placeholders():
         pipe.send_text("\r")
         await _wait_until(lambda: len(submitted) == 1 and not state.running)
         assert submitted == [f"{first_paste} second\npaste"]
-        assert state.blocks[0].text == display_message
+        assert state.blocks[0].text == submitted[0]
 
         pipe.send_text("\x1b[A")
         await _wait_until(lambda: application.current_buffer.text == display_message)
@@ -2061,6 +2137,7 @@ async def test_bracketed_paste_uses_live_row_width_and_numbered_placeholders():
         f"{first_paste} second\npaste",
         f"{first_paste} second\npaste",
     ]
+    assert [block.text for block in state.blocks if block.kind == "user"] == submitted
 
 
 async def test_hidden_paste_preserves_the_existing_message_bound():

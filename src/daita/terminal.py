@@ -1839,6 +1839,7 @@ async def _chat(
                 _render_model_answer(
                     result.final_text,
                     fallback="(empty response)",
+                    maximum=None,
                 ),
                 file=output_stream,
             )
@@ -3834,7 +3835,7 @@ def _render_model_answer(
     value: object,
     *,
     fallback: str = "(empty response)",
-    maximum: int = _MAX_DISPLAY_CHARACTERS,
+    maximum: int | None = _MAX_DISPLAY_CHARACTERS,
 ) -> str:
     if not isinstance(value, str):
         return fallback
@@ -3850,7 +3851,7 @@ def _render_model_answer(
         )
         for character in value
     )
-    if len(projected) > maximum:
+    if maximum is not None and len(projected) > maximum:
         projected = projected[: max(0, maximum - 3)] + "..."
     return projected or fallback
 

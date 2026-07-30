@@ -259,6 +259,14 @@ async def test_model_answers_preserve_lines_and_neutralize_terminal_controls(
     assert "ANSI ?[2J OSC ?]0;unsafe? rewrite?hidden bidi?" in text
 
 
+def test_plain_terminal_model_answer_is_not_silently_truncated():
+    answer = "ANSWER_START\n" + ("x" * 20_000) + "\nANSWER_END"
+
+    rendered = terminal._render_model_answer(answer, maximum=None)
+
+    assert rendered == answer
+
+
 async def test_exact_approval_json_is_complete_reversible_and_terminal_safe():
     prefix = 'Quoted "line"\ncontrols:\x1b[2J\x00\u202e'
     instructions = prefix + "x" * (12_000 - len(prefix))

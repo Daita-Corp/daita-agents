@@ -26,6 +26,7 @@ from .observation import AgentEvent, AgentEventKind
 MAX_COMPOSER_CHARACTERS = 16_384
 MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
 _MAX_COMPOSER_ROWS = 6
+_MOUSE_SCROLL_LINES = 3
 _MAX_RENDER_CHARACTERS = 16_384
 _MAX_DETAIL_UTF8_BYTES = 16 * 1_024
 _MAX_CODE_VISIBLE_LINES = 80
@@ -436,10 +437,16 @@ class TerminalViewState:
     tool_cards: dict[str, ToolCardState] = field(default_factory=dict)
     approval_panel: ApprovalPanelState | None = None
 
-    def append_plain(self, kind: str, value: object) -> None:
+    def append_plain(
+        self,
+        kind: str,
+        value: object,
+        *,
+        maximum: int | None = _MAX_RENDER_CHARACTERS,
+    ) -> None:
         safe = _sanitize_terminal_text(
             value,
-            maximum=_MAX_RENDER_CHARACTERS,
+            maximum=maximum,
             preserve_lines=True,
             fallback="",
         )
@@ -447,7 +454,7 @@ class TerminalViewState:
             self.blocks.append(TerminalBlock(kind, safe))
 
     def append_user(self, message: str) -> None:
-        self.append_plain("user", message)
+        self.append_plain("user", message, maximum=None)
 
     def append_local(self, presentation: str, value: object) -> None:
         kind = (
@@ -472,7 +479,7 @@ class TerminalViewState:
         if final_text is not None:
             safe_answer = _sanitize_terminal_text(
                 final_text,
-                maximum=_MAX_RENDER_CHARACTERS,
+                maximum=None,
                 preserve_lines=True,
                 fallback="(empty response)",
             )
@@ -1575,6 +1582,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
         )
         from prompt_toolkit.layout.controls import FormattedTextControl
         from prompt_toolkit.layout.dimension import Dimension
+        from prompt_toolkit.mouse_events import MouseEventType
         from prompt_toolkit.output import create_output
         from prompt_toolkit.styles import Style
         from prompt_toolkit.widgets import Frame, TextArea
@@ -1607,6 +1615,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
         "Keys": Keys,
         "Layout": Layout,
         "Markdown": Markdown,
+        "MouseEventType": MouseEventType,
         "Point": Point,
         "CompleteEvent": CompleteEvent,
         "Completion": Completion,
@@ -2132,7 +2141,7 @@ def _create_application(
         composer.buffer.reset(append_to_history=True)
         pasted_texts = {}
         next_paste_number = 1
-        state.append_user(display_message)
+        state.append_user(message)
         if display_message.startswith("/"):
             start_task(event.app, execute_command(event.app, message))
             return
@@ -2243,30 +2252,29 @@ def _create_application(
             )
         )
 
+    def scroll_transcript(lines: int) -> None:
+        nonlocal transcript_scroll_offset
+        transcript_scroll_offset = min(
+            max(0, content_line_count - 1),
+            max(0, transcript_scroll_offset + lines),
+        )
+
     @keys.add("pageup", eager=True)
     def page_up(event: Any) -> None:
-        nonlocal transcript_scroll_offset
         panel = state.approval_panel
         if panel is not None:
             panel.move(-max(1, _viewport_height(approval_window)))
         else:
-            transcript_scroll_offset = min(
-                max(0, content_line_count - 1),
-                transcript_scroll_offset + _viewport_height(content_window),
-            )
+            scroll_transcript(_viewport_height(content_window))
         invalidate(event.app)
 
     @keys.add("pagedown", eager=True)
     def page_down(event: Any) -> None:
-        nonlocal transcript_scroll_offset
         panel = state.approval_panel
         if panel is not None:
             panel.move(max(1, _viewport_height(approval_window)))
         else:
-            transcript_scroll_offset = max(
-                0,
-                transcript_scroll_offset - _viewport_height(content_window),
-            )
+            scroll_transcript(-_viewport_height(content_window))
         invalidate(event.app)
 
     @keys.add("c-o", eager=True)
@@ -2663,13 +2671,26 @@ def _create_application(
             y=max(0, content_line_count - 1 - transcript_scroll_offset),
         )
 
+    def transcript_mouse_handler(mouse_event: Any) -> Any:
+        event_type = mouse_event.event_type
+        if event_type == runtime["MouseEventType"].SCROLL_UP:
+            scroll_transcript(_MOUSE_SCROLL_LINES)
+        elif event_type == runtime["MouseEventType"].SCROLL_DOWN:
+            scroll_transcript(-_MOUSE_SCROLL_LINES)
+        else:
+            return NotImplemented
+        invalidate(application)
+        return None
+
+    content_control = runtime["FormattedTextControl"](
+        shell_content_fragments,
+        focusable=False,
+        show_cursor=False,
+        get_cursor_position=shell_content_cursor,
+    )
+    content_control.mouse_handler = transcript_mouse_handler
     content_window = runtime["Window"](
-        runtime["FormattedTextControl"](
-            shell_content_fragments,
-            focusable=False,
-            show_cursor=False,
-            get_cursor_position=shell_content_cursor,
-        ),
+        content_control,
         wrap_lines=False,
         always_hide_cursor=True,
         height=runtime["Dimension"](weight=1),
@@ -2714,7 +2735,7 @@ def _create_application(
         key_bindings=keys,
         full_screen=True,
         erase_when_done=True,
-        mouse_support=False,
+        mouse_support=True,
         input=enhanced_input,
         output=enhanced_output,
         style=semantic_style,
@@ -3683,12 +3704,16 @@ def _render_transcript_fragments(
     fragments: list[tuple[str, str]] = [("", "\n")]
     for block in state.blocks:
         if block.kind == "user":
+            fragments.append(("class:tui.user.label", " You\n"))
             fragments.extend(
-                [
-                    ("class:tui.user.label", " You\n"),
-                    ("", f" {block.text}\n\n"),
-                ]
+                _render_user_message_fragments(
+                    runtime,
+                    block.text,
+                    width=width,
+                    capabilities=capabilities,
+                )
             )
+            fragments.append(("", "\n"))
         elif block.kind == "assistant":
             fragments.append(("class:tui.assistant.label", " Daita\n"))
             fragments.extend(
@@ -4261,6 +4286,33 @@ def _render_rich_fragment_lines(
     return lines
 
 
+def _render_user_message_fragments(
+    runtime: dict[str, Any],
+    value: object,
+    *,
+    width: int,
+    capabilities: TerminalCapabilities,
+) -> list[tuple[str, str]]:
+    safe = _sanitize_terminal_text(
+        value,
+        maximum=None,
+        preserve_lines=True,
+        fallback="(empty message)",
+    )
+    lines = _render_rich_fragment_lines(
+        runtime,
+        runtime["Text"](safe),
+        width=max(1, width - 1),
+        capabilities=capabilities,
+    )
+    fragments: list[tuple[str, str]] = []
+    for line in lines:
+        fragments.append(("", " "))
+        fragments.extend(line)
+        fragments.append(("", "\n"))
+    return fragments
+
+
 def _render_markdown_fragments(
     runtime: dict[str, Any],
     value: object,
@@ -4290,7 +4342,7 @@ def _render_markdown_ansi(
 ) -> str:
     safe = _sanitize_terminal_text(
         value,
-        maximum=_MAX_RENDER_CHARACTERS,
+        maximum=None,
         preserve_lines=True,
         fallback="(empty response)",
     )
@@ -4326,7 +4378,7 @@ def _render_markdown_text(value: object, *, width: int = 80) -> str:
     target = io.StringIO()
     safe = _sanitize_terminal_text(
         value,
-        maximum=_MAX_RENDER_CHARACTERS,
+        maximum=None,
         preserve_lines=True,
         fallback="(empty response)",
     )
@@ -4744,7 +4796,7 @@ def _clear_current_task_cancellation() -> None:
 def _sanitize_terminal_text(
     value: object,
     *,
-    maximum: int,
+    maximum: int | None,
     preserve_lines: bool,
     fallback: str,
 ) -> str:
@@ -4769,7 +4821,7 @@ def _sanitize_terminal_text(
         else:
             projected.append("?")
     rendered = "".join(projected)
-    if len(rendered) > maximum:
+    if maximum is not None and len(rendered) > maximum:
         rendered = rendered[: max(0, maximum - 3)] + "..."
     return rendered or fallback
 
