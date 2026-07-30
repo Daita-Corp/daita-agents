@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "A transcript driven data agent"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "Apache-2.0"
+license = "MIT"
 authors = [{name = "Daita", email = "support@daita-tech.io"}]
 classifiers = [
     "Development Status :: 4 - Beta",

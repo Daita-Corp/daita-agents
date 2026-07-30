@@ -170,4 +170,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
 
 ## License
 
-[Apache 2.0](LICENSE)
+[MIT](LICENSE)
