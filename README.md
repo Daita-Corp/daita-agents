@@ -163,11 +163,37 @@ PYTHONPATH=src .venv/bin/python examples/00_quickstart_sqlite_from_db.py
 
 ## Upgrade or uninstall
 
+Close every running Daita terminal before upgrading:
+
 ```bash
 pipx upgrade daita-agents
 pipx reinstall daita-agents
 pipx uninstall daita-agents
 ```
+
+Version 1.0.0 establishes the first supported agent home format. Beginning with
+the next release, every release candidate must open and preserve agent homes
+created by the immediately preceding release. An upgrade preserves agent
+identity, model configuration, source registrations and catalogs,
+conversations, approved memory and user profile, semantics, learning
+candidates, and skills. It never silently resets incompatible state.
+
+Before changing versions, an optional complete local backup can be made while
+Daita is closed:
+
+```bash
+cp -a ~/.daita ~/.daita-backup-before-upgrade
+```
+
+The backup contains the agent homes but not secret values held by the OS
+keychain. Those keychain entries remain installed and are referenced by the
+backed-up configuration.
+
+If an installed release cannot admit an existing state database, it exits
+before writing to that database and reports that the agent home was preserved.
+Restore the complete backup before installing an older version; opening a home
+with an older release after a newer release has changed its format is not a
+supported downgrade path.
 
 Use `pipx reinstall daita-agents` to repair missing or damaged application
 dependencies. Uninstalling the application does not delete existing agent

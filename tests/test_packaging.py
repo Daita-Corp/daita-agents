@@ -32,6 +32,7 @@ def _project_metadata() -> dict[str, Any]:
 def test_default_distribution_contains_every_supported_production_dependency():
     project = _project_metadata()
 
+    assert project["version"] == "1.0.0"
     assert set(project["dependencies"]) == {
         "anthropic>=0.116.0",
         "asyncpg>=0.30.0",
@@ -55,6 +56,11 @@ def test_customer_and_fixture_documentation_use_the_complete_pipx_install():
     assert "pipx upgrade daita-agents" in readme
     assert PIPX_REPAIR in readme
     assert "pipx uninstall daita-agents" in readme
+    assert "Version 1.0.0 establishes the first supported agent home format" in readme
+    assert "immediately preceding release" in readme
+    assert "agent home was preserved" in readme
+    assert "supported downgrade path" in readme
+    assert "cp -a ~/.daita ~/.daita-backup-before-upgrade" in readme
     assert "\ndaita\n" in readme
     assert "## Advanced/headless CLI" in readme
     assert "pipx install daita-agents" in fixture
@@ -88,11 +94,23 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     assert "pipx install" in smoke
     assert "pipx reinstall" in smoke
     assert "pipx uninstall" in smoke
+    assert "--baseline-wheel" in smoke
+    assert "--candidate-wheel" in smoke
+    assert "cross-version smoke requires distinct baseline" in smoke
+    assert "candidate wheels" in smoke
+    assert "force-installs the candidate" in smoke
     assert '"create",' in smoke
     assert '"preservation-agent"' in smoke
     assert '"agent.toml"' in smoke
     assert '"state.db"' in smoke
+    assert '"config.json"' in smoke
+    assert '"MEMORY.md"' in smoke
+    assert '"USER.md"' in smoke
+    assert '"SKILL.md"' in smoke
     assert "_sha256" in smoke
+    assert "_home_hashes" in smoke
+    assert "candidate_projection != baseline_projection" in smoke
+    assert '"Append after upgrade."' in smoke
     assert "pipx upgrade daita-agents" not in smoke
     assert "pip install" not in smoke
     assert "twine" not in smoke

@@ -102,6 +102,64 @@ _SEARCH_TERM = re.compile(r"[A-Za-z0-9_]+")
 _ACTIVE_SOURCE_KEY_PREFIX = "active_source:"
 _LEARNING_REVIEW_STAMPS_KEY_PREFIX = "learning_review_stamps:"
 _T = TypeVar("_T")
+_V1_TABLE_DEFINITIONS = {
+    "learning_candidates": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "messages": (
+        ("run_id", "TEXT", 1, None, 1),
+        ("position", "INTEGER", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "metadata": (
+        ("key", "TEXT", 0, None, 1),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "runs": (
+        ("id", "TEXT", 0, None, 1),
+        ("agent_id", "TEXT", 1, None, 0),
+        ("conversation_id", "TEXT", 1, None, 0),
+        ("turn_index", "INTEGER", 1, None, 0),
+        ("input", "TEXT", 1, None, 0),
+        ("result", "TEXT", 0, None, 0),
+    ),
+    "semantic_annotations": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "snapshots": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("source_id", "TEXT", 1, None, 2),
+        ("sync_id", "TEXT", 1, None, 0),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "sources": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "syncs": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("source_id", "TEXT", 1, None, 0),
+        ("data", "TEXT", 1, None, 0),
+    ),
+}
+_V1_MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
+_V1_NAMED_INDEXES = {
+    "runs_conversation_turn": (
+        "runs",
+        True,
+        ("agent_id", "conversation_id", "turn_index"),
+    )
+}
+_INCOMPATIBLE_STATE_MESSAGE = (
+    "state database is not compatible with this Daita release; "
+    "the agent home was preserved"
+)
 
 
 def _active_source_key(agent_id: str) -> str:
@@ -141,7 +199,7 @@ class _CatalogCommitGate:
 
 
 class SQLiteStateStore:
-    """One deliberately non-versioned persistence boundary for embedded MVP use."""
+    """One fixed-format persistence boundary for the launched v1 agent home."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -2097,6 +2155,9 @@ async def _run_candidate_transaction(
 
 def _initialize(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        _validate_existing_state(path)
+        return
     with _connect(path) as connection:
         connection.executescript("""
             CREATE TABLE IF NOT EXISTS metadata (
@@ -2150,29 +2211,98 @@ def _initialize(path: Path) -> None:
                 PRIMARY KEY(agent_id, id)
             );
             """)
-        run_columns = tuple(
-            row[1] for row in connection.execute("PRAGMA table_info(runs)")
-        )
-        expected_run_columns = (
-            "id",
-            "agent_id",
-            "conversation_id",
-            "turn_index",
-            "input",
-            "result",
-        )
-        if run_columns != expected_run_columns:
-            raise RuntimeError(
-                "state database uses a pre-conversation MVP schema; "
-                "create a fresh agent home"
-            )
         connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS runs_conversation_turn
                ON runs(agent_id, conversation_id, turn_index)""")
+
+
+def _validate_existing_state(path: Path) -> None:
+    try:
+        with _connect_read_only(path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            if tables != set(_V1_TABLE_DEFINITIONS):
+                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+            for table, expected in _V1_TABLE_DEFINITIONS.items():
+                actual = tuple(
+                    (row[1], str(row[2]).upper(), row[3], row[4], row[5])
+                    for row in connection.execute(f"PRAGMA table_info({table})")
+                )
+                if actual != expected:
+                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+
+            messages_foreign_keys = tuple(
+                (row[2], row[3], row[4], row[5], row[6], row[7])
+                for row in connection.execute("PRAGMA foreign_key_list(messages)")
+            )
+            if messages_foreign_keys != _V1_MESSAGES_FOREIGN_KEYS:
+                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+            for table in set(_V1_TABLE_DEFINITIONS) - {"messages"}:
+                if tuple(connection.execute(f"PRAGMA foreign_key_list({table})")):
+                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+
+            named_indexes = {
+                row[0]: row[1]
+                for row in connection.execute(
+                    "SELECT name, tbl_name FROM sqlite_master "
+                    "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            if named_indexes != {
+                name: definition[0] for name, definition in _V1_NAMED_INDEXES.items()
+            }:
+                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+            for name, (
+                table,
+                expected_unique,
+                expected_columns,
+            ) in _V1_NAMED_INDEXES.items():
+                indexes = {
+                    row[1]: bool(row[2])
+                    for row in connection.execute(f"PRAGMA index_list({table})")
+                    if not str(row[1]).startswith("sqlite_autoindex")
+                }
+                if indexes != {name: expected_unique}:
+                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+                columns = tuple(
+                    row[2] for row in connection.execute(f"PRAGMA index_info({name})")
+                )
+                if columns != expected_columns:
+                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+
+            extra_objects = tuple(
+                connection.execute(
+                    "SELECT type, name FROM sqlite_master "
+                    "WHERE type IN ('trigger', 'view') "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+            )
+            if extra_objects:
+                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+    except RuntimeError:
+        raise
+    except (OSError, sqlite3.Error):
+        raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE) from None
 
 
 def _connect(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=30)
     connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def _connect_read_only(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        path.as_uri() + "?mode=ro",
+        timeout=30,
+        uri=True,
+    )
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA query_only = ON")
     return connection
 
 
