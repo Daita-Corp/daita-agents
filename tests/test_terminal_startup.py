@@ -29,7 +29,7 @@ def _startup_state(
         model_label=model,
         source_summary="2 sources",
         startup=terminal_tui.TerminalStartupInfo(
-            version="2.0.0a0",
+            version="1.0.0",
             provider_label="OpenAI",
             model_status="configured",
             agent_home=home,
@@ -88,7 +88,7 @@ def test_startup_ascii_and_no_color_modes_preserve_semantic_information():
         capabilities=terminal_tui.TerminalCapabilities("none", True),
     )
 
-    assert "DAITA  2.0.0a0" in ascii_rendered
+    assert "DAITA  1.0.0" in ascii_rendered
     assert "+-" in ascii_rendered
     assert "| Status" in ascii_rendered
     assert "OK Ready" in ascii_rendered
@@ -180,7 +180,7 @@ state = terminal_tui.TerminalViewState(
     "model",
     "source",
     startup=terminal_tui.TerminalStartupInfo(
-        "2.0.0a0",
+        "1.0.0",
         "provider",
         "configured",
         "/tmp/atlas",

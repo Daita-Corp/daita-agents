@@ -128,6 +128,8 @@ async def _run_shell(
     command_requires_suspension: Any = None,
     skill_completions: tuple[tuple[str, str], ...] = (),
     load_skill_completions: Any = None,
+    source_completions: tuple[tuple[str, str, str], ...] = (),
+    load_source_completions: Any = None,
 ) -> asyncio.Task[TerminalApplicationResult]:
     async def no_commands(
         command: str,
@@ -144,6 +146,8 @@ async def _run_shell(
             command_requires_suspension=command_requires_suspension,
             skill_completions=skill_completions,
             load_skill_completions=load_skill_completions,
+            source_completions=source_completions,
+            load_source_completions=load_source_completions,
             input_stream=io.StringIO(),
             output_stream=io.StringIO(),
             suspend_bridge=suspend_bridge or TerminalSuspendBridge(),
@@ -290,7 +294,7 @@ async def test_ready_tui_emits_startup_before_any_transcript_blocks():
         "gpt-5.6-sol",
         "Warehouse",
         startup=terminal_tui.TerminalStartupInfo(
-            version="2.0.0a0",
+            version="1.0.0",
             provider_label="OpenAI",
             model_status="configured",
             agent_home="/tmp/daita/atlas",
@@ -335,7 +339,7 @@ def test_ready_tui_reflows_live_startup_when_terminal_width_changes():
         "gpt-5.6-sol",
         "Warehouse",
         startup=terminal_tui.TerminalStartupInfo(
-            version="2.0.0a0",
+            version="1.0.0",
             provider_label="OpenAI",
             model_status="configured",
             agent_home="/tmp/daita/agents/atlas",
@@ -391,7 +395,7 @@ def test_ready_tui_reflows_live_startup_when_terminal_width_changes():
         output.size = Size(rows=30, columns=60)
         application.before_render.fire()
         narrow = rendered_startup()
-        assert "DAITA  2.0.0a0" in narrow
+        assert "DAITA  1.0.0" in narrow
         assert "████▄" not in narrow
         assert (
             max(terminal_tui._display_width(line) for line in narrow.splitlines()) <= 60
@@ -414,7 +418,7 @@ async def test_full_screen_resize_repaints_without_leaving_alternate_screen():
         "gpt-5.6-sol",
         "Warehouse",
         startup=terminal_tui.TerminalStartupInfo(
-            version="2.0.0a0",
+            version="1.0.0",
             provider_label="OpenAI",
             model_status="configured",
             agent_home="/tmp/daita/agents/atlas",
@@ -627,7 +631,7 @@ def test_terminal_controller_injects_one_named_bridge_at_every_agent_path():
         and node.func.attr in {"create", "open"}
     ]
 
-    assert len(construction_calls) == 6
+    assert len(construction_calls) == 7
     for call in construction_calls:
         observer = next(
             (keyword.value for keyword in call.keywords if keyword.arg == "observer"),
@@ -3069,10 +3073,12 @@ async def test_slash_completion_covers_the_documented_surface_and_remains_local(
         "/source use <name>",
         "/source add",
         "/source refresh <id>",
+        "/source detach <source>",
         "/catalog",
         "/settings",
         "/new",
         "/resume <id>",
+        "/conversation clear",
         "/learn <material>",
         "/review [cost-usd]",
         "/memory",
@@ -3082,6 +3088,7 @@ async def test_slash_completion_covers_the_documented_surface_and_remains_local(
         "/skills use <name> [request]",
         "/status",
         "/conversation",
+        "/agent delete",
         "/help",
         "/exit",
     )
@@ -3142,6 +3149,23 @@ def test_dynamic_skill_completion_adds_alias_and_preserves_builtin_priority():
     assert "/status " not in display
 
 
+def test_source_completion_uses_friendly_quoted_one_run_selector():
+    source = SimpleNamespace(
+        id="source:sha256:" + ("a" * 64),
+        display_name='Revenue "FY26"',
+        adapter_id="postgresql",
+        active=True,
+    )
+
+    assert terminal._source_override_completions((source,)) == (
+        (
+            '@"Revenue \\"FY26\\"" ',
+            '@Revenue "FY26"',
+            "Ask one question using PostgreSQL",
+        ),
+    )
+
+
 async def test_skill_completion_refreshes_after_a_local_skill_mutation():
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
@@ -3189,6 +3213,134 @@ async def test_skill_completion_refreshes_after_a_local_skill_mutation():
 
     assert commands == ["/skills", "/customer-health-investigation"]
     assert result.action == "exit"
+
+
+async def test_at_dropdown_opens_filters_and_inserts_one_run_source_selector(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "First source")
+    messages: list[str] = []
+    applications: list[Any] = []
+    original_create_application = terminal_tui._create_application
+
+    def capture_application(*args: Any, **kwargs: Any) -> Any:
+        created = original_create_application(*args, **kwargs)
+        applications.append(created[0])
+        return created
+
+    monkeypatch.setattr(
+        terminal_tui,
+        "_create_application",
+        capture_application,
+    )
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        messages.append(message)
+        return _result("Override complete.")
+
+    def completion_state() -> Any:
+        if not applications:
+            return None
+        return applications[0].current_buffer.complete_state
+
+    source_completions = (
+        (
+            '@"First source" ',
+            "@First source",
+            "Ask one question using SQLite",
+        ),
+        (
+            '@"Second source" ',
+            "@Second source",
+            "Ask one question using PostgreSQL",
+        ),
+    )
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            source_completions=source_completions,
+        )
+        pipe.send_text("@")
+        await _wait_until(
+            lambda: completion_state() is not None
+            and len(completion_state().completions) == 2
+        )
+        assert all(
+            completion.display_meta_text
+            for completion in completion_state().completions
+        )
+
+        pipe.send_text("sec")
+        await _wait_until(
+            lambda: completion_state() is not None
+            and [completion.text for completion in completion_state().completions]
+            == ['@"Second source" ']
+        )
+        await _wait_until(lambda: "Ask one question using PostgreSQL" in output.text)
+        pipe.send_text("\t")
+        await _wait_until(
+            lambda: applications[0].current_buffer.text == '@"Second source" '
+        )
+        pipe.send_text("show recent orders\r")
+        await _wait_until(lambda: messages == ['@"Second source" show recent orders'])
+        pipe.send_text("\x04")
+        await task
+
+    assert state.source_summary == "First source"
+
+
+async def test_source_completion_refreshes_after_a_local_source_mutation():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "First source")
+    commands: list[str] = []
+    messages: list[str] = []
+    sources: list[tuple[str, str, str]] = []
+    refreshes = 0
+
+    async def load_source_completions() -> tuple[tuple[str, str, str], ...]:
+        nonlocal refreshes
+        refreshes += 1
+        return tuple(sources)
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        messages.append(message)
+        return _result("Override complete.")
+
+    async def handle_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        commands.append(command)
+        sources.append(
+            (
+                '@"Second source" ',
+                "@Second source",
+                "Ask one question using SQLite",
+            )
+        )
+        return TerminalCommandResult(conversation_id, output="Source added.\n")
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            handle_command=handle_command,
+            load_source_completions=load_source_completions,
+        )
+        pipe.send_text("/sources\r")
+        await _wait_until(lambda: commands == ["/sources"] and refreshes >= 1)
+        pipe.send_text("@sec\tquestion\r")
+        await _wait_until(lambda: bool(messages))
+        pipe.send_text("\x04")
+        await task
+
+    assert messages == ['@"Second source" question']
 
 
 async def test_skill_command_result_delegates_exact_message_to_ordinary_model_run():

@@ -75,6 +75,18 @@ class Agent:
         return await EmbeddedAgent.list(root=root)
 
     @classmethod
+    async def delete(
+        cls,
+        name: str,
+        *,
+        root: str | Path | None = None,
+        keychain: KeychainStore | None = None,
+    ) -> None:
+        """Permanently delete one inactive agent home and its owned credentials."""
+
+        await EmbeddedAgent.delete(name, root=root, keychain=keychain)
+
+    @classmethod
     async def create(
         cls,
         name: str,
@@ -246,6 +258,11 @@ class Agent:
         """Return whether one conversation ID belongs to this agent."""
 
         return await self._embedded.conversation_exists(conversation_id)
+
+    async def clear_conversations(self) -> int:
+        """Delete transcripts and candidate records, not approved knowledge."""
+
+        return await self._embedded.clear_conversations()
 
     async def active_source(
         self,

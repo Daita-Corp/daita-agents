@@ -753,6 +753,8 @@ class LearningCandidateStore(Protocol):
 
     async def clear_rejected_learning_candidates(self, agent_id: str) -> int: ...
 
+    async def clear_conversations(self, agent_id: str) -> int: ...
+
 
 class LearningMemoryReader(Protocol):
     async def read_memory(self) -> str: ...
@@ -970,6 +972,14 @@ class OneShotCandidateReviewer:
         self._closed = True
         async with self._review_lock:
             return None
+
+    async def clear_conversations(self) -> int:
+        """Clear transcript-derived records while excluding approved knowledge."""
+
+        async with self._review_lock:
+            if self._closed:
+                raise LearningCandidateError("candidate reviewer is closed")
+            return await self._store.clear_conversations(self._agent_id)
 
     async def _review_once(
         self,

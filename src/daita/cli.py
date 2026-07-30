@@ -17,6 +17,7 @@ from typing import Protocol, Sequence
 
 from . import (
     Agent,
+    AgentConfig,
     AgentEvent,
     ApprovalDecision,
     ApprovalHandler,
@@ -174,6 +175,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     sources = commands.add_parser("sources", help="list attached sources")
     sources.add_argument("name")
+
+    detach = commands.add_parser("detach", help="detach a source")
+    detach.add_argument("name")
+    detach.add_argument("source_id")
+    detach.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm source detachment and owned-credential deletion",
+    )
+
+    conversations = commands.add_parser(
+        "conversations",
+        help="manage persisted conversation history",
+    )
+    conversation_commands = conversations.add_subparsers(
+        dest="conversations_command",
+        required=True,
+    )
+    conversation_clear = conversation_commands.add_parser(
+        "clear",
+        help="clear all conversation history",
+    )
+    conversation_clear.add_argument("name")
+    conversation_clear.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm transcript and candidate-record deletion",
+    )
+
+    delete = commands.add_parser("delete", help="permanently delete an agent")
+    delete.add_argument("name")
+    delete.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm agent-home and owned-credential deletion",
+    )
 
     run = commands.add_parser("run", help="run one agent request")
     run.add_argument("name")
@@ -1137,6 +1174,43 @@ async def _execute(args: argparse.Namespace) -> object:
         agent = await Agent.create(args.name, root=args.root)
         try:
             return {"agent_id": agent.id, "name": agent.name, "home": str(agent.home)}
+        finally:
+            await agent.close()
+    if args.command == "delete":
+        if not args.yes:
+            raise ValueError("delete requires --yes")
+        await Agent.delete(args.name, root=args.root)
+        return {"name": args.name, "deleted": True}
+    if args.command == "detach":
+        if not args.yes:
+            raise ValueError("detach requires --yes")
+        agent = await Agent.open(
+            args.name,
+            root=args.root,
+            config=AgentConfig(),
+        )
+        try:
+            detached_source = await agent.detach(args.source_id)
+            return {
+                "source_id": detached_source.id,
+                "name": detached_source.display_name,
+                "detached": True,
+            }
+        finally:
+            await agent.close()
+    if args.command == "conversations":
+        if not args.yes:
+            raise ValueError("conversations clear requires --yes")
+        agent = await Agent.open(
+            args.name,
+            root=args.root,
+            config=AgentConfig(),
+        )
+        try:
+            return {
+                "name": args.name,
+                "cleared_runs": await agent.clear_conversations(),
+            }
         finally:
             await agent.close()
     if args.command == "run":

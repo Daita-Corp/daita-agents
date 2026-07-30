@@ -482,9 +482,10 @@ def test_candidate_review_measurement_rejects_values_above_fixed_bounds(
 def test_readme_documents_explicit_inactive_review_lifecycle() -> None:
     readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
     normalized = " ".join(readme.split())
+    normalized_words = normalized.replace("-", " ")
 
     assert "Candidate review is disabled by default." in readme
-    assert "one tool-free model request outside `AgentLoop`" in readme
+    assert "one tool free model request outside `AgentLoop`" in normalized_words
     assert "`/memory accept <id>` handles exactly one candidate" in readme
     assert "There is no bulk acceptance." in normalized
     assert "Daita performs no post-run review, auxiliary model call" not in readme

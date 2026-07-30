@@ -294,9 +294,13 @@ class SQLiteStateStore:
     async def detach_source(
         self, agent_id: str, source_id: str, detached_at: datetime
     ) -> SourceRegistration:
-        def write() -> SourceRegistration:
-            with _connect(self.path) as connection:
-                connection.execute("BEGIN IMMEDIATE")
+        gate = _CatalogCommitGate()
+
+        def write() -> SourceRegistration | None:
+            connection = _connect(self.path)
+            try:
+                if not gate.start(connection):
+                    return None
                 row = connection.execute(
                     "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
                     (agent_id, source_id),
@@ -337,9 +341,33 @@ class SQLiteStateStore:
                                 _dumps(remaining[0].id),
                             ),
                         )
+                connection.commit()
                 return detached
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
 
-        return await asyncio.to_thread(write)
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled_before_start = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled_before_start = (
+                    gate.cancel_before_start() or cancelled_before_start
+                )
+        detached = worker.result()
+        if cancelled_before_start:
+            if detached is not None:
+                raise AssertionError("cancelled source detach transaction committed")
+            raise asyncio.CancelledError
+        if detached is None:
+            raise AssertionError(
+                "source detach transaction stopped without cancellation"
+            )
+        return detached
 
     async def record_sync(self, sync: CatalogSync) -> CatalogSync:
         def write() -> CatalogSync:
@@ -1559,6 +1587,72 @@ class SQLiteStateStore:
             return row is not None
 
         return await asyncio.to_thread(read)
+
+    async def clear_conversations(self, agent_id: str) -> int:
+        """Delete transcripts and candidate records derived from them."""
+
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("agent_id must be a non-empty string")
+        gate = _CatalogCommitGate()
+
+        def write() -> int | None:
+            connection = _connect(self.path)
+            try:
+                if not gate.start(connection):
+                    return None
+                row = connection.execute(
+                    "SELECT COUNT(*) FROM runs WHERE agent_id = ?",
+                    (agent_id,),
+                ).fetchone()
+                run_count = int(row[0])
+                connection.execute(
+                    """DELETE FROM messages
+                       WHERE run_id IN (
+                           SELECT id FROM runs WHERE agent_id = ?
+                       )""",
+                    (agent_id,),
+                )
+                connection.execute(
+                    "DELETE FROM runs WHERE agent_id = ?",
+                    (agent_id,),
+                )
+                connection.execute(
+                    "DELETE FROM learning_candidates WHERE agent_id = ?",
+                    (agent_id,),
+                )
+                connection.execute(
+                    "DELETE FROM metadata WHERE key = ?",
+                    (_learning_review_stamps_key(agent_id),),
+                )
+                connection.commit()
+                return run_count
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled_before_start = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled_before_start = (
+                    gate.cancel_before_start() or cancelled_before_start
+                )
+        cleared = worker.result()
+        if cancelled_before_start:
+            if cleared is not None:
+                raise AssertionError(
+                    "cancelled conversation-clear transaction committed"
+                )
+            raise asyncio.CancelledError
+        if cleared is None:
+            raise AssertionError(
+                "conversation-clear transaction stopped without cancellation"
+            )
+        return cleared
 
     async def conversation_source_id(
         self,

@@ -259,6 +259,17 @@ class KeychainSecretProvider:
         except ImportError:
             raise
         except Exception:
+            remaining: object
+            try:
+                remaining = await _run_blocking_to_completion(
+                    client.get_password,
+                    self._service_name,
+                    reference.name,
+                )
+            except Exception:
+                remaining = object()
+            if remaining is None or remaining == "":
+                return
             raise SecretResolutionError(
                 "secret_provider_unavailable",
                 "The configured keychain provider could not delete the secret.",

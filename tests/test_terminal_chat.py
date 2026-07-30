@@ -634,7 +634,7 @@ async def test_source_use_and_one_question_override_are_local_and_persisted(
             "/source use Second source\n"
             "/sources\n"
             "second question\n"
-            "@ready-sqlite override question\n"
+            '@"Ready SQLite" override question\n'
             "/exit\n"
         ),
         output_stream=output,

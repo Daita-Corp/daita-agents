@@ -141,6 +141,7 @@ def test_survivor_docs_and_examples_describe_only_the_mvp():
     readme = (root / "README.md").read_text(encoding="utf-8")
     examples_readme = (root / "examples" / "README.md").read_text(encoding="utf-8")
     normalized_readme = " ".join(readme.split())
+    normalized_readme_words = normalized_readme.replace("-", " ")
     normalized_examples_readme = " ".join(examples_readme.split())
 
     for required in (
@@ -151,7 +152,7 @@ def test_survivor_docs_and_examples_describe_only_the_mvp():
         "does not persist events, collect telemetry",
         "session runtime",
     ):
-        assert required in normalized_readme
+        assert required.replace("-", " ") in normalized_readme_words
     assert "bounded cold continuation" in normalized_examples_readme
     assert "best-effort non-persisted events" in normalized_examples_readme
 

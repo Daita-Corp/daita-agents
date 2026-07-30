@@ -165,7 +165,7 @@ entry_points = {
     for item in distribution.entry_points
     if item.group == "console_scripts"
 }
-assert distribution.version == "2.0.0a0"
+assert distribution.version == "1.0.0"
 assert entry_points == {"daita": "daita.cli:main"}
 requirements = tuple(distribution.requires or ())
 assert any(item.startswith("openai") for item in requirements)

@@ -42,7 +42,7 @@ from .semantics import (
 )
 from .skills import Skill, SkillSummary
 
-__version__ = "2.0.0a0"
+__version__ = "1.0.0"
 
 __all__ = [
     "Agent",

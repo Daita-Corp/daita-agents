@@ -1270,17 +1270,34 @@ def test_cli_3_y_and_n_remain_ordinary_messages_outside_approval():
     provider.assert_consumed()
 
 
-def test_future_cli_4_parser_adds_only_the_direct_knowledge_commands():
+def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
     commands = _subcommands(cli.build_parser())
     assert set(commands) == {
         "create",
         "attach",
         "sources",
+        "detach",
+        "conversations",
+        "delete",
         "run",
         "chat",
         "memory",
         "skills",
     }
+    assert _surface(commands["detach"]) == (
+        ("name", "source_id"),
+        frozenset({"-h", "--help", "--yes"}),
+    )
+    assert _surface(commands["delete"]) == (
+        ("name",),
+        frozenset({"-h", "--help", "--yes"}),
+    )
+    conversations = _subcommands(commands["conversations"])
+    assert set(conversations) == {"clear"}
+    assert _surface(conversations["clear"]) == (
+        ("name",),
+        frozenset({"-h", "--help", "--yes"}),
+    )
 
     memory = _subcommands(commands["memory"])
     assert set(memory) == {

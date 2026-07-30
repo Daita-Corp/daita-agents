@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import tomllib
 from typing import Self, TypeVar, cast
@@ -346,6 +347,77 @@ class EmbeddedAgent:
             if len(names) == _MAX_DISCOVERED_AGENTS:
                 break
         return tuple(names)
+
+    @classmethod
+    async def delete(
+        cls,
+        name: str,
+        *,
+        root: str | Path | None = None,
+        keychain: KeychainStore | None = None,
+    ) -> None:
+        """Delete one inactive agent home after removing its owned credentials."""
+
+        _, cancelled = await _await_async_completion(
+            lambda: cls._delete_admitted_home(
+                name,
+                root=root,
+                keychain=keychain or KeychainSecretProvider(),
+            )
+        )
+        if cancelled:
+            raise asyncio.CancelledError
+
+    @classmethod
+    async def _delete_admitted_home(
+        cls,
+        name: str,
+        *,
+        root: str | Path | None,
+        keychain: KeychainStore,
+    ) -> None:
+        del cls
+        (home, writer_lock), _cancelled = await _await_sync_completion(
+            lambda: _admit_agent_home(name, root, False)
+        )
+        store: SQLiteStateStore | None = None
+        try:
+            manifest, _cancelled = await _await_sync_completion(
+                lambda: _read_manifest(home, name)
+            )
+            store = SQLiteStateStore(home / "state.db")
+            identity = await store.load_identity()
+            if identity is None or identity != manifest:
+                raise AgentIdentityMismatchError(
+                    "agent.toml does not match state.db identity"
+                )
+            model_document, _cancelled = await _await_sync_completion(
+                lambda: _read_model_configuration_document(home)
+            )
+            sources = await store.list_sources(identity.id)
+            references = _owned_agent_credential_references(
+                identity.id,
+                model_document=model_document,
+                sources=sources,
+            )
+            failures = 0
+            for reference in references:
+                try:
+                    await keychain.delete(reference)
+                except Exception:
+                    failures += 1
+            if failures:
+                raise AgentHomeError(
+                    "agent credentials could not all be deleted; "
+                    "the agent home was preserved"
+                )
+            await store.close()
+            store = None
+            await _await_sync_completion(lambda: _delete_agent_home(home))
+        finally:
+            if store is not None:
+                await store.close()
+            writer_lock.release()
 
     @classmethod
     async def create(
@@ -1036,6 +1108,13 @@ class EmbeddedAgent:
             conversation_id,
         )
 
+    async def clear_conversations(self) -> int:
+        """Delete transcripts and candidate records, not approved knowledge."""
+
+        async with self._run_lock:
+            self._require_open()
+            return await self._candidate_reviewer.clear_conversations()
+
     async def active_source(
         self,
         *,
@@ -1581,9 +1660,22 @@ class EmbeddedAgent:
     async def detach(self, source_id: str) -> SourceRegistration:
         async with self._mutation_lock:
             self._require_open()
-            return await self._store.detach_source(
+            detached = await self._store.detach_source(
                 self.identity.id, source_id, self._clock()
             )
+            reference = _owned_source_credential_reference(
+                detached,
+                agent_id=self.identity.id,
+            )
+            if reference is not None:
+                try:
+                    await self._keychain.delete(reference)
+                except Exception:
+                    raise AgentHomeError(
+                        "source was detached, but its stored credential "
+                        "could not be deleted"
+                    ) from None
+            return detached
 
     async def refresh_source(self, source_id: str) -> SourceRegistration:
         """Refresh one active source using its exact admitted registration."""
@@ -2072,6 +2164,85 @@ def _credential_reference_is_owned(
     )
 
 
+def _owned_source_credential_reference(
+    registration: SourceRegistration,
+    *,
+    agent_id: str,
+) -> SecretReference | None:
+    if registration.agent_id != agent_id or registration.adapter_id != "postgresql":
+        return None
+    value = registration.configuration.get("credential_ref")
+    if not isinstance(value, str):
+        return None
+    try:
+        reference = SecretReference.parse(value)
+    except ValueError:
+        return None
+    return (
+        reference
+        if _credential_reference_is_owned(
+            reference,
+            agent_id=agent_id,
+            provider="postgresql",
+        )
+        else None
+    )
+
+
+def _owned_agent_credential_references(
+    agent_id: str,
+    *,
+    model_document: object | None,
+    sources: tuple[SourceRegistration, ...],
+) -> tuple[SecretReference, ...]:
+    references: dict[str, SecretReference] = {}
+    if model_document is not None:
+        if not isinstance(model_document, dict):
+            raise AgentHomeError(
+                "model configuration is invalid; the agent home was preserved"
+            )
+        route = model_document.get("model_route")
+        candidates = route.get("candidates") if isinstance(route, dict) else None
+        if not isinstance(candidates, list):
+            raise AgentHomeError(
+                "model configuration is invalid; the agent home was preserved"
+            )
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise AgentHomeError(
+                    "model configuration is invalid; the agent home was preserved"
+                )
+            provider_id = candidate.get("provider_id")
+            reference_value = candidate.get("secret_reference")
+            if not isinstance(provider_id, str) or (
+                reference_value is not None and not isinstance(reference_value, str)
+            ):
+                raise AgentHomeError(
+                    "model configuration is invalid; the agent home was preserved"
+                )
+            provider, separator, _model = provider_id.partition(":")
+            if not separator or reference_value is None:
+                continue
+            try:
+                reference = SecretReference.parse(reference_value)
+            except ValueError:
+                continue
+            if _credential_reference_is_owned(
+                reference,
+                agent_id=agent_id,
+                provider=provider,
+            ):
+                references[reference.to_uri()] = reference
+    for source in sources:
+        source_reference = _owned_source_credential_reference(
+            source,
+            agent_id=agent_id,
+        )
+        if source_reference is not None:
+            references[source_reference.to_uri()] = source_reference
+    return tuple(references[key] for key in sorted(references))
+
+
 async def _validate_model_route(
     route: ModelRoute,
     *,
@@ -2172,7 +2343,7 @@ def _keychain_references(
     )
 
 
-def _read_model_configuration(home: Path, agent_id: str) -> AgentConfig | None:
+def _read_model_configuration_document(home: Path) -> object | None:
     path = home / _MODEL_CONFIG_NAME
     if path.is_symlink():
         raise AgentHomeError("model configuration cannot be a symlink")
@@ -2205,6 +2376,18 @@ def _read_model_configuration(home: Path, agent_id: str) -> AgentConfig | None:
                 ValueError(f"invalid JSON constant: {value}")
             ),
         )
+        return value
+    except AgentHomeError:
+        raise
+    except Exception:
+        raise AgentHomeError("model configuration is invalid") from None
+
+
+def _read_model_configuration(home: Path, agent_id: str) -> AgentConfig | None:
+    value = _read_model_configuration_document(home)
+    if value is None:
+        return None
+    try:
         return _decode_agent_config(value, agent_id=agent_id)
     except AgentHomeError:
         raise
@@ -2671,6 +2854,37 @@ def _cleanup_failed_create(home: Path) -> None:
             os.unlink(home / name)
         except FileNotFoundError:
             pass
+
+
+def _delete_agent_home(home: Path) -> None:
+    """Atomically retire one admitted home, then remove only that exact tree."""
+
+    try:
+        state = os.lstat(home)
+    except OSError as error:
+        raise AgentHomeError("agent home is unavailable for deletion") from error
+    if not stat.S_ISDIR(state.st_mode) or stat.S_ISLNK(state.st_mode):
+        raise AgentHomeError("agent home must be a non-symlink directory")
+    if home.resolve(strict=True) != home:
+        raise AgentHomeError("agent home cannot contain a symlink or path alias")
+    tombstone = home.parent / f".{home.name}.deleting-{uuid4().hex}"
+    try:
+        os.replace(home, tombstone)
+        directory = os.open(home.parent, os.O_RDONLY)
+        try:
+            try:
+                os.fsync(directory)
+            except OSError:
+                pass
+        finally:
+            os.close(directory)
+        shutil.rmtree(tombstone)
+    except OSError as error:
+        if tombstone.exists():
+            raise AgentHomeError(
+                "agent was retired but its temporary deletion tree remains"
+            ) from error
+        raise AgentHomeError("agent home could not be deleted") from error
 
 
 __all__ = [

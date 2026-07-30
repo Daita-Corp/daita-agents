@@ -57,10 +57,20 @@ _SLASH_COMMAND_COMPLETIONS = (
     ("/source use ", "/source use <name>", "Use a source for new conversations"),
     ("/source add", "/source add", "Add a data source"),
     ("/source refresh ", "/source refresh <id>", "Refresh a source catalog"),
+    (
+        "/source detach ",
+        "/source detach <source>",
+        "Detach a source and delete its Daita-owned credential",
+    ),
     ("/catalog", "/catalog", "Show the current catalog summary"),
     ("/settings", "/settings", "Show agent and model settings"),
     ("/new", "/new", "Start a new conversation"),
     ("/resume ", "/resume <id>", "Resume a previous conversation"),
+    (
+        "/conversation clear",
+        "/conversation clear",
+        "Delete all conversation history",
+    ),
     ("/learn ", "/learn <material>", "Teach durable knowledge or a procedure"),
     (
         "/review",
@@ -83,6 +93,7 @@ _SLASH_COMMAND_COMPLETIONS = (
     ),
     ("/status", "/status", "Show current agent status"),
     ("/conversation", "/conversation", "Show the current conversation ID"),
+    ("/agent delete", "/agent delete", "Permanently delete this agent"),
     ("/help", "/help", "Show command help"),
     ("/exit", "/exit", "Exit Daita"),
 )
@@ -1397,6 +1408,10 @@ async def run_terminal_tui(
     load_skill_completions: (
         Callable[[], Awaitable[Sequence[tuple[str, str]]]] | None
     ) = None,
+    source_completions: Sequence[tuple[str, str, str]] = (),
+    load_source_completions: (
+        Callable[[], Awaitable[Sequence[tuple[str, str, str]]]] | None
+    ) = None,
     input_stream: TextIO,
     output_stream: TextIO,
     suspend_bridge: TerminalSuspendBridge,
@@ -1452,6 +1467,8 @@ async def run_terminal_tui(
             command_requires_suspension=command_requires_suspension,
             skill_completions=skill_completions,
             load_skill_completions=load_skill_completions,
+            source_completions=source_completions,
+            load_source_completions=load_source_completions,
             observer_bridge=observer_bridge,
             approval_bridge=approval_bridge,
             enhanced_input=enhanced_input,
@@ -1542,7 +1559,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
     try:
         from prompt_toolkit.application import Application
         from prompt_toolkit.application.run_in_terminal import in_terminal
-        from prompt_toolkit.completion import CompleteEvent, WordCompleter
+        from prompt_toolkit.completion import CompleteEvent, Completion
         from prompt_toolkit.data_structures import Point
         from prompt_toolkit.filters import Condition
         from prompt_toolkit.formatted_text import ANSI, FormattedText
@@ -1592,6 +1609,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
         "Markdown": Markdown,
         "Point": Point,
         "CompleteEvent": CompleteEvent,
+        "Completion": Completion,
         "Style": Style,
         "Syntax": Syntax,
         "Table": Table,
@@ -1600,7 +1618,6 @@ def _load_terminal_runtime() -> dict[str, Any]:
         "Theme": Theme,
         "VSplit": VSplit,
         "Window": Window,
-        "WordCompleter": WordCompleter,
         "create_input": create_input,
         "create_output": create_output,
         "in_terminal": in_terminal,
@@ -1619,6 +1636,10 @@ def _create_application(
     load_skill_completions: (
         Callable[[], Awaitable[Sequence[tuple[str, str]]]] | None
     ) = None,
+    source_completions: Sequence[tuple[str, str, str]] = (),
+    load_source_completions: (
+        Callable[[], Awaitable[Sequence[tuple[str, str, str]]]] | None
+    ) = None,
     observer_bridge: TerminalObserverBridge,
     approval_bridge: TerminalApprovalBridge | None,
     enhanced_input: Any,
@@ -1631,18 +1652,78 @@ def _create_application(
     capabilities = _terminal_capabilities(enhanced_output)
     glyphs = _terminal_glyphs(capabilities)
     keys = runtime["KeyBindings"]()
-    completion_display, completion_descriptions = _slash_completion_maps(
-        skill_completions
-    )
+    current_skill_completions = tuple(skill_completions)
+    current_source_completions = tuple(source_completions)
     composer_buffer: Any = None
 
-    def slash_completion_is_active() -> bool:
+    def completion_is_active() -> bool:
         if composer_buffer is None:
             return False
         text = composer_buffer.document.text_before_cursor
-        return text.startswith("/") and "\n" not in text
+        return text.startswith(("/", "@")) and "\n" not in text
 
-    slash_completion_filter = runtime["Condition"](slash_completion_is_active)
+    completion_filter = runtime["Condition"](completion_is_active)
+
+    def composer_completer() -> Any:
+        slash_display, slash_descriptions = _slash_completion_maps(
+            current_skill_completions
+        )
+        source_display = {
+            insertion: display
+            for insertion, display, _description in current_source_completions
+        }
+        source_descriptions = {
+            insertion: description
+            for insertion, _display, description in current_source_completions
+        }
+
+        class ComposerCompleter:
+            def get_completions(
+                self,
+                document: Any,
+                complete_event: Any,
+            ) -> Any:
+                del complete_event
+                text = document.text_before_cursor
+                if "\n" in text:
+                    return
+                if text.startswith("/"):
+                    display = slash_display
+                    descriptions = slash_descriptions
+                    query = text.casefold()
+                elif text.startswith("@"):
+                    display = source_display
+                    descriptions = source_descriptions
+                    query = text.casefold()
+                    if query.startswith('@"'):
+                        query = "@" + query[2:]
+                else:
+                    return
+                for insertion, label in display.items():
+                    searchable_insertion = insertion.casefold()
+                    searchable_label = label.casefold()
+                    if not (
+                        searchable_insertion.startswith(text.casefold())
+                        or searchable_label.startswith(query)
+                    ):
+                        continue
+                    yield runtime["Completion"](
+                        insertion,
+                        start_position=-len(text),
+                        display=label,
+                        display_meta=descriptions[insertion],
+                    )
+
+            async def get_completions_async(
+                self,
+                document: Any,
+                complete_event: Any,
+            ) -> Any:
+                for completion in self.get_completions(document, complete_event):
+                    yield completion
+
+        return ComposerCompleter()
+
     composer = runtime["TextArea"](
         multiline=True,
         wrap_lines=True,
@@ -1651,36 +1732,31 @@ def _create_application(
         prompt=runtime["FormattedText"]([("class:tui.prompt", f"{glyphs.prompt} ")]),
         style="class:tui.composer",
         name="composer",
-        completer=runtime["WordCompleter"](
-            tuple(completion_display),
-            ignore_case=True,
-            display_dict=completion_display,
-            meta_dict=completion_descriptions,
-            sentence=True,
-        ),
-        complete_while_typing=slash_completion_filter,
+        completer=composer_completer(),
+        complete_while_typing=completion_filter,
         history=runtime["InMemoryHistory"](),
     )
     composer_buffer = composer.buffer
 
-    def set_skill_completions(values: Sequence[tuple[str, str]]) -> None:
-        display, descriptions = _slash_completion_maps(values)
-        composer.buffer.completer = runtime["WordCompleter"](
-            tuple(display),
-            ignore_case=True,
-            display_dict=display,
-            meta_dict=descriptions,
-            sentence=True,
-        )
-
-    async def refresh_skill_completions() -> None:
-        if load_skill_completions is None:
-            return
-        try:
-            values = await load_skill_completions()
-        except (asyncio.CancelledError, Exception):
-            return
-        set_skill_completions(values)
+    async def refresh_completions(*, include_sources: bool) -> None:
+        nonlocal current_skill_completions, current_source_completions
+        changed = False
+        if load_skill_completions is not None:
+            try:
+                current_skill_completions = tuple(await load_skill_completions())
+            except (asyncio.CancelledError, Exception):
+                pass
+            else:
+                changed = True
+        if include_sources and load_source_completions is not None:
+            try:
+                current_source_completions = tuple(await load_source_completions())
+            except (asyncio.CancelledError, Exception):
+                pass
+            else:
+                changed = True
+        if changed:
+            composer.buffer.completer = composer_completer()
 
     enforcing_bound = False
     last_valid_composer_document = composer.buffer.document
@@ -1957,7 +2033,7 @@ def _create_application(
             return
         finally:
             if settle_task:
-                await refresh_skill_completions()
+                await refresh_completions(include_sources=False)
                 _project_pending_events(observer_bridge, state)
                 state.running = False
                 state.active_task = None
@@ -2001,7 +2077,7 @@ def _create_application(
             application.exit(exception=error)
             return
         finally:
-            await refresh_skill_completions()
+            await refresh_completions(include_sources=True)
             _project_pending_events(observer_bridge, state)
             state.running = False
             state.active_task = None

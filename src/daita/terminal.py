@@ -269,6 +269,7 @@ _SKILL_DESCRIPTION_PLACEHOLDER = "Describe when the agent should use this skill.
 _SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
 _BUILTIN_SLASH_COMMANDS = frozenset(
     {
+        "/agent",
         "/catalog",
         "/conversation",
         "/exit",
@@ -489,6 +490,8 @@ async def run_terminal_application(
                 approval_bridge=approval_bridge,
             )
             if action == "exit":
+                return 0
+            if action == "deleted":
                 return 0
             if action == "model":
                 validated = True
@@ -1280,19 +1283,100 @@ async def _source_status_label(
     return "select source" if resolved_sources else "none"
 
 
+def _quoted_source_override(selector: str) -> str:
+    escaped = selector.replace("\\", "\\\\").replace('"', '\\"')
+    return f'@"{escaped}"'
+
+
+def _source_override_completions(
+    sources: tuple[Any, ...],
+) -> tuple[tuple[str, str, str], ...]:
+    active_sources = tuple(source for source in sources if source.active)
+    folded_name_counts: dict[str, int] = {}
+    for source in active_sources:
+        folded = source.display_name.casefold()
+        folded_name_counts[folded] = folded_name_counts.get(folded, 0) + 1
+
+    completions: list[tuple[str, str, str]] = []
+    for source in active_sources:
+        display_name = _safe_display(
+            source.display_name,
+            fallback="source",
+            maximum=512,
+        )
+        use_display_name = (
+            display_name == source.display_name
+            and len(source.display_name.encode("utf-8")) <= 1_024
+            and folded_name_counts[source.display_name.casefold()] == 1
+        )
+        selector = source.display_name if use_display_name else source.id
+        adapter_id = getattr(source, "adapter_id", "source")
+        source_type = _SOURCE_TYPE_LABELS.get(adapter_id, adapter_id)
+        description = f"Ask one question using {source_type}"
+        if not use_display_name:
+            description += f" · {source.id[-8:]}"
+        completions.append(
+            (
+                _quoted_source_override(selector) + " ",
+                f"@{display_name}",
+                description,
+            )
+        )
+    return tuple(completions)
+
+
+def _parse_source_override(message: str) -> tuple[str, str] | None:
+    if not message.startswith("@"):
+        return None
+    if len(message) == 1 or message[1].isspace():
+        raise terminal_tui.TerminalUserInputError(
+            "Choose a source after @, then enter a question."
+        )
+
+    if not message.startswith('@"'):
+        selector_end = 1
+        while selector_end < len(message) and not message[selector_end].isspace():
+            selector_end += 1
+        selector = message[1:selector_end]
+        question = message[selector_end:].strip()
+        return selector, question
+
+    selector_characters: list[str] = []
+    position = 2
+    while position < len(message):
+        character = message[position]
+        if character == '"':
+            position += 1
+            if position < len(message) and not message[position].isspace():
+                raise terminal_tui.TerminalUserInputError(
+                    "Put a space after the quoted @ source name."
+                )
+            return "".join(selector_characters), message[position:].strip()
+        if character == "\\" and position + 1 < len(message):
+            escaped = message[position + 1]
+            if escaped in {'"', "\\"}:
+                selector_characters.append(escaped)
+                position += 2
+                continue
+        selector_characters.append(character)
+        position += 1
+    raise terminal_tui.TerminalUserInputError(
+        "Close the quoted @ source name before entering a question."
+    )
+
+
 async def _message_source_override(
     agent: Agent,
     message: str,
 ) -> tuple[str, str | None]:
-    selector_token, separator, remainder = message.partition(" ")
-    if not selector_token.startswith("@") or len(selector_token) == 1:
+    parsed = _parse_source_override(message)
+    if parsed is None:
         return message, None
-    selector = selector_token[1:]
+    selector, question = parsed
     try:
         source = await agent.resolve_source(selector)
     except SourceSelectionError as error:
         raise terminal_tui.TerminalUserInputError(str(error)) from error
-    question = remainder.strip() if separator else ""
     if not question:
         raise terminal_tui.TerminalUserInputError(
             "A source override must be followed by a question."
@@ -1814,6 +1898,12 @@ def _command_uses_terminal_prompts(command: str) -> bool:
         return True
     if parts[0] == "/source" and parts[1:] == ["add"]:
         return True
+    if parts[0] == "/source" and len(parts) >= 3 and parts[1] == "detach":
+        return True
+    if parts[0] == "/conversation" and parts[1:] == ["clear"]:
+        return True
+    if parts[0] == "/agent" and parts[1:] == ["delete"]:
+        return True
     if parts[0] in {"/memory", "/user"} and parts[1:] == ["edit"]:
         return True
     if parts[0] == "/review" and len(parts) == 1:
@@ -1849,10 +1939,12 @@ async def _chat_tui(
     observer_bridge: terminal_tui.TerminalObserverBridge,
     approval_bridge: terminal_tui.TerminalApprovalBridge | None,
 ) -> tuple[Agent, str | None, str]:
+    sources = tuple(source for source in await agent.list_sources() if source.active)
     state = await _ready_view_state(
         agent,
         conversation_id=conversation_id,
         validated=validated,
+        sources=sources,
     )
 
     async def run_message(message: str, selected_conversation: str | None) -> Any:
@@ -1873,6 +1965,9 @@ async def _chat_tui(
         return tuple(
             (summary.name, summary.description) for summary in await list_skills()
         )
+
+    async def load_source_completions() -> tuple[tuple[str, str, str], ...]:
+        return _source_override_completions(tuple(await agent.list_sources()))
 
     async def handle_command(
         command: str,
@@ -1971,9 +2066,13 @@ async def _chat_tui(
                 "/catalog": "catalog",
                 "/settings": "settings",
             }.get(command.split(maxsplit=1)[0], "local"),
-            source_summary=await _source_status_label(
-                agent,
-                conversation_id=selected_conversation,
+            source_summary=(
+                None
+                if action == "deleted"
+                else await _source_status_label(
+                    agent,
+                    conversation_id=selected_conversation,
+                )
             ),
         )
 
@@ -1985,6 +2084,8 @@ async def _chat_tui(
         command_requires_suspension=_command_uses_terminal_prompts,
         skill_completions=await load_skill_completions(),
         load_skill_completions=load_skill_completions,
+        source_completions=_source_override_completions(sources),
+        load_source_completions=load_source_completions,
         input_stream=input_stream,
         output_stream=output_stream,
         suspend_bridge=suspend_bridge,
@@ -2112,6 +2213,53 @@ async def _handle_local_command(
             file=output_stream,
         )
         return agent, conversation_id, None
+    if name == "/conversation" and parts[1:] == ["clear"]:
+        confirmation = _read_line(
+            "Clear all conversation history and learning candidate records? [y/N]: ",
+            input_stream,
+            output_stream,
+        )
+        if confirmation.strip().lower() != "y":
+            print("Conversation history was not changed.", file=output_stream)
+            return agent, conversation_id, None
+        cleared = await agent.clear_conversations()
+        print(
+            f"Cleared {cleared} persisted conversation "
+            f"{'run' if cleared == 1 else 'runs'}.",
+            file=output_stream,
+        )
+        print("Approved memory and skills were preserved.", file=output_stream)
+        return agent, None, None
+    if name == "/agent" and parts[1:] == ["delete"]:
+        selected_name = agent.name
+        confirmation = _read_line(
+            f"Type {selected_name} to permanently delete this agent: ",
+            input_stream,
+            output_stream,
+        )
+        if confirmation != selected_name:
+            print("Agent was not deleted.", file=output_stream)
+            return agent, conversation_id, None
+        await agent.close()
+        try:
+            await Agent.delete(selected_name, root=root, keychain=keychain)
+        except Exception as error:
+            print(
+                "Agent deletion failed: "
+                + _safe_display(str(error), fallback="deletion failed"),
+                file=output_stream,
+            )
+            replacement = await Agent.open(
+                selected_name,
+                root=root,
+                keychain=keychain,
+                model_validator=model_validator,
+                approval_handler=approval_handler,
+                observer=observer_bridge,
+            )
+            return replacement, conversation_id, None
+        print(f"Deleted agent {selected_name}.", file=output_stream)
+        return agent, None, "deleted"
     if name == "/source" and (len(parts) == 1 or parts[1:] == ["use"]):
         prior = await _active_source_for(
             agent,
@@ -2196,6 +2344,61 @@ async def _handle_local_command(
             validated=validated,
         )
         return agent, conversation_id, None
+    if name == "/source" and len(parts) >= 3 and parts[1] == "detach":
+        try:
+            selected = await agent.resolve_source(" ".join(parts[2:]))
+        except SourceSelectionError as error:
+            print(
+                _safe_display(str(error), fallback="Source selection failed."),
+                file=output_stream,
+            )
+            return agent, conversation_id, None
+        active = await _active_source_for(
+            agent,
+            conversation_id=conversation_id,
+        )
+        confirmation = _read_line(
+            "Detach "
+            f"{_safe_display(selected.display_name, fallback='this source')} "
+            "and delete its Daita-owned credential? [y/N]: ",
+            input_stream,
+            output_stream,
+        )
+        if confirmation.strip().lower() != "y":
+            print("Source was not detached.", file=output_stream)
+            return agent, conversation_id, None
+        detached_succeeded = False
+        try:
+            await agent.detach(selected.id)
+        except Exception as error:
+            current = next(
+                (
+                    source
+                    for source in await agent.list_sources()
+                    if source.id == selected.id
+                ),
+                None,
+            )
+            detached_succeeded = current is not None and not current.active
+            print(
+                "Source detachment needs attention: "
+                + _safe_display(str(error), fallback="credential cleanup failed"),
+                file=output_stream,
+            )
+        else:
+            detached_succeeded = True
+            print(
+                f"Detached source "
+                f"{_safe_display(selected.display_name, fallback='source')}.",
+                file=output_stream,
+            )
+        if detached_succeeded and active is not None and active.id == selected.id:
+            conversation_id = None
+            print(
+                "Started a new conversation because its source was detached.",
+                file=output_stream,
+            )
+        return agent, conversation_id, "sources" if detached_succeeded else None
     if name == "/source" and len(parts) == 3 and parts[1] == "refresh":
         try:
             await agent.refresh_source(parts[2])
@@ -2276,9 +2479,13 @@ async def _handle_local_command(
     elif name == "/source":
         print(
             "Usage: /source | /source use <name> | /source add | "
-            "/source refresh <source-id>",
+            "/source refresh <source-id> | /source detach <source>",
             file=output_stream,
         )
+    elif name == "/conversation":
+        print("Usage: /conversation | /conversation clear", file=output_stream)
+    elif name == "/agent":
+        print("Usage: /agent delete", file=output_stream)
     elif name in {
         "/exit",
         "/help",
@@ -2287,7 +2494,6 @@ async def _handle_local_command(
         "/catalog",
         "/settings",
         "/status",
-        "/conversation",
         "/model",
     }:
         print(f"Usage: {name}", file=output_stream)
@@ -2330,6 +2536,7 @@ async def _ready_view_state(
     *,
     conversation_id: str | None,
     validated: bool,
+    sources: tuple[Any, ...] | None = None,
 ) -> terminal_tui.TerminalViewState:
     """Assemble only safe, public runtime facts for terminal presentation."""
 
@@ -2339,7 +2546,11 @@ async def _ready_view_state(
     candidate = route.candidates[0]
     provider, _, model = candidate.provider_id.partition(":")
     provider_label = dict(_PROVIDERS).get(provider, provider)
-    sources = tuple(source for source in await agent.list_sources() if source.active)
+    sources = (
+        tuple(source for source in await agent.list_sources() if source.active)
+        if sources is None
+        else tuple(source for source in sources if source.active)
+    )
     summary = await agent.catalog_summary()
     source_summary = await _source_status_label(
         agent,
@@ -2519,10 +2730,13 @@ def _write_chat_help(output_stream: TextIO) -> None:
         "/source use <name>",
         "/source add",
         "/source refresh <id>",
+        "/source detach <source>",
+        '@"source name" <question>',
         "/catalog",
         "/settings",
         "/new",
         "/resume <id>",
+        "/conversation clear",
         "/learn <material>",
         "/review [cost-usd]",
         "/memory [list|show|edit|accept|reject <id>|clear-rejected]",
@@ -2533,6 +2747,7 @@ def _write_chat_help(output_stream: TextIO) -> None:
         "/<skill-name> [request]",
         "/status",
         "/conversation",
+        "/agent delete",
         "/help",
         "/exit",
     ):

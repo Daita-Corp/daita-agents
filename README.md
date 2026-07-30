@@ -27,7 +27,7 @@ become more useful over time without giving up human control.
 | **Talk to real data** | Query SQLite, PostgreSQL, CSV, and JSON without writing SQL. |
 | **Use your preferred model** | OpenAI, Anthropic, Gemini, Grok, Ollama, or a custom OpenAI compatible endpoint. |
 | **Keep useful context** | Persist conversations, user approved memory, and reusable Markdown skills. |
-| **Stay in control** | Validate SQL against the current catalog and approve agent-proposed local changes. |
+| **Stay in control** | Validate SQL against the current catalog and approve agent proposed local changes. |
 
 ## Quick start
 
@@ -73,7 +73,7 @@ model like any other result, so it can correct the call on the next step. The
 loop has bounded steps, wall time, tokens, and estimated cost; it does not add
 a verifier pass or a session runtime.
 
-Data access remains read-only. SQL and local paths are checked against the
+Data access remains read only. SQL and local paths are checked against the
 current catalog before source I/O, and every requested tool call receives one
 ordered result even if another call fails.
 
@@ -83,13 +83,13 @@ Conversation continuity projects a bounded tail of completed runs: at most 8
 runs, 40 messages, and 24,000 UTF-8 bytes.
 
 Memory and skills are bounded, advisory Markdown. They are not source truth,
-authorization, or evidence. Agent-proposed changes occur only in the
-foreground through an in-process approve-once callback. The optional observer
-is best-effort and does not persist events, collect telemetry, or direct
+authorization, or evidence. Agent proposed changes occur only in the
+foreground through an in process approve once callback. The optional observer
+is best effort and does not persist events, collect telemetry, or direct
 execution.
 
 Candidate review is disabled by default. When explicitly requested, review
-uses one tool-free model request outside `AgentLoop` and places proposals in an
+uses one tool free model request outside `AgentLoop` and places proposals in an
 inactive inbox. `/memory accept <id>` handles exactly one candidate through a
 fresh foreground run and the normal approval path. There is no bulk
 acceptance.
@@ -98,7 +98,7 @@ For the complete implementation boundaries, see [AGENTS.md](AGENTS.md).
 
 ## Advanced/headless CLI
 
-The zero-argument `daita` command is the normal path. Automation-friendly
+The zero argument `daita` command is the normal path. Automation-friendly
 commands use the same public API:
 
 ```bash
@@ -110,7 +110,7 @@ daita --root /private/tmp/daita run atlas "Summarize sales" \
 
 `run` writes one JSON record. Provider credentials and PostgreSQL passwords
 must come from their documented environment or keychain references, never
-secret command-line values.
+secret command line values.
 
 Discover all commands and options with:
 
@@ -119,6 +119,35 @@ daita --help
 daita memory --help
 daita skills --help
 ```
+
+## Manage local data
+
+The terminal provides confirmed lifecycle commands:
+
+```text
+/source detach <source>
+/conversation clear
+/agent delete
+```
+
+Source detachment disables access and deletes a Daita-owned PostgreSQL
+credential. Its non-secret registration remains as inactive lifecycle history
+until the agent is deleted. Clearing conversations deletes all transcripts,
+learning candidate records, and review stamps while preserving separately
+approved memory, user profile, semantics, and skills. Agent deletion removes
+the complete agent home and its Daita-owned keychain credentials; it never
+changes the attached source data itself.
+
+Automation must pass an explicit confirmation flag:
+
+```bash
+daita detach atlas <source-id> --yes
+daita conversations clear atlas --yes
+daita delete atlas --yes
+```
+
+If owned credential cleanup fails, agent deletion preserves the agent home so
+the operation can be retried.
 
 ## Python and examples
 
