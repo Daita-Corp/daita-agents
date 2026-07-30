@@ -1802,6 +1802,8 @@ def _create_application(
         return max(1, columns - prompt_width)
 
     def prune_unreferenced_pasted_texts(buffer: Any) -> None:
+        if not pasted_texts:
+            return
         active_placeholders = set(_PASTED_TEXT_PLACEHOLDER_PATTERN.findall(buffer.text))
         removed = tuple(
             placeholder
@@ -1818,9 +1820,9 @@ def _create_application(
         if enforcing_bound:
             return
         prune_unreferenced_pasted_texts(buffer)
-        if (
-            len(buffer.text) <= MAX_COMPOSER_CHARACTERS
-            and len(_materialize_pasted_texts(buffer.text, pasted_texts))
+        if len(buffer.text) <= MAX_COMPOSER_CHARACTERS and (
+            not pasted_texts
+            or len(_materialize_pasted_texts(buffer.text, pasted_texts))
             <= MAX_COMPOSER_CHARACTERS
         ):
             if history_position < len(input_history):

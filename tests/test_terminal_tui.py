@@ -1957,7 +1957,11 @@ def test_ascii_setup_status_and_plain_chat_prompt_are_readable(
     assert terminal_tui._terminal_glyphs(capabilities).prompt == ">"
 
 
-async def test_composer_enforces_the_existing_input_bound():
+async def test_composer_enforces_the_existing_input_bound(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    input_bound = 64
+    monkeypatch.setattr(terminal_tui, "MAX_COMPOSER_CHARACTERS", input_bound)
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
     submitted: list[str] = []
@@ -1969,13 +1973,13 @@ async def test_composer_enforces_the_existing_input_bound():
 
     with create_pipe_input() as pipe:
         task = await _run_shell(pipe, output, state, run_message=run_message)
-        pipe.send_text(("x" * (MAX_COMPOSER_CHARACTERS + 100)) + "\r")
+        pipe.send_text(("x" * (input_bound + 100)) + "\r")
         await _wait_until(lambda: bool(submitted))
         pipe.send_text("\x04")
         await task
 
     assert len(submitted) == 1
-    assert len(submitted[0]) == MAX_COMPOSER_CHARACTERS
+    assert len(submitted[0]) == input_bound
 
 
 async def test_bracketed_paste_uses_live_row_width_and_numbered_placeholders():

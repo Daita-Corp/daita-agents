@@ -159,7 +159,7 @@ class KeychainSecretProvider:
     def client(self) -> _KeyringClient:
         if self._client is None:
             try:
-                import keyring  # type: ignore[import-not-found]
+                import keyring
             except ImportError:
                 raise ImportError(
                     "Daita's keychain runtime dependency is unavailable. "
