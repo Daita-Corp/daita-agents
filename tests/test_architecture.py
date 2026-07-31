@@ -808,6 +808,29 @@ def test_catalog_schema_slice_extends_existing_catalog_and_capability_owners():
         assert prohibited not in _python_text(PACKAGE)
 
 
+def test_catalog_snapshot_reuse_is_private_derived_storage_state():
+    assert _class_owners("CatalogSnapshotRef") == {"catalog/models.py"}
+    assert "CatalogSnapshotRef" not in daita.__all__
+    protocol_methods = _class_methods(
+        PACKAGE / "catalog" / "protocols.py",
+        "CatalogStore",
+    )
+    assert {
+        "list_current_snapshot_refs",
+        "load_current_snapshot",
+    } <= protocol_methods
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    assert "_decoded_catalog_snapshots" in storage
+    assert "CREATE TABLE IF NOT EXISTS decoded_catalog_snapshots" not in storage
+    for prohibited in (
+        "CatalogSchemaCache",
+        "CatalogSearchService",
+        "SchemaGraph",
+        "VectorStore",
+    ):
+        assert prohibited not in _python_text(PACKAGE)
+
+
 def test_cli_adds_no_parallel_state_approval_or_observation_owner():
     cli_tree = ast.parse((PACKAGE / "cli.py").read_text(encoding="utf-8"))
     cli_classes = {

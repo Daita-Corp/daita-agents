@@ -183,6 +183,20 @@ class CatalogSyncStatus(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class CatalogSnapshotRef:
+    """Lightweight identity for one exact current source snapshot generation."""
+
+    agent_id: str
+    source_id: str
+    sync_id: str
+
+    def __post_init__(self) -> None:
+        _required_text(self.agent_id, "catalog snapshot ref agent_id")
+        _required_text(self.source_id, "catalog snapshot ref source_id")
+        _required_text(self.sync_id, "catalog snapshot ref sync_id")
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogSummary:
     """Compact current-catalog facts for non-model public presentation."""
 
@@ -1324,6 +1338,7 @@ __all__ = [
     "CatalogResource",
     "CatalogResourceRevision",
     "CatalogSchemaRequest",
+    "CatalogSnapshotRef",
     "CatalogSearchHit",
     "CatalogSearchRequest",
     "CatalogSearchResult",

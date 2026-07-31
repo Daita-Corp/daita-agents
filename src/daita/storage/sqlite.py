@@ -30,6 +30,7 @@ from ..catalog.models import (
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
+    CatalogSnapshotRef,
     CatalogSearchHit,
     CatalogSearchRequest,
     CatalogSearchResult,
@@ -47,6 +48,7 @@ from ..catalog.models import (
     Sensitivity,
     SourceCatalogSnapshot,
 )
+from ..catalog.protocols import CatalogStoreError
 from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..learning_candidates import (
     DocumentCandidateContent,
@@ -99,6 +101,7 @@ from ..semantics import (
 )
 
 _SEARCH_TERM = re.compile(r"[A-Za-z0-9_]+")
+_CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH = 64
 _ACTIVE_SOURCE_KEY_PREFIX = "active_source:"
 _LEARNING_REVIEW_STAMPS_KEY_PREFIX = "learning_review_stamps:"
 _T = TypeVar("_T")
@@ -203,6 +206,10 @@ class SQLiteStateStore:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._decoded_catalog_snapshots: dict[
+            tuple[str, str, str], SourceCatalogSnapshot
+        ] = {}
+        self._decoded_catalog_snapshot_lock = asyncio.Lock()
 
     @classmethod
     async def open(cls, path: str | Path, **_: object) -> SQLiteStateStore:
@@ -211,7 +218,8 @@ class SQLiteStateStore:
         return cls(resolved)
 
     async def close(self) -> None:
-        return None
+        async with self._decoded_catalog_snapshot_lock:
+            self._decoded_catalog_snapshots.clear()
 
     async def initialize_identity(self, identity: AgentIdentity) -> AgentIdentity:
         def write() -> AgentIdentity:
@@ -425,6 +433,8 @@ class SQLiteStateStore:
             raise AssertionError(
                 "source detach transaction stopped without cancellation"
             )
+        async with self._decoded_catalog_snapshot_lock:
+            self._evict_decoded_catalog_source(agent_id, source_id)
         return detached
 
     async def record_sync(self, sync: CatalogSync) -> CatalogSync:
@@ -528,7 +538,107 @@ class SQLiteStateStore:
             raise asyncio.CancelledError
         if committed is None:
             raise AssertionError("catalog transaction stopped without cancellation")
+        async with self._decoded_catalog_snapshot_lock:
+            self._publish_decoded_catalog_snapshot(committed)
         return committed
+
+    async def list_current_snapshot_refs(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...],
+    ) -> tuple[CatalogSnapshotRef, ...]:
+        _catalog_identifier(agent_id, "catalog snapshot agent_id")
+        selected_source_ids = _catalog_snapshot_source_ids(source_ids)
+
+        def read() -> tuple[CatalogSnapshotRef, ...]:
+            with _connect(self.path) as connection:
+                if not selected_source_ids:
+                    rows = connection.execute(
+                        "SELECT agent_id, source_id, sync_id FROM snapshots "
+                        "WHERE agent_id = ? ORDER BY source_id, sync_id",
+                        (agent_id,),
+                    ).fetchall()
+                else:
+                    rows = []
+                    for offset in range(
+                        0,
+                        len(selected_source_ids),
+                        _CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH,
+                    ):
+                        batch = selected_source_ids[
+                            offset : offset + _CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH
+                        ]
+                        placeholders = ", ".join("?" for _ in batch)
+                        rows.extend(
+                            connection.execute(
+                                "SELECT agent_id, source_id, sync_id FROM snapshots "
+                                f"WHERE agent_id = ? AND source_id IN ({placeholders})",
+                                (agent_id, *batch),
+                            ).fetchall()
+                        )
+            return tuple(
+                CatalogSnapshotRef(
+                    agent_id=row_agent_id,
+                    source_id=source_id,
+                    sync_id=sync_id,
+                )
+                for row_agent_id, source_id, sync_id in sorted(
+                    rows,
+                    key=lambda item: (item[1], item[2]),
+                )
+            )
+
+        return await asyncio.to_thread(read)
+
+    async def load_current_snapshot(
+        self,
+        ref: CatalogSnapshotRef,
+    ) -> SourceCatalogSnapshot | None:
+        if not isinstance(ref, CatalogSnapshotRef):
+            raise TypeError("ref must be a CatalogSnapshotRef")
+        key = (ref.agent_id, ref.source_id, ref.sync_id)
+
+        async with self._decoded_catalog_snapshot_lock:
+            cached = self._decoded_catalog_snapshots.get(key)
+            if cached is not None:
+                current_sync_id = await asyncio.to_thread(
+                    _current_snapshot_sync_id,
+                    self.path,
+                    ref.agent_id,
+                    ref.source_id,
+                )
+                if current_sync_id != ref.sync_id:
+                    self._decoded_catalog_snapshots.pop(key, None)
+                    return None
+                return cached
+
+            row = await asyncio.to_thread(
+                _current_snapshot_row,
+                self.path,
+                ref.agent_id,
+                ref.source_id,
+            )
+            if row is None or row[0] != ref.sync_id:
+                return None
+            snapshot = await asyncio.to_thread(_decode_catalog_snapshot, row[1])
+            if (
+                snapshot.sync.agent_id != ref.agent_id
+                or snapshot.sync.source_id != ref.source_id
+                or snapshot.sync.id != ref.sync_id
+            ):
+                raise CatalogStoreError(
+                    "stored catalog snapshot does not match its exact reference"
+                )
+            current_sync_id = await asyncio.to_thread(
+                _current_snapshot_sync_id,
+                self.path,
+                ref.agent_id,
+                ref.source_id,
+            )
+            if current_sync_id != ref.sync_id:
+                return None
+            self._publish_decoded_catalog_snapshot(snapshot)
+            return snapshot
 
     async def load_sync(self, agent_id: str, sync_id: str) -> CatalogSync | None:
         def read() -> CatalogSync | None:
@@ -555,39 +665,32 @@ class SQLiteStateStore:
             raise TypeError("active_source_ids must be a tuple of non-empty strings")
         if len(active_source_ids) != len(set(active_source_ids)):
             raise ValueError("active_source_ids cannot contain duplicates")
-        selected_source_ids = frozenset(active_source_ids)
-
-        def read() -> CatalogSummary:
-            with _connect(self.path) as connection:
-                rows = connection.execute(
-                    "SELECT source_id, data FROM snapshots "
-                    "WHERE agent_id = ? ORDER BY source_id",
-                    (agent_id,),
-                ).fetchall()
-            snapshots = tuple(
-                _expect(_loads(data), SourceCatalogSnapshot)
-                for source_id, data in rows
-                if source_id in selected_source_ids
-            )
-            completion_times = tuple(
-                snapshot.sync.completed_at
-                for snapshot in snapshots
-                if snapshot.sync.completed_at is not None
-            )
-            resource_count = sum(len(snapshot.resources) for snapshot in snapshots)
+        if not active_source_ids:
             return CatalogSummary(
-                active_source_count=len(active_source_ids),
-                resource_count=resource_count,
-                relationship_count=sum(
-                    len(snapshot.relationships) for snapshot in snapshots
-                ),
-                latest_successful_sync_completed_at=(
-                    max(completion_times) if completion_times else None
-                ),
-                is_empty=resource_count == 0,
+                active_source_count=0,
+                resource_count=0,
+                relationship_count=0,
+                latest_successful_sync_completed_at=None,
+                is_empty=True,
             )
-
-        return await asyncio.to_thread(read)
+        snapshots = await self._snapshots(agent_id, active_source_ids)
+        completion_times = tuple(
+            snapshot.sync.completed_at
+            for snapshot in snapshots
+            if snapshot.sync.completed_at is not None
+        )
+        resource_count = sum(len(snapshot.resources) for snapshot in snapshots)
+        return CatalogSummary(
+            active_source_count=len(active_source_ids),
+            resource_count=resource_count,
+            relationship_count=sum(
+                len(snapshot.relationships) for snapshot in snapshots
+            ),
+            latest_successful_sync_completed_at=(
+                max(completion_times) if completion_times else None
+            ),
+            is_empty=resource_count == 0,
+        )
 
     async def load_resource(
         self, agent_id: str, resource_id: str
@@ -612,7 +715,10 @@ class SQLiteStateStore:
     ) -> tuple[CatalogResource, ...]:
         resources = [
             resource
-            for snapshot in await self._snapshots(agent_id)
+            for snapshot in await self._snapshots(
+                agent_id,
+                () if source_id is None else (source_id,),
+            )
             if source_id is None or snapshot.sync.source_id == source_id
             for resource in snapshot.resources
         ]
@@ -665,7 +771,7 @@ class SQLiteStateStore:
             dict.fromkeys(term.casefold() for term in _SEARCH_TERM.findall(query))
         )
         needles = tuple(dict.fromkeys((query, *terms))) if query else ()
-        snapshots = await self._snapshots(request.agent_id)
+        snapshots = await self._snapshots(request.agent_id, request.source_ids)
         resources = tuple(
             sorted(
                 (resource for snapshot in snapshots for resource in snapshot.resources),
@@ -1792,16 +1898,33 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
-    async def _snapshots(self, agent_id: str) -> tuple[SourceCatalogSnapshot, ...]:
-        def read() -> tuple[SourceCatalogSnapshot, ...]:
-            with _connect(self.path) as connection:
-                rows = connection.execute(
-                    "SELECT data FROM snapshots WHERE agent_id = ? ORDER BY source_id",
-                    (agent_id,),
-                ).fetchall()
-            return tuple(_expect(_loads(row[0]), SourceCatalogSnapshot) for row in rows)
-
-        return await asyncio.to_thread(read)
+    async def _snapshots(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> tuple[SourceCatalogSnapshot, ...]:
+        for attempt in range(2):
+            refs = await self.list_current_snapshot_refs(agent_id, source_ids)
+            snapshots: list[SourceCatalogSnapshot] = []
+            generation_changed = False
+            for ref in refs:
+                snapshot = await self.load_current_snapshot(ref)
+                if snapshot is None:
+                    generation_changed = True
+                    break
+                snapshots.append(snapshot)
+            if (
+                not generation_changed
+                and refs
+                == await self.list_current_snapshot_refs(
+                    agent_id,
+                    source_ids,
+                )
+            ):
+                return tuple(snapshots)
+            if attempt == 1:
+                break
+        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
 
     async def _relationships(self, agent_id: str) -> tuple[CatalogRelationship, ...]:
         return tuple(
@@ -1809,6 +1932,24 @@ class SQLiteStateStore:
             for snapshot in await self._snapshots(agent_id)
             for relationship in snapshot.relationships
         )
+
+    def _publish_decoded_catalog_snapshot(
+        self,
+        snapshot: SourceCatalogSnapshot,
+    ) -> None:
+        sync = snapshot.sync
+        key = (sync.agent_id, sync.source_id, sync.id)
+        existing = self._decoded_catalog_snapshots.get(key)
+        for cached_key in tuple(self._decoded_catalog_snapshots):
+            if cached_key[:2] == key[:2] and cached_key != key:
+                del self._decoded_catalog_snapshots[cached_key]
+        if existing is None:
+            self._decoded_catalog_snapshots[key] = snapshot
+
+    def _evict_decoded_catalog_source(self, agent_id: str, source_id: str) -> None:
+        for key in tuple(self._decoded_catalog_snapshots):
+            if key[:2] == (agent_id, source_id):
+                del self._decoded_catalog_snapshots[key]
 
 
 def _catalog_search_reason(
@@ -1862,6 +2003,58 @@ def _catalog_search_reason(
         if any(predicate(needle, value) for needle in needles for _, value in fields):
             return reason, rank
     return None, 6
+
+
+def _catalog_identifier(value: str, field_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be non-empty text")
+    if value != value.strip():
+        raise ValueError(f"{field_name} cannot have surrounding whitespace")
+    if len(value) > 512:
+        raise ValueError(f"{field_name} exceeds 512 characters")
+
+
+def _catalog_snapshot_source_ids(source_ids: tuple[str, ...]) -> tuple[str, ...]:
+    if not isinstance(source_ids, tuple):
+        raise TypeError("catalog snapshot source_ids must be a tuple")
+    for source_id in source_ids:
+        _catalog_identifier(source_id, "catalog snapshot source_id")
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError("catalog snapshot source_ids cannot contain duplicates")
+    return source_ids
+
+
+def _current_snapshot_sync_id(
+    path: Path,
+    agent_id: str,
+    source_id: str,
+) -> str | None:
+    with _connect(path) as connection:
+        row = connection.execute(
+            "SELECT sync_id FROM snapshots WHERE agent_id = ? AND source_id = ?",
+            (agent_id, source_id),
+        ).fetchone()
+    return None if row is None else str(row[0])
+
+
+def _current_snapshot_row(
+    path: Path,
+    agent_id: str,
+    source_id: str,
+) -> tuple[str, str] | None:
+    with _connect(path) as connection:
+        row = connection.execute(
+            "SELECT sync_id, data FROM snapshots "
+            "WHERE agent_id = ? AND source_id = ?",
+            (agent_id, source_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return str(row[0]), str(row[1])
+
+
+def _decode_catalog_snapshot(value: str) -> SourceCatalogSnapshot:
+    return _expect(_loads(value), SourceCatalogSnapshot)
 
 
 def _validate_semantic_owner(

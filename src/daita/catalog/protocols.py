@@ -9,6 +9,7 @@ from .models import (
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
+    CatalogSnapshotRef,
     CatalogSearchRequest,
     CatalogSearchResult,
     CatalogSummary,
@@ -72,6 +73,17 @@ class CatalogStore(Protocol):
         self,
         snapshot: SourceCatalogSnapshot,
     ) -> SourceCatalogSnapshot: ...
+
+    async def list_current_snapshot_refs(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...],
+    ) -> tuple[CatalogSnapshotRef, ...]: ...
+
+    async def load_current_snapshot(
+        self,
+        ref: CatalogSnapshotRef,
+    ) -> SourceCatalogSnapshot | None: ...
 
     async def load_sync(self, agent_id: str, sync_id: str) -> CatalogSync | None: ...
 

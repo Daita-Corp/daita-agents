@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
@@ -14,8 +15,10 @@ from daita.catalog import (
     CatalogSearchRequest,
     CatalogSync,
     CatalogSyncStatus,
+    CatalogTraversalRequest,
     ResourceKind,
 )
+from daita.catalog.models import CatalogSnapshotRef
 from daita.llm.models import FinishReason, ModelProfile, ModelResponse
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
@@ -33,6 +36,24 @@ def _database(path: Path, *, with_tables: bool = True) -> None:
                 parent_id INTEGER REFERENCES parent(id)
             );
             """)
+
+
+def _snapshot_decode_counter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[], int]:
+    original_loads = sqlite_store._loads
+    counter_lock = threading.Lock()
+    count = 0
+
+    def counting_loads(value: str) -> object:
+        nonlocal count
+        if '"__record__":"SourceCatalogSnapshot"' in value:
+            with counter_lock:
+                count += 1
+        return original_loads(value)
+
+    monkeypatch.setattr(sqlite_store, "_loads", counting_loads)
+    return lambda: count
 
 
 async def test_catalog_summary_aggregates_current_active_snapshots_and_latest_sync(
@@ -136,6 +157,10 @@ async def test_catalog_preview_contains_only_active_current_snapshot_truth(
         )
 
         await agent.detach(first.id)
+        assert all(
+            key[:2] != (agent.id, first.id)
+            for key in agent._embedded._store._decoded_catalog_snapshots
+        )
         preview = await agent.catalog_preview(limit=50)
         assert tuple(resource.name for resource in preview) == ("second_only",)
         assert {resource.source_id for resource in preview} == {second.id}
@@ -148,6 +173,10 @@ async def test_catalog_preview_contains_only_active_current_snapshot_truth(
         assert tuple(resource.name for resource in preview) == ("refreshed_only",)
 
         await agent.detach(second.id)
+        assert all(
+            key[:2] != (agent.id, second.id)
+            for key in agent._embedded._store._decoded_catalog_snapshots
+        )
         assert await agent.catalog_preview(limit=50) == ()
         assert (await agent.catalog_summary()).is_empty is True
     finally:
@@ -174,6 +203,249 @@ async def test_broad_catalog_discovery_matches_any_term_and_resource_kind(
         assert tuple(hit.name for hit in result.hits) == ("child", "parent")
         assert result.total_matches == 2
         assert all("kind" in hit.matched_fields for hit in result.hits)
+    finally:
+        await agent.close()
+
+
+async def test_current_snapshot_refs_are_agent_and_source_isolated(tmp_path: Path):
+    first_database = tmp_path / "refs-first.sqlite"
+    second_database = tmp_path / "refs-second.sqlite"
+    _database(first_database)
+    _database(second_database)
+    agent = await Agent.create("snapshot-refs", root=tmp_path)
+    try:
+        first = await agent.attach(SQLiteSource(first_database))
+        second = await agent.attach(SQLiteSource(second_database))
+        store = agent._embedded._store
+
+        refs = await store.list_current_snapshot_refs(agent.id, ())
+        assert refs == tuple(
+            sorted(refs, key=lambda item: (item.source_id, item.sync_id))
+        )
+        assert {item.source_id for item in refs} == {first.id, second.id}
+        assert all(item.agent_id == agent.id for item in refs)
+        assert (
+            await store.list_current_snapshot_refs(
+                agent.id,
+                (second.id, first.id),
+            )
+            == refs
+        )
+        assert await store.list_current_snapshot_refs(agent.id, (first.id,)) == tuple(
+            item for item in refs if item.source_id == first.id
+        )
+        assert await store.list_current_snapshot_refs("another-agent", ()) == ()
+        assert (
+            await store.list_current_snapshot_refs(agent.id, ("missing-source",)) == ()
+        )
+
+        with pytest.raises(ValueError, match="duplicates"):
+            await store.list_current_snapshot_refs(agent.id, (first.id, first.id))
+        with pytest.raises(ValueError, match="non-empty"):
+            await store.list_current_snapshot_refs(agent.id, ("",))
+    finally:
+        await agent.close()
+
+
+async def test_current_snapshot_load_requires_the_exact_current_reference(
+    tmp_path: Path,
+):
+    database = tmp_path / "exact-ref.sqlite"
+    _database(database)
+    agent = await Agent.create("snapshot-exact-ref", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        store = agent._embedded._store
+        ref = (await store.list_current_snapshot_refs(agent.id, (source.id,)))[0]
+
+        snapshot = await store.load_current_snapshot(ref)
+        assert snapshot is not None
+        assert snapshot.sync.agent_id == ref.agent_id
+        assert snapshot.sync.source_id == ref.source_id
+        assert snapshot.sync.id == ref.sync_id
+        assert (
+            await store.load_current_snapshot(
+                CatalogSnapshotRef(
+                    agent_id=ref.agent_id,
+                    source_id=ref.source_id,
+                    sync_id="not-current",
+                )
+            )
+            is None
+        )
+        assert (
+            await store.load_current_snapshot(
+                CatalogSnapshotRef(
+                    agent_id="another-agent",
+                    source_id=ref.source_id,
+                    sync_id=ref.sync_id,
+                )
+            )
+            is None
+        )
+    finally:
+        await agent.close()
+
+
+def test_snapshot_ref_rejects_unbounded_or_blank_identity_fields():
+    with pytest.raises(ValueError, match="non-empty"):
+        CatalogSnapshotRef(agent_id="", source_id="source", sync_id="sync")
+    with pytest.raises(ValueError, match="surrounding whitespace"):
+        CatalogSnapshotRef(agent_id="agent", source_id=" source", sync_id="sync")
+    with pytest.raises(ValueError, match="512"):
+        CatalogSnapshotRef(agent_id="agent", source_id="source", sync_id="x" * 513)
+
+
+async def test_catalog_reads_decode_one_generation_once_and_share_concurrent_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "decode-once.sqlite"
+    _database(database)
+    agent = await Agent.create("snapshot-decode-once", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        reader = SQLiteStateStore(agent.home / "state.db")
+        ref = (await reader.list_current_snapshot_refs(agent.id, (source.id,)))[0]
+        decode_count = _snapshot_decode_counter(monkeypatch)
+
+        loaded = await asyncio.gather(
+            *(reader.load_current_snapshot(ref) for _ in range(16))
+        )
+        assert loaded[0] is not None
+        assert all(snapshot is loaded[0] for snapshot in loaded)
+        snapshot = loaded[0]
+        assert snapshot is not None
+
+        resources = await reader.list_resources(agent.id, source.id)
+        await reader.load_resource(agent.id, resources[0].id)
+        await reader.load_revision(
+            agent.id,
+            resources[0].id,
+            resources[0].current_revision,
+        )
+        await reader.load_facets(
+            agent.id,
+            resources[0].id,
+            resources[0].current_revision,
+        )
+        await reader.load_incident_relationships(agent.id, resources[0].id)
+        await reader.load_relationships(
+            agent.id,
+            tuple(item.id for item in snapshot.relationships),
+        )
+        await reader.search(
+            CatalogSearchRequest(agent_id=agent.id, query="parent", limit=50)
+        )
+        await reader.traverse(
+            CatalogTraversalRequest(
+                agent_id=agent.id,
+                from_resource_ids=(snapshot.relationships[0].from_resource_id,),
+                to_resource_ids=(snapshot.relationships[0].to_resource_id,),
+            )
+        )
+        assert decode_count() == 1
+    finally:
+        await agent.close()
+
+
+async def test_failed_snapshot_decode_does_not_publish_a_cache_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "failed-decode.sqlite"
+    _database(database)
+    agent = await Agent.create("failed-snapshot-decode", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        reader = SQLiteStateStore(agent.home / "state.db")
+        ref = (await reader.list_current_snapshot_refs(agent.id, (source.id,)))[0]
+        original_loads = sqlite_store._loads
+        fail_next_snapshot = True
+
+        def failing_loads(value: str) -> object:
+            nonlocal fail_next_snapshot
+            if fail_next_snapshot and '"__record__":"SourceCatalogSnapshot"' in value:
+                fail_next_snapshot = False
+                raise ValueError("forced snapshot decode failure")
+            return original_loads(value)
+
+        monkeypatch.setattr(sqlite_store, "_loads", failing_loads)
+        with pytest.raises(ValueError, match="forced snapshot decode failure"):
+            await reader.load_current_snapshot(ref)
+        assert reader._decoded_catalog_snapshots == {}
+
+        snapshot = await reader.load_current_snapshot(ref)
+        assert snapshot is not None
+        assert set(reader._decoded_catalog_snapshots) == {
+            (ref.agent_id, ref.source_id, ref.sync_id)
+        }
+    finally:
+        await agent.close()
+
+
+async def test_refresh_invalidates_stale_ref_and_decodes_the_new_generation_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "generation-refresh.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE old_table (id INTEGER PRIMARY KEY)")
+    agent = await Agent.create("snapshot-generation-refresh", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        reader = SQLiteStateStore(agent.home / "state.db")
+        decode_count = _snapshot_decode_counter(monkeypatch)
+        old_ref = (await reader.list_current_snapshot_refs(agent.id, (source.id,)))[0]
+        old_resources = await reader.list_resources(agent.id, source.id)
+        assert tuple(item.name for item in old_resources) == ("old_table",)
+        assert decode_count() == 1
+
+        with sqlite3.connect(database) as connection:
+            connection.execute("DROP TABLE old_table")
+            connection.execute("CREATE TABLE new_table (id INTEGER PRIMARY KEY)")
+        await agent.refresh_source(source.id)
+
+        new_ref = (await reader.list_current_snapshot_refs(agent.id, (source.id,)))[0]
+        assert new_ref != old_ref
+        assert await reader.load_current_snapshot(old_ref) is None
+        new_resources = await reader.list_resources(agent.id, source.id)
+        assert tuple(item.name for item in new_resources) == ("new_table",)
+        assert await reader.load_resource(agent.id, old_resources[0].id) is None
+        assert decode_count() == 2
+        assert set(reader._decoded_catalog_snapshots) == {
+            (new_ref.agent_id, new_ref.source_id, new_ref.sync_id)
+        }
+    finally:
+        await agent.close()
+
+
+async def test_failed_snapshot_commit_does_not_publish_candidate_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "failed-cache-publication.sqlite"
+    _database(database)
+    agent = await Agent.create("failed-cache-publication", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        store = agent._embedded._store
+        cache_before = dict(store._decoded_catalog_snapshots)
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE uncommitted (id INTEGER PRIMARY KEY)")
+
+        def fail_commit(connection):
+            raise RuntimeError("forced catalog commit failure")
+
+        monkeypatch.setattr(sqlite_store, "_commit_catalog_transaction", fail_commit)
+        with pytest.raises(RuntimeError, match="forced catalog commit failure"):
+            await agent.refresh_source(source.id)
+
+        assert store._decoded_catalog_snapshots == cache_before
+        assert tuple(
+            item.name
+            for item in await agent.list_catalog_resources(source_id=source.id)
+        ) == ("child", "parent")
     finally:
         await agent.close()
 
@@ -260,6 +532,7 @@ async def test_refresh_cancellation_before_transaction_keeps_old_snapshot(
     agent = await Agent.create("pre-commit", root=tmp_path)
     source = await agent.attach(SQLiteSource(database))
     old_resources = await agent.list_catalog_resources(source_id=source.id)
+    cache_before = dict(agent._embedded._store._decoded_catalog_snapshots)
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE later (id INTEGER PRIMARY KEY)")
 
@@ -285,6 +558,7 @@ async def test_refresh_cancellation_before_transaction_keeps_old_snapshot(
 
         current_resources = await agent.list_catalog_resources(source_id=source.id)
         assert current_resources == old_resources
+        assert agent._embedded._store._decoded_catalog_snapshots == cache_before
         with sqlite3.connect(agent.home / "state.db") as connection:
             sync_ids = tuple(
                 row[0]

@@ -10,6 +10,7 @@ from .models import (
     CatalogFacet,
     CatalogRelationship,
     CatalogResource,
+    CatalogResourceRevision,
     CatalogSchemaRequest,
     CatalogSearchHit,
     CatalogSearchRequest,
@@ -22,6 +23,7 @@ from .models import (
     RelationshipDirection,
     RelationshipKind,
     ResourceKind,
+    SourceCatalogSnapshot,
 )
 from .protocols import CatalogResourceNotFoundError, CatalogStore, CatalogStoreError
 
@@ -33,6 +35,10 @@ _SCHEMA_COLUMN_LIMIT = 256
 _SCHEMA_KEY_LIMIT = 64
 _SCHEMA_RELATIONSHIP_LIMIT = 200
 _SCHEMA_STRUCTURAL_FACT_LIMIT = 32
+
+
+class _CatalogGenerationChanged(RuntimeError):
+    """Signal one bounded schema-slice retry from fresh snapshot references."""
 
 
 class CatalogService:
@@ -89,13 +95,19 @@ class CatalogService:
         )
 
     async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
-        active_source_ids = {
-            registration.id
-            for registration in await self._sources.list_sources(request.agent_id)
-            if registration.agent_id == request.agent_id and registration.active
-        }
+        active_source_ids = set(await self._active_source_ids(request.agent_id))
         if request.source_ids:
             active_source_ids.intersection_update(request.source_ids)
+        return await self._search_active_sources(
+            request,
+            tuple(sorted(active_source_ids)),
+        )
+
+    async def _search_active_sources(
+        self,
+        request: CatalogSearchRequest,
+        active_source_ids: tuple[str, ...],
+    ) -> CatalogSearchResult:
         if not active_source_ids:
             return CatalogSearchResult(
                 request=request,
@@ -104,15 +116,14 @@ class CatalogService:
                 truncated=False,
             )
 
-        ordered_source_ids = tuple(sorted(active_source_ids))
         scoped_results = []
-        for offset in range(0, len(ordered_source_ids), 64):
+        for offset in range(0, len(active_source_ids), 64):
             scoped_results.append(
                 await self._store.search(
                     CatalogSearchRequest(
                         agent_id=request.agent_id,
                         query=request.query,
-                        source_ids=ordered_source_ids[offset : offset + 64],
+                        source_ids=active_source_ids[offset : offset + 64],
                         resource_kinds=request.resource_kinds,
                         limit=request.limit,
                     )
@@ -144,43 +155,143 @@ class CatalogService:
 
         if not isinstance(request, CatalogSchemaRequest):
             raise TypeError("request must be a CatalogSchemaRequest record")
-        if request.source_id is not None:
-            await self._active_source(request.agent_id, request.source_id)
+        for attempt in range(2):
+            active_source_ids = await self._active_source_ids(request.agent_id)
+            if (
+                request.source_id is not None
+                and request.source_id not in active_source_ids
+            ):
+                raise CatalogStoreError(
+                    f"unknown active catalog source for {request.agent_id}: "
+                    f"{request.source_id}"
+                )
+            refs = (
+                ()
+                if not active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    active_source_ids,
+                )
+            )
+            snapshots: list[SourceCatalogSnapshot] = []
+            generation_changed = False
+            for ref in refs:
+                snapshot = await self._store.load_current_snapshot(ref)
+                if snapshot is None:
+                    generation_changed = True
+                    break
+                snapshots.append(snapshot)
+            if generation_changed:
+                if attempt == 0:
+                    continue
+                break
+            try:
+                projection = await self._schema_slice_from_snapshots(
+                    request,
+                    tuple(snapshots),
+                    active_source_ids,
+                )
+            except _CatalogGenerationChanged:
+                if attempt == 0:
+                    continue
+                break
+            current_source_ids = await self._active_source_ids(request.agent_id)
+            current_refs = (
+                ()
+                if not current_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    current_source_ids,
+                )
+            )
+            if current_source_ids == active_source_ids and current_refs == refs:
+                return projection
+            if attempt == 1:
+                break
+        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
+
+    async def _schema_slice_from_snapshots(
+        self,
+        request: CatalogSchemaRequest,
+        snapshots: tuple[SourceCatalogSnapshot, ...],
+        active_source_ids: tuple[str, ...],
+    ) -> FrozenJsonObject:
+        resources_by_id: dict[str, CatalogResource] = {}
+        revisions_by_resource_id: dict[str, CatalogResourceRevision] = {}
+        facets_by_resource_id: dict[str, list[CatalogFacet]] = {}
+        relationships_by_id: dict[str, CatalogRelationship] = {}
+        incident_by_resource_id: dict[str, list[CatalogRelationship]] = {}
+        all_syncs_by_id: dict[str, CatalogSync] = {}
+        for snapshot in snapshots:
+            sync = snapshot.sync
+            if (
+                sync.agent_id != request.agent_id
+                or sync.source_id not in active_source_ids
+                or sync.id in all_syncs_by_id
+            ):
+                raise CatalogStoreError("catalog snapshot set has invalid ownership")
+            all_syncs_by_id[sync.id] = sync
+            for resource in snapshot.resources:
+                if resource.id in resources_by_id:
+                    raise CatalogStoreError("catalog snapshot set repeats a resource")
+                resources_by_id[resource.id] = resource
+            for revision in snapshot.revisions:
+                if revision.resource_id in revisions_by_resource_id:
+                    raise CatalogStoreError("catalog snapshot set repeats a revision")
+                revisions_by_resource_id[revision.resource_id] = revision
+            for facet in snapshot.facets:
+                facets_by_resource_id.setdefault(facet.resource_id, []).append(facet)
+            for relationship in snapshot.relationships:
+                if relationship.id in relationships_by_id:
+                    raise CatalogStoreError(
+                        "catalog snapshot set repeats a relationship"
+                    )
+                relationships_by_id[relationship.id] = relationship
+                incident_by_resource_id.setdefault(
+                    relationship.from_resource_id,
+                    [],
+                ).append(relationship)
+                incident_by_resource_id.setdefault(
+                    relationship.to_resource_id,
+                    [],
+                ).append(relationship)
 
         match_by_resource_id: dict[str, CatalogSearchHit] = {}
         if request.query is not None:
-            search = await self.search(
-                CatalogSearchRequest(
-                    agent_id=request.agent_id,
-                    query=request.query,
-                    source_ids=(
-                        () if request.source_id is None else (request.source_id,)
-                    ),
-                    limit=50,
-                )
+            scoped_source_ids = (
+                active_source_ids if request.source_id is None else (request.source_id,)
+            )
+            search_request = CatalogSearchRequest(
+                agent_id=request.agent_id,
+                query=request.query,
+                source_ids=(() if request.source_id is None else (request.source_id,)),
+                limit=50,
+            )
+            search = await self._search_active_sources(
+                search_request,
+                scoped_source_ids,
             )
             match_by_resource_id = {hit.resource_id: hit for hit in search.hits}
         else:
             search = None
 
         if request.resource_ids:
-            resources_by_id: dict[str, CatalogResource] = {}
+            selected_resources_by_id: dict[str, CatalogResource] = {}
             for resource_id in request.resource_ids:
-                resource = await self._active_resource(
-                    request.agent_id,
-                    resource_id,
-                )
+                candidate_resource = resources_by_id.get(resource_id)
+                if candidate_resource is None:
+                    raise CatalogResourceNotFoundError(request.agent_id, resource_id)
                 if (
                     request.source_id is not None
-                    and resource.source_id != request.source_id
+                    and candidate_resource.source_id != request.source_id
                 ):
                     raise CatalogStoreError(
                         "catalog schema resource is outside requested source scope"
                     )
-                resources_by_id[resource.id] = resource
+                selected_resources_by_id[candidate_resource.id] = candidate_resource
             candidates = tuple(
                 sorted(
-                    resources_by_id.values(),
+                    selected_resources_by_id.values(),
                     key=lambda item: (
                         item.native_identity.casefold(),
                         item.native_identity,
@@ -193,43 +304,49 @@ class CatalogService:
             assert search is not None
             candidates_list: list[CatalogResource] = []
             for hit in search.hits:
-                resource = await self._active_resource(
-                    request.agent_id,
-                    hit.resource_id,
-                )
+                hit_resource = resources_by_id.get(hit.resource_id)
+                if (
+                    hit_resource is None
+                    or hit_resource.current_revision != hit.revision
+                    or hit_resource.source_id != hit.source_id
+                ):
+                    raise _CatalogGenerationChanged
                 if (
                     request.source_id is not None
-                    and resource.source_id != request.source_id
+                    and hit_resource.source_id != request.source_id
                 ):
                     raise CatalogStoreError(
                         "catalog schema search escaped requested source scope"
                     )
-                candidates_list.append(resource)
+                candidates_list.append(hit_resource)
             candidates = tuple(candidates_list)
             total_matches = search.total_matches
 
         selected = candidates[: request.limit]
-        resources_cache = {resource.id: resource for resource in selected}
-        sync_by_id: dict[str, CatalogSync] = {}
+        selected_resources = {resource.id: resource for resource in selected}
+        selected_syncs_by_id: dict[str, CatalogSync] = {}
         resource_payloads: list[dict[str, object]] = []
         columns_truncated = False
         primary_keys_truncated = False
         unique_keys_truncated = False
         structural_facts_truncated = False
         for resource in selected:
-            sync = await self._current_resource_sync(
-                request.agent_id,
-                resource,
-                sync_by_id,
-            )
+            resource_sync = all_syncs_by_id.get(resource.current_sync_id)
+            if (
+                resource_sync is None
+                or resource_sync.agent_id != request.agent_id
+                or resource_sync.source_id != resource.source_id
+                or resource_sync.status is not CatalogSyncStatus.SUCCEEDED
+            ):
+                raise CatalogStoreError("catalog resource sync is not current")
+            selected_syncs_by_id[resource_sync.id] = resource_sync
             (
                 structural,
                 resource_columns_truncated,
                 resource_primary_keys_truncated,
                 resource_unique_keys_truncated,
-            ) = await self._schema_resource_structure(
-                request.agent_id,
-                resource,
+            ) = self._schema_resource_structure(
+                tuple(facets_by_resource_id.get(resource.id, ())),
             )
             match_hit = match_by_resource_id.get(resource.id)
             matched_fields = () if match_hit is None else match_hit.matched_fields
@@ -253,7 +370,7 @@ class CatalogService:
                             :_SCHEMA_STRUCTURAL_FACT_LIMIT
                         ],
                     },
-                    "sync_id": sync.id,
+                    "sync_id": resource_sync.id,
                     "unique_key_fields": structural["unique_key_fields"],
                 }
             )
@@ -271,28 +388,32 @@ class CatalogService:
         relationship_payloads: list[dict[str, object]] = []
         relationships_truncated = False
         if request.include_relationships:
-            relationships_by_id: dict[str, CatalogRelationship] = {}
+            selected_relationships_by_id: dict[str, CatalogRelationship] = {}
             for resource in selected:
-                incident = await self._store.load_incident_relationships(
-                    request.agent_id,
-                    resource.id,
-                    limit=_SCHEMA_RELATIONSHIP_LIMIT + 1,
+                incident = tuple(
+                    sorted(
+                        incident_by_resource_id.get(resource.id, ()),
+                        key=lambda item: item.id,
+                    )[: _SCHEMA_RELATIONSHIP_LIMIT + 1]
                 )
                 if len(incident) > _SCHEMA_RELATIONSHIP_LIMIT:
                     relationships_truncated = True
                 for relationship in incident:
-                    relationships_by_id[relationship.id] = relationship
+                    selected_relationships_by_id[relationship.id] = relationship
             relationships = tuple(
-                sorted(relationships_by_id.values(), key=lambda item: item.id)
+                sorted(
+                    selected_relationships_by_id.values(),
+                    key=lambda item: item.id,
+                )
             )
             if len(relationships) > _SCHEMA_RELATIONSHIP_LIMIT:
                 relationships_truncated = True
-            selected_ids = set(resources_cache)
+            selected_ids = set(selected_resources)
             for relationship in relationships[:_SCHEMA_RELATIONSHIP_LIMIT]:
-                from_resource, to_resource = await self._current_relationship_endpoints(
-                    request.agent_id,
+                from_resource, to_resource = self._snapshot_relationship_endpoints(
                     relationship,
-                    resources_cache,
+                    resources_by_id,
+                    revisions_by_resource_id,
                 )
                 unselected_endpoints = tuple(
                     _schema_endpoint_payload(endpoint)
@@ -326,7 +447,7 @@ class CatalogService:
                 "sync_id": sync.id,
             }
             for sync in sorted(
-                sync_by_id.values(),
+                selected_syncs_by_id.values(),
                 key=lambda item: (item.source_id, item.id),
             )
         )
@@ -355,6 +476,15 @@ class CatalogService:
                 },
                 "trust_classification": "untrusted_external_data",
             }
+        )
+
+    async def _active_source_ids(self, agent_id: str) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                registration.id
+                for registration in await self._sources.list_sources(agent_id)
+                if registration.agent_id == agent_id and registration.active
+            )
         )
 
     async def inspect_resource(
@@ -594,16 +724,10 @@ class CatalogService:
             raise CatalogStoreError("catalog resource sync is not current")
         return sync
 
-    async def _schema_resource_structure(
+    def _schema_resource_structure(
         self,
-        agent_id: str,
-        resource: CatalogResource,
+        facets: tuple[CatalogFacet, ...],
     ) -> tuple[dict[str, object], bool, bool, bool]:
-        facets = await self._store.load_facets(
-            agent_id,
-            resource.id,
-            resource.current_revision,
-        )
         tabular = next(
             (facet for facet in facets if facet.kind is FacetKind.TABULAR),
             None,
@@ -682,6 +806,37 @@ class CatalogService:
             len(ordered_primary) > _SCHEMA_KEY_LIMIT,
             len(ordered_unique_keys) > _SCHEMA_KEY_LIMIT,
         )
+
+    def _snapshot_relationship_endpoints(
+        self,
+        relationship: CatalogRelationship,
+        resources_by_id: dict[str, CatalogResource],
+        revisions_by_resource_id: dict[str, CatalogResourceRevision],
+    ) -> tuple[CatalogResource, CatalogResource]:
+        endpoints: list[CatalogResource] = []
+        for resource_id in (
+            relationship.from_resource_id,
+            relationship.to_resource_id,
+        ):
+            endpoint = resources_by_id.get(resource_id)
+            if endpoint is None:
+                raise CatalogStoreError(
+                    "catalog relationship has a non-current endpoint"
+                )
+            current_revision = revisions_by_resource_id.get(endpoint.id)
+            if (
+                endpoint.source_id != relationship.source_id
+                or endpoint.current_sync_id != relationship.sync_id
+                or current_revision is None
+                or current_revision.revision != endpoint.current_revision
+                or current_revision.sync_id != endpoint.current_sync_id
+                or relationship.revision not in current_revision.relationship_revisions
+            ):
+                raise CatalogStoreError(
+                    "catalog relationship is not current for both endpoints"
+                )
+            endpoints.append(endpoint)
+        return endpoints[0], endpoints[1]
 
     async def _current_relationship_endpoints(
         self,

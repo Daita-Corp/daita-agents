@@ -32,6 +32,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
+import daita.storage.sqlite as sqlite_store
 
 
 def _fixture_database(path: Path, *, reverse: bool = False) -> None:
@@ -862,6 +863,69 @@ async def test_schema_refresh_filters_old_resources_and_carries_new_revisions(
             "value",
             "later",
         )
+    finally:
+        await agent.close()
+
+
+async def test_schema_slice_reopens_with_one_decode_and_identical_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "coherent-reopen.sqlite"
+    _fixture_database(database)
+    agent = await Agent.create("catalog-schema-coherent-reopen", root=tmp_path)
+    source = await agent.attach(SQLiteSource(database))
+    resources = await agent.list_catalog_resources(source_id=source.id)
+    resource_ids = tuple(resource.id for resource in resources)
+    expected = canonical_json(await _schema(agent, resource_ids=resource_ids))
+    await agent.close()
+
+    original_loads = sqlite_store._loads
+    decode_count = 0
+
+    def counting_loads(value: str) -> object:
+        nonlocal decode_count
+        if '"__record__":"SourceCatalogSnapshot"' in value:
+            decode_count += 1
+        return original_loads(value)
+
+    monkeypatch.setattr(sqlite_store, "_loads", counting_loads)
+    reopened = await Agent.open("catalog-schema-coherent-reopen", root=tmp_path)
+    try:
+        first = await _schema(reopened, resource_ids=resource_ids)
+        second = await _schema(reopened, resource_ids=resource_ids)
+        assert canonical_json(first) == expected
+        assert canonical_json(second) == expected
+        assert decode_count == 1
+    finally:
+        await reopened.close()
+
+
+async def test_schema_slice_retries_a_generation_conflict_only_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "generation-conflict.sqlite"
+    _fixture_database(database)
+    agent = await Agent.create("catalog-schema-generation-conflict", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        resource = (await agent.list_catalog_resources(source_id=source.id))[0]
+        store = agent._embedded._store
+        load_count = 0
+
+        async def changing_generation(ref):
+            nonlocal load_count
+            load_count += 1
+            return None
+
+        monkeypatch.setattr(store, "load_current_snapshot", changing_generation)
+        with pytest.raises(
+            CatalogStoreError,
+            match="generation changed repeatedly",
+        ):
+            await _schema(agent, resource_ids=(resource.id,))
+        assert load_count == 2
     finally:
         await agent.close()
 
