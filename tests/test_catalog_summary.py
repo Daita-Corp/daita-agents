@@ -19,6 +19,8 @@ from daita.catalog import (
     ResourceKind,
 )
 from daita.catalog.models import CatalogSnapshotRef
+from daita.catalog.protocols import CatalogStoreError
+import daita.catalog.service as catalog_service
 from daita.llm.models import FinishReason, ModelProfile, ModelResponse
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
@@ -207,6 +209,362 @@ async def test_broad_catalog_discovery_matches_any_term_and_resource_kind(
         await agent.close()
 
 
+async def test_catalog_search_compiles_one_generation_once_for_concurrent_cold_queries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "compile-once.sqlite"
+    _database(database)
+    agent = await Agent.create("catalog-index-compile-once", root=tmp_path)
+    try:
+        await agent.attach(SQLiteSource(database))
+        original_compile = catalog_service._compile_source_index
+        compile_count = 0
+
+        def counting_compile(snapshot):
+            nonlocal compile_count
+            compile_count += 1
+            return original_compile(snapshot)
+
+        monkeypatch.setattr(
+            catalog_service,
+            "_compile_source_index",
+            counting_compile,
+        )
+        requests = tuple(
+            CatalogSearchRequest(agent_id=agent.id, query="parent", limit=10)
+            for _ in range(16)
+        )
+        results = await asyncio.gather(
+            *(agent.search_catalog(request) for request in requests)
+        )
+
+        assert compile_count == 1
+        assert all(result == results[0] for result in results)
+        assert tuple(hit.name for hit in results[0].hits) == ("parent", "child")
+    finally:
+        await agent.close()
+
+
+async def test_non_empty_catalog_search_ranks_only_posting_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "posting-candidates.sqlite"
+    with sqlite3.connect(database) as connection:
+        for index in range(128):
+            signal = ", needle_signal TEXT" if index == 73 else ""
+            connection.execute(
+                f"CREATE TABLE resource_{index:03d} "
+                f"(id INTEGER PRIMARY KEY{signal})"
+            )
+    agent = await Agent.create("catalog-index-posting-work", root=tmp_path)
+    try:
+        await agent.attach(SQLiteSource(database))
+        original_rank = catalog_service._rank_index_candidate
+        rank_count = 0
+
+        def counting_rank(*args, **kwargs):
+            nonlocal rank_count
+            rank_count += 1
+            return original_rank(*args, **kwargs)
+
+        monkeypatch.setattr(
+            catalog_service,
+            "_rank_index_candidate",
+            counting_rank,
+        )
+        result = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="needle signal",
+                limit=10,
+            )
+        )
+
+        assert tuple(hit.name for hit in result.hits) == ("resource_073",)
+        assert rank_count == 1
+    finally:
+        await agent.close()
+
+
+async def test_catalog_index_refresh_evicts_stale_postings_and_inactive_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "index-refresh.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE old_table " "(id INTEGER PRIMARY KEY, legacyonly TEXT)"
+        )
+    agent = await Agent.create("catalog-index-refresh", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        original_compile = catalog_service._compile_source_index
+        compiled_sync_ids: list[str] = []
+
+        def counting_compile(snapshot):
+            compiled_sync_ids.append(snapshot.sync.id)
+            return original_compile(snapshot)
+
+        monkeypatch.setattr(
+            catalog_service,
+            "_compile_source_index",
+            counting_compile,
+        )
+        first = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="legacyonly",
+                limit=10,
+            )
+        )
+        repeated = await agent.search_catalog(first.request)
+        assert tuple(hit.name for hit in first.hits) == ("old_table",)
+        assert repeated == first
+        assert len(compiled_sync_ids) == 1
+
+        with sqlite3.connect(database) as connection:
+            connection.execute("DROP TABLE old_table")
+            connection.execute(
+                "CREATE TABLE new_table " "(id INTEGER PRIMARY KEY, currentonly TEXT)"
+            )
+        await agent.refresh_source(source.id)
+
+        stale = await agent.search_catalog(first.request)
+        current = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="currentonly",
+                limit=10,
+            )
+        )
+        assert stale.hits == ()
+        assert tuple(hit.name for hit in current.hits) == ("new_table",)
+        assert len(compiled_sync_ids) == 2
+        assert set(agent._embedded._catalog_service._source_indexes) == {
+            (agent.id, source.id, compiled_sync_ids[-1])
+        }
+
+        await agent.detach(source.id)
+        inactive = await agent.search_catalog(current.request)
+        assert inactive.hits == ()
+        assert all(
+            key[:2] != (agent.id, source.id)
+            for key in agent._embedded._catalog_service._source_indexes
+        )
+    finally:
+        await agent.close()
+
+
+async def test_failed_catalog_index_compilation_is_not_published_and_can_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "index-compile-failure.sqlite"
+    _database(database)
+    agent = await Agent.create("catalog-index-compile-failure", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        original_compile = catalog_service._compile_source_index
+        compile_attempts = 0
+
+        def fail_once(snapshot):
+            nonlocal compile_attempts
+            compile_attempts += 1
+            if compile_attempts == 1:
+                raise ValueError("forced index compilation failure")
+            return original_compile(snapshot)
+
+        monkeypatch.setattr(catalog_service, "_compile_source_index", fail_once)
+        request = CatalogSearchRequest(
+            agent_id=agent.id,
+            query="parent",
+            limit=10,
+        )
+        with pytest.raises(CatalogStoreError, match="index compilation failed"):
+            await agent.search_catalog(request)
+        assert agent._embedded._catalog_service._source_indexes == {}
+
+        recovered = await agent.search_catalog(request)
+        assert tuple(hit.name for hit in recovered.hits) == ("parent", "child")
+        assert compile_attempts == 2
+        assert len(agent._embedded._catalog_service._source_indexes) == 1
+        assert next(iter(agent._embedded._catalog_service._source_indexes))[:2] == (
+            agent.id,
+            source.id,
+        )
+    finally:
+        await agent.close()
+
+
+async def test_indexed_search_normalizes_ranks_diversifies_and_exposes_evidence(
+    tmp_path: Path,
+):
+    database = tmp_path / "indexed-ranking.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE "OrderItems" (
+                id INTEGER PRIMARY KEY,
+                "StraßeCode" TEXT,
+                customer_id INTEGER
+            );
+            CREATE INDEX order_items_customer_idx ON "OrderItems"(customer_id);
+            CREATE TABLE "SnakeCaseRecord" (
+                id INTEGER PRIMARY KEY,
+                snake_case_value TEXT
+            );
+            CREATE TABLE showcase (id INTEGER PRIMARY KEY);
+            CREATE TABLE needle (id INTEGER PRIMARY KEY);
+            CREATE TABLE column_match (
+                id INTEGER PRIMARY KEY,
+                needle TEXT
+            );
+            CREATE TABLE customer_revenue (id INTEGER PRIMARY KEY);
+            CREATE TABLE customer_profiles (id INTEGER PRIMARY KEY);
+            CREATE TABLE region_lookup (id INTEGER PRIMARY KEY);
+            CREATE TABLE parent (id INTEGER PRIMARY KEY);
+            CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL REFERENCES parent(id)
+            );
+            CREATE VIEW customer_view AS SELECT id FROM customer_profiles;
+            """)
+    agent = await Agent.create("catalog-index-ranking", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        outside_database = tmp_path / "indexed-ranking-outside.sqlite"
+        with sqlite3.connect(outside_database) as connection:
+            connection.executescript("""
+                CREATE TABLE outside_base (id INTEGER PRIMARY KEY);
+                CREATE TABLE "main.needle" (id INTEGER PRIMARY KEY);
+                CREATE VIEW customer_outside AS SELECT id FROM outside_base;
+                """)
+        await agent.attach(SQLiteSource(outside_database))
+
+        camel = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="ＯＲＤＥＲ items",
+                limit=10,
+            )
+        )
+        unicode = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="STRASSE",
+                limit=10,
+            )
+        )
+        snake_and_camel = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="snake case",
+                limit=10,
+            )
+        )
+        exact = await agent.search_catalog(
+            CatalogSearchRequest(agent_id=agent.id, query="needle", limit=10)
+        )
+        qualified = await agent.search_catalog(
+            CatalogSearchRequest(agent_id=agent.id, query="main.needle", limit=10)
+        )
+        diversified = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="show customer revenue by region",
+                limit=2,
+            )
+        )
+        relationship = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="parent id",
+                limit=50,
+            )
+        )
+        views = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="customer",
+                source_ids=(source.id,),
+                resource_kinds=(ResourceKind.VIEW,),
+                limit=10,
+            )
+        )
+        all_views = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="customer",
+                resource_kinds=(ResourceKind.VIEW,),
+                limit=10,
+            )
+        )
+
+        assert camel.hits[0].name == "OrderItems"
+        assert unicode.hits[0].name == "OrderItems"
+        assert "column:StraßeCode" in unicode.hits[0].matched_fields
+        assert snake_and_camel.hits[0].name == "SnakeCaseRecord"
+        assert "column:snake_case_value" in snake_and_camel.hits[0].matched_fields
+        assert exact.hits[0].name == "needle"
+        assert exact.hits[0].match_reasons == ("resource_name_exact",)
+        exact_column = next(hit for hit in exact.hits if hit.name == "column_match")
+        assert exact_column.match_reasons == ("structural_field_exact",)
+        assert exact.hits[0].score > exact_column.score
+        assert qualified.hits[0].name == "needle"
+        assert qualified.hits[1].name == "main.needle"
+        assert qualified.hits[0].score > exact.hits[0].score
+        assert tuple(hit.name for hit in diversified.hits) == (
+            "customer_revenue",
+            "region_lookup",
+        )
+        assert diversified.total_matches == 6
+        child = next(hit for hit in relationship.hits if hit.name == "child")
+        order_items = next(hit for hit in relationship.hits if hit.name == "OrderItems")
+        assert "column:parent_id" in child.matched_fields
+        assert "index_field:parent_id" not in child.matched_fields
+        assert "relationship_field:parent_id" in child.matched_fields
+        assert "index_field:customer_id" in order_items.matched_fields
+        assert tuple(hit.name for hit in views.hits) == ("customer_view",)
+        assert tuple(hit.name for hit in all_views.hits) == (
+            "customer_outside",
+            "customer_view",
+        )
+    finally:
+        await agent.close()
+
+
+async def test_catalog_search_merges_true_global_top_k_across_more_than_64_sources(
+    tmp_path: Path,
+):
+    agent = await Agent.create("catalog-index-global-top-k", root=tmp_path)
+    try:
+        for index in range(65):
+            database = tmp_path / f"global-{index:03d}.sqlite"
+            table = "target" if index == 64 else f"target_candidate_{index:03d}"
+            with sqlite3.connect(database) as connection:
+                connection.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)")
+            await agent.attach(SQLiteSource(database))
+
+        result = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="target",
+                limit=3,
+            )
+        )
+
+        assert tuple(hit.name for hit in result.hits) == (
+            "target",
+            "target_candidate_000",
+            "target_candidate_001",
+        )
+        assert result.total_matches == 65
+        assert result.truncated is True
+    finally:
+        await agent.close()
+
+
 async def test_current_snapshot_refs_are_agent_and_source_isolated(tmp_path: Path):
     first_database = tmp_path / "refs-first.sqlite"
     second_database = tmp_path / "refs-second.sqlite"
@@ -333,9 +691,6 @@ async def test_catalog_reads_decode_one_generation_once_and_share_concurrent_loa
         await reader.load_relationships(
             agent.id,
             tuple(item.id for item in snapshot.relationships),
-        )
-        await reader.search(
-            CatalogSearchRequest(agent_id=agent.id, query="parent", limit=50)
         )
         await reader.traverse(
             CatalogTraversalRequest(

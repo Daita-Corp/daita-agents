@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+from bisect import bisect_left
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
+import re
+from types import MappingProxyType
 from typing import TYPE_CHECKING
+import unicodedata
 
 from .._json import FrozenJsonObject
 from .models import (
@@ -12,6 +19,7 @@ from .models import (
     CatalogResource,
     CatalogResourceRevision,
     CatalogSchemaRequest,
+    CatalogSnapshotRef,
     CatalogSearchHit,
     CatalogSearchRequest,
     CatalogSearchResult,
@@ -35,6 +43,80 @@ _SCHEMA_COLUMN_LIMIT = 256
 _SCHEMA_KEY_LIMIT = 64
 _SCHEMA_RELATIONSHIP_LIMIT = 200
 _SCHEMA_STRUCTURAL_FACT_LIMIT = 32
+_SEARCH_TOKEN_LIMIT = 64
+_SEARCH_TOKEN_LENGTH_LIMIT = 128
+_SEARCH_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "by",
+        "can",
+        "for",
+        "from",
+        "get",
+        "give",
+        "how",
+        "in",
+        "is",
+        "me",
+        "of",
+        "on",
+        "show",
+        "the",
+        "to",
+        "what",
+        "which",
+    }
+)
+_CAMEL_ACRONYM_BOUNDARY = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+_CAMEL_WORD_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalizedText:
+    complete: str
+    tokens: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedPosting:
+    resource_id: str
+    field_kind: str
+    field_name: str
+    normalized_value: str
+    tokens: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedEdge:
+    neighbor_resource_id: str
+    relationship_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceCatalogIndex:
+    agent_id: str
+    source_id: str
+    sync_id: str
+    snapshot: SourceCatalogSnapshot
+    resources_by_id: Mapping[str, CatalogResource]
+    revisions_by_resource_id: Mapping[str, CatalogResourceRevision]
+    facets_by_resource_id: Mapping[str, tuple[CatalogFacet, ...]]
+    relationships_by_id: Mapping[str, CatalogRelationship]
+    adjacency_by_resource_id: Mapping[str, tuple[_IndexedEdge, ...]]
+    exact_resource_names: Mapping[str, tuple[str, ...]]
+    token_postings: Mapping[str, tuple[_IndexedPosting, ...]]
+    posting_tokens: tuple[str, ...]
+    postings_by_resource_id: Mapping[str, tuple[_IndexedPosting, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class _RankedCandidate:
+    hit: CatalogSearchHit
+    matched_terms: tuple[str, ...]
+    rank_key: tuple[int, int, int, int, int, int, int, int, int, str, str, str]
 
 
 class _CatalogGenerationChanged(RuntimeError):
@@ -53,6 +135,8 @@ class CatalogService:
             raise TypeError("sources must provide source registration reads")
         self._store = store
         self._sources = sources
+        self._source_indexes: dict[tuple[str, str, str], _SourceCatalogIndex] = {}
+        self._source_index_lock = asyncio.Lock()
 
     async def summary(self, agent_id: str) -> CatalogSummary:
         """Project active source counts from their current committed snapshots."""
@@ -95,56 +179,266 @@ class CatalogService:
         )
 
     async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
-        active_source_ids = set(await self._active_source_ids(request.agent_id))
-        if request.source_ids:
-            active_source_ids.intersection_update(request.source_ids)
-        return await self._search_active_sources(
-            request,
-            tuple(sorted(active_source_ids)),
-        )
-
-    async def _search_active_sources(
-        self,
-        request: CatalogSearchRequest,
-        active_source_ids: tuple[str, ...],
-    ) -> CatalogSearchResult:
-        if not active_source_ids:
-            return CatalogSearchResult(
-                request=request,
-                hits=(),
-                total_matches=0,
-                truncated=False,
+        if not isinstance(request, CatalogSearchRequest):
+            raise TypeError("request must be a CatalogSearchRequest record")
+        for attempt in range(2):
+            active_source_ids = await self._active_source_ids(request.agent_id)
+            scoped_source_ids = (
+                tuple(
+                    source_id
+                    for source_id in active_source_ids
+                    if source_id in request.source_ids
+                )
+                if request.source_ids
+                else active_source_ids
             )
-
-        scoped_results = []
-        for offset in range(0, len(active_source_ids), 64):
-            scoped_results.append(
-                await self._store.search(
-                    CatalogSearchRequest(
-                        agent_id=request.agent_id,
-                        query=request.query,
-                        source_ids=active_source_ids[offset : offset + 64],
-                        resource_kinds=request.resource_kinds,
-                        limit=request.limit,
-                    )
+            refs = (
+                ()
+                if not active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    active_source_ids,
                 )
             )
-        ranked_hits = sorted(
-            (hit for result in scoped_results for hit in result.hits),
-            key=lambda hit: (
-                _match_reason_rank(hit.match_reasons),
-                -hit.score,
-                hit.name,
-                hit.resource_id,
-            ),
+            await self._evict_stale_indexes(
+                request.agent_id,
+                active_source_ids,
+                refs,
+            )
+            selected_refs = tuple(
+                ref for ref in refs if ref.source_id in scoped_source_ids
+            )
+            indexes: list[_SourceCatalogIndex] = []
+            generation_changed = False
+            for ref in selected_refs:
+                try:
+                    indexes.append(await self._index_for_ref(ref))
+                except _CatalogGenerationChanged:
+                    generation_changed = True
+                    break
+            if generation_changed:
+                if attempt == 0:
+                    continue
+                break
+            result = self._search_indexes(request, tuple(indexes))
+            current_active_source_ids = await self._active_source_ids(request.agent_id)
+            current_refs = (
+                ()
+                if not current_active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    current_active_source_ids,
+                )
+            )
+            if current_active_source_ids == active_source_ids and current_refs == refs:
+                return result
+            if attempt == 1:
+                break
+        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
+
+    async def _index_for_ref(
+        self,
+        ref: CatalogSnapshotRef,
+    ) -> _SourceCatalogIndex:
+        if not isinstance(ref, CatalogSnapshotRef):
+            raise TypeError("ref must be a CatalogSnapshotRef record")
+        key = (ref.agent_id, ref.source_id, ref.sync_id)
+        cached = self._source_indexes.get(key)
+        if cached is not None:
+            return cached
+        snapshot = await self._store.load_current_snapshot(ref)
+        if snapshot is None:
+            raise _CatalogGenerationChanged
+        if (
+            snapshot.sync.agent_id,
+            snapshot.sync.source_id,
+            snapshot.sync.id,
+        ) != key:
+            raise CatalogStoreError("catalog snapshot disagrees with its reference")
+        return await self._index_for_snapshot(snapshot)
+
+    async def _index_for_snapshot(
+        self,
+        snapshot: SourceCatalogSnapshot,
+    ) -> _SourceCatalogIndex:
+        sync = snapshot.sync
+        key = (sync.agent_id, sync.source_id, sync.id)
+        cached = self._source_indexes.get(key)
+        if cached is not None:
+            return cached
+        async with self._source_index_lock:
+            cached = self._source_indexes.get(key)
+            if cached is not None:
+                return cached
+            try:
+                compiled = _compile_source_index(snapshot)
+            except CatalogStoreError:
+                raise
+            except Exception as exc:
+                raise CatalogStoreError(
+                    "catalog index compilation failed for "
+                    f"{sync.agent_id}/{sync.source_id}/{sync.id}"
+                ) from exc
+            self._source_indexes[key] = compiled
+            return compiled
+
+    async def _evict_stale_indexes(
+        self,
+        agent_id: str,
+        active_source_ids: tuple[str, ...],
+        refs: tuple[CatalogSnapshotRef, ...],
+    ) -> None:
+        active = set(active_source_ids)
+        current_sync_by_source = {
+            ref.source_id: ref.sync_id for ref in refs if ref.agent_id == agent_id
+        }
+        async with self._source_index_lock:
+            for key in tuple(self._source_indexes):
+                cached_agent_id, source_id, sync_id = key
+                if cached_agent_id != agent_id:
+                    continue
+                if (
+                    source_id not in active
+                    or current_sync_by_source.get(source_id) != sync_id
+                ):
+                    del self._source_indexes[key]
+
+    def _search_indexes(
+        self,
+        request: CatalogSearchRequest,
+        indexes: tuple[_SourceCatalogIndex, ...],
+    ) -> CatalogSearchResult:
+        for index in indexes:
+            if index.agent_id != request.agent_id or (
+                request.source_ids and index.source_id not in request.source_ids
+            ):
+                raise CatalogStoreError("catalog search index escaped request scope")
+
+        normalized_query = _normalize_search_text(request.query)
+        significant_terms = tuple(
+            token
+            for token in normalized_query.tokens
+            if token not in _SEARCH_STOP_WORDS
         )
-        hits = tuple(ranked_hits[: request.limit])
-        total_matches = sum(result.total_matches for result in scoped_results)
+        resource_kinds = set(request.resource_kinds)
+        index_by_source_id = {index.source_id: index for index in indexes}
+
+        if not normalized_query.complete:
+            resources_by_id = {
+                resource.id: resource
+                for index in indexes
+                for resource in index.resources_by_id.values()
+                if not resource_kinds or resource.kind in resource_kinds
+            }
+            candidates = tuple(
+                _inventory_candidate(resource)
+                for resource in sorted(
+                    resources_by_id.values(),
+                    key=_resource_search_tie_key,
+                )
+            )
+        else:
+            postings_by_candidate: dict[str, set[_IndexedPosting]] = {}
+            candidate_resources: dict[str, CatalogResource] = {}
+            for index in indexes:
+                exact_ids = index.exact_resource_names.get(
+                    normalized_query.complete,
+                    (),
+                )
+                for resource_id in exact_ids:
+                    resource = index.resources_by_id[resource_id]
+                    if resource_kinds and resource.kind not in resource_kinds:
+                        continue
+                    candidate_resources[resource_id] = resource
+                    matching = tuple(
+                        posting
+                        for posting in index.postings_by_resource_id.get(
+                            resource_id,
+                            (),
+                        )
+                        if posting.normalized_value == normalized_query.complete
+                    )
+                    postings_by_candidate.setdefault(resource_id, set()).update(
+                        matching
+                    )
+                for term in significant_terms:
+                    token_position = bisect_left(index.posting_tokens, term)
+                    while token_position < len(index.posting_tokens):
+                        indexed_token = index.posting_tokens[token_position]
+                        if not indexed_token.startswith(term):
+                            break
+                        postings = index.token_postings[indexed_token]
+                        for posting in postings:
+                            resource = index.resources_by_id[posting.resource_id]
+                            if resource_kinds and resource.kind not in resource_kinds:
+                                continue
+                            candidate_resources[posting.resource_id] = resource
+                            postings_by_candidate.setdefault(
+                                posting.resource_id,
+                                set(),
+                            ).add(posting)
+                        token_position += 1
+            candidates = tuple(
+                _rank_index_candidate(
+                    candidate_resources[resource_id],
+                    tuple(sorted(postings, key=_posting_sort_key)),
+                    normalized_query,
+                    significant_terms,
+                )
+                for resource_id, postings in sorted(postings_by_candidate.items())
+            )
+            candidates = _diversify_candidates(candidates, significant_terms)
+
+        direct_ids = {candidate.hit.resource_id for candidate in candidates}
+        neighbor_by_id: dict[
+            str,
+            tuple[tuple[int, str, str, str], CatalogSearchHit],
+        ] = {}
+        for direct_position, candidate in enumerate(candidates):
+            index = index_by_source_id[candidate.hit.source_id]
+            for edge in index.adjacency_by_resource_id.get(
+                candidate.hit.resource_id,
+                (),
+            ):
+                neighbor = index.resources_by_id.get(edge.neighbor_resource_id)
+                if (
+                    neighbor is None
+                    or neighbor.id in direct_ids
+                    or (resource_kinds and neighbor.kind not in resource_kinds)
+                ):
+                    continue
+                order = (
+                    direct_position,
+                    edge.relationship_id,
+                    _normalize_search_text(neighbor.native_identity).complete,
+                    neighbor.id,
+                )
+                hit = CatalogSearchHit(
+                    resource_id=neighbor.id,
+                    source_id=neighbor.source_id,
+                    kind=neighbor.kind,
+                    name=neighbor.name,
+                    revision=neighbor.current_revision,
+                    sensitivity=neighbor.sensitivity,
+                    score=0.0,
+                    matched_fields=(f"relationship:{edge.relationship_id}",),
+                    match_reasons=("relationship_neighbor",),
+                )
+                existing = neighbor_by_id.get(neighbor.id)
+                if existing is None or order < existing[0]:
+                    neighbor_by_id[neighbor.id] = (order, hit)
+
+        direct_hits = tuple(candidate.hit for candidate in candidates)
+        neighbors = tuple(
+            hit for _, hit in sorted(neighbor_by_id.values(), key=lambda item: item[0])
+        )
+        all_hits = (*direct_hits, *neighbors)
+        hits = tuple(all_hits[: request.limit])
         return CatalogSearchResult(
             request=request,
             hits=hits,
-            total_matches=total_matches,
-            truncated=total_matches > len(hits),
+            total_matches=len(all_hits),
+            truncated=len(all_hits) > len(hits),
         )
 
     async def schema_slice(
@@ -185,11 +479,24 @@ class CatalogService:
                 if attempt == 0:
                     continue
                 break
+            await self._evict_stale_indexes(
+                request.agent_id,
+                active_source_ids,
+                refs,
+            )
+            indexes = (
+                tuple(
+                    [await self._index_for_snapshot(snapshot) for snapshot in snapshots]
+                )
+                if request.query is not None
+                else ()
+            )
             try:
                 projection = await self._schema_slice_from_snapshots(
                     request,
                     tuple(snapshots),
                     active_source_ids,
+                    indexes,
                 )
             except _CatalogGenerationChanged:
                 if attempt == 0:
@@ -215,6 +522,7 @@ class CatalogService:
         request: CatalogSchemaRequest,
         snapshots: tuple[SourceCatalogSnapshot, ...],
         active_source_ids: tuple[str, ...],
+        indexes: tuple[_SourceCatalogIndex, ...],
     ) -> FrozenJsonObject:
         resources_by_id: dict[str, CatalogResource] = {}
         revisions_by_resource_id: dict[str, CatalogResourceRevision] = {}
@@ -258,18 +566,19 @@ class CatalogService:
 
         match_by_resource_id: dict[str, CatalogSearchHit] = {}
         if request.query is not None:
-            scoped_source_ids = (
-                active_source_ids if request.source_id is None else (request.source_id,)
-            )
             search_request = CatalogSearchRequest(
                 agent_id=request.agent_id,
                 query=request.query,
                 source_ids=(() if request.source_id is None else (request.source_id,)),
                 limit=50,
             )
-            search = await self._search_active_sources(
+            search = self._search_indexes(
                 search_request,
-                scoped_source_ids,
+                tuple(
+                    index
+                    for index in indexes
+                    if request.source_id is None or index.source_id == request.source_id
+                ),
             )
             match_by_resource_id = {hit.resource_id: hit for hit in search.hits}
         else:
@@ -952,22 +1261,453 @@ def _facet_payload(facet: CatalogFacet) -> dict[str, object]:
     }
 
 
-def _match_reason_rank(match_reasons: tuple[str, ...]) -> int:
-    for reason, rank in (
-        ("resource_name_exact", 0),
-        ("resource_name_prefix", 1),
-        ("resource_name_contains", 2),
-        ("structural_field_exact", 3),
-        ("structural_field_contains", 4),
-        ("metadata_contains", 5),
-        ("relationship_neighbor", 6),
-        ("lexical_exact", 0),
-        ("lexical_prefix", 1),
-        ("lexical_contains", 5),
+def _compile_source_index(snapshot: SourceCatalogSnapshot) -> _SourceCatalogIndex:
+    """Compile one immutable, exact-generation catalog search shard."""
+
+    if not isinstance(snapshot, SourceCatalogSnapshot):
+        raise TypeError("snapshot must be a SourceCatalogSnapshot record")
+    sync = snapshot.sync
+    resources_by_id = {resource.id: resource for resource in snapshot.resources}
+    revisions_by_resource_id = {
+        revision.resource_id: revision for revision in snapshot.revisions
+    }
+    facets_by_resource_id: dict[str, list[CatalogFacet]] = {}
+    for facet in snapshot.facets:
+        facets_by_resource_id.setdefault(facet.resource_id, []).append(facet)
+    relationships_by_id = {
+        relationship.id: relationship for relationship in snapshot.relationships
+    }
+
+    postings_by_resource_id: dict[str, set[_IndexedPosting]] = {
+        resource_id: set() for resource_id in resources_by_id
+    }
+    exact_resource_names: dict[str, set[str]] = {}
+
+    def add_posting(
+        resource_id: str,
+        field_kind: str,
+        field_name: str,
+        value: str,
+    ) -> None:
+        normalized = _normalize_search_text(value)
+        posting = _IndexedPosting(
+            resource_id=resource_id,
+            field_kind=field_kind,
+            field_name=field_name,
+            normalized_value=normalized.complete,
+            tokens=normalized.tokens,
+        )
+        postings_by_resource_id[resource_id].add(posting)
+
+    for resource in sorted(resources_by_id.values(), key=lambda item: item.id):
+        for field_kind, field_name, value in (
+            ("resource_name", "name", resource.name),
+            ("native_identity", "native_identity", resource.native_identity),
+        ):
+            add_posting(resource.id, field_kind, field_name, value)
+            normalized = _normalize_search_text(value).complete
+            exact_resource_names.setdefault(normalized, set()).add(resource.id)
+        add_posting(
+            resource.id,
+            "kind",
+            "kind",
+            f"{resource.kind.value} {resource.kind.value}s",
+        )
+
+        for facet in sorted(
+            facets_by_resource_id.get(resource.id, ()),
+            key=lambda item: (item.kind.value, item.revision),
+        ):
+            if facet.kind is not FacetKind.TABULAR:
+                continue
+            raw_columns = facet.payload.get("columns", ())
+            raw_indexes = facet.payload.get("indexes", ())
+            if not isinstance(raw_columns, tuple) or not isinstance(
+                raw_indexes,
+                tuple,
+            ):
+                raise CatalogStoreError("catalog tabular facet has invalid structure")
+            for raw_column in raw_columns:
+                if not isinstance(raw_column, FrozenJsonObject):
+                    raise CatalogStoreError(
+                        "catalog tabular column has invalid structure"
+                    )
+                name = raw_column.get("name")
+                if not isinstance(name, str) or not name:
+                    raise CatalogStoreError("catalog tabular column is incomplete")
+                add_posting(resource.id, "column", f"column:{name}", name)
+            for raw_index in raw_indexes:
+                if not isinstance(raw_index, FrozenJsonObject):
+                    raise CatalogStoreError(
+                        "catalog tabular index has invalid structure"
+                    )
+                raw_fields = raw_index.get("columns")
+                if not isinstance(raw_fields, tuple) or any(
+                    not isinstance(field, str) or not field for field in raw_fields
+                ):
+                    raise CatalogStoreError(
+                        "catalog tabular index fields have invalid structure"
+                    )
+                for field in raw_fields:
+                    assert isinstance(field, str)
+                    add_posting(
+                        resource.id,
+                        "index_field",
+                        f"index_field:{field}",
+                        field,
+                    )
+
+    adjacency_by_resource_id: dict[str, list[_IndexedEdge]] = {}
+    for relationship in sorted(
+        relationships_by_id.values(),
+        key=lambda item: item.id,
     ):
-        if reason in match_reasons:
-            return rank
-    return 7
+        adjacency_by_resource_id.setdefault(
+            relationship.from_resource_id,
+            [],
+        ).append(
+            _IndexedEdge(
+                neighbor_resource_id=relationship.to_resource_id,
+                relationship_id=relationship.id,
+            )
+        )
+        adjacency_by_resource_id.setdefault(
+            relationship.to_resource_id,
+            [],
+        ).append(
+            _IndexedEdge(
+                neighbor_resource_id=relationship.from_resource_id,
+                relationship_id=relationship.id,
+            )
+        )
+        for pair in relationship.field_pairs:
+            add_posting(
+                relationship.from_resource_id,
+                "relationship_field",
+                f"relationship_field:{pair.source_field}",
+                pair.source_field,
+            )
+            add_posting(
+                relationship.to_resource_id,
+                "relationship_field",
+                f"relationship_field:{pair.target_field}",
+                pair.target_field,
+            )
+
+    token_postings: dict[str, set[_IndexedPosting]] = {}
+    for postings in postings_by_resource_id.values():
+        for posting in postings:
+            for token in posting.tokens:
+                token_postings.setdefault(token, set()).add(posting)
+
+    def edge_sort_key(
+        resource_id: str,
+        edge: _IndexedEdge,
+    ) -> tuple[str, str, str, str, str]:
+        relationship = relationships_by_id[edge.relationship_id]
+        neighbor = resources_by_id[edge.neighbor_resource_id]
+        return (
+            relationship.kind.value,
+            relationship.provenance.value,
+            _normalize_search_text(neighbor.native_identity).complete,
+            relationship.id,
+            edge.neighbor_resource_id,
+        )
+
+    ordered_token_postings = {
+        token: tuple(sorted(postings, key=_posting_sort_key))
+        for token, postings in sorted(token_postings.items())
+    }
+    return _SourceCatalogIndex(
+        agent_id=sync.agent_id,
+        source_id=sync.source_id,
+        sync_id=sync.id,
+        snapshot=snapshot,
+        resources_by_id=MappingProxyType(dict(sorted(resources_by_id.items()))),
+        revisions_by_resource_id=MappingProxyType(
+            dict(sorted(revisions_by_resource_id.items()))
+        ),
+        facets_by_resource_id=MappingProxyType(
+            {
+                resource_id: tuple(
+                    sorted(
+                        facets,
+                        key=lambda item: (item.kind.value, item.revision),
+                    )
+                )
+                for resource_id, facets in sorted(facets_by_resource_id.items())
+            }
+        ),
+        relationships_by_id=MappingProxyType(dict(sorted(relationships_by_id.items()))),
+        adjacency_by_resource_id=MappingProxyType(
+            {
+                resource_id: tuple(
+                    sorted(
+                        edges,
+                        key=lambda edge: edge_sort_key(resource_id, edge),
+                    )
+                )
+                for resource_id, edges in sorted(adjacency_by_resource_id.items())
+            }
+        ),
+        exact_resource_names=MappingProxyType(
+            {
+                value: tuple(sorted(resource_ids))
+                for value, resource_ids in sorted(exact_resource_names.items())
+            }
+        ),
+        token_postings=MappingProxyType(ordered_token_postings),
+        posting_tokens=tuple(ordered_token_postings),
+        postings_by_resource_id=MappingProxyType(
+            {
+                resource_id: tuple(sorted(postings, key=_posting_sort_key))
+                for resource_id, postings in sorted(postings_by_resource_id.items())
+            }
+        ),
+    )
+
+
+def _normalize_search_text(value: str) -> _NormalizedText:
+    if not isinstance(value, str):
+        raise TypeError("catalog search text must be a string")
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    split = _CAMEL_ACRONYM_BOUNDARY.sub(" ", normalized)
+    split = _CAMEL_WORD_BOUNDARY.sub(" ", split)
+    complete = normalized.casefold()
+    tokens: list[str] = []
+    current: list[str] = []
+    for character in split.casefold():
+        if character.isalnum():
+            current.append(character)
+            continue
+        if current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    bounded_tokens = tuple(
+        dict.fromkeys(token[:_SEARCH_TOKEN_LENGTH_LIMIT] for token in tokens if token)
+    )[:_SEARCH_TOKEN_LIMIT]
+    return _NormalizedText(complete=complete, tokens=bounded_tokens)
+
+
+def _posting_sort_key(posting: _IndexedPosting) -> tuple[str, str, str, str]:
+    return (
+        posting.resource_id,
+        posting.field_kind,
+        posting.field_name.casefold(),
+        posting.field_name,
+    )
+
+
+def _resource_search_tie_key(
+    resource: CatalogResource,
+) -> tuple[str, str, str, str]:
+    normalized = _normalize_search_text(resource.native_identity).complete
+    return (normalized, resource.native_identity, resource.name, resource.id)
+
+
+def _inventory_candidate(resource: CatalogResource) -> _RankedCandidate:
+    hit = CatalogSearchHit(
+        resource_id=resource.id,
+        source_id=resource.source_id,
+        kind=resource.kind,
+        name=resource.name,
+        revision=resource.current_revision,
+        sensitivity=resource.sensitivity,
+        score=0.0,
+        matched_fields=(),
+        match_reasons=("metadata_contains",),
+    )
+    normalized = _normalize_search_text(resource.native_identity).complete
+    return _RankedCandidate(
+        hit=hit,
+        matched_terms=(),
+        rank_key=(0, 0, 0, 0, 0, 0, 0, 0, 0, normalized, resource.name, resource.id),
+    )
+
+
+def _rank_index_candidate(
+    resource: CatalogResource,
+    postings: tuple[_IndexedPosting, ...],
+    query: _NormalizedText,
+    significant_terms: tuple[str, ...],
+) -> _RankedCandidate:
+    """Build deterministic rank evidence for one posting-derived candidate."""
+
+    matched_terms = tuple(
+        term
+        for term in significant_terms
+        if any(
+            token.startswith(term) for posting in postings for token in posting.tokens
+        )
+    )
+    resource_postings = tuple(
+        posting
+        for posting in postings
+        if posting.field_kind in {"resource_name", "native_identity"}
+    )
+    column_postings = tuple(
+        posting
+        for posting in postings
+        if posting.field_kind in {"column", "index_field"}
+    )
+    relationship_postings = tuple(
+        posting for posting in postings if posting.field_kind == "relationship_field"
+    )
+    kind_postings = tuple(
+        posting for posting in postings if posting.field_kind == "kind"
+    )
+
+    def exact_terms(fields: tuple[_IndexedPosting, ...]) -> set[str]:
+        return {
+            term
+            for term in significant_terms
+            if any(term in posting.tokens for posting in fields)
+        }
+
+    def prefix_terms(fields: tuple[_IndexedPosting, ...]) -> set[str]:
+        return {
+            term
+            for term in significant_terms
+            if any(
+                token.startswith(term) and token != term
+                for posting in fields
+                for token in posting.tokens
+            )
+        }
+
+    exact_native = int(
+        any(
+            posting.field_kind == "native_identity"
+            and posting.normalized_value == query.complete
+            for posting in resource_postings
+        )
+    )
+    exact_name = int(
+        any(
+            posting.field_kind == "resource_name"
+            and posting.normalized_value == query.complete
+            for posting in resource_postings
+        )
+    )
+    resource_exact_terms = exact_terms(resource_postings)
+    column_exact_terms = exact_terms(column_postings)
+    resource_prefix_terms = prefix_terms(resource_postings)
+    column_prefix_terms = prefix_terms(column_postings)
+    relationship_terms = exact_terms(relationship_postings) | prefix_terms(
+        relationship_postings
+    )
+    kind_terms = exact_terms(kind_postings) | prefix_terms(kind_postings)
+
+    reason: str
+    if exact_native or exact_name:
+        reason = "resource_name_exact"
+    elif (
+        any(
+            posting.normalized_value.startswith(query.complete)
+            for posting in resource_postings
+        )
+        or resource_prefix_terms
+    ):
+        reason = "resource_name_prefix"
+    elif resource_postings:
+        reason = "resource_name_contains"
+    elif any(posting.normalized_value == query.complete for posting in column_postings):
+        reason = "structural_field_exact"
+    elif column_postings or relationship_postings:
+        reason = "structural_field_contains"
+    else:
+        reason = "metadata_contains"
+
+    field_priority = {
+        "resource_name": 0,
+        "native_identity": 1,
+        "column": 2,
+        "index_field": 3,
+        "relationship_field": 4,
+        "kind": 5,
+    }
+    matched_fields = tuple(
+        dict.fromkeys(
+            posting.field_name
+            for posting in sorted(
+                postings,
+                key=lambda item: (
+                    field_priority[item.field_kind],
+                    item.field_name.casefold(),
+                    item.field_name,
+                ),
+            )
+        )
+    )[:32]
+    score = float(
+        exact_native * 200_000
+        + exact_name * 180_000
+        + len(matched_terms) * 5_000
+        + len(resource_exact_terms) * 500
+        + len(column_exact_terms) * 200
+        + len(resource_prefix_terms) * 100
+        + len(column_prefix_terms) * 50
+        + len(relationship_terms) * 20
+        + len(kind_terms) * 10
+    )
+    normalized_native = _normalize_search_text(resource.native_identity).complete
+    rank_key = (
+        -exact_native,
+        -exact_name,
+        -len(matched_terms),
+        -len(resource_exact_terms),
+        -len(column_exact_terms),
+        -len(resource_prefix_terms),
+        -len(column_prefix_terms),
+        -len(relationship_terms),
+        -len(kind_terms),
+        normalized_native,
+        resource.native_identity,
+        resource.id,
+    )
+    return _RankedCandidate(
+        hit=CatalogSearchHit(
+            resource_id=resource.id,
+            source_id=resource.source_id,
+            kind=resource.kind,
+            name=resource.name,
+            revision=resource.current_revision,
+            sensitivity=resource.sensitivity,
+            score=score,
+            matched_fields=matched_fields,
+            match_reasons=(reason,),
+        ),
+        matched_terms=matched_terms,
+        rank_key=rank_key,
+    )
+
+
+def _diversify_candidates(
+    candidates: tuple[_RankedCandidate, ...],
+    significant_terms: tuple[str, ...],
+) -> tuple[_RankedCandidate, ...]:
+    remaining = list(sorted(candidates, key=lambda candidate: candidate.rank_key))
+    selected: list[_RankedCandidate] = []
+    covered: set[str] = set()
+    significant = set(significant_terms)
+    while remaining and covered != significant:
+        best = min(
+            remaining,
+            key=lambda candidate: (
+                -len(set(candidate.matched_terms) - covered),
+                candidate.rank_key,
+            ),
+        )
+        new_terms = set(best.matched_terms) - covered
+        if not new_terms:
+            break
+        selected.append(best)
+        covered.update(new_terms)
+        remaining.remove(best)
+    selected.extend(sorted(remaining, key=lambda candidate: candidate.rank_key))
+    return tuple(selected)
 
 
 def _neighbor_payload(resource: CatalogResource) -> dict[str, object]:

@@ -10,8 +10,6 @@ from .models import (
     CatalogResource,
     CatalogResourceRevision,
     CatalogSnapshotRef,
-    CatalogSearchRequest,
-    CatalogSearchResult,
     CatalogSummary,
     CatalogSync,
     CatalogTraversalRequest,
@@ -133,8 +131,6 @@ class CatalogStore(Protocol):
         agent_id: str,
         relationship_ids: tuple[str, ...],
     ) -> tuple[CatalogRelationship, ...]: ...
-
-    async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult: ...
 
     async def traverse(
         self,

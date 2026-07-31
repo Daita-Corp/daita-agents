@@ -831,6 +831,30 @@ def test_catalog_snapshot_reuse_is_private_derived_storage_state():
         assert prohibited not in _python_text(PACKAGE)
 
 
+def test_catalog_indexed_retrieval_is_private_and_catalog_owned():
+    protocol_methods = _class_methods(
+        PACKAGE / "catalog" / "protocols.py",
+        "CatalogStore",
+    )
+    storage_methods = _class_methods(
+        PACKAGE / "storage" / "sqlite.py",
+        "SQLiteStateStore",
+    )
+    service = (PACKAGE / "catalog" / "service.py").read_text(encoding="utf-8")
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop")
+
+    assert "search" not in protocol_methods
+    assert "search" not in storage_methods
+    assert "_SourceCatalogIndex" in service
+    assert "_source_indexes" in service
+    assert "_compile_source_index" in service
+    assert "_catalog_search_reason" not in storage
+    assert "_SourceCatalogIndex" not in storage
+    assert "CatalogSearchHit" not in storage
+    assert "_SourceCatalogIndex" not in loop
+
+
 def test_cli_adds_no_parallel_state_approval_or_observation_owner():
     cli_tree = ast.parse((PACKAGE / "cli.py").read_text(encoding="utf-8"))
     cli_classes = {
