@@ -12,8 +12,6 @@ from .models import (
     CatalogSnapshotRef,
     CatalogSummary,
     CatalogSync,
-    CatalogTraversalRequest,
-    CatalogTraversalResult,
     RelationshipKind,
     SourceCatalogSnapshot,
 )
@@ -125,17 +123,6 @@ class CatalogStore(Protocol):
         relationship_kinds: tuple[RelationshipKind, ...] = (),
         limit: int = 50,
     ) -> tuple[CatalogRelationship, ...]: ...
-
-    async def load_relationships(
-        self,
-        agent_id: str,
-        relationship_ids: tuple[str, ...],
-    ) -> tuple[CatalogRelationship, ...]: ...
-
-    async def traverse(
-        self,
-        request: CatalogTraversalRequest,
-    ) -> CatalogTraversalResult: ...
 
 
 __all__ = [

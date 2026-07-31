@@ -855,6 +855,34 @@ def test_catalog_indexed_retrieval_is_private_and_catalog_owned():
     assert "_SourceCatalogIndex" not in loop
 
 
+def test_catalog_bounded_traversal_is_catalog_owned_and_not_storage_owned():
+    protocol_methods = _class_methods(
+        PACKAGE / "catalog" / "protocols.py",
+        "CatalogStore",
+    )
+    storage_methods = _class_methods(
+        PACKAGE / "storage" / "sqlite.py",
+        "SQLiteStateStore",
+    )
+    service = (PACKAGE / "catalog" / "service.py").read_text(encoding="utf-8")
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop")
+
+    assert "traverse" not in protocol_methods
+    assert "traverse" not in storage_methods
+    assert "load_relationships" not in protocol_methods
+    assert "load_relationships" not in storage_methods
+    assert "_traverse_indexes" in service
+    assert "distance_by_resource" in service
+    assert "parents_by_resource" in service
+    assert "deque(admitted_sources)" in service
+    assert "CatalogPath" not in storage
+    assert "CatalogPathStep" not in storage
+    assert "distance_by_resource" not in storage
+    assert "CatalogTraversalRequest" not in storage
+    assert "CatalogTraversalRequest" not in loop
+
+
 def test_cli_adds_no_parallel_state_approval_or_observation_owner():
     cli_tree = ast.parse((PACKAGE / "cli.py").read_text(encoding="utf-8"))
     cli_classes = {

@@ -15,7 +15,6 @@ from daita.catalog import (
     CatalogSearchRequest,
     CatalogSync,
     CatalogSyncStatus,
-    CatalogTraversalRequest,
     ResourceKind,
 )
 from daita.catalog.models import CatalogSnapshotRef
@@ -688,17 +687,6 @@ async def test_catalog_reads_decode_one_generation_once_and_share_concurrent_loa
             resources[0].current_revision,
         )
         await reader.load_incident_relationships(agent.id, resources[0].id)
-        await reader.load_relationships(
-            agent.id,
-            tuple(item.id for item in snapshot.relationships),
-        )
-        await reader.traverse(
-            CatalogTraversalRequest(
-                agent_id=agent.id,
-                from_resource_ids=(snapshot.relationships[0].from_resource_id,),
-                to_resource_ids=(snapshot.relationships[0].to_resource_id,),
-            )
-        )
         assert decode_count() == 1
     finally:
         await agent.close()

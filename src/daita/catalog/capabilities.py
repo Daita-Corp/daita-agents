@@ -461,6 +461,10 @@ def _traverse_output_schema() -> dict[str, object]:
             "reachable": {"type": "boolean"},
             "request": {"type": "object"},
             "truncated": {"type": "boolean"},
+            "truncation_reason": {
+                "type": ["string", "null"],
+                "enum": ["depth", "nodes", "edges", "paths", None],
+            },
             "trust_classification": {"type": "string"},
             "visited_edges": {"type": "integer"},
             "visited_nodes": {"type": "integer"},
@@ -470,6 +474,7 @@ def _traverse_output_schema() -> dict[str, object]:
             "reachable",
             "request",
             "truncated",
+            "truncation_reason",
             "trust_classification",
             "visited_edges",
             "visited_nodes",

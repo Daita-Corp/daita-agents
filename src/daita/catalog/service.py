@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from bisect import bisect_left
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +16,8 @@ import unicodedata
 from .._json import FrozenJsonObject
 from .models import (
     CatalogFacet,
+    CatalogPath,
+    CatalogPathStep,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
@@ -27,6 +30,8 @@ from .models import (
     CatalogSync,
     CatalogSyncStatus,
     CatalogTraversalRequest,
+    CatalogTraversalResult,
+    CatalogTraversalTruncationReason,
     FacetKind,
     RelationshipDirection,
     RelationshipKind,
@@ -93,6 +98,14 @@ class _IndexedPosting:
 class _IndexedEdge:
     neighbor_resource_id: str
     relationship_id: str
+    direction: RelationshipDirection
+
+
+@dataclass(frozen=True, slots=True)
+class _ParentStep:
+    parent_resource_id: str
+    relationship_id: str
+    direction: RelationshipDirection
 
 
 @dataclass(frozen=True, slots=True)
@@ -890,40 +903,274 @@ class CatalogService:
     ) -> FrozenJsonObject:
         if not isinstance(request, CatalogTraversalRequest):
             raise TypeError("request must be a CatalogTraversalRequest record")
-        resources: dict[str, CatalogResource] = {}
-        for resource_id in (*request.from_resource_ids, *request.to_resource_ids):
-            resources[resource_id] = await self._active_resource(
+        for attempt in range(2):
+            active_source_ids = await self._active_source_ids(request.agent_id)
+            refs = (
+                ()
+                if not active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    active_source_ids,
+                )
+            )
+            await self._evict_stale_indexes(
                 request.agent_id,
-                resource_id,
+                active_source_ids,
+                refs,
+            )
+            indexes: list[_SourceCatalogIndex] = []
+            generation_changed = False
+            for ref in refs:
+                try:
+                    indexes.append(await self._index_for_ref(ref))
+                except _CatalogGenerationChanged:
+                    generation_changed = True
+                    break
+            if generation_changed:
+                if attempt == 0:
+                    continue
+                break
+            resolved_indexes = tuple(indexes)
+            result = self._traverse_indexes(request, resolved_indexes)
+            projection = self._traversal_projection(result, resolved_indexes)
+            current_active_source_ids = await self._active_source_ids(request.agent_id)
+            current_refs = (
+                ()
+                if not current_active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    current_active_source_ids,
+                )
+            )
+            if current_active_source_ids == active_source_ids and current_refs == refs:
+                return projection
+            if attempt == 1:
+                break
+        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
+
+    def _traverse_indexes(
+        self,
+        request: CatalogTraversalRequest,
+        indexes: tuple[_SourceCatalogIndex, ...],
+    ) -> CatalogTraversalResult:
+        resources_by_id: dict[str, CatalogResource] = {}
+        relationships_by_id: dict[str, CatalogRelationship] = {}
+        index_by_resource_id: dict[str, _SourceCatalogIndex] = {}
+        for index in indexes:
+            if index.agent_id != request.agent_id:
+                raise CatalogStoreError("catalog traversal index escaped agent scope")
+            duplicate_resources = resources_by_id.keys() & index.resources_by_id.keys()
+            duplicate_relationships = (
+                relationships_by_id.keys() & index.relationships_by_id.keys()
+            )
+            if duplicate_resources or duplicate_relationships:
+                raise CatalogStoreError("catalog traversal index identities overlap")
+            resources_by_id.update(index.resources_by_id)
+            relationships_by_id.update(index.relationships_by_id)
+            index_by_resource_id.update(
+                (resource_id, index) for resource_id in index.resources_by_id
             )
 
-        result = await self._store.traverse(request)
-        relationship_ids = tuple(
-            dict.fromkeys(
-                step.relationship_id for path in result.paths for step in path.steps
+        for resource_id in (*request.from_resource_ids, *request.to_resource_ids):
+            if resource_id not in resources_by_id:
+                raise CatalogResourceNotFoundError(request.agent_id, resource_id)
+
+        def resource_key(resource_id: str) -> tuple[str, str, str]:
+            resource = resources_by_id[resource_id]
+            return (
+                _normalize_search_text(resource.native_identity).complete,
+                resource.source_id,
+                resource.id,
             )
-        )
-        relationships = await self._store.load_relationships(
-            request.agent_id,
-            relationship_ids,
-        )
-        relationships_by_id = {
-            relationship.id: relationship for relationship in relationships
+
+        ordered_sources = tuple(sorted(request.from_resource_ids, key=resource_key))
+        target_ids = set(request.to_resource_ids)
+        admitted_sources = ordered_sources[: request.max_nodes]
+        distance_by_resource = {resource_id: 0 for resource_id in admitted_sources}
+        parents_by_resource: dict[str, list[_ParentStep]] = {
+            resource_id: [] for resource_id in admitted_sources
         }
-        if tuple(relationships_by_id) != relationship_ids:
-            raise CatalogStoreError(
-                "catalog traversal references a non-current relationship"
+        frontier = deque(admitted_sources)
+        examined_edges = 0
+        truncation_reason = (
+            CatalogTraversalTruncationReason.NODES
+            if len(admitted_sources) < len(ordered_sources)
+            else None
+        )
+        allowed_kinds = set(request.relationship_kinds)
+
+        while frontier and truncation_reason is None:
+            current_resource_id = frontier.popleft()
+            current_distance = distance_by_resource[current_resource_id]
+            if current_resource_id in target_ids and current_distance > 0:
+                continue
+            index = index_by_resource_id[current_resource_id]
+            for edge in index.adjacency_by_resource_id.get(current_resource_id, ()):
+                relationship = relationships_by_id[edge.relationship_id]
+                if allowed_kinds and relationship.kind not in allowed_kinds:
+                    continue
+                if examined_edges >= request.max_edges:
+                    truncation_reason = CatalogTraversalTruncationReason.EDGES
+                    break
+                examined_edges += 1
+                known_distance = distance_by_resource.get(edge.neighbor_resource_id)
+                if current_distance >= request.max_depth:
+                    if known_distance is None:
+                        truncation_reason = CatalogTraversalTruncationReason.DEPTH
+                        break
+                    continue
+
+                candidate_distance = current_distance + 1
+                parent = _ParentStep(
+                    parent_resource_id=current_resource_id,
+                    relationship_id=edge.relationship_id,
+                    direction=edge.direction,
+                )
+                if known_distance is None:
+                    if len(distance_by_resource) >= request.max_nodes:
+                        truncation_reason = CatalogTraversalTruncationReason.NODES
+                        break
+                    distance_by_resource[edge.neighbor_resource_id] = candidate_distance
+                    parents_by_resource[edge.neighbor_resource_id] = [parent]
+                    frontier.append(edge.neighbor_resource_id)
+                elif known_distance == candidate_distance:
+                    parents = parents_by_resource[edge.neighbor_resource_id]
+                    if parent not in parents:
+                        parents.append(parent)
+
+        def parent_key(parent: _ParentStep) -> tuple[object, ...]:
+            relationship = relationships_by_id[parent.relationship_id]
+            return (
+                *resource_key(parent.parent_resource_id),
+                relationship.kind.value,
+                relationship.provenance.value,
+                relationship.id,
+                parent.direction.value,
             )
+
+        ordered_parents = {
+            resource_id: tuple(sorted(parents, key=parent_key))
+            for resource_id, parents in parents_by_resource.items()
+        }
+        reachable_targets = tuple(
+            sorted(
+                (
+                    resource_id
+                    for resource_id in target_ids
+                    if distance_by_resource.get(resource_id, 0) > 0
+                ),
+                key=resource_key,
+            )
+        )
+        path_count_limit = request.max_paths + 1
+        path_counts: dict[str, int] = {}
+
+        def bounded_path_count(resource_id: str) -> int:
+            cached = path_counts.get(resource_id)
+            if cached is not None:
+                return cached
+            if distance_by_resource[resource_id] == 0:
+                path_counts[resource_id] = 1
+                return 1
+            total = 0
+            for parent in ordered_parents[resource_id]:
+                total += bounded_path_count(parent.parent_resource_id)
+                if total >= path_count_limit:
+                    total = path_count_limit
+                    break
+            path_counts[resource_id] = total
+            return total
+
+        available_path_count = 0
+        for target_id in reachable_targets:
+            available_path_count += bounded_path_count(target_id)
+            if available_path_count >= path_count_limit:
+                available_path_count = path_count_limit
+                break
+
+        paths: list[CatalogPath] = []
+        reverse_resource_ids: list[str] = []
+        reverse_steps: list[CatalogPathStep] = []
+
+        def reconstruct(resource_id: str) -> None:
+            if len(paths) >= request.max_paths:
+                return
+            reverse_resource_ids.append(resource_id)
+            if distance_by_resource[resource_id] == 0:
+                paths.append(
+                    CatalogPath(
+                        resource_ids=tuple(reversed(reverse_resource_ids)),
+                        steps=tuple(reversed(reverse_steps)),
+                    )
+                )
+            else:
+                for parent in ordered_parents[resource_id]:
+                    if len(paths) >= request.max_paths:
+                        break
+                    reverse_steps.append(
+                        CatalogPathStep(
+                            relationship_id=parent.relationship_id,
+                            from_resource_id=parent.parent_resource_id,
+                            to_resource_id=resource_id,
+                            direction=parent.direction,
+                        )
+                    )
+                    reconstruct(parent.parent_resource_id)
+                    reverse_steps.pop()
+            reverse_resource_ids.pop()
+
+        for target_id in reachable_targets:
+            if len(paths) >= request.max_paths:
+                break
+            reconstruct(target_id)
+
+        if truncation_reason is None and available_path_count > request.max_paths:
+            truncation_reason = CatalogTraversalTruncationReason.PATHS
+        return CatalogTraversalResult(
+            request=request,
+            paths=tuple(paths),
+            reachable=bool(paths),
+            visited_nodes=len(distance_by_resource),
+            visited_edges=examined_edges,
+            truncated=truncation_reason is not None,
+            truncation_reason=truncation_reason,
+        )
+
+    def _traversal_projection(
+        self,
+        result: CatalogTraversalResult,
+        indexes: tuple[_SourceCatalogIndex, ...],
+    ) -> FrozenJsonObject:
+        request = result.request
+        resources_by_id = {
+            resource_id: resource
+            for index in indexes
+            for resource_id, resource in index.resources_by_id.items()
+        }
+        revisions_by_resource_id = {
+            resource_id: revision
+            for index in indexes
+            for resource_id, revision in index.revisions_by_resource_id.items()
+        }
+        relationships_by_id = {
+            relationship_id: relationship
+            for index in indexes
+            for relationship_id, relationship in index.relationships_by_id.items()
+        }
 
         paths_payload: list[dict[str, object]] = []
         for path in result.paths:
             steps_payload: list[dict[str, object]] = []
             for step in path.steps:
-                relationship = relationships_by_id[step.relationship_id]
-                endpoints = await self._current_relationship_endpoints(
-                    request.agent_id,
+                relationship = relationships_by_id.get(step.relationship_id)
+                if relationship is None:
+                    raise CatalogStoreError(
+                        "catalog traversal references a non-current relationship"
+                    )
+                endpoints = self._snapshot_relationship_endpoints(
                     relationship,
-                    resources,
+                    resources_by_id,
+                    revisions_by_resource_id,
                 )
                 if step.direction is RelationshipDirection.FORWARD:
                     expected = (
@@ -971,6 +1218,11 @@ class CatalogService:
                 "paths": paths_payload,
                 "reachable": result.reachable,
                 "truncated": result.truncated,
+                "truncation_reason": (
+                    None
+                    if result.truncation_reason is None
+                    else result.truncation_reason.value
+                ),
                 "visited_edges": result.visited_edges,
                 "visited_nodes": result.visited_nodes,
                 "trust_classification": "untrusted_external_data",
@@ -1369,6 +1621,7 @@ def _compile_source_index(snapshot: SourceCatalogSnapshot) -> _SourceCatalogInde
             _IndexedEdge(
                 neighbor_resource_id=relationship.to_resource_id,
                 relationship_id=relationship.id,
+                direction=RelationshipDirection.FORWARD,
             )
         )
         adjacency_by_resource_id.setdefault(
@@ -1378,6 +1631,7 @@ def _compile_source_index(snapshot: SourceCatalogSnapshot) -> _SourceCatalogInde
             _IndexedEdge(
                 neighbor_resource_id=relationship.from_resource_id,
                 relationship_id=relationship.id,
+                direction=RelationshipDirection.REVERSE,
             )
         )
         for pair in relationship.field_pairs:
@@ -1403,7 +1657,7 @@ def _compile_source_index(snapshot: SourceCatalogSnapshot) -> _SourceCatalogInde
     def edge_sort_key(
         resource_id: str,
         edge: _IndexedEdge,
-    ) -> tuple[str, str, str, str, str]:
+    ) -> tuple[str, str, str, str, str, str]:
         relationship = relationships_by_id[edge.relationship_id]
         neighbor = resources_by_id[edge.neighbor_resource_id]
         return (
@@ -1411,6 +1665,7 @@ def _compile_source_index(snapshot: SourceCatalogSnapshot) -> _SourceCatalogInde
             relationship.provenance.value,
             _normalize_search_text(neighbor.native_identity).complete,
             relationship.id,
+            edge.direction.value,
             edge.neighbor_resource_id,
         )
 

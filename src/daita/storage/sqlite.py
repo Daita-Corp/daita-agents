@@ -7,7 +7,6 @@ attached sources, current catalog snapshots, and exact run transcripts.
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime
@@ -25,8 +24,6 @@ from .._json import FrozenJsonObject
 from ..adapters.models import SourceRegistration
 from ..catalog.models import (
     CatalogFacet,
-    CatalogPath,
-    CatalogPathStep,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
@@ -34,8 +31,6 @@ from ..catalog.models import (
     CatalogSync,
     CatalogSyncStatus,
     CatalogSummary,
-    CatalogTraversalRequest,
-    CatalogTraversalResult,
     FacetKind,
     RelationshipDirection,
     RelationshipFieldPair,
@@ -754,82 +749,6 @@ class SQLiteStateStore:
             and (not relationship_kinds or item.kind in relationship_kinds)
         ]
         return tuple(sorted(relationships, key=lambda item: item.id)[:limit])
-
-    async def load_relationships(
-        self, agent_id: str, relationship_ids: tuple[str, ...]
-    ) -> tuple[CatalogRelationship, ...]:
-        by_id = {item.id: item for item in await self._relationships(agent_id)}
-        return tuple(by_id[item_id] for item_id in relationship_ids if item_id in by_id)
-
-    async def traverse(
-        self, request: CatalogTraversalRequest
-    ) -> CatalogTraversalResult:
-        relationships = tuple(
-            item
-            for item in await self._relationships(request.agent_id)
-            if not request.relationship_kinds or item.kind in request.relationship_kinds
-        )
-        adjacency: dict[
-            str, list[tuple[str, CatalogRelationship, RelationshipDirection]]
-        ] = {}
-        for item in relationships:
-            adjacency.setdefault(item.from_resource_id, []).append(
-                (item.to_resource_id, item, RelationshipDirection.FORWARD)
-            )
-            adjacency.setdefault(item.to_resource_id, []).append(
-                (item.from_resource_id, item, RelationshipDirection.REVERSE)
-            )
-        targets = set(request.to_resource_ids)
-        queue: deque[tuple[str, tuple[str, ...], tuple[CatalogPathStep, ...]]] = deque(
-            (source, (source,), ()) for source in request.from_resource_ids
-        )
-        paths: list[CatalogPath] = []
-        visited_nodes: set[str] = set(request.from_resource_ids)
-        visited_edges: set[str] = set()
-        truncated = False
-        while queue and len(paths) < request.max_paths:
-            current, resource_ids, steps = queue.popleft()
-            if current in targets and steps:
-                paths.append(CatalogPath(resource_ids=resource_ids, steps=steps))
-                continue
-            if len(steps) >= request.max_depth:
-                continue
-            for neighbor, relationship, direction in adjacency.get(current, ()):
-                if neighbor in resource_ids:
-                    continue
-                if len(visited_edges) >= request.max_edges or (
-                    neighbor not in visited_nodes
-                    and len(visited_nodes) >= request.max_nodes
-                ):
-                    truncated = True
-                    continue
-                visited_edges.add(relationship.id)
-                visited_nodes.add(neighbor)
-                queue.append(
-                    (
-                        neighbor,
-                        (*resource_ids, neighbor),
-                        (
-                            *steps,
-                            CatalogPathStep(
-                                relationship_id=relationship.id,
-                                from_resource_id=current,
-                                to_resource_id=neighbor,
-                                direction=direction,
-                            ),
-                        ),
-                    )
-                )
-        if queue:
-            truncated = True
-        return CatalogTraversalResult(
-            request=request,
-            paths=tuple(paths),
-            reachable=bool(paths),
-            visited_nodes=len(visited_nodes),
-            visited_edges=len(visited_edges),
-            truncated=truncated,
-        )
 
     async def list_semantic_annotations(
         self,
