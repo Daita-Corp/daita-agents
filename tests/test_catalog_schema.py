@@ -8,7 +8,7 @@ import sqlite3
 
 import pytest
 
-from daita import Agent, SQLiteSource
+from daita import Agent, LocalDirectorySource, SQLiteSource
 from daita._json import FrozenJsonObject, canonical_json
 from daita.capabilities import (
     CapabilityInputError,
@@ -1830,6 +1830,521 @@ async def test_schema_slice_retries_a_generation_conflict_only_once(
         ):
             await _schema(agent, resource_ids=(resource.id,))
         assert load_count == 2
+    finally:
+        await agent.close()
+
+
+async def test_validation_schemas_use_one_bulk_current_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "validation-bulk.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE accounts (
+                account_id INTEGER PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'active'
+            );
+            CREATE VIEW account_lookup AS
+            SELECT account_id, email FROM accounts;
+        """)
+    agent = await Agent.create("catalog-validation-bulk", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        service = agent._embedded._catalog_service
+        data_view = agent._embedded._data_view
+        store = agent._embedded._store
+        original_bulk = service.tabular_resources
+        original_refs = store.list_current_snapshot_refs
+        original_snapshot = store.load_current_snapshot
+        original_compile = catalog_service._compile_source_index
+        counts = {
+            "bulk": 0,
+            "refs": 0,
+            "snapshot": 0,
+            "compile": 0,
+        }
+        projected = []
+
+        async def counting_bulk(agent_id: str, source_id: str):
+            counts["bulk"] += 1
+            result = await original_bulk(agent_id, source_id)
+            projected.append(result)
+            return result
+
+        async def counting_refs(agent_id: str, source_ids: tuple[str, ...]):
+            counts["refs"] += 1
+            return await original_refs(agent_id, source_ids)
+
+        async def counting_snapshot(ref):
+            counts["snapshot"] += 1
+            return await original_snapshot(ref)
+
+        def counting_compile(snapshot):
+            counts["compile"] += 1
+            return original_compile(snapshot)
+
+        async def legacy_read(*args, **kwargs):
+            pytest.fail("validation schemas performed a superseded store read")
+
+        monkeypatch.setattr(service, "tabular_resources", counting_bulk)
+        monkeypatch.setattr(store, "list_current_snapshot_refs", counting_refs)
+        monkeypatch.setattr(store, "load_current_snapshot", counting_snapshot)
+        monkeypatch.setattr(catalog_service, "_compile_source_index", counting_compile)
+        for method_name in (
+            "list_resources",
+            "load_resource",
+            "load_revision",
+            "load_facets",
+            "load_sync",
+        ):
+            monkeypatch.setattr(store, method_name, legacy_read)
+
+        first = await data_view.resource_schemas(agent.id, source.id)
+        second = await data_view.resource_schemas(agent.id, source.id)
+
+        assert first == second
+        assert counts == {
+            "bulk": 2,
+            "refs": 4,
+            "snapshot": 1,
+            "compile": 1,
+        }
+        assert tuple(item.name for item in first) == ("account_lookup", "accounts")
+        by_name = {item.name: item for item in first}
+        assert by_name["accounts"].columns == ("account_id", "email", "status")
+        assert by_name["accounts"].unique_key_columns == ("account_id", "email")
+        assert by_name["accounts"].column_declared_types == (
+            ("account_id", "INTEGER"),
+            ("email", "TEXT"),
+            ("status", "TEXT"),
+        )
+        assert by_name["accounts"].aliases == ("main.accounts",)
+        assert by_name["accounts"].resource_kind == "table"
+        assert by_name["accounts"].writable is True
+        assert by_name["account_lookup"].resource_kind == "view"
+        assert by_name["account_lookup"].writable is False
+
+        assert len(projected) == 2
+        facts = projected[0]
+        assert tuple(item.resource.name for item in facts) == (
+            "account_lookup",
+            "accounts",
+        )
+        for item in facts:
+            assert item.sync.agent_id == agent.id
+            assert item.sync.source_id == source.id
+            assert item.resource.agent_id == agent.id
+            assert item.resource.source_id == source.id
+            assert item.resource.current_sync_id == item.sync.id
+            assert item.revision.resource_id == item.resource.id
+            assert item.revision.revision == item.resource.current_revision
+            assert item.revision.sync_id == item.sync.id
+            assert item.facet.resource_id == item.resource.id
+            assert item.facet.sync_id == item.sync.id
+            assert item.facet.revision in item.revision.facet_revisions
+            assert item.facet.kind.value == "tabular"
+            assert item.sync.source_revision == item.revision.source_revision
+    finally:
+        await agent.close()
+
+
+async def test_validation_schema_reopen_decodes_and_compiles_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "validation-reopen.sqlite"
+    _fixture_database(database)
+    agent = await Agent.create("catalog-validation-reopen", root=tmp_path)
+    source = await agent.attach(SQLiteSource(database))
+    agent_id = agent.id
+    source_id = source.id
+    await agent.close()
+
+    original_loads = sqlite_store._loads
+    original_compile = catalog_service._compile_source_index
+    decode_count = 0
+    compile_count = 0
+
+    def counting_loads(value: str) -> object:
+        nonlocal decode_count
+        if '"__record__":"SourceCatalogSnapshot"' in value:
+            decode_count += 1
+        return original_loads(value)
+
+    def counting_compile(snapshot):
+        nonlocal compile_count
+        compile_count += 1
+        return original_compile(snapshot)
+
+    monkeypatch.setattr(sqlite_store, "_loads", counting_loads)
+    monkeypatch.setattr(catalog_service, "_compile_source_index", counting_compile)
+    reopened = await Agent.open("catalog-validation-reopen", root=tmp_path)
+    try:
+        store = reopened._embedded._store
+        snapshot_read_count = 0
+        original_snapshot = store.load_current_snapshot
+
+        async def counting_snapshot(ref):
+            nonlocal snapshot_read_count
+            snapshot_read_count += 1
+            return await original_snapshot(ref)
+
+        async def legacy_read(*args, **kwargs):
+            pytest.fail("validation schemas performed a superseded store read")
+
+        monkeypatch.setattr(store, "load_current_snapshot", counting_snapshot)
+        for method_name in (
+            "list_resources",
+            "load_resource",
+            "load_revision",
+            "load_facets",
+            "load_sync",
+        ):
+            monkeypatch.setattr(store, method_name, legacy_read)
+
+        first = await reopened._embedded._data_view.resource_schemas(
+            agent_id,
+            source_id,
+        )
+        second = await reopened._embedded._data_view.resource_schemas(
+            agent_id,
+            source_id,
+        )
+        assert first == second
+        assert decode_count == 1
+        assert compile_count == 1
+        assert snapshot_read_count == 1
+    finally:
+        await reopened.close()
+
+
+async def test_validation_schema_refresh_replaces_all_current_structural_facts(
+    tmp_path: Path,
+):
+    database = tmp_path / "validation-refresh.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE current_table (
+                id INTEGER PRIMARY KEY,
+                code TEXT NOT NULL
+            );
+            CREATE TABLE stale_table (id INTEGER PRIMARY KEY, stale_value TEXT);
+        """)
+    agent = await Agent.create("catalog-validation-refresh", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        service = agent._embedded._catalog_service
+        data_view = agent._embedded._data_view
+        old_facts = {
+            item.resource.name: item
+            for item in await service.tabular_resources(agent.id, source.id)
+        }
+        old_schemas = {
+            item.name: item
+            for item in await data_view.resource_schemas(agent.id, source.id)
+        }
+
+        with sqlite3.connect(database) as connection:
+            connection.executescript("""
+                ALTER TABLE current_table ADD COLUMN later TEXT;
+                CREATE UNIQUE INDEX current_table_code_unique
+                    ON current_table(code);
+                DROP TABLE stale_table;
+                CREATE TABLE replacement_table (
+                    replacement_id INTEGER PRIMARY KEY,
+                    value NUMERIC
+                );
+            """)
+        await agent.refresh_source(source.id)
+
+        new_facts = {
+            item.resource.name: item
+            for item in await service.tabular_resources(agent.id, source.id)
+        }
+        new_schemas = {
+            item.name: item
+            for item in await data_view.resource_schemas(agent.id, source.id)
+        }
+        assert set(old_facts) == {"current_table", "stale_table"}
+        assert set(new_facts) == {"current_table", "replacement_table"}
+        assert set(new_schemas) == {"current_table", "replacement_table"}
+        assert "stale_table" not in new_schemas
+
+        old_current = old_facts["current_table"]
+        new_current = new_facts["current_table"]
+        assert new_current.resource.id == old_current.resource.id
+        assert new_current.sync.id != old_current.sync.id
+        assert new_current.sync.source_revision != old_current.sync.source_revision
+        assert new_current.resource.current_revision != (
+            old_current.resource.current_revision
+        )
+        assert new_current.revision.revision == new_current.resource.current_revision
+        assert new_current.revision.sync_id == new_current.sync.id
+        assert new_current.facet.sync_id == new_current.sync.id
+        assert tuple(
+            column["name"]
+            for column in _mapping_sequence(new_current.facet.payload["columns"])
+        ) == ("id", "code", "later")
+        assert old_schemas["current_table"].unique_key_columns == ("id",)
+        assert new_schemas["current_table"].unique_key_columns == ("id", "code")
+        assert new_schemas["current_table"].columns == ("id", "code", "later")
+        assert new_schemas["current_table"].revision == (
+            new_current.resource.current_revision
+        )
+        assert new_schemas["current_table"].source_revision == (
+            new_current.sync.source_revision
+        )
+        assert all(
+            key != (agent.id, source.id, old_current.sync.id)
+            for key in service._source_indexes
+        )
+    finally:
+        await agent.close()
+
+
+async def test_validation_projection_retries_one_generation_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "validation-transient-conflict.sqlite"
+    _fixture_database(database)
+    agent = await Agent.create("catalog-validation-transient-conflict", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        store = agent._embedded._store
+        original_snapshot = store.load_current_snapshot
+        load_count = 0
+
+        async def one_conflict(ref):
+            nonlocal load_count
+            load_count += 1
+            if load_count == 1:
+                return None
+            return await original_snapshot(ref)
+
+        monkeypatch.setattr(store, "load_current_snapshot", one_conflict)
+        facts = await agent._embedded._catalog_service.tabular_resources(
+            agent.id,
+            source.id,
+        )
+        assert facts
+        assert load_count == 2
+    finally:
+        await agent.close()
+
+
+async def test_validation_projection_reports_repeated_generation_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "validation-repeated-conflict.sqlite"
+    _fixture_database(database)
+    agent = await Agent.create("catalog-validation-repeated-conflict", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        store = agent._embedded._store
+        load_count = 0
+
+        async def changing_generation(ref):
+            nonlocal load_count
+            load_count += 1
+            return None
+
+        monkeypatch.setattr(store, "load_current_snapshot", changing_generation)
+        with pytest.raises(
+            CatalogStoreError,
+            match="generation changed repeatedly",
+        ):
+            await agent._embedded._catalog_service.tabular_resources(
+                agent.id,
+                source.id,
+            )
+        assert load_count == 2
+    finally:
+        await agent.close()
+
+
+async def test_validation_projection_enforces_active_source_and_agent_isolation(
+    tmp_path: Path,
+):
+    first_database = tmp_path / "validation-first.sqlite"
+    second_database = tmp_path / "validation-second.sqlite"
+    with sqlite3.connect(first_database) as connection:
+        connection.execute("CREATE TABLE first_private (id INTEGER PRIMARY KEY)")
+    with sqlite3.connect(second_database) as connection:
+        connection.execute("CREATE TABLE second_private (id INTEGER PRIMARY KEY)")
+    first = await Agent.create("catalog-validation-first", root=tmp_path)
+    second = await Agent.create("catalog-validation-second", root=tmp_path)
+    try:
+        first_source = await first.attach(SQLiteSource(first_database))
+        first_other_source = await first.attach(SQLiteSource(second_database))
+        second_source = await second.attach(SQLiteSource(second_database))
+        first_service = first._embedded._catalog_service
+        facts = await first_service.tabular_resources(first.id, first_source.id)
+        assert tuple(item.resource.name for item in facts) == ("first_private",)
+        assert all(item.resource.agent_id == first.id for item in facts)
+        assert all(item.resource.source_id == first_source.id for item in facts)
+        other_facts = await first_service.tabular_resources(
+            first.id,
+            first_other_source.id,
+        )
+        assert tuple(item.resource.name for item in other_facts) == ("second_private",)
+        assert all(
+            item.resource.source_id == first_other_source.id for item in other_facts
+        )
+
+        with pytest.raises(CatalogStoreError, match="unknown active catalog source"):
+            await first_service.tabular_resources(second.id, first_source.id)
+        with pytest.raises(CatalogStoreError, match="unknown active catalog source"):
+            await first_service.tabular_resources(first.id, second_source.id)
+
+        await first.detach(first_source.id)
+        with pytest.raises(CatalogStoreError, match="unknown active catalog source"):
+            await first_service.tabular_resources(first.id, first_source.id)
+        assert all(
+            key[:2] != (first.id, first_source.id)
+            for key in first_service._source_indexes
+        )
+    finally:
+        await first.close()
+        await second.close()
+
+
+async def test_validation_projection_translates_tabular_resource_kinds_and_order(
+    tmp_path: Path,
+):
+    database = tmp_path / "validation-kinds.sqlite"
+    database.touch()
+    agent = await Agent.create("catalog-validation-kinds", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        nodes = {
+            "zeta": ("warehouse.zeta", ResourceKind.TABLE, True),
+            "alpha_events": ("alpha.events", ResourceKind.TABLE, True),
+            "beta_events": ("beta.events", ResourceKind.VIEW, True),
+            "csv": ("files/records.csv", ResourceKind.FILE, True),
+            "json": ("files/records.json", ResourceKind.FILE, True),
+            "blob": ("files/blob.json", ResourceKind.FILE, False),
+        }
+        await _commit_schema_graph(
+            agent,
+            source.id,
+            nodes=nodes,
+            edges=(),
+            sync_id="validation-kinds-1",
+        )
+        service = agent._embedded._catalog_service
+        data_view = agent._embedded._data_view
+        first_facts = await service.tabular_resources(agent.id, source.id)
+        first_schemas = await data_view.resource_schemas(agent.id, source.id)
+
+        assert tuple(item.resource.native_identity for item in first_facts) == tuple(
+            item.aliases[0] for item in first_schemas
+        )
+        assert tuple(item.name for item in first_schemas) == (
+            "csv",
+            "events",
+            "events",
+            "json",
+            "zeta",
+        )
+        event_schemas = tuple(item for item in first_schemas if item.name == "events")
+        assert len(event_schemas) == 2
+        assert len({item.resource_id for item in event_schemas}) == 2
+        assert {item.aliases for item in event_schemas} == {
+            ("alpha.events",),
+            ("beta.events",),
+        }
+        assert {item.resource_kind for item in first_schemas} == {
+            "file",
+            "table",
+            "view",
+        }
+        assert "files/blob.json" not in {
+            item.resource.native_identity for item in first_facts
+        }
+
+        await _commit_schema_graph(
+            agent,
+            source.id,
+            nodes=dict(reversed(tuple(nodes.items()))),
+            edges=(),
+            sync_id="validation-kinds-2",
+        )
+        second_schemas = await data_view.resource_schemas(agent.id, source.id)
+        assert tuple(
+            (item.name, item.aliases, item.resource_id, item.columns)
+            for item in second_schemas
+        ) == tuple(
+            (item.name, item.aliases, item.resource_id, item.columns)
+            for item in first_schemas
+        )
+    finally:
+        await agent.close()
+
+
+async def test_validation_projection_translates_csv_and_json_files(tmp_path: Path):
+    files = tmp_path / "validation-files"
+    files.mkdir()
+    (files / "records.csv").write_text("id,name\n1,Ada\n", encoding="utf-8")
+    (files / "events.json").write_text(
+        '[{"event_id": 1, "kind": "created"}]',
+        encoding="utf-8",
+    )
+    (files / "ignored.txt").write_text("not cataloged", encoding="utf-8")
+    agent = await Agent.create("catalog-validation-files", root=tmp_path)
+    try:
+        source = await agent.attach(LocalDirectorySource(files))
+        schemas = await agent._embedded._data_view.resource_schemas(
+            agent.id,
+            source.id,
+        )
+        by_name = {item.name: item for item in schemas}
+        assert set(by_name) == {"events.json", "records.csv"}
+        assert by_name["events.json"].columns == ("event_id", "kind")
+        assert by_name["events.json"].column_declared_types == (
+            ("event_id", "JSON"),
+            ("kind", "JSON"),
+        )
+        assert by_name["records.csv"].columns == ("id", "name")
+        assert by_name["records.csv"].column_declared_types == (
+            ("id", "TEXT"),
+            ("name", "TEXT"),
+        )
+        assert all(item.resource_kind == "file" for item in schemas)
+        assert all(item.writable is False for item in schemas)
+    finally:
+        await agent.close()
+
+
+async def test_validation_projection_empty_source_is_bounded_without_source_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "validation-empty.sqlite"
+    database.touch()
+    agent = await Agent.create("catalog-validation-empty", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        database.rename(tmp_path / "validation-empty-unavailable.sqlite")
+        store = agent._embedded._store
+
+        async def legacy_read(*args, **kwargs):
+            pytest.fail("empty validation projection used a per-resource store read")
+
+        for method_name in (
+            "list_resources",
+            "load_resource",
+            "load_revision",
+            "load_facets",
+            "load_sync",
+        ):
+            monkeypatch.setattr(store, method_name, legacy_read)
+        assert (
+            await agent._embedded._data_view.resource_schemas(agent.id, source.id) == ()
+        )
     finally:
         await agent.close()
 

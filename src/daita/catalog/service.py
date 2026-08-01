@@ -132,6 +132,48 @@ class _SourceCatalogIndex:
 
 
 @dataclass(frozen=True, slots=True)
+class CatalogTabularResource:
+    """Exact current catalog records needed for one validation schema."""
+
+    sync: CatalogSync
+    resource: CatalogResource
+    revision: CatalogResourceRevision
+    facet: CatalogFacet
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sync, CatalogSync):
+            raise TypeError("tabular resource sync must be a CatalogSync")
+        if not isinstance(self.resource, CatalogResource):
+            raise TypeError("tabular resource must be a CatalogResource")
+        if not isinstance(self.revision, CatalogResourceRevision):
+            raise TypeError(
+                "tabular resource revision must be a CatalogResourceRevision"
+            )
+        if not isinstance(self.facet, CatalogFacet):
+            raise TypeError("tabular resource facet must be a CatalogFacet")
+        if self.resource.kind not in {
+            ResourceKind.TABLE,
+            ResourceKind.VIEW,
+            ResourceKind.FILE,
+        }:
+            raise ValueError("tabular resource has a non-tabular resource kind")
+        if self.facet.kind is not FacetKind.TABULAR:
+            raise ValueError("tabular resource requires a tabular facet")
+        if (
+            self.resource.agent_id != self.sync.agent_id
+            or self.resource.source_id != self.sync.source_id
+            or self.resource.current_sync_id != self.sync.id
+            or self.revision.resource_id != self.resource.id
+            or self.revision.revision != self.resource.current_revision
+            or self.revision.sync_id != self.sync.id
+            or self.facet.resource_id != self.resource.id
+            or self.facet.sync_id != self.sync.id
+            or self.facet.revision not in self.revision.facet_revisions
+        ):
+            raise ValueError("tabular resource records are not exact-current bindings")
+
+
+@dataclass(frozen=True, slots=True)
 class _RankedCandidate:
     hit: CatalogSearchHit
     matched_terms: tuple[str, ...]
@@ -207,6 +249,115 @@ class CatalogService:
         return tuple(
             sorted(resources, key=lambda resource: (resource.name, resource.id))[:limit]
         )
+
+    async def tabular_resources(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> tuple[CatalogTabularResource, ...]:
+        """Project one exact current source generation for SQL validation."""
+
+        for attempt in range(2):
+            try:
+                await self._active_source(agent_id, source_id)
+            except CatalogStoreError:
+                async with self._source_index_lock:
+                    for key in tuple(self._source_indexes):
+                        if key[:2] == (agent_id, source_id):
+                            del self._source_indexes[key]
+                raise
+
+            refs = await self._store.list_current_snapshot_refs(
+                agent_id,
+                (source_id,),
+            )
+            if any(
+                ref.agent_id != agent_id or ref.source_id != source_id for ref in refs
+            ):
+                raise CatalogStoreError(
+                    "catalog snapshot reference escaped validation source scope"
+                )
+            if len(refs) > 1:
+                raise CatalogStoreError(
+                    "catalog validation source has multiple current generations"
+                )
+
+            current_sync_id = None if not refs else refs[0].sync_id
+            async with self._source_index_lock:
+                for key in tuple(self._source_indexes):
+                    if key[:2] == (agent_id, source_id) and key[2] != current_sync_id:
+                        del self._source_indexes[key]
+
+            if not refs:
+                result: tuple[CatalogTabularResource, ...] = ()
+            else:
+                try:
+                    index = await self._index_for_ref(refs[0])
+                except _CatalogGenerationChanged:
+                    if attempt == 0:
+                        continue
+                    break
+                if index.agent_id != agent_id or index.source_id != source_id:
+                    raise CatalogStoreError(
+                        "catalog validation index escaped source scope"
+                    )
+                records: list[CatalogTabularResource] = []
+                for resource in sorted(
+                    index.resources_by_id.values(),
+                    key=lambda item: (item.name, item.id),
+                ):
+                    if resource.kind not in {
+                        ResourceKind.TABLE,
+                        ResourceKind.VIEW,
+                        ResourceKind.FILE,
+                    }:
+                        continue
+                    tabular_facets = tuple(
+                        facet
+                        for facet in index.facets_by_resource_id.get(resource.id, ())
+                        if facet.kind is FacetKind.TABULAR
+                    )
+                    if not tabular_facets:
+                        continue
+                    if len(tabular_facets) != 1:
+                        raise CatalogStoreError(
+                            "catalog resource has multiple current tabular facets"
+                        )
+                    revision = index.revisions_by_resource_id.get(resource.id)
+                    if revision is None:
+                        raise CatalogStoreError(
+                            "catalog resource lacks its current revision"
+                        )
+                    try:
+                        records.append(
+                            CatalogTabularResource(
+                                sync=index.snapshot.sync,
+                                resource=resource,
+                                revision=revision,
+                                facet=tabular_facets[0],
+                            )
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise CatalogStoreError(
+                            "catalog tabular resource has inconsistent current facts"
+                        ) from exc
+                result = tuple(records)
+
+            try:
+                await self._active_source(agent_id, source_id)
+            except CatalogStoreError:
+                if attempt == 0:
+                    continue
+                break
+            current_refs = await self._store.list_current_snapshot_refs(
+                agent_id,
+                (source_id,),
+            )
+            if current_refs == refs:
+                return result
+            if attempt == 1:
+                break
+        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
 
     async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
         if not isinstance(request, CatalogSearchRequest):
