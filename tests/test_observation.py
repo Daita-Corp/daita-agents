@@ -241,12 +241,14 @@ async def test_text_run_order_payloads_and_durable_boundaries():
         "provider_id",
         "duration_ms",
         "input_tokens",
+        "context_input_tokens",
         "output_tokens",
     }
     assert model_data["provider_id"] == "mock:observed"
     assert isinstance(model_data["duration_ms"], int)
     assert model_data["duration_ms"] >= 0
     assert model_data["input_tokens"] == 7
+    assert model_data["context_input_tokens"] == 7
     assert model_data["output_tokens"] == 5
     completed_data = events[2].data.to_dict()
     assert completed_data == {

@@ -75,37 +75,11 @@ class CatalogDataView:
         agent_id: str,
         source_id: str,
     ) -> tuple[ResourceSchema, ...]:
-        resources = await self._store.list_resources(agent_id, source_id)
+        tabular_resources = await self._service.tabular_resources(agent_id, source_id)
         schemas: list[ResourceSchema] = []
-        source_revision_by_sync: dict[str, str | None] = {}
-        for resource in resources:
-            if resource.kind not in {
-                ResourceKind.TABLE,
-                ResourceKind.VIEW,
-                ResourceKind.FILE,
-            }:
-                continue
-            if resource.current_sync_id not in source_revision_by_sync:
-                sync = await self._store.load_sync(
-                    agent_id,
-                    resource.current_sync_id,
-                )
-                source_revision_by_sync[resource.current_sync_id] = (
-                    None
-                    if sync is None or sync.source_id != resource.source_id
-                    else sync.source_revision
-                )
-            facets = await self._store.load_facets(
-                agent_id,
-                resource.id,
-                resource.current_revision,
-            )
-            tabular = next(
-                (facet for facet in facets if facet.kind is FacetKind.TABULAR),
-                None,
-            )
-            if tabular is None:
-                continue
+        for item in tabular_resources:
+            resource = item.resource
+            tabular = item.facet
             raw_columns = tabular.payload.get("columns", ())
             if not isinstance(raw_columns, tuple):
                 continue
@@ -168,7 +142,7 @@ class CatalogDataView:
                     columns=columns,
                     aliases=aliases,
                     revision=resource.current_revision,
-                    source_revision=source_revision_by_sync[resource.current_sync_id],
+                    source_revision=item.sync.source_revision,
                     resource_kind=resource.kind.value,
                     sensitivity_class=resource.sensitivity.value,
                     writable=resource.kind is ResourceKind.TABLE,

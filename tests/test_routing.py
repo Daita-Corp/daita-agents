@@ -116,6 +116,7 @@ async def test_router_aggregates_every_complete_attempt():
 
     assert response.usage.input_tokens == 5
     assert response.usage.output_tokens == 1
+    assert response.request_input_tokens == 3
     assert response.usage.cost_estimate.status is CostEstimateStatus.COMPLETE
     assert response.usage.cost_estimate.amount_usd == Decimal("0.03")
 

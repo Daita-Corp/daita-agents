@@ -808,6 +808,81 @@ def test_catalog_schema_slice_extends_existing_catalog_and_capability_owners():
         assert prohibited not in _python_text(PACKAGE)
 
 
+def test_catalog_snapshot_reuse_is_private_derived_storage_state():
+    assert _class_owners("CatalogSnapshotRef") == {"catalog/models.py"}
+    assert "CatalogSnapshotRef" not in daita.__all__
+    protocol_methods = _class_methods(
+        PACKAGE / "catalog" / "protocols.py",
+        "CatalogStore",
+    )
+    assert {
+        "list_current_snapshot_refs",
+        "load_current_snapshot",
+    } <= protocol_methods
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    assert "_decoded_catalog_snapshots" in storage
+    assert "CREATE TABLE IF NOT EXISTS decoded_catalog_snapshots" not in storage
+    for prohibited in (
+        "CatalogSchemaCache",
+        "CatalogSearchService",
+        "SchemaGraph",
+        "VectorStore",
+    ):
+        assert prohibited not in _python_text(PACKAGE)
+
+
+def test_catalog_indexed_retrieval_is_private_and_catalog_owned():
+    protocol_methods = _class_methods(
+        PACKAGE / "catalog" / "protocols.py",
+        "CatalogStore",
+    )
+    storage_methods = _class_methods(
+        PACKAGE / "storage" / "sqlite.py",
+        "SQLiteStateStore",
+    )
+    service = (PACKAGE / "catalog" / "service.py").read_text(encoding="utf-8")
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop")
+
+    assert "search" not in protocol_methods
+    assert "search" not in storage_methods
+    assert "_SourceCatalogIndex" in service
+    assert "_source_indexes" in service
+    assert "_compile_source_index" in service
+    assert "_catalog_search_reason" not in storage
+    assert "_SourceCatalogIndex" not in storage
+    assert "CatalogSearchHit" not in storage
+    assert "_SourceCatalogIndex" not in loop
+
+
+def test_catalog_bounded_traversal_is_catalog_owned_and_not_storage_owned():
+    protocol_methods = _class_methods(
+        PACKAGE / "catalog" / "protocols.py",
+        "CatalogStore",
+    )
+    storage_methods = _class_methods(
+        PACKAGE / "storage" / "sqlite.py",
+        "SQLiteStateStore",
+    )
+    service = (PACKAGE / "catalog" / "service.py").read_text(encoding="utf-8")
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop")
+
+    assert "traverse" not in protocol_methods
+    assert "traverse" not in storage_methods
+    assert "load_relationships" not in protocol_methods
+    assert "load_relationships" not in storage_methods
+    assert "_traverse_indexes" in service
+    assert "distance_by_resource" in service
+    assert "parents_by_resource" in service
+    assert "deque(admitted_sources)" in service
+    assert "CatalogPath" not in storage
+    assert "CatalogPathStep" not in storage
+    assert "distance_by_resource" not in storage
+    assert "CatalogTraversalRequest" not in storage
+    assert "CatalogTraversalRequest" not in loop
+
+
 def test_cli_adds_no_parallel_state_approval_or_observation_owner():
     cli_tree = ast.parse((PACKAGE / "cli.py").read_text(encoding="utf-8"))
     cli_classes = {

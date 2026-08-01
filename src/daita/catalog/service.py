@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
+from bisect import bisect_left
+from collections import deque
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
+import re
+from types import MappingProxyType
 from typing import TYPE_CHECKING
+import unicodedata
 
 from .._json import FrozenJsonObject
 from .models import (
+    CATALOG_TRAVERSAL_MAX_EDGES,
+    CATALOG_TRAVERSAL_MAX_NODES,
+    CATALOG_TRAVERSAL_MAX_PATHS,
     CatalogFacet,
+    CatalogPath,
+    CatalogPathStep,
     CatalogRelationship,
     CatalogResource,
+    CatalogResourceRevision,
     CatalogSchemaRequest,
+    CatalogSnapshotRef,
     CatalogSearchHit,
     CatalogSearchRequest,
     CatalogSearchResult,
@@ -18,10 +33,14 @@ from .models import (
     CatalogSync,
     CatalogSyncStatus,
     CatalogTraversalRequest,
+    CatalogTraversalResult,
+    CatalogTraversalTruncationReason,
     FacetKind,
     RelationshipDirection,
     RelationshipKind,
+    RelationshipProvenance,
     ResourceKind,
+    SourceCatalogSnapshot,
 )
 from .protocols import CatalogResourceNotFoundError, CatalogStore, CatalogStoreError
 
@@ -33,6 +52,147 @@ _SCHEMA_COLUMN_LIMIT = 256
 _SCHEMA_KEY_LIMIT = 64
 _SCHEMA_RELATIONSHIP_LIMIT = 200
 _SCHEMA_STRUCTURAL_FACT_LIMIT = 32
+_SCHEMA_JOIN_MAX_EDGES = CATALOG_TRAVERSAL_MAX_EDGES
+_SCHEMA_JOIN_MAX_NODES = CATALOG_TRAVERSAL_MAX_NODES
+_SEARCH_TOKEN_LIMIT = 64
+_SEARCH_TOKEN_LENGTH_LIMIT = 128
+_SEARCH_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "by",
+        "can",
+        "for",
+        "from",
+        "get",
+        "give",
+        "how",
+        "in",
+        "is",
+        "me",
+        "of",
+        "on",
+        "show",
+        "the",
+        "to",
+        "what",
+        "which",
+    }
+)
+_CAMEL_ACRONYM_BOUNDARY = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+_CAMEL_WORD_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalizedText:
+    complete: str
+    tokens: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedPosting:
+    resource_id: str
+    field_kind: str
+    field_name: str
+    normalized_value: str
+    tokens: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedEdge:
+    neighbor_resource_id: str
+    relationship_id: str
+    direction: RelationshipDirection
+
+
+@dataclass(frozen=True, slots=True)
+class _ParentStep:
+    parent_resource_id: str
+    relationship_id: str
+    direction: RelationshipDirection
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceCatalogIndex:
+    agent_id: str
+    source_id: str
+    sync_id: str
+    snapshot: SourceCatalogSnapshot
+    resources_by_id: Mapping[str, CatalogResource]
+    revisions_by_resource_id: Mapping[str, CatalogResourceRevision]
+    facets_by_resource_id: Mapping[str, tuple[CatalogFacet, ...]]
+    relationships_by_id: Mapping[str, CatalogRelationship]
+    adjacency_by_resource_id: Mapping[str, tuple[_IndexedEdge, ...]]
+    exact_resource_names: Mapping[str, tuple[str, ...]]
+    token_postings: Mapping[str, tuple[_IndexedPosting, ...]]
+    posting_tokens: tuple[str, ...]
+    postings_by_resource_id: Mapping[str, tuple[_IndexedPosting, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogTabularResource:
+    """Exact current catalog records needed for one validation schema."""
+
+    sync: CatalogSync
+    resource: CatalogResource
+    revision: CatalogResourceRevision
+    facet: CatalogFacet
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sync, CatalogSync):
+            raise TypeError("tabular resource sync must be a CatalogSync")
+        if not isinstance(self.resource, CatalogResource):
+            raise TypeError("tabular resource must be a CatalogResource")
+        if not isinstance(self.revision, CatalogResourceRevision):
+            raise TypeError(
+                "tabular resource revision must be a CatalogResourceRevision"
+            )
+        if not isinstance(self.facet, CatalogFacet):
+            raise TypeError("tabular resource facet must be a CatalogFacet")
+        if self.resource.kind not in {
+            ResourceKind.TABLE,
+            ResourceKind.VIEW,
+            ResourceKind.FILE,
+        }:
+            raise ValueError("tabular resource has a non-tabular resource kind")
+        if self.facet.kind is not FacetKind.TABULAR:
+            raise ValueError("tabular resource requires a tabular facet")
+        if (
+            self.resource.agent_id != self.sync.agent_id
+            or self.resource.source_id != self.sync.source_id
+            or self.resource.current_sync_id != self.sync.id
+            or self.revision.resource_id != self.resource.id
+            or self.revision.revision != self.resource.current_revision
+            or self.revision.sync_id != self.sync.id
+            or self.facet.resource_id != self.resource.id
+            or self.facet.sync_id != self.sync.id
+            or self.facet.revision not in self.revision.facet_revisions
+        ):
+            raise ValueError("tabular resource records are not exact-current bindings")
+
+
+@dataclass(frozen=True, slots=True)
+class _RankedCandidate:
+    hit: CatalogSearchHit
+    matched_terms: tuple[str, ...]
+    rank_key: tuple[int, int, int, int, int, int, int, int, int, str, str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _SchemaJoinSelection:
+    paths: tuple[CatalogPath, ...]
+    bridge_resource_ids: tuple[str, ...]
+    relationship_ids: tuple[str, ...]
+    unresolved_reasons: tuple[str, ...]
+    truncation_reason: str | None
+    visited_nodes: int
+    visited_edges: int
+
+
+class _CatalogGenerationChanged(RuntimeError):
+    """Signal one bounded schema-slice retry from fresh snapshot references."""
 
 
 class CatalogService:
@@ -47,6 +207,8 @@ class CatalogService:
             raise TypeError("sources must provide source registration reads")
         self._store = store
         self._sources = sources
+        self._source_indexes: dict[tuple[str, str, str], _SourceCatalogIndex] = {}
+        self._source_index_lock = asyncio.Lock()
 
     async def summary(self, agent_id: str) -> CatalogSummary:
         """Project active source counts from their current committed snapshots."""
@@ -88,52 +250,376 @@ class CatalogService:
             sorted(resources, key=lambda resource: (resource.name, resource.id))[:limit]
         )
 
-    async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
-        active_source_ids = {
-            registration.id
-            for registration in await self._sources.list_sources(request.agent_id)
-            if registration.agent_id == request.agent_id and registration.active
-        }
-        if request.source_ids:
-            active_source_ids.intersection_update(request.source_ids)
-        if not active_source_ids:
-            return CatalogSearchResult(
-                request=request,
-                hits=(),
-                total_matches=0,
-                truncated=False,
-            )
+    async def tabular_resources(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> tuple[CatalogTabularResource, ...]:
+        """Project one exact current source generation for SQL validation."""
 
-        ordered_source_ids = tuple(sorted(active_source_ids))
-        scoped_results = []
-        for offset in range(0, len(ordered_source_ids), 64):
-            scoped_results.append(
-                await self._store.search(
-                    CatalogSearchRequest(
-                        agent_id=request.agent_id,
-                        query=request.query,
-                        source_ids=ordered_source_ids[offset : offset + 64],
-                        resource_kinds=request.resource_kinds,
-                        limit=request.limit,
+        for attempt in range(2):
+            try:
+                await self._active_source(agent_id, source_id)
+            except CatalogStoreError:
+                async with self._source_index_lock:
+                    for key in tuple(self._source_indexes):
+                        if key[:2] == (agent_id, source_id):
+                            del self._source_indexes[key]
+                raise
+
+            refs = await self._store.list_current_snapshot_refs(
+                agent_id,
+                (source_id,),
+            )
+            if any(
+                ref.agent_id != agent_id or ref.source_id != source_id for ref in refs
+            ):
+                raise CatalogStoreError(
+                    "catalog snapshot reference escaped validation source scope"
+                )
+            if len(refs) > 1:
+                raise CatalogStoreError(
+                    "catalog validation source has multiple current generations"
+                )
+
+            current_sync_id = None if not refs else refs[0].sync_id
+            async with self._source_index_lock:
+                for key in tuple(self._source_indexes):
+                    if key[:2] == (agent_id, source_id) and key[2] != current_sync_id:
+                        del self._source_indexes[key]
+
+            if not refs:
+                result: tuple[CatalogTabularResource, ...] = ()
+            else:
+                try:
+                    index = await self._index_for_ref(refs[0])
+                except _CatalogGenerationChanged:
+                    if attempt == 0:
+                        continue
+                    break
+                if index.agent_id != agent_id or index.source_id != source_id:
+                    raise CatalogStoreError(
+                        "catalog validation index escaped source scope"
                     )
+                records: list[CatalogTabularResource] = []
+                for resource in sorted(
+                    index.resources_by_id.values(),
+                    key=lambda item: (item.name, item.id),
+                ):
+                    if resource.kind not in {
+                        ResourceKind.TABLE,
+                        ResourceKind.VIEW,
+                        ResourceKind.FILE,
+                    }:
+                        continue
+                    tabular_facets = tuple(
+                        facet
+                        for facet in index.facets_by_resource_id.get(resource.id, ())
+                        if facet.kind is FacetKind.TABULAR
+                    )
+                    if not tabular_facets:
+                        continue
+                    if len(tabular_facets) != 1:
+                        raise CatalogStoreError(
+                            "catalog resource has multiple current tabular facets"
+                        )
+                    revision = index.revisions_by_resource_id.get(resource.id)
+                    if revision is None:
+                        raise CatalogStoreError(
+                            "catalog resource lacks its current revision"
+                        )
+                    try:
+                        records.append(
+                            CatalogTabularResource(
+                                sync=index.snapshot.sync,
+                                resource=resource,
+                                revision=revision,
+                                facet=tabular_facets[0],
+                            )
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise CatalogStoreError(
+                            "catalog tabular resource has inconsistent current facts"
+                        ) from exc
+                result = tuple(records)
+
+            try:
+                await self._active_source(agent_id, source_id)
+            except CatalogStoreError:
+                if attempt == 0:
+                    continue
+                break
+            current_refs = await self._store.list_current_snapshot_refs(
+                agent_id,
+                (source_id,),
+            )
+            if current_refs == refs:
+                return result
+            if attempt == 1:
+                break
+        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
+
+    async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
+        if not isinstance(request, CatalogSearchRequest):
+            raise TypeError("request must be a CatalogSearchRequest record")
+        for attempt in range(2):
+            active_source_ids = await self._active_source_ids(request.agent_id)
+            scoped_source_ids = (
+                tuple(
+                    source_id
+                    for source_id in active_source_ids
+                    if source_id in request.source_ids
+                )
+                if request.source_ids
+                else active_source_ids
+            )
+            refs = (
+                ()
+                if not active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    active_source_ids,
                 )
             )
-        ranked_hits = sorted(
-            (hit for result in scoped_results for hit in result.hits),
-            key=lambda hit: (
-                _match_reason_rank(hit.match_reasons),
-                -hit.score,
-                hit.name,
-                hit.resource_id,
-            ),
+            await self._evict_stale_indexes(
+                request.agent_id,
+                active_source_ids,
+                refs,
+            )
+            selected_refs = tuple(
+                ref for ref in refs if ref.source_id in scoped_source_ids
+            )
+            indexes: list[_SourceCatalogIndex] = []
+            generation_changed = False
+            for ref in selected_refs:
+                try:
+                    indexes.append(await self._index_for_ref(ref))
+                except _CatalogGenerationChanged:
+                    generation_changed = True
+                    break
+            if generation_changed:
+                if attempt == 0:
+                    continue
+                break
+            result = self._search_indexes(request, tuple(indexes))
+            current_active_source_ids = await self._active_source_ids(request.agent_id)
+            current_refs = (
+                ()
+                if not current_active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    current_active_source_ids,
+                )
+            )
+            if current_active_source_ids == active_source_ids and current_refs == refs:
+                return result
+            if attempt == 1:
+                break
+        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
+
+    async def _index_for_ref(
+        self,
+        ref: CatalogSnapshotRef,
+    ) -> _SourceCatalogIndex:
+        if not isinstance(ref, CatalogSnapshotRef):
+            raise TypeError("ref must be a CatalogSnapshotRef record")
+        key = (ref.agent_id, ref.source_id, ref.sync_id)
+        cached = self._source_indexes.get(key)
+        if cached is not None:
+            return cached
+        snapshot = await self._store.load_current_snapshot(ref)
+        if snapshot is None:
+            raise _CatalogGenerationChanged
+        if (
+            snapshot.sync.agent_id,
+            snapshot.sync.source_id,
+            snapshot.sync.id,
+        ) != key:
+            raise CatalogStoreError("catalog snapshot disagrees with its reference")
+        return await self._index_for_snapshot(snapshot)
+
+    async def _index_for_snapshot(
+        self,
+        snapshot: SourceCatalogSnapshot,
+    ) -> _SourceCatalogIndex:
+        sync = snapshot.sync
+        key = (sync.agent_id, sync.source_id, sync.id)
+        cached = self._source_indexes.get(key)
+        if cached is not None:
+            return cached
+        async with self._source_index_lock:
+            cached = self._source_indexes.get(key)
+            if cached is not None:
+                return cached
+            try:
+                compiled = _compile_source_index(snapshot)
+            except CatalogStoreError:
+                raise
+            except Exception as exc:
+                raise CatalogStoreError(
+                    "catalog index compilation failed for "
+                    f"{sync.agent_id}/{sync.source_id}/{sync.id}"
+                ) from exc
+            self._source_indexes[key] = compiled
+            return compiled
+
+    async def _evict_stale_indexes(
+        self,
+        agent_id: str,
+        active_source_ids: tuple[str, ...],
+        refs: tuple[CatalogSnapshotRef, ...],
+    ) -> None:
+        active = set(active_source_ids)
+        current_sync_by_source = {
+            ref.source_id: ref.sync_id for ref in refs if ref.agent_id == agent_id
+        }
+        async with self._source_index_lock:
+            for key in tuple(self._source_indexes):
+                cached_agent_id, source_id, sync_id = key
+                if cached_agent_id != agent_id:
+                    continue
+                if (
+                    source_id not in active
+                    or current_sync_by_source.get(source_id) != sync_id
+                ):
+                    del self._source_indexes[key]
+
+    def _search_indexes(
+        self,
+        request: CatalogSearchRequest,
+        indexes: tuple[_SourceCatalogIndex, ...],
+    ) -> CatalogSearchResult:
+        for index in indexes:
+            if index.agent_id != request.agent_id or (
+                request.source_ids and index.source_id not in request.source_ids
+            ):
+                raise CatalogStoreError("catalog search index escaped request scope")
+
+        normalized_query = _normalize_search_text(request.query)
+        significant_terms = tuple(
+            token
+            for token in normalized_query.tokens
+            if token not in _SEARCH_STOP_WORDS
         )
-        hits = tuple(ranked_hits[: request.limit])
-        total_matches = sum(result.total_matches for result in scoped_results)
+        resource_kinds = set(request.resource_kinds)
+        index_by_source_id = {index.source_id: index for index in indexes}
+
+        if not normalized_query.complete:
+            resources_by_id = {
+                resource.id: resource
+                for index in indexes
+                for resource in index.resources_by_id.values()
+                if not resource_kinds or resource.kind in resource_kinds
+            }
+            candidates = tuple(
+                _inventory_candidate(resource)
+                for resource in sorted(
+                    resources_by_id.values(),
+                    key=_resource_search_tie_key,
+                )
+            )
+        else:
+            postings_by_candidate: dict[str, set[_IndexedPosting]] = {}
+            candidate_resources: dict[str, CatalogResource] = {}
+            for index in indexes:
+                exact_ids = index.exact_resource_names.get(
+                    normalized_query.complete,
+                    (),
+                )
+                for resource_id in exact_ids:
+                    resource = index.resources_by_id[resource_id]
+                    if resource_kinds and resource.kind not in resource_kinds:
+                        continue
+                    candidate_resources[resource_id] = resource
+                    matching = tuple(
+                        posting
+                        for posting in index.postings_by_resource_id.get(
+                            resource_id,
+                            (),
+                        )
+                        if posting.normalized_value == normalized_query.complete
+                    )
+                    postings_by_candidate.setdefault(resource_id, set()).update(
+                        matching
+                    )
+                for term in significant_terms:
+                    token_position = bisect_left(index.posting_tokens, term)
+                    while token_position < len(index.posting_tokens):
+                        indexed_token = index.posting_tokens[token_position]
+                        if not indexed_token.startswith(term):
+                            break
+                        postings = index.token_postings[indexed_token]
+                        for posting in postings:
+                            resource = index.resources_by_id[posting.resource_id]
+                            if resource_kinds and resource.kind not in resource_kinds:
+                                continue
+                            candidate_resources[posting.resource_id] = resource
+                            postings_by_candidate.setdefault(
+                                posting.resource_id,
+                                set(),
+                            ).add(posting)
+                        token_position += 1
+            candidates = tuple(
+                _rank_index_candidate(
+                    candidate_resources[resource_id],
+                    tuple(sorted(postings, key=_posting_sort_key)),
+                    normalized_query,
+                    significant_terms,
+                )
+                for resource_id, postings in sorted(postings_by_candidate.items())
+            )
+            candidates = _diversify_candidates(candidates, significant_terms)
+
+        direct_ids = {candidate.hit.resource_id for candidate in candidates}
+        neighbor_by_id: dict[
+            str,
+            tuple[tuple[int, str, str, str], CatalogSearchHit],
+        ] = {}
+        for direct_position, candidate in enumerate(candidates):
+            index = index_by_source_id[candidate.hit.source_id]
+            for edge in index.adjacency_by_resource_id.get(
+                candidate.hit.resource_id,
+                (),
+            ):
+                neighbor = index.resources_by_id.get(edge.neighbor_resource_id)
+                if (
+                    neighbor is None
+                    or neighbor.id in direct_ids
+                    or (resource_kinds and neighbor.kind not in resource_kinds)
+                ):
+                    continue
+                order = (
+                    direct_position,
+                    edge.relationship_id,
+                    _normalize_search_text(neighbor.native_identity).complete,
+                    neighbor.id,
+                )
+                hit = CatalogSearchHit(
+                    resource_id=neighbor.id,
+                    source_id=neighbor.source_id,
+                    kind=neighbor.kind,
+                    name=neighbor.name,
+                    revision=neighbor.current_revision,
+                    sensitivity=neighbor.sensitivity,
+                    score=0.0,
+                    matched_fields=(f"relationship:{edge.relationship_id}",),
+                    match_reasons=("relationship_neighbor",),
+                )
+                existing = neighbor_by_id.get(neighbor.id)
+                if existing is None or order < existing[0]:
+                    neighbor_by_id[neighbor.id] = (order, hit)
+
+        direct_hits = tuple(candidate.hit for candidate in candidates)
+        neighbors = tuple(
+            hit for _, hit in sorted(neighbor_by_id.values(), key=lambda item: item[0])
+        )
+        all_hits = (*direct_hits, *neighbors)
+        hits = tuple(all_hits[: request.limit])
         return CatalogSearchResult(
             request=request,
             hits=hits,
-            total_matches=total_matches,
-            truncated=total_matches > len(hits),
+            total_matches=len(all_hits),
+            truncated=len(all_hits) > len(hits),
         )
 
     async def schema_slice(
@@ -144,43 +630,156 @@ class CatalogService:
 
         if not isinstance(request, CatalogSchemaRequest):
             raise TypeError("request must be a CatalogSchemaRequest record")
-        if request.source_id is not None:
-            await self._active_source(request.agent_id, request.source_id)
+        for attempt in range(2):
+            active_source_ids = await self._active_source_ids(request.agent_id)
+            if (
+                request.source_id is not None
+                and request.source_id not in active_source_ids
+            ):
+                raise CatalogStoreError(
+                    f"unknown active catalog source for {request.agent_id}: "
+                    f"{request.source_id}"
+                )
+            refs = (
+                ()
+                if not active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    active_source_ids,
+                )
+            )
+            await self._evict_stale_indexes(
+                request.agent_id,
+                active_source_ids,
+                refs,
+            )
+            indexes: list[_SourceCatalogIndex] = []
+            generation_changed = False
+            for ref in refs:
+                try:
+                    indexes.append(await self._index_for_ref(ref))
+                except _CatalogGenerationChanged:
+                    generation_changed = True
+                    break
+            if generation_changed:
+                if attempt == 0:
+                    continue
+                break
+            try:
+                projection = self._schema_slice_from_indexes(
+                    request,
+                    active_source_ids,
+                    tuple(indexes),
+                )
+            except _CatalogGenerationChanged:
+                if attempt == 0:
+                    continue
+                break
+            current_source_ids = await self._active_source_ids(request.agent_id)
+            current_refs = (
+                ()
+                if not current_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    current_source_ids,
+                )
+            )
+            if current_source_ids == active_source_ids and current_refs == refs:
+                return projection
+            if attempt == 1:
+                break
+        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
+
+    def _schema_slice_from_indexes(
+        self,
+        request: CatalogSchemaRequest,
+        active_source_ids: tuple[str, ...],
+        indexes: tuple[_SourceCatalogIndex, ...],
+    ) -> FrozenJsonObject:
+        resources_by_id: dict[str, CatalogResource] = {}
+        revisions_by_resource_id: dict[str, CatalogResourceRevision] = {}
+        facets_by_resource_id: dict[str, tuple[CatalogFacet, ...]] = {}
+        relationships_by_id: dict[str, CatalogRelationship] = {}
+        all_syncs_by_id: dict[str, CatalogSync] = {}
+        index_by_resource_id: dict[str, _SourceCatalogIndex] = {}
+        index_by_source_id: dict[str, _SourceCatalogIndex] = {}
+        for index in indexes:
+            sync = index.snapshot.sync
+            if (
+                sync.agent_id != request.agent_id
+                or sync.source_id not in active_source_ids
+                or index.agent_id != request.agent_id
+                or index.source_id != sync.source_id
+                or index.sync_id != sync.id
+                or sync.id in all_syncs_by_id
+            ):
+                raise CatalogStoreError("catalog index set has invalid ownership")
+            all_syncs_by_id[sync.id] = sync
+            index_by_source_id[index.source_id] = index
+            for resource in index.resources_by_id.values():
+                if resource.id in resources_by_id:
+                    raise CatalogStoreError("catalog index set repeats a resource")
+                resources_by_id[resource.id] = resource
+                index_by_resource_id[resource.id] = index
+            for revision in index.revisions_by_resource_id.values():
+                if revision.resource_id in revisions_by_resource_id:
+                    raise CatalogStoreError("catalog index set repeats a revision")
+                revisions_by_resource_id[revision.resource_id] = revision
+            for resource_id, facets in index.facets_by_resource_id.items():
+                facets_by_resource_id[resource_id] = facets
+            for relationship in index.relationships_by_id.values():
+                if relationship.id in relationships_by_id:
+                    raise CatalogStoreError("catalog index set repeats a relationship")
+                relationships_by_id[relationship.id] = relationship
 
         match_by_resource_id: dict[str, CatalogSearchHit] = {}
+        normalized_query = _normalize_search_text(request.query or "")
+        significant_terms = tuple(
+            token
+            for token in normalized_query.tokens
+            if token not in _SEARCH_STOP_WORDS
+        )
         if request.query is not None:
-            search = await self.search(
-                CatalogSearchRequest(
-                    agent_id=request.agent_id,
-                    query=request.query,
-                    source_ids=(
-                        () if request.source_id is None else (request.source_id,)
-                    ),
-                    limit=50,
-                )
+            search_request = CatalogSearchRequest(
+                agent_id=request.agent_id,
+                query=request.query,
+                source_ids=(() if request.source_id is None else (request.source_id,)),
+                resource_kinds=(
+                    ResourceKind.TABLE,
+                    ResourceKind.VIEW,
+                    ResourceKind.FILE,
+                ),
+                limit=50,
+            )
+            search = self._search_indexes(
+                search_request,
+                tuple(
+                    index
+                    for index in indexes
+                    if request.source_id is None or index.source_id == request.source_id
+                ),
             )
             match_by_resource_id = {hit.resource_id: hit for hit in search.hits}
         else:
             search = None
 
         if request.resource_ids:
-            resources_by_id: dict[str, CatalogResource] = {}
+            selected_resources_by_id: dict[str, CatalogResource] = {}
             for resource_id in request.resource_ids:
-                resource = await self._active_resource(
-                    request.agent_id,
-                    resource_id,
-                )
+                candidate_resource = resources_by_id.get(resource_id)
+                if candidate_resource is None:
+                    raise CatalogResourceNotFoundError(request.agent_id, resource_id)
                 if (
                     request.source_id is not None
-                    and resource.source_id != request.source_id
+                    and candidate_resource.source_id != request.source_id
                 ):
                     raise CatalogStoreError(
                         "catalog schema resource is outside requested source scope"
                     )
-                resources_by_id[resource.id] = resource
+                selected_resources_by_id[candidate_resource.id] = candidate_resource
             candidates = tuple(
                 sorted(
-                    resources_by_id.values(),
+                    selected_resources_by_id.values(),
                     key=lambda item: (
                         item.native_identity.casefold(),
                         item.native_identity,
@@ -193,47 +792,131 @@ class CatalogService:
             assert search is not None
             candidates_list: list[CatalogResource] = []
             for hit in search.hits:
-                resource = await self._active_resource(
-                    request.agent_id,
-                    hit.resource_id,
-                )
+                if hit.match_reasons == ("relationship_neighbor",):
+                    continue
+                hit_resource = resources_by_id.get(hit.resource_id)
+                if (
+                    hit_resource is None
+                    or hit_resource.current_revision != hit.revision
+                    or hit_resource.source_id != hit.source_id
+                ):
+                    raise _CatalogGenerationChanged
                 if (
                     request.source_id is not None
-                    and resource.source_id != request.source_id
+                    and hit_resource.source_id != request.source_id
                 ):
                     raise CatalogStoreError(
                         "catalog schema search escaped requested source scope"
                     )
-                candidates_list.append(resource)
+                hit_index = index_by_resource_id[hit_resource.id]
+                if not self._is_tabular_resource(hit_index, hit_resource.id):
+                    continue
+                candidates_list.append(hit_resource)
             candidates = tuple(candidates_list)
             total_matches = search.total_matches
 
-        selected = candidates[: request.limit]
-        resources_cache = {resource.id: resource for resource in selected}
-        sync_by_id: dict[str, CatalogSync] = {}
+        if request.resource_ids:
+            seed_limit = request.limit
+        elif request.limit == 1:
+            seed_limit = 1
+        else:
+            bridge_reserve = max(0, request.max_join_depth - 1)
+            seed_limit = min(request.limit, max(2, request.limit - bridge_reserve))
+        seeds = candidates[:seed_limit]
+        seed_ids = {resource.id for resource in seeds}
+        seed_rank = {resource.id: rank for rank, resource in enumerate(seeds)}
+        matched_terms_by_resource_id = {
+            resource.id: self._schema_matched_terms(
+                index_by_resource_id[resource.id],
+                resource.id,
+                significant_terms,
+            )
+            for resource in seeds
+        }
+        covered_terms = tuple(
+            term
+            for term in significant_terms
+            if any(
+                term in matched_terms
+                for matched_terms in matched_terms_by_resource_id.values()
+            )
+        )
+        unresolved_terms = tuple(
+            term for term in significant_terms if term not in covered_terms
+        )
+
+        join_selection = _SchemaJoinSelection((), (), (), (), None, 0, 0)
+        if request.include_relationships and len(seeds) >= 2:
+            join_selection = self._select_schema_joins(
+                request,
+                seeds,
+                index_by_source_id,
+            )
+
+        included_ids = set(seed_ids)
+        included_ids.update(join_selection.bridge_resource_ids)
+        optional_neighbors_truncated = False
+        if request.include_relationships and len(seeds) == 1:
+            seed = seeds[0]
+            index = index_by_resource_id[seed.id]
+            eligible_ids = self._sql_join_relationship_ids(index)
+            neighbor_candidates = tuple(
+                edge.neighbor_resource_id
+                for edge in index.adjacency_by_resource_id.get(seed.id, ())
+                if edge.relationship_id in eligible_ids
+            )
+            for neighbor_id in neighbor_candidates:
+                if neighbor_id in included_ids:
+                    continue
+                if len(included_ids) >= request.limit:
+                    optional_neighbors_truncated = True
+                    break
+                included_ids.add(neighbor_id)
+
+        selected = tuple(
+            sorted(
+                (resources_by_id[resource_id] for resource_id in included_ids),
+                key=lambda item: (
+                    _normalize_search_text(item.native_identity).complete,
+                    item.native_identity,
+                    item.id,
+                ),
+            )
+        )
+        selected_resources = {resource.id: resource for resource in selected}
+        selected_syncs_by_id: dict[str, CatalogSync] = {}
         resource_payloads: list[dict[str, object]] = []
         columns_truncated = False
         primary_keys_truncated = False
         unique_keys_truncated = False
         structural_facts_truncated = False
         for resource in selected:
-            sync = await self._current_resource_sync(
-                request.agent_id,
-                resource,
-                sync_by_id,
-            )
+            resource_sync = all_syncs_by_id.get(resource.current_sync_id)
+            if (
+                resource_sync is None
+                or resource_sync.agent_id != request.agent_id
+                or resource_sync.source_id != resource.source_id
+                or resource_sync.status is not CatalogSyncStatus.SUCCEEDED
+            ):
+                raise CatalogStoreError("catalog resource sync is not current")
+            selected_syncs_by_id[resource_sync.id] = resource_sync
             (
                 structural,
                 resource_columns_truncated,
                 resource_primary_keys_truncated,
                 resource_unique_keys_truncated,
-            ) = await self._schema_resource_structure(
-                request.agent_id,
-                resource,
+            ) = self._schema_resource_structure(
+                facets_by_resource_id.get(resource.id, ()),
             )
             match_hit = match_by_resource_id.get(resource.id)
             matched_fields = () if match_hit is None else match_hit.matched_fields
             match_reasons = () if match_hit is None else match_hit.match_reasons
+            if resource.id in seed_ids:
+                selection_role = "seed"
+            elif resource.id in join_selection.bridge_resource_ids:
+                selection_role = "bridge"
+            else:
+                selection_role = "neighbor"
             resource_structural_facts_truncated = (
                 len(matched_fields) > _SCHEMA_STRUCTURAL_FACT_LIMIT
                 or len(match_reasons) > _SCHEMA_STRUCTURAL_FACT_LIMIT
@@ -242,10 +925,12 @@ class CatalogService:
                 {
                     "columns": structural["columns"],
                     "kind": resource.kind.value,
+                    "matched_terms": matched_terms_by_resource_id.get(resource.id, ()),
                     "name": resource.native_identity,
                     "primary_key_fields": structural["primary_key_fields"],
                     "resource_id": resource.id,
                     "revision": resource.current_revision,
+                    "selection_role": selection_role,
                     "source_id": resource.source_id,
                     "structural_facts": {
                         "match_reasons": match_reasons[:_SCHEMA_STRUCTURAL_FACT_LIMIT],
@@ -253,7 +938,7 @@ class CatalogService:
                             :_SCHEMA_STRUCTURAL_FACT_LIMIT
                         ],
                     },
-                    "sync_id": sync.id,
+                    "sync_id": resource_sync.id,
                     "unique_key_fields": structural["unique_key_fields"],
                 }
             )
@@ -269,30 +954,36 @@ class CatalogService:
             )
 
         relationship_payloads: list[dict[str, object]] = []
-        relationships_truncated = False
+        relationships_truncated = (
+            join_selection.truncation_reason == "relationship_limit"
+        )
         if request.include_relationships:
-            relationships_by_id: dict[str, CatalogRelationship] = {}
+            selected_relationship_ids = set(join_selection.relationship_ids)
             for resource in selected:
-                incident = await self._store.load_incident_relationships(
-                    request.agent_id,
-                    resource.id,
-                    limit=_SCHEMA_RELATIONSHIP_LIMIT + 1,
+                index = index_by_resource_id[resource.id]
+                selected_relationship_ids.update(
+                    edge.relationship_id
+                    for edge in index.adjacency_by_resource_id.get(resource.id, ())
+                    if len(seeds) == 1
+                    or edge.neighbor_resource_id in selected_resources
                 )
-                if len(incident) > _SCHEMA_RELATIONSHIP_LIMIT:
-                    relationships_truncated = True
-                for relationship in incident:
-                    relationships_by_id[relationship.id] = relationship
             relationships = tuple(
-                sorted(relationships_by_id.values(), key=lambda item: item.id)
+                sorted(
+                    (
+                        relationships_by_id[relationship_id]
+                        for relationship_id in selected_relationship_ids
+                    ),
+                    key=lambda item: item.id,
+                )
             )
             if len(relationships) > _SCHEMA_RELATIONSHIP_LIMIT:
                 relationships_truncated = True
-            selected_ids = set(resources_cache)
+            selected_ids = set(selected_resources)
             for relationship in relationships[:_SCHEMA_RELATIONSHIP_LIMIT]:
-                from_resource, to_resource = await self._current_relationship_endpoints(
-                    request.agent_id,
+                from_resource, to_resource = self._snapshot_relationship_endpoints(
                     relationship,
-                    resources_cache,
+                    resources_by_id,
+                    revisions_by_resource_id,
                 )
                 unselected_endpoints = tuple(
                     _schema_endpoint_payload(endpoint)
@@ -319,6 +1010,68 @@ class CatalogService:
                     }
                 )
 
+        unresolved_reasons = set(join_selection.unresolved_reasons)
+        candidate_resources_truncated = len(candidates) > len(seeds)
+        resources_truncated = (
+            candidate_resources_truncated
+            or optional_neighbors_truncated
+            or join_selection.truncation_reason == "resource_limit"
+        )
+        if candidate_resources_truncated:
+            unresolved_reasons.add("resource_limit")
+        if relationships_truncated:
+            unresolved_reasons.add("relationship_limit")
+        truncation_reason = join_selection.truncation_reason
+        if truncation_reason is None and relationships_truncated:
+            truncation_reason = "relationship_limit"
+        elif truncation_reason is None and (
+            candidate_resources_truncated or optional_neighbors_truncated
+        ):
+            truncation_reason = "resource_limit"
+        ordered_unresolved_reasons = _ordered_schema_unresolved_reasons(
+            unresolved_reasons
+        )
+
+        path_payloads = []
+        for path in join_selection.paths:
+            path_seed_ids = tuple(
+                sorted(
+                    (
+                        resource_id
+                        for resource_id in path.resource_ids
+                        if resource_id in seed_ids
+                    ),
+                    key=lambda resource_id: seed_rank[resource_id],
+                )
+            )
+            if len(path_seed_ids) == 1:
+                terminal_source_id = resources_by_id[path_seed_ids[0]].source_id
+                root_seed_id = next(
+                    (
+                        resource.id
+                        for resource in seeds
+                        if resource.source_id == terminal_source_id
+                        and resource.id != path_seed_ids[0]
+                    ),
+                    None,
+                )
+                if root_seed_id is not None:
+                    path_seed_ids = tuple(
+                        sorted(
+                            (root_seed_id, path_seed_ids[0]),
+                            key=lambda resource_id: seed_rank[resource_id],
+                        )
+                    )
+            path_payloads.append(
+                {
+                    "relationship_ids": tuple(
+                        step.relationship_id for step in path.steps
+                    ),
+                    "resource_ids": path.resource_ids,
+                    "seed_resource_ids": path_seed_ids,
+                }
+            )
+
         source_payloads = tuple(
             {
                 "source_id": sync.source_id,
@@ -326,7 +1079,7 @@ class CatalogService:
                 "sync_id": sync.id,
             }
             for sync in sorted(
-                sync_by_id.values(),
+                selected_syncs_by_id.values(),
                 key=lambda item: (item.source_id, item.id),
             )
         )
@@ -337,24 +1090,309 @@ class CatalogService:
                     "primary_key_fields_per_resource": _SCHEMA_KEY_LIMIT,
                     "relationships": _SCHEMA_RELATIONSHIP_LIMIT,
                     "resources": request.limit,
+                    "join_depth": request.max_join_depth,
+                    "join_graph_edges": _SCHEMA_JOIN_MAX_EDGES,
+                    "join_graph_nodes": _SCHEMA_JOIN_MAX_NODES,
                     "structural_facts_per_resource": _SCHEMA_STRUCTURAL_FACT_LIMIT,
                     "unique_key_fields_per_resource": _SCHEMA_KEY_LIMIT,
                 },
                 "include_relationships": request.include_relationships,
+                "paths": path_payloads,
                 "relationships": relationship_payloads,
                 "resources": resource_payloads,
+                "selection": {
+                    "bridge_resource_ids": tuple(join_selection.bridge_resource_ids),
+                    "covered_terms": covered_terms,
+                    "seed_resource_ids": tuple(resource.id for resource in seeds),
+                    "unresolved_reasons": ordered_unresolved_reasons,
+                    "unresolved_terms": unresolved_terms,
+                },
                 "sources": source_payloads,
                 "total_matches": total_matches,
                 "truncation": {
                     "columns": columns_truncated,
+                    "paths": join_selection.truncation_reason is not None,
                     "primary_key_fields": primary_keys_truncated,
+                    "reason": truncation_reason,
                     "relationships": relationships_truncated,
-                    "resources": total_matches > len(selected),
+                    "resources": resources_truncated,
                     "structural_facts": structural_facts_truncated,
                     "unique_key_fields": unique_keys_truncated,
                 },
                 "trust_classification": "untrusted_external_data",
             }
+        )
+
+    def _schema_matched_terms(
+        self,
+        index: _SourceCatalogIndex,
+        resource_id: str,
+        significant_terms: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        postings = index.postings_by_resource_id.get(resource_id, ())
+        return tuple(
+            term
+            for term in significant_terms
+            if any(
+                token.startswith(term)
+                for posting in postings
+                for token in posting.tokens
+            )
+        )
+
+    def _is_tabular_resource(
+        self,
+        index: _SourceCatalogIndex,
+        resource_id: str,
+    ) -> bool:
+        resource = index.resources_by_id.get(resource_id)
+        return bool(
+            resource is not None
+            and resource.kind
+            in {ResourceKind.TABLE, ResourceKind.VIEW, ResourceKind.FILE}
+            and any(
+                facet.kind is FacetKind.TABULAR
+                for facet in index.facets_by_resource_id.get(resource_id, ())
+            )
+        )
+
+    def _sql_join_relationship_ids(
+        self,
+        index: _SourceCatalogIndex,
+    ) -> frozenset[str]:
+        eligible: set[str] = set()
+        for relationship in index.relationships_by_id.values():
+            if (
+                relationship.kind is not RelationshipKind.REFERENCES
+                or relationship.provenance is not RelationshipProvenance.CONNECTOR
+                or not relationship.field_pairs
+                or relationship.source_id != index.source_id
+                or relationship.sync_id != index.sync_id
+                or not self._is_tabular_resource(
+                    index,
+                    relationship.from_resource_id,
+                )
+                or not self._is_tabular_resource(
+                    index,
+                    relationship.to_resource_id,
+                )
+            ):
+                continue
+            from_fields = _tabular_field_names(
+                index.facets_by_resource_id[relationship.from_resource_id]
+            )
+            to_fields = _tabular_field_names(
+                index.facets_by_resource_id[relationship.to_resource_id]
+            )
+            if all(
+                pair.source_field in from_fields and pair.target_field in to_fields
+                for pair in relationship.field_pairs
+            ):
+                eligible.add(relationship.id)
+        return frozenset(eligible)
+
+    def _select_schema_joins(
+        self,
+        request: CatalogSchemaRequest,
+        seeds: tuple[CatalogResource, ...],
+        index_by_source_id: Mapping[str, _SourceCatalogIndex],
+    ) -> _SchemaJoinSelection:
+        groups: dict[str, list[CatalogResource]] = {}
+        for seed in seeds:
+            groups.setdefault(seed.source_id, []).append(seed)
+
+        unresolved_reasons: set[str] = set()
+        if len(groups) > 1:
+            unresolved_reasons.add("cross_source_unsupported")
+        selected_paths: list[CatalogPath] = []
+        bridge_ids: set[str] = set()
+        selected_relationship_ids: set[str] = set()
+        visited_nodes = 0
+        visited_edges = 0
+        truncation_reason: str | None = None
+        seed_ids = {seed.id for seed in seeds}
+        seed_rank = {seed.id: rank for rank, seed in enumerate(seeds)}
+
+        for source_id in sorted(groups):
+            index = index_by_source_id[source_id]
+            source_seeds = tuple(groups[source_id])
+            joinable_seeds = tuple(
+                seed
+                for seed in source_seeds
+                if self._is_tabular_resource(index, seed.id)
+            )
+            if len(joinable_seeds) != len(source_seeds):
+                unresolved_reasons.add("non_tabular_seed")
+            if len(joinable_seeds) < 2:
+                continue
+
+            eligible_relationship_ids = self._sql_join_relationship_ids(index)
+            tree_resource_ids = {joinable_seeds[0].id}
+            remaining = list(joinable_seeds[1:])
+            while remaining:
+                candidates: list[
+                    tuple[
+                        tuple[object, ...],
+                        CatalogPath,
+                        CatalogResource,
+                    ]
+                ] = []
+                saw_depth = False
+                work_stopped = False
+                ordered_tree_ids = tuple(
+                    sorted(
+                        tree_resource_ids,
+                        key=lambda resource_id: _resource_join_key(
+                            index.resources_by_id[resource_id]
+                        ),
+                    )
+                )
+                for tree_resource_id in ordered_tree_ids:
+                    for terminal in remaining:
+                        remaining_nodes = _SCHEMA_JOIN_MAX_NODES - visited_nodes
+                        remaining_edges = _SCHEMA_JOIN_MAX_EDGES - visited_edges
+                        if remaining_nodes < 2:
+                            unresolved_reasons.add("graph_node_limit")
+                            truncation_reason = "graph_node_limit"
+                            work_stopped = True
+                            break
+                        if remaining_edges < 1:
+                            unresolved_reasons.add("graph_edge_limit")
+                            truncation_reason = "graph_edge_limit"
+                            work_stopped = True
+                            break
+                        result = self._traverse_indexes(
+                            CatalogTraversalRequest(
+                                agent_id=request.agent_id,
+                                from_resource_ids=(tree_resource_id,),
+                                to_resource_ids=(terminal.id,),
+                                relationship_kinds=(RelationshipKind.REFERENCES,),
+                                max_depth=request.max_join_depth,
+                                max_paths=CATALOG_TRAVERSAL_MAX_PATHS,
+                                max_nodes=remaining_nodes,
+                                max_edges=remaining_edges,
+                            ),
+                            (index,),
+                            eligible_relationship_ids=eligible_relationship_ids,
+                            stop_at_shortest_target=True,
+                        )
+                        visited_nodes += result.visited_nodes
+                        visited_edges += result.visited_edges
+                        if result.truncation_reason in {
+                            CatalogTraversalTruncationReason.NODES,
+                            CatalogTraversalTruncationReason.EDGES,
+                        }:
+                            reason = (
+                                "graph_node_limit"
+                                if result.truncation_reason
+                                is CatalogTraversalTruncationReason.NODES
+                                else "graph_edge_limit"
+                            )
+                            unresolved_reasons.add(reason)
+                            truncation_reason = reason
+                            work_stopped = True
+                            break
+                        if (
+                            result.truncation_reason
+                            is CatalogTraversalTruncationReason.DEPTH
+                        ):
+                            saw_depth = True
+                        for path in result.paths:
+                            new_bridges = {
+                                resource_id
+                                for resource_id in path.resource_ids
+                                if resource_id not in seed_ids
+                                and resource_id not in tree_resource_ids
+                            }
+                            candidates.append(
+                                (
+                                    (
+                                        len(path.steps),
+                                        len(new_bridges),
+                                        tuple(
+                                            step.relationship_id for step in path.steps
+                                        ),
+                                        tuple(
+                                            _normalize_search_text(
+                                                index.resources_by_id[
+                                                    resource_id
+                                                ].native_identity
+                                            ).complete
+                                            for resource_id in path.resource_ids
+                                        ),
+                                        seed_rank[terminal.id],
+                                    ),
+                                    path,
+                                    terminal,
+                                )
+                            )
+                    if work_stopped:
+                        break
+                if work_stopped:
+                    break
+                if not candidates:
+                    unresolved_reasons.add("max_join_depth" if saw_depth else "no_path")
+                    if saw_depth:
+                        truncation_reason = "max_join_depth"
+                    break
+
+                _, chosen_path, terminal = min(candidates, key=lambda item: item[0])
+                new_bridge_ids = {
+                    resource_id
+                    for resource_id in chosen_path.resource_ids
+                    if resource_id not in seed_ids
+                    and resource_id not in tree_resource_ids
+                }
+                new_relationship_ids = {
+                    step.relationship_id for step in chosen_path.steps
+                } - selected_relationship_ids
+                if len(seed_ids | bridge_ids | new_bridge_ids) > request.limit:
+                    unresolved_reasons.add("resource_limit")
+                    truncation_reason = "resource_limit"
+                    break
+                if (
+                    len(selected_relationship_ids | new_relationship_ids)
+                    > _SCHEMA_RELATIONSHIP_LIMIT
+                ):
+                    unresolved_reasons.add("relationship_limit")
+                    truncation_reason = "relationship_limit"
+                    break
+                selected_paths.append(chosen_path)
+                bridge_ids.update(new_bridge_ids)
+                selected_relationship_ids.update(new_relationship_ids)
+                tree_resource_ids.update(chosen_path.resource_ids)
+                remaining = [
+                    seed for seed in remaining if seed.id not in tree_resource_ids
+                ]
+
+        return _SchemaJoinSelection(
+            paths=tuple(selected_paths),
+            bridge_resource_ids=tuple(
+                sorted(
+                    bridge_ids,
+                    key=lambda resource_id: _resource_join_key(
+                        next(
+                            index.resources_by_id[resource_id]
+                            for index in index_by_source_id.values()
+                            if resource_id in index.resources_by_id
+                        )
+                    ),
+                )
+            ),
+            relationship_ids=tuple(sorted(selected_relationship_ids)),
+            unresolved_reasons=_ordered_schema_unresolved_reasons(unresolved_reasons),
+            truncation_reason=truncation_reason,
+            visited_nodes=visited_nodes,
+            visited_edges=visited_edges,
+        )
+
+    async def _active_source_ids(self, agent_id: str) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                registration.id
+                for registration in await self._sources.list_sources(agent_id)
+                if registration.agent_id == agent_id and registration.active
+            )
         )
 
     async def inspect_resource(
@@ -451,40 +1489,295 @@ class CatalogService:
     ) -> FrozenJsonObject:
         if not isinstance(request, CatalogTraversalRequest):
             raise TypeError("request must be a CatalogTraversalRequest record")
-        resources: dict[str, CatalogResource] = {}
-        for resource_id in (*request.from_resource_ids, *request.to_resource_ids):
-            resources[resource_id] = await self._active_resource(
+        for attempt in range(2):
+            active_source_ids = await self._active_source_ids(request.agent_id)
+            refs = (
+                ()
+                if not active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    active_source_ids,
+                )
+            )
+            await self._evict_stale_indexes(
                 request.agent_id,
-                resource_id,
+                active_source_ids,
+                refs,
+            )
+            indexes: list[_SourceCatalogIndex] = []
+            generation_changed = False
+            for ref in refs:
+                try:
+                    indexes.append(await self._index_for_ref(ref))
+                except _CatalogGenerationChanged:
+                    generation_changed = True
+                    break
+            if generation_changed:
+                if attempt == 0:
+                    continue
+                break
+            resolved_indexes = tuple(indexes)
+            result = self._traverse_indexes(request, resolved_indexes)
+            projection = self._traversal_projection(result, resolved_indexes)
+            current_active_source_ids = await self._active_source_ids(request.agent_id)
+            current_refs = (
+                ()
+                if not current_active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    request.agent_id,
+                    current_active_source_ids,
+                )
+            )
+            if current_active_source_ids == active_source_ids and current_refs == refs:
+                return projection
+            if attempt == 1:
+                break
+        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
+
+    def _traverse_indexes(
+        self,
+        request: CatalogTraversalRequest,
+        indexes: tuple[_SourceCatalogIndex, ...],
+        *,
+        eligible_relationship_ids: frozenset[str] | None = None,
+        stop_at_shortest_target: bool = False,
+    ) -> CatalogTraversalResult:
+        resources_by_id: dict[str, CatalogResource] = {}
+        relationships_by_id: dict[str, CatalogRelationship] = {}
+        index_by_resource_id: dict[str, _SourceCatalogIndex] = {}
+        for index in indexes:
+            if index.agent_id != request.agent_id:
+                raise CatalogStoreError("catalog traversal index escaped agent scope")
+            duplicate_resources = resources_by_id.keys() & index.resources_by_id.keys()
+            duplicate_relationships = (
+                relationships_by_id.keys() & index.relationships_by_id.keys()
+            )
+            if duplicate_resources or duplicate_relationships:
+                raise CatalogStoreError("catalog traversal index identities overlap")
+            resources_by_id.update(index.resources_by_id)
+            relationships_by_id.update(index.relationships_by_id)
+            index_by_resource_id.update(
+                (resource_id, index) for resource_id in index.resources_by_id
             )
 
-        result = await self._store.traverse(request)
-        relationship_ids = tuple(
-            dict.fromkeys(
-                step.relationship_id for path in result.paths for step in path.steps
+        for resource_id in (*request.from_resource_ids, *request.to_resource_ids):
+            if resource_id not in resources_by_id:
+                raise CatalogResourceNotFoundError(request.agent_id, resource_id)
+
+        def resource_key(resource_id: str) -> tuple[str, str, str]:
+            resource = resources_by_id[resource_id]
+            return (
+                _normalize_search_text(resource.native_identity).complete,
+                resource.source_id,
+                resource.id,
             )
-        )
-        relationships = await self._store.load_relationships(
-            request.agent_id,
-            relationship_ids,
-        )
-        relationships_by_id = {
-            relationship.id: relationship for relationship in relationships
+
+        ordered_sources = tuple(sorted(request.from_resource_ids, key=resource_key))
+        target_ids = set(request.to_resource_ids)
+        admitted_sources = ordered_sources[: request.max_nodes]
+        distance_by_resource = {resource_id: 0 for resource_id in admitted_sources}
+        parents_by_resource: dict[str, list[_ParentStep]] = {
+            resource_id: [] for resource_id in admitted_sources
         }
-        if tuple(relationships_by_id) != relationship_ids:
-            raise CatalogStoreError(
-                "catalog traversal references a non-current relationship"
+        frontier = deque(admitted_sources)
+        examined_edges = 0
+        shortest_target_distance: int | None = None
+        truncation_reason = (
+            CatalogTraversalTruncationReason.NODES
+            if len(admitted_sources) < len(ordered_sources)
+            else None
+        )
+        allowed_kinds = set(request.relationship_kinds)
+
+        while frontier and truncation_reason is None:
+            current_resource_id = frontier.popleft()
+            current_distance = distance_by_resource[current_resource_id]
+            if (
+                stop_at_shortest_target
+                and shortest_target_distance is not None
+                and current_distance >= shortest_target_distance
+            ):
+                break
+            if current_resource_id in target_ids and current_distance > 0:
+                continue
+            index = index_by_resource_id[current_resource_id]
+            for edge in index.adjacency_by_resource_id.get(current_resource_id, ()):
+                relationship = relationships_by_id[edge.relationship_id]
+                if allowed_kinds and relationship.kind not in allowed_kinds:
+                    continue
+                if (
+                    eligible_relationship_ids is not None
+                    and relationship.id not in eligible_relationship_ids
+                ):
+                    continue
+                if examined_edges >= request.max_edges:
+                    truncation_reason = CatalogTraversalTruncationReason.EDGES
+                    break
+                examined_edges += 1
+                known_distance = distance_by_resource.get(edge.neighbor_resource_id)
+                if current_distance >= request.max_depth:
+                    if known_distance is None:
+                        truncation_reason = CatalogTraversalTruncationReason.DEPTH
+                        break
+                    continue
+
+                candidate_distance = current_distance + 1
+                parent = _ParentStep(
+                    parent_resource_id=current_resource_id,
+                    relationship_id=edge.relationship_id,
+                    direction=edge.direction,
+                )
+                if known_distance is None:
+                    if len(distance_by_resource) >= request.max_nodes:
+                        truncation_reason = CatalogTraversalTruncationReason.NODES
+                        break
+                    distance_by_resource[edge.neighbor_resource_id] = candidate_distance
+                    parents_by_resource[edge.neighbor_resource_id] = [parent]
+                    frontier.append(edge.neighbor_resource_id)
+                    if (
+                        stop_at_shortest_target
+                        and edge.neighbor_resource_id in target_ids
+                        and shortest_target_distance is None
+                    ):
+                        shortest_target_distance = candidate_distance
+                elif known_distance == candidate_distance:
+                    parents = parents_by_resource[edge.neighbor_resource_id]
+                    if parent not in parents:
+                        parents.append(parent)
+
+        def parent_key(parent: _ParentStep) -> tuple[object, ...]:
+            relationship = relationships_by_id[parent.relationship_id]
+            return (
+                *resource_key(parent.parent_resource_id),
+                relationship.kind.value,
+                relationship.provenance.value,
+                relationship.id,
+                parent.direction.value,
             )
+
+        ordered_parents = {
+            resource_id: tuple(sorted(parents, key=parent_key))
+            for resource_id, parents in parents_by_resource.items()
+        }
+        reachable_targets = tuple(
+            sorted(
+                (
+                    resource_id
+                    for resource_id in target_ids
+                    if distance_by_resource.get(resource_id, 0) > 0
+                ),
+                key=resource_key,
+            )
+        )
+        path_count_limit = request.max_paths + 1
+        path_counts: dict[str, int] = {}
+
+        def bounded_path_count(resource_id: str) -> int:
+            cached = path_counts.get(resource_id)
+            if cached is not None:
+                return cached
+            if distance_by_resource[resource_id] == 0:
+                path_counts[resource_id] = 1
+                return 1
+            total = 0
+            for parent in ordered_parents[resource_id]:
+                total += bounded_path_count(parent.parent_resource_id)
+                if total >= path_count_limit:
+                    total = path_count_limit
+                    break
+            path_counts[resource_id] = total
+            return total
+
+        available_path_count = 0
+        for target_id in reachable_targets:
+            available_path_count += bounded_path_count(target_id)
+            if available_path_count >= path_count_limit:
+                available_path_count = path_count_limit
+                break
+
+        paths: list[CatalogPath] = []
+        reverse_resource_ids: list[str] = []
+        reverse_steps: list[CatalogPathStep] = []
+
+        def reconstruct(resource_id: str) -> None:
+            if len(paths) >= request.max_paths:
+                return
+            reverse_resource_ids.append(resource_id)
+            if distance_by_resource[resource_id] == 0:
+                paths.append(
+                    CatalogPath(
+                        resource_ids=tuple(reversed(reverse_resource_ids)),
+                        steps=tuple(reversed(reverse_steps)),
+                    )
+                )
+            else:
+                for parent in ordered_parents[resource_id]:
+                    if len(paths) >= request.max_paths:
+                        break
+                    reverse_steps.append(
+                        CatalogPathStep(
+                            relationship_id=parent.relationship_id,
+                            from_resource_id=parent.parent_resource_id,
+                            to_resource_id=resource_id,
+                            direction=parent.direction,
+                        )
+                    )
+                    reconstruct(parent.parent_resource_id)
+                    reverse_steps.pop()
+            reverse_resource_ids.pop()
+
+        for target_id in reachable_targets:
+            if len(paths) >= request.max_paths:
+                break
+            reconstruct(target_id)
+
+        if truncation_reason is None and available_path_count > request.max_paths:
+            truncation_reason = CatalogTraversalTruncationReason.PATHS
+        return CatalogTraversalResult(
+            request=request,
+            paths=tuple(paths),
+            reachable=bool(paths),
+            visited_nodes=len(distance_by_resource),
+            visited_edges=examined_edges,
+            truncated=truncation_reason is not None,
+            truncation_reason=truncation_reason,
+        )
+
+    def _traversal_projection(
+        self,
+        result: CatalogTraversalResult,
+        indexes: tuple[_SourceCatalogIndex, ...],
+    ) -> FrozenJsonObject:
+        request = result.request
+        resources_by_id = {
+            resource_id: resource
+            for index in indexes
+            for resource_id, resource in index.resources_by_id.items()
+        }
+        revisions_by_resource_id = {
+            resource_id: revision
+            for index in indexes
+            for resource_id, revision in index.revisions_by_resource_id.items()
+        }
+        relationships_by_id = {
+            relationship_id: relationship
+            for index in indexes
+            for relationship_id, relationship in index.relationships_by_id.items()
+        }
 
         paths_payload: list[dict[str, object]] = []
         for path in result.paths:
             steps_payload: list[dict[str, object]] = []
             for step in path.steps:
-                relationship = relationships_by_id[step.relationship_id]
-                endpoints = await self._current_relationship_endpoints(
-                    request.agent_id,
+                relationship = relationships_by_id.get(step.relationship_id)
+                if relationship is None:
+                    raise CatalogStoreError(
+                        "catalog traversal references a non-current relationship"
+                    )
+                endpoints = self._snapshot_relationship_endpoints(
                     relationship,
-                    resources,
+                    resources_by_id,
+                    revisions_by_resource_id,
                 )
                 if step.direction is RelationshipDirection.FORWARD:
                     expected = (
@@ -532,6 +1825,11 @@ class CatalogService:
                 "paths": paths_payload,
                 "reachable": result.reachable,
                 "truncated": result.truncated,
+                "truncation_reason": (
+                    None
+                    if result.truncation_reason is None
+                    else result.truncation_reason.value
+                ),
                 "visited_edges": result.visited_edges,
                 "visited_nodes": result.visited_nodes,
                 "trust_classification": "untrusted_external_data",
@@ -594,16 +1892,10 @@ class CatalogService:
             raise CatalogStoreError("catalog resource sync is not current")
         return sync
 
-    async def _schema_resource_structure(
+    def _schema_resource_structure(
         self,
-        agent_id: str,
-        resource: CatalogResource,
+        facets: tuple[CatalogFacet, ...],
     ) -> tuple[dict[str, object], bool, bool, bool]:
-        facets = await self._store.load_facets(
-            agent_id,
-            resource.id,
-            resource.current_revision,
-        )
         tabular = next(
             (facet for facet in facets if facet.kind is FacetKind.TABULAR),
             None,
@@ -682,6 +1974,37 @@ class CatalogService:
             len(ordered_primary) > _SCHEMA_KEY_LIMIT,
             len(ordered_unique_keys) > _SCHEMA_KEY_LIMIT,
         )
+
+    def _snapshot_relationship_endpoints(
+        self,
+        relationship: CatalogRelationship,
+        resources_by_id: dict[str, CatalogResource],
+        revisions_by_resource_id: dict[str, CatalogResourceRevision],
+    ) -> tuple[CatalogResource, CatalogResource]:
+        endpoints: list[CatalogResource] = []
+        for resource_id in (
+            relationship.from_resource_id,
+            relationship.to_resource_id,
+        ):
+            endpoint = resources_by_id.get(resource_id)
+            if endpoint is None:
+                raise CatalogStoreError(
+                    "catalog relationship has a non-current endpoint"
+                )
+            current_revision = revisions_by_resource_id.get(endpoint.id)
+            if (
+                endpoint.source_id != relationship.source_id
+                or endpoint.current_sync_id != relationship.sync_id
+                or current_revision is None
+                or current_revision.revision != endpoint.current_revision
+                or current_revision.sync_id != endpoint.current_sync_id
+                or relationship.revision not in current_revision.relationship_revisions
+            ):
+                raise CatalogStoreError(
+                    "catalog relationship is not current for both endpoints"
+                )
+            endpoints.append(endpoint)
+        return endpoints[0], endpoints[1]
 
     async def _current_relationship_endpoints(
         self,
@@ -772,6 +2095,53 @@ class CatalogService:
         )
 
 
+def _resource_join_key(resource: CatalogResource) -> tuple[str, str, str]:
+    return (
+        _normalize_search_text(resource.native_identity).complete,
+        resource.native_identity,
+        resource.id,
+    )
+
+
+def _tabular_field_names(facets: tuple[CatalogFacet, ...]) -> frozenset[str]:
+    tabular = next(
+        (facet for facet in facets if facet.kind is FacetKind.TABULAR),
+        None,
+    )
+    if tabular is None:
+        return frozenset()
+    raw_columns = tabular.payload.get("columns", ())
+    if not isinstance(raw_columns, tuple):
+        raise CatalogStoreError("catalog tabular facet has invalid structure")
+    fields: set[str] = set()
+    for raw_column in raw_columns:
+        if not isinstance(raw_column, FrozenJsonObject):
+            raise CatalogStoreError("catalog tabular column has invalid structure")
+        name = raw_column.get("name")
+        if not isinstance(name, str) or not name:
+            raise CatalogStoreError("catalog tabular column is incomplete")
+        fields.add(name)
+    return frozenset(fields)
+
+
+def _ordered_schema_unresolved_reasons(
+    reasons: set[str] | tuple[str, ...],
+) -> tuple[str, ...]:
+    order = {
+        "cross_source_unsupported": 0,
+        "non_tabular_seed": 1,
+        "no_path": 2,
+        "max_join_depth": 3,
+        "graph_node_limit": 4,
+        "graph_edge_limit": 5,
+        "resource_limit": 6,
+        "relationship_limit": 7,
+    }
+    return tuple(
+        sorted(set(reasons), key=lambda reason: (order.get(reason, 99), reason))
+    )
+
+
 def _resource_payload(resource: CatalogResource) -> dict[str, object]:
     return {
         "current_sync_id": resource.current_sync_id,
@@ -797,22 +2167,456 @@ def _facet_payload(facet: CatalogFacet) -> dict[str, object]:
     }
 
 
-def _match_reason_rank(match_reasons: tuple[str, ...]) -> int:
-    for reason, rank in (
-        ("resource_name_exact", 0),
-        ("resource_name_prefix", 1),
-        ("resource_name_contains", 2),
-        ("structural_field_exact", 3),
-        ("structural_field_contains", 4),
-        ("metadata_contains", 5),
-        ("relationship_neighbor", 6),
-        ("lexical_exact", 0),
-        ("lexical_prefix", 1),
-        ("lexical_contains", 5),
+def _compile_source_index(snapshot: SourceCatalogSnapshot) -> _SourceCatalogIndex:
+    """Compile one immutable, exact-generation catalog search shard."""
+
+    if not isinstance(snapshot, SourceCatalogSnapshot):
+        raise TypeError("snapshot must be a SourceCatalogSnapshot record")
+    sync = snapshot.sync
+    resources_by_id = {resource.id: resource for resource in snapshot.resources}
+    revisions_by_resource_id = {
+        revision.resource_id: revision for revision in snapshot.revisions
+    }
+    facets_by_resource_id: dict[str, list[CatalogFacet]] = {}
+    for facet in snapshot.facets:
+        facets_by_resource_id.setdefault(facet.resource_id, []).append(facet)
+    relationships_by_id = {
+        relationship.id: relationship for relationship in snapshot.relationships
+    }
+
+    postings_by_resource_id: dict[str, set[_IndexedPosting]] = {
+        resource_id: set() for resource_id in resources_by_id
+    }
+    exact_resource_names: dict[str, set[str]] = {}
+
+    def add_posting(
+        resource_id: str,
+        field_kind: str,
+        field_name: str,
+        value: str,
+    ) -> None:
+        normalized = _normalize_search_text(value)
+        posting = _IndexedPosting(
+            resource_id=resource_id,
+            field_kind=field_kind,
+            field_name=field_name,
+            normalized_value=normalized.complete,
+            tokens=normalized.tokens,
+        )
+        postings_by_resource_id[resource_id].add(posting)
+
+    for resource in sorted(resources_by_id.values(), key=lambda item: item.id):
+        for field_kind, field_name, value in (
+            ("resource_name", "name", resource.name),
+            ("native_identity", "native_identity", resource.native_identity),
+        ):
+            add_posting(resource.id, field_kind, field_name, value)
+            normalized = _normalize_search_text(value).complete
+            exact_resource_names.setdefault(normalized, set()).add(resource.id)
+        add_posting(
+            resource.id,
+            "kind",
+            "kind",
+            f"{resource.kind.value} {resource.kind.value}s",
+        )
+
+        for facet in sorted(
+            facets_by_resource_id.get(resource.id, ()),
+            key=lambda item: (item.kind.value, item.revision),
+        ):
+            if facet.kind is not FacetKind.TABULAR:
+                continue
+            raw_columns = facet.payload.get("columns", ())
+            raw_indexes = facet.payload.get("indexes", ())
+            if not isinstance(raw_columns, tuple) or not isinstance(
+                raw_indexes,
+                tuple,
+            ):
+                raise CatalogStoreError("catalog tabular facet has invalid structure")
+            for raw_column in raw_columns:
+                if not isinstance(raw_column, FrozenJsonObject):
+                    raise CatalogStoreError(
+                        "catalog tabular column has invalid structure"
+                    )
+                name = raw_column.get("name")
+                if not isinstance(name, str) or not name:
+                    raise CatalogStoreError("catalog tabular column is incomplete")
+                add_posting(resource.id, "column", f"column:{name}", name)
+            for raw_index in raw_indexes:
+                if not isinstance(raw_index, FrozenJsonObject):
+                    raise CatalogStoreError(
+                        "catalog tabular index has invalid structure"
+                    )
+                raw_fields = raw_index.get("columns")
+                if not isinstance(raw_fields, tuple) or any(
+                    not isinstance(field, str) or not field for field in raw_fields
+                ):
+                    raise CatalogStoreError(
+                        "catalog tabular index fields have invalid structure"
+                    )
+                for field in raw_fields:
+                    assert isinstance(field, str)
+                    add_posting(
+                        resource.id,
+                        "index_field",
+                        f"index_field:{field}",
+                        field,
+                    )
+
+    adjacency_by_resource_id: dict[str, list[_IndexedEdge]] = {}
+    for relationship in sorted(
+        relationships_by_id.values(),
+        key=lambda item: item.id,
     ):
-        if reason in match_reasons:
-            return rank
-    return 7
+        adjacency_by_resource_id.setdefault(
+            relationship.from_resource_id,
+            [],
+        ).append(
+            _IndexedEdge(
+                neighbor_resource_id=relationship.to_resource_id,
+                relationship_id=relationship.id,
+                direction=RelationshipDirection.FORWARD,
+            )
+        )
+        adjacency_by_resource_id.setdefault(
+            relationship.to_resource_id,
+            [],
+        ).append(
+            _IndexedEdge(
+                neighbor_resource_id=relationship.from_resource_id,
+                relationship_id=relationship.id,
+                direction=RelationshipDirection.REVERSE,
+            )
+        )
+        for pair in relationship.field_pairs:
+            add_posting(
+                relationship.from_resource_id,
+                "relationship_field",
+                f"relationship_field:{pair.source_field}",
+                pair.source_field,
+            )
+            add_posting(
+                relationship.to_resource_id,
+                "relationship_field",
+                f"relationship_field:{pair.target_field}",
+                pair.target_field,
+            )
+
+    token_postings: dict[str, set[_IndexedPosting]] = {}
+    for postings in postings_by_resource_id.values():
+        for posting in postings:
+            for token in posting.tokens:
+                token_postings.setdefault(token, set()).add(posting)
+
+    def edge_sort_key(
+        resource_id: str,
+        edge: _IndexedEdge,
+    ) -> tuple[str, str, str, str, str, str]:
+        relationship = relationships_by_id[edge.relationship_id]
+        neighbor = resources_by_id[edge.neighbor_resource_id]
+        return (
+            relationship.kind.value,
+            relationship.provenance.value,
+            _normalize_search_text(neighbor.native_identity).complete,
+            relationship.id,
+            edge.direction.value,
+            edge.neighbor_resource_id,
+        )
+
+    ordered_token_postings = {
+        token: tuple(sorted(postings, key=_posting_sort_key))
+        for token, postings in sorted(token_postings.items())
+    }
+    return _SourceCatalogIndex(
+        agent_id=sync.agent_id,
+        source_id=sync.source_id,
+        sync_id=sync.id,
+        snapshot=snapshot,
+        resources_by_id=MappingProxyType(dict(sorted(resources_by_id.items()))),
+        revisions_by_resource_id=MappingProxyType(
+            dict(sorted(revisions_by_resource_id.items()))
+        ),
+        facets_by_resource_id=MappingProxyType(
+            {
+                resource_id: tuple(
+                    sorted(
+                        facets,
+                        key=lambda item: (item.kind.value, item.revision),
+                    )
+                )
+                for resource_id, facets in sorted(facets_by_resource_id.items())
+            }
+        ),
+        relationships_by_id=MappingProxyType(dict(sorted(relationships_by_id.items()))),
+        adjacency_by_resource_id=MappingProxyType(
+            {
+                resource_id: tuple(
+                    sorted(
+                        edges,
+                        key=lambda edge: edge_sort_key(resource_id, edge),
+                    )
+                )
+                for resource_id, edges in sorted(adjacency_by_resource_id.items())
+            }
+        ),
+        exact_resource_names=MappingProxyType(
+            {
+                value: tuple(sorted(resource_ids))
+                for value, resource_ids in sorted(exact_resource_names.items())
+            }
+        ),
+        token_postings=MappingProxyType(ordered_token_postings),
+        posting_tokens=tuple(ordered_token_postings),
+        postings_by_resource_id=MappingProxyType(
+            {
+                resource_id: tuple(sorted(postings, key=_posting_sort_key))
+                for resource_id, postings in sorted(postings_by_resource_id.items())
+            }
+        ),
+    )
+
+
+def _normalize_search_text(value: str) -> _NormalizedText:
+    if not isinstance(value, str):
+        raise TypeError("catalog search text must be a string")
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    split = _CAMEL_ACRONYM_BOUNDARY.sub(" ", normalized)
+    split = _CAMEL_WORD_BOUNDARY.sub(" ", split)
+    complete = normalized.casefold()
+    tokens: list[str] = []
+    current: list[str] = []
+    for character in split.casefold():
+        if character.isalnum():
+            current.append(character)
+            continue
+        if current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    bounded_tokens = tuple(
+        dict.fromkeys(token[:_SEARCH_TOKEN_LENGTH_LIMIT] for token in tokens if token)
+    )[:_SEARCH_TOKEN_LIMIT]
+    return _NormalizedText(complete=complete, tokens=bounded_tokens)
+
+
+def _posting_sort_key(posting: _IndexedPosting) -> tuple[str, str, str, str]:
+    return (
+        posting.resource_id,
+        posting.field_kind,
+        posting.field_name.casefold(),
+        posting.field_name,
+    )
+
+
+def _resource_search_tie_key(
+    resource: CatalogResource,
+) -> tuple[str, str, str, str]:
+    normalized = _normalize_search_text(resource.native_identity).complete
+    return (normalized, resource.native_identity, resource.name, resource.id)
+
+
+def _inventory_candidate(resource: CatalogResource) -> _RankedCandidate:
+    hit = CatalogSearchHit(
+        resource_id=resource.id,
+        source_id=resource.source_id,
+        kind=resource.kind,
+        name=resource.name,
+        revision=resource.current_revision,
+        sensitivity=resource.sensitivity,
+        score=0.0,
+        matched_fields=(),
+        match_reasons=("metadata_contains",),
+    )
+    normalized = _normalize_search_text(resource.native_identity).complete
+    return _RankedCandidate(
+        hit=hit,
+        matched_terms=(),
+        rank_key=(0, 0, 0, 0, 0, 0, 0, 0, 0, normalized, resource.name, resource.id),
+    )
+
+
+def _rank_index_candidate(
+    resource: CatalogResource,
+    postings: tuple[_IndexedPosting, ...],
+    query: _NormalizedText,
+    significant_terms: tuple[str, ...],
+) -> _RankedCandidate:
+    """Build deterministic rank evidence for one posting-derived candidate."""
+
+    matched_terms = tuple(
+        term
+        for term in significant_terms
+        if any(
+            token.startswith(term) for posting in postings for token in posting.tokens
+        )
+    )
+    resource_postings = tuple(
+        posting
+        for posting in postings
+        if posting.field_kind in {"resource_name", "native_identity"}
+    )
+    column_postings = tuple(
+        posting
+        for posting in postings
+        if posting.field_kind in {"column", "index_field"}
+    )
+    relationship_postings = tuple(
+        posting for posting in postings if posting.field_kind == "relationship_field"
+    )
+    kind_postings = tuple(
+        posting for posting in postings if posting.field_kind == "kind"
+    )
+
+    def exact_terms(fields: tuple[_IndexedPosting, ...]) -> set[str]:
+        return {
+            term
+            for term in significant_terms
+            if any(term in posting.tokens for posting in fields)
+        }
+
+    def prefix_terms(fields: tuple[_IndexedPosting, ...]) -> set[str]:
+        return {
+            term
+            for term in significant_terms
+            if any(
+                token.startswith(term) and token != term
+                for posting in fields
+                for token in posting.tokens
+            )
+        }
+
+    exact_native = int(
+        any(
+            posting.field_kind == "native_identity"
+            and posting.normalized_value == query.complete
+            for posting in resource_postings
+        )
+    )
+    exact_name = int(
+        any(
+            posting.field_kind == "resource_name"
+            and posting.normalized_value == query.complete
+            for posting in resource_postings
+        )
+    )
+    resource_exact_terms = exact_terms(resource_postings)
+    column_exact_terms = exact_terms(column_postings)
+    resource_prefix_terms = prefix_terms(resource_postings)
+    column_prefix_terms = prefix_terms(column_postings)
+    relationship_terms = exact_terms(relationship_postings) | prefix_terms(
+        relationship_postings
+    )
+    kind_terms = exact_terms(kind_postings) | prefix_terms(kind_postings)
+
+    reason: str
+    if exact_native or exact_name:
+        reason = "resource_name_exact"
+    elif (
+        any(
+            posting.normalized_value.startswith(query.complete)
+            for posting in resource_postings
+        )
+        or resource_prefix_terms
+    ):
+        reason = "resource_name_prefix"
+    elif resource_postings:
+        reason = "resource_name_contains"
+    elif any(posting.normalized_value == query.complete for posting in column_postings):
+        reason = "structural_field_exact"
+    elif column_postings or relationship_postings:
+        reason = "structural_field_contains"
+    else:
+        reason = "metadata_contains"
+
+    field_priority = {
+        "resource_name": 0,
+        "native_identity": 1,
+        "column": 2,
+        "index_field": 3,
+        "relationship_field": 4,
+        "kind": 5,
+    }
+    matched_fields = tuple(
+        dict.fromkeys(
+            posting.field_name
+            for posting in sorted(
+                postings,
+                key=lambda item: (
+                    field_priority[item.field_kind],
+                    item.field_name.casefold(),
+                    item.field_name,
+                ),
+            )
+        )
+    )[:32]
+    score = float(
+        exact_native * 200_000
+        + exact_name * 180_000
+        + len(matched_terms) * 5_000
+        + len(resource_exact_terms) * 500
+        + len(column_exact_terms) * 200
+        + len(resource_prefix_terms) * 100
+        + len(column_prefix_terms) * 50
+        + len(relationship_terms) * 20
+        + len(kind_terms) * 10
+    )
+    normalized_native = _normalize_search_text(resource.native_identity).complete
+    rank_key = (
+        -exact_native,
+        -exact_name,
+        -len(matched_terms),
+        -len(resource_exact_terms),
+        -len(column_exact_terms),
+        -len(resource_prefix_terms),
+        -len(column_prefix_terms),
+        -len(relationship_terms),
+        -len(kind_terms),
+        normalized_native,
+        resource.native_identity,
+        resource.id,
+    )
+    return _RankedCandidate(
+        hit=CatalogSearchHit(
+            resource_id=resource.id,
+            source_id=resource.source_id,
+            kind=resource.kind,
+            name=resource.name,
+            revision=resource.current_revision,
+            sensitivity=resource.sensitivity,
+            score=score,
+            matched_fields=matched_fields,
+            match_reasons=(reason,),
+        ),
+        matched_terms=matched_terms,
+        rank_key=rank_key,
+    )
+
+
+def _diversify_candidates(
+    candidates: tuple[_RankedCandidate, ...],
+    significant_terms: tuple[str, ...],
+) -> tuple[_RankedCandidate, ...]:
+    remaining = list(sorted(candidates, key=lambda candidate: candidate.rank_key))
+    selected: list[_RankedCandidate] = []
+    covered: set[str] = set()
+    significant = set(significant_terms)
+    while remaining and covered != significant:
+        best = min(
+            remaining,
+            key=lambda candidate: (
+                -len(set(candidate.matched_terms) - covered),
+                candidate.rank_key,
+            ),
+        )
+        new_terms = set(best.matched_terms) - covered
+        if not new_terms:
+            break
+        selected.append(best)
+        covered.update(new_terms)
+        remaining.remove(best)
+    selected.extend(sorted(remaining, key=lambda candidate: candidate.rank_key))
+    return tuple(selected)
 
 
 def _neighbor_payload(resource: CatalogResource) -> dict[str, object]:

@@ -9,12 +9,9 @@ from .models import (
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
-    CatalogSearchRequest,
-    CatalogSearchResult,
+    CatalogSnapshotRef,
     CatalogSummary,
     CatalogSync,
-    CatalogTraversalRequest,
-    CatalogTraversalResult,
     RelationshipKind,
     SourceCatalogSnapshot,
 )
@@ -73,6 +70,17 @@ class CatalogStore(Protocol):
         snapshot: SourceCatalogSnapshot,
     ) -> SourceCatalogSnapshot: ...
 
+    async def list_current_snapshot_refs(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...],
+    ) -> tuple[CatalogSnapshotRef, ...]: ...
+
+    async def load_current_snapshot(
+        self,
+        ref: CatalogSnapshotRef,
+    ) -> SourceCatalogSnapshot | None: ...
+
     async def load_sync(self, agent_id: str, sync_id: str) -> CatalogSync | None: ...
 
     async def summarize_catalog(
@@ -115,19 +123,6 @@ class CatalogStore(Protocol):
         relationship_kinds: tuple[RelationshipKind, ...] = (),
         limit: int = 50,
     ) -> tuple[CatalogRelationship, ...]: ...
-
-    async def load_relationships(
-        self,
-        agent_id: str,
-        relationship_ids: tuple[str, ...],
-    ) -> tuple[CatalogRelationship, ...]: ...
-
-    async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult: ...
-
-    async def traverse(
-        self,
-        request: CatalogTraversalRequest,
-    ) -> CatalogTraversalResult: ...
 
 
 __all__ = [

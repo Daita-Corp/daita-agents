@@ -183,6 +183,20 @@ class CatalogSyncStatus(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class CatalogSnapshotRef:
+    """Lightweight identity for one exact current source snapshot generation."""
+
+    agent_id: str
+    source_id: str
+    sync_id: str
+
+    def __post_init__(self) -> None:
+        _required_text(self.agent_id, "catalog snapshot ref agent_id")
+        _required_text(self.source_id, "catalog snapshot ref source_id")
+        _required_text(self.sync_id, "catalog snapshot ref sync_id")
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogSummary:
     """Compact current-catalog facts for non-model public presentation."""
 
@@ -213,6 +227,13 @@ class CatalogSummary:
 class RelationshipDirection(str, Enum):
     FORWARD = "forward"
     REVERSE = "reverse"
+
+
+class CatalogTraversalTruncationReason(str, Enum):
+    DEPTH = "depth"
+    NODES = "nodes"
+    EDGES = "edges"
+    PATHS = "paths"
 
 
 def catalog_resource_id(
@@ -1032,6 +1053,7 @@ class CatalogSchemaRequest:
     source_id: str | None = None
     limit: int = 12
     include_relationships: bool = True
+    max_join_depth: int = 3
 
     def __post_init__(self) -> None:
         _required_text(self.agent_id, "catalog schema agent_id")
@@ -1063,6 +1085,15 @@ class CatalogSchemaRequest:
             raise ValueError("catalog schema limit must be from 1 through 50")
         if not isinstance(self.include_relationships, bool):
             raise TypeError("catalog schema include_relationships must be a boolean")
+        if (
+            not isinstance(self.max_join_depth, int)
+            or isinstance(self.max_join_depth, bool)
+            or not 1 <= self.max_join_depth <= CATALOG_TRAVERSAL_MAX_DEPTH
+        ):
+            raise ValueError(
+                "catalog schema max_join_depth must be from 1 through "
+                f"{CATALOG_TRAVERSAL_MAX_DEPTH}"
+            )
         object.__setattr__(self, "resource_ids", resource_ids)
 
 
@@ -1290,6 +1321,7 @@ class CatalogTraversalResult:
     visited_nodes: int
     visited_edges: int
     truncated: bool
+    truncation_reason: CatalogTraversalTruncationReason | None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, CatalogTraversalRequest):
@@ -1301,6 +1333,14 @@ class CatalogTraversalResult:
             raise TypeError("catalog traversal reachable must be a boolean")
         if not isinstance(self.truncated, bool):
             raise TypeError("catalog traversal truncated must be a boolean")
+        if self.truncation_reason is not None and not isinstance(
+            self.truncation_reason,
+            CatalogTraversalTruncationReason,
+        ):
+            raise TypeError(
+                "catalog traversal truncation_reason must be a "
+                "CatalogTraversalTruncationReason"
+            )
         _non_negative_int(self.visited_nodes, "catalog traversal visited_nodes")
         _non_negative_int(self.visited_edges, "catalog traversal visited_edges")
         if len(paths) > self.request.max_paths:
@@ -1313,6 +1353,10 @@ class CatalogTraversalResult:
             raise ValueError("catalog traversal result exceeds max_edges")
         if self.reachable != bool(paths):
             raise ValueError("catalog traversal reachable disagrees with paths")
+        if self.truncated != (self.truncation_reason is not None):
+            raise ValueError(
+                "catalog traversal truncated disagrees with truncation_reason"
+            )
         object.__setattr__(self, "paths", paths)
 
 
@@ -1324,6 +1368,7 @@ __all__ = [
     "CatalogResource",
     "CatalogResourceRevision",
     "CatalogSchemaRequest",
+    "CatalogSnapshotRef",
     "CatalogSearchHit",
     "CatalogSearchRequest",
     "CatalogSearchResult",
@@ -1331,6 +1376,7 @@ __all__ = [
     "CatalogSyncStatus",
     "CatalogTraversalRequest",
     "CatalogTraversalResult",
+    "CatalogTraversalTruncationReason",
     "FacetKind",
     "FileFacet",
     "RelationshipDirection",
