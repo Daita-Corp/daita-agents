@@ -219,6 +219,7 @@ async def test_ready_tui_does_not_print_redundant_startup_status(
     assert entered[0].agent_label == "atlas"
     assert entered[0].model_label == "test-model"
     assert entered[0].source_summary == "Ready SQLite"
+    assert entered[0].context_capacity_tokens == 123_904
 
 
 async def test_model_answers_preserve_lines_and_neutralize_terminal_controls(

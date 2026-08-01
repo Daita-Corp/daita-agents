@@ -42,6 +42,7 @@ _MIN_READY_ROWS = 8
 _MIN_APPROVAL_ROWS = 15
 _MAX_QUEUED_EVENTS = 4_096
 _MAX_EVENT_COUNTER = 999_999_999_999
+_MAX_TRACKED_CONTEXT_CONVERSATIONS = 64
 _ANIMATION_INTERVAL_SECONDS = 0.12
 _RUNNING_GLYPHS = ("◐", "◓", "◑", "◒")
 _ASCII_RUNNING_GLYPHS = ("~", "-", "~", "+")
@@ -419,6 +420,8 @@ class TerminalViewState:
     model_label: str
     source_summary: str
     conversation_id: str | None = None
+    context_capacity_tokens: int | None = None
+    conversation_context_tokens: int | None = None
     startup: TerminalStartupInfo | None = None
     blocks: list[TerminalBlock] = field(default_factory=list)
     running: bool = False
@@ -436,6 +439,55 @@ class TerminalViewState:
     animation_frame: int = 0
     tool_cards: dict[str, ToolCardState] = field(default_factory=dict)
     approval_panel: ApprovalPanelState | None = None
+    _context_by_conversation: dict[str, int] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.context_capacity_tokens, "context_capacity_tokens"),
+            (self.conversation_context_tokens, "conversation_context_tokens"),
+        ):
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+            ):
+                raise ValueError(f"{field_name} must be a non-negative integer")
+        if self.context_capacity_tokens == 0:
+            raise ValueError("context_capacity_tokens must be positive")
+        if (
+            self.conversation_id is not None
+            and self.conversation_context_tokens is not None
+        ):
+            self._remember_conversation_context(
+                self.conversation_id,
+                self.conversation_context_tokens,
+            )
+
+    def select_conversation(self, conversation_id: str | None) -> None:
+        """Select one conversation and project its process-local context usage."""
+
+        if conversation_id == self.conversation_id:
+            return
+        self.conversation_id = conversation_id
+        self.conversation_context_tokens = (
+            None
+            if conversation_id is None
+            else self._context_by_conversation.get(conversation_id)
+        )
+
+    def _remember_conversation_context(
+        self,
+        conversation_id: str,
+        tokens: int,
+    ) -> None:
+        if conversation_id in self._context_by_conversation:
+            del self._context_by_conversation[conversation_id]
+        self._context_by_conversation[conversation_id] = tokens
+        while len(self._context_by_conversation) > _MAX_TRACKED_CONTEXT_CONVERSATIONS:
+            oldest = next(iter(self._context_by_conversation))
+            del self._context_by_conversation[oldest]
 
     def append_plain(
         self,
@@ -468,7 +520,7 @@ class TerminalViewState:
         previous_conversation = self.conversation_id
         candidate_conversation = getattr(result, "conversation_id", None)
         if isinstance(candidate_conversation, str) and candidate_conversation:
-            self.conversation_id = candidate_conversation
+            self.select_conversation(candidate_conversation)
             if previous_conversation is None:
                 self.append_plain(
                     "metadata",
@@ -672,6 +724,18 @@ class TerminalViewState:
             return
         if event.kind is AgentEventKind.MODEL_COMPLETED:
             self.model_duration_ms = _event_counter(event.data.get("duration_ms"))
+            context_input_tokens = _event_counter(
+                event.data.get("context_input_tokens")
+            )
+            if context_input_tokens is None:
+                context_input_tokens = _event_counter(event.data.get("input_tokens"))
+            if context_input_tokens is not None:
+                self._remember_conversation_context(
+                    event.conversation_id,
+                    context_input_tokens,
+                )
+                if self.conversation_id in {None, event.conversation_id}:
+                    self.conversation_context_tokens = context_input_tokens
             self.run_input_tokens = min(
                 _MAX_EVENT_COUNTER,
                 self.run_input_tokens
@@ -1188,7 +1252,10 @@ def _status_projection(
         if show_steps:
             right_parts.append(f"{state.steps} steps")
         if show_tokens:
-            right_parts.append(f"{_format_token_count(state.total_tokens)} tokens")
+            context_progress = _context_progress_text(state, glyphs=glyphs)
+            right_parts.append(
+                context_progress or f"{_format_token_count(state.total_tokens)} tokens"
+            )
         if show_cost:
             right_parts.append(state.estimated_cost)
         left = glyphs.separator.join(left_parts)
@@ -1259,6 +1326,34 @@ def _status_projection(
         source_summary=header_source,
         collapsed=tuple(collapsed),
     )
+
+
+def _context_progress_text(
+    state: TerminalViewState,
+    *,
+    glyphs: TerminalGlyphs,
+) -> str:
+    capacity = state.context_capacity_tokens
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1:
+        return ""
+    bar_width = 10
+    tokens = state.conversation_context_tokens
+    if tokens is None:
+        filled_cells = 0
+        percentage = "--"
+    else:
+        bounded_tokens = max(0, min(tokens, capacity))
+        filled_cells = min(
+            bar_width,
+            (bounded_tokens * bar_width + capacity - 1) // capacity,
+        )
+        percentage = f"{min(100, round(tokens * 100 / capacity))}%"
+    if glyphs.top_left == "+":
+        filled, empty = "#", "-"
+    else:
+        filled, empty = "█", "░"
+    bar = filled * filled_cells + empty * (bar_width - filled_cells)
+    return f"ctx [{bar}] {percentage}"
 
 
 def _format_token_count(value: int) -> str:
@@ -2059,7 +2154,7 @@ def _create_application(
                     result = await handle_command(command, state.conversation_id)
             else:
                 result = await handle_command(command, state.conversation_id)
-            state.conversation_id = result.conversation_id
+            state.select_conversation(result.conversation_id)
             if result.source_summary is not None:
                 state.source_summary = _sanitize_terminal_text(
                     result.source_summary,

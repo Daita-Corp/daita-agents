@@ -2591,11 +2591,24 @@ async def _ready_view_state(
             "Catalog is empty. Use /source refresh <id> after checking source access."
         )
     agent_home = getattr(agent, "home", None)
+    model_profile = getattr(agent, "model_profile", None)
+    context_capacity_tokens = getattr(
+        model_profile,
+        "maximum_input_tokens",
+        None,
+    )
+    if (
+        not isinstance(context_capacity_tokens, int)
+        or isinstance(context_capacity_tokens, bool)
+        or context_capacity_tokens < 1
+    ):
+        context_capacity_tokens = None
     return terminal_tui.TerminalViewState(
         agent_label=_safe_display(agent.name, fallback="agent"),
         model_label=_safe_display(model, fallback="model"),
         source_summary=source_summary,
         conversation_id=conversation_id,
+        context_capacity_tokens=context_capacity_tokens,
         startup=terminal_tui.TerminalStartupInfo(
             version=__version__,
             provider_label=_safe_display(provider_label, fallback="provider"),

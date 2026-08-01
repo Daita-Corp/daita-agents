@@ -456,6 +456,7 @@ class AgentLoop:
                 "provider_id": response.provider_id or self._model.provider_id,
                 "duration_ms": duration_ms,
                 "input_tokens": response.usage.input_tokens,
+                "context_input_tokens": response.request_input_tokens,
                 "output_tokens": response.usage.output_tokens,
             },
         )

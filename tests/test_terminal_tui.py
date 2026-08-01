@@ -173,12 +173,13 @@ def _event(
     data: dict[str, object],
     *,
     run_id: str = "run-live",
+    conversation_id: str = "conversation-live",
 ) -> AgentEvent:
     return AgentEvent(
         kind=kind,
         occurred_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
         run_id=run_id,
-        conversation_id="conversation-live",
+        conversation_id=conversation_id,
         data=FrozenJsonObject.from_mapping(data),
     )
 
@@ -704,6 +705,81 @@ def test_initial_status_reports_zero_cost_before_the_first_run():
     assert state.total_tokens == 0
     assert state.estimated_cost == "$0"
     assert projected.right == "0 steps · 0 tokens · $0"
+
+
+def test_context_progress_uses_latest_conversation_request_and_input_capacity():
+    state = TerminalViewState(
+        "atlas",
+        "gpt-5.6-sol",
+        "source",
+        conversation_id="conversation-live",
+        context_capacity_tokens=1_000,
+        conversation_context_tokens=340,
+    )
+    glyphs = terminal_tui._terminal_glyphs(
+        terminal_tui.TerminalCapabilities("truecolor", True)
+    )
+
+    projected = terminal_tui._status_projection(
+        state,
+        width=120,
+        mode="full",
+        glyphs=glyphs,
+    )
+
+    assert "ctx [████░░░░░░] 34%" in projected.right
+    assert "tokens" not in projected.right
+
+    ascii_progress = terminal_tui._context_progress_text(
+        state,
+        glyphs=terminal_tui._terminal_glyphs(
+            terminal_tui.TerminalCapabilities("16", False)
+        ),
+    )
+    assert ascii_progress == "ctx [####------] 34%"
+
+
+def test_context_progress_persists_per_conversation_and_not_per_run():
+    state = TerminalViewState(
+        "atlas",
+        "model",
+        "source",
+        conversation_id="conversation-old",
+        context_capacity_tokens=1_000,
+        conversation_context_tokens=200,
+    )
+
+    state.apply_event(
+        _event(
+            AgentEventKind.RUN_STARTED,
+            {"agent_id": "agent-live"},
+            conversation_id="conversation-old",
+        )
+    )
+    assert state.conversation_context_tokens == 200
+
+    state.apply_event(
+        _event(
+            AgentEventKind.MODEL_COMPLETED,
+            {
+                "provider_id": "openai:model",
+                "duration_ms": 19,
+                "input_tokens": 500,
+                "context_input_tokens": 250,
+                "output_tokens": 3,
+            },
+            conversation_id="conversation-old",
+        )
+    )
+    assert state.run_input_tokens == 500
+    assert state.conversation_context_tokens == 250
+
+    state.select_conversation(None)
+    assert state.conversation_context_tokens is None
+    state.select_conversation("conversation-old")
+    assert state.conversation_context_tokens == 250
+    state.select_conversation("conversation-unseen")
+    assert state.conversation_context_tokens is None
 
 
 def test_all_seven_observation_events_project_live_and_final_states():

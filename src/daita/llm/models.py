@@ -328,6 +328,7 @@ class ModelResponse:
     text: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
     usage: ModelUsage = field(default_factory=ModelUsage)
+    request_input_tokens: int | None = None
     provider_id: str | None = None
     provider_response_id: str | None = None
     provider_metadata: Mapping[str, object] = field(default_factory=dict)
@@ -358,11 +359,21 @@ class ModelResponse:
             raise ValueError("tool_calls finish reason requires at least one tool call")
         if not isinstance(self.usage, ModelUsage):
             raise TypeError("usage must be a ModelUsage record")
+        request_input_tokens = self.request_input_tokens
+        if request_input_tokens is None:
+            request_input_tokens = self.usage.input_tokens
+        if (
+            not isinstance(request_input_tokens, int)
+            or isinstance(request_input_tokens, bool)
+            or request_input_tokens < 0
+        ):
+            raise ValueError("request_input_tokens must be a non-negative integer")
         if self.provider_response_id is not None:
             _required_text(self.provider_response_id, "provider_response_id")
         if self.provider_id is not None:
             _required_text(self.provider_id, "model-response provider_id")
         object.__setattr__(self, "tool_calls", tool_calls)
+        object.__setattr__(self, "request_input_tokens", request_input_tokens)
         object.__setattr__(
             self,
             "provider_metadata",
