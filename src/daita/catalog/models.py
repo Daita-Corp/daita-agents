@@ -1053,6 +1053,7 @@ class CatalogSchemaRequest:
     source_id: str | None = None
     limit: int = 12
     include_relationships: bool = True
+    max_join_depth: int = 3
 
     def __post_init__(self) -> None:
         _required_text(self.agent_id, "catalog schema agent_id")
@@ -1084,6 +1085,15 @@ class CatalogSchemaRequest:
             raise ValueError("catalog schema limit must be from 1 through 50")
         if not isinstance(self.include_relationships, bool):
             raise TypeError("catalog schema include_relationships must be a boolean")
+        if (
+            not isinstance(self.max_join_depth, int)
+            or isinstance(self.max_join_depth, bool)
+            or not 1 <= self.max_join_depth <= CATALOG_TRAVERSAL_MAX_DEPTH
+        ):
+            raise ValueError(
+                "catalog schema max_join_depth must be from 1 through "
+                f"{CATALOG_TRAVERSAL_MAX_DEPTH}"
+            )
         object.__setattr__(self, "resource_ids", resource_ids)
 
 

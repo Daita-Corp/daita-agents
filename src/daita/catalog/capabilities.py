@@ -150,6 +150,7 @@ class CatalogSchemaExecutor:
                 source_id=source_id,
                 limit=_integer_argument(request, "limit", 12),
                 include_relationships=include_relationships,
+                max_join_depth=_integer_argument(request, "max_join_depth", 3),
             )
         )
         return ToolOutput(
@@ -236,9 +237,8 @@ def catalog_declarations(
     schema = Capability(
         id=CATALOG_SCHEMA_CAPABILITY_ID,
         description=(
-            "Use first for SQL planning. Returns columns, keys, and direct "
-            "relationship field pairs. Do not call catalog_traverse in the same "
-            "response."
+            "SQL schema, bridges, paths, and exact join fields. Do not use with "
+            "catalog_traverse."
         ),
         input_schema={
             "type": "object",
@@ -248,6 +248,12 @@ def catalog_declarations(
                 "source_id": {"type": "string"},
                 "limit": {"type": "integer"},
                 "include_relationships": {"type": "boolean"},
+                "max_join_depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": CATALOG_TRAVERSAL_MAX_DEPTH,
+                    "default": 3,
+                },
             },
             "additionalProperties": False,
         },
@@ -432,8 +438,10 @@ def _schema_output_schema() -> dict[str, object]:
         "properties": {
             "bounds": {"type": "object"},
             "include_relationships": {"type": "boolean"},
+            "paths": {"type": "array"},
             "relationships": {"type": "array"},
             "resources": {"type": "array"},
+            "selection": {"type": "object"},
             "sources": {"type": "array"},
             "total_matches": {"type": "integer"},
             "truncation": {"type": "object"},
@@ -442,8 +450,10 @@ def _schema_output_schema() -> dict[str, object]:
         "required": [
             "bounds",
             "include_relationships",
+            "paths",
             "relationships",
             "resources",
+            "selection",
             "sources",
             "total_matches",
             "truncation",
