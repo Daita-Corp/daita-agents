@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
+from hashlib import sha256
 import re
 from typing import Protocol, cast
 
-from ..._json import FrozenJsonObject
+from ..._json import FrozenJsonObject, canonical_json
 from ...artifacts.delivery import LocalArtifactDelivery
 from ...artifacts.models import (
     ArtifactAuthorship,
@@ -100,6 +101,8 @@ from .export_capabilities import (
     ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
     ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     DOCUMENT_CREATE_CAPABILITY_ID,
+    POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
+    SQLITE_CSV_EXPORT_CAPABILITY_ID,
 )
 from .sql import ResourceSchema, validate_postgresql_read, validate_sqlite_read
 
@@ -132,6 +135,8 @@ _MVP_CAPABILITIES = frozenset(
         SEMANTIC_SAVE_CAPABILITY_ID,
         SEMANTIC_DELETE_CAPABILITY_ID,
         DOCUMENT_CREATE_CAPABILITY_ID,
+        SQLITE_CSV_EXPORT_CAPABILITY_ID,
+        POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
         ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
         ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     }
@@ -147,8 +152,13 @@ _SEMANTIC_CAPABILITIES = frozenset(
 _ARTIFACT_CREATE_SAVE_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
+        SQLITE_CSV_EXPORT_CAPABILITY_ID,
+        POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
         ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
     }
+)
+_EXACT_CSV_CAPABILITIES = frozenset(
+    {SQLITE_CSV_EXPORT_CAPABILITY_ID, POSTGRESQL_CSV_EXPORT_CAPABILITY_ID}
 )
 _ARTIFACT_ACTION_WORDS = frozenset(
     {
@@ -169,6 +179,7 @@ _ARTIFACT_OBJECT_WORDS = frozenset(
     {
         "artifact",
         "artifacts",
+        "csv",
         "disk",
         "document",
         "documents",
@@ -507,6 +518,7 @@ class DataToolRuntime:
                     call,
                     capability,
                     output,
+                    arguments,
                 )
                 result = _success(call, output, artifact_ref=artifact_ref)
         except CapabilityInputError as error:
@@ -585,6 +597,7 @@ class DataToolRuntime:
         call: ToolCall,
         capability: Capability,
         output: ToolOutput,
+        arguments: Mapping[str, object] | None = None,
     ) -> ArtifactRef | None:
         policy = capability.artifact_policy
         draft = output.artifact
@@ -600,6 +613,16 @@ class DataToolRuntime:
                     "artifact-producing capability omitted its required draft"
                 )
             return None
+        if draft.provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
+            if (
+                output.data.get("format") != "csv"
+                or output.data.get("filename") != draft.suggested_filename
+                or output.data.get("row_count") != draft.provenance.row_count
+                or output.data.get("column_count") != len(draft.provenance.columns)
+            ):
+                raise ToolOutputValidationError(
+                    "exact artifact summary differs from its execution provenance"
+                )
         if policy.max_artifact_count != 1:
             raise ToolOutputValidationError(
                 "artifact draft exceeds the capability artifact count"
@@ -631,7 +654,12 @@ class DataToolRuntime:
                 "Artifact storage is unavailable.",
                 {"stage": "composition"},
             )
-        bound = await self._bind_artifact_provenance(run, draft)
+        bound = await self._bind_artifact_provenance(
+            run,
+            capability,
+            arguments or {},
+            draft,
+        )
         return await self._artifacts.commit(
             bound,
             policy,
@@ -644,11 +672,24 @@ class DataToolRuntime:
     async def _bind_artifact_provenance(
         self,
         run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
         draft: ArtifactDraft,
     ) -> ArtifactDraft:
         provenance = draft.provenance
+        if provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
+            if capability.id not in _EXACT_CSV_CAPABILITIES:
+                raise ToolOutputValidationError(
+                    "exact-source artifact came from a non-export capability"
+                )
+            return await self._bind_exact_export_provenance(
+                run,
+                capability,
+                arguments,
+                draft,
+            )
         if provenance.authorship is not ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS:
-            return draft
+            raise ToolOutputValidationError("artifact authorship is not supported")
         evidence_call_ids = provenance.evidence_call_ids
         if not evidence_call_ids:
             return ArtifactDraft(
@@ -806,6 +847,120 @@ class DataToolRuntime:
                 authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
                 evidence_call_ids=evidence_call_ids,
                 resource_bindings=tuple(bindings[key] for key in sorted(bindings)),
+            ),
+        )
+
+    async def _bind_exact_export_provenance(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+        draft: ArtifactDraft,
+    ) -> ArtifactDraft:
+        source_id = arguments.get("source_id")
+        sql = arguments.get("sql")
+        parameters = arguments.get("parameters", ())
+        if (
+            not isinstance(source_id, str)
+            or not isinstance(sql, str)
+            or not isinstance(parameters, tuple)
+        ):
+            raise ToolOutputValidationError(
+                "exact export execution arguments are unavailable"
+            )
+        expected_adapter = (
+            "postgresql"
+            if capability.id == POSTGRESQL_CSV_EXPORT_CAPABILITY_ID
+            else "sqlite"
+        )
+        if (
+            await self._catalog.source_adapter_id(run.agent_id, source_id)
+            != expected_adapter
+        ):
+            raise ArtifactError(
+                "artifact_incomplete_export",
+                "Current source facts no longer prove the exact CSV export.",
+                {
+                    "reason": "catalog_changed",
+                    "completed_rows": draft.provenance.row_count or 0,
+                    "completed_columns": len(draft.provenance.columns),
+                    "completed_bytes": len(draft.content),
+                },
+            )
+        resources = await self._catalog.resource_schemas(run.agent_id, source_id)
+        validator = (
+            validate_postgresql_read
+            if capability.id == POSTGRESQL_CSV_EXPORT_CAPABILITY_ID
+            else validate_sqlite_read
+        )
+        validation = validator(
+            sql,
+            source_id=source_id,
+            resources=resources,
+            parameters=parameters,
+        )
+        if (
+            not validation.valid
+            or validation.analysis is None
+            or validation.source_revision is None
+            or not validation.resource_ids
+            or len(validation.resource_revisions) != len(validation.resource_ids)
+        ):
+            raise ArtifactError(
+                "artifact_incomplete_export",
+                "Current catalog facts no longer prove the exact CSV export.",
+                {
+                    "reason": "catalog_changed",
+                    "completed_rows": draft.provenance.row_count or 0,
+                    "completed_columns": len(draft.provenance.columns),
+                    "completed_bytes": len(draft.content),
+                },
+            )
+        schemas = {item.resource_id: item for item in resources}
+        bindings = tuple(
+            ArtifactResourceBinding(
+                source_id=source_id,
+                source_revision=validation.source_revision,
+                resource_id=resource_id,
+                resource_revision=revision,
+            )
+            for resource_id, revision in sorted(validation.resource_revisions)
+        )
+        parameters_sha256 = (
+            "sha256:" + sha256(canonical_json(parameters).encode("utf-8")).hexdigest()
+        )
+        provenance = draft.provenance
+        if (
+            provenance.resource_bindings != bindings
+            or provenance.sql_fingerprint != validation.analysis.sql_fingerprint
+            or provenance.parameters_sha256 != parameters_sha256
+        ):
+            raise ToolOutputValidationError(
+                "exact artifact provenance differs from current runtime execution facts"
+            )
+        sensitivities = [draft.sensitivity]
+        for resource_id in validation.resource_ids:
+            schema = schemas.get(resource_id)
+            if schema is None:
+                raise ToolOutputValidationError(
+                    "exact artifact resource is absent from current catalog facts"
+                )
+            try:
+                sensitivities.append(Sensitivity(schema.sensitivity_class))
+            except ValueError:
+                sensitivities.append(Sensitivity.RESTRICTED)
+        return ArtifactDraft(
+            content=draft.content,
+            suggested_filename=draft.suggested_filename,
+            media_type=draft.media_type,
+            sensitivity=_resolved_sensitivity(tuple(sensitivities)),
+            provenance=ArtifactProvenance(
+                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
+                resource_bindings=bindings,
+                sql_fingerprint=validation.analysis.sql_fingerprint,
+                parameters_sha256=parameters_sha256,
+                columns=provenance.columns,
+                row_count=provenance.row_count,
             ),
         )
 
@@ -1641,6 +1796,8 @@ class DataToolRuntime:
         if capability.id in {
             SQLITE_QUERY_CAPABILITY_ID,
             POSTGRESQL_QUERY_CAPABILITY_ID,
+            SQLITE_CSV_EXPORT_CAPABILITY_ID,
+            POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
         }:
             return await self._validate_sql(run, capability, arguments)
         if capability.id == LOCAL_FILE_READ_CAPABILITY_ID:
@@ -1821,7 +1978,11 @@ class DataToolRuntime:
             )
         expected_adapter = (
             "postgresql"
-            if capability.id == POSTGRESQL_QUERY_CAPABILITY_ID
+            if capability.id
+            in {
+                POSTGRESQL_QUERY_CAPABILITY_ID,
+                POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
+            }
             else "sqlite"
         )
         actual_adapter = await self._catalog.source_adapter_id(run.agent_id, source_id)

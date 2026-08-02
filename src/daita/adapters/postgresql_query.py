@@ -14,8 +14,11 @@ from typing import Any, cast
 from uuid import UUID
 
 from .._json import canonical_json
+from ..artifacts.models import ArtifactError
+from ..artifacts.renderers import ExactCsvRenderer
 from ..domains.data.capabilities import PostgreSQLReadResult
 from ..domains.data.controller import CatalogSchemaReader
+from ..domains.data.export_capabilities import ExactCsvExportResult, ExactCsvProgress
 from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_postgresql_read
 from ..security import SecretProvider, default_secret_provider
@@ -258,6 +261,171 @@ class PostgreSQLQueryBackend:
             projection=projection,
         )
 
+    async def execute_exact_csv(
+        self,
+        *,
+        agent_id: str,
+        source_id: str,
+        sql: str,
+        parameters: tuple[object, ...],
+        max_rows: int,
+        max_columns: int,
+        max_bytes: int,
+        timeout_seconds: float,
+        progress: ExactCsvProgress | None = None,
+    ) -> ExactCsvExportResult:
+        """Run one fresh read and stream original driver values into exact CSV."""
+
+        registration = await self._sources.load_source(agent_id, source_id)
+        if (
+            registration is None
+            or registration.agent_id != agent_id
+            or registration.id != source_id
+            or not registration.active
+        ):
+            raise PostgreSQLQueryError(
+                "source_not_available",
+                "The PostgreSQL source is not attached to this agent.",
+            )
+        if registration.adapter_id != "postgresql":
+            raise PostgreSQLQueryError(
+                "source_adapter_mismatch",
+                "The selected source is not a PostgreSQL source.",
+            )
+        resources = await self._catalog.resource_schemas(agent_id, source_id)
+        validation = validate_postgresql_read(
+            sql,
+            source_id=source_id,
+            resources=resources,
+            parameters=parameters,
+        )
+        if not validation.valid or validation.analysis is None:
+            codes = ",".join(validation.issue_codes[:8]) or "invalid_sql"
+            raise PostgreSQLQueryError(
+                "query_revalidation_failed",
+                f"PostgreSQL query failed deterministic revalidation: {codes}",
+            )
+        if not validation.resource_ids:
+            raise PostgreSQLQueryError(
+                "query_resource_scope_empty",
+                "PostgreSQL query must reference a current catalog resource.",
+            )
+        if validation.source_revision is None or len(
+            validation.resource_revisions
+        ) != len(validation.resource_ids):
+            raise PostgreSQLQueryError(
+                "catalog_provenance_missing",
+                "PostgreSQL query requires complete current catalog provenance.",
+            )
+
+        connection = None
+        transaction = None
+        transaction_finished = False
+        query_failed = False
+        content = b""
+        columns: tuple[str, ...] = ()
+        row_count = 0
+        completed = {"rows": 0, "columns": 0, "bytes": 0}
+
+        def record_progress(rows: int, column_count: int, byte_count: int) -> None:
+            completed.update(
+                rows=rows,
+                columns=column_count,
+                bytes=byte_count,
+            )
+            if progress is not None:
+                progress(rows, column_count, byte_count)
+
+        try:
+            connection = await _connect(registration, self._secret_provider)
+            transaction = connection.transaction(
+                isolation="repeatable_read",
+                readonly=True,
+            )
+            await transaction.start()
+            timeout_milliseconds = max(1, int(timeout_seconds * 1_000))
+            await connection.execute(
+                "SELECT set_config('statement_timeout', $1, true)",
+                f"{timeout_milliseconds}ms",
+            )
+            await connection.execute(
+                "SELECT set_config('search_path', $1, true)",
+                "pg_catalog",
+            )
+            structure = await _load_structure(
+                connection,
+                registration,
+                max_resources=_DEFAULT_MAX_RESOURCES,
+                max_columns=_DEFAULT_MAX_COLUMNS,
+                max_indexes=_DEFAULT_MAX_INDEXES,
+                max_relationships=_DEFAULT_MAX_RELATIONSHIPS,
+            )
+            if structure.source_revision != validation.source_revision:
+                raise PostgreSQLQueryError(
+                    "catalog_source_stale",
+                    "PostgreSQL source structure changed after its catalog snapshot.",
+                )
+            async with asyncio.timeout(timeout_seconds):
+                content, columns, row_count = await _execute_exact_csv_query(
+                    connection,
+                    validation.analysis.canonical_sql,
+                    parameters,
+                    max_rows=max_rows,
+                    max_columns=max_columns,
+                    max_bytes=max_bytes,
+                    timeout_seconds=timeout_seconds,
+                    progress=record_progress,
+                )
+            await transaction.commit()
+            transaction_finished = True
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError as error:
+            raise ArtifactError(
+                "artifact_incomplete_export",
+                "The exact CSV export exceeded its execution-time limit.",
+                {
+                    "reason": "time_limit",
+                    "completed_rows": completed["rows"],
+                    "completed_columns": completed["columns"],
+                    "completed_bytes": completed["bytes"],
+                },
+            ) from error
+        except ImportError:
+            raise
+        except (ArtifactError, PostgreSQLQueryError):
+            raise
+        except Exception:
+            query_failed = True
+        finally:
+            try:
+                if transaction is not None and not transaction_finished:
+                    await _rollback_postgresql_transaction(
+                        transaction,
+                        connection,
+                        timeout_seconds=self._cleanup_timeout_seconds,
+                    )
+            finally:
+                if connection is not None:
+                    await _close_postgresql_connection(
+                        connection,
+                        timeout_seconds=self._cleanup_timeout_seconds,
+                    )
+        if query_failed:
+            raise PostgreSQLQueryError(
+                "postgresql_query_failed",
+                "PostgreSQL could not complete the exact bounded read.",
+            )
+        return ExactCsvExportResult(
+            source_id=source_id,
+            source_revision=validation.source_revision,
+            sql_fingerprint=validation.analysis.sql_fingerprint,
+            resource_revisions=validation.resource_revisions,
+            columns=columns,
+            row_count=row_count,
+            content=content,
+        )
+
 
 async def _execute_user_query(
     connection: Any,
@@ -339,6 +507,68 @@ async def _execute_user_query(
     return columns, tuple(rows), value_limited
 
 
+async def _execute_exact_csv_query(
+    connection: Any,
+    sql: str,
+    parameters: tuple[object, ...],
+    *,
+    max_rows: int,
+    max_columns: int,
+    max_bytes: int,
+    timeout_seconds: float,
+    progress: ExactCsvProgress | None = None,
+) -> tuple[bytes, tuple[str, ...], int]:
+    shape_statement = await connection.prepare(sql, timeout=timeout_seconds)
+    attributes = tuple(shape_statement.get_attributes())
+    raw_names = tuple(attribute.name for attribute in attributes)
+    renderer = ExactCsvRenderer(
+        raw_names,
+        max_rows=max_rows,
+        max_columns=max_columns,
+        max_bytes=max_bytes,
+        max_seconds=timeout_seconds,
+    )
+    if progress is not None:
+        progress(renderer.row_count, len(renderer.columns), renderer.byte_count)
+    bounded_sql = _exact_bounded_result_sql(
+        sql,
+        column_names=renderer.columns,
+        max_rows=max_rows,
+        max_bytes=max_bytes,
+    )
+    statement = await connection.prepare(bounded_sql, timeout=timeout_seconds)
+    cursor = statement.cursor(
+        *parameters,
+        prefetch=min(1_000, max_rows + 1),
+        timeout=timeout_seconds,
+    )
+    async for record in cursor:
+        values_method = getattr(record, "values", None)
+        values: tuple[object, ...] | None = None
+        if callable(values_method):
+            try:
+                values = tuple(cast(Iterable[object], values_method()))
+            except TypeError:
+                pass
+        elif isinstance(record, Sequence):
+            values = tuple(cast(Sequence[object], record))
+        if (
+            values is None
+            or len(values) != len(renderer.columns) + 1
+            or not isinstance(values[-1], bool)
+        ):
+            raise PostgreSQLQueryError(
+                "query_result_invalid",
+                "PostgreSQL returned an invalid exact tabular row.",
+            )
+        if values[-1] is not True:
+            renderer.incomplete("byte_limit")
+        renderer.append(values[:-1])
+        if progress is not None:
+            progress(renderer.row_count, len(renderer.columns), renderer.byte_count)
+    return renderer.finish(), renderer.columns, renderer.row_count
+
+
 def _bounded_result_sql(
     sql: str,
     *,
@@ -368,6 +598,38 @@ def _bounded_result_sql(
         f"{_BOUNDED_RESULT_MARKER} SELECT {', '.join(selected)} "
         f"FROM ({sql}) AS {row_alias}{alias_clause} LIMIT {max_rows + 1}"
     )
+
+
+def _exact_bounded_result_sql(
+    sql: str,
+    *,
+    column_names: tuple[str, ...],
+    max_rows: int,
+    max_bytes: int,
+) -> str:
+    aliases = tuple(
+        f"__daita_exact_column_{index}" for index in range(len(column_names))
+    )
+    row_alias = "__daita_exact_row"
+    size_check = f"pg_catalog.pg_column_size({row_alias}) <= {max_bytes}"
+    selected = [
+        (
+            f'CASE WHEN {size_check} THEN {row_alias}."{alias}" ELSE NULL END '
+            f"AS {_postgresql_identifier(column_name)}"
+        )
+        for alias, column_name in zip(aliases, column_names, strict=True)
+    ]
+    selected.append(f'{size_check} AS "__daita_exact_within_result_limit"')
+    alias_clause = " (" + ", ".join(f'"{item}"' for item in aliases) + ")"
+    return (
+        "/* daita:postgresql.exact_csv */ "
+        f"SELECT {', '.join(selected)} FROM ({sql}) AS {row_alias}{alias_clause} "
+        f"LIMIT {max_rows + 1}"
+    )
+
+
+def _postgresql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _unique_columns(values: tuple[str, ...]) -> tuple[str, ...]:

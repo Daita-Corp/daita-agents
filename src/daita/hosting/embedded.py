@@ -708,12 +708,14 @@ class EmbeddedAgent:
         catalog_service = CatalogService(store, store)
         data_view = CatalogDataView(store, catalog_service, store)
         catalog = catalog_declarations(identity.id, catalog_service)
-        sqlite = sqlite_query_declarations(
-            identity.id, SQLiteQueryBackend(store, data_view)
+        sqlite_backend = SQLiteQueryBackend(store, data_view)
+        postgresql_backend = PostgreSQLQueryBackend(
+            store, data_view, secret_provider or keychain
         )
+        sqlite = sqlite_query_declarations(identity.id, sqlite_backend)
         postgresql = postgresql_query_declarations(
             identity.id,
-            PostgreSQLQueryBackend(store, data_view, secret_provider or keychain),
+            postgresql_backend,
         )
         local_files = local_file_read_declarations(
             identity.id, LocalDirectoryReadBackend(store, store)
@@ -755,7 +757,12 @@ class EmbeddedAgent:
         skills = skill_declarations(skill_store)
         semantics = semantic_declarations(identity.id, store)
         artifacts = (
-            artifact_capability_declarations(artifact_delivery)
+            artifact_capability_declarations(
+                artifact_delivery,
+                agent_id=identity.id,
+                sqlite_backend=sqlite_backend,
+                postgresql_backend=postgresql_backend,
+            )
             if artifact_store.available
             else None
         )

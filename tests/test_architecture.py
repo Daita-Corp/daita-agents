@@ -1,4 +1,5 @@
 import ast
+from collections.abc import Mapping
 from pathlib import Path
 import sqlite3
 
@@ -1126,6 +1127,68 @@ def test_artifacts_have_one_concrete_owner_and_no_storage_renderer_or_policy_reg
         "ArtifactProvider",
     ):
         assert prohibited not in artifact_text
+
+
+def test_exact_csv_extends_existing_adapter_capability_and_renderer_owners():
+    assert _class_owners("ExactCsvRenderer") == {"artifacts/renderers.py"}
+    for adapter, class_name in (
+        ("sqlite_query.py", "SQLiteQueryBackend"),
+        ("postgresql_query.py", "PostgreSQLQueryBackend"),
+    ):
+        methods = _class_methods(PACKAGE / "adapters" / adapter, class_name)
+        assert "execute_exact_csv" in methods
+        tree = ast.parse((PACKAGE / "adapters" / adapter).read_text(encoding="utf-8"))
+        method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "execute_exact_csv"
+        )
+        calls = {
+            node.func.id
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "project_result_rows" not in calls
+        assert "_json_value" not in calls
+        assert "_unique_columns" not in calls
+
+    renderers = (PACKAGE / "artifacts" / "renderers.py").read_text(encoding="utf-8")
+    exports = (PACKAGE / "domains" / "data" / "export_capabilities.py").read_text(
+        encoding="utf-8"
+    )
+    assert "BoundedResultProjection" not in renderers
+    assert "BoundedResultProjection" not in exports
+    assert "ExactCsvRenderer" not in _python_text(PACKAGE / "loop")
+    assert "ArtifactRendererRegistry" not in renderers
+
+
+def test_exact_csv_tool_arguments_contain_query_selection_but_never_rows_or_bytes():
+    from daita.domains.data.export_capabilities import (
+        POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
+        SQLITE_CSV_EXPORT_CAPABILITY_ID,
+        artifact_extension_declarations,
+    )
+
+    declarations = artifact_extension_declarations()
+    for capability in declarations.capabilities:
+        if capability.id not in {
+            SQLITE_CSV_EXPORT_CAPABILITY_ID,
+            POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
+        }:
+            continue
+        properties = capability.input_schema["properties"]
+        assert isinstance(properties, Mapping)
+        assert set(properties) == {
+            "source_id",
+            "sql",
+            "parameters",
+            "format",
+            "filename",
+        }
+        assert set(properties).isdisjoint(
+            {"rows", "content", "bytes", "provenance", "sensitivity", "path"}
+        )
 
 
 def test_agent_loop_carries_artifact_records_but_never_imports_renderers_delivery_or_filesystem_paths():
