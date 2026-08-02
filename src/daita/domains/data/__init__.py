@@ -18,6 +18,17 @@ from .capabilities import (
     sqlite_query_extension_declarations,
 )
 from .context import CatalogContextReader, DataContextBuilder
+from .export_capabilities import (
+    ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+    ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+    ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
+    ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
+    DOCUMENT_CREATE_CAPABILITY_ID,
+    DOCUMENT_CREATE_TOOL_NAME,
+    ArtifactCapabilityDeclarations,
+    artifact_capability_declarations,
+    artifact_extension_declarations,
+)
 from .controller import (
     POSTGRESQL_QUERY_CAPABILITY_ID,
     POSTGRESQL_QUERY_EVIDENCE_KIND,
@@ -59,12 +70,19 @@ from .sql import (
 
 __all__ = [
     "BoundedResultProjection",
+    "ARTIFACT_SAVE_LOCAL_CAPABILITY_ID",
+    "ARTIFACT_SAVE_LOCAL_TOOL_NAME",
+    "ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID",
+    "ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME",
+    "ArtifactCapabilityDeclarations",
     "CatalogContextReader",
     "CatalogDataReader",
     "CatalogDataView",
     "CatalogSchemaReader",
     "DataContextBuilder",
     "DataToolRuntime",
+    "DOCUMENT_CREATE_CAPABILITY_ID",
+    "DOCUMENT_CREATE_TOOL_NAME",
     "LOCAL_FILE_READ_CAPABILITY_ID",
     "LOCAL_FILE_READ_EVIDENCE_KIND",
     "LOCAL_FILE_READ_EXECUTOR_ID",
@@ -96,6 +114,8 @@ __all__ = [
     "SqlValidationResult",
     "analyze_postgresql_sql",
     "analyze_sqlite_sql",
+    "artifact_capability_declarations",
+    "artifact_extension_declarations",
     "local_file_read_declarations",
     "local_file_read_extension_declarations",
     "normalize_sql",

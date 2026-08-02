@@ -2621,7 +2621,7 @@ async def test_resize_idle_running_and_approving_preserves_focus_and_view_state(
         output.size = Size(rows=30, columns=100)
         await asyncio.sleep(0.08)
         assert application.layout.current_control is approval_focus
-        pipe.send_text("d")
+        pipe.send_text("n")
         await _wait_until(lambda: approval_decisions == [ApprovalDecision.DENY])
         await _wait_until(lambda: not state.running)
         pipe.send_text("\x04")
@@ -2954,12 +2954,12 @@ async def test_exact_approval_panel_reviews_complete_frozen_arguments_and_approv
         assert "skills.write" in rendered
         assert "line-00" in rendered
         assert "line-39" in rendered
-        assert "[A] Approve once" in rendered
-        assert "[D] Deny" in rendered
+        assert "[Y] Approve once" in rendered
+        assert "[N] Deny" in rendered
 
         pipe.send_text("\x1b[6~")
         await _wait_until(lambda: panel.cursor_line > 0)
-        pipe.send_text("a")
+        pipe.send_text("y")
         await _wait_until(lambda: decisions == [ApprovalDecision.APPROVE])
         await _wait_until(lambda: not state.running)
         pipe.send_text("follow-up\r")
@@ -2974,6 +2974,36 @@ async def test_exact_approval_panel_reviews_complete_frozen_arguments_and_approv
         ("save this", None),
         ("follow-up", "conversation-one"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("entered", "expected", "prompt_count"),
+    (
+        ("y\n", ApprovalDecision.APPROVE, 1),
+        ("N\n", ApprovalDecision.DENY, 1),
+        ("a\n\ny\n", ApprovalDecision.APPROVE, 3),
+    ),
+    ids=("approve", "deny", "invalid-then-approve"),
+)
+async def test_line_approval_uses_the_same_explicit_y_n_contract(
+    entered: str,
+    expected: ApprovalDecision,
+    prompt_count: int,
+) -> None:
+    output = io.StringIO()
+    decision = await terminal._prompt_for_exact_approval(
+        _approval_request({"name": "bounded-skill", "content": "safe"}),
+        input_stream=io.StringIO(entered),
+        output_stream=output,
+    )
+
+    assert decision is expected
+    assert (
+        output.getvalue().count("Approve this exact change once? [y/n]") == prompt_count
+    )
+    assert output.getvalue().count("Enter y to approve or n to deny.") == max(
+        0, prompt_count - 1
+    )
 
 
 def test_exact_approval_document_uses_the_existing_review_bound():
@@ -2998,18 +3028,7 @@ def test_exact_approval_document_uses_the_existing_review_bound():
     assert terminal_tui._approval_panel_for_request(oversized) is None
 
 
-@pytest.mark.parametrize(
-    "key",
-    (
-        "d",
-        "\x1b",
-        "\x03",
-        "x",
-        "\r",
-    ),
-    ids=("deny", "escape", "ctrl-c", "invalid", "composer-submit"),
-)
-async def test_approval_keys_fail_closed_and_never_submit_the_composer(key: str):
+async def test_explicit_n_denies_approval_without_submitting_the_composer():
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
     request = _approval_request({"name": "bounded-skill", "content": "safe"})
@@ -3037,7 +3056,7 @@ async def test_approval_keys_fail_closed_and_never_submit_the_composer(key: str)
         )
         pipe.send_text("review\r")
         await _wait_until(lambda: state.approval_panel is not None)
-        pipe.send_text(key)
+        pipe.send_text("n")
         await _wait_until(lambda: decisions == [ApprovalDecision.DENY])
         await _wait_until(lambda: not state.running)
         pipe.send_text("\x04")
@@ -3048,7 +3067,101 @@ async def test_approval_keys_fail_closed_and_never_submit_the_composer(key: str)
     assert state.approval_panel is None
 
 
-async def test_cancelled_and_invalid_approval_presenters_return_existing_deny():
+@pytest.mark.parametrize(
+    "key",
+    ("a", "d", "x", "\r", " ", "\x1b", "\x1b[I", "\x1b[?1;2c"),
+    ids=(
+        "old-approve",
+        "old-deny",
+        "invalid",
+        "enter",
+        "space",
+        "escape",
+        "terminal-focus-event",
+        "terminal-device-response",
+    ),
+)
+async def test_unrecognized_approval_keys_remain_pending(key: str):
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    request = _approval_request({"name": "bounded-skill", "content": "safe"})
+    decisions: list[ApprovalDecision] = []
+
+    async def fallback(unexpected: ApprovalRequest) -> ApprovalDecision:
+        raise AssertionError(unexpected)
+
+    approval_bridge = terminal_tui.TerminalApprovalBridge(fallback)
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del message, conversation_id
+        decisions.append(await approval_bridge(request))
+        return _result("handled")
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            approval_bridge=approval_bridge,
+        )
+        pipe.send_text("review\r")
+        await _wait_until(lambda: state.approval_panel is not None)
+        panel = state.approval_panel
+        pipe.send_text(key)
+        await asyncio.sleep(0.05)
+        remained_pending = state.approval_panel is panel and decisions == []
+        if state.approval_panel is not None:
+            pipe.send_text("n")
+            await _wait_until(lambda: decisions == [ApprovalDecision.DENY])
+            await _wait_until(lambda: not state.running)
+        pipe.send_text("\x04")
+        await task
+
+    assert remained_pending
+
+
+async def test_approval_ctrl_c_interrupts_without_a_denial():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    request = _approval_request({"name": "bounded-skill", "content": "safe"})
+    decisions: list[ApprovalDecision] = []
+    cancelled = asyncio.Event()
+
+    async def fallback(unexpected: ApprovalRequest) -> ApprovalDecision:
+        raise AssertionError(unexpected)
+
+    approval_bridge = terminal_tui.TerminalApprovalBridge(fallback)
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del message, conversation_id
+        try:
+            decisions.append(await approval_bridge(request))
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return _result("handled")
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            approval_bridge=approval_bridge,
+        )
+        pipe.send_text("review\r")
+        await _wait_until(lambda: state.approval_panel is not None)
+        pipe.send_text("\x03")
+        await _wait_until(lambda: cancelled.is_set() and not state.running)
+        pipe.send_text("\x04")
+        await task
+
+    assert decisions == []
+    assert state.approval_panel is None
+
+
+async def test_cancelled_and_invalid_approval_presenters_propagate_truthfully():
     request = _approval_request({"name": "bounded-skill", "content": "safe"})
 
     async def fallback(unexpected: ApprovalRequest) -> ApprovalDecision:
@@ -3061,7 +3174,8 @@ async def test_cancelled_and_invalid_approval_presenters_return_existing_deny():
         raise asyncio.CancelledError
 
     previous = bridge.install(cancelled)
-    assert await bridge(request) is ApprovalDecision.DENY
+    with pytest.raises(asyncio.CancelledError):
+        await bridge(request)
     bridge.restore(previous)
 
     async def invalid(unexpected: ApprovalRequest) -> Any:
@@ -3069,31 +3183,41 @@ async def test_cancelled_and_invalid_approval_presenters_return_existing_deny():
         return "approve"
 
     previous = bridge.install(invalid)
-    assert await bridge(request) is ApprovalDecision.DENY
+    with pytest.raises(TypeError, match="ApprovalDecision"):
+        await bridge(request)
     bridge.restore(previous)
 
 
-async def test_approval_rendering_failure_denies_without_failing_the_run(
+async def test_approval_rendering_failure_propagates_without_a_false_denial(
     monkeypatch: pytest.MonkeyPatch,
 ):
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
     request = _approval_request({"name": "bounded-skill", "content": "safe"})
-    decisions: list[ApprovalDecision] = []
+    failures: list[str] = []
+    render_attempted = asyncio.Event()
 
     async def fallback(unexpected: ApprovalRequest) -> ApprovalDecision:
         raise AssertionError(unexpected)
 
     approval_bridge = terminal_tui.TerminalApprovalBridge(fallback)
 
-    def fail_render(panel: terminal_tui.ApprovalPanelState) -> Any:
+    def fail_render(
+        panel: terminal_tui.ApprovalPanelState,
+        **kwargs: Any,
+    ) -> Any:
+        del kwargs
+        render_attempted.set()
         raise RuntimeError(panel.tool_name)
 
     monkeypatch.setattr(terminal_tui, "_render_approval_panel_fragments", fail_render)
 
     async def run_message(message: str, conversation_id: str | None) -> Any:
         del message, conversation_id
-        decisions.append(await approval_bridge(request))
+        try:
+            await approval_bridge(request)
+        except RuntimeError as error:
+            failures.append(str(error))
         return _result("continued")
 
     with create_pipe_input() as pipe:
@@ -3105,7 +3229,8 @@ async def test_approval_rendering_failure_denies_without_failing_the_run(
             approval_bridge=approval_bridge,
         )
         pipe.send_text("review\r")
-        await _wait_until(lambda: decisions == [ApprovalDecision.DENY])
+        await render_attempted.wait()
+        await _wait_until(lambda: failures == ["skill_save"])
         await _wait_until(lambda: not state.running)
         pipe.send_text("\x04")
         await task
@@ -3114,11 +3239,12 @@ async def test_approval_rendering_failure_denies_without_failing_the_run(
     assert state.blocks[-1].text == "continued"
 
 
-async def test_application_shutdown_denies_the_focused_approval():
+async def test_application_shutdown_cancels_the_focused_approval():
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
     request = _approval_request({"name": "bounded-skill", "content": "safe"})
     decisions: list[ApprovalDecision] = []
+    cancelled = asyncio.Event()
 
     async def fallback(unexpected: ApprovalRequest) -> ApprovalDecision:
         raise AssertionError(unexpected)
@@ -3127,7 +3253,11 @@ async def test_application_shutdown_denies_the_focused_approval():
 
     async def run_message(message: str, conversation_id: str | None) -> Any:
         del message, conversation_id
-        decisions.append(await approval_bridge(request))
+        try:
+            decisions.append(await approval_bridge(request))
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
         return _result("shutdown")
 
     with create_pipe_input() as pipe:
@@ -3144,12 +3274,13 @@ async def test_application_shutdown_denies_the_focused_approval():
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    assert decisions == [ApprovalDecision.DENY]
+    assert cancelled.is_set()
+    assert decisions == []
     assert state.approval_panel is None
     assert state.active_task is None
 
 
-async def test_secret_shaped_approval_is_denied_before_output_or_view_state():
+async def test_secret_shaped_approval_fails_without_a_false_user_denial():
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
     sentinel = "stage-four-credential-sentinel"
@@ -3159,7 +3290,7 @@ async def test_secret_shaped_approval_is_denied_before_output_or_view_state():
             "password": sentinel,
         }
     )
-    decisions: list[ApprovalDecision] = []
+    failures: list[str] = []
 
     async def fallback(unexpected: ApprovalRequest) -> ApprovalDecision:
         raise AssertionError(unexpected)
@@ -3168,7 +3299,10 @@ async def test_secret_shaped_approval_is_denied_before_output_or_view_state():
 
     async def run_message(message: str, conversation_id: str | None) -> Any:
         del message, conversation_id
-        decisions.append(await approval_bridge(request))
+        try:
+            await approval_bridge(request)
+        except RuntimeError as error:
+            failures.append(str(error))
         return _result("denied safely")
 
     with create_pipe_input() as pipe:
@@ -3180,12 +3314,13 @@ async def test_secret_shaped_approval_is_denied_before_output_or_view_state():
             approval_bridge=approval_bridge,
         )
         pipe.send_text("review\r")
-        await _wait_until(lambda: decisions == [ApprovalDecision.DENY])
+        await _wait_until(lambda: len(failures) == 1)
         await _wait_until(lambda: not state.running)
         pipe.send_text("\x04")
         await task
 
     assert state.approval_panel is None
+    assert "cannot be reviewed safely" in failures[0]
     assert sentinel not in output.text
     assert sentinel not in repr(state)
 

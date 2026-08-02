@@ -5,9 +5,22 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
+import re
 from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject
+from ...artifacts.delivery import LocalArtifactDelivery
+from ...artifacts.models import (
+    ArtifactAuthorship,
+    ArtifactDraft,
+    ArtifactError,
+    ArtifactProvenance,
+    ArtifactRef,
+    ArtifactResourceBinding,
+    artifact_ref_to_mapping,
+    canonical_artifact_filename,
+)
+from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
     AccessMode,
     ApprovalDecision,
@@ -23,6 +36,7 @@ from ...capabilities import (
     ToolOutput,
     ToolOutputValidationError,
 )
+from ...catalog.models import Sensitivity
 from ...memory.capabilities import MEMORY_SET_CAPABILITY_ID, MEMORY_SET_TOOL_NAME
 from ...observation import (
     AgentEvent,
@@ -82,6 +96,11 @@ from .file_capabilities import (
     LOCAL_FILE_READ_CAPABILITY_ID,
     LOCAL_FILE_READ_EVIDENCE_KIND,
 )
+from .export_capabilities import (
+    ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+    ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
+    DOCUMENT_CREATE_CAPABILITY_ID,
+)
 from .sql import ResourceSchema, validate_postgresql_read, validate_sqlite_read
 
 SQLITE_QUERY_CAPABILITY_ID = "data.sqlite.query"
@@ -112,6 +131,9 @@ _MVP_CAPABILITIES = frozenset(
         SEMANTIC_VIEW_CAPABILITY_ID,
         SEMANTIC_SAVE_CAPABILITY_ID,
         SEMANTIC_DELETE_CAPABILITY_ID,
+        DOCUMENT_CREATE_CAPABILITY_ID,
+        ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+        ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     }
 )
 _SEMANTIC_CAPABILITIES = frozenset(
@@ -122,6 +144,80 @@ _SEMANTIC_CAPABILITIES = frozenset(
         SEMANTIC_DELETE_CAPABILITY_ID,
     }
 )
+_ARTIFACT_CREATE_SAVE_CAPABILITIES = frozenset(
+    {
+        DOCUMENT_CREATE_CAPABILITY_ID,
+        ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+    }
+)
+_ARTIFACT_ACTION_WORDS = frozenset(
+    {
+        "create",
+        "download",
+        "export",
+        "generate",
+        "make",
+        "package",
+        "produce",
+        "put",
+        "save",
+        "turn",
+        "write",
+    }
+)
+_ARTIFACT_OBJECT_WORDS = frozenset(
+    {
+        "artifact",
+        "artifacts",
+        "disk",
+        "document",
+        "documents",
+        "file",
+        "files",
+        "markdown",
+        "md",
+        "report",
+        "reports",
+        "txt",
+    }
+)
+_ARTIFACT_DEICTIC_WORDS = frozenset({"it", "that", "them", "this"})
+_INTENT_META_WORDS = frozenset(
+    {
+        "define",
+        "describe",
+        "discuss",
+        "explain",
+        "how",
+        "list",
+        "read",
+        "show",
+        "tell",
+        "what",
+        "where",
+        "why",
+    }
+)
+_INTENT_NEGATION_WORDS = frozenset({"cannot", "dont", "never", "no", "not", "without"})
+_DEFAULT_CHANGE_ACTION_WORDS = frozenset({"change", "make", "save", "set", "use"})
+_DEFAULT_FUTURE_WORDS = frozenset(
+    {"always", "default", "future", "permanent", "permanently"}
+)
+_DEFAULT_LOCATION_WORDS = frozenset(
+    {
+        "destination",
+        "directory",
+        "downloads",
+        "export",
+        "exports",
+        "folder",
+        "here",
+        "location",
+        "there",
+    }
+)
+_INTENT_CLAUSE_SPLIT = re.compile(r"(?:[,.!?;:]+|\b(?:and|but|then)\b)")
+_INTENT_WORD = re.compile(r"[a-z0-9]+")
 _SEMANTIC_MANAGEMENT_SIGNALS = (
     "business meaning",
     "correct the definition",
@@ -213,6 +309,8 @@ class DataToolRuntime:
         observer: AgentObserver | None = None,
         clock: Callable[[], datetime] | None = None,
         transcripts: TranscriptReader | None = None,
+        artifacts: AgentHomeArtifactStore | None = None,
+        artifact_delivery: LocalArtifactDelivery | None = None,
     ) -> None:
         if not isinstance(registry, CapabilityRegistry):
             raise TypeError("registry must be CapabilityRegistry")
@@ -235,6 +333,8 @@ class DataToolRuntime:
         self._observer = observer
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._transcripts = transcripts
+        self._artifacts = artifacts
+        self._artifact_delivery = artifact_delivery
         self._selected_learning_candidates: dict[str, LearningCandidate] = {}
         self._successful_learning_candidate_mutations: set[str] = set()
 
@@ -402,7 +502,13 @@ class DataToolRuntime:
                         candidate,
                     )
                 output = self._registry.validate_output(capability.id, candidate)
-                result = _success(call, output)
+                artifact_ref = await self._commit_artifact_output(
+                    run,
+                    call,
+                    capability,
+                    output,
+                )
+                result = _success(call, output, artifact_ref=artifact_ref)
         except CapabilityInputError as error:
             if (
                 capability is not None
@@ -424,6 +530,8 @@ class DataToolRuntime:
                 result = _error(call, error.code, str(error), error.details)
         except ToolOutputValidationError as error:
             result = _error(call, "invalid_tool_result", str(error))
+        except ArtifactError as error:
+            result = _error(call, error.code, error.message, error.details)
         except SkillNotFoundError:
             result = _error(
                 call,
@@ -471,6 +579,236 @@ class DataToolRuntime:
             raise asyncio.CancelledError
         return result
 
+    async def _commit_artifact_output(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        output: ToolOutput,
+    ) -> ArtifactRef | None:
+        policy = capability.artifact_policy
+        draft = output.artifact
+        if policy is None:
+            if draft is not None:
+                raise ToolOutputValidationError(
+                    "capability without artifact policy returned a draft"
+                )
+            return None
+        if draft is None:
+            if policy.artifact_required:
+                raise ToolOutputValidationError(
+                    "artifact-producing capability omitted its required draft"
+                )
+            return None
+        if policy.max_artifact_count != 1:
+            raise ToolOutputValidationError(
+                "artifact draft exceeds the capability artifact count"
+            )
+        if draft.media_type not in policy.allowed_media_types:
+            raise ToolOutputValidationError(
+                "artifact draft media type is outside the capability policy"
+            )
+        if (
+            len(draft.content) > policy.max_bytes_per_artifact
+            or len(draft.content) > policy.max_total_bytes_per_call
+        ):
+            raise ToolOutputValidationError(
+                "artifact draft bytes exceed the capability policy"
+            )
+        try:
+            canonical_artifact_filename(
+                draft.suggested_filename,
+                draft.media_type,
+                policy.allowed_extensions,
+            )
+        except ArtifactError as error:
+            raise ToolOutputValidationError(
+                "artifact draft filename or extension violates the capability policy"
+            ) from error
+        if self._artifacts is None:
+            raise ArtifactError(
+                "artifact_storage_failed",
+                "Artifact storage is unavailable.",
+                {"stage": "composition"},
+            )
+        bound = await self._bind_artifact_provenance(run, draft)
+        return await self._artifacts.commit(
+            bound,
+            policy,
+            run_id=run.id,
+            conversation_id=run.conversation_id or run.id,
+            call_id=call.id,
+            capability_id=capability.id,
+        )
+
+    async def _bind_artifact_provenance(
+        self,
+        run: RunInput,
+        draft: ArtifactDraft,
+    ) -> ArtifactDraft:
+        provenance = draft.provenance
+        if provenance.authorship is not ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS:
+            return draft
+        evidence_call_ids = provenance.evidence_call_ids
+        if not evidence_call_ids:
+            return ArtifactDraft(
+                content=draft.content,
+                suggested_filename=draft.suggested_filename,
+                media_type=draft.media_type,
+                sensitivity=_resolved_sensitivity((draft.sensitivity,)),
+                provenance=ArtifactProvenance(
+                    authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
+                ),
+            )
+        if self._transcripts is None:
+            raise CapabilityInputError(
+                "invalid_argument_value",
+                "Artifact evidence validation is unavailable.",
+                {"name": "evidence_call_ids"},
+            )
+        try:
+            transcript = await self._transcripts.load(run.id)
+        except KeyError as error:
+            raise CapabilityInputError(
+                "invalid_argument_value",
+                "Artifact evidence must reference the current run.",
+                {"name": "evidence_call_ids"},
+            ) from error
+        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
+            raise CapabilityInputError(
+                "invalid_argument_value",
+                "Artifact evidence belongs to another run.",
+                {"name": "evidence_call_ids"},
+            )
+        bindings: dict[tuple[str, str], ArtifactResourceBinding] = {}
+        sensitivities: list[Sensitivity] = [draft.sensitivity]
+        schema_cache: dict[str, dict[str, ResourceSchema]] = {}
+        for call_id in evidence_call_ids:
+            results = tuple(
+                block
+                for message in transcript.messages
+                if message.role is MessageRole.TOOL
+                for block in message.content
+                if isinstance(block, ToolResultBlock) and block.call_id == call_id
+            )
+            call_exists = any(
+                candidate.id == call_id
+                for message in transcript.messages
+                if message.role is MessageRole.ASSISTANT
+                for candidate in message.tool_calls
+            )
+            if len(results) != 1 or not call_exists or results[0].is_error:
+                raise CapabilityInputError(
+                    "invalid_argument_value",
+                    "Artifact evidence must reference one earlier successful data call.",
+                    {"name": "evidence_call_ids", "call_id": call_id},
+                )
+            block = results[0]
+            if block.output.get("kind") not in {
+                SQLITE_QUERY_EVIDENCE_KIND,
+                POSTGRESQL_QUERY_EVIDENCE_KIND,
+                LOCAL_FILE_READ_EVIDENCE_KIND,
+            }:
+                raise CapabilityInputError(
+                    "invalid_argument_value",
+                    "Artifact evidence must reference a validated data result.",
+                    {"name": "evidence_call_ids", "call_id": call_id},
+                )
+            data = block.output.get("data")
+            if not isinstance(data, Mapping):
+                raise CapabilityInputError(
+                    "invalid_argument_value",
+                    "Artifact evidence result data is unavailable.",
+                    {"name": "evidence_call_ids", "call_id": call_id},
+                )
+            source_id = data.get("source_id")
+            source_revision = data.get("source_revision")
+            if not isinstance(source_id, str) or not isinstance(source_revision, str):
+                raise CapabilityInputError(
+                    "invalid_argument_value",
+                    "Artifact evidence source identity is unavailable.",
+                    {"name": "evidence_call_ids", "call_id": call_id},
+                )
+            raw_resources: tuple[tuple[str, str], ...]
+            if block.output.get("kind") == LOCAL_FILE_READ_EVIDENCE_KIND:
+                resource_id = data.get("resource_id")
+                resource_revision = data.get("resource_revision")
+                raw_resources = (
+                    ((resource_id, resource_revision),)
+                    if isinstance(resource_id, str)
+                    and isinstance(resource_revision, str)
+                    else ()
+                )
+            else:
+                raw_revisions = data.get("resource_revisions")
+                raw_resources = tuple(
+                    (resource_id, revision)
+                    for item in (
+                        raw_revisions if isinstance(raw_revisions, tuple) else ()
+                    )
+                    if isinstance(item, Mapping)
+                    and isinstance((resource_id := item.get("resource_id")), str)
+                    and isinstance((revision := item.get("revision")), str)
+                )
+            if not raw_resources:
+                raise CapabilityInputError(
+                    "invalid_argument_value",
+                    "Artifact evidence resource identity is unavailable.",
+                    {"name": "evidence_call_ids", "call_id": call_id},
+                )
+            schemas = schema_cache.get(source_id)
+            if schemas is None:
+                schemas = {
+                    item.resource_id: item
+                    for item in await self._catalog.resource_schemas(
+                        run.agent_id,
+                        source_id,
+                    )
+                }
+                schema_cache[source_id] = schemas
+            for resource_id, resource_revision in raw_resources:
+                schema = schemas.get(resource_id)
+                if (
+                    schema is None
+                    or schema.revision != resource_revision
+                    or schema.source_revision != source_revision
+                ):
+                    raise CapabilityInputError(
+                        "invalid_argument_value",
+                        "Artifact evidence is no longer current in the catalog.",
+                        {"name": "evidence_call_ids", "call_id": call_id},
+                    )
+                key = (source_id, resource_id)
+                binding = ArtifactResourceBinding(
+                    source_id=source_id,
+                    source_revision=source_revision,
+                    resource_id=resource_id,
+                    resource_revision=resource_revision,
+                )
+                prior = bindings.get(key)
+                if prior is not None and prior != binding:
+                    raise CapabilityInputError(
+                        "invalid_argument_value",
+                        "Artifact evidence contains conflicting resource revisions.",
+                        {"name": "evidence_call_ids", "call_id": call_id},
+                    )
+                bindings[key] = binding
+                try:
+                    sensitivities.append(Sensitivity(schema.sensitivity_class))
+                except ValueError:
+                    sensitivities.append(Sensitivity.RESTRICTED)
+        return ArtifactDraft(
+            content=draft.content,
+            suggested_filename=draft.suggested_filename,
+            media_type=draft.media_type,
+            sensitivity=_resolved_sensitivity(tuple(sensitivities)),
+            provenance=ArtifactProvenance(
+                authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
+                evidence_call_ids=evidence_call_ids,
+                resource_bindings=tuple(bindings[key] for key in sorted(bindings)),
+            ),
+        )
+
     async def _execute_side_effect(
         self,
         run: RunInput,
@@ -484,6 +822,22 @@ class DataToolRuntime:
             or not capability.side_effecting
         ):
             raise ValueError("side-effect execution requires a write capability")
+        if (
+            capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
+            and not _explicit_artifact_request(run.message)
+        ) or (
+            capability.id == ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID
+            and not _explicit_default_location_request(run.message)
+        ):
+            return (
+                _error(
+                    call,
+                    "tool_not_available",
+                    "The requested tool is not available for this user request.",
+                    {"tool_name": call.name},
+                ),
+                False,
+            )
         selected_candidate = self._selected_learning_candidates.get(run.id)
         if selected_candidate is not None and not candidate_matches_mutation_call(
             selected_candidate,
@@ -507,6 +861,19 @@ class DataToolRuntime:
         if not isinstance(fingerprint, FrozenJsonObject):
             raise ValueError("side-effect preflight must return FrozenJsonObject")
         await self._validate_semantic_preflight(run, capability, fingerprint)
+        if (
+            capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
+            and fingerprint.get("requires_approval") is False
+        ):
+            return await self._execute_preflighted_side_effect(
+                run,
+                call,
+                capability,
+                side_effect,
+                execution,
+                fingerprint,
+                selected_candidate,
+            )
         if self._approval_handler is None:
             return (
                 _error(
@@ -518,13 +885,31 @@ class DataToolRuntime:
                 False,
             )
 
+        approval_arguments = (
+            fingerprint
+            if capability.id
+            in {
+                ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+                ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
+            }
+            else cast(FrozenJsonObject, execution.arguments)
+        )
+        reason = "Allow this exact side-effecting tool invocation once?"
+        if capability.id == ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID:
+            if self._artifact_delivery is None:
+                raise ArtifactError(
+                    "artifact_storage_failed",
+                    "Artifact delivery configuration is unavailable.",
+                    {"stage": "composition"},
+                )
+            reason = self._artifact_delivery.approval_prompt_for_default(fingerprint)
         request = ApprovalRequest(
             run_id=run.id,
             call_id=call.id,
             tool_name=call.name,
             capability_id=capability.id,
-            arguments=cast(FrozenJsonObject, execution.arguments),
-            reason="Allow this exact side-effecting tool invocation once?",
+            arguments=approval_arguments,
+            reason=reason,
         )
         self._emit_approval_requested(run, call, capability)
         try:
@@ -566,6 +951,26 @@ class DataToolRuntime:
             )
 
         self._emit_approval_decided(run, call, "approved")
+        return await self._execute_preflighted_side_effect(
+            run,
+            call,
+            capability,
+            side_effect,
+            execution,
+            fingerprint,
+            selected_candidate,
+        )
+
+    async def _execute_preflighted_side_effect(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        side_effect: SideEffectExecutor,
+        execution: ToolExecution,
+        fingerprint: FrozenJsonObject,
+        selected_candidate: LearningCandidate | None,
+    ) -> tuple[ToolResultBlock, bool]:
         async with self._mutation_lock:
             try:
                 current = await side_effect.preflight(execution)
@@ -578,6 +983,7 @@ class DataToolRuntime:
                 SemanticNotFoundError,
                 SemanticValidationError,
                 SkillNotFoundError,
+                ArtifactError,
             ):
                 return (
                     _error(
@@ -611,6 +1017,10 @@ class DataToolRuntime:
             if selected_candidate is not None:
                 self._successful_learning_candidate_mutations.add(run.id)
             output = self._registry.validate_output(capability.id, candidate)
+            if output.artifact is not None or capability.artifact_policy is not None:
+                raise ToolOutputValidationError(
+                    "side-effect capability cannot produce an artifact draft"
+                )
             return _success(call, output), cancelled
 
     async def _validate_semantic_preflight(
@@ -1141,6 +1551,8 @@ class DataToolRuntime:
                     SEMANTIC_DELETE_CAPABILITY_ID,
                     SKILL_SAVE_CAPABILITY_ID,
                     SKILL_DELETE_CAPABILITY_ID,
+                    ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+                    ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
                 }
                 and capability.side_effecting
             ):
@@ -1463,6 +1875,8 @@ class DataToolRuntime:
             else _learning_candidate_mutation_tool(selected_candidate)
         )
         semantic_requested = _semantic_management_requested(run.message)
+        artifact_requested = _explicit_artifact_request(run.message)
+        default_location_requested = _explicit_default_location_request(run.message)
         if not semantic_requested:
             semantic_requested = await self._semantic_maintenance_requested(run)
         for name in sorted(self._registry.tool_names):
@@ -1479,6 +1893,16 @@ class DataToolRuntime:
                 capability.id in _SEMANTIC_CAPABILITIES
                 and not semantic_requested
                 and name != candidate_mutation_tool
+            ):
+                continue
+            if (
+                capability.id in _ARTIFACT_CREATE_SAVE_CAPABILITIES
+                and not artifact_requested
+            ):
+                continue
+            if (
+                capability.id == ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID
+                and not default_location_requested
             ):
                 continue
             candidates.append((name, view.applicability))
@@ -1608,6 +2032,8 @@ async def _execute_definitely(
 def _exception_result(call: ToolCall, error: BaseException) -> ToolResultBlock:
     if isinstance(error, ToolOutputValidationError):
         return _error(call, "invalid_tool_result", str(error))
+    if isinstance(error, ArtifactError):
+        return _error(call, error.code, error.message, error.details)
     return _error(
         call,
         "tool_execution_failed",
@@ -1651,18 +2077,99 @@ def _applicable(
     return len(matching) >= applicability.minimum_active_sources
 
 
-def _success(call: ToolCall, result: ToolOutput) -> ToolResultBlock:
+def _explicit_artifact_request(message: str) -> bool:
+    for tokens in _intent_clauses(message):
+        for index, action in enumerate(tokens):
+            if action not in _ARTIFACT_ACTION_WORDS:
+                continue
+            before = tokens[:index]
+            after = tokens[index + 1 :]
+            if any(item in _INTENT_META_WORDS for item in before):
+                continue
+            if any(item in _INTENT_NEGATION_WORDS for item in before[-3:]):
+                continue
+            if after[:1] and after[0] in _INTENT_NEGATION_WORDS:
+                continue
+            if any(item in _ARTIFACT_OBJECT_WORDS for item in tokens):
+                return True
+            if action in {"download", "export", "save"} and any(
+                item in _ARTIFACT_DEICTIC_WORDS for item in tokens
+            ):
+                return True
+    return False
+
+
+def _explicit_default_location_request(message: str) -> bool:
+    normalized = _normalize_intent_text(message)
+    persistent_phrase = "from now on" in normalized or "going forward" in normalized
+    for tokens in _intent_clauses(normalized):
+        for index, action in enumerate(tokens):
+            if action not in _DEFAULT_CHANGE_ACTION_WORDS:
+                continue
+            before = tokens[:index]
+            after = tokens[index + 1 :]
+            if any(item in _INTENT_META_WORDS for item in before):
+                continue
+            if any(item in _INTENT_NEGATION_WORDS for item in before[-3:]):
+                continue
+            if after[:1] and after[0] in _INTENT_NEGATION_WORDS:
+                continue
+            has_future_authority = persistent_phrase or any(
+                item in _DEFAULT_FUTURE_WORDS for item in tokens
+            )
+            has_location = any(item in _DEFAULT_LOCATION_WORDS for item in tokens)
+            if has_location and (
+                has_future_authority or action in {"change", "make", "set"}
+            ):
+                return True
+    return False
+
+
+def _intent_clauses(message: str) -> tuple[tuple[str, ...], ...]:
+    normalized = _normalize_intent_text(message)
+    return tuple(
+        tuple(_INTENT_WORD.findall(clause))
+        for clause in _INTENT_CLAUSE_SPLIT.split(normalized)
+        if clause.strip()
+    )
+
+
+def _normalize_intent_text(message: str) -> str:
+    return " ".join(
+        message.casefold()
+        .replace("don’t", "do not")
+        .replace("don't", "do not")
+        .replace("can’t", "cannot")
+        .replace("can't", "cannot")
+        .split()
+    )
+
+
+def _success(
+    call: ToolCall,
+    result: ToolOutput,
+    *,
+    artifact_ref: ArtifactRef | None = None,
+) -> ToolResultBlock:
     output: dict[str, object] = {
         "kind": result.kind,
         "data": result.data,
     }
-    if result.artifact is not None:
-        output["artifact"] = {
-            "media_type": result.artifact.media_type,
-            "retention": result.artifact.retention,
-            "sensitivity": result.artifact.sensitivity,
-        }
+    if artifact_ref is not None:
+        output["artifact"] = artifact_ref_to_mapping(artifact_ref)
     return ToolResultBlock(call_id=call.id, output=output)
+
+
+def _resolved_sensitivity(values: tuple[Sensitivity, ...]) -> Sensitivity:
+    ordered = {
+        Sensitivity.PUBLIC: 0,
+        Sensitivity.INTERNAL: 1,
+        Sensitivity.CONFIDENTIAL: 2,
+        Sensitivity.RESTRICTED: 3,
+        Sensitivity.UNKNOWN: 3,
+    }
+    selected = max(values, key=lambda item: ordered[item])
+    return Sensitivity.RESTRICTED if selected is Sensitivity.UNKNOWN else selected
 
 
 def _error(

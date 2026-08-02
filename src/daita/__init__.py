@@ -2,6 +2,13 @@
 
 from .adapters import LocalDirectorySource, PostgreSQLSource, SQLiteSource
 from .agent import Agent
+from .artifacts import (
+    ArtifactDeliveryReceipt,
+    ArtifactDestination,
+    ArtifactError,
+    ArtifactPayload,
+    ArtifactRef,
+)
 from .catalog import CatalogSummary
 from .capabilities import ApprovalDecision, ApprovalHandler, ApprovalRequest
 from .config import AgentConfig
@@ -50,6 +57,11 @@ __all__ = [
     "AgentEvent",
     "AgentEventKind",
     "AgentObserver",
+    "ArtifactDeliveryReceipt",
+    "ArtifactDestination",
+    "ArtifactError",
+    "ArtifactPayload",
+    "ArtifactRef",
     "ApprovalDecision",
     "ApprovalHandler",
     "ApprovalRequest",

@@ -1849,6 +1849,7 @@ async def _chat(
                 f"{_safe_display(result.reason, fallback='failed')}",
                 file=output_stream,
             )
+        await _write_artifact_outcomes(agent, result, output_stream)
         print(file=output_stream)
         print(
             f"{result.steps} steps · {result.usage.total_tokens} tokens · "
@@ -2136,6 +2137,39 @@ async def _run_message(
             print(file=output_stream)
             print("Run interrupted; returning to the prompt.", file=output_stream)
         return None
+
+
+async def _write_artifact_outcomes(
+    agent: Agent,
+    result: Any,
+    output_stream: TextIO,
+) -> None:
+    for receipt in tuple(getattr(result, "artifact_deliveries", ())):
+        filename = getattr(receipt, "filename", None)
+        saved_path = getattr(receipt, "saved_path", None)
+        if not isinstance(filename, str) or not isinstance(saved_path, str):
+            continue
+        print(
+            "Saved "
+            + _safe_display(filename, fallback="artifact")
+            + " to "
+            + _safe_display(saved_path, fallback="the selected destination"),
+            file=output_stream,
+        )
+    run_id = getattr(result, "run_id", None)
+    if not isinstance(run_id, str) or not run_id:
+        return
+    try:
+        transcript = await agent.transcript(run_id)
+        failures = terminal_tui._artifact_delivery_failures(
+            terminal_tui._completed_tool_pairs(transcript)
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return
+    for message in failures:
+        print(message, file=output_stream)
 
 
 async def _handle_local_command(
@@ -2806,20 +2840,24 @@ async def _prompt_for_exact_approval(
         )
         return ApprovalDecision.DENY
     print(rendered, file=output_stream)
-    try:
-        answer = _read_line(
-            "Approve this exact change once? [y/N] ",
-            input_stream,
-            output_stream,
-        )
-    except EOFError:
-        print(file=output_stream)
-        return ApprovalDecision.DENY
-    except KeyboardInterrupt as error:
-        raise asyncio.CancelledError from error
-    if answer.strip().lower() == "y":
-        return ApprovalDecision.APPROVE
-    return ApprovalDecision.DENY
+    while True:
+        try:
+            answer = _read_line(
+                "Approve this exact change once? [y/n] ",
+                input_stream,
+                output_stream,
+            )
+        except EOFError:
+            print(file=output_stream)
+            return ApprovalDecision.DENY
+        except KeyboardInterrupt as error:
+            raise asyncio.CancelledError from error
+        normalized = answer.strip().casefold()
+        if normalized == "y":
+            return ApprovalDecision.APPROVE
+        if normalized == "n":
+            return ApprovalDecision.DENY
+        print("Enter y to approve or n to deny.", file=output_stream)
 
 
 def _parse_candidate_review_cost_limit(value: str) -> Decimal:

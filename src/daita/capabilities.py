@@ -10,6 +10,7 @@ import re
 from typing import Protocol, TypeVar
 
 from ._json import FrozenJsonObject, canonical_json
+from .artifacts.models import ArtifactDraft
 from .llm.models import ToolDefinition
 
 _T = TypeVar("_T")
@@ -78,6 +79,61 @@ class ToolOutputValidationError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactPolicy:
+    """Stable capability metadata for its one optional artifact draft."""
+
+    allowed_media_types: frozenset[str]
+    allowed_extensions: tuple[tuple[str, tuple[str, ...]], ...]
+    artifact_required: bool
+    max_artifact_count: int
+    max_bytes_per_artifact: int
+    max_total_bytes_per_call: int
+
+    def __post_init__(self) -> None:
+        media_types = frozenset(self.allowed_media_types)
+        if not media_types or any(
+            not isinstance(item, str) or not item.strip() for item in media_types
+        ):
+            raise ValueError("artifact policy media types must be non-empty text")
+        extensions = tuple(
+            (media_type, tuple(values))
+            for media_type, values in self.allowed_extensions
+        )
+        if {media_type for media_type, _ in extensions} != media_types:
+            raise ValueError("artifact policy extensions must cover each media type")
+        if len(extensions) != len(media_types):
+            raise ValueError("artifact policy media type declarations cannot duplicate")
+        for media_type, values in extensions:
+            if not values or len(values) != len(set(values)):
+                raise ValueError("artifact policy extensions must be distinct")
+            if any(
+                not isinstance(value, str) or not re.fullmatch(r"\.[a-z0-9]+", value)
+                for value in values
+            ):
+                raise ValueError("artifact policy extensions must be canonical")
+        if not isinstance(self.artifact_required, bool):
+            raise TypeError("artifact_required must be a boolean")
+        if (
+            not isinstance(self.max_artifact_count, int)
+            or isinstance(self.max_artifact_count, bool)
+            or self.max_artifact_count not in {0, 1}
+        ):
+            raise ValueError("max_artifact_count must be zero or one")
+        if self.artifact_required and self.max_artifact_count != 1:
+            raise ValueError("a required artifact needs max_artifact_count one")
+        for value, name in (
+            (self.max_bytes_per_artifact, "max_bytes_per_artifact"),
+            (self.max_total_bytes_per_call, "max_total_bytes_per_call"),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.max_total_bytes_per_call < self.max_bytes_per_artifact:
+            raise ValueError("per-call bytes cannot be below per-artifact bytes")
+        object.__setattr__(self, "allowed_media_types", media_types)
+        object.__setattr__(self, "allowed_extensions", extensions)
+
+
+@dataclass(frozen=True, slots=True)
 class Capability:
     id: str
     description: str
@@ -87,6 +143,7 @@ class Capability:
     executor_id: str
     access_mode: AccessMode = AccessMode.READ
     side_effecting: bool = False
+    artifact_policy: ArtifactPolicy | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -100,6 +157,10 @@ class Capability:
             raise TypeError("access_mode must be AccessMode")
         if not isinstance(self.side_effecting, bool):
             raise TypeError("side_effecting must be a boolean")
+        if self.artifact_policy is not None and not isinstance(
+            self.artifact_policy, ArtifactPolicy
+        ):
+            raise TypeError("artifact_policy must be ArtifactPolicy or None")
         if (self.access_mode is AccessMode.WRITE) is not self.side_effecting:
             raise ValueError(
                 "write tools must be side-effecting and read tools cannot be"
@@ -167,30 +228,15 @@ class ToolExecution:
 
 
 @dataclass(frozen=True, slots=True)
-class ToolArtifact:
-    content: bytes
-    media_type: str
-    sensitivity: str = "internal"
-    retention: str = "run"
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.content, bytes):
-            raise TypeError("artifact content must be bytes")
-        _text(self.media_type, "artifact media_type")
-        _text(self.sensitivity, "artifact sensitivity")
-        _text(self.retention, "artifact retention")
-
-
-@dataclass(frozen=True, slots=True)
 class ToolOutput:
     kind: str
     data: Mapping[str, object] = field(default_factory=dict)
-    artifact: ToolArtifact | None = None
+    artifact: ArtifactDraft | None = None
 
     def __post_init__(self) -> None:
         _text(self.kind, "tool output kind")
-        if self.artifact is not None and not isinstance(self.artifact, ToolArtifact):
-            raise TypeError("artifact must be ToolArtifact or None")
+        if self.artifact is not None and not isinstance(self.artifact, ArtifactDraft):
+            raise TypeError("artifact must be ArtifactDraft or None")
         object.__setattr__(self, "data", FrozenJsonObject.from_mapping(self.data))
 
 
@@ -546,6 +592,7 @@ __all__ = [
     "ApprovalDecision",
     "ApprovalHandler",
     "ApprovalRequest",
+    "ArtifactPolicy",
     "Capability",
     "CapabilityInputError",
     "CapabilityRegistry",
@@ -553,7 +600,6 @@ __all__ = [
     "ExtensionDeclarations",
     "SideEffectExecutor",
     "ToolApplicability",
-    "ToolArtifact",
     "ToolExecution",
     "ToolOutput",
     "ToolOutputValidationError",

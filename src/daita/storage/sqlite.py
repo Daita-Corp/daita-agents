@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
@@ -21,6 +21,14 @@ import threading
 from typing import Any, TypeVar
 
 from .._json import FrozenJsonObject
+from ..artifacts.models import (
+    ArtifactAuthorship,
+    ArtifactDeliveryReceipt,
+    ArtifactProvenance,
+    ArtifactRef,
+    ArtifactResourceBinding,
+    artifact_ref_from_mapping,
+)
 from ..adapters.models import SourceRegistration
 from ..catalog.models import (
     CatalogFacet,
@@ -1433,6 +1441,80 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
+    async def list_artifact_refs(
+        self,
+        agent_id: str,
+        *,
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> tuple[ArtifactRef, ...]:
+        """Derive current reachable refs from persisted agent-scoped tool messages."""
+
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("agent_id must be non-empty text")
+        if run_id is not None and (not isinstance(run_id, str) or not run_id):
+            raise ValueError("run_id must be non-empty text or None")
+        if conversation_id is not None and (
+            not isinstance(conversation_id, str) or not conversation_id
+        ):
+            raise ValueError("conversation_id must be non-empty text or None")
+
+        def read() -> tuple[ArtifactRef, ...]:
+            clauses = ["r.agent_id = ?"]
+            values: list[object] = [agent_id]
+            if run_id is not None:
+                clauses.append("r.id = ?")
+                values.append(run_id)
+            if conversation_id is not None:
+                clauses.append("r.conversation_id = ?")
+                values.append(conversation_id)
+            where = " AND ".join(clauses)
+            with _connect_read_only(self.path) as connection:
+                rows = connection.execute(
+                    f"""SELECT r.id, r.conversation_id, m.data
+                        FROM runs AS r
+                        JOIN messages AS m ON m.run_id = r.id
+                        WHERE {where}
+                        ORDER BY r.id, m.position""",
+                    tuple(values),
+                ).fetchall()
+            refs: dict[str, ArtifactRef] = {}
+            for stored_run_id, stored_conversation_id, data in rows:
+                message = _expect(_loads(data), CanonicalMessage)
+                if message.role is not MessageRole.TOOL:
+                    continue
+                for block in message.content:
+                    if not isinstance(block, ToolResultBlock) or block.is_error:
+                        continue
+                    value = block.output.get("artifact")
+                    if not isinstance(value, Mapping):
+                        continue
+                    try:
+                        ref = artifact_ref_from_mapping(value)
+                    except (TypeError, ValueError) as error:
+                        raise RuntimeError(
+                            "stored artifact reference is invalid"
+                        ) from error
+                    if (
+                        ref.run_id != stored_run_id
+                        or ref.conversation_id != stored_conversation_id
+                        or ref.call_id != block.call_id
+                    ):
+                        raise RuntimeError(
+                            "stored artifact reference identity does not match its run"
+                        )
+                    existing = refs.get(ref.artifact_id)
+                    if existing is not None and existing != ref:
+                        raise RuntimeError("stored artifact identity is ambiguous")
+                    refs[ref.artifact_id] = ref
+            return tuple(
+                sorted(
+                    refs.values(), key=lambda item: (item.created_at, item.artifact_id)
+                )
+            )
+
+        return await asyncio.to_thread(read)
+
     async def conversation_runs(
         self,
         agent_id: str,
@@ -2210,6 +2292,10 @@ _RECORD_TYPES: dict[str, type[Any]] = {
         SourceCatalogSnapshot,
         RunInput,
         LoopExit,
+        ArtifactResourceBinding,
+        ArtifactProvenance,
+        ArtifactRef,
+        ArtifactDeliveryReceipt,
         TextBlock,
         ToolCall,
         ToolResultBlock,
@@ -2242,6 +2328,7 @@ _ENUM_TYPES: dict[str, type[Enum]] = {
         RelationshipProvenance,
         ResourceKind,
         Sensitivity,
+        ArtifactAuthorship,
         LoopExitKind,
         MessageRole,
         CostBasis,
@@ -2269,7 +2356,13 @@ def _pack(value: object) -> object:
     if isinstance(value, Enum):
         return {"__enum__": type(value).__name__, "value": value.value}
     if isinstance(value, datetime):
-        return {"__datetime__": value.isoformat()}
+        timestamp = value.isoformat()
+        offset = value.utcoffset()
+        if offset is not None and offset.total_seconds() == 0:
+            timestamp = (
+                value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            )
+        return {"__datetime__": timestamp}
     if isinstance(value, Decimal):
         return {"__decimal__": str(value)}
     if isinstance(value, (tuple, list)):

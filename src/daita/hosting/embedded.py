@@ -20,6 +20,14 @@ from typing import Self, TypeVar, cast
 from uuid import uuid4
 
 from .._json import FrozenJsonObject
+from ..artifacts.delivery import LocalArtifactDelivery
+from ..artifacts.models import (
+    ArtifactDeliveryReceipt,
+    ArtifactDestination,
+    ArtifactPayload,
+    ArtifactRef,
+)
+from ..artifacts.store import AgentHomeArtifactStore
 from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySource
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
@@ -43,6 +51,7 @@ from ..domains.data import (
     CatalogDataView,
     DataContextBuilder,
     DataToolRuntime,
+    artifact_capability_declarations,
     local_file_read_declarations,
     postgresql_query_declarations,
     sqlite_query_declarations,
@@ -283,6 +292,8 @@ class EmbeddedAgent:
         skill_store: SkillStore,
         candidate_reviewer: OneShotCandidateReviewer,
         data_context_builder: DataContextBuilder | None,
+        artifact_store: AgentHomeArtifactStore,
+        artifact_delivery: LocalArtifactDelivery,
         candidate_acceptance_supported: bool,
         mutation_lock: asyncio.Lock,
         model_profile: ModelProfile | None,
@@ -314,6 +325,8 @@ class EmbeddedAgent:
         self._skill_store = skill_store
         self._candidate_reviewer = candidate_reviewer
         self._data_context_builder = data_context_builder
+        self._artifact_store = artifact_store
+        self._artifact_delivery = artifact_delivery
         self._candidate_acceptance_supported = candidate_acceptance_supported
         self._clock = clock
         self._id_factory = id_factory
@@ -441,7 +454,12 @@ class EmbeddedAgent:
         reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
+        downloads_directory: Path | None = None,
     ) -> Self:
+        if downloads_directory is not None and not isinstance(
+            downloads_directory, Path
+        ):
+            raise TypeError("downloads_directory must be pathlib.Path or None")
         resolved_clock = clock or _utc_now
         resolved_ids = id_factory or _new_id
         model, model_profile, model_route, limits = _resolve_configuration(
@@ -473,6 +491,22 @@ class EmbeddedAgent:
             )
             store = await SQLiteStateStore.open(home / "state.db", clock=resolved_clock)
             await store.initialize_identity(identity)
+            artifact_store = await AgentHomeArtifactStore.open(
+                agent_id=identity.id,
+                agent_home=home,
+                references=store,
+                clock=resolved_clock,
+                id_factory=resolved_ids,
+            )
+            artifact_delivery = await LocalArtifactDelivery.open(
+                agent_id=identity.id,
+                agent_home=home,
+                artifacts=artifact_store,
+                sources=store,
+                downloads_directory=downloads_directory,
+                clock=resolved_clock,
+                id_factory=resolved_ids,
+            )
             embedded = cls._compose(
                 identity=identity,
                 home=home,
@@ -494,6 +528,8 @@ class EmbeddedAgent:
                 reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
+                artifact_store=artifact_store,
+                artifact_delivery=artifact_delivery,
             )
             _, cancelled = await _await_sync_completion(
                 lambda: _write_manifest(home, identity)
@@ -534,7 +570,12 @@ class EmbeddedAgent:
         reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
+        downloads_directory: Path | None = None,
     ) -> Self:
+        if downloads_directory is not None and not isinstance(
+            downloads_directory, Path
+        ):
+            raise TypeError("downloads_directory must be pathlib.Path or None")
         resolved_clock = clock or _utc_now
         resolved_ids = id_factory or _new_id
         limit_override = limits
@@ -591,6 +632,22 @@ class EmbeddedAgent:
                     limits=limit_override,
                     secret_provider=secret_provider or keychain,
                 )
+            artifact_store = await AgentHomeArtifactStore.open(
+                agent_id=identity.id,
+                agent_home=home,
+                references=store,
+                clock=resolved_clock,
+                id_factory=resolved_ids,
+            )
+            artifact_delivery = await LocalArtifactDelivery.open(
+                agent_id=identity.id,
+                agent_home=home,
+                artifacts=artifact_store,
+                sources=store,
+                downloads_directory=downloads_directory,
+                clock=resolved_clock,
+                id_factory=resolved_ids,
+            )
             return cls._compose(
                 identity=identity,
                 home=home,
@@ -612,6 +669,8 @@ class EmbeddedAgent:
                 reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
+                artifact_store=artifact_store,
+                artifact_delivery=artifact_delivery,
             )
         except BaseException:
             if store is not None:
@@ -643,6 +702,8 @@ class EmbeddedAgent:
         reviewer_max_estimated_cost_usd: Decimal | None,
         observer: AgentObserver | None,
         approval_handler: ApprovalHandler | None,
+        artifact_store: AgentHomeArtifactStore,
+        artifact_delivery: LocalArtifactDelivery,
     ) -> Self:
         catalog_service = CatalogService(store, store)
         data_view = CatalogDataView(store, catalog_service, store)
@@ -693,6 +754,11 @@ class EmbeddedAgent:
         memory = memory_set_declarations(memory_store)
         skills = skill_declarations(skill_store)
         semantics = semantic_declarations(identity.id, store)
+        artifacts = (
+            artifact_capability_declarations(artifact_delivery)
+            if artifact_store.available
+            else None
+        )
         capabilities = CapabilityRegistry(
             capabilities=(
                 *catalog.capabilities,
@@ -702,6 +768,7 @@ class EmbeddedAgent:
                 *memory.capabilities,
                 *skills.capabilities,
                 *semantics.capabilities,
+                *(artifacts.capabilities if artifacts is not None else ()),
             ),
             executors=(
                 *catalog.executors,
@@ -711,6 +778,7 @@ class EmbeddedAgent:
                 *memory.executors,
                 *skills.executors,
                 *semantics.executors,
+                *(artifacts.executors if artifacts is not None else ()),
             ),
             tool_views=(
                 *catalog.tool_views,
@@ -720,6 +788,7 @@ class EmbeddedAgent:
                 *memory.tool_views,
                 *skills.tool_views,
                 *semantics.tool_views,
+                *(artifacts.tool_views if artifacts is not None else ()),
             ),
         )
         data_tool_runtime = DataToolRuntime(
@@ -730,6 +799,8 @@ class EmbeddedAgent:
             observer=observer,
             clock=clock,
             transcripts=store,
+            artifacts=artifact_store,
+            artifact_delivery=artifact_delivery,
         )
         resolved_context = context_builder
         resolved_tools = tools
@@ -745,6 +816,9 @@ class EmbeddedAgent:
                 memory=memory_store,
                 skills=skill_store,
                 semantics=store,
+                artifact_destinations=(
+                    artifact_delivery if artifacts is not None else None
+                ),
             )
             resolved_tools = data_tool_runtime
         transcripts = store
@@ -780,6 +854,8 @@ class EmbeddedAgent:
                 if isinstance(resolved_context, DataContextBuilder)
                 else None
             ),
+            artifact_store=artifact_store,
+            artifact_delivery=artifact_delivery,
             candidate_acceptance_supported=(
                 isinstance(resolved_context, DataContextBuilder)
                 and resolved_tools is data_tool_runtime
@@ -1075,6 +1151,7 @@ class EmbeddedAgent:
                 prior_messages=prior_messages,
             )
         finally:
+            self._artifact_delivery.end_run(run_input.id)
             if learning_candidate_id is not None:
                 assert self._data_context_builder is not None
                 self._data_context_builder.clear_learning_candidate(run_input.id)
@@ -1113,7 +1190,68 @@ class EmbeddedAgent:
 
         async with self._run_lock:
             self._require_open()
-            return await self._candidate_reviewer.clear_conversations()
+            cleared = await self._candidate_reviewer.clear_conversations()
+            cancelled = False
+            try:
+                _, cancelled = await _await_async_completion(
+                    self._artifact_store.remove_all_run_artifacts
+                )
+            except Exception:
+                # SQLite deletion is already authoritative. A private orphan is
+                # retried by bounded startup cleanup and never restores a ref.
+                pass
+            if cancelled:
+                raise asyncio.CancelledError
+            return cleared
+
+    async def list_artifacts(
+        self,
+        *,
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> tuple[ArtifactRef, ...]:
+        self._require_open()
+        return await self._artifact_store.list_refs(
+            run_id=run_id,
+            conversation_id=conversation_id,
+        )
+
+    async def read_artifact(self, artifact_id: str) -> ArtifactPayload:
+        self._require_open()
+        return await self._artifact_store.read(artifact_id)
+
+    async def save_artifact(
+        self,
+        artifact_id: str,
+        destination: Path | None = None,
+        *,
+        filename: str | None = None,
+    ) -> ArtifactDeliveryReceipt:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._artifact_delivery.save_public(
+                artifact_id,
+                destination=destination,
+                filename=filename,
+            )
+
+    async def export_destination(self) -> ArtifactDestination:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._artifact_delivery.export_destination()
+
+    async def set_export_destination(
+        self,
+        directory: Path,
+    ) -> ArtifactDestination:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._artifact_delivery.set_export_destination(directory)
+
+    async def reset_export_destination(self) -> ArtifactDestination:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._artifact_delivery.reset_export_destination()
 
     async def active_source(
         self,
@@ -1764,6 +1902,8 @@ class EmbeddedAgent:
             self._candidate_reviewer,
             self._memory_store,
             self._skill_store,
+            self._artifact_delivery,
+            self._artifact_store,
             self._store,
         ):
             try:

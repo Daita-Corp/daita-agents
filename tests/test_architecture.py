@@ -41,6 +41,17 @@ def _class_owners(class_name: str) -> set[str]:
     return owners
 
 
+def _imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported.add(node.module)
+    return imported
+
+
 def test_final_src_layout_has_one_package_owner_and_no_replacement_alias():
     assert PACKAGE == ROOT / "src" / "daita"
     assert not (ROOT / "daita").exists()
@@ -67,6 +78,11 @@ def test_public_surface_is_focused():
         "AgentEvent",
         "AgentEventKind",
         "AgentObserver",
+        "ArtifactDeliveryReceipt",
+        "ArtifactDestination",
+        "ArtifactError",
+        "ArtifactPayload",
+        "ArtifactRef",
         "ApprovalDecision",
         "ApprovalHandler",
         "ApprovalRequest",
@@ -124,10 +140,19 @@ def test_stage_seven_exports_records_without_exporting_their_owners():
     assert daita.SkillSummary.__module__ == "daita.skills.store"
     assert daita.SemanticAnnotation.__module__ == "daita.semantics"
     assert daita.SemanticAnnotationView.__module__ == "daita.semantics"
+    assert daita.ArtifactRef.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactPayload.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactDeliveryReceipt.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactDestination.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactError.__module__ == "daita.artifacts.models"
 
     assert set(daita.__all__).isdisjoint(
         {
             "CapabilityRegistry",
+            "AgentHomeArtifactStore",
+            "ArtifactDraft",
+            "ArtifactPolicy",
+            "LocalArtifactDelivery",
             "MemoryStore",
             "SideEffectExecutor",
             "SkillStore",
@@ -438,6 +463,8 @@ async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branc
             assert capability.side_effecting is True
             assert callable(getattr(executor, "preflight", None))
         assert write_tools == {
+            "artifact_save_local",
+            "artifact_set_export_location",
             "memory_set",
             "semantic_delete",
             "semantic_save",
@@ -1084,3 +1111,79 @@ def test_registry_and_data_runtime_keep_executor_resolution_ownership():
     }
     assert resolution_owners == {"capabilities.py", "domains/data/controller.py"}
     assert resolved_executor_callers == {"domains/data/controller.py"}
+
+
+def test_artifacts_have_one_concrete_owner_and_no_storage_renderer_or_policy_registry():
+    assert _class_owners("AgentHomeArtifactStore") == {"artifacts/store.py"}
+    assert _class_owners("LocalArtifactDelivery") == {"artifacts/delivery.py"}
+    assert _class_owners("ArtifactPolicy") == {"capabilities.py"}
+    assert _class_owners("ArtifactDraft") == {"artifacts/models.py"}
+    artifact_text = _python_text(PACKAGE / "artifacts")
+    for prohibited in (
+        "ArtifactStoreRegistry",
+        "ArtifactRendererRegistry",
+        "ArtifactPolicyRegistry",
+        "ArtifactProvider",
+    ):
+        assert prohibited not in artifact_text
+
+
+def test_agent_loop_carries_artifact_records_but_never_imports_renderers_delivery_or_filesystem_paths():
+    path = PACKAGE / "loop" / "driver.py"
+    imports = _imports(path)
+    assert "pathlib" not in imports
+    assert "os" not in imports
+    text = path.read_text(encoding="utf-8")
+    assert "artifacts.models" in text
+    assert "artifacts.delivery" not in text
+    assert "artifacts.renderers" not in text
+    assert "AgentHomeArtifactStore" not in text
+    assert "LocalArtifactDelivery" not in text
+
+
+def test_artifact_delivery_uses_no_bash_shell_subprocess_or_unrestricted_file_tool():
+    path = PACKAGE / "artifacts" / "delivery.py"
+    text = path.read_text(encoding="utf-8")
+    imports = _imports(path)
+    assert "subprocess" not in imports
+    assert "bash" not in text.casefold()
+    assert "shell=True" not in text
+    assert "os.system" not in text
+    assert "general_filesystem" not in text
+    assert "data.file.write" not in text
+
+
+def test_artifact_payloads_and_destination_grants_never_enter_sqlite_messages_or_model_requests():
+    sqlite_text = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    context_text = (PACKAGE / "domains" / "data" / "context.py").read_text(
+        encoding="utf-8"
+    )
+    assert "ArtifactPayload" not in sqlite_text
+    assert "ArtifactDraft" not in sqlite_text
+    assert "_DestinationGrant" not in sqlite_text
+    assert "ArtifactPayload" not in context_text
+    assert "_DestinationGrant" not in context_text
+    assert "grant_digest" not in context_text
+    assert "saved_path" not in context_text
+
+
+def test_local_file_read_path_no_longer_imports_or_constructs_artifact_bytes():
+    for relative in (
+        "adapters/local_files.py",
+        "domains/data/file_capabilities.py",
+    ):
+        text = (PACKAGE / relative).read_text(encoding="utf-8")
+        assert "ToolArtifact" not in text
+        assert "ArtifactDraft" not in text
+        assert "artifact=" not in text
+        assert "artifacts." not in text
+
+
+def test_xlsx_dependencies_are_absent_before_phase_three_and_default_integrations_remain_lazy():
+    packaging = (ROOT / "pyproject.toml").read_text(encoding="utf-8").casefold()
+    for dependency in ("openpyxl", "xlsxwriter", "pandas"):
+        assert dependency not in packaging
+    artifact_text = _python_text(PACKAGE / "artifacts")
+    assert "openpyxl" not in artifact_text
+    assert "xlsxwriter" not in artifact_text
+    assert ".xlsx" not in artifact_text

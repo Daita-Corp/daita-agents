@@ -157,6 +157,9 @@ _CAPABILITY_LABELS = {
     "data.sqlite.query": "Query SQLite",
     "data.postgresql.query": "Query PostgreSQL",
     "data.file.read": "Read data file",
+    "artifact.create_document": "Create document",
+    "artifact.save_local": "Save artifact",
+    "artifact.set_export_location": "Set export location",
     "memory.set": "Update memory",
     "skill.view": "Read skill",
     "skill.save": "Save skill",
@@ -364,14 +367,11 @@ class TerminalApprovalBridge:
 
     async def __call__(self, request: ApprovalRequest) -> ApprovalDecision:
         presenter = self._presenter
-        if presenter is None:
-            return await self._fallback(request)
-        try:
-            decision = await presenter(request)
-        except BaseException:
-            return ApprovalDecision.DENY
+        decision = await (
+            self._fallback(request) if presenter is None else presenter(request)
+        )
         if not isinstance(decision, ApprovalDecision):
-            return ApprovalDecision.DENY
+            raise TypeError("approval presenter must return ApprovalDecision")
         return decision
 
     def install(
@@ -545,6 +545,16 @@ class TerminalViewState:
             )
             safe_answer = f"{kind or 'failed'}: {reason}"
         self.blocks.append(TerminalBlock("assistant", safe_answer))
+        for receipt in tuple(getattr(result, "artifact_deliveries", ())):
+            filename = getattr(receipt, "filename", None)
+            saved_path = getattr(receipt, "saved_path", None)
+            if not isinstance(filename, str) or not isinstance(saved_path, str):
+                continue
+            self.append_plain(
+                "artifact.delivery",
+                f"Saved {filename} to {saved_path}",
+                maximum=None,
+            )
 
         steps = getattr(result, "steps", 0)
         usage = getattr(result, "usage", None)
@@ -677,6 +687,10 @@ class TerminalViewState:
             TerminalBlock("tool", card.call_id, tool_card=card)
             for card in canonical_cards
         ]
+        delivery_failures = _artifact_delivery_failures(pairs)
+        canonical_blocks.extend(
+            TerminalBlock("artifact.delivery", message) for message in delivery_failures
+        )
         self.blocks = [
             *retained[:retained_before_insertion],
             *canonical_blocks,
@@ -1560,7 +1574,7 @@ async def run_terminal_tui(
             raise
 
     try:
-        application, approval_previous, deny_pending_approval = _create_application(
+        application, approval_previous, cancel_pending_approval = _create_application(
             runtime,
             state,
             run_message=run_message,
@@ -1620,7 +1634,7 @@ async def run_terminal_tui(
             raise RuntimeError("terminal application returned an invalid result")
         return result
     finally:
-        deny_pending_approval()
+        cancel_pending_approval()
         await asyncio.sleep(0)
         active = state.active_task
         if active is not None and not active.done():
@@ -1973,12 +1987,7 @@ def _create_application(
     approval_waiter: asyncio.Future[ApprovalDecision] | None = None
     approval_lock = asyncio.Lock()
 
-    def resolve_approval(decision: ApprovalDecision) -> None:
-        nonlocal approval_waiter
-        waiter = approval_waiter
-        if waiter is None or waiter.done():
-            return
-        waiter.set_result(decision)
+    def clear_approval_view() -> None:
         state.approval_panel = None
         state.run_status = "working" if state.running else "ready"
         try:
@@ -1986,6 +1995,30 @@ def _create_application(
             application.invalidate()
         except Exception:
             pass
+
+    def resolve_approval(decision: ApprovalDecision) -> None:
+        nonlocal approval_waiter
+        waiter = approval_waiter
+        if waiter is None or waiter.done():
+            return
+        waiter.set_result(decision)
+        clear_approval_view()
+
+    def fail_approval(error: Exception) -> None:
+        nonlocal approval_waiter
+        waiter = approval_waiter
+        if waiter is None or waiter.done():
+            return
+        waiter.set_exception(error)
+        clear_approval_view()
+
+    def cancel_approval() -> None:
+        nonlocal approval_waiter
+        waiter = approval_waiter
+        if waiter is None or waiter.done():
+            return
+        waiter.cancel()
+        clear_approval_view()
 
     def approval_fragments() -> list[tuple[str, str]]:
         panel = state.approval_panel
@@ -1996,12 +2029,12 @@ def _create_application(
                 panel,
                 glyphs=glyphs,
             )
-        except BaseException:
-            resolve_approval(ApprovalDecision.DENY)
+        except Exception as error:
+            fail_approval(error)
             return [
                 (
                     "class:tui.approval.failure",
-                    " Approval denied: review rendering failed.\n",
+                    " Approval unavailable: review rendering failed.\n",
                 )
             ]
         panel.rendered_line_count = max(
@@ -2038,54 +2071,39 @@ def _create_application(
 
     async def present_approval(request: ApprovalRequest) -> ApprovalDecision:
         nonlocal approval_waiter
-        try:
-            async with approval_lock:
-                panel = _approval_panel_for_request(request)
-                if panel is None:
-                    state.notice = (
-                        "Approval denied: exact arguments cannot be reviewed safely."
-                    )
-                    try:
-                        application.invalidate()
-                    except Exception:
-                        pass
-                    return ApprovalDecision.DENY
-                loop = asyncio.get_running_loop()
-                waiter = loop.create_future()
-                approval_waiter = waiter
-                state.approval_panel = panel
-                state.run_status = "approval"
+        async with approval_lock:
+            panel = _approval_panel_for_request(request)
+            if panel is None:
+                state.notice = (
+                    "Approval unavailable: exact arguments cannot be reviewed safely."
+                )
                 try:
-                    approval_fragments()
-                    if state.approval_panel is None:
-                        return ApprovalDecision.DENY
+                    application.invalidate()
+                except Exception:
+                    pass
+                raise RuntimeError("approval arguments cannot be reviewed safely")
+            loop = asyncio.get_running_loop()
+            waiter = loop.create_future()
+            approval_waiter = waiter
+            state.approval_panel = panel
+            state.run_status = "approval"
+            try:
+                approval_fragments()
+                if state.approval_panel is not None:
                     application.layout.focus(approval_window)
                     application.invalidate()
-                    decision = await waiter
-                except BaseException:
-                    resolve_approval(ApprovalDecision.DENY)
-                    return ApprovalDecision.DENY
-                finally:
-                    if state.approval_panel is panel:
-                        state.approval_panel = None
-                    if approval_waiter is waiter:
-                        approval_waiter = None
-                    state.run_status = "working" if state.running else "ready"
-                    try:
-                        application.layout.focus(composer)
-                        application.invalidate()
-                    except Exception:
-                        pass
-                return (
-                    decision
-                    if isinstance(decision, ApprovalDecision)
-                    else ApprovalDecision.DENY
-                )
-        except BaseException:
-            return ApprovalDecision.DENY
+                decision = await waiter
+            finally:
+                if state.approval_panel is panel:
+                    clear_approval_view()
+                if approval_waiter is waiter:
+                    approval_waiter = None
+            if not isinstance(decision, ApprovalDecision):
+                raise TypeError("approval presenter must return ApprovalDecision")
+            return decision
 
-    def deny_pending_approval() -> None:
-        resolve_approval(ApprovalDecision.DENY)
+    def cancel_pending_approval() -> None:
+        cancel_approval()
 
     def invalidate(application: Any) -> None:
         application.invalidate()
@@ -2196,12 +2214,16 @@ def _create_application(
         state.active_task = application.create_background_task(coroutine)
         invalidate(application)
 
+    def remind_approval(application: Any) -> None:
+        state.notice = "Press Y to approve once or N to deny."
+        invalidate(application)
+
     @keys.add("c-m", eager=True)
     def submit(event: Any) -> None:
         nonlocal history_position, history_draft, transcript_scroll_offset
         nonlocal pasted_texts, next_paste_number
         if state.approval_panel is not None:
-            resolve_approval(ApprovalDecision.DENY)
+            remind_approval(event.app)
             return
         if not terminal_is_usable():
             state.notice = "Resize the terminal before submitting input."
@@ -2245,7 +2267,7 @@ def _create_application(
     @keys.add("c-j", eager=True)
     def insert_newline(event: Any) -> None:
         if state.approval_panel is not None:
-            resolve_approval(ApprovalDecision.DENY)
+            remind_approval(event.app)
             return
         if len(composer.buffer.text) < MAX_COMPOSER_CHARACTERS:
             composer.buffer.insert_text("\n")
@@ -2257,7 +2279,7 @@ def _create_application(
     def paste(event: Any) -> None:
         nonlocal next_paste_number
         if state.approval_panel is not None:
-            resolve_approval(ApprovalDecision.DENY)
+            remind_approval(event.app)
             return
         data = event.data.replace("\r\n", "\n").replace("\r", "\n")
         if not data:
@@ -2317,7 +2339,7 @@ def _create_application(
     @keys.add("c-c", eager=True)
     def interrupt(event: Any) -> None:
         if state.approval_panel is not None:
-            resolve_approval(ApprovalDecision.DENY)
+            cancel_approval()
             return
         active = state.active_task
         if active is not None and not active.done():
@@ -2330,7 +2352,7 @@ def _create_application(
     @keys.add("c-d", eager=True)
     def end_of_file(event: Any) -> None:
         if state.approval_panel is not None:
-            resolve_approval(ApprovalDecision.DENY)
+            cancel_approval()
             return
         if composer.buffer.text:
             composer.buffer.delete()
@@ -2375,7 +2397,7 @@ def _create_application(
     @keys.add("c-o", eager=True)
     def toggle_tool_detail(event: Any) -> None:
         if state.approval_panel is not None:
-            resolve_approval(ApprovalDecision.DENY)
+            remind_approval(event.app)
             return
         if state.toggle_expanded_detail():
             state.notice = ""
@@ -2386,7 +2408,7 @@ def _create_application(
     @keys.add("c-l", eager=True)
     def redraw(event: Any) -> None:
         if state.approval_panel is not None:
-            resolve_approval(ApprovalDecision.DENY)
+            remind_approval(event.app)
             return
         event.app.renderer.clear()
         invalidate(event.app)
@@ -2394,7 +2416,7 @@ def _create_application(
     @keys.add("tab", eager=True)
     def complete_command(event: Any) -> None:
         if state.approval_panel is not None:
-            resolve_approval(ApprovalDecision.DENY)
+            remind_approval(event.app)
             return
         buffer = composer.buffer
         if buffer.complete_state is None:
@@ -2418,7 +2440,7 @@ def _create_application(
     @keys.add("escape", filter=escape_filter, eager=True)
     def escape(event: Any) -> None:
         if state.approval_panel is not None:
-            resolve_approval(ApprovalDecision.DENY)
+            remind_approval(event.app)
             return
         if composer.buffer.complete_state is not None:
             composer.buffer.cancel_completion()
@@ -2476,16 +2498,23 @@ def _create_application(
             panel.cursor_line = max(0, panel.rendered_line_count - 1)
         invalidate(event.app)
 
-    @keys.add(runtime["Keys"].Any, filter=approval_filter, eager=True)
-    def approval_character(event: Any) -> None:
-        key = str(event.data).casefold()
-        if key == "a" and not terminal_is_usable():
+    @keys.add("y", filter=approval_filter, eager=True)
+    @keys.add("Y", filter=approval_filter, eager=True)
+    def approve_once(event: Any) -> None:
+        if not terminal_is_usable():
             state.notice = "Resize the terminal to review this approval."
             invalidate(event.app)
             return
-        resolve_approval(
-            ApprovalDecision.APPROVE if key == "a" else ApprovalDecision.DENY
-        )
+        resolve_approval(ApprovalDecision.APPROVE)
+
+    @keys.add("n", filter=approval_filter, eager=True)
+    @keys.add("N", filter=approval_filter, eager=True)
+    def deny_once(event: Any) -> None:
+        resolve_approval(ApprovalDecision.DENY)
+
+    @keys.add(runtime["Keys"].Any, filter=approval_filter, eager=True)
+    def ignore_unknown_approval_input(event: Any) -> None:
+        remind_approval(event.app)
 
     def projected_status() -> StatusProjection:
         projection = responsive()
@@ -2843,7 +2872,7 @@ def _create_application(
         if approval_bridge is not None
         else None
     )
-    return application, approval_previous, deny_pending_approval
+    return application, approval_previous, cancel_pending_approval
 
 
 async def _run_application(application: Any) -> Any:
@@ -2925,6 +2954,42 @@ def _completed_tool_pairs(
     if not set(results).issubset(call_ids):
         raise ValueError("completed transcript contains an unmatched tool result")
     return tuple((call, results.get(call.id)) for call in calls)
+
+
+def _artifact_delivery_failures(
+    pairs: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
+) -> tuple[str, ...]:
+    messages: list[str] = []
+    for call, result in pairs:
+        if call.name != "artifact_save_local" or result is None or not result.is_error:
+            continue
+        artifact_id = call.arguments.get("artifact_id")
+        error = result.output.get("error")
+        if not isinstance(artifact_id, str) or not isinstance(error, Mapping):
+            continue
+        code = _sanitize_terminal_text(
+            error.get("code"),
+            maximum=128,
+            preserve_lines=False,
+            fallback="artifact_delivery_failed",
+        )
+        detail = _sanitize_terminal_text(
+            error.get("message"),
+            maximum=512,
+            preserve_lines=False,
+            fallback="The artifact was not saved locally.",
+        )
+        safe_id = _sanitize_terminal_text(
+            artifact_id,
+            maximum=64,
+            preserve_lines=False,
+            fallback="the internal artifact",
+        )
+        messages.append(
+            f"Artifact {safe_id} remains available; local delivery failed: "
+            f"{code}: {detail}"
+        )
+    return tuple(messages)
 
 
 def _slash_command_menu_fragments(
@@ -3069,8 +3134,8 @@ def _render_approval_panel_fragments(
         ("class:tui.approval.arguments", f"{panel.arguments_text}\n\n"),
         (
             "class:tui.approval.action",
-            f" {glyphs.approval} [A] Approve once"
-            "                                      [D] Deny\n",
+            f" {glyphs.approval} [Y] Approve once"
+            "                                      [N] Deny\n",
         ),
     ]
 

@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Protocol, TypeVar
 
 from .._json import FrozenJsonObject
+from ..artifacts.models import (
+    ArtifactDeliveryReceipt,
+    ArtifactRef,
+    artifact_delivery_receipt_from_mapping,
+    artifact_ref_from_mapping,
+)
 from ..llm.errors import ContextWindowExceeded, ModelProviderError
 from ..llm.models import (
     CanonicalMessage,
@@ -162,6 +168,8 @@ class AgentLoop:
         messages = (*prior_messages, *transcript.messages)
         current_start = len(prior_messages)
         usage = ModelUsage(cost_estimate=CostEstimate.unavailable("no_model_attempts"))
+        artifacts: list[ArtifactRef] = []
+        artifact_deliveries: list[ArtifactDeliveryReceipt] = []
 
         try:
             user = CanonicalMessage(
@@ -182,6 +190,8 @@ class AgentLoop:
                         step - 1,
                         usage,
                         run_started,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
                     )
                 request = await _before(
                     deadline,
@@ -200,6 +210,8 @@ class AgentLoop:
                         step - 1,
                         usage,
                         run_started,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
                     )
                 model_started = (
                     asyncio.get_running_loop().time()
@@ -228,6 +240,8 @@ class AgentLoop:
                         usage,
                         run_started,
                         final_text=response.text,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
                     )
 
                 results = await _before(
@@ -248,6 +262,12 @@ class AgentLoop:
                     )
                     await self._transcripts.append(run.id, tool_message)
                     messages = (*messages, tool_message)
+                    artifact = _artifact_ref(result)
+                    if artifact is not None:
+                        artifacts.append(artifact)
+                    receipt = _artifact_delivery(result)
+                    if receipt is not None:
+                        artifact_deliveries.append(receipt)
 
                 budget_reason = self._usage_limit_reason(usage)
                 if budget_reason is not None:
@@ -259,6 +279,8 @@ class AgentLoop:
                             step,
                             usage,
                             run_started,
+                            artifacts=tuple(artifacts),
+                            artifact_deliveries=tuple(artifact_deliveries),
                         )
                     return await self._wrap_up(
                         run,
@@ -268,6 +290,8 @@ class AgentLoop:
                         budget_reason,
                         deadline,
                         run_started,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
                     )
 
             return await self._wrap_up(
@@ -278,6 +302,8 @@ class AgentLoop:
                 "step_limit_reached",
                 deadline,
                 run_started,
+                artifacts=tuple(artifacts),
+                artifact_deliveries=tuple(artifact_deliveries),
             )
         except asyncio.CancelledError:
             await self._finish(
@@ -287,6 +313,8 @@ class AgentLoop:
                 _completed_steps(messages[current_start:]),
                 usage,
                 run_started,
+                artifacts=tuple(artifacts),
+                artifact_deliveries=tuple(artifact_deliveries),
             )
             raise
         except TimeoutError:
@@ -297,6 +325,8 @@ class AgentLoop:
                 _completed_steps(messages[current_start:]),
                 usage,
                 run_started,
+                artifacts=tuple(artifacts),
+                artifact_deliveries=tuple(artifact_deliveries),
             )
         except ContextWindowExceeded:
             return await self._finish(
@@ -306,6 +336,8 @@ class AgentLoop:
                 _completed_steps(messages[current_start:]),
                 usage,
                 run_started,
+                artifacts=tuple(artifacts),
+                artifact_deliveries=tuple(artifact_deliveries),
             )
         except ModelProviderError as error:
             usage = _add_usage(usage, error.usage)
@@ -316,6 +348,8 @@ class AgentLoop:
                 _completed_steps(messages[current_start:]),
                 usage,
                 run_started,
+                artifacts=tuple(artifacts),
+                artifact_deliveries=tuple(artifact_deliveries),
             )
 
     async def _wrap_up(
@@ -327,10 +361,20 @@ class AgentLoop:
         reason: str,
         deadline: float,
         run_started: float,
+        *,
+        artifacts: tuple[ArtifactRef, ...],
+        artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...],
     ) -> LoopExit:
         if asyncio.get_running_loop().time() >= deadline:
             return await self._finish(
-                run, LoopExitKind.FAILED, reason, steps, usage, run_started
+                run,
+                LoopExitKind.FAILED,
+                reason,
+                steps,
+                usage,
+                run_started,
+                artifacts=artifacts,
+                artifact_deliveries=artifact_deliveries,
             )
         request = await _before(
             deadline,
@@ -350,6 +394,8 @@ class AgentLoop:
                 steps,
                 usage,
                 run_started,
+                artifacts=artifacts,
+                artifact_deliveries=artifact_deliveries,
             )
         try:
             model_started = (
@@ -361,7 +407,14 @@ class AgentLoop:
         except ModelProviderError as error:
             usage = _add_usage(usage, error.usage)
             return await self._finish(
-                run, LoopExitKind.FAILED, reason, steps, usage, run_started
+                run,
+                LoopExitKind.FAILED,
+                reason,
+                steps,
+                usage,
+                run_started,
+                artifacts=artifacts,
+                artifact_deliveries=artifact_deliveries,
             )
         model_duration_ms = (
             _duration_ms(model_started) if model_started is not None else None
@@ -374,7 +427,14 @@ class AgentLoop:
             self._emit_model_completed(run, response, model_duration_ms)
         if response.text is None:
             return await self._finish(
-                run, LoopExitKind.FAILED, reason, steps, usage, run_started
+                run,
+                LoopExitKind.FAILED,
+                reason,
+                steps,
+                usage,
+                run_started,
+                artifacts=artifacts,
+                artifact_deliveries=artifact_deliveries,
             )
         return await self._finish(
             run,
@@ -384,6 +444,8 @@ class AgentLoop:
             usage,
             run_started,
             final_text=response.text,
+            artifacts=artifacts,
+            artifact_deliveries=artifact_deliveries,
         )
 
     async def _finish(
@@ -396,6 +458,8 @@ class AgentLoop:
         run_started: float,
         *,
         final_text: str | None = None,
+        artifacts: tuple[ArtifactRef, ...] = (),
+        artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...] = (),
     ) -> LoopExit:
         result = LoopExit(
             run_id=run.id,
@@ -405,6 +469,8 @@ class AgentLoop:
             final_text=final_text,
             steps=steps,
             usage=usage,
+            artifacts=artifacts,
+            artifact_deliveries=artifact_deliveries,
             created_at=self._clock(),
         )
         await self._transcripts.finish(result)
@@ -541,6 +607,31 @@ def _add_usage(left: ModelUsage, right: ModelUsage) -> ModelUsage:
 
 def _completed_steps(messages: tuple[CanonicalMessage, ...]) -> int:
     return sum(message.role is MessageRole.ASSISTANT for message in messages)
+
+
+def _artifact_ref(result: ToolResultBlock) -> ArtifactRef | None:
+    if result.is_error:
+        return None
+    value = result.output.get("artifact")
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        ref = artifact_ref_from_mapping(value)
+    except (TypeError, ValueError):
+        return None
+    return ref if ref.call_id == result.call_id else None
+
+
+def _artifact_delivery(result: ToolResultBlock) -> ArtifactDeliveryReceipt | None:
+    if result.is_error or result.output.get("kind") != "artifact.delivery_receipt":
+        return None
+    value = result.output.get("data")
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        return artifact_delivery_receipt_from_mapping(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _duration_ms(started: float) -> int:

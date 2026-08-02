@@ -36,7 +36,7 @@ from ..catalog.models import (
     TabularFacet,
     catalog_resource_id,
 )
-from ..capabilities import ExtensionDeclarations, ToolArtifact
+from ..capabilities import ExtensionDeclarations
 from ..catalog.protocols import CatalogStore
 from ..domains.data.file_capabilities import LocalFileReadResult
 from ..domains.data.results import project_result_rows
@@ -565,9 +565,6 @@ class LocalDirectoryReadBackend:
             max_rows=max_rows,
             max_bytes=max_bytes,
         )
-        # The durable artifact may recover rows hidden only by the inline byte
-        # limit, but it never expands the declared row bound.
-        artifact_content = canonical_json(parsed.rows[:max_rows]).encode("utf-8")
         return LocalFileReadResult(
             source_id=source_id,
             source_revision=expected.content_sha256,
@@ -577,12 +574,6 @@ class LocalDirectoryReadBackend:
             encoding=parsed.encoding,
             columns=parsed.columns,
             projection=projection,
-            artifact=ToolArtifact(
-                content=artifact_content,
-                media_type="application/json",
-                sensitivity=resource.sensitivity.value,
-                retention="run",
-            ),
         )
 
 

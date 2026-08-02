@@ -8,6 +8,7 @@ from decimal import Decimal
 from enum import Enum
 import math
 
+from ..artifacts.models import ArtifactDeliveryReceipt, ArtifactRef
 from ..llm.models import CanonicalMessage, ModelUsage
 
 
@@ -105,6 +106,8 @@ class LoopExit:
     final_text: str | None = None
     steps: int = 0
     usage: ModelUsage = field(default_factory=ModelUsage)
+    artifacts: tuple[ArtifactRef, ...] = ()
+    artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...] = ()
 
     def __post_init__(self) -> None:
         _required_text(self.run_id, "loop-exit run_id")
@@ -125,6 +128,18 @@ class LoopExit:
             raise ValueError("loop-exit steps must be a non-negative integer")
         if not isinstance(self.usage, ModelUsage):
             raise TypeError("loop-exit usage must be ModelUsage")
+        artifacts = tuple(self.artifacts)
+        deliveries = tuple(self.artifact_deliveries)
+        if any(not isinstance(item, ArtifactRef) for item in artifacts):
+            raise TypeError("loop-exit artifacts must contain ArtifactRef records")
+        if any(not isinstance(item, ArtifactDeliveryReceipt) for item in deliveries):
+            raise TypeError(
+                "loop-exit artifact_deliveries must contain receipt records"
+            )
+        if any(item.run_id != self.run_id for item in artifacts):
+            raise ValueError("loop-exit artifacts must belong to its run")
+        object.__setattr__(self, "artifacts", artifacts)
+        object.__setattr__(self, "artifact_deliveries", deliveries)
 
 
 @dataclass(frozen=True, slots=True)

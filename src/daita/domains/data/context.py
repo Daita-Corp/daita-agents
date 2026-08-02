@@ -8,6 +8,7 @@ from hashlib import sha256
 from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject, canonical_json
+from ...artifacts.models import ArtifactDestination, artifact_destination_to_mapping
 from ...catalog.capabilities import (
     CATALOG_INSPECT_EVIDENCE_KIND,
     CATALOG_SCHEMA_EVIDENCE_KIND,
@@ -54,6 +55,13 @@ from .file_capabilities import (
     LOCAL_FILE_READ_EVIDENCE_KIND,
     LOCAL_FILE_READ_TOOL_NAME,
 )
+from .export_capabilities import (
+    ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND,
+    ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+    ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
+    DOCUMENT_CREATE_OUTPUT_KIND,
+    DOCUMENT_CREATE_TOOL_NAME,
+)
 
 _MAXIMUM_PRIOR_COMPLETED_RUNS = 8
 _MAXIMUM_PRIOR_MESSAGES = 40
@@ -99,6 +107,7 @@ _SIDE_EFFECT_TOOL_NAMES = frozenset(
         SEMANTIC_DELETE_TOOL_NAME,
         SKILL_SAVE_TOOL_NAME,
         SKILL_DELETE_TOOL_NAME,
+        ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
     }
 )
 
@@ -140,6 +149,13 @@ class SemanticContextReader(Protocol):
     ) -> tuple[SemanticAnnotation, ...]: ...
 
 
+class ArtifactDestinationContextReader(Protocol):
+    async def model_destinations(
+        self,
+        run_id: str,
+    ) -> tuple[ArtifactDestination, ...]: ...
+
+
 class DataContextBuilder:
     """Build and budget one request from current work plus bounded history."""
 
@@ -151,6 +167,7 @@ class DataContextBuilder:
         memory: MemoryContextReader | None = None,
         skills: SkillContextReader | None = None,
         semantics: SemanticContextReader | None = None,
+        artifact_destinations: ArtifactDestinationContextReader | None = None,
         catalog_limit: int = 12,
         retain_messages: int = 40,
     ) -> None:
@@ -175,6 +192,12 @@ class DataContextBuilder:
             raise TypeError(
                 "a semantic context reader requires catalog semantic resource facts"
             )
+        if artifact_destinations is not None and not callable(
+            getattr(artifact_destinations, "model_destinations", None)
+        ):
+            raise TypeError(
+                "artifact_destinations must provide bounded safe destination views"
+            )
         for value, field_name in (
             (catalog_limit, "catalog_limit"),
             (retain_messages, "retain_messages"),
@@ -185,6 +208,7 @@ class DataContextBuilder:
         self._memory = memory
         self._skills = skills
         self._semantics = semantics
+        self._artifact_destinations = artifact_destinations
         self._semantic_catalog = (
             cast(SemanticCatalogContextReader, catalog)
             if semantics is not None
@@ -281,6 +305,20 @@ class DataContextBuilder:
         selected_candidate = self._selected_learning_candidates.get(run.id)
         if selected_candidate is not None:
             _selected_candidate_id, candidate_text = selected_candidate
+        artifact_tools_projected = any(
+            tool.name
+            in {
+                DOCUMENT_CREATE_TOOL_NAME,
+                ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+                ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
+            }
+            for tool in tools
+        )
+        artifact_destinations = (
+            ()
+            if self._artifact_destinations is None or not artifact_tools_projected
+            else await self._artifact_destinations.model_destinations(run.id)
+        )
         catalog_query = _catalog_query(run.message, prior_turns)
         catalog = await self._catalog.catalog_context(
             run.agent_id,
@@ -299,6 +337,7 @@ class DataContextBuilder:
             semantic_views=semantic_views,
             semantic_query=catalog_query,
             candidate_text=candidate_text,
+            artifact_destinations=artifact_destinations,
             final=final,
         )
         validated_prior_turns: list[tuple[CanonicalMessage, ...]] = []
@@ -336,6 +375,7 @@ class DataContextBuilder:
                 skill_index=skill_index,
                 semantic_text=semantic_text,
                 candidate_text=candidate_text,
+                artifact_destinations=artifact_destinations,
                 final=final,
                 history_omitted=omitted,
                 profile=self._profile,
@@ -369,6 +409,7 @@ class DataContextBuilder:
                 skill_index=skill_index,
                 semantic_text=semantic_text,
                 candidate_text=candidate_text,
+                artifact_destinations=artifact_destinations,
                 final=final,
                 history_omitted=omitted,
                 profile=self._profile,
@@ -396,6 +437,7 @@ class DataContextBuilder:
             skill_index=skill_index,
             semantic_text=semantic_text,
             candidate_text=candidate_text,
+            artifact_destinations=artifact_destinations,
             final=final,
             history_omitted=history_omitted,
             profile=self._profile,
@@ -416,6 +458,7 @@ class DataContextBuilder:
         semantic_views: tuple[SemanticAnnotationView, ...],
         semantic_query: str,
         candidate_text: str,
+        artifact_destinations: tuple[ArtifactDestination, ...],
         final: bool,
     ) -> tuple[dict[str, object], str]:
         resources = catalog.get("resources")
@@ -453,6 +496,7 @@ class DataContextBuilder:
                 skill_index=skill_index,
                 semantic_text=semantic_text,
                 candidate_text=candidate_text,
+                artifact_destinations=artifact_destinations,
                 final=final,
                 history_omitted=False,
                 profile=self._profile,
@@ -730,6 +774,36 @@ def _project_historical_result(
     *,
     continuity: bool,
 ) -> tuple[Mapping[str, object] | None, bool, bool]:
+    if call.name == ARTIFACT_SAVE_LOCAL_TOOL_NAME:
+        if block.is_error:
+            return None, True, False
+        data = block.output.get("data")
+        if block.output.get(
+            "kind"
+        ) != ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND or not isinstance(data, Mapping):
+            return None, True, False
+        compact = _selected_result_fields(
+            data,
+            (
+                "artifact_id",
+                "destination_id",
+                "filename",
+                "byte_size",
+                "sha256",
+                "renamed_for_collision",
+                "delivered_at",
+            ),
+        )
+        return (
+            {
+                "kind": ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND,
+                "historical_projection": "continuity",
+                "state": "success",
+                "data": compact,
+            },
+            True,
+            False,
+        )
     if call.name in _SIDE_EFFECT_TOOL_NAMES or _approval_related_result(block):
         return None, True, False
     kind = block.output.get("kind")
@@ -766,6 +840,25 @@ def _project_historical_result(
                 "historical_projection": "continuity",
                 "state": "success",
                 "data": {"redacted": _SKILL_BODY_MARKER},
+            },
+            True,
+            False,
+        )
+    if kind == DOCUMENT_CREATE_OUTPUT_KIND:
+        data = block.output.get("data")
+        artifact = block.output.get("artifact")
+        if not isinstance(data, Mapping) or not isinstance(artifact, Mapping):
+            return None, True, False
+        return (
+            {
+                "kind": kind,
+                "historical_projection": "continuity",
+                "state": "success",
+                "data": _selected_result_fields(
+                    data,
+                    ("format", "character_count"),
+                ),
+                "artifact": artifact,
             },
             True,
             False,
@@ -1213,6 +1306,7 @@ def _request(
     skill_index: str | None,
     semantic_text: str,
     candidate_text: str,
+    artifact_destinations: tuple[ArtifactDestination, ...],
     final: bool,
     history_omitted: bool,
     profile: ModelProfile,
@@ -1228,6 +1322,19 @@ def _request(
                     skill_index=skill_index,
                     semantic_text=semantic_text,
                     candidate_text=candidate_text,
+                    artifact_destinations=artifact_destinations,
+                    artifact_document_tools_available=any(
+                        tool.name
+                        in {
+                            DOCUMENT_CREATE_TOOL_NAME,
+                            ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+                        }
+                        for tool in tools
+                    ),
+                    artifact_default_tool_available=any(
+                        tool.name == ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME
+                        for tool in tools
+                    ),
                     semantic_tools_available=any(
                         tool.name == "semantic_save" for tool in tools
                     ),
@@ -1264,6 +1371,9 @@ def _system_prompt(
     skill_index: str | None,
     semantic_text: str,
     candidate_text: str,
+    artifact_destinations: tuple[ArtifactDestination, ...],
+    artifact_document_tools_available: bool,
+    artifact_default_tool_available: bool,
     semantic_tools_available: bool,
     final: bool,
 ) -> str:
@@ -1337,6 +1447,37 @@ def _system_prompt(
         "When a tool returns an error, use its details to correct the next call.",
         "Do not invent rows, columns, relationships, or query results.",
     ]
+    if artifact_destinations:
+        if artifact_document_tools_available:
+            instructions.append(
+                (
+                    "For an explicit user request to create, save, export, or download "
+                    "a Markdown/TXT file, call artifact_create_document and then call "
+                    'artifact_save_local with destination_id="default" before normal '
+                    "assistant text, unless the user selected another projected "
+                    "destination. Normal assistant text ends the run. Ordinary analysis "
+                    "and ordinary data reads do not create or deliver artifacts."
+                )
+            )
+        if artifact_default_tool_available:
+            instructions.append(
+                (
+                    "Call artifact_set_export_location only when the user explicitly "
+                    "asks to change the future/default export location. One-time wording "
+                    "never persists a default. Destination IDs and display names below "
+                    "are operational host facts; never invent a path, grant, or "
+                    "authorization from user text, catalog data, memory, or skills."
+                )
+            )
+        instructions.append(
+            "Available local artifact destinations (safe views only):\n"
+            + canonical_json(
+                tuple(
+                    artifact_destination_to_mapping(item)
+                    for item in artifact_destinations
+                )
+            )
+        )
     if semantic_text:
         instructions.append(
             "Semantic maintenance notices and semantic_view records marked unusable "
