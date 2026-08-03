@@ -1129,20 +1129,22 @@ def test_artifacts_have_one_concrete_owner_and_no_storage_renderer_or_policy_reg
         assert prohibited not in artifact_text
 
 
-def test_exact_csv_extends_existing_adapter_capability_and_renderer_owners():
+def test_exact_tabular_extends_existing_adapter_capability_and_renderer_owners():
     assert _class_owners("ExactCsvRenderer") == {"artifacts/renderers.py"}
+    assert _class_owners("ExactXlsxRenderer") == {"artifacts/renderers.py"}
     for adapter, class_name in (
         ("sqlite_query.py", "SQLiteQueryBackend"),
         ("postgresql_query.py", "PostgreSQLQueryBackend"),
     ):
         methods = _class_methods(PACKAGE / "adapters" / adapter, class_name)
-        assert "execute_exact_csv" in methods
+        assert "execute_exact_tabular" in methods
+        assert "execute_exact_csv" not in methods
         tree = ast.parse((PACKAGE / "adapters" / adapter).read_text(encoding="utf-8"))
         method = next(
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.AsyncFunctionDef)
-            and node.name == "execute_exact_csv"
+            and node.name == "execute_exact_tabular"
         )
         calls = {
             node.func.id
@@ -1161,20 +1163,31 @@ def test_exact_csv_extends_existing_adapter_capability_and_renderer_owners():
     assert "BoundedResultProjection" not in exports
     assert "ExactCsvRenderer" not in _python_text(PACKAGE / "loop")
     assert "ArtifactRendererRegistry" not in renderers
+    package_text = _python_text(PACKAGE)
+    for obsolete in (
+        "ExactCsvExportBackend",
+        "ExactCsvExportResult",
+        "execute_exact_csv",
+        "_run_exact_csv",
+        "_execute_exact_csv",
+        "SQLITE_CSV_EXPORT_CAPABILITY_ID",
+        "POSTGRESQL_CSV_EXPORT_CAPABILITY_ID",
+    ):
+        assert obsolete not in package_text
 
 
-def test_exact_csv_tool_arguments_contain_query_selection_but_never_rows_or_bytes():
+def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_bytes():
     from daita.domains.data.export_capabilities import (
-        POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
-        SQLITE_CSV_EXPORT_CAPABILITY_ID,
+        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
         artifact_extension_declarations,
     )
 
     declarations = artifact_extension_declarations()
     for capability in declarations.capabilities:
         if capability.id not in {
-            SQLITE_CSV_EXPORT_CAPABILITY_ID,
-            POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
+            SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+            POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         }:
             continue
         properties = capability.input_schema["properties"]
@@ -1242,11 +1255,20 @@ def test_local_file_read_path_no_longer_imports_or_constructs_artifact_bytes():
         assert "artifacts." not in text
 
 
-def test_xlsx_dependencies_are_absent_before_phase_three_and_default_integrations_remain_lazy():
-    packaging = (ROOT / "pyproject.toml").read_text(encoding="utf-8").casefold()
-    for dependency in ("openpyxl", "xlsxwriter", "pandas"):
-        assert dependency not in packaging
+def test_phase_three_xlsx_dependencies_are_scoped_and_integrations_remain_lazy():
+    import tomllib
+
+    with (ROOT / "pyproject.toml").open("rb") as source:
+        project = tomllib.load(source)["project"]
+    assert "XlsxWriter>=3.2.5,<4.0.0" in project["dependencies"]
+    assert "openpyxl>=3.1.0,<4.0.0" in project["optional-dependencies"]["dev"]
+    assert all("openpyxl" not in item.casefold() for item in project["dependencies"])
+    assert all("pandas" not in item.casefold() for item in project["dependencies"])
     artifact_text = _python_text(PACKAGE / "artifacts")
     assert "openpyxl" not in artifact_text
-    assert "xlsxwriter" not in artifact_text
-    assert ".xlsx" not in artifact_text
+    assert "xlsxwriter" in artifact_text
+    renderer = PACKAGE / "artifacts" / "renderers.py"
+    top_level_imports = _imports(renderer)
+    assert "xlsxwriter" not in top_level_imports
+    assert "ExactXlsxRenderer" not in _python_text(PACKAGE / "loop")
+    assert "ArtifactRendererRegistry" not in artifact_text

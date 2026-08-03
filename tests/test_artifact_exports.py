@@ -39,10 +39,10 @@ from daita.artifacts.renderers import (
 from daita.catalog.models import Sensitivity
 from daita.domains.data.sql import ResourceSchema
 from daita.domains.data.export_capabilities import (
-    POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
-    POSTGRESQL_CSV_EXPORT_TOOL_NAME,
-    SQLITE_CSV_EXPORT_CAPABILITY_ID,
-    SQLITE_CSV_EXPORT_TOOL_NAME,
+    POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+    POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
+    SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+    SQLITE_TABULAR_EXPORT_TOOL_NAME,
     artifact_extension_declarations,
 )
 from daita.llm.models import (
@@ -380,10 +380,12 @@ async def test_postgresql_exact_adapter_streams_typed_values_without_json_projec
         ),
     )
     content, columns, row_count = (
-        await postgresql_query_module._execute_exact_csv_query(
+        await postgresql_query_module._execute_exact_tabular_query(
             connection,
             'SELECT amount, "when", payload FROM public.orders WHERE id = $1',
             (7,),
+            format_name="csv",
+            xlsx_provenance=None,
             max_rows=100_000,
             max_columns=256,
             max_bytes=64 * 1024 * 1024,
@@ -409,10 +411,12 @@ async def test_postgresql_exact_adapter_rejects_invalid_columns_and_server_byte_
 ):
     duplicate = _Connection(("same", "same"), ())
     with pytest.raises(ArtifactError) as duplicate_failure:
-        await postgresql_query_module._execute_exact_csv_query(
+        await postgresql_query_module._execute_exact_tabular_query(
             duplicate,
             "SELECT 1, 2",
             (),
+            format_name="csv",
+            xlsx_provenance=None,
             max_rows=100_000,
             max_columns=256,
             max_bytes=64 * 1024 * 1024,
@@ -423,10 +427,12 @@ async def test_postgresql_exact_adapter_rejects_invalid_columns_and_server_byte_
 
     byte_limited = _Connection(("value",), ((None, False),))
     with pytest.raises(ArtifactError) as byte_failure:
-        await postgresql_query_module._execute_exact_csv_query(
+        await postgresql_query_module._execute_exact_tabular_query(
             byte_limited,
             "SELECT value FROM public.orders",
             (),
+            format_name="csv",
+            xlsx_provenance=None,
             max_rows=100_000,
             max_columns=256,
             max_bytes=64 * 1024 * 1024,
@@ -505,8 +511,10 @@ class _BackendConnection:
         self.settings.append((sql, parameters))
 
 
+@pytest.mark.parametrize("format_name", ("csv", "xlsx"))
 async def test_postgresql_backend_contract_revalidates_and_executes_once_without_live_db(
     monkeypatch: pytest.MonkeyPatch,
+    format_name: str,
 ) -> None:
     agent_id = "agent-postgresql"
     registration = SourceRegistration.build(
@@ -546,6 +554,7 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
         exact_calls += 1
         assert args[2] == (Decimal("1.20"),)
         assert kwargs["max_rows"] == 100_000
+        assert kwargs["format_name"] == format_name
         return b'"amount"\r\n1.20\r\n', ("amount",), 1
 
     async def close(*args: object, **kwargs: object):
@@ -556,7 +565,7 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
     monkeypatch.setattr(postgresql_query_module, "_connect", connect)
     monkeypatch.setattr(postgresql_query_module, "_load_structure", load_structure)
     monkeypatch.setattr(
-        postgresql_query_module, "_execute_exact_csv_query", execute_exact
+        postgresql_query_module, "_execute_exact_tabular_query", execute_exact
     )
     monkeypatch.setattr(postgresql_query_module, "_close_postgresql_connection", close)
     backend = postgresql_query_module.PostgreSQLQueryBackend(
@@ -564,11 +573,14 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
         _CatalogSchemas((resource,)),
         EmptySecretProvider(),
     )
-    result = await backend.execute_exact_csv(
+    result = await backend.execute_exact_tabular(
         agent_id=agent_id,
         source_id=registration.id,
         sql="SELECT amount FROM public.orders WHERE amount = $1",
         parameters=(Decimal("1.20"),),
+        format_name=format_name,
+        parameters_sha256="sha256:" + "0" * 64,
+        created_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
         max_rows=100_000,
         max_columns=256,
         max_bytes=64 * 1024 * 1024,
@@ -579,6 +591,7 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
     assert connection.transaction_record.committed
     assert closed
     assert result.content == b'"amount"\r\n1.20\r\n'
+    assert result.format == format_name
     assert result.resource_revisions == ((resource.resource_id, resource.revision),)
     assert result.source_revision == source_revision
 
@@ -590,15 +603,19 @@ def test_source_specific_csv_tool_schemas_cannot_accept_rows_bytes_or_provenance
     views = {
         item.name: item
         for item in extension.tool_views
-        if item.name in {SQLITE_CSV_EXPORT_TOOL_NAME, POSTGRESQL_CSV_EXPORT_TOOL_NAME}
+        if item.name
+        in {SQLITE_TABULAR_EXPORT_TOOL_NAME, POSTGRESQL_TABULAR_EXPORT_TOOL_NAME}
     }
     assert set(views) == {
-        SQLITE_CSV_EXPORT_TOOL_NAME,
-        POSTGRESQL_CSV_EXPORT_TOOL_NAME,
+        SQLITE_TABULAR_EXPORT_TOOL_NAME,
+        POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
     }
     for name, expected_capability in (
-        (SQLITE_CSV_EXPORT_TOOL_NAME, SQLITE_CSV_EXPORT_CAPABILITY_ID),
-        (POSTGRESQL_CSV_EXPORT_TOOL_NAME, POSTGRESQL_CSV_EXPORT_CAPABILITY_ID),
+        (SQLITE_TABULAR_EXPORT_TOOL_NAME, SQLITE_TABULAR_EXPORT_CAPABILITY_ID),
+        (
+            POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
+            POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+        ),
     ):
         view = views[name]
         assert view.capability_id == expected_capability
@@ -669,7 +686,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         _tools(
             ToolCall(
                 id="export",
-                name=SQLITE_CSV_EXPORT_TOOL_NAME,
+                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
                 arguments={
                     "source_id": source_id,
                     "sql": (
@@ -706,7 +723,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         assert len(result.artifacts) == len(result.artifact_deliveries) == 1
         ref = result.artifacts[0]
         assert ref.call_id == "export"
-        assert ref.capability_id == SQLITE_CSV_EXPORT_CAPABILITY_ID
+        assert ref.capability_id == SQLITE_TABULAR_EXPORT_CAPABILITY_ID
         assert ref.media_type == "text/csv"
         assert ref.sensitivity is Sensitivity.INTERNAL
         assert ref.sensitivity is not Sensitivity.PUBLIC
@@ -820,7 +837,7 @@ async def test_csv_export_reuses_current_sql_and_catalog_validation(
         _tools(
             ToolCall(
                 id="invalid",
-                name=SQLITE_CSV_EXPORT_TOOL_NAME,
+                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
                 arguments={
                     "source_id": source_id,
                     "sql": sql,
@@ -859,7 +876,7 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
             _tools(
                 ToolCall(
                     id="mismatch",
-                    name=POSTGRESQL_CSV_EXPORT_TOOL_NAME,
+                    name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
                         "sql": "SELECT label FROM records",
@@ -880,7 +897,7 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
             _tools(
                 ToolCall(
                     id="stale",
-                    name=SQLITE_CSV_EXPORT_TOOL_NAME,
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
                         "sql": "SELECT label FROM records",
@@ -904,7 +921,7 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
             _tools(
                 ToolCall(
                     id="detached",
-                    name=SQLITE_CSV_EXPORT_TOOL_NAME,
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
                         "sql": "SELECT label FROM records",
@@ -938,19 +955,19 @@ async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
         rows=(("one", 1), ("two", 2)),
         downloads=downloads,
     )
-    original = sqlite_query_module._run_exact_csv_sync
+    original = sqlite_query_module._run_exact_tabular_sync
 
     def delayed(*args: Any, **kwargs: Any):
         if "slow_export" in args[1]:
             time_module.sleep(0.1)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(sqlite_query_module, "_run_exact_csv_sync", delayed)
+    monkeypatch.setattr(sqlite_query_module, "_run_exact_tabular_sync", delayed)
     provider._script = (
         _tools(
             ToolCall(
                 id="first",
-                name=SQLITE_CSV_EXPORT_TOOL_NAME,
+                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
                 arguments={
                     "source_id": source_id,
                     "sql": "SELECT label FROM records /* slow_export */ ORDER BY number",
@@ -960,7 +977,7 @@ async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
             ),
             ToolCall(
                 id="failed",
-                name=SQLITE_CSV_EXPORT_TOOL_NAME,
+                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
                 arguments={
                     "source_id": source_id,
                     "sql": "SELECT label AS duplicate, number AS duplicate FROM records",
@@ -970,7 +987,7 @@ async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
             ),
             ToolCall(
                 id="third",
-                name=SQLITE_CSV_EXPORT_TOOL_NAME,
+                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
                 arguments={
                     "source_id": source_id,
                     "sql": "SELECT number FROM records ORDER BY number",
@@ -1018,7 +1035,7 @@ async def test_exact_csv_cancellation_emits_no_artifact_or_partial_reference(
         del kwargs
         started.set()
         assert release.wait(2)
-        expected_schema_version = args[3]
+        expected_schema_version = args[5]
         return (
             b'"label"\r\n',
             ("label",),
@@ -1026,12 +1043,12 @@ async def test_exact_csv_cancellation_emits_no_artifact_or_partial_reference(
             (f"schema_version:{expected_schema_version}"),
         )
 
-    monkeypatch.setattr(sqlite_query_module, "_run_exact_csv_sync", blocked)
+    monkeypatch.setattr(sqlite_query_module, "_run_exact_tabular_sync", blocked)
     provider._script = (
         _tools(
             ToolCall(
                 id="cancelled-export",
-                name=SQLITE_CSV_EXPORT_TOOL_NAME,
+                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
                 arguments={
                     "source_id": source_id,
                     "sql": "SELECT label FROM records",
@@ -1070,7 +1087,7 @@ async def test_delivery_failure_after_csv_commit_retains_valid_internal_artifact
         _tools(
             ToolCall(
                 id="export",
-                name=SQLITE_CSV_EXPORT_TOOL_NAME,
+                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
                 arguments={
                     "source_id": source_id,
                     "sql": "SELECT label, number FROM records",

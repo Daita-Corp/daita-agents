@@ -101,8 +101,8 @@ from .export_capabilities import (
     ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
     ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     DOCUMENT_CREATE_CAPABILITY_ID,
-    POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
-    SQLITE_CSV_EXPORT_CAPABILITY_ID,
+    POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+    SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
 )
 from .sql import ResourceSchema, validate_postgresql_read, validate_sqlite_read
 
@@ -135,8 +135,8 @@ _MVP_CAPABILITIES = frozenset(
         SEMANTIC_SAVE_CAPABILITY_ID,
         SEMANTIC_DELETE_CAPABILITY_ID,
         DOCUMENT_CREATE_CAPABILITY_ID,
-        SQLITE_CSV_EXPORT_CAPABILITY_ID,
-        POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
+        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
         ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     }
@@ -152,13 +152,13 @@ _SEMANTIC_CAPABILITIES = frozenset(
 _ARTIFACT_CREATE_SAVE_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
-        SQLITE_CSV_EXPORT_CAPABILITY_ID,
-        POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
+        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
     }
 )
-_EXACT_CSV_CAPABILITIES = frozenset(
-    {SQLITE_CSV_EXPORT_CAPABILITY_ID, POSTGRESQL_CSV_EXPORT_CAPABILITY_ID}
+_EXACT_TABULAR_CAPABILITIES = frozenset(
+    {SQLITE_TABULAR_EXPORT_CAPABILITY_ID, POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}
 )
 _ARTIFACT_ACTION_WORDS = frozenset(
     {
@@ -189,7 +189,12 @@ _ARTIFACT_OBJECT_WORDS = frozenset(
         "md",
         "report",
         "reports",
+        "spreadsheet",
+        "spreadsheets",
         "txt",
+        "workbook",
+        "workbooks",
+        "xlsx",
     }
 )
 _ARTIFACT_DEICTIC_WORDS = frozenset({"it", "that", "them", "this"})
@@ -615,7 +620,7 @@ class DataToolRuntime:
             return None
         if draft.provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
             if (
-                output.data.get("format") != "csv"
+                output.data.get("format") not in {"csv", "xlsx"}
                 or output.data.get("filename") != draft.suggested_filename
                 or output.data.get("row_count") != draft.provenance.row_count
                 or output.data.get("column_count") != len(draft.provenance.columns)
@@ -678,7 +683,7 @@ class DataToolRuntime:
     ) -> ArtifactDraft:
         provenance = draft.provenance
         if provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
-            if capability.id not in _EXACT_CSV_CAPABILITIES:
+            if capability.id not in _EXACT_TABULAR_CAPABILITIES:
                 raise ToolOutputValidationError(
                     "exact-source artifact came from a non-export capability"
                 )
@@ -870,7 +875,7 @@ class DataToolRuntime:
             )
         expected_adapter = (
             "postgresql"
-            if capability.id == POSTGRESQL_CSV_EXPORT_CAPABILITY_ID
+            if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
             else "sqlite"
         )
         if (
@@ -879,7 +884,7 @@ class DataToolRuntime:
         ):
             raise ArtifactError(
                 "artifact_incomplete_export",
-                "Current source facts no longer prove the exact CSV export.",
+                "Current source facts no longer prove the exact tabular export.",
                 {
                     "reason": "catalog_changed",
                     "completed_rows": draft.provenance.row_count or 0,
@@ -890,7 +895,7 @@ class DataToolRuntime:
         resources = await self._catalog.resource_schemas(run.agent_id, source_id)
         validator = (
             validate_postgresql_read
-            if capability.id == POSTGRESQL_CSV_EXPORT_CAPABILITY_ID
+            if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
             else validate_sqlite_read
         )
         validation = validator(
@@ -908,7 +913,7 @@ class DataToolRuntime:
         ):
             raise ArtifactError(
                 "artifact_incomplete_export",
-                "Current catalog facts no longer prove the exact CSV export.",
+                "Current catalog facts no longer prove the exact tabular export.",
                 {
                     "reason": "catalog_changed",
                     "completed_rows": draft.provenance.row_count or 0,
@@ -939,6 +944,7 @@ class DataToolRuntime:
                 "exact artifact provenance differs from current runtime execution facts"
             )
         sensitivities = [draft.sensitivity]
+        current_sensitivities: list[Sensitivity] = []
         for resource_id in validation.resource_ids:
             schema = schemas.get(resource_id)
             if schema is None:
@@ -946,9 +952,22 @@ class DataToolRuntime:
                     "exact artifact resource is absent from current catalog facts"
                 )
             try:
-                sensitivities.append(Sensitivity(schema.sensitivity_class))
+                current_sensitivities.append(Sensitivity(schema.sensitivity_class))
             except ValueError:
-                sensitivities.append(Sensitivity.RESTRICTED)
+                current_sensitivities.append(Sensitivity.RESTRICTED)
+        current_sensitivity = _resolved_sensitivity(tuple(current_sensitivities))
+        if draft.sensitivity is not current_sensitivity:
+            raise ArtifactError(
+                "artifact_incomplete_export",
+                "Current catalog sensitivity no longer proves the exact tabular export.",
+                {
+                    "reason": "catalog_changed",
+                    "completed_rows": draft.provenance.row_count or 0,
+                    "completed_columns": len(draft.provenance.columns),
+                    "completed_bytes": len(draft.content),
+                },
+            )
+        sensitivities.extend(current_sensitivities)
         return ArtifactDraft(
             content=draft.content,
             suggested_filename=draft.suggested_filename,
@@ -1796,8 +1815,8 @@ class DataToolRuntime:
         if capability.id in {
             SQLITE_QUERY_CAPABILITY_ID,
             POSTGRESQL_QUERY_CAPABILITY_ID,
-            SQLITE_CSV_EXPORT_CAPABILITY_ID,
-            POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
+            SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+            POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         }:
             return await self._validate_sql(run, capability, arguments)
         if capability.id == LOCAL_FILE_READ_CAPABILITY_ID:
@@ -1981,7 +2000,7 @@ class DataToolRuntime:
             if capability.id
             in {
                 POSTGRESQL_QUERY_CAPABILITY_ID,
-                POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
+                POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
             }
             else "sqlite"
         )

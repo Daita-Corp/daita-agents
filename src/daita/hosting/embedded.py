@@ -762,6 +762,7 @@ class EmbeddedAgent:
                 agent_id=identity.id,
                 sqlite_backend=sqlite_backend,
                 postgresql_backend=postgresql_backend,
+                clock=clock,
             )
             if artifact_store.available
             else None

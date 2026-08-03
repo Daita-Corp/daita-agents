@@ -15,10 +15,18 @@ from uuid import UUID
 
 from .._json import canonical_json
 from ..artifacts.models import ArtifactError
-from ..artifacts.renderers import ExactCsvRenderer
+from ..artifacts.renderers import (
+    ExactCsvRenderer,
+    ExactXlsxProvenance,
+    ExactXlsxRenderer,
+)
 from ..domains.data.capabilities import PostgreSQLReadResult
 from ..domains.data.controller import CatalogSchemaReader
-from ..domains.data.export_capabilities import ExactCsvExportResult, ExactCsvProgress
+from ..domains.data.export_capabilities import (
+    ExactTabularExportResult,
+    ExactTabularProgress,
+    resolved_exact_export_sensitivity,
+)
 from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_postgresql_read
 from ..security import SecretProvider, default_secret_provider
@@ -261,20 +269,23 @@ class PostgreSQLQueryBackend:
             projection=projection,
         )
 
-    async def execute_exact_csv(
+    async def execute_exact_tabular(
         self,
         *,
         agent_id: str,
         source_id: str,
         sql: str,
         parameters: tuple[object, ...],
+        format_name: str,
+        parameters_sha256: str,
+        created_at: datetime,
         max_rows: int,
         max_columns: int,
         max_bytes: int,
         timeout_seconds: float,
-        progress: ExactCsvProgress | None = None,
-    ) -> ExactCsvExportResult:
-        """Run one fresh read and stream original driver values into exact CSV."""
+        progress: ExactTabularProgress | None = None,
+    ) -> ExactTabularExportResult:
+        """Run one fresh read through the selected fixed exact renderer."""
 
         registration = await self._sources.load_source(agent_id, source_id)
         if (
@@ -326,6 +337,26 @@ class PostgreSQLQueryBackend:
         columns: tuple[str, ...] = ()
         row_count = 0
         completed = {"rows": 0, "columns": 0, "bytes": 0}
+        sensitivity = resolved_exact_export_sensitivity(
+            tuple(
+                item.sensitivity_class
+                for item in resources
+                if item.resource_id in validation.resource_ids
+            )
+        )
+        xlsx_provenance = (
+            ExactXlsxProvenance(
+                source_id=source_id,
+                source_revision=validation.source_revision,
+                resource_revisions=validation.resource_revisions,
+                sql_fingerprint=validation.analysis.sql_fingerprint,
+                parameters_sha256=parameters_sha256,
+                sensitivity=sensitivity,
+                created_at=created_at,
+            )
+            if format_name == "xlsx"
+            else None
+        )
 
         def record_progress(rows: int, column_count: int, byte_count: int) -> None:
             completed.update(
@@ -366,10 +397,12 @@ class PostgreSQLQueryBackend:
                     "PostgreSQL source structure changed after its catalog snapshot.",
                 )
             async with asyncio.timeout(timeout_seconds):
-                content, columns, row_count = await _execute_exact_csv_query(
+                content, columns, row_count = await _execute_exact_tabular_query(
                     connection,
                     validation.analysis.canonical_sql,
                     parameters,
+                    format_name=format_name,
+                    xlsx_provenance=xlsx_provenance,
                     max_rows=max_rows,
                     max_columns=max_columns,
                     max_bytes=max_bytes,
@@ -383,7 +416,7 @@ class PostgreSQLQueryBackend:
         except TimeoutError as error:
             raise ArtifactError(
                 "artifact_incomplete_export",
-                "The exact CSV export exceeded its execution-time limit.",
+                "The exact tabular export exceeded its execution-time limit.",
                 {
                     "reason": "time_limit",
                     "completed_rows": completed["rows"],
@@ -416,7 +449,8 @@ class PostgreSQLQueryBackend:
                 "postgresql_query_failed",
                 "PostgreSQL could not complete the exact bounded read.",
             )
-        return ExactCsvExportResult(
+        return ExactTabularExportResult(
+            format=format_name,
             source_id=source_id,
             source_revision=validation.source_revision,
             sql_fingerprint=validation.analysis.sql_fingerprint,
@@ -424,6 +458,7 @@ class PostgreSQLQueryBackend:
             columns=columns,
             row_count=row_count,
             content=content,
+            sensitivity=sensitivity,
         )
 
 
@@ -507,30 +542,44 @@ async def _execute_user_query(
     return columns, tuple(rows), value_limited
 
 
-async def _execute_exact_csv_query(
+async def _execute_exact_tabular_query(
     connection: Any,
     sql: str,
     parameters: tuple[object, ...],
     *,
+    format_name: str,
+    xlsx_provenance: ExactXlsxProvenance | None,
     max_rows: int,
     max_columns: int,
     max_bytes: int,
     timeout_seconds: float,
-    progress: ExactCsvProgress | None = None,
+    progress: ExactTabularProgress | None = None,
 ) -> tuple[bytes, tuple[str, ...], int]:
     shape_statement = await connection.prepare(sql, timeout=timeout_seconds)
     attributes = tuple(shape_statement.get_attributes())
     raw_names = tuple(attribute.name for attribute in attributes)
-    renderer = ExactCsvRenderer(
-        raw_names,
-        max_rows=max_rows,
-        max_columns=max_columns,
-        max_bytes=max_bytes,
-        max_seconds=timeout_seconds,
-    )
+    if format_name == "csv":
+        renderer: ExactCsvRenderer | ExactXlsxRenderer = ExactCsvRenderer(
+            raw_names,
+            max_rows=max_rows,
+            max_columns=max_columns,
+            max_bytes=max_bytes,
+            max_seconds=timeout_seconds,
+        )
+    elif format_name == "xlsx" and xlsx_provenance is not None:
+        renderer = ExactXlsxRenderer(
+            raw_names,
+            provenance=xlsx_provenance,
+            max_rows=max_rows,
+            max_columns=max_columns,
+            max_bytes=max_bytes,
+            max_seconds=timeout_seconds,
+        )
+    else:
+        raise ValueError("exact tabular format and provenance are invalid")
     if progress is not None:
         progress(renderer.row_count, len(renderer.columns), renderer.byte_count)
-    bounded_sql = _exact_bounded_result_sql(
+    bounded_sql = _exact_tabular_bounded_result_sql(
         sql,
         column_names=renderer.columns,
         max_rows=max_rows,
@@ -600,7 +649,7 @@ def _bounded_result_sql(
     )
 
 
-def _exact_bounded_result_sql(
+def _exact_tabular_bounded_result_sql(
     sql: str,
     *,
     column_names: tuple[str, ...],
@@ -622,7 +671,7 @@ def _exact_bounded_result_sql(
     selected.append(f'{size_check} AS "__daita_exact_within_result_limit"')
     alias_clause = " (" + ", ".join(f'"{item}"' for item in aliases) + ")"
     return (
-        "/* daita:postgresql.exact_csv */ "
+        "/* daita:postgresql.exact_tabular */ "
         f"SELECT {', '.join(selected)} FROM ({sql}) AS {row_alias}{alias_clause} "
         f"LIMIT {max_rows + 1}"
     )

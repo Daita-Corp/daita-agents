@@ -59,11 +59,11 @@ from .export_capabilities import (
     ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND,
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
     ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
-    CSV_EXPORT_OUTPUT_KIND,
+    TABULAR_EXPORT_OUTPUT_KIND,
     DOCUMENT_CREATE_OUTPUT_KIND,
     DOCUMENT_CREATE_TOOL_NAME,
-    POSTGRESQL_CSV_EXPORT_TOOL_NAME,
-    SQLITE_CSV_EXPORT_TOOL_NAME,
+    POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
+    SQLITE_TABULAR_EXPORT_TOOL_NAME,
 )
 
 _MAXIMUM_PRIOR_COMPLETED_RUNS = 8
@@ -312,8 +312,8 @@ class DataContextBuilder:
             tool.name
             in {
                 DOCUMENT_CREATE_TOOL_NAME,
-                SQLITE_CSV_EXPORT_TOOL_NAME,
-                POSTGRESQL_CSV_EXPORT_TOOL_NAME,
+                SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
                 ARTIFACT_SAVE_LOCAL_TOOL_NAME,
                 ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
             }
@@ -868,7 +868,7 @@ def _project_historical_result(
             True,
             False,
         )
-    if kind == CSV_EXPORT_OUTPUT_KIND:
+    if kind == TABULAR_EXPORT_OUTPUT_KIND:
         data = block.output.get("data")
         artifact = block.output.get("artifact")
         if not isinstance(data, Mapping) or not isinstance(artifact, Mapping):
@@ -1351,8 +1351,8 @@ def _request(
                         tool.name
                         in {
                             DOCUMENT_CREATE_TOOL_NAME,
-                            SQLITE_CSV_EXPORT_TOOL_NAME,
-                            POSTGRESQL_CSV_EXPORT_TOOL_NAME,
+                            SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                            POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
                             ARTIFACT_SAVE_LOCAL_TOOL_NAME,
                         }
                         for tool in tools
@@ -1479,7 +1479,8 @@ def _system_prompt(
                 (
                     "For an explicit user request to create, save, export, or download "
                     "a Markdown/TXT file, call artifact_create_document. For an exact "
-                    "CSV request, call the source-specific data_export_sqlite or "
+                    "CSV or XLSX request, call the source-specific data_export_sqlite "
+                    "or "
                     "data_export_postgresql tool with a fresh validated read-only SQL "
                     "query; never place source rows or artifact bytes in tool arguments. "
                     "After either creation tool succeeds, call artifact_save_local with "

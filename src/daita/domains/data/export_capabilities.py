@@ -1,10 +1,11 @@
-"""Fixed document, exact-CSV, and local-delivery capabilities."""
+"""Fixed document, exact-tabular, and local-delivery capabilities."""
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
 from typing import Protocol
 
@@ -40,6 +41,9 @@ from ...artifacts.renderers import (
     MAX_CSV_COLUMNS,
     MAX_CSV_ROWS,
     MAX_CSV_SECONDS,
+    MAX_XLSX_BYTES,
+    XLSX_ALLOWED_EXTENSIONS,
+    XLSX_MEDIA_TYPE,
     render_model_document,
 )
 from ...catalog.models import Sensitivity
@@ -49,13 +53,13 @@ DOCUMENT_CREATE_EXECUTOR_ID = "artifact.create_document.executor"
 DOCUMENT_CREATE_TOOL_NAME = "artifact_create_document"
 DOCUMENT_CREATE_OUTPUT_KIND = "artifact.document"
 
-SQLITE_CSV_EXPORT_CAPABILITY_ID = "data.sqlite.export_csv"
-SQLITE_CSV_EXPORT_EXECUTOR_ID = "data.sqlite.export_csv.executor"
-SQLITE_CSV_EXPORT_TOOL_NAME = "data_export_sqlite"
-POSTGRESQL_CSV_EXPORT_CAPABILITY_ID = "data.postgresql.export_csv"
-POSTGRESQL_CSV_EXPORT_EXECUTOR_ID = "data.postgresql.export_csv.executor"
-POSTGRESQL_CSV_EXPORT_TOOL_NAME = "data_export_postgresql"
-CSV_EXPORT_OUTPUT_KIND = "artifact.csv_export"
+SQLITE_TABULAR_EXPORT_CAPABILITY_ID = "data.sqlite.export_tabular"
+SQLITE_TABULAR_EXPORT_EXECUTOR_ID = "data.sqlite.export_tabular.executor"
+SQLITE_TABULAR_EXPORT_TOOL_NAME = "data_export_sqlite"
+POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID = "data.postgresql.export_tabular"
+POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID = "data.postgresql.export_tabular.executor"
+POSTGRESQL_TABULAR_EXPORT_TOOL_NAME = "data_export_postgresql"
+TABULAR_EXPORT_OUTPUT_KIND = "artifact.tabular_export"
 
 ARTIFACT_SAVE_LOCAL_CAPABILITY_ID = "artifact.save_local"
 ARTIFACT_SAVE_LOCAL_EXECUTOR_ID = "artifact.save_local.executor"
@@ -76,9 +80,10 @@ class ArtifactCapabilityDeclarations:
 
 
 @dataclass(frozen=True, slots=True)
-class ExactCsvExportResult:
-    """One complete typed-source export after deterministic CSV rendering."""
+class ExactTabularExportResult:
+    """One complete typed-source export after its selected fixed renderer."""
 
+    format: str
     source_id: str
     source_revision: str
     sql_fingerprint: str
@@ -86,25 +91,28 @@ class ExactCsvExportResult:
     columns: tuple[str, ...]
     row_count: int
     content: bytes
+    sensitivity: Sensitivity
 
     def __post_init__(self) -> None:
+        if self.format not in {"csv", "xlsx"}:
+            raise ValueError("exact tabular format is invalid")
         for value, name in (
             (self.source_id, "source_id"),
             (self.source_revision, "source_revision"),
             (self.sql_fingerprint, "sql_fingerprint"),
         ):
             if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"exact CSV {name} must be non-empty text")
+                raise ValueError(f"exact tabular {name} must be non-empty text")
         if not self.sql_fingerprint.startswith("sha256:"):
-            raise ValueError("exact CSV sql_fingerprint must use sha256")
+            raise ValueError("exact tabular sql_fingerprint must use sha256")
         revisions = tuple(sorted(tuple(item) for item in self.resource_revisions))
         if not revisions or len(revisions) > 64:
-            raise ValueError("exact CSV resource revisions exceed their bound")
+            raise ValueError("exact tabular resource revisions exceed their bound")
         if len({item[0] for item in revisions}) != len(revisions) or any(
             not resource_id or not revision.startswith("sha256:")
             for resource_id, revision in revisions
         ):
-            raise ValueError("exact CSV resource revisions are invalid")
+            raise ValueError("exact tabular resource revisions are invalid")
         columns = tuple(self.columns)
         if (
             not 1 <= len(columns) <= MAX_CSV_COLUMNS
@@ -114,40 +122,72 @@ class ExactCsvExportResult:
                 for column in columns
             )
         ):
-            raise ValueError("exact CSV columns are invalid")
+            raise ValueError("exact tabular columns are invalid")
         if (
             not isinstance(self.row_count, int)
             or isinstance(self.row_count, bool)
             or not 0 <= self.row_count <= MAX_CSV_ROWS
         ):
-            raise ValueError("exact CSV row_count is outside its bound")
+            raise ValueError("exact tabular row_count is outside its bound")
         if (
             not isinstance(self.content, bytes)
             or not self.content
             or len(self.content) > MAX_CSV_BYTES
         ):
-            raise ValueError("exact CSV content is outside its byte bound")
+            raise ValueError("exact tabular content is outside its byte bound")
+        if (
+            not isinstance(self.sensitivity, Sensitivity)
+            or self.sensitivity is Sensitivity.UNKNOWN
+        ):
+            raise ValueError("exact tabular sensitivity must be resolved")
         object.__setattr__(self, "resource_revisions", revisions)
         object.__setattr__(self, "columns", columns)
 
 
-ExactCsvProgress = Callable[[int, int, int], None]
+ExactTabularProgress = Callable[[int, int, int], None]
 
 
-class ExactCsvExportBackend(Protocol):
-    async def execute_exact_csv(
+class ExactTabularExportBackend(Protocol):
+    async def execute_exact_tabular(
         self,
         *,
         agent_id: str,
         source_id: str,
         sql: str,
         parameters: tuple[object, ...],
+        format_name: str,
+        parameters_sha256: str,
+        created_at: datetime,
         max_rows: int,
         max_columns: int,
         max_bytes: int,
         timeout_seconds: float,
-        progress: ExactCsvProgress | None = None,
-    ) -> ExactCsvExportResult: ...
+        progress: ExactTabularProgress | None = None,
+    ) -> ExactTabularExportResult: ...
+
+
+def resolved_exact_export_sensitivity(
+    values: tuple[str | Sensitivity, ...],
+) -> Sensitivity:
+    """Resolve current resource labels at the exact-artifact trust boundary."""
+
+    order = {
+        Sensitivity.PUBLIC: 0,
+        Sensitivity.INTERNAL: 1,
+        Sensitivity.CONFIDENTIAL: 2,
+        Sensitivity.RESTRICTED: 3,
+        Sensitivity.UNKNOWN: 3,
+    }
+    resolved: list[Sensitivity] = []
+    for value in values:
+        try:
+            resolved.append(
+                value if isinstance(value, Sensitivity) else Sensitivity(value)
+            )
+        except ValueError:
+            resolved.append(Sensitivity.RESTRICTED)
+    selected = max(resolved or [Sensitivity.RESTRICTED], key=order.__getitem__)
+    return Sensitivity.RESTRICTED if selected is Sensitivity.UNKNOWN else selected
 
 
 class DocumentArtifactExecutor:
@@ -175,18 +215,20 @@ class DocumentArtifactExecutor:
         )
 
 
-class _CsvExportExecutor:
+class _TabularExportExecutor:
     executor_id: str
 
     def __init__(
         self,
         agent_id: str,
-        backend: ExactCsvExportBackend,
+        backend: ExactTabularExportBackend,
         *,
+        clock: Callable[[], datetime],
         max_seconds: float = MAX_CSV_SECONDS,
     ) -> None:
         self._agent_id = agent_id
         self._backend = backend
+        self._clock = clock
         self._max_seconds = max_seconds
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
@@ -198,20 +240,26 @@ class _CsvExportExecutor:
         assert isinstance(source_id, str)
         assert isinstance(sql, str)
         assert isinstance(parameters, tuple)
-        assert format_name == "csv"
+        assert format_name in {"csv", "xlsx"}
         assert filename is None or isinstance(filename, str)
         completed = {"rows": 0, "columns": 0, "bytes": 0}
 
         def progress(rows: int, columns: int, byte_count: int) -> None:
             completed.update(rows=rows, columns=columns, bytes=byte_count)
 
+        parameters_sha256 = (
+            "sha256:" + sha256(canonical_json(parameters).encode("utf-8")).hexdigest()
+        )
         try:
             async with asyncio.timeout(self._max_seconds):
-                result = await self._backend.execute_exact_csv(
+                result = await self._backend.execute_exact_tabular(
                     agent_id=self._agent_id,
                     source_id=source_id,
                     sql=sql,
                     parameters=parameters,
+                    format_name=format_name,
+                    parameters_sha256=parameters_sha256,
+                    created_at=self._clock(),
                     max_rows=MAX_CSV_ROWS,
                     max_columns=MAX_CSV_COLUMNS,
                     max_bytes=MAX_CSV_BYTES,
@@ -221,7 +269,7 @@ class _CsvExportExecutor:
         except TimeoutError as error:
             raise ArtifactError(
                 "artifact_incomplete_export",
-                "The exact CSV export exceeded its execution-time limit.",
+                "The exact tabular export exceeded its execution-time limit.",
                 {
                     "reason": "time_limit",
                     "completed_rows": completed["rows"],
@@ -229,12 +277,16 @@ class _CsvExportExecutor:
                     "completed_bytes": completed["bytes"],
                 },
             ) from error
-        if result.source_id != source_id:
-            raise ValueError("exact CSV backend returned a different source")
+        if result.source_id != source_id or result.format != format_name:
+            raise ValueError("exact tabular backend returned different execution facts")
+        media_type = "text/csv" if format_name == "csv" else XLSX_MEDIA_TYPE
+        extensions = (
+            CSV_ALLOWED_EXTENSIONS if format_name == "csv" else XLSX_ALLOWED_EXTENSIONS
+        )
         safe_filename = canonical_artifact_filename(
-            filename or "export.csv",
-            "text/csv",
-            CSV_ALLOWED_EXTENSIONS,
+            filename or f"export.{format_name}",
+            media_type,
+            extensions,
         )
         bindings = tuple(
             ArtifactResourceBinding(
@@ -245,14 +297,11 @@ class _CsvExportExecutor:
             )
             for resource_id, revision in result.resource_revisions
         )
-        parameters_sha256 = (
-            "sha256:" + sha256(canonical_json(parameters).encode("utf-8")).hexdigest()
-        )
         draft = ArtifactDraft(
             content=result.content,
             suggested_filename=safe_filename,
-            media_type="text/csv",
-            sensitivity=Sensitivity.PUBLIC,
+            media_type=media_type,
+            sensitivity=result.sensitivity,
             provenance=ArtifactProvenance(
                 authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
                 resource_bindings=bindings,
@@ -263,9 +312,9 @@ class _CsvExportExecutor:
             ),
         )
         return ToolOutput(
-            kind=CSV_EXPORT_OUTPUT_KIND,
+            kind=TABULAR_EXPORT_OUTPUT_KIND,
             data={
-                "format": "csv",
+                "format": format_name,
                 "filename": safe_filename,
                 "row_count": result.row_count,
                 "column_count": len(result.columns),
@@ -274,12 +323,12 @@ class _CsvExportExecutor:
         )
 
 
-class SQLiteCsvExportExecutor(_CsvExportExecutor):
-    executor_id = SQLITE_CSV_EXPORT_EXECUTOR_ID
+class SQLiteTabularExportExecutor(_TabularExportExecutor):
+    executor_id = SQLITE_TABULAR_EXPORT_EXECUTOR_ID
 
 
-class PostgreSQLCsvExportExecutor(_CsvExportExecutor):
-    executor_id = POSTGRESQL_CSV_EXPORT_EXECUTOR_ID
+class PostgreSQLTabularExportExecutor(_TabularExportExecutor):
+    executor_id = POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID
 
 
 class ArtifactSaveLocalExecutor:
@@ -346,16 +395,17 @@ def artifact_capability_declarations(
     delivery: LocalArtifactDelivery,
     *,
     agent_id: str,
-    sqlite_backend: ExactCsvExportBackend,
-    postgresql_backend: ExactCsvExportBackend,
+    sqlite_backend: ExactTabularExportBackend,
+    postgresql_backend: ExactTabularExportBackend,
+    clock: Callable[[], datetime],
 ) -> ArtifactCapabilityDeclarations:
     extension = artifact_extension_declarations()
     return ArtifactCapabilityDeclarations(
         capabilities=extension.capabilities,
         executors=(
             DocumentArtifactExecutor(),
-            SQLiteCsvExportExecutor(agent_id, sqlite_backend),
-            PostgreSQLCsvExportExecutor(agent_id, postgresql_backend),
+            SQLiteTabularExportExecutor(agent_id, sqlite_backend, clock=clock),
+            PostgreSQLTabularExportExecutor(agent_id, postgresql_backend, clock=clock),
             ArtifactSaveLocalExecutor(delivery),
             ArtifactSetExportLocationExecutor(delivery),
         ),
@@ -406,14 +456,14 @@ def artifact_extension_declarations() -> ExtensionDeclarations:
             max_total_bytes_per_call=MAX_DOCUMENT_BYTES,
         ),
     )
-    sqlite_csv = _csv_export_capability(
-        capability_id=SQLITE_CSV_EXPORT_CAPABILITY_ID,
-        executor_id=SQLITE_CSV_EXPORT_EXECUTOR_ID,
+    sqlite_tabular = _tabular_export_capability(
+        capability_id=SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+        executor_id=SQLITE_TABULAR_EXPORT_EXECUTOR_ID,
         adapter_name="SQLite",
     )
-    postgresql_csv = _csv_export_capability(
-        capability_id=POSTGRESQL_CSV_EXPORT_CAPABILITY_ID,
-        executor_id=POSTGRESQL_CSV_EXPORT_EXECUTOR_ID,
+    postgresql_tabular = _tabular_export_capability(
+        capability_id=POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+        executor_id=POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID,
         adapter_name="PostgreSQL",
     )
     save = Capability(
@@ -473,7 +523,7 @@ def artifact_extension_declarations() -> ExtensionDeclarations:
         access_mode=AccessMode.WRITE,
         side_effecting=True,
     )
-    capabilities = (document, sqlite_csv, postgresql_csv, save, set_location)
+    capabilities = (document, sqlite_tabular, postgresql_tabular, save, set_location)
     views = (
         ToolView(
             name=DOCUMENT_CREATE_TOOL_NAME,
@@ -481,17 +531,17 @@ def artifact_extension_declarations() -> ExtensionDeclarations:
             description=document.description,
         ),
         ToolView(
-            name=SQLITE_CSV_EXPORT_TOOL_NAME,
-            capability_id=sqlite_csv.id,
-            description=sqlite_csv.description,
+            name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+            capability_id=sqlite_tabular.id,
+            description=sqlite_tabular.description,
             applicability=ToolApplicability(
                 source_adapter_ids=("sqlite",), minimum_active_sources=1
             ),
         ),
         ToolView(
-            name=POSTGRESQL_CSV_EXPORT_TOOL_NAME,
-            capability_id=postgresql_csv.id,
-            description=postgresql_csv.description,
+            name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
+            capability_id=postgresql_tabular.id,
+            description=postgresql_tabular.description,
             applicability=ToolApplicability(
                 source_adapter_ids=("postgresql",), minimum_active_sources=1
             ),
@@ -514,7 +564,7 @@ def artifact_extension_declarations() -> ExtensionDeclarations:
     )
 
 
-def _csv_export_capability(
+def _tabular_export_capability(
     *,
     capability_id: str,
     executor_id: str,
@@ -524,7 +574,8 @@ def _csv_export_capability(
         id=capability_id,
         description=(
             f"Run one fresh validated read-only {adapter_name} query and create one "
-            "complete exact CSV artifact without routing rows through the model."
+            "complete exact CSV or XLSX artifact without routing rows through the "
+            "model."
         ),
         input_schema={
             "type": "object",
@@ -532,17 +583,17 @@ def _csv_export_capability(
                 "source_id": {"type": "string", "minLength": 1, "maxLength": 256},
                 "sql": {"type": "string", "minLength": 1},
                 "parameters": {"type": "array"},
-                "format": {"type": "string", "enum": ["csv"]},
+                "format": {"type": "string", "enum": ["csv", "xlsx"]},
                 "filename": {"type": "string", "minLength": 1, "maxLength": 120},
             },
             "required": ["source_id", "sql", "format"],
             "additionalProperties": False,
         },
-        output_kind=CSV_EXPORT_OUTPUT_KIND,
+        output_kind=TABULAR_EXPORT_OUTPUT_KIND,
         output_schema={
             "type": "object",
             "properties": {
-                "format": {"type": "string", "enum": ["csv"]},
+                "format": {"type": "string", "enum": ["csv", "xlsx"]},
                 "filename": {"type": "string"},
                 "row_count": {"type": "integer", "minimum": 0},
                 "column_count": {
@@ -556,12 +607,12 @@ def _csv_export_capability(
         },
         executor_id=executor_id,
         artifact_policy=ArtifactPolicy(
-            allowed_media_types=frozenset({"text/csv"}),
-            allowed_extensions=CSV_ALLOWED_EXTENSIONS,
+            allowed_media_types=frozenset({"text/csv", XLSX_MEDIA_TYPE}),
+            allowed_extensions=CSV_ALLOWED_EXTENSIONS + XLSX_ALLOWED_EXTENSIONS,
             artifact_required=True,
             max_artifact_count=1,
-            max_bytes_per_artifact=MAX_ARTIFACT_BYTES,
-            max_total_bytes_per_call=MAX_ARTIFACT_BYTES,
+            max_bytes_per_artifact=max(MAX_CSV_BYTES, MAX_XLSX_BYTES),
+            max_total_bytes_per_call=max(MAX_CSV_BYTES, MAX_XLSX_BYTES),
         ),
     )
 
@@ -611,22 +662,23 @@ __all__ = [
     "ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID",
     "ARTIFACT_SET_EXPORT_LOCATION_EXECUTOR_ID",
     "ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME",
-    "CSV_EXPORT_OUTPUT_KIND",
+    "TABULAR_EXPORT_OUTPUT_KIND",
     "DOCUMENT_CREATE_CAPABILITY_ID",
     "DOCUMENT_CREATE_EXECUTOR_ID",
     "DOCUMENT_CREATE_OUTPUT_KIND",
     "DOCUMENT_CREATE_TOOL_NAME",
-    "ExactCsvExportBackend",
-    "ExactCsvProgress",
-    "ExactCsvExportResult",
-    "POSTGRESQL_CSV_EXPORT_CAPABILITY_ID",
-    "POSTGRESQL_CSV_EXPORT_EXECUTOR_ID",
-    "POSTGRESQL_CSV_EXPORT_TOOL_NAME",
-    "PostgreSQLCsvExportExecutor",
-    "SQLITE_CSV_EXPORT_CAPABILITY_ID",
-    "SQLITE_CSV_EXPORT_EXECUTOR_ID",
-    "SQLITE_CSV_EXPORT_TOOL_NAME",
-    "SQLiteCsvExportExecutor",
+    "ExactTabularExportBackend",
+    "ExactTabularProgress",
+    "ExactTabularExportResult",
+    "POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID",
+    "POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID",
+    "POSTGRESQL_TABULAR_EXPORT_TOOL_NAME",
+    "PostgreSQLTabularExportExecutor",
+    "SQLITE_TABULAR_EXPORT_CAPABILITY_ID",
+    "SQLITE_TABULAR_EXPORT_EXECUTOR_ID",
+    "SQLITE_TABULAR_EXPORT_TOOL_NAME",
+    "SQLiteTabularExportExecutor",
     "artifact_capability_declarations",
     "artifact_extension_declarations",
+    "resolved_exact_export_sensitivity",
 ]

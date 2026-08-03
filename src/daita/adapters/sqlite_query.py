@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Mapping
+from datetime import datetime
 import os
 from pathlib import Path
 import sqlite3
@@ -13,10 +14,18 @@ import threading
 import time
 
 from ..artifacts.models import ArtifactError
-from ..artifacts.renderers import ExactCsvRenderer
+from ..artifacts.renderers import (
+    ExactCsvRenderer,
+    ExactXlsxProvenance,
+    ExactXlsxRenderer,
+)
 from ..domains.data.capabilities import SQLiteReadResult
 from ..domains.data.controller import CatalogSchemaReader
-from ..domains.data.export_capabilities import ExactCsvExportResult, ExactCsvProgress
+from ..domains.data.export_capabilities import (
+    ExactTabularExportResult,
+    ExactTabularProgress,
+    resolved_exact_export_sensitivity,
+)
 from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_sqlite_read
 from .protocols import SourceStore
@@ -119,20 +128,23 @@ class SQLiteQueryBackend:
             projection=projection,
         )
 
-    async def execute_exact_csv(
+    async def execute_exact_tabular(
         self,
         *,
         agent_id: str,
         source_id: str,
         sql: str,
         parameters: tuple[object, ...],
+        format_name: str,
+        parameters_sha256: str,
+        created_at: datetime,
         max_rows: int,
         max_columns: int,
         max_bytes: int,
         timeout_seconds: float,
-        progress: ExactCsvProgress | None = None,
-    ) -> ExactCsvExportResult:
-        """Run one fresh exact read and render typed values before projection."""
+        progress: ExactTabularProgress | None = None,
+    ) -> ExactTabularExportResult:
+        """Run one fresh exact read through the selected fixed renderer."""
 
         registration = await self._sources.load_source(agent_id, source_id)
         if (
@@ -181,10 +193,32 @@ class SQLiteQueryBackend:
                 "source_configuration_invalid",
                 "SQLite source configuration is missing its path.",
             )
-        content, columns, row_count, live_source_revision = await _run_exact_csv(
+        sensitivity = resolved_exact_export_sensitivity(
+            tuple(
+                item.sensitivity_class
+                for item in resources
+                if item.resource_id in validation.resource_ids
+            )
+        )
+        xlsx_provenance = (
+            ExactXlsxProvenance(
+                source_id=source_id,
+                source_revision=validation.source_revision,
+                resource_revisions=validation.resource_revisions,
+                sql_fingerprint=validation.analysis.sql_fingerprint,
+                parameters_sha256=parameters_sha256,
+                sensitivity=sensitivity,
+                created_at=created_at,
+            )
+            if format_name == "xlsx"
+            else None
+        )
+        content, columns, row_count, live_source_revision = await _run_exact_tabular(
             _regular_unaliased_path(configured_path),
             validation.analysis.canonical_sql,
             parameters,
+            format_name=format_name,
+            xlsx_provenance=xlsx_provenance,
             expected_schema_version=_expected_schema_version(
                 validation.source_revision
             ),
@@ -194,7 +228,8 @@ class SQLiteQueryBackend:
             timeout_seconds=timeout_seconds,
             progress=progress,
         )
-        return ExactCsvExportResult(
+        return ExactTabularExportResult(
+            format=format_name,
             source_id=source_id,
             source_revision=live_source_revision,
             sql_fingerprint=validation.analysis.sql_fingerprint,
@@ -202,6 +237,7 @@ class SQLiteQueryBackend:
             columns=columns,
             row_count=row_count,
             content=content,
+            sensitivity=sensitivity,
         )
 
 
@@ -284,25 +320,29 @@ async def _run_query(
         raise
 
 
-async def _run_exact_csv(
+async def _run_exact_tabular(
     path: Path,
     sql: str,
     parameters: tuple[object, ...],
     *,
+    format_name: str,
+    xlsx_provenance: ExactXlsxProvenance | None,
     expected_schema_version: int,
     max_rows: int,
     max_columns: int,
     max_bytes: int,
     timeout_seconds: float,
-    progress: ExactCsvProgress | None = None,
+    progress: ExactTabularProgress | None = None,
 ) -> tuple[bytes, tuple[str, ...], int, str]:
     cancellation = threading.Event()
     worker = asyncio.create_task(
         asyncio.to_thread(
-            _run_exact_csv_sync,
+            _run_exact_tabular_sync,
             path,
             sql,
             parameters,
+            format_name,
+            xlsx_provenance,
             expected_schema_version,
             max_rows,
             max_columns,
@@ -326,23 +366,25 @@ async def _run_exact_csv(
         raise
 
 
-def _run_exact_csv_sync(
+def _run_exact_tabular_sync(
     path: Path,
     sql: str,
     parameters: tuple[object, ...],
+    format_name: str,
+    xlsx_provenance: ExactXlsxProvenance | None,
     expected_schema_version: int,
     max_rows: int,
     max_columns: int,
     max_bytes: int,
     timeout_seconds: float,
     cancellation: threading.Event,
-    progress: ExactCsvProgress | None = None,
+    progress: ExactTabularProgress | None = None,
 ) -> tuple[bytes, tuple[str, ...], int, str]:
     uri = f"{path.as_uri()}?mode=ro"
     connection: sqlite3.Connection | None = None
     timed_out = threading.Event()
     deadline = time.monotonic() + timeout_seconds
-    renderer: ExactCsvRenderer | None = None
+    renderer: ExactCsvRenderer | ExactXlsxRenderer | None = None
 
     def interrupted() -> int:
         if cancellation.is_set():
@@ -382,13 +424,25 @@ def _run_exact_csv_sync(
                 "SQLite read did not return tabular results.",
             )
         columns = tuple(item[0] for item in cursor.description)
-        renderer = ExactCsvRenderer(
-            columns,
-            max_rows=max_rows,
-            max_columns=max_columns,
-            max_bytes=max_bytes,
-            max_seconds=timeout_seconds,
-        )
+        if format_name == "csv":
+            renderer = ExactCsvRenderer(
+                columns,
+                max_rows=max_rows,
+                max_columns=max_columns,
+                max_bytes=max_bytes,
+                max_seconds=timeout_seconds,
+            )
+        elif format_name == "xlsx" and xlsx_provenance is not None:
+            renderer = ExactXlsxRenderer(
+                columns,
+                provenance=xlsx_provenance,
+                max_rows=max_rows,
+                max_columns=max_columns,
+                max_bytes=max_bytes,
+                max_seconds=timeout_seconds,
+            )
+        else:
+            raise ValueError("exact tabular format and provenance are invalid")
         if progress is not None:
             progress(renderer.row_count, len(renderer.columns), renderer.byte_count)
         while True:
@@ -423,7 +477,7 @@ def _run_exact_csv_sync(
             completed_bytes = 0 if renderer is None else renderer.byte_count
             raise ArtifactError(
                 "artifact_incomplete_export",
-                "The exact CSV export exceeded its execution-time limit.",
+                "The exact tabular export exceeded its execution-time limit.",
                 {
                     "reason": "time_limit",
                     "completed_rows": completed_rows,
