@@ -34,15 +34,16 @@ def test_default_distribution_contains_every_supported_production_dependency():
     project = _project_metadata()
 
     assert project["version"] == "1.0.0"
+    assert project["requires-python"] == ">=3.11,<3.13"
     assert set(project["dependencies"]) == {
-        "anthropic>=0.116.0",
-        "asyncpg>=0.30.0",
-        "google-genai>=1.73.1",
-        "keyring>=25.0.0",
-        "openai>=1.99.9",
+        "anthropic>=0.116.0,<1.0.0",
+        "asyncpg>=0.30.0,<1.0.0",
+        "google-genai>=1.73.1,<2.0.0",
+        "keyring>=25.0.0,<26.0.0",
+        "openai>=1.99.9,<2.0.0",
         "prompt-toolkit>=3.0.52,<4.0.0",
         "rich>=15.0.0,<16.0.0",
-        "sqlglot>=25.0.0",
+        "sqlglot>=30.14.0,<30.15.0",
         "XlsxWriter>=3.2.5,<4.0.0",
     }
     assert set(project["optional-dependencies"]) == {"dev"}
@@ -101,6 +102,12 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     assert "cross-version smoke requires distinct baseline" in smoke
     assert "candidate wheels" in smoke
     assert "force-installs the candidate" in smoke
+    assert '"pip", "check"' in smoke
+    assert "import xlsxwriter" in smoke
+    assert "Workbook(" in smoke
+    assert '"Requires-Python"' in smoke
+    assert '">=3.11"' in smoke
+    assert '"<3.13"' in smoke
     assert '"create",' in smoke
     assert '"preservation-agent"' in smoke
     assert '"agent.toml"' in smoke
@@ -119,6 +126,16 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     assert "publish" not in smoke
     assert "$HOME" not in smoke
     assert "~/" not in smoke
+
+
+def test_ci_requires_clean_pipx_wheel_smoke_on_each_supported_python():
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "pipx-release:" in workflow
+    assert 'python-version: ["3.11", "3.12"]' in workflow
+    assert "python tests/pipx_lifecycle_smoke.py" in workflow
+    assert 'python -m pip install -e ".[dev]" pipx' in workflow
+    assert "[dev,sqlite]" not in workflow
 
 
 def _missing_import(module: str, action: Callable[[], object]) -> ImportError:

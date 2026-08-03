@@ -687,7 +687,7 @@ class TerminalViewState:
             TerminalBlock("tool", card.call_id, tool_card=card)
             for card in canonical_cards
         ]
-        delivery_failures = _artifact_delivery_failures(pairs)
+        delivery_failures = _artifact_delivery_messages(pairs)
         canonical_blocks.extend(
             TerminalBlock("artifact.delivery", message) for message in delivery_failures
         )
@@ -2956,14 +2956,29 @@ def _completed_tool_pairs(
     return tuple((call, results.get(call.id)) for call in calls)
 
 
-def _artifact_delivery_failures(
+def _artifact_delivery_messages(
     pairs: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
 ) -> tuple[str, ...]:
     messages: list[str] = []
+    created_artifact_ids: list[str] = []
+    delivery_attempts: set[str] = set()
     for call, result in pairs:
-        if call.name != "artifact_save_local" or result is None or not result.is_error:
+        if result is not None and not result.is_error:
+            artifact = result.output.get("artifact")
+            if isinstance(artifact, Mapping):
+                artifact_id = artifact.get("artifact_id")
+                if (
+                    isinstance(artifact_id, str)
+                    and artifact_id not in created_artifact_ids
+                ):
+                    created_artifact_ids.append(artifact_id)
+        if call.name != "artifact_save_local" or result is None:
             continue
         artifact_id = call.arguments.get("artifact_id")
+        if isinstance(artifact_id, str):
+            delivery_attempts.add(artifact_id)
+        if not result.is_error:
+            continue
         error = result.output.get("error")
         if not isinstance(artifact_id, str) or not isinstance(error, Mapping):
             continue
@@ -2988,6 +3003,19 @@ def _artifact_delivery_failures(
         messages.append(
             f"Artifact {safe_id} remains available; local delivery failed: "
             f"{code}: {detail}"
+        )
+    for artifact_id in created_artifact_ids:
+        if artifact_id in delivery_attempts:
+            continue
+        safe_id = _sanitize_terminal_text(
+            artifact_id,
+            maximum=64,
+            preserve_lines=False,
+            fallback="The internal artifact",
+        )
+        messages.append(
+            f"Artifact {safe_id} was created internally but was not saved locally; "
+            "no delivery completed."
         )
     return tuple(messages)
 

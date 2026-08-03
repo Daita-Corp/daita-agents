@@ -56,12 +56,13 @@ from .file_capabilities import (
     LOCAL_FILE_READ_TOOL_NAME,
 )
 from .export_capabilities import (
-    ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND,
+    ARTIFACT_CONVERT_TOOL_NAME,
+    ARTIFACT_LIST_TOOL_NAME,
+    ARTIFACT_READ_TOOL_NAME,
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
     ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
-    TABULAR_EXPORT_OUTPUT_KIND,
-    DOCUMENT_CREATE_OUTPUT_KIND,
     DOCUMENT_CREATE_TOOL_NAME,
+    LOCAL_FILE_COPY_TOOL_NAME,
     POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
     SQLITE_TABULAR_EXPORT_TOOL_NAME,
 )
@@ -110,6 +111,7 @@ _SIDE_EFFECT_TOOL_NAMES = frozenset(
         SEMANTIC_DELETE_TOOL_NAME,
         SKILL_SAVE_TOOL_NAME,
         SKILL_DELETE_TOOL_NAME,
+        ARTIFACT_SAVE_LOCAL_TOOL_NAME,
         ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
     }
 )
@@ -314,6 +316,9 @@ class DataContextBuilder:
                 DOCUMENT_CREATE_TOOL_NAME,
                 SQLITE_TABULAR_EXPORT_TOOL_NAME,
                 POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
+                ARTIFACT_LIST_TOOL_NAME,
+                ARTIFACT_READ_TOOL_NAME,
+                ARTIFACT_CONVERT_TOOL_NAME,
                 ARTIFACT_SAVE_LOCAL_TOOL_NAME,
                 ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
             }
@@ -779,36 +784,6 @@ def _project_historical_result(
     *,
     continuity: bool,
 ) -> tuple[Mapping[str, object] | None, bool, bool]:
-    if call.name == ARTIFACT_SAVE_LOCAL_TOOL_NAME:
-        if block.is_error:
-            return None, True, False
-        data = block.output.get("data")
-        if block.output.get(
-            "kind"
-        ) != ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND or not isinstance(data, Mapping):
-            return None, True, False
-        compact = _selected_result_fields(
-            data,
-            (
-                "artifact_id",
-                "destination_id",
-                "filename",
-                "byte_size",
-                "sha256",
-                "renamed_for_collision",
-                "delivered_at",
-            ),
-        )
-        return (
-            {
-                "kind": ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND,
-                "historical_projection": "continuity",
-                "state": "success",
-                "data": compact,
-            },
-            True,
-            False,
-        )
     if call.name in _SIDE_EFFECT_TOOL_NAMES or _approval_related_result(block):
         return None, True, False
     kind = block.output.get("kind")
@@ -845,44 +820,6 @@ def _project_historical_result(
                 "historical_projection": "continuity",
                 "state": "success",
                 "data": {"redacted": _SKILL_BODY_MARKER},
-            },
-            True,
-            False,
-        )
-    if kind == DOCUMENT_CREATE_OUTPUT_KIND:
-        data = block.output.get("data")
-        artifact = block.output.get("artifact")
-        if not isinstance(data, Mapping) or not isinstance(artifact, Mapping):
-            return None, True, False
-        return (
-            {
-                "kind": kind,
-                "historical_projection": "continuity",
-                "state": "success",
-                "data": _selected_result_fields(
-                    data,
-                    ("format", "character_count"),
-                ),
-                "artifact": artifact,
-            },
-            True,
-            False,
-        )
-    if kind == TABULAR_EXPORT_OUTPUT_KIND:
-        data = block.output.get("data")
-        artifact = block.output.get("artifact")
-        if not isinstance(data, Mapping) or not isinstance(artifact, Mapping):
-            return None, True, False
-        return (
-            {
-                "kind": kind,
-                "historical_projection": "continuity",
-                "state": "success",
-                "data": _selected_result_fields(
-                    data,
-                    ("format", "filename", "row_count", "column_count"),
-                ),
-                "artifact": artifact,
             },
             True,
             False,
@@ -1347,12 +1284,16 @@ def _request(
                     semantic_text=semantic_text,
                     candidate_text=candidate_text,
                     artifact_destinations=artifact_destinations,
-                    artifact_document_tools_available=any(
+                    artifact_tools_available=any(
                         tool.name
                         in {
                             DOCUMENT_CREATE_TOOL_NAME,
+                            LOCAL_FILE_COPY_TOOL_NAME,
                             SQLITE_TABULAR_EXPORT_TOOL_NAME,
                             POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
+                            ARTIFACT_LIST_TOOL_NAME,
+                            ARTIFACT_READ_TOOL_NAME,
+                            ARTIFACT_CONVERT_TOOL_NAME,
                             ARTIFACT_SAVE_LOCAL_TOOL_NAME,
                         }
                         for tool in tools
@@ -1398,7 +1339,7 @@ def _system_prompt(
     semantic_text: str,
     candidate_text: str,
     artifact_destinations: tuple[ArtifactDestination, ...],
-    artifact_document_tools_available: bool,
+    artifact_tools_available: bool,
     artifact_default_tool_available: bool,
     semantic_tools_available: bool,
     final: bool,
@@ -1472,22 +1413,33 @@ def _system_prompt(
         ),
         "When a tool returns an error, use its details to correct the next call.",
         "Do not invent rows, columns, relationships, or query results.",
+        (
+            "Ground categorical literals and business mappings in current catalog "
+            "facets, active semantics, or a bounded validated value read. Ordinary user "
+            "wording is not an exact stored value; never silently substitute a mapping, "
+            "and ask if evidence remains ambiguous."
+        ),
     ]
     if artifact_destinations:
-        if artifact_document_tools_available:
+        if artifact_tools_available:
             instructions.append(
                 (
-                    "For an explicit user request to create, save, export, or download "
-                    "a Markdown/TXT file, call artifact_create_document. For an exact "
-                    "CSV or XLSX request, call the source-specific data_export_sqlite "
-                    "or "
-                    "data_export_postgresql tool with a fresh validated read-only SQL "
-                    "query; never place source rows or artifact bytes in tool arguments. "
-                    "After either creation tool succeeds, call artifact_save_local with "
-                    'destination_id="default" before normal assistant text, unless the '
-                    "user selected another projected destination. Normal assistant text "
-                    "ends the run. Ordinary analysis and ordinary data reads do not "
-                    "create or deliver artifacts."
+                    "File tools: artifact_create_document for Markdown/TXT; "
+                    "data_export_sqlite or data_export_postgresql for exact CSV/XLSX; "
+                    "data_export_file for byte-identical attached CSV/JSON, never "
+                    "data_read_file. For earlier conversation files use artifact_list, "
+                    "then artifact_read only if needed; artifact_convert only converts a "
+                    "verified Daita XLSX Data snapshot to CSV. Never put source rows or "
+                    "artifact bytes in arguments or rerun a source for conversion; ask "
+                    "if the artifact choice remains ambiguous. "
+                    "A committed artifact reference proves only internal creation, not "
+                    "delivery. After each creation, call "
+                    'artifact_save_local with destination_id="default" before normal '
+                    "text unless another projected destination was selected; one call per "
+                    "new artifact and no text first. Only a successful artifact delivery "
+                    "receipt proves a local file exists; never claim saved or downloaded "
+                    "without it. Normal assistant text ends the run; ordinary reads "
+                    "create none."
                 )
             )
         if artifact_default_tool_available:

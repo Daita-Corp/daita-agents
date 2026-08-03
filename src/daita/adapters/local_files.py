@@ -38,6 +38,10 @@ from ..catalog.models import (
 )
 from ..capabilities import ExtensionDeclarations
 from ..catalog.protocols import CatalogStore
+from ..domains.data.export_capabilities import (
+    LocalFileCopyIncompleteError,
+    LocalFileCopyResult,
+)
 from ..domains.data.file_capabilities import LocalFileReadResult
 from ..domains.data.results import project_result_rows
 from .models import (
@@ -576,6 +580,184 @@ class LocalDirectoryReadBackend:
             projection=projection,
         )
 
+    async def execute_copy(
+        self,
+        *,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        max_bytes: int,
+    ) -> LocalFileCopyResult:
+        """Read exact current source bytes without parsing or converting them."""
+
+        _required_identifier(agent_id, "agent_id")
+        _required_identifier(source_id, "source_id")
+        _required_identifier(resource_id, "resource_id")
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or not 1 <= max_bytes <= 64 * 1024 * 1024
+        ):
+            raise ValueError("max_bytes must be from 1 through 67108864")
+
+        registration = await self._sources.load_source(agent_id, source_id)
+        if (
+            registration is None
+            or registration.agent_id != agent_id
+            or registration.id != source_id
+            or not registration.active
+        ):
+            raise LocalDirectorySourceError(
+                "source_not_available",
+                "The local-directory source is not attached to this agent.",
+                source_id=source_id,
+            )
+        if registration.adapter_id != _ADAPTER_ID:
+            raise LocalDirectorySourceError(
+                "source_adapter_mismatch",
+                "The selected source is not a local-directory source.",
+                source_id=source_id,
+            )
+        resource = await self._catalog.load_resource(agent_id, resource_id)
+        if resource is None or resource.id != resource_id:
+            raise LocalDirectorySourceError(
+                "resource_not_available",
+                "The selected file is not present in the current catalog.",
+                source_id=source_id,
+            )
+        if resource.source_id != source_id or resource.agent_id != agent_id:
+            raise LocalDirectorySourceError(
+                "resource_scope_mismatch",
+                "The selected file does not belong to this source.",
+                source_id=source_id,
+            )
+        if resource.kind is not ResourceKind.FILE:
+            raise LocalDirectorySourceError(
+                "resource_kind_unsupported",
+                "Local copies require a current CSV or JSON file resource.",
+                source_id=source_id,
+            )
+        relative_path = _normalized_relative_path(resource.native_identity, source_id)
+        revision = await self._catalog.load_revision(
+            agent_id,
+            resource.id,
+            resource.current_revision,
+        )
+        if (
+            revision is None
+            or revision.resource_id != resource.id
+            or revision.sync_id != resource.current_sync_id
+            or revision.revision != resource.current_revision
+        ):
+            raise LocalDirectorySourceError(
+                "catalog_revision_missing",
+                "The selected file has no current catalog revision.",
+                source_id=source_id,
+            )
+        sync = await self._catalog.load_sync(agent_id, resource.current_sync_id)
+        if (
+            sync is None
+            or sync.id != resource.current_sync_id
+            or sync.agent_id != agent_id
+            or sync.source_id != source_id
+            or sync.status is not CatalogSyncStatus.SUCCEEDED
+            or sync.source_revision is None
+        ):
+            raise LocalDirectorySourceError(
+                "catalog_revision_missing",
+                "The selected file has no current source revision.",
+                source_id=source_id,
+            )
+        facets = await self._catalog.load_facets(
+            agent_id,
+            resource.id,
+            resource.current_revision,
+        )
+        if {item.revision for item in facets} != set(revision.facet_revisions) or any(
+            item.resource_id != resource.id or item.sync_id != resource.current_sync_id
+            for item in facets
+        ):
+            raise LocalDirectorySourceError(
+                "catalog_facets_invalid",
+                "The current file catalog facts are incomplete or inconsistent.",
+                source_id=source_id,
+            )
+        file_facet, tabular_facet = _current_file_facets(facets, source_id)
+        limits, root_path, root_device, root_inode = _read_configuration(registration)
+        expected = _expected_file_facts(
+            file_facet,
+            tabular_facet,
+            revision.source_revision,
+            source_id,
+        )
+        if PurePosixPath(relative_path).suffix.casefold() != f".{expected.format}":
+            raise LocalDirectorySourceError(
+                "catalog_file_format_invalid",
+                "The catalog file format does not match its resource identity.",
+                source_id=source_id,
+            )
+        effective_max_bytes = min(max_bytes, limits.max_file_bytes)
+        if expected.size_bytes > effective_max_bytes:
+            raise LocalFileCopyIncompleteError("byte_limit")
+
+        cancellation = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                _read_registered_file,
+                root_path,
+                root_device,
+                root_inode,
+                relative_path,
+                effective_max_bytes,
+                source_id,
+                cancellation,
+            )
+        )
+        try:
+            content, _file_stat = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancellation.set()
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            raise
+        except DiscoveryLimitError as error:
+            raise LocalFileCopyIncompleteError("byte_limit") from error
+        except LocalDirectorySourceError:
+            raise
+        except (OSError, RuntimeError) as error:
+            raise LocalDirectorySourceError(
+                "local_file_read_failed",
+                "The local file could not be copied safely.",
+                source_id=source_id,
+            ) from error
+
+        content_hash = "sha256:" + sha256(content).hexdigest()
+        if (
+            len(content) != expected.size_bytes
+            or content_hash != expected.content_sha256
+            or revision.source_revision != expected.content_sha256
+        ):
+            raise LocalFileCopyIncompleteError(
+                "source_changed",
+                completed_bytes=len(content),
+            )
+        return LocalFileCopyResult(
+            source_id=source_id,
+            source_revision=sync.source_revision,
+            resource_id=resource.id,
+            resource_revision=resource.current_revision,
+            filename=PurePosixPath(relative_path).name,
+            format=expected.format,
+            media_type=expected.media_type,
+            content=content,
+            sensitivity=resource.sensitivity,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class _RootDescriptor:
@@ -618,6 +800,7 @@ class _ParsedFile:
 @dataclass(frozen=True, slots=True)
 class _ExpectedFileFacts:
     format: str
+    media_type: str
     encoding: str
     size_bytes: int
     content_sha256: str
@@ -870,12 +1053,14 @@ def _expected_file_facts(
 ) -> _ExpectedFileFacts:
     file_payload = file_facet.payload
     file_format = file_payload.get("format")
+    media_type = file_payload.get("media_type")
     encoding = file_payload.get("encoding")
     size_bytes = file_payload.get("size_bytes")
     content_sha256 = file_payload.get("content_sha256")
     raw_columns = tabular_facet.payload.get("columns")
     if (
         file_format not in {"csv", "json"}
+        or media_type != ("text/csv" if file_format == "csv" else "application/json")
         or encoding not in {"utf-8", "utf-8-sig"}
         or not isinstance(size_bytes, int)
         or isinstance(size_bytes, bool)
@@ -912,10 +1097,12 @@ def _expected_file_facts(
             source_id=source_id,
         )
     assert isinstance(file_format, str)
+    assert isinstance(media_type, str)
     assert isinstance(encoding, str)
     assert isinstance(content_sha256, str)
     return _ExpectedFileFacts(
         format=file_format,
+        media_type=media_type,
         encoding=encoding,
         size_bytes=size_bytes,
         content_sha256=content_sha256,

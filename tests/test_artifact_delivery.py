@@ -420,7 +420,7 @@ async def test_delivery_rejects_internal_digest_change_before_external_copy(
         tmp_path, "digest-before-copy", downloads
     )
     try:
-        ref = (await agent.list_artifacts())[0]
+        ref = (await agent.read_artifact(artifact_id)).ref
         payload = agent.home / "artifacts" / ref.run_id / artifact_id / "payload"
         payload.write_bytes(b"x" * ref.byte_size)
         with pytest.raises(ArtifactError) as failure:
@@ -431,7 +431,7 @@ async def test_delivery_rejects_internal_digest_change_before_external_copy(
         await agent.close()
 
 
-async def test_verified_saved_path_is_only_path_allowed_in_current_receipt_and_is_redacted_from_history(
+async def test_verified_receipt_path_and_artifact_identity_are_not_projected_from_history(
     tmp_path: Path,
 ) -> None:
     downloads = tmp_path / "downloads"
@@ -474,7 +474,7 @@ async def test_verified_saved_path_is_only_path_allowed_in_current_receipt_and_i
         historical = provider.requests[-1]
         text = str(historical)
         assert receipt.saved_path not in text
-        assert artifact_id in text
+        assert artifact_id not in text
         assert all(
             message.role is not MessageRole.SYSTEM or str(downloads) not in str(message)
             for message in historical.messages

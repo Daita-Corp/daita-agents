@@ -476,6 +476,39 @@ async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branc
         await agent.close()
 
 
+def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
+    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+        encoding="utf-8"
+    )
+    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    exports = (PACKAGE / "domains" / "data" / "export_capabilities.py").read_text(
+        encoding="utf-8"
+    )
+    for obsolete in (
+        "_explicit_artifact_request",
+        "_explicit_default_location_request",
+        "_ARTIFACT_ACTION_WORDS",
+        "_ARTIFACT_OBJECT_WORDS",
+        "_intent_clauses",
+    ):
+        assert obsolete not in controller
+    for obsolete_history_owner in (
+        "ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND",
+        "DOCUMENT_CREATE_OUTPUT_KIND",
+        "TABULAR_EXPORT_OUTPUT_KIND",
+        "LOCAL_FILE_COPY_OUTPUT_KIND",
+    ):
+        assert obsolete_history_owner not in context
+    assert 'ARTIFACT_LIST_TOOL_NAME = "artifact_list"' in exports
+    assert 'ARTIFACT_READ_TOOL_NAME = "artifact_read"' in exports
+    assert 'ARTIFACT_CONVERT_TOOL_NAME = "artifact_convert"' in exports
+    assert "artifact_list" not in (PACKAGE / "agent.py").read_text(encoding="utf-8")
+    assert "artifact_list" not in (PACKAGE / "hosting" / "embedded.py").read_text(
+        encoding="utf-8"
+    )
+    assert "artifact_list" not in (PACKAGE / "cli.py").read_text(encoding="utf-8")
+
+
 def test_observation_owners_keep_tool_events_out_of_loop_and_storage():
     storage = _python_text(PACKAGE / "storage")
     controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(

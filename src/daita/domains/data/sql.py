@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 import hashlib
+import re
 from typing import Any, Literal
 
 from ..._installation import PIPX_REPAIR_GUIDANCE
@@ -18,9 +19,14 @@ _SqlDialect = Literal["sqlite", "postgresql"]
 _MAX_ISSUES = 32
 _MAX_CANDIDATES = 8
 _MAX_VALIDATION_ISSUE_DETAILS_CHARACTERS = 1_536
+MAX_SQL_CHARACTERS = 65_536
+MAX_SQL_PARAMETERS = 128
 _ASCII_IDENTIFIER_CASE_TRANSLATION = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
     "abcdefghijklmnopqrstuvwxyz",
+)
+_SQL_CALL_PREFIX = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\(",
 )
 
 # PostgreSQL functions can perform external I/O even in a read-only
@@ -30,7 +36,11 @@ _ASCII_IDENTIFIER_CASE_TRANSLATION = str.maketrans(
 _POSTGRESQL_BOUNDED_FUNCTIONS = frozenset(
     {
         "ABS",
+        "AGE",
+        "ARRAY_AGG",
         "AVG",
+        "BOOL_AND",
+        "BOOL_OR",
         "CAST",
         "CEIL",
         "CEILING",
@@ -38,39 +48,63 @@ _POSTGRESQL_BOUNDED_FUNCTIONS = frozenset(
         "COALESCE",
         "CONCAT",
         "CONCAT_WS",
+        "CORR",
         "COUNT",
+        "COVAR_POP",
+        "COVAR_SAMP",
+        "CUME_DIST",
+        "DATE",
+        "DATE_BIN",
+        "DATE_TRUNC",
+        "DECODE",
+        "DENSE_RANK",
+        "EVERY",
         "EXTRACT",
+        "FIRST_VALUE",
         "FLOOR",
         "GREATEST",
+        "JSON_AGG",
+        "JSONB_AGG",
+        "LAG",
+        "LAST_VALUE",
+        "LEAD",
         "LENGTH",
         "LEAST",
         "LOWER",
         "LTRIM",
         "MAX",
         "MIN",
+        "NTH_VALUE",
+        "NTILE",
         "NULLIF",
         "OCTET_LENGTH",
+        "PERCENTILE_CONT",
+        "PERCENTILE_DISC",
+        "PERCENT_RANK",
+        "RANK",
         "REPLACE",
         "ROW_NUMBER",
         "ROUND",
         "RTRIM",
         "SIGN",
+        "SPLIT_PART",
+        "STDDEV",
+        "STDDEV_POP",
+        "STDDEV_SAMP",
+        "STRING_AGG",
         "SUBSTR",
         "SUBSTRING",
         "SUM",
+        "TIMEZONE",
+        "TO_CHAR",
         "TRIM",
         "UPPER",
+        "VARIANCE",
+        "VAR_POP",
+        "VAR_SAMP",
     }
 )
-_POSTGRESQL_NON_DISPATCH_EXPRESSIONS = frozenset(
-    {
-        "CAST",
-        "COALESCE",
-        "GREATEST",
-        "LEAST",
-        "NULLIF",
-    }
-)
+_STRUCTURAL_CALL_EXPRESSIONS = frozenset({"EXISTS"})
 _VOLATILE_CONTEXT_EXPRESSIONS = frozenset(
     {
         "CURRENT_CATALOG",
@@ -566,8 +600,6 @@ def _load_sqlglot(dialect: _SqlDialect = "sqlite") -> tuple[Any, Any]:
 
 
 def _explain_prefix(sql: str) -> tuple[str, str] | None:
-    import re
-
     match = re.match(
         r"(?is)^\s*(EXPLAIN(?:\s+QUERY\s+PLAN|\s+ANALYZE)?)\s+(.+)$",
         sql,
@@ -593,6 +625,11 @@ def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
     display_name = "PostgreSQL" if dialect == "postgresql" else "SQLite"
     sqlglot_dialect = "postgres" if dialect == "postgresql" else "sqlite"
 
+    if isinstance(sql, str) and len(sql) > MAX_SQL_CHARACTERS:
+        raise SqlAnalysisError(
+            "sql_too_large",
+            f"SQL must contain at most {MAX_SQL_CHARACTERS} characters.",
+        )
     normalized = normalize_sql(sql)
     if not normalized:
         raise SqlAnalysisError("empty_sql", "SQL must not be empty.")
@@ -935,21 +972,14 @@ def _function_facts(
     anonymous_type = getattr(exp, "Anonymous", ())
     for function in root.find_all(exp.Func):
         is_anonymous = isinstance(function, anonymous_type)
-        raw_name = (
-            str(function.name or "") if is_anonymous else str(function.sql_name() or "")
+        raw_name = _rendered_callable_name(
+            function,
+            dialect=dialect,
+            is_anonymous=is_anonymous,
         )
-        name = (raw_name.strip() or type(function).__name__).upper()[:256]
-        # sqlglot also models structural SQL (CASE branches, EXISTS, CAST, and
-        # similar grammar nodes) as Func subclasses.  Parsed call tokens carry
-        # source metadata; structural nodes do not.  Record actual dispatch and
-        # context-sensitive keyword expressions, not every Func-shaped node.
-        if (
-            not is_anonymous
-            and not function.meta
-            and name not in _VOLATILE_CONTEXT_EXPRESSIONS
-            and name not in _POSTGRESQL_NON_DISPATCH_EXPRESSIONS
-        ):
+        if raw_name is None:
             continue
+        name = (raw_name.strip() or type(function).__name__).upper()[:256]
         namespace = _function_namespace(function, exp)
         if namespace is not None:
             name = f"{namespace.upper()[:128]}.{name}"[:256]
@@ -970,6 +1000,39 @@ def _function_facts(
         tuple(sorted(unresolved)),
         tuple(sorted(table_functions)),
     )
+
+
+def _rendered_callable_name(
+    function: Any,
+    *,
+    dialect: _SqlDialect,
+    is_anonymous: bool,
+) -> str | None:
+    """Return the callable identity emitted by the selected SQL generator."""
+
+    if is_anonymous:
+        name = str(function.name or "").strip()
+        return name or type(function).__name__
+    rendered = str(
+        function.sql(
+            dialect="postgres" if dialect == "postgresql" else "sqlite",
+            pretty=False,
+        )
+    ).strip()
+    match = _SQL_CALL_PREFIX.match(rendered)
+    if match is not None:
+        name = match.group(1).upper()
+        if name in _STRUCTURAL_CALL_EXPRESSIONS:
+            return None
+        return name
+    sql_name = str(function.sql_name() or "").strip().upper()
+    if sql_name in _VOLATILE_CONTEXT_EXPRESSIONS:
+        return sql_name
+    # sqlglot models infix operators, CASE branches, ARRAY constructors, and
+    # other structural grammar as Func subclasses.  If the selected dialect
+    # does not render the node as a call or context keyword, it has no callable
+    # identity for the function boundary.
+    return None
 
 
 def _function_namespace(function: Any, exp: Any) -> str | None:
@@ -1033,23 +1096,26 @@ def _expression_boundary_facts(
 
 
 def _is_table_function(function: Any, exp: Any) -> bool:
-    current = function.parent
-    while current is not None and not isinstance(current, exp.Select):
-        if isinstance(
-            current,
-            tuple(
-                item
-                for item in (
-                    getattr(exp, "From", None),
-                    getattr(exp, "Join", None),
-                    getattr(exp, "Lateral", None),
-                    getattr(exp, "Table", None),
-                )
-                if item is not None
-            ),
-        ):
-            return True
-        current = current.parent
+    current = function
+    while (parent := current.parent) is not None:
+        if isinstance(parent, exp.Dot) and parent.expression is current:
+            current = parent
+            continue
+        if isinstance(parent, exp.Table) and parent.this is current:
+            current = parent
+            continue
+        if isinstance(parent, exp.Alias):
+            if parent.this is not current:
+                return False
+            current = parent
+            continue
+        if isinstance(parent, exp.Lateral):
+            return parent.this is current
+        if isinstance(parent, exp.From):
+            return parent.this is current or current in parent.expressions
+        if isinstance(parent, exp.Join):
+            return parent.this is current
+        return False
     return False
 
 
@@ -1641,6 +1707,14 @@ def _lexical_column_issues(
                 )
                 relation = None
                 if not matches:
+                    if _is_legal_output_alias(
+                        column,
+                        scope,
+                        state,
+                        exp,
+                        dialect=dialect,
+                    ):
+                        continue
                     ancestor_matches: tuple[str, ...] = ()
                     ancestor = scope.parent
                     while ancestor is not None and not ancestor_matches:
@@ -1667,14 +1741,6 @@ def _lexical_column_issues(
                         matches = ancestor_matches
             if not matches:
                 if unresolved_qualifiers[id(scope)]:
-                    continue
-                if _is_legal_output_alias(
-                    column,
-                    scope,
-                    state,
-                    exp,
-                    dialect=dialect,
-                ):
                     continue
                 if relation is None and len(relation_tuple) == 1:
                     relation = relation_tuple[0]
@@ -1812,6 +1878,14 @@ def _validate_sql_read(
         resource for resource in resources if resource.source_id == source_id
     )
     issues: list[SqlValidationIssue] = []
+    if len(parameters) > MAX_SQL_PARAMETERS:
+        issues.append(
+            SqlValidationIssue(
+                "parameter_count_exceeded",
+                f"SQL reads accept at most {MAX_SQL_PARAMETERS} bound parameters.",
+                {"received": len(parameters)},
+            )
+        )
     if analysis.statement_count != 1:
         issues.append(
             SqlValidationIssue(
@@ -2016,6 +2090,14 @@ def _validate_sql_read(
             )
         if resource.resource_id not in resolved_ids:
             resolved_ids.append(resource.resource_id)
+
+    if not any(not table.is_cte for table in analysis.tables):
+        issues.append(
+            SqlValidationIssue(
+                "resource_scope_empty",
+                f"{display_name} data queries must reference a cataloged resource.",
+            )
+        )
 
     resolved_resources = tuple(
         resource

@@ -211,15 +211,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="confirm transcript and candidate-record deletion",
     )
 
-    artifacts = commands.add_parser("artifacts", help="list or save run artifacts")
+    artifacts = commands.add_parser("artifacts", help="save a known run artifact by ID")
     artifact_commands = artifacts.add_subparsers(
         dest="artifacts_command",
         required=True,
     )
-    artifact_list = artifact_commands.add_parser("list")
-    artifact_list.add_argument("name")
-    artifact_list.add_argument("--run-id")
-    artifact_list.add_argument("--conversation-id")
     artifact_save = artifact_commands.add_parser("save")
     artifact_save.add_argument("name")
     artifact_save.add_argument("artifact_id")
@@ -1344,14 +1340,6 @@ async def _execute(args: argparse.Namespace) -> object:
     agent = await Agent.open(args.name, root=args.root)
     try:
         if args.command == "artifacts":
-            if args.artifacts_command == "list":
-                return [
-                    artifact_ref_to_mapping(item)
-                    for item in await agent.list_artifacts(
-                        run_id=args.run_id,
-                        conversation_id=args.conversation_id,
-                    )
-                ]
             receipt = await agent.save_artifact(
                 args.artifact_id,
                 args.destination,

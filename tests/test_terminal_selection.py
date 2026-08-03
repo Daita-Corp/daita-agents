@@ -286,6 +286,27 @@ def test_selector_visuals_share_ascii_theme_without_changing_values():
     assert state.selected_value() == "alpha-id"
 
 
+def test_multi_selector_visuals_render_checked_state_deterministically():
+    state = terminal_selection._MultiSelectionState(
+        terminal_selection._normalize_options(_OPTIONS),
+        maximum=3,
+        empty_message="Select at least one option.",
+        maximum_message="Select at most three options.",
+    )
+    state.toggle()
+
+    rendered = "".join(
+        text
+        for _style, text in terminal_selection._render_multi_fragments(
+            "Choose many",
+            state,
+            size=(80, 24),
+        )
+    )
+
+    assert "› [x] Alpha" in rendered
+
+
 async def test_labels_and_descriptions_are_sanitized_and_bounded():
     unsafe = "unsafe\x1b[31m\u202e" + ("x" * 400)
     selected, output = await _enhanced_choice(
@@ -336,15 +357,12 @@ async def test_multi_select_initial_highlight_starts_empty_and_space_selects_it(
                 enhanced_output=output,
             )
         )
-        await asyncio.sleep(0.02)
+        await _wait_for_output(output, "› [ ] Alpha")
         assert "› [ ] Alpha" in output.text
-        pipe.send_text(" ")
-        await asyncio.sleep(0.02)
-        pipe.send_text("\r")
+        pipe.send_text(" \r")
         selected = await task
 
     assert selected == ("alpha-id",)
-    assert "x" in output.text
     assert output.show_count >= 1
 
 

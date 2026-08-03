@@ -18,6 +18,7 @@ from daita.artifacts.models import (
     ArtifactError,
     ArtifactProvenance,
     ArtifactRef,
+    artifact_ref_from_mapping,
     artifact_ref_to_mapping,
 )
 from daita.artifacts.renderers import DOCUMENT_ALLOWED_EXTENSIONS, render_model_document
@@ -315,6 +316,55 @@ async def test_artifact_draft_bytes_never_enter_tool_result_transcript_exit_or_j
     assert (await store.read(ref.artifact_id)).content == secret
 
 
+async def test_pre_lineage_artifact_reference_is_admitted_and_reserialized_canonically(
+    tmp_path: Path,
+) -> None:
+    store, _ = await _store(tmp_path)
+    ref = await _commit(store)
+    serialized = artifact_ref_to_mapping(ref)
+    provenance = cast(dict[str, object], serialized["provenance"])
+    provenance.pop("derived_from_artifact_id")
+
+    class _PreLineageReferences:
+        async def list_artifact_refs(
+            self,
+            agent_id: str,
+            *,
+            run_id: str | None = None,
+            conversation_id: str | None = None,
+        ) -> tuple[ArtifactRef, ...]:
+            del agent_id
+            decoded = artifact_ref_from_mapping(serialized)
+            if run_id is not None and decoded.run_id != run_id:
+                return ()
+            if (
+                conversation_id is not None
+                and decoded.conversation_id != conversation_id
+            ):
+                return ()
+            return (decoded,)
+
+    reopened = await AgentHomeArtifactStore.open(
+        agent_id="agent-one",
+        agent_home=store.agent_home,
+        references=_PreLineageReferences(),
+        clock=lambda: NOW,
+        id_factory=_artifact_ids(),
+    )
+    assert reopened.available
+    payload = await reopened.read(ref.artifact_id)
+    assert payload.content == b"# Result\n"
+    assert payload.ref.provenance.derived_from_artifact_id is None
+    canonical = artifact_ref_to_mapping(payload.ref)
+    canonical_provenance = cast(dict[str, object], canonical["provenance"])
+    assert canonical_provenance["derived_from_artifact_id"] is None
+
+    invalid = dict(serialized)
+    invalid["provenance"] = {**provenance, "unexpected": True}
+    with pytest.raises(ValueError, match="invalid shape"):
+        artifact_ref_from_mapping(invalid)
+
+
 async def test_artifact_commit_returns_ref_only_after_atomic_directory_publication(
     tmp_path: Path,
 ) -> None:
@@ -547,7 +597,6 @@ async def test_clear_conversations_removes_internal_artifacts_but_preserves_deli
         result = await agent.run("Create a TXT file.")
         artifact_id = result.artifacts[0].artifact_id
         assert await agent.clear_conversations() == 1
-        assert await agent.list_artifacts() == ()
         assert (await agent.export_destination()).display_name == "export"
         assert (agent.home / "artifacts" / "delivery-config.json").is_file()
         with pytest.raises(ArtifactError) as missing:
@@ -594,7 +643,6 @@ async def test_clear_conversations_cancellation_never_leaves_a_persisted_danglin
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await clearing
-        assert await agent.list_artifacts() == ()
         with pytest.raises(ArtifactError) as missing:
             await agent.read_artifact(artifact_id)
         assert missing.value.code == "artifact_missing"

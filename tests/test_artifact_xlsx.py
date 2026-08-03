@@ -34,6 +34,7 @@ from daita.artifacts.renderers import (
     MAX_XLSX_SECONDS,
     MAX_XLSX_UNCOMPRESSED_BYTES,
     XLSX_MEDIA_TYPE,
+    read_exact_xlsx_data,
     render_exact_xlsx,
     verify_exact_xlsx,
 )
@@ -190,6 +191,27 @@ def test_exact_xlsx_frozen_scalars_precision_and_fixed_provenance() -> None:
         ("Row Count", 1),
         ("Sensitivity", "confidential"),
         ("Created At", "2026-08-01T12:30:45Z"),
+    )
+
+
+def test_fixed_xlsx_reader_preserves_data_rows_including_all_blank_rows() -> None:
+    content = render_exact_xlsx(
+        ("label", "on_date", "enabled"),
+        (
+            ("alpha", date(2026, 8, 1), True),
+            (None, None, None),
+            ("omega", None, False),
+        ),
+        provenance=_provenance(),
+    )
+
+    data = read_exact_xlsx_data(content)
+
+    assert data.columns == ("label", "on_date", "enabled")
+    assert data.rows == (
+        ("alpha", date(2026, 8, 1), True),
+        (None, None, None),
+        ("omega", None, False),
     )
 
 
@@ -571,8 +593,11 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
             for block in message.content
             if isinstance(block, TextBlock)
         )
-        assert "CSV or XLSX request" in first_request
-        assert "never place source rows or artifact bytes" in first_request
+        assert (
+            "data_export_sqlite or data_export_postgresql for exact CSV/XLSX"
+            in first_request
+        )
+        assert "Never put source rows or artifact bytes in arguments" in first_request
     finally:
         await agent.close()
 
@@ -583,13 +608,12 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
         clock=lambda: _CREATED_AT,
     )
     try:
-        refs = await reopened.list_artifacts()
-        assert len(refs) == 1
-        payload = await reopened.read_artifact(refs[0].artifact_id)
+        ref = result.artifacts[0]
+        payload = await reopened.read_artifact(ref.artifact_id)
         verify_exact_xlsx(payload.content)
-        redelivery = await reopened.save_artifact(refs[0].artifact_id)
+        redelivery = await reopened.save_artifact(ref.artifact_id)
         assert Path(redelivery.saved_path).read_bytes() == payload.content
-        assert redelivery.sha256 == refs[0].sha256
+        assert redelivery.sha256 == ref.sha256
     finally:
         await reopened.close()
 
@@ -876,7 +900,6 @@ async def test_xlsx_cancellation_emits_no_artifact_bytes_reference_or_delivery(
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await running
-        assert await agent.list_artifacts() == ()
         assert not tuple(downloads.iterdir())
     finally:
         release.set()

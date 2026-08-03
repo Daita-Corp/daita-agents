@@ -86,22 +86,20 @@ async def _create_artifact_agent(
     return agent, result.artifacts[0]
 
 
-async def test_public_list_read_and_save_work_after_restart_without_rerunning_model(
+async def test_public_known_id_read_and_save_work_after_restart_without_rerunning_model(
     tmp_path: Path,
 ) -> None:
     downloads = tmp_path / "public-downloads"
     downloads.mkdir()
     agent, ref = await _create_artifact_agent(tmp_path, "public-restart", downloads)
     try:
-        conversation_id = ref.conversation_id
+        assert ref.conversation_id
     finally:
         await agent.close()
     reopened = await Agent.open(
         "public-restart", root=tmp_path, downloads_directory=downloads
     )
     try:
-        assert await reopened.list_artifacts(run_id=ref.run_id) == (ref,)
-        assert await reopened.list_artifacts(conversation_id=conversation_id) == (ref,)
         assert (await reopened.read_artifact(ref.artifact_id)).content == (
             b"surface payload\n"
         )
@@ -340,6 +338,43 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
         for block in failed_state.blocks
     )
 
+    not_delivered = Transcript(
+        run=run,
+        messages=(
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                tool_calls=(
+                    ToolCall(
+                        id="create",
+                        name="artifact_create_document",
+                        arguments={"format": "txt", "content": "report"},
+                    ),
+                ),
+            ),
+            CanonicalMessage(
+                role=MessageRole.TOOL,
+                content=(
+                    ToolResultBlock(
+                        call_id="create",
+                        output={
+                            "kind": "artifact.document",
+                            "data": {"format": "txt", "character_count": 6},
+                            "artifact": {"artifact_id": ref.artifact_id},
+                            "delivery_status": "not_delivered",
+                        },
+                    ),
+                ),
+            ),
+        ),
+    )
+    not_delivered_state = terminal_tui.TerminalViewState("agent", "model", "no sources")
+    not_delivered_state.hydrate_transcript(not_delivered, run_id=ref.run_id)
+    assert any(
+        block.kind == "artifact.delivery"
+        and "was created internally but was not saved locally" in block.text
+        for block in not_delivered_state.blocks
+    )
+
 
 def test_open_reveal_and_folder_picker_are_user_actions_not_model_or_shell_tools() -> (
     None
@@ -421,7 +456,7 @@ async def test_fake_provider_markdown_vertical_slice_commits_delivers_restarts_a
         assert (await agent.read_artifact(artifact_id)).content == (
             b"# Report\n\nVerified content.\n"
         )
-        conversation_id = result.conversation_id
+        assert result.conversation_id
     finally:
         await agent.close()
 
@@ -431,9 +466,6 @@ async def test_fake_provider_markdown_vertical_slice_commits_delivers_restarts_a
         downloads_directory=downloads,
     )
     try:
-        assert await reopened.list_artifacts(conversation_id=conversation_id) == (
-            result.artifacts[0],
-        )
         assert (await reopened.read_artifact(artifact_id)).content == (
             b"# Report\n\nVerified content.\n"
         )

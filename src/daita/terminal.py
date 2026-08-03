@@ -2161,7 +2161,7 @@ async def _write_artifact_outcomes(
         return
     try:
         transcript = await agent.transcript(run_id)
-        failures = terminal_tui._artifact_delivery_failures(
+        failures = terminal_tui._artifact_delivery_messages(
             terminal_tui._completed_tool_pairs(transcript)
         )
     except asyncio.CancelledError:

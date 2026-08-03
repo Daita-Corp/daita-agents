@@ -119,6 +119,7 @@ class ArtifactResourceBinding:
 class ArtifactProvenance:
     authorship: ArtifactAuthorship
     evidence_call_ids: tuple[str, ...] = ()
+    derived_from_artifact_id: str | None = None
     resource_bindings: tuple[ArtifactResourceBinding, ...] = ()
     sql_fingerprint: str | None = None
     parameters_sha256: str | None = None
@@ -133,6 +134,14 @@ class ArtifactProvenance:
             raise ValueError("artifact evidence_call_ids exceed their distinct bound")
         for item in evidence:
             _required_text(item, "artifact evidence call id", maximum=256)
+        if self.derived_from_artifact_id is not None and (
+            not isinstance(self.derived_from_artifact_id, str)
+            or _ARTIFACT_ID.fullmatch(self.derived_from_artifact_id) is None
+        ):
+            raise ValueError(
+                "artifact derived_from_artifact_id must use "
+                "artifact-<32 lowercase hex>"
+            )
         bindings = tuple(self.resource_bindings)
         if len(bindings) > 64 or any(
             not isinstance(item, ArtifactResourceBinding) for item in bindings
@@ -162,7 +171,8 @@ class ArtifactProvenance:
         if self.parameters_sha256 is not None:
             _digest(self.parameters_sha256, "artifact parameters_sha256")
         if self.authorship is ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS and (
-            self.sql_fingerprint is not None
+            self.derived_from_artifact_id is not None
+            or self.sql_fingerprint is not None
             or self.parameters_sha256 is not None
             or bool(columns)
             or self.row_count is not None
@@ -170,14 +180,27 @@ class ArtifactProvenance:
             raise ValueError(
                 "model-authored provenance cannot claim exact export facts"
             )
-        if self.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA and (
-            evidence
-            or not 1 <= len(bindings) <= 64
-            or self.sql_fingerprint is None
-            or self.parameters_sha256 is None
-            or self.row_count is None
-        ):
-            raise ValueError("exact-source provenance requires complete runtime facts")
+        if self.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
+            has_query_facts = (
+                self.sql_fingerprint is not None
+                or self.parameters_sha256 is not None
+                or bool(columns)
+                or self.row_count is not None
+            )
+            query_facts_complete = (
+                self.sql_fingerprint is not None
+                and self.parameters_sha256 is not None
+                and bool(columns)
+                and self.row_count is not None
+            )
+            if (
+                evidence
+                or not 1 <= len(bindings) <= 64
+                or (has_query_facts and not query_facts_complete)
+            ):
+                raise ValueError(
+                    "exact-source provenance requires complete runtime facts"
+                )
         object.__setattr__(self, "evidence_call_ids", evidence)
         object.__setattr__(self, "resource_bindings", bindings)
         object.__setattr__(self, "columns", columns)
@@ -463,6 +486,7 @@ def artifact_provenance_to_mapping(value: ArtifactProvenance) -> dict[str, objec
     return {
         "authorship": value.authorship.value,
         "evidence_call_ids": value.evidence_call_ids,
+        "derived_from_artifact_id": value.derived_from_artifact_id,
         "resource_bindings": tuple(
             {
                 "source_id": item.source_id,
@@ -480,21 +504,24 @@ def artifact_provenance_to_mapping(value: ArtifactProvenance) -> dict[str, objec
 
 
 def artifact_provenance_from_mapping(value: Mapping[str, object]) -> ArtifactProvenance:
-    _exact_keys(
-        value,
-        frozenset(
-            {
-                "authorship",
-                "evidence_call_ids",
-                "resource_bindings",
-                "sql_fingerprint",
-                "parameters_sha256",
-                "columns",
-                "row_count",
-            }
-        ),
-        "artifact provenance",
+    expected_keys = frozenset(
+        {
+            "authorship",
+            "evidence_call_ids",
+            "derived_from_artifact_id",
+            "resource_bindings",
+            "sql_fingerprint",
+            "parameters_sha256",
+            "columns",
+            "row_count",
+        }
     )
+    actual_keys = set(value)
+    if actual_keys not in (
+        expected_keys,
+        expected_keys - {"derived_from_artifact_id"},
+    ):
+        raise ValueError("artifact provenance has an invalid shape")
     raw_bindings = value.get("resource_bindings", ())
     if not isinstance(raw_bindings, (tuple, list)):
         raise ValueError("artifact resource_bindings must be an array")
@@ -540,6 +567,11 @@ def artifact_provenance_from_mapping(value: Mapping[str, object]) -> ArtifactPro
     row_count = raw_row_count if type(raw_row_count) is int else None
     sql_fingerprint = value.get("sql_fingerprint")
     parameters_sha256 = value.get("parameters_sha256")
+    derived_from_artifact_id = value.get("derived_from_artifact_id")
+    if derived_from_artifact_id is not None and not isinstance(
+        derived_from_artifact_id, str
+    ):
+        raise ValueError("artifact derived_from_artifact_id is invalid")
     if sql_fingerprint is not None and not isinstance(sql_fingerprint, str):
         raise ValueError("artifact provenance sql_fingerprint is invalid")
     if parameters_sha256 is not None and not isinstance(parameters_sha256, str):
@@ -547,6 +579,7 @@ def artifact_provenance_from_mapping(value: Mapping[str, object]) -> ArtifactPro
     return ArtifactProvenance(
         authorship=ArtifactAuthorship(value.get("authorship")),
         evidence_call_ids=tuple(evidence),
+        derived_from_artifact_id=derived_from_artifact_id,
         resource_bindings=tuple(bindings),
         sql_fingerprint=sql_fingerprint,
         parameters_sha256=parameters_sha256,

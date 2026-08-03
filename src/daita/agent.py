@@ -14,7 +14,6 @@ from .artifacts.models import (
     ArtifactDeliveryReceipt,
     ArtifactDestination,
     ArtifactPayload,
-    ArtifactRef,
 )
 from .adapters.models import SourceRegistration
 from .adapters.postgresql import (
@@ -276,25 +275,6 @@ class Agent:
         """Delete transcripts and candidate records, not approved knowledge."""
 
         return await self._embedded.clear_conversations()
-
-    async def list_artifacts(
-        self,
-        *,
-        run_id: str | None = None,
-        conversation_id: str | None = None,
-    ) -> tuple[ArtifactRef, ...]:
-        for value, name in (
-            (run_id, "run_id"),
-            (conversation_id, "conversation_id"),
-        ):
-            if value is not None and (
-                not isinstance(value, str) or not value.strip() or len(value) > 256
-            ):
-                raise ValueError(f"{name} must be bounded non-empty text or None")
-        return await self._embedded.list_artifacts(
-            run_id=run_id,
-            conversation_id=conversation_id,
-        )
 
     async def read_artifact(self, artifact_id: str) -> ArtifactPayload:
         _validate_artifact_id(artifact_id)

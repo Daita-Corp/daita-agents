@@ -218,10 +218,13 @@ class ToolExecution:
     run_id: str
     capability_id: str
     arguments: Mapping[str, object] = field(default_factory=dict)
+    conversation_id: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.run_id, "tool run_id")
         _text(self.capability_id, "tool capability_id")
+        if self.conversation_id is not None:
+            _text(self.conversation_id, "tool conversation_id")
         object.__setattr__(
             self, "arguments", FrozenJsonObject.from_mapping(self.arguments)
         )

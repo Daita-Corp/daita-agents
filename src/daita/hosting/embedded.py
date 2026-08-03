@@ -25,7 +25,6 @@ from ..artifacts.models import (
     ArtifactDeliveryReceipt,
     ArtifactDestination,
     ArtifactPayload,
-    ArtifactRef,
 )
 from ..artifacts.store import AgentHomeArtifactStore
 from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySource
@@ -717,9 +716,8 @@ class EmbeddedAgent:
             identity.id,
             postgresql_backend,
         )
-        local_files = local_file_read_declarations(
-            identity.id, LocalDirectoryReadBackend(store, store)
-        )
+        local_file_backend = LocalDirectoryReadBackend(store, store)
+        local_files = local_file_read_declarations(identity.id, local_file_backend)
         mutation_lock = asyncio.Lock()
         memory_store = MemoryStore(home, mutation_lock)
         skill_store = SkillStore(home, mutation_lock)
@@ -759,7 +757,9 @@ class EmbeddedAgent:
         artifacts = (
             artifact_capability_declarations(
                 artifact_delivery,
+                artifact_store,
                 agent_id=identity.id,
+                local_file_backend=local_file_backend,
                 sqlite_backend=sqlite_backend,
                 postgresql_backend=postgresql_backend,
                 clock=clock,
@@ -1211,18 +1211,6 @@ class EmbeddedAgent:
             if cancelled:
                 raise asyncio.CancelledError
             return cleared
-
-    async def list_artifacts(
-        self,
-        *,
-        run_id: str | None = None,
-        conversation_id: str | None = None,
-    ) -> tuple[ArtifactRef, ...]:
-        self._require_open()
-        return await self._artifact_store.list_refs(
-            run_id=run_id,
-            conversation_id=conversation_id,
-        )
 
     async def read_artifact(self, artifact_id: str) -> ArtifactPayload:
         self._require_open()

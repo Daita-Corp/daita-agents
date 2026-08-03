@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 from importlib import import_module
@@ -14,7 +14,7 @@ import math
 import re
 import stat
 import time as time_module
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 from uuid import UUID
 from xml.etree import ElementTree
 from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
@@ -411,6 +411,14 @@ class ExactXlsxProvenance:
             "created_at",
             self.created_at.astimezone(timezone.utc).replace(microsecond=0),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ExactXlsxData:
+    """Typed values from the one fixed Daita XLSX Data worksheet."""
+
+    columns: tuple[str, ...]
+    rows: tuple[tuple[object, ...], ...]
 
 
 class ExactXlsxRenderer:
@@ -822,6 +830,195 @@ def verify_exact_xlsx(
     )
     if format_codes not in {(), ("yyyy-mm-dd",)}:
         _invalid_xlsx("locale_sensitive_format", completed_bytes=len(content))
+
+
+def read_exact_xlsx_data(
+    content: bytes,
+    *,
+    max_rows: int = MAX_XLSX_ROWS,
+    max_columns: int = MAX_XLSX_COLUMNS,
+    max_seconds: float = MAX_XLSX_SECONDS,
+    clock: Callable[[], float] = time_module.monotonic,
+) -> ExactXlsxData:
+    """Read only the fixed, verified Daita XLSX Data worksheet."""
+
+    if (
+        not isinstance(max_rows, int)
+        or isinstance(max_rows, bool)
+        or max_rows < 1
+        or not isinstance(max_columns, int)
+        or isinstance(max_columns, bool)
+        or max_columns < 1
+    ):
+        raise ValueError("XLSX read bounds must be positive integers")
+    if (
+        not isinstance(max_seconds, (int, float))
+        or isinstance(max_seconds, bool)
+        or not math.isfinite(float(max_seconds))
+        or float(max_seconds) <= 0
+    ):
+        raise ValueError("XLSX read time bound must be finite and positive")
+    deadline = clock() + float(max_seconds)
+    verify_exact_xlsx(content)
+    if clock() >= deadline:
+        _xlsx_read_failed("time_limit")
+    try:
+        with ZipFile(BytesIO(content), "r") as archive:
+            shared_root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+            sheet_root = ElementTree.fromstring(
+                archive.read("xl/worksheets/sheet1.xml")
+            )
+            provenance_root = ElementTree.fromstring(
+                archive.read("xl/worksheets/sheet2.xml")
+            )
+    except (BadZipFile, KeyError, OSError, ElementTree.ParseError) as error:
+        raise ArtifactError(
+            "artifact_invalid_format",
+            "The XLSX artifact does not match Daita's fixed workbook format.",
+            {"media_type": XLSX_MEDIA_TYPE, "reason": "invalid_package"},
+        ) from error
+    shared_strings = tuple(
+        "".join(node.itertext())
+        for node in shared_root.findall(f"{{{_SPREADSHEET_NAMESPACE}}}si")
+    )
+    sheet_data = sheet_root.find(f"{{{_SPREADSHEET_NAMESPACE}}}sheetData")
+    if sheet_data is None:
+        _xlsx_read_failed("missing_data_sheet")
+    total_rows = _xlsx_provenance_row_count(provenance_root, shared_strings)
+    if total_rows > max_rows:
+        _xlsx_read_failed("row_limit")
+    parsed_rows: dict[int, tuple[object, ...]] = {}
+    for row_node in sheet_data.findall(f"{{{_SPREADSHEET_NAMESPACE}}}row"):
+        if clock() >= deadline:
+            _xlsx_read_failed("time_limit")
+        raw_row_number = row_node.get("r")
+        if raw_row_number is None or not raw_row_number.isdecimal():
+            _xlsx_read_failed("invalid_row_reference")
+        row_number = int(raw_row_number)
+        if not 1 <= row_number <= total_rows + 1 or row_number in parsed_rows:
+            _xlsx_read_failed("invalid_row_reference")
+        values: dict[int, object] = {}
+        for cell in row_node.findall(f"{{{_SPREADSHEET_NAMESPACE}}}c"):
+            reference = cell.get("r", "")
+            column_index = _xlsx_column_index(reference)
+            if _xlsx_row_index(reference) != row_number:
+                _xlsx_read_failed("invalid_cell_reference")
+            if column_index >= max_columns:
+                _xlsx_read_failed("column_limit")
+            if column_index in values:
+                _xlsx_read_failed("duplicate_cell")
+            values[column_index] = _xlsx_cell_value(cell, shared_strings)
+        width = max(values, default=-1) + 1
+        parsed_rows[row_number] = tuple(values.get(index) for index in range(width))
+    if 1 not in parsed_rows:
+        _xlsx_read_failed("missing_header")
+    raw_columns = parsed_rows[1]
+    if not raw_columns or any(not isinstance(item, str) for item in raw_columns):
+        _xlsx_read_failed("invalid_header")
+    columns = _validated_tabular_columns(
+        cast(tuple[str, ...], raw_columns),
+        max_columns,
+        format_name="XLSX",
+    )
+    rows = tuple(
+        tuple((*row, *(None for _ in range(len(columns) - len(row)))))
+        for row_number in range(2, total_rows + 2)
+        for row in (parsed_rows.get(row_number, ()),)
+    )
+    if any(len(row) > len(columns) for row in rows):
+        _xlsx_read_failed("invalid_row_shape")
+    return ExactXlsxData(columns=columns, rows=rows)
+
+
+def _xlsx_cell_value(
+    cell: ElementTree.Element,
+    shared_strings: tuple[str, ...],
+) -> object:
+    value = cell.findtext(f"{{{_SPREADSHEET_NAMESPACE}}}v")
+    cell_type = cell.get("t")
+    if value is None:
+        return None
+    if cell_type == "s":
+        try:
+            return shared_strings[int(value)]
+        except (IndexError, ValueError) as error:
+            raise ArtifactError(
+                "artifact_invalid_format",
+                "The XLSX artifact contains an invalid shared-string reference.",
+                {"media_type": XLSX_MEDIA_TYPE, "reason": "invalid_shared_string"},
+            ) from error
+    if cell_type == "b":
+        if value not in {"0", "1"}:
+            _xlsx_read_failed("invalid_boolean")
+        return value == "1"
+    if cell_type not in {None, "n"}:
+        _xlsx_read_failed("unsupported_cell_type")
+    try:
+        number: int | float = (
+            int(value) if re.fullmatch(r"-?[0-9]+", value) else float(value)
+        )
+    except ValueError as error:
+        raise ArtifactError(
+            "artifact_invalid_format",
+            "The XLSX artifact contains an invalid numeric cell.",
+            {"media_type": XLSX_MEDIA_TYPE, "reason": "invalid_number"},
+        ) from error
+    if isinstance(number, float) and not math.isfinite(number):
+        _xlsx_read_failed("invalid_number")
+    if cell.get("s") == "1":
+        if isinstance(number, float) and not number.is_integer():
+            _xlsx_read_failed("invalid_date")
+        try:
+            return date(1899, 12, 30) + timedelta(days=int(number))
+        except (OverflowError, ValueError) as error:
+            raise ArtifactError(
+                "artifact_invalid_format",
+                "The XLSX artifact contains an invalid date cell.",
+                {"media_type": XLSX_MEDIA_TYPE, "reason": "invalid_date"},
+            ) from error
+    return number
+
+
+def _xlsx_column_index(reference: str) -> int:
+    match = re.fullmatch(r"([A-Z]+)[1-9][0-9]*", reference)
+    if match is None:
+        _xlsx_read_failed("invalid_cell_reference")
+    result = 0
+    for character in match.group(1):
+        result = result * 26 + ord(character) - ord("A") + 1
+    return result - 1
+
+
+def _xlsx_row_index(reference: str) -> int:
+    match = re.fullmatch(r"[A-Z]+([1-9][0-9]*)", reference)
+    if match is None:
+        _xlsx_read_failed("invalid_cell_reference")
+    return int(match.group(1))
+
+
+def _xlsx_provenance_row_count(
+    root: ElementTree.Element,
+    shared_strings: tuple[str, ...],
+) -> int:
+    sheet_data = root.find(f"{{{_SPREADSHEET_NAMESPACE}}}sheetData")
+    if sheet_data is None:
+        _xlsx_read_failed("missing_provenance_sheet")
+    for row in sheet_data.findall(f"{{{_SPREADSHEET_NAMESPACE}}}row"):
+        cells = row.findall(f"{{{_SPREADSHEET_NAMESPACE}}}c")
+        values = tuple(_xlsx_cell_value(cell, shared_strings) for cell in cells)
+        if values[:1] == ("Row Count",):
+            if len(values) != 2 or type(values[1]) is not int or values[1] < 0:
+                _xlsx_read_failed("invalid_provenance_row_count")
+            return cast(int, values[1])
+    _xlsx_read_failed("missing_provenance_row_count")
+
+
+def _xlsx_read_failed(reason: str) -> NoReturn:
+    raise ArtifactError(
+        "artifact_invalid_format",
+        "The XLSX artifact does not match Daita's fixed workbook format.",
+        {"media_type": XLSX_MEDIA_TYPE, "reason": reason},
+    )
 
 
 def _load_xlsxwriter() -> Any:

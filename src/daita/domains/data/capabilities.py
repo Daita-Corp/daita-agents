@@ -23,6 +23,7 @@ from .controller import (
     SQLITE_QUERY_EVIDENCE_KIND,
 )
 from .results import BoundedResultProjection
+from .sql import MAX_SQL_CHARACTERS, MAX_SQL_PARAMETERS
 
 SQLITE_QUERY_EXECUTOR_ID = "data.sqlite.query.executor"
 POSTGRESQL_QUERY_EXECUTOR_ID = "data.postgresql.query.executor"
@@ -233,8 +234,15 @@ def _query_declarations(
             "type": "object",
             "properties": {
                 "source_id": {"type": "string"},
-                "sql": {"type": "string"},
-                "parameters": {"type": "array"},
+                "sql": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_SQL_CHARACTERS,
+                },
+                "parameters": {
+                    "type": "array",
+                    "maxItems": MAX_SQL_PARAMETERS,
+                },
             },
             "required": ["source_id", "sql"],
             "additionalProperties": False,

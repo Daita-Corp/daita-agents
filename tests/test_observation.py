@@ -618,7 +618,7 @@ async def test_public_create_and_open_inject_the_observer(tmp_path):
     first_provider = MockModelProvider((_stop("created"),))
     profile = ModelProfile(
         id=first_provider.provider_id,
-        context_window_tokens=10_000,
+        context_window_tokens=20_000,
         max_output_tokens=1_000,
         supports_tools=True,
     )

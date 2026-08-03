@@ -4,17 +4,18 @@ from collections import defaultdict
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from daita import Agent, ApprovalDecision, ApprovalRequest, ArtifactError
 from daita._json import FrozenJsonObject
+import daita.domains.data.controller as data_controller
 from daita.domains.data.context import DataContextBuilder
-from daita.domains.data.controller import (
-    _explicit_artifact_request,
-    _explicit_default_location_request,
-)
 from daita.domains.data.export_capabilities import (
+    ARTIFACT_CONVERT_TOOL_NAME,
+    ARTIFACT_LIST_TOOL_NAME,
+    ARTIFACT_READ_TOOL_NAME,
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
     ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
     DOCUMENT_CREATE_TOOL_NAME,
@@ -83,68 +84,38 @@ def _result_error_code(result: ToolResultBlock) -> str:
     return code
 
 
-@pytest.mark.parametrize(
-    "message",
-    (
-        "Create a document containing these notes.",
-        "Save this analysis as Markdown.",
-        "Download the report.",
-        "Write these results to a TXT file.",
-        "Put this in a document.",
-    ),
-)
-def test_explicit_artifact_intent_accepts_only_creation_or_delivery_requests(
-    message: str,
-) -> None:
-    assert _explicit_artifact_request(message)
-
-
-@pytest.mark.parametrize(
-    "message",
-    (
-        "Show my user profile.",
-        "Explain how file downloads work.",
-        "Explain what the save file command does.",
-        "List the attached files.",
-        "Read this file.",
-        "Analyze the filesystem schema.",
-        "Do not save this as a file.",
-    ),
-)
-def test_artifact_intent_rejects_mentions_questions_reads_and_negation(
-    message: str,
-) -> None:
-    assert not _explicit_artifact_request(message)
-
-
-@pytest.mark.parametrize(
-    "message",
-    (
-        "Make Downloads my default export location.",
-        "From now on save exports here.",
-        "Change my default export folder.",
-        "Always use this destination for future exports.",
-    ),
-)
-def test_default_location_intent_requires_an_explicit_persistent_change(
-    message: str,
-) -> None:
-    assert _explicit_default_location_request(message)
-
-
-@pytest.mark.parametrize(
-    "message",
-    (
-        "What is my default export location?",
-        "Save this file to Downloads once.",
-        "List my export destinations.",
-        "Do not change my default folder.",
-    ),
-)
-def test_default_location_intent_rejects_queries_and_one_time_language(
-    message: str,
-) -> None:
-    assert not _explicit_default_location_request(message)
+def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -> None:
+    assert not hasattr(data_controller, "_explicit_artifact_request")
+    assert not hasattr(data_controller, "_explicit_default_location_request")
+    declarations = artifact_extension_declarations()
+    schemas = {
+        view.name: next(
+            item for item in declarations.capabilities if item.id == view.capability_id
+        ).input_schema
+        for view in declarations.tool_views
+        if view.name
+        in {
+            ARTIFACT_LIST_TOOL_NAME,
+            ARTIFACT_READ_TOOL_NAME,
+            ARTIFACT_CONVERT_TOOL_NAME,
+        }
+    }
+    properties = {name: schema.get("properties") for name, schema in schemas.items()}
+    assert all(isinstance(value, Mapping) for value in properties.values())
+    list_properties = cast(Mapping[str, object], properties[ARTIFACT_LIST_TOOL_NAME])
+    read_properties = cast(Mapping[str, object], properties[ARTIFACT_READ_TOOL_NAME])
+    convert_properties = cast(
+        Mapping[str, object], properties[ARTIFACT_CONVERT_TOOL_NAME]
+    )
+    assert set(list_properties) == set()
+    assert set(read_properties) == {"artifact_id"}
+    assert set(convert_properties) == {
+        "artifact_id",
+        "format",
+        "filename",
+    }
+    for schema in schemas.values():
+        assert schema["additionalProperties"] is False
 
 
 def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite() -> (
@@ -293,7 +264,8 @@ async def test_system_and_persistent_save_preflight_are_preauthorized_for_explic
         selected = await agent.set_export_destination(persistent)
         assert selected.destination_id == destination_id
         second = await agent.run(
-            "Save the existing artifact to my persistent export location."
+            "Save the existing artifact to my persistent export location.",
+            conversation_id=first.conversation_id,
         )
         assert len(first.artifact_deliveries) == 1
         assert len(second.artifact_deliveries) == 1
@@ -328,7 +300,8 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
         downloads_directory=downloads,
     )
     try:
-        artifact_id = (await agent.run("Create a file.")).artifacts[0].artifact_id
+        created = await agent.run("Create a file.")
+        artifact_id = created.artifacts[0].artifact_id
         run_id = "run-ffffffffffffffffffffffffffffffff"
         destination = await agent._embedded._artifact_delivery.register_one_time(
             one_time,
@@ -339,7 +312,7 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
             agent_id=agent.id,
             message="Save this file once to the selected folder.",
             created_at=agent._embedded.identity.created_at,
-            conversation_id="conversation-ffffffffffffffffffffffffffffffff",
+            conversation_id=created.conversation_id,
         )
         result = (
             await agent._embedded._data_tool_runtime.execute_all(
@@ -509,6 +482,13 @@ async def test_context_requires_default_delivery_before_final_text_for_explicit_
             'artifact_save_local with destination_id="default" before normal' in system
         )
         assert "Normal assistant text ends the run" in system
+        assert "Ordinary user wording is not an exact stored value" in system
+        assert "bounded validated value read" in system
+        assert "A committed artifact reference proves only internal creation" in system
+        assert (
+            "Only a successful artifact delivery receipt proves a local file exists"
+            in system
+        )
     finally:
         await agent.close()
 
@@ -535,128 +515,39 @@ async def test_context_does_not_create_artifacts_for_ordinary_analysis_or_reads(
         await agent.close()
 
 
-async def test_non_artifact_message_cannot_authorize_preapproved_local_save(
+async def test_model_artifact_tools_are_projected_without_prompt_classification(
     tmp_path: Path,
 ) -> None:
     downloads = tmp_path / "downloads"
     downloads.mkdir()
-    artifact_id = "artifact-00000000000000000000000000000001"
-    provider = MockModelProvider(
-        (
-            _document_call(),
-            _stop("created"),
-            _call(
-                "unrequested-save",
-                ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-                {"artifact_id": artifact_id, "destination_id": "default"},
-            ),
-            _stop("blocked"),
-        ),
-        provider_id="mock:artifact-intent-authority",
-    )
-    approvals: list[ApprovalRequest] = []
-
-    async def approve(request: ApprovalRequest) -> ApprovalDecision:
-        approvals.append(request)
-        return ApprovalDecision.APPROVE
-
+    provider = MockModelProvider((_stop("analysis"),), provider_id="mock:model-led")
     agent = await Agent.create(
-        "artifact-intent-authority",
+        "artifact-model-led",
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
-        id_factory=_ids(),
-        approval_handler=approve,
         downloads_directory=downloads,
     )
     try:
-        created = await agent.run("Create a TXT file.")
-        assert created.artifacts[0].artifact_id == artifact_id
-        blocked = await agent.run("Show my user profile.")
-        transcript = await agent.transcript(blocked.run_id)
-        results = tuple(
-            block
-            for message in transcript.messages
-            if message.role is MessageRole.TOOL
-            for block in message.content
-            if isinstance(block, ToolResultBlock)
-        )
-        assert _result_error_code(results[-1]) == "tool_not_available"
-        assert blocked.artifact_deliveries == ()
-        assert approvals == []
-        assert not tuple(downloads.iterdir())
-        assert (await agent.read_artifact(artifact_id)).content == b"result\n"
-        projected = {tool.name for tool in provider.requests[2].tools}
-        assert ARTIFACT_SAVE_LOCAL_TOOL_NAME not in projected
-    finally:
-        await agent.close()
-
-
-async def test_artifact_governance_rejects_forced_side_effect_projection(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    downloads = tmp_path / "downloads"
-    downloads.mkdir()
-    approvals: list[ApprovalRequest] = []
-
-    async def approve(request: ApprovalRequest) -> ApprovalDecision:
-        approvals.append(request)
-        return ApprovalDecision.APPROVE
-
-    agent = await Agent.create(
-        "artifact-governance-authority",
-        root=tmp_path,
-        approval_handler=approve,
-        downloads_directory=downloads,
-    )
-    runtime = agent._embedded._data_tool_runtime
-
-    async def force_projection(run: RunInput) -> tuple[str, ...]:
-        del run
-        return (
-            ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+        result = await agent.run("Show my user profile.")
+        assert result.artifacts == ()
+        projected = {tool.name for tool in provider.requests[0].tools}
+        assert {
+            DOCUMENT_CREATE_TOOL_NAME,
             ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
-        )
-
-    monkeypatch.setattr(runtime, "_projected_tool_names", force_projection)
-    run = RunInput(
-        id="run-ffffffffffffffffffffffffffffffff",
-        agent_id=agent.id,
-        message="Show my user profile.",
-        created_at=agent._embedded.identity.created_at,
-        conversation_id="conversation-ffffffffffffffffffffffffffffffff",
-    )
-    try:
-        results = await runtime.execute_all(
-            run,
-            (
-                ToolCall(
-                    id="forced-save",
-                    name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-                    arguments={
-                        "artifact_id": "artifact-ffffffffffffffffffffffffffffffff",
-                        "destination_id": "default",
-                    },
-                ),
-                ToolCall(
-                    id="forced-default",
-                    name=ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
-                    arguments={"destination_id": "destination-system-downloads"},
-                ),
-            ),
-        )
-        assert tuple(_result_error_code(result) for result in results) == (
-            "tool_not_available",
-            "tool_not_available",
-        )
-        assert approvals == []
+        } <= projected
+        assert {
+            ARTIFACT_LIST_TOOL_NAME,
+            ARTIFACT_READ_TOOL_NAME,
+            ARTIFACT_CONVERT_TOOL_NAME,
+            ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+        }.isdisjoint(projected)
         assert not tuple(downloads.iterdir())
     finally:
         await agent.close()
 
 
-async def test_default_location_request_projects_only_its_governed_artifact_tool(
+async def test_default_location_request_leaves_operation_choice_to_the_model(
     tmp_path: Path,
 ) -> None:
     downloads = tmp_path / "downloads"
@@ -678,7 +569,7 @@ async def test_default_location_request_projects_only_its_governed_artifact_tool
         projected = {tool.name for tool in request.tools}
         assert ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME in projected
         assert ARTIFACT_SAVE_LOCAL_TOOL_NAME not in projected
-        assert DOCUMENT_CREATE_TOOL_NAME not in projected
+        assert DOCUMENT_CREATE_TOOL_NAME in projected
         system = "\n".join(
             block.text
             for message in request.messages

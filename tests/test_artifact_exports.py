@@ -742,6 +742,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
 
         export_result = transcript.messages[2].content[0]
         assert isinstance(export_result, ToolResultBlock)
+        assert export_result.output["delivery_status"] == "not_delivered"
         export_data = export_result.output["data"]
         assert isinstance(export_data, Mapping)
         assert set(export_data) == {
@@ -784,7 +785,9 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         )
         assert "data_export_sqlite" in first_request_text
         assert "artifact_save_local" in first_request_text
-        assert "never place source rows or artifact bytes" in first_request_text
+        assert (
+            "Never put source rows or artifact bytes in arguments" in first_request_text
+        )
     finally:
         await agent.close()
 
@@ -792,12 +795,11 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         "csv-public", root=tmp_path, downloads_directory=downloads
     )
     try:
-        refs = await reopened.list_artifacts()
-        assert len(refs) == 1
-        assert (await reopened.read_artifact(refs[0].artifact_id)).content == expected
-        redelivery = await reopened.save_artifact(refs[0].artifact_id)
+        ref = result.artifacts[0]
+        assert (await reopened.read_artifact(ref.artifact_id)).content == expected
+        redelivery = await reopened.save_artifact(ref.artifact_id)
         assert Path(redelivery.saved_path).read_bytes() == expected
-        assert redelivery.sha256 == refs[0].sha256
+        assert redelivery.sha256 == ref.sha256
     finally:
         await reopened.close()
 
@@ -855,7 +857,6 @@ async def test_csv_export_reuses_current_sql_and_catalog_validation(
         assert isinstance(block, ToolResultBlock)
         assert _error_code(block) == expected
         assert result.artifacts == ()
-        assert await agent.list_artifacts() == ()
     finally:
         await agent.close()
 
@@ -938,7 +939,6 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
         )
         assert isinstance(detached_block, ToolResultBlock)
         assert _error_code(detached_block) == "tool_not_available"
-        assert await agent.list_artifacts() == ()
     finally:
         await agent.close()
 
@@ -1065,7 +1065,6 @@ async def test_exact_csv_cancellation_emits_no_artifact_or_partial_reference(
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await running
-        assert await agent.list_artifacts() == ()
         assert not tuple(downloads.iterdir())
     finally:
         release.set()

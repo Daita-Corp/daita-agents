@@ -492,6 +492,8 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
         assert resolved == capability
         await agent.run("What can you do?")
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
+            "artifact_create_document",
+            "artifact_set_export_location",
             "memory_set",
             "skill_delete",
             "skill_save",
@@ -694,6 +696,8 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
         result = await agent.run("Do not mutate anything")
         transcript = await agent.transcript(result.run_id)
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
+            "artifact_create_document",
+            "artifact_set_export_location",
             "memory_set",
             "skill_delete",
             "skill_save",

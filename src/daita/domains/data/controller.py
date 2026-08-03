@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from hashlib import sha256
-import re
 from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject, canonical_json
@@ -21,6 +20,7 @@ from ...artifacts.models import (
     artifact_ref_to_mapping,
     canonical_artifact_filename,
 )
+from ...artifacts.renderers import XLSX_MEDIA_TYPE
 from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
     AccessMode,
@@ -98,9 +98,13 @@ from .file_capabilities import (
     LOCAL_FILE_READ_EVIDENCE_KIND,
 )
 from .export_capabilities import (
+    ARTIFACT_CONVERT_CAPABILITY_ID,
+    ARTIFACT_LIST_CAPABILITY_ID,
+    ARTIFACT_READ_CAPABILITY_ID,
     ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
     ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     DOCUMENT_CREATE_CAPABILITY_ID,
+    LOCAL_FILE_COPY_CAPABILITY_ID,
     POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
     SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
 )
@@ -135,8 +139,12 @@ _MVP_CAPABILITIES = frozenset(
         SEMANTIC_SAVE_CAPABILITY_ID,
         SEMANTIC_DELETE_CAPABILITY_ID,
         DOCUMENT_CREATE_CAPABILITY_ID,
+        LOCAL_FILE_COPY_CAPABILITY_ID,
         SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
         POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+        ARTIFACT_LIST_CAPABILITY_ID,
+        ARTIFACT_READ_CAPABILITY_ID,
+        ARTIFACT_CONVERT_CAPABILITY_ID,
         ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
         ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     }
@@ -149,91 +157,9 @@ _SEMANTIC_CAPABILITIES = frozenset(
         SEMANTIC_DELETE_CAPABILITY_ID,
     }
 )
-_ARTIFACT_CREATE_SAVE_CAPABILITIES = frozenset(
-    {
-        DOCUMENT_CREATE_CAPABILITY_ID,
-        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-        ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
-    }
-)
 _EXACT_TABULAR_CAPABILITIES = frozenset(
     {SQLITE_TABULAR_EXPORT_CAPABILITY_ID, POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}
 )
-_ARTIFACT_ACTION_WORDS = frozenset(
-    {
-        "create",
-        "download",
-        "export",
-        "generate",
-        "make",
-        "package",
-        "produce",
-        "put",
-        "save",
-        "turn",
-        "write",
-    }
-)
-_ARTIFACT_OBJECT_WORDS = frozenset(
-    {
-        "artifact",
-        "artifacts",
-        "csv",
-        "disk",
-        "document",
-        "documents",
-        "file",
-        "files",
-        "markdown",
-        "md",
-        "report",
-        "reports",
-        "spreadsheet",
-        "spreadsheets",
-        "txt",
-        "workbook",
-        "workbooks",
-        "xlsx",
-    }
-)
-_ARTIFACT_DEICTIC_WORDS = frozenset({"it", "that", "them", "this"})
-_INTENT_META_WORDS = frozenset(
-    {
-        "define",
-        "describe",
-        "discuss",
-        "explain",
-        "how",
-        "list",
-        "read",
-        "show",
-        "tell",
-        "what",
-        "where",
-        "why",
-    }
-)
-_INTENT_NEGATION_WORDS = frozenset({"cannot", "dont", "never", "no", "not", "without"})
-_DEFAULT_CHANGE_ACTION_WORDS = frozenset({"change", "make", "save", "set", "use"})
-_DEFAULT_FUTURE_WORDS = frozenset(
-    {"always", "default", "future", "permanent", "permanently"}
-)
-_DEFAULT_LOCATION_WORDS = frozenset(
-    {
-        "destination",
-        "directory",
-        "downloads",
-        "export",
-        "exports",
-        "folder",
-        "here",
-        "location",
-        "there",
-    }
-)
-_INTENT_CLAUSE_SPLIT = re.compile(r"(?:[,.!?;:]+|\b(?:and|but|then)\b)")
-_INTENT_WORD = re.compile(r"[a-z0-9]+")
 _SEMANTIC_MANAGEMENT_SIGNALS = (
     "business meaning",
     "correct the definition",
@@ -493,6 +419,7 @@ class DataToolRuntime:
                 run_id=run.id,
                 capability_id=capability.id,
                 arguments=arguments,
+                conversation_id=run.conversation_id or run.id,
             )
             if capability.side_effecting:
                 result, cancelled_after_mutation = await self._execute_side_effect(
@@ -619,14 +546,40 @@ class DataToolRuntime:
                 )
             return None
         if draft.provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
-            if (
-                output.data.get("format") not in {"csv", "xlsx"}
-                or output.data.get("filename") != draft.suggested_filename
-                or output.data.get("row_count") != draft.provenance.row_count
-                or output.data.get("column_count") != len(draft.provenance.columns)
-            ):
+            if capability.id in _EXACT_TABULAR_CAPABILITIES:
+                if (
+                    output.data.get("format") not in {"csv", "xlsx"}
+                    or output.data.get("filename") != draft.suggested_filename
+                    or output.data.get("row_count") != draft.provenance.row_count
+                    or output.data.get("column_count") != len(draft.provenance.columns)
+                ):
+                    raise ToolOutputValidationError(
+                        "exact artifact summary differs from its execution provenance"
+                    )
+            elif capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
+                if (
+                    output.data.get("format") not in {"csv", "json"}
+                    or output.data.get("filename") != draft.suggested_filename
+                    or output.data.get("byte_size") != len(draft.content)
+                ):
+                    raise ToolOutputValidationError(
+                        "exact file-copy summary differs from its source bytes"
+                    )
+            elif capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
+                if (
+                    output.data.get("source_artifact_id")
+                    != draft.provenance.derived_from_artifact_id
+                    or output.data.get("format") != "csv"
+                    or output.data.get("filename") != draft.suggested_filename
+                    or output.data.get("row_count") != draft.provenance.row_count
+                    or output.data.get("column_count") != len(draft.provenance.columns)
+                ):
+                    raise ToolOutputValidationError(
+                        "artifact conversion summary differs from its snapshot facts"
+                    )
+            else:
                 raise ToolOutputValidationError(
-                    "exact artifact summary differs from its execution provenance"
+                    "exact-source artifact came from a non-export capability"
                 )
         if policy.max_artifact_count != 1:
             raise ToolOutputValidationError(
@@ -683,15 +636,27 @@ class DataToolRuntime:
     ) -> ArtifactDraft:
         provenance = draft.provenance
         if provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
-            if capability.id not in _EXACT_TABULAR_CAPABILITIES:
-                raise ToolOutputValidationError(
-                    "exact-source artifact came from a non-export capability"
+            if capability.id in _EXACT_TABULAR_CAPABILITIES:
+                return await self._bind_exact_export_provenance(
+                    run,
+                    capability,
+                    arguments,
+                    draft,
                 )
-            return await self._bind_exact_export_provenance(
-                run,
-                capability,
-                arguments,
-                draft,
+            if capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
+                return await self._bind_local_file_copy_provenance(
+                    run,
+                    arguments,
+                    draft,
+                )
+            if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
+                return await self._bind_artifact_conversion_provenance(
+                    run,
+                    arguments,
+                    draft,
+                )
+            raise ToolOutputValidationError(
+                "exact-source artifact came from a non-export capability"
             )
         if provenance.authorship is not ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS:
             raise ToolOutputValidationError("artifact authorship is not supported")
@@ -983,6 +948,182 @@ class DataToolRuntime:
             ),
         )
 
+    async def _bind_local_file_copy_provenance(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        draft: ArtifactDraft,
+    ) -> ArtifactDraft:
+        source_id = arguments.get("source_id")
+        resource_id = arguments.get("resource_id")
+        provenance = draft.provenance
+        if not isinstance(source_id, str) or not isinstance(resource_id, str):
+            raise ToolOutputValidationError(
+                "local-file copy execution arguments are unavailable"
+            )
+        if (
+            len(provenance.resource_bindings) != 1
+            or provenance.sql_fingerprint is not None
+            or provenance.parameters_sha256 is not None
+            or provenance.columns
+            or provenance.row_count is not None
+        ):
+            raise ToolOutputValidationError(
+                "local-file copy provenance differs from byte-copy facts"
+            )
+        binding = provenance.resource_bindings[0]
+        identity = await self._catalog.resource_identity(run.agent_id, resource_id)
+        if (
+            await self._catalog.source_adapter_id(run.agent_id, source_id)
+            != "local-directory"
+            or identity != (source_id, "file", binding.resource_revision)
+            or not await self._catalog.is_current_tabular_file(
+                run.agent_id,
+                source_id,
+                resource_id,
+            )
+        ):
+            raise ArtifactError(
+                "artifact_incomplete_export",
+                "Current catalog facts no longer prove the local-file copy.",
+                {
+                    "reason": "catalog_changed",
+                    "completed_rows": 0,
+                    "completed_columns": 0,
+                    "completed_bytes": len(draft.content),
+                },
+            )
+        schema = next(
+            (
+                item
+                for item in await self._catalog.resource_schemas(
+                    run.agent_id,
+                    source_id,
+                )
+                if item.resource_id == resource_id
+            ),
+            None,
+        )
+        if (
+            schema is None
+            or schema.resource_kind != "file"
+            or schema.revision != binding.resource_revision
+            or schema.source_revision != binding.source_revision
+            or binding.source_id != source_id
+            or binding.resource_id != resource_id
+        ):
+            raise ArtifactError(
+                "artifact_incomplete_export",
+                "Current catalog revisions no longer prove the local-file copy.",
+                {
+                    "reason": "catalog_changed",
+                    "completed_rows": 0,
+                    "completed_columns": 0,
+                    "completed_bytes": len(draft.content),
+                },
+            )
+        try:
+            catalog_sensitivity = Sensitivity(schema.sensitivity_class)
+        except ValueError:
+            catalog_sensitivity = Sensitivity.RESTRICTED
+        current_sensitivity = _resolved_sensitivity((catalog_sensitivity,))
+        if draft.sensitivity is not current_sensitivity:
+            raise ArtifactError(
+                "artifact_incomplete_export",
+                "Current catalog sensitivity no longer proves the local-file copy.",
+                {
+                    "reason": "catalog_changed",
+                    "completed_rows": 0,
+                    "completed_columns": 0,
+                    "completed_bytes": len(draft.content),
+                },
+            )
+        current_binding = ArtifactResourceBinding(
+            source_id=source_id,
+            source_revision=schema.source_revision,
+            resource_id=resource_id,
+            resource_revision=schema.revision,
+        )
+        return ArtifactDraft(
+            content=draft.content,
+            suggested_filename=draft.suggested_filename,
+            media_type=draft.media_type,
+            sensitivity=_resolved_sensitivity((draft.sensitivity, catalog_sensitivity)),
+            provenance=ArtifactProvenance(
+                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
+                resource_bindings=(current_binding,),
+            ),
+        )
+
+    async def _bind_artifact_conversion_provenance(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        draft: ArtifactDraft,
+    ) -> ArtifactDraft:
+        artifact_id = arguments.get("artifact_id")
+        if not isinstance(artifact_id, str):
+            raise ToolOutputValidationError(
+                "artifact conversion input identity is unavailable"
+            )
+        source = await self._current_conversation_artifact_ref(run, artifact_id)
+        if source is None:
+            raise ArtifactError(
+                "artifact_missing",
+                "The requested artifact is not available in the current conversation.",
+                {"artifact_id": artifact_id},
+            )
+        if (
+            source.capability_id not in _EXACT_TABULAR_CAPABILITIES
+            or source.media_type != XLSX_MEDIA_TYPE
+            or source.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA
+        ):
+            raise ArtifactError(
+                "artifact_invalid_format",
+                "Only a Daita-generated exact XLSX artifact can be converted to CSV.",
+                {
+                    "media_type": source.media_type,
+                    "allowed_extensions": (".xlsx",),
+                },
+            )
+        if self._artifacts is None:
+            raise ArtifactError(
+                "artifact_storage_failed",
+                "Artifact storage is unavailable.",
+                {"stage": "composition"},
+            )
+        await self._artifacts.read_ref(source)
+        provenance = draft.provenance
+        source_provenance = source.provenance
+        if (
+            provenance.derived_from_artifact_id != source.artifact_id
+            or provenance.resource_bindings != source_provenance.resource_bindings
+            or provenance.sql_fingerprint != source_provenance.sql_fingerprint
+            or provenance.parameters_sha256 != source_provenance.parameters_sha256
+            or provenance.columns != source_provenance.columns
+            or provenance.row_count != source_provenance.row_count
+            or draft.sensitivity is not source.sensitivity
+            or draft.media_type != "text/csv"
+        ):
+            raise ToolOutputValidationError(
+                "artifact conversion differs from its verified source snapshot"
+            )
+        return ArtifactDraft(
+            content=draft.content,
+            suggested_filename=draft.suggested_filename,
+            media_type="text/csv",
+            sensitivity=source.sensitivity,
+            provenance=ArtifactProvenance(
+                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
+                derived_from_artifact_id=source.artifact_id,
+                resource_bindings=source_provenance.resource_bindings,
+                sql_fingerprint=source_provenance.sql_fingerprint,
+                parameters_sha256=source_provenance.parameters_sha256,
+                columns=source_provenance.columns,
+                row_count=source_provenance.row_count,
+            ),
+        )
+
     async def _execute_side_effect(
         self,
         run: RunInput,
@@ -996,22 +1137,6 @@ class DataToolRuntime:
             or not capability.side_effecting
         ):
             raise ValueError("side-effect execution requires a write capability")
-        if (
-            capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
-            and not _explicit_artifact_request(run.message)
-        ) or (
-            capability.id == ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID
-            and not _explicit_default_location_request(run.message)
-        ):
-            return (
-                _error(
-                    call,
-                    "tool_not_available",
-                    "The requested tool is not available for this user request.",
-                    {"tool_name": call.name},
-                ),
-                False,
-            )
         selected_candidate = self._selected_learning_candidates.get(run.id)
         if selected_candidate is not None and not candidate_matches_mutation_call(
             selected_candidate,
@@ -1813,13 +1938,57 @@ class DataToolRuntime:
                     {},
                 )
         if capability.id in {
+            ARTIFACT_READ_CAPABILITY_ID,
+            ARTIFACT_CONVERT_CAPABILITY_ID,
+        }:
+            artifact_id = arguments.get("artifact_id")
+            ref = (
+                await self._current_conversation_artifact_ref(run, artifact_id)
+                if isinstance(artifact_id, str)
+                else None
+            )
+            if ref is None:
+                return (
+                    "artifact_missing",
+                    "The requested artifact is not available in the current conversation.",
+                    {"artifact_id": artifact_id},
+                )
+            if capability.id == ARTIFACT_READ_CAPABILITY_ID and ref.media_type not in {
+                "application/json",
+                "text/csv",
+                "text/markdown",
+                "text/plain",
+                XLSX_MEDIA_TYPE,
+            }:
+                return (
+                    "artifact_invalid_format",
+                    "This artifact format does not support a model preview.",
+                    {"media_type": ref.media_type},
+                )
+            if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID and (
+                ref.capability_id not in _EXACT_TABULAR_CAPABILITIES
+                or ref.media_type != XLSX_MEDIA_TYPE
+                or ref.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA
+            ):
+                return (
+                    "artifact_invalid_format",
+                    "Only a Daita-generated exact XLSX artifact can be converted to CSV.",
+                    {
+                        "media_type": ref.media_type,
+                        "allowed_extensions": (".xlsx",),
+                    },
+                )
+        if capability.id in {
             SQLITE_QUERY_CAPABILITY_ID,
             POSTGRESQL_QUERY_CAPABILITY_ID,
             SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
             POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         }:
             return await self._validate_sql(run, capability, arguments)
-        if capability.id == LOCAL_FILE_READ_CAPABILITY_ID:
+        if capability.id in {
+            LOCAL_FILE_READ_CAPABILITY_ID,
+            LOCAL_FILE_COPY_CAPABILITY_ID,
+        }:
             source_id = arguments.get("source_id")
             resource_id = arguments.get("resource_id")
             if (
@@ -1835,6 +2004,24 @@ class DataToolRuntime:
                     {"resource_id": resource_id, "source_id": source_id},
                 )
         return None
+
+    async def _current_conversation_artifact_ref(
+        self,
+        run: RunInput,
+        artifact_id: str,
+    ) -> ArtifactRef | None:
+        if self._artifacts is None:
+            return None
+        return next(
+            (
+                item
+                for item in await self._artifacts.list_refs(
+                    conversation_id=run.conversation_id or run.id
+                )
+                if item.artifact_id == artifact_id
+            ),
+            None,
+        )
 
     def _apply_source_scope(
         self,
@@ -2055,8 +2242,17 @@ class DataToolRuntime:
             else _learning_candidate_mutation_tool(selected_candidate)
         )
         semantic_requested = _semantic_management_requested(run.message)
-        artifact_requested = _explicit_artifact_request(run.message)
-        default_location_requested = _explicit_default_location_request(run.message)
+        artifact_refs = (
+            ()
+            if self._artifacts is None
+            else await self._artifacts.list_refs(
+                conversation_id=run.conversation_id or run.id
+            )
+        )
+        has_current_run_artifacts = any(item.run_id == run.id for item in artifact_refs)
+        has_prior_conversation_artifacts = any(
+            item.run_id != run.id for item in artifact_refs
+        )
         if not semantic_requested:
             semantic_requested = await self._semantic_maintenance_requested(run)
         for name in sorted(self._registry.tool_names):
@@ -2076,13 +2272,17 @@ class DataToolRuntime:
             ):
                 continue
             if (
-                capability.id in _ARTIFACT_CREATE_SAVE_CAPABILITIES
-                and not artifact_requested
+                capability.id
+                in {
+                    ARTIFACT_LIST_CAPABILITY_ID,
+                    ARTIFACT_READ_CAPABILITY_ID,
+                    ARTIFACT_CONVERT_CAPABILITY_ID,
+                }
+                and not has_prior_conversation_artifacts
             ):
                 continue
-            if (
-                capability.id == ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID
-                and not default_location_requested
+            if capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID and not (
+                has_current_run_artifacts or has_prior_conversation_artifacts
             ):
                 continue
             candidates.append((name, view.applicability))
@@ -2257,74 +2457,6 @@ def _applicable(
     return len(matching) >= applicability.minimum_active_sources
 
 
-def _explicit_artifact_request(message: str) -> bool:
-    for tokens in _intent_clauses(message):
-        for index, action in enumerate(tokens):
-            if action not in _ARTIFACT_ACTION_WORDS:
-                continue
-            before = tokens[:index]
-            after = tokens[index + 1 :]
-            if any(item in _INTENT_META_WORDS for item in before):
-                continue
-            if any(item in _INTENT_NEGATION_WORDS for item in before[-3:]):
-                continue
-            if after[:1] and after[0] in _INTENT_NEGATION_WORDS:
-                continue
-            if any(item in _ARTIFACT_OBJECT_WORDS for item in tokens):
-                return True
-            if action in {"download", "export", "save"} and any(
-                item in _ARTIFACT_DEICTIC_WORDS for item in tokens
-            ):
-                return True
-    return False
-
-
-def _explicit_default_location_request(message: str) -> bool:
-    normalized = _normalize_intent_text(message)
-    persistent_phrase = "from now on" in normalized or "going forward" in normalized
-    for tokens in _intent_clauses(normalized):
-        for index, action in enumerate(tokens):
-            if action not in _DEFAULT_CHANGE_ACTION_WORDS:
-                continue
-            before = tokens[:index]
-            after = tokens[index + 1 :]
-            if any(item in _INTENT_META_WORDS for item in before):
-                continue
-            if any(item in _INTENT_NEGATION_WORDS for item in before[-3:]):
-                continue
-            if after[:1] and after[0] in _INTENT_NEGATION_WORDS:
-                continue
-            has_future_authority = persistent_phrase or any(
-                item in _DEFAULT_FUTURE_WORDS for item in tokens
-            )
-            has_location = any(item in _DEFAULT_LOCATION_WORDS for item in tokens)
-            if has_location and (
-                has_future_authority or action in {"change", "make", "set"}
-            ):
-                return True
-    return False
-
-
-def _intent_clauses(message: str) -> tuple[tuple[str, ...], ...]:
-    normalized = _normalize_intent_text(message)
-    return tuple(
-        tuple(_INTENT_WORD.findall(clause))
-        for clause in _INTENT_CLAUSE_SPLIT.split(normalized)
-        if clause.strip()
-    )
-
-
-def _normalize_intent_text(message: str) -> str:
-    return " ".join(
-        message.casefold()
-        .replace("don’t", "do not")
-        .replace("don't", "do not")
-        .replace("can’t", "cannot")
-        .replace("can't", "cannot")
-        .split()
-    )
-
-
 def _success(
     call: ToolCall,
     result: ToolOutput,
@@ -2337,6 +2469,7 @@ def _success(
     }
     if artifact_ref is not None:
         output["artifact"] = artifact_ref_to_mapping(artifact_ref)
+        output["delivery_status"] = "not_delivered"
     return ToolResultBlock(call_id=call.id, output=output)
 
 
