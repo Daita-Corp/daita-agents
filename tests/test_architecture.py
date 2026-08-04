@@ -1295,6 +1295,7 @@ def test_phase_three_xlsx_dependencies_are_scoped_and_integrations_remain_lazy()
         project = tomllib.load(source)["project"]
     assert "XlsxWriter>=3.2.5,<4.0.0" in project["dependencies"]
     assert "openpyxl>=3.1.0,<4.0.0" in project["optional-dependencies"]["dev"]
+    assert "types-openpyxl>=3.1.0,<4.0.0" in project["optional-dependencies"]["dev"]
     assert all("openpyxl" not in item.casefold() for item in project["dependencies"])
     assert all("pandas" not in item.casefold() for item in project["dependencies"])
     artifact_text = _python_text(PACKAGE / "artifacts")

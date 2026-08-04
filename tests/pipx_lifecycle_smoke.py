@@ -153,7 +153,6 @@ def main() -> int:
                     sys.executable,
                     "-m",
                     "build",
-                    "--no-isolation",
                     "--outdir",
                     str(distribution),
                 ],

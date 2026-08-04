@@ -90,6 +90,7 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     smoke = (ROOT / "tests/pipx_lifecycle_smoke.py").read_text(encoding="utf-8")
 
     assert "python -m build" in smoke
+    assert '"--no-isolation"' not in smoke
     assert "PIPX_HOME" in smoke
     assert "PIPX_BIN_DIR" in smoke
     assert "daita --help" in smoke
