@@ -14,7 +14,15 @@ from typing import Any, cast, TextIO
 import pytest
 from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.input import create_pipe_input
-from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+from prompt_toolkit.input.vt100_parser import Vt100Parser
+from prompt_toolkit.key_binding.bindings.mouse import xterm_sgr_mouse_events
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.mouse_events import (
+    MouseButton,
+    MouseEvent,
+    MouseEventType,
+    MouseModifier,
+)
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.styles import Style
 
@@ -561,6 +569,56 @@ async def test_full_screen_transcript_uses_page_keys_and_mouse_wheel_for_scrolli
         pipe.send_text("\x04")
         await task
         assert output.mouse_disable_count == 1
+
+
+def test_installed_prompt_toolkit_sgr_mouse_protocol_spike_is_deterministic():
+    packets = (
+        "\x1b[<0;10;5M",  # left down
+        "\x1b[<32;11;5M",  # left drag/move
+        "\x1b[<0;11;5m",  # left up
+        "\x1b[<64;12;5M",  # wheel up
+        "\x1b[<81;12;5M",  # control + wheel down
+    )
+    parsed: list[Any] = []
+    parser = Vt100Parser(parsed.append)
+
+    parser.feed_and_flush("".join(packets))
+
+    assert [(press.key, press.data) for press in parsed] == [
+        (Keys.Vt100MouseEvent, packet) for packet in packets
+    ]
+    assert xterm_sgr_mouse_events[(0, "M")] == (
+        MouseButton.LEFT,
+        MouseEventType.MOUSE_DOWN,
+        frozenset(),
+    )
+    assert xterm_sgr_mouse_events[(32, "M")] == (
+        MouseButton.LEFT,
+        MouseEventType.MOUSE_MOVE,
+        frozenset(),
+    )
+    assert xterm_sgr_mouse_events[(0, "m")] == (
+        MouseButton.LEFT,
+        MouseEventType.MOUSE_UP,
+        frozenset(),
+    )
+    assert xterm_sgr_mouse_events[(64, "M")] == (
+        MouseButton.NONE,
+        MouseEventType.SCROLL_UP,
+        frozenset(),
+    )
+    assert xterm_sgr_mouse_events[(81, "M")] == (
+        MouseButton.NONE,
+        MouseEventType.SCROLL_DOWN,
+        frozenset({MouseModifier.CONTROL}),
+    )
+    mouse_event = MouseEvent(
+        position=Point(0, 0),
+        event_type=MouseEventType.MOUSE_UP,
+        button=MouseButton.LEFT,
+        modifiers=frozenset(),
+    )
+    assert not hasattr(mouse_event, "click_count")
 
 
 async def test_terminal_controller_projects_themed_local_command_results(
@@ -1272,6 +1330,16 @@ def test_hydration_matches_results_by_call_id_and_restores_transcript_order():
             run_id="run-one",
         )
     )
+    prior_ids = {
+        block.text: block.presentation_id
+        for block in state.blocks
+        if block.kind == "tool"
+    }
+    phantom_id = prior_ids["call-phantom"]
+    assert phantom_id is not None
+    phantom_anchor = state.transcript_document.make_anchor(
+        state.transcript_document.position(phantom_id, 0)
+    )
 
     state.hydrate_transcript(transcript, run_id="run-one")
 
@@ -1279,6 +1347,10 @@ def test_hydration_matches_results_by_call_id_and_restores_transcript_order():
         first.id,
         second.id,
     ]
+    assert [
+        block.presentation_id for block in state.blocks if block.kind == "tool"
+    ] == [prior_ids[first.id], prior_ids[second.id]]
+    assert state.transcript_document.reconcile_anchor(phantom_anchor) is None
     assert "call-phantom" not in state.tool_cards
     first_details = state.tool_cards[first.id].details
     second_details = state.tool_cards[second.id].details
@@ -1522,6 +1594,109 @@ def test_success_collapse_failure_expansion_and_toggles_are_process_local():
     assert transcript.messages[1].tool_calls == (failed, succeeded)
 
 
+def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_document():
+    runtime = terminal_tui._load_terminal_runtime()
+    capabilities = terminal_tui.TerminalCapabilities("none", True)
+    state = TerminalViewState("atlas", "model", "source")
+    call = ToolCall(
+        id="call-semantic",
+        name="data_query_sqlite",
+        arguments={"source_id": "source-one", "sql": "SELECT 1 AS value"},
+    )
+    transcript = _tool_transcript(
+        (call,),
+        (
+            ToolResultBlock(
+                call_id=call.id,
+                output={
+                    "kind": "data.sqlite.query_result",
+                    "data": {
+                        "columns": ["value"],
+                        "rows": [{"value": 1}],
+                        "total_rows": 1,
+                    },
+                },
+            ),
+        ),
+    )
+    state.apply_event(
+        _event(
+            AgentEventKind.TOOL_STARTED,
+            {
+                "call_id": call.id,
+                "tool_name": call.name,
+                "capability_id": "data.sqlite.query",
+            },
+            run_id="run-one",
+        )
+    )
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=96,
+        capabilities=capabilities,
+    )
+    block = next(block for block in state.blocks if block.kind == "tool")
+    block_id = block.presentation_id
+    assert block_id is not None
+    assert state.transcript_document.text(block_id).startswith("Query SQLite\n")
+    title_anchor = state.transcript_document.make_anchor(
+        state.transcript_document.position(block_id, 0)
+    )
+
+    state.apply_event(
+        _event(
+            AgentEventKind.TOOL_COMPLETED,
+            {
+                "call_id": call.id,
+                "tool_name": call.name,
+                "duration_ms": 8,
+                "success": True,
+            },
+            run_id="run-one",
+        )
+    )
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=96,
+        capabilities=capabilities,
+    )
+    assert block.presentation_id == block_id
+    assert state.transcript_document.reconcile_anchor(title_anchor) is not None
+
+    state.hydrate_transcript(transcript, run_id="run-one")
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=96,
+        capabilities=capabilities,
+    )
+    hydrated_block = next(block for block in state.blocks if block.kind == "tool")
+    assert hydrated_block.presentation_id == block_id
+    assert state.transcript_document.reconcile_anchor(title_anchor) is not None
+    collapsed_text = state.transcript_document.text(block_id)
+    expansion_start = collapsed_text.index("Ctrl+O expand")
+    expansion_range = state.transcript_document.normalize_range(
+        state.transcript_document.position(block_id, expansion_start),
+        state.transcript_document.position(
+            block_id,
+            expansion_start + len("Ctrl+O expand"),
+        ),
+    )
+
+    assert state.toggle_expanded_detail() is True
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=96,
+        capabilities=capabilities,
+    )
+
+    assert state.transcript_document.reconcile_anchor(title_anchor) is not None
+    assert state.transcript_document.reconcile_range(expansion_range) is None
+
+
 @pytest.mark.parametrize("failure", ("load", "projection"))
 async def test_hydration_failures_do_not_change_the_authoritative_loop_exit(
     monkeypatch: pytest.MonkeyPatch,
@@ -1667,6 +1842,48 @@ def test_conversation_display_preserves_complete_messages_and_wraps_user_text():
     assert "_USER_END" in transcript
     assert "ASSISTANT_START" in transcript
     assert "ASSISTANT_END" in transcript
+
+
+def test_transcript_renderer_exercises_stable_semantic_projection_without_rewrap_churn():
+    runtime = terminal_tui._load_terminal_runtime()
+    capabilities = terminal_tui.TerminalCapabilities("none", True)
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("café 界\tpath/to/file\x1b[2J")
+    block = state.blocks[0]
+    block_id = block.presentation_id
+
+    narrow = "".join(
+        text
+        for _style, text in terminal_tui._render_transcript_fragments(
+            runtime,
+            state,
+            width=20,
+            capabilities=capabilities,
+        )
+    )
+    narrow_projection = state.transcript_projection
+    narrow_revision = state.transcript_document.blocks[0].revision
+
+    wide = "".join(
+        text
+        for _style, text in terminal_tui._render_transcript_fragments(
+            runtime,
+            state,
+            width=80,
+            capabilities=capabilities,
+        )
+    )
+
+    assert block_id is not None
+    assert block.presentation_id == block_id
+    assert state.transcript_document.presentation_ids == (block_id,)
+    assert state.transcript_document.text(block_id) == "café 界\tpath/to/file?[2J"
+    assert state.transcript_document.blocks[0].revision == narrow_revision == 0
+    assert narrow_projection is not None
+    assert state.transcript_projection is not None
+    assert narrow_projection.row_count > state.transcript_projection.row_count
+    assert "\x1b" not in narrow + wide
+    assert "?[2J" in narrow + wide
 
 
 def test_green_identity_focus_theme_uses_semantic_styles(

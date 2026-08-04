@@ -22,6 +22,11 @@ from .llm.models import MessageRole, ToolCall, ToolResultBlock
 from .llm.pricing import CostEstimate, format_cost_estimate
 from .loop.models import Transcript
 from .observation import AgentEvent, AgentEventKind
+from .terminal_transcript import (
+    PresentationBlockId,
+    TranscriptDocument,
+    TranscriptProjection,
+)
 
 MAX_COMPOSER_CHARACTERS = 16_384
 MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
@@ -277,13 +282,18 @@ class TerminalStartupInfo:
             object.__setattr__(self, name, values)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class TerminalBlock:
     """One disposable transcript block shown in the current process."""
 
     kind: str
     text: str
     tool_card: ToolCardState | None = None
+    presentation_id: PresentationBlockId | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,6 +449,16 @@ class TerminalViewState:
     animation_frame: int = 0
     tool_cards: dict[str, ToolCardState] = field(default_factory=dict)
     approval_panel: ApprovalPanelState | None = None
+    transcript_document: TranscriptDocument = field(
+        default_factory=TranscriptDocument,
+        repr=False,
+        compare=False,
+    )
+    transcript_projection: TranscriptProjection | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     _context_by_conversation: dict[str, int] = field(
         default_factory=dict,
         repr=False,
@@ -503,7 +523,7 @@ class TerminalViewState:
             fallback="",
         )
         if safe:
-            self.blocks.append(TerminalBlock(kind, safe))
+            self._append_block(TerminalBlock(kind, safe))
 
     def append_user(self, message: str) -> None:
         self.append_plain("user", message, maximum=None)
@@ -544,7 +564,7 @@ class TerminalViewState:
                 fallback="failed",
             )
             safe_answer = f"{kind or 'failed'}: {reason}"
-        self.blocks.append(TerminalBlock("assistant", safe_answer))
+        self._append_block(TerminalBlock("assistant", safe_answer))
         for receipt in tuple(getattr(result, "artifact_deliveries", ())):
             filename = getattr(receipt, "filename", None)
             saved_path = getattr(receipt, "saved_path", None)
@@ -683,8 +703,20 @@ class TerminalViewState:
             if index < insertion_index:
                 retained_before_insertion += 1
             retained.append(block)
+        prior_presentation_ids = {
+            block.tool_card.call_id: block.presentation_id
+            for block in self.blocks
+            if block.kind == "tool"
+            and block.tool_card is not None
+            and block.tool_card.run_id == run_id
+        }
         canonical_blocks = [
-            TerminalBlock("tool", card.call_id, tool_card=card)
+            TerminalBlock(
+                "tool",
+                card.call_id,
+                tool_card=card,
+                presentation_id=prior_presentation_ids.get(card.call_id),
+            )
             for card in canonical_cards
         ]
         delivery_failures = _artifact_delivery_messages(pairs)
@@ -702,6 +734,17 @@ class TerminalViewState:
                 del self.tool_cards[call_id]
         for card in canonical_cards:
             self.tool_cards[card.call_id] = card
+        self._sync_transcript_document(
+            tuple(
+                (
+                    self.transcript_document.text(block.presentation_id)
+                    if block.presentation_id is not None
+                    and self.transcript_document.contains(block.presentation_id)
+                    else block.text
+                )
+                for block in self.blocks
+            ),
+        )
 
     def toggle_expanded_detail(self) -> bool:
         """Toggle the most recent completed hydrated card in this process."""
@@ -897,7 +940,7 @@ class TerminalViewState:
                 label=label,
             )
             self.tool_cards[call_id] = card
-            self.blocks.append(TerminalBlock("tool", call_id, tool_card=card))
+            self._append_block(TerminalBlock("tool", call_id, tool_card=card))
         else:
             if capability_id is not None:
                 card.capability_id = capability_id
@@ -925,6 +968,49 @@ class TerminalViewState:
                 if exit_kind == "interrupted" or reason == "cancelled"
                 else "observation_incomplete"
             )
+
+    def _append_block(self, block: TerminalBlock) -> None:
+        """Admit one block to both disposable views under one stable identity."""
+
+        snapshot = self.transcript_document.append(block.text)
+        block.presentation_id = snapshot.id
+        self.blocks.append(block)
+
+    def _sync_transcript_document(
+        self,
+        selectable_texts: Sequence[str],
+        *,
+        width: int | None = None,
+    ) -> None:
+        """Reconcile renderer-owned selectable projections without persisting them."""
+
+        if len(selectable_texts) != len(self.blocks):
+            raise ValueError("each terminal block requires one selectable projection")
+        current_ids: list[PresentationBlockId] = []
+        seen: set[PresentationBlockId] = set()
+        for block, selectable_text in zip(
+            self.blocks,
+            selectable_texts,
+            strict=True,
+        ):
+            block_id = block.presentation_id
+            if (
+                block_id is None
+                or block_id in seen
+                or not self.transcript_document.contains(block_id)
+            ):
+                block_id = self.transcript_document.append(selectable_text).id
+                block.presentation_id = block_id
+            else:
+                self.transcript_document.replace(block_id, selectable_text)
+            current_ids.append(block_id)
+            seen.add(block_id)
+        for block_id in tuple(self.transcript_document.presentation_ids):
+            if block_id not in seen:
+                self.transcript_document.remove(block_id)
+        self.transcript_document.reorder(tuple(current_ids))
+        if width is not None:
+            self.transcript_projection = self.transcript_document.project(width)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3890,7 +3976,9 @@ def _render_transcript_fragments(
             glyphs=glyphs,
         )
     fragments: list[tuple[str, str]] = [("", "\n")]
+    selectable_texts: list[str] = []
     for block in state.blocks:
+        selectable_text = block.text
         if block.kind == "user":
             fragments.append(("class:tui.user.label", " You\n"))
             fragments.extend(
@@ -3913,6 +4001,11 @@ def _render_transcript_fragments(
                 )
             )
             fragments.append(("", "\n"))
+            selectable_text = _canonical_assistant_text(
+                runtime,
+                block.text,
+                capabilities=capabilities,
+            )
         elif block.kind == "metadata":
             fragments.append(("class:tui.metadata", f" {block.text}\n\n"))
         elif block.kind in {
@@ -3942,15 +4035,23 @@ def _render_transcript_fragments(
             )
         elif block.kind == "tool":
             try:
+                card = block.tool_card or state.tool_cards.get(block.text)
                 fragments.extend(
                     _render_tool_card_fragments(
-                        block.tool_card or state.tool_cards.get(block.text),
+                        card,
                         width=width,
                         runtime=runtime,
                         responsive=responsive,
                         capabilities=capabilities,
                         glyphs=glyphs,
                     )
+                )
+                selectable_text = _canonical_tool_card_text(
+                    card,
+                    runtime=runtime,
+                    responsive=responsive,
+                    capabilities=capabilities,
+                    glyphs=glyphs,
                 )
             except Exception:
                 fragments.extend(
@@ -3959,6 +4060,7 @@ def _render_transcript_fragments(
                         ("", "\n"),
                     ]
                 )
+                selectable_text = "Tool status unavailable"
         else:
             fragments.extend(
                 [
@@ -3966,6 +4068,8 @@ def _render_transcript_fragments(
                     ("class:tui.local", f" {block.text}\n\n"),
                 ]
             )
+        selectable_texts.append(selectable_text)
+    state._sync_transcript_document(tuple(selectable_texts), width=width)
     return fragments
 
 
@@ -4089,6 +4193,74 @@ def _render_tool_card_fragments(
         )
     fragments.append(("", "\n"))
     return fragments
+
+
+def _canonical_tool_card_text(
+    card: ToolCardState | None,
+    *,
+    runtime: dict[str, Any],
+    responsive: ResponsiveProjection,
+    capabilities: TerminalCapabilities,
+    glyphs: TerminalGlyphs,
+) -> str:
+    """Use the existing card renderer for a wrap-stable selectable projection."""
+
+    canonical_responsive = ResponsiveProjection(
+        columns=_MAX_RENDER_WIDTH + 2,
+        rows=responsive.rows,
+        mode=responsive.mode,
+        content_width=_MAX_RENDER_WIDTH,
+        collapsed_preview_columns=responsive.collapsed_preview_columns,
+        expanded_preview_columns=responsive.expanded_preview_columns,
+        bordered_cards=False,
+        stacked_metadata=responsive.stacked_metadata,
+        two_sided_status=responsive.two_sided_status,
+        usable=responsive.usable,
+        minimum_rows=responsive.minimum_rows,
+        transcript_rows=responsive.transcript_rows,
+    )
+    rendered = "".join(
+        text
+        for _style, text in _render_tool_card_fragments(
+            card,
+            width=_MAX_RENDER_WIDTH,
+            runtime=runtime,
+            responsive=canonical_responsive,
+            capabilities=capabilities,
+            glyphs=glyphs,
+        )
+    ).rstrip("\n")
+    lines = rendered.splitlines()
+    if card is not None and lines:
+        label = _sanitize_terminal_text(
+            card.label,
+            maximum=_MAX_RENDER_CHARACTERS,
+            preserve_lines=False,
+            fallback="Tool call",
+        )
+        label_index = lines[0].find(label)
+        if label_index >= 0:
+            lines[0] = lines[0][label_index:]
+    return "\n".join(line[3:] if line.startswith("   ") else line for line in lines)
+
+
+def _canonical_assistant_text(
+    runtime: dict[str, Any],
+    value: object,
+    *,
+    capabilities: TerminalCapabilities,
+) -> str:
+    """Project visible Markdown text once at the supported maximum width."""
+
+    return "".join(
+        text
+        for _style, text in _render_markdown_fragments(
+            runtime,
+            value,
+            width=_MAX_RENDER_WIDTH,
+            capabilities=capabilities,
+        )
+    ).rstrip("\n")
 
 
 def _render_tool_details(
