@@ -1,4 +1,5 @@
 import ast
+from collections.abc import Mapping
 from pathlib import Path
 import sqlite3
 
@@ -41,6 +42,17 @@ def _class_owners(class_name: str) -> set[str]:
     return owners
 
 
+def _imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported.add(node.module)
+    return imported
+
+
 def test_final_src_layout_has_one_package_owner_and_no_replacement_alias():
     assert PACKAGE == ROOT / "src" / "daita"
     assert not (ROOT / "daita").exists()
@@ -67,6 +79,11 @@ def test_public_surface_is_focused():
         "AgentEvent",
         "AgentEventKind",
         "AgentObserver",
+        "ArtifactDeliveryReceipt",
+        "ArtifactDestination",
+        "ArtifactError",
+        "ArtifactPayload",
+        "ArtifactRef",
         "ApprovalDecision",
         "ApprovalHandler",
         "ApprovalRequest",
@@ -124,10 +141,19 @@ def test_stage_seven_exports_records_without_exporting_their_owners():
     assert daita.SkillSummary.__module__ == "daita.skills.store"
     assert daita.SemanticAnnotation.__module__ == "daita.semantics"
     assert daita.SemanticAnnotationView.__module__ == "daita.semantics"
+    assert daita.ArtifactRef.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactPayload.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactDeliveryReceipt.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactDestination.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactError.__module__ == "daita.artifacts.models"
 
     assert set(daita.__all__).isdisjoint(
         {
             "CapabilityRegistry",
+            "AgentHomeArtifactStore",
+            "ArtifactDraft",
+            "ArtifactPolicy",
+            "LocalArtifactDelivery",
             "MemoryStore",
             "SideEffectExecutor",
             "SkillStore",
@@ -438,6 +464,8 @@ async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branc
             assert capability.side_effecting is True
             assert callable(getattr(executor, "preflight", None))
         assert write_tools == {
+            "artifact_save_local",
+            "artifact_set_export_location",
             "memory_set",
             "semantic_delete",
             "semantic_save",
@@ -446,6 +474,39 @@ async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branc
         }
     finally:
         await agent.close()
+
+
+def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
+    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+        encoding="utf-8"
+    )
+    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    exports = (PACKAGE / "domains" / "data" / "export_capabilities.py").read_text(
+        encoding="utf-8"
+    )
+    for obsolete in (
+        "_explicit_artifact_request",
+        "_explicit_default_location_request",
+        "_ARTIFACT_ACTION_WORDS",
+        "_ARTIFACT_OBJECT_WORDS",
+        "_intent_clauses",
+    ):
+        assert obsolete not in controller
+    for obsolete_history_owner in (
+        "ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND",
+        "DOCUMENT_CREATE_OUTPUT_KIND",
+        "TABULAR_EXPORT_OUTPUT_KIND",
+        "LOCAL_FILE_COPY_OUTPUT_KIND",
+    ):
+        assert obsolete_history_owner not in context
+    assert 'ARTIFACT_LIST_TOOL_NAME = "artifact_list"' in exports
+    assert 'ARTIFACT_READ_TOOL_NAME = "artifact_read"' in exports
+    assert 'ARTIFACT_CONVERT_TOOL_NAME = "artifact_convert"' in exports
+    assert "artifact_list" not in (PACKAGE / "agent.py").read_text(encoding="utf-8")
+    assert "artifact_list" not in (PACKAGE / "hosting" / "embedded.py").read_text(
+        encoding="utf-8"
+    )
+    assert "artifact_list" not in (PACKAGE / "cli.py").read_text(encoding="utf-8")
 
 
 def test_observation_owners_keep_tool_events_out_of_loop_and_storage():
@@ -1084,3 +1145,164 @@ def test_registry_and_data_runtime_keep_executor_resolution_ownership():
     }
     assert resolution_owners == {"capabilities.py", "domains/data/controller.py"}
     assert resolved_executor_callers == {"domains/data/controller.py"}
+
+
+def test_artifacts_have_one_concrete_owner_and_no_storage_renderer_or_policy_registry():
+    assert _class_owners("AgentHomeArtifactStore") == {"artifacts/store.py"}
+    assert _class_owners("LocalArtifactDelivery") == {"artifacts/delivery.py"}
+    assert _class_owners("ArtifactPolicy") == {"capabilities.py"}
+    assert _class_owners("ArtifactDraft") == {"artifacts/models.py"}
+    artifact_text = _python_text(PACKAGE / "artifacts")
+    for prohibited in (
+        "ArtifactStoreRegistry",
+        "ArtifactRendererRegistry",
+        "ArtifactPolicyRegistry",
+        "ArtifactProvider",
+    ):
+        assert prohibited not in artifact_text
+
+
+def test_exact_tabular_extends_existing_adapter_capability_and_renderer_owners():
+    assert _class_owners("ExactCsvRenderer") == {"artifacts/renderers.py"}
+    assert _class_owners("ExactXlsxRenderer") == {"artifacts/renderers.py"}
+    for adapter, class_name in (
+        ("sqlite_query.py", "SQLiteQueryBackend"),
+        ("postgresql_query.py", "PostgreSQLQueryBackend"),
+    ):
+        methods = _class_methods(PACKAGE / "adapters" / adapter, class_name)
+        assert "execute_exact_tabular" in methods
+        assert "execute_exact_csv" not in methods
+        tree = ast.parse((PACKAGE / "adapters" / adapter).read_text(encoding="utf-8"))
+        method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "execute_exact_tabular"
+        )
+        calls = {
+            node.func.id
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "project_result_rows" not in calls
+        assert "_json_value" not in calls
+        assert "_unique_columns" not in calls
+
+    renderers = (PACKAGE / "artifacts" / "renderers.py").read_text(encoding="utf-8")
+    exports = (PACKAGE / "domains" / "data" / "export_capabilities.py").read_text(
+        encoding="utf-8"
+    )
+    assert "BoundedResultProjection" not in renderers
+    assert "BoundedResultProjection" not in exports
+    assert "ExactCsvRenderer" not in _python_text(PACKAGE / "loop")
+    assert "ArtifactRendererRegistry" not in renderers
+    package_text = _python_text(PACKAGE)
+    for obsolete in (
+        "ExactCsvExportBackend",
+        "ExactCsvExportResult",
+        "execute_exact_csv",
+        "_run_exact_csv",
+        "_execute_exact_csv",
+        "SQLITE_CSV_EXPORT_CAPABILITY_ID",
+        "POSTGRESQL_CSV_EXPORT_CAPABILITY_ID",
+    ):
+        assert obsolete not in package_text
+
+
+def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_bytes():
+    from daita.domains.data.export_capabilities import (
+        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+        artifact_extension_declarations,
+    )
+
+    declarations = artifact_extension_declarations()
+    for capability in declarations.capabilities:
+        if capability.id not in {
+            SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+            POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+        }:
+            continue
+        properties = capability.input_schema["properties"]
+        assert isinstance(properties, Mapping)
+        assert set(properties) == {
+            "source_id",
+            "sql",
+            "parameters",
+            "format",
+            "filename",
+        }
+        assert set(properties).isdisjoint(
+            {"rows", "content", "bytes", "provenance", "sensitivity", "path"}
+        )
+
+
+def test_agent_loop_carries_artifact_records_but_never_imports_renderers_delivery_or_filesystem_paths():
+    path = PACKAGE / "loop" / "driver.py"
+    imports = _imports(path)
+    assert "pathlib" not in imports
+    assert "os" not in imports
+    text = path.read_text(encoding="utf-8")
+    assert "artifacts.models" in text
+    assert "artifacts.delivery" not in text
+    assert "artifacts.renderers" not in text
+    assert "AgentHomeArtifactStore" not in text
+    assert "LocalArtifactDelivery" not in text
+
+
+def test_artifact_delivery_uses_no_bash_shell_subprocess_or_unrestricted_file_tool():
+    path = PACKAGE / "artifacts" / "delivery.py"
+    text = path.read_text(encoding="utf-8")
+    imports = _imports(path)
+    assert "subprocess" not in imports
+    assert "bash" not in text.casefold()
+    assert "shell=True" not in text
+    assert "os.system" not in text
+    assert "general_filesystem" not in text
+    assert "data.file.write" not in text
+
+
+def test_artifact_payloads_and_destination_grants_never_enter_sqlite_messages_or_model_requests():
+    sqlite_text = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    context_text = (PACKAGE / "domains" / "data" / "context.py").read_text(
+        encoding="utf-8"
+    )
+    assert "ArtifactPayload" not in sqlite_text
+    assert "ArtifactDraft" not in sqlite_text
+    assert "_DestinationGrant" not in sqlite_text
+    assert "ArtifactPayload" not in context_text
+    assert "_DestinationGrant" not in context_text
+    assert "grant_digest" not in context_text
+    assert "saved_path" not in context_text
+
+
+def test_local_file_read_path_no_longer_imports_or_constructs_artifact_bytes():
+    for relative in (
+        "adapters/local_files.py",
+        "domains/data/file_capabilities.py",
+    ):
+        text = (PACKAGE / relative).read_text(encoding="utf-8")
+        assert "ToolArtifact" not in text
+        assert "ArtifactDraft" not in text
+        assert "artifact=" not in text
+        assert "artifacts." not in text
+
+
+def test_phase_three_xlsx_dependencies_are_scoped_and_integrations_remain_lazy():
+    import tomllib
+
+    with (ROOT / "pyproject.toml").open("rb") as source:
+        project = tomllib.load(source)["project"]
+    assert "XlsxWriter>=3.2.5,<4.0.0" in project["dependencies"]
+    assert "openpyxl>=3.1.0,<4.0.0" in project["optional-dependencies"]["dev"]
+    assert "types-openpyxl>=3.1.0,<4.0.0" in project["optional-dependencies"]["dev"]
+    assert all("openpyxl" not in item.casefold() for item in project["dependencies"])
+    assert all("pandas" not in item.casefold() for item in project["dependencies"])
+    artifact_text = _python_text(PACKAGE / "artifacts")
+    assert "openpyxl" not in artifact_text
+    assert "xlsxwriter" in artifact_text
+    renderer = PACKAGE / "artifacts" / "renderers.py"
+    top_level_imports = _imports(renderer)
+    assert "xlsxwriter" not in top_level_imports
+    assert "ExactXlsxRenderer" not in _python_text(PACKAGE / "loop")
+    assert "ArtifactRendererRegistry" not in artifact_text

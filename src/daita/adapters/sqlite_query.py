@@ -5,14 +5,27 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Mapping
+from datetime import datetime
 import os
 from pathlib import Path
 import sqlite3
 import stat
 import threading
+import time
 
+from ..artifacts.models import ArtifactError
+from ..artifacts.renderers import (
+    ExactCsvRenderer,
+    ExactXlsxProvenance,
+    ExactXlsxRenderer,
+)
 from ..domains.data.capabilities import SQLiteReadResult
 from ..domains.data.controller import CatalogSchemaReader
+from ..domains.data.export_capabilities import (
+    ExactTabularExportResult,
+    ExactTabularProgress,
+    resolved_exact_export_sensitivity,
+)
 from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_sqlite_read
 from .protocols import SourceStore
@@ -115,6 +128,118 @@ class SQLiteQueryBackend:
             projection=projection,
         )
 
+    async def execute_exact_tabular(
+        self,
+        *,
+        agent_id: str,
+        source_id: str,
+        sql: str,
+        parameters: tuple[object, ...],
+        format_name: str,
+        parameters_sha256: str,
+        created_at: datetime,
+        max_rows: int,
+        max_columns: int,
+        max_bytes: int,
+        timeout_seconds: float,
+        progress: ExactTabularProgress | None = None,
+    ) -> ExactTabularExportResult:
+        """Run one fresh exact read through the selected fixed renderer."""
+
+        registration = await self._sources.load_source(agent_id, source_id)
+        if (
+            registration is None
+            or registration.agent_id != agent_id
+            or registration.id != source_id
+            or not registration.active
+        ):
+            raise SQLiteQueryError(
+                "source_not_available",
+                "The SQLite source is not attached to this agent.",
+            )
+        if registration.adapter_id != "sqlite":
+            raise SQLiteQueryError(
+                "source_adapter_mismatch",
+                "The selected source is not a SQLite source.",
+            )
+        resources = await self._catalog.resource_schemas(agent_id, source_id)
+        validation = validate_sqlite_read(
+            sql,
+            source_id=source_id,
+            resources=resources,
+            parameters=parameters,
+        )
+        if not validation.valid or validation.analysis is None:
+            codes = ",".join(validation.issue_codes[:8]) or "invalid_sql"
+            raise SQLiteQueryError(
+                "query_revalidation_failed",
+                f"SQLite query failed deterministic revalidation: {codes}",
+            )
+        if not validation.resource_ids:
+            raise SQLiteQueryError(
+                "query_resource_scope_empty",
+                "SQLite query must reference a current catalog resource.",
+            )
+        if validation.source_revision is None or len(
+            validation.resource_revisions
+        ) != len(validation.resource_ids):
+            raise SQLiteQueryError(
+                "catalog_provenance_missing",
+                "SQLite query requires complete current catalog provenance.",
+            )
+        configured_path = registration.configuration.get("path")
+        if not isinstance(configured_path, str):
+            raise SQLiteQueryError(
+                "source_configuration_invalid",
+                "SQLite source configuration is missing its path.",
+            )
+        sensitivity = resolved_exact_export_sensitivity(
+            tuple(
+                item.sensitivity_class
+                for item in resources
+                if item.resource_id in validation.resource_ids
+            )
+        )
+        xlsx_provenance = (
+            ExactXlsxProvenance(
+                source_id=source_id,
+                source_revision=validation.source_revision,
+                resource_revisions=validation.resource_revisions,
+                sql_fingerprint=validation.analysis.sql_fingerprint,
+                parameters_sha256=parameters_sha256,
+                sensitivity=sensitivity,
+                created_at=created_at,
+            )
+            if format_name == "xlsx"
+            else None
+        )
+        content, columns, row_count, live_source_revision = await _run_exact_tabular(
+            _regular_unaliased_path(configured_path),
+            validation.analysis.canonical_sql,
+            parameters,
+            format_name=format_name,
+            xlsx_provenance=xlsx_provenance,
+            expected_schema_version=_expected_schema_version(
+                validation.source_revision
+            ),
+            max_rows=max_rows,
+            max_columns=max_columns,
+            max_bytes=max_bytes,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+        )
+        return ExactTabularExportResult(
+            format=format_name,
+            source_id=source_id,
+            source_revision=live_source_revision,
+            sql_fingerprint=validation.analysis.sql_fingerprint,
+            resource_revisions=validation.resource_revisions,
+            columns=columns,
+            row_count=row_count,
+            content=content,
+            sensitivity=sensitivity,
+        )
+
 
 def _expected_schema_version(source_revision: str) -> int:
     prefix = "schema_version:"
@@ -193,6 +318,184 @@ async def _run_query(
             except BaseException:
                 break
         raise
+
+
+async def _run_exact_tabular(
+    path: Path,
+    sql: str,
+    parameters: tuple[object, ...],
+    *,
+    format_name: str,
+    xlsx_provenance: ExactXlsxProvenance | None,
+    expected_schema_version: int,
+    max_rows: int,
+    max_columns: int,
+    max_bytes: int,
+    timeout_seconds: float,
+    progress: ExactTabularProgress | None = None,
+) -> tuple[bytes, tuple[str, ...], int, str]:
+    cancellation = threading.Event()
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            _run_exact_tabular_sync,
+            path,
+            sql,
+            parameters,
+            format_name,
+            xlsx_provenance,
+            expected_schema_version,
+            max_rows,
+            max_columns,
+            max_bytes,
+            timeout_seconds,
+            cancellation,
+            progress,
+        )
+    )
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        cancellation.set()
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        raise
+
+
+def _run_exact_tabular_sync(
+    path: Path,
+    sql: str,
+    parameters: tuple[object, ...],
+    format_name: str,
+    xlsx_provenance: ExactXlsxProvenance | None,
+    expected_schema_version: int,
+    max_rows: int,
+    max_columns: int,
+    max_bytes: int,
+    timeout_seconds: float,
+    cancellation: threading.Event,
+    progress: ExactTabularProgress | None = None,
+) -> tuple[bytes, tuple[str, ...], int, str]:
+    uri = f"{path.as_uri()}?mode=ro"
+    connection: sqlite3.Connection | None = None
+    timed_out = threading.Event()
+    deadline = time.monotonic() + timeout_seconds
+    renderer: ExactCsvRenderer | ExactXlsxRenderer | None = None
+
+    def interrupted() -> int:
+        if cancellation.is_set():
+            return 1
+        if time.monotonic() >= deadline:
+            timed_out.set()
+            return 1
+        return 0
+
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA trusted_schema = OFF")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.enable_load_extension(False)
+        connection.set_progress_handler(interrupted, 500)
+        if hasattr(connection, "setlimit"):
+            connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, max(4_096, max_bytes))
+        connection.execute("BEGIN")
+        version_row = connection.execute("PRAGMA schema_version").fetchone()
+        if version_row is None or not isinstance(version_row[0], int):
+            raise SQLiteQueryError(
+                "source_revision_unavailable",
+                "SQLite source revision could not be read.",
+            )
+        live_schema_version = version_row[0]
+        if live_schema_version != expected_schema_version:
+            raise SQLiteQueryError(
+                "catalog_source_stale",
+                "SQLite source schema changed after its catalog snapshot.",
+            )
+        connection.set_authorizer(_read_only_authorizer)
+        cursor = connection.execute(sql, parameters)
+        if cursor.description is None:
+            raise SQLiteQueryError(
+                "query_result_missing",
+                "SQLite read did not return tabular results.",
+            )
+        columns = tuple(item[0] for item in cursor.description)
+        if format_name == "csv":
+            renderer = ExactCsvRenderer(
+                columns,
+                max_rows=max_rows,
+                max_columns=max_columns,
+                max_bytes=max_bytes,
+                max_seconds=timeout_seconds,
+            )
+        elif format_name == "xlsx" and xlsx_provenance is not None:
+            renderer = ExactXlsxRenderer(
+                columns,
+                provenance=xlsx_provenance,
+                max_rows=max_rows,
+                max_columns=max_columns,
+                max_bytes=max_bytes,
+                max_seconds=timeout_seconds,
+            )
+        else:
+            raise ValueError("exact tabular format and provenance are invalid")
+        if progress is not None:
+            progress(renderer.row_count, len(renderer.columns), renderer.byte_count)
+        while True:
+            batch = cursor.fetchmany(256)
+            if not batch:
+                break
+            for row in batch:
+                renderer.append(row)
+                if progress is not None:
+                    progress(
+                        renderer.row_count,
+                        len(renderer.columns),
+                        renderer.byte_count,
+                    )
+        content = renderer.finish()
+        connection.set_authorizer(None)
+        connection.execute("COMMIT")
+        return (
+            content,
+            renderer.columns,
+            renderer.row_count,
+            f"schema_version:{live_schema_version}",
+        )
+    except ArtifactError:
+        raise
+    except SQLiteQueryError:
+        raise
+    except sqlite3.Error as error:
+        if timed_out.is_set():
+            completed_rows = 0 if renderer is None else renderer.row_count
+            completed_columns = 0 if renderer is None else len(renderer.columns)
+            completed_bytes = 0 if renderer is None else renderer.byte_count
+            raise ArtifactError(
+                "artifact_incomplete_export",
+                "The exact tabular export exceeded its execution-time limit.",
+                {
+                    "reason": "time_limit",
+                    "completed_rows": completed_rows,
+                    "completed_columns": completed_columns,
+                    "completed_bytes": completed_bytes,
+                },
+            ) from error
+        raise SQLiteQueryError(
+            "sqlite_query_failed",
+            "SQLite could not complete the exact bounded read.",
+        ) from error
+    finally:
+        if connection is not None:
+            connection.set_authorizer(None)
+            connection.set_progress_handler(None, 0)
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            connection.close()
 
 
 def _run_query_sync(

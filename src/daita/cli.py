@@ -22,6 +22,7 @@ from . import (
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
+    ArtifactError,
     LocalDirectorySource,
     LoopExit,
     LearningCandidateRejectionReason,
@@ -32,6 +33,11 @@ from . import (
     Skill,
     SkillSummary,
     create_llm_provider,
+)
+from .artifacts.models import (
+    artifact_delivery_receipt_to_mapping,
+    artifact_destination_to_mapping,
+    artifact_ref_to_mapping,
 )
 from .llm import (
     CostEstimate,
@@ -52,6 +58,7 @@ from .terminal import (
     _learning_invocation_message,
     _render_model_answer,
     _validate_candidate_review_cost_limit,
+    _write_artifact_outcomes,
     _write_learning_candidate_list,
     _write_learning_candidate_view,
     _write_learning_review_result,
@@ -203,6 +210,33 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="confirm transcript and candidate-record deletion",
     )
+
+    artifacts = commands.add_parser("artifacts", help="save a known run artifact by ID")
+    artifact_commands = artifacts.add_subparsers(
+        dest="artifacts_command",
+        required=True,
+    )
+    artifact_save = artifact_commands.add_parser("save")
+    artifact_save.add_argument("name")
+    artifact_save.add_argument("artifact_id")
+    artifact_save.add_argument("--destination", type=Path)
+    artifact_save.add_argument("--filename")
+
+    export_location = commands.add_parser(
+        "export-location",
+        help="get or change the persistent local export location",
+    )
+    export_location_commands = export_location.add_subparsers(
+        dest="export_location_command",
+        required=True,
+    )
+    export_location_get = export_location_commands.add_parser("get")
+    export_location_get.add_argument("name")
+    export_location_set = export_location_commands.add_parser("set")
+    export_location_set.add_argument("name")
+    export_location_set.add_argument("directory", type=Path)
+    export_location_reset = export_location_commands.add_parser("reset")
+    export_location_reset.add_argument("name")
 
     delete = commands.add_parser("delete", help="permanently delete an agent")
     delete.add_argument("name")
@@ -979,14 +1013,18 @@ async def _prompt_for_exact_approval(
             sort_keys=True,
         )
     )
-    try:
-        answer = input("Approve this exact change once? [y/N]")
-    except EOFError:
-        print()
-        return ApprovalDecision.DENY
-    if answer.strip().lower() == "y":
-        return ApprovalDecision.APPROVE
-    return ApprovalDecision.DENY
+    while True:
+        try:
+            answer = input("Approve this exact change once? [y/n]")
+        except EOFError:
+            print()
+            return ApprovalDecision.DENY
+        normalized = answer.strip().casefold()
+        if normalized == "y":
+            return ApprovalDecision.APPROVE
+        if normalized == "n":
+            return ApprovalDecision.DENY
+        print("Enter y to approve or n to deny.")
 
 
 async def _handle_chat_command(
@@ -1149,6 +1187,7 @@ async def _chat(args: argparse.Namespace) -> int:
                 print(result.final_text)
             else:
                 print(f"{result.kind.value}: {result.reason}")
+            await _write_artifact_outcomes(agent, result, sys.stdout)
             print()
             print(
                 f"{result.steps} steps · {result.usage.total_tokens} tokens · "
@@ -1239,6 +1278,13 @@ async def _execute(args: argparse.Namespace) -> object:
                 "reason": result.reason,
                 "text": result.final_text,
                 "steps": result.steps,
+                "artifacts": tuple(
+                    artifact_ref_to_mapping(item) for item in result.artifacts
+                ),
+                "artifact_deliveries": tuple(
+                    artifact_delivery_receipt_to_mapping(item)
+                    for item in result.artifact_deliveries
+                ),
             }
         finally:
             await agent.close()
@@ -1293,6 +1339,21 @@ async def _execute(args: argparse.Namespace) -> object:
             await agent.close()
     agent = await Agent.open(args.name, root=args.root)
     try:
+        if args.command == "artifacts":
+            receipt = await agent.save_artifact(
+                args.artifact_id,
+                args.destination,
+                filename=args.filename,
+            )
+            return artifact_delivery_receipt_to_mapping(receipt)
+        if args.command == "export-location":
+            if args.export_location_command == "get":
+                destination = await agent.export_destination()
+            elif args.export_location_command == "set":
+                destination = await agent.set_export_destination(args.directory)
+            else:
+                destination = await agent.reset_export_destination()
+            return artifact_destination_to_mapping(destination)
         if args.command == "attach":
             source = _source_from_attach_args(args)
             registration = await agent.attach(source)
@@ -1473,6 +1534,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("Chat interrupted.", file=sys.stderr)
         return 130
+    except ArtifactError as error:
+        print(
+            json.dumps(
+                {
+                    "error": {
+                        "code": error.code,
+                        "message": error.message,
+                        "details": error.details.to_dict(),
+                    }
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 1
     except (ValueError, RuntimeError, OSError, ImportError) as error:
         print(json.dumps({"error": str(error)}), file=sys.stderr)
         return 1

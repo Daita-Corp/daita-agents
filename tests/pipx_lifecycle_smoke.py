@@ -153,7 +153,6 @@ def main() -> int:
                     sys.executable,
                     "-m",
                     "build",
-                    "--no-isolation",
                     "--outdir",
                     str(distribution),
                 ],
@@ -215,6 +214,41 @@ def main() -> int:
             env=environment,
         )
         installed_python = pipx_home / "venvs" / "daita-agents" / "bin" / "python"
+        _run(
+            [str(installed_python), "-m", "pip", "check"],
+            cwd=outside_checkout,
+            env=environment,
+        )
+        runtime_dependency_check = """
+from io import BytesIO
+
+import xlsxwriter
+
+from daita.artifacts.renderers import _load_xlsxwriter
+
+
+assert _load_xlsxwriter() is xlsxwriter
+buffer = BytesIO()
+workbook = xlsxwriter.Workbook(
+    buffer,
+    {
+        "in_memory": True,
+        "strings_to_formulas": False,
+        "strings_to_urls": False,
+    },
+)
+worksheet = workbook.add_worksheet("Data")
+worksheet.write_string(0, 0, "isolated pipx XLSX smoke")
+workbook.close()
+content = buffer.getvalue()
+assert content.startswith(b"PK")
+assert len(content) > 0
+"""
+        _run(
+            [str(installed_python), "-I", "-c", runtime_dependency_check],
+            cwd=outside_checkout,
+            env=environment,
+        )
         seed_state = """
 import asyncio
 from datetime import datetime, timezone
@@ -497,10 +531,22 @@ entry_points = {
 }
 assert distribution.version == sys.argv[1]
 assert entry_points == {"daita": "daita.cli:main"}
+requires_python = distribution.metadata["Requires-Python"]
+assert requires_python is not None
+assert {item.strip() for item in requires_python.split(",")} == {
+    ">=3.11",
+    "<3.13",
+}
 requirements = tuple(distribution.requires or ())
 assert any(item.startswith("openai") for item in requirements)
+assert any(item.startswith("anthropic") for item in requirements)
+assert any(item.startswith("google-genai") for item in requirements)
 assert any(item.startswith("asyncpg") for item in requirements)
+assert any(item.startswith("sqlglot") for item in requirements)
+assert any(item.startswith("keyring") for item in requirements)
 assert any(item.startswith("prompt-toolkit") for item in requirements)
+assert any(item.startswith("rich") for item in requirements)
+assert any(item.startswith("XlsxWriter") for item in requirements)
 """
         _run(
             [
@@ -534,6 +580,16 @@ assert any(item.startswith("prompt-toolkit") for item in requirements)
             )
         _run(
             [str(command), "--help"],
+            cwd=outside_checkout,
+            env=environment,
+        )
+        _run(
+            [str(installed_python), "-m", "pip", "check"],
+            cwd=outside_checkout,
+            env=environment,
+        )
+        _run(
+            [str(installed_python), "-I", "-c", runtime_dependency_check],
             cwd=outside_checkout,
             env=environment,
         )

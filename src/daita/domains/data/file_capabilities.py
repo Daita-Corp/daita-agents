@@ -12,7 +12,6 @@ from ...capabilities import (
     ExtensionDeclarations,
     Executor,
     ToolApplicability,
-    ToolArtifact,
     ToolExecution,
     ToolOutput,
     ToolView,
@@ -84,7 +83,6 @@ class LocalFileReadResult:
     projection: BoundedResultProjection
     complete: bool = True
     limitation_reasons: tuple[str, ...] = ()
-    artifact: ToolArtifact | None = None
 
     def __post_init__(self) -> None:
         for value, name, maximum in (
@@ -104,11 +102,6 @@ class LocalFileReadResult:
         limitations = _limitation_tuple(self.limitation_reasons)
         if self.complete == bool(limitations):
             raise ValueError("complete must agree with limitation_reasons")
-        if self.artifact is not None and not isinstance(
-            self.artifact,
-            ToolArtifact,
-        ):
-            raise TypeError("artifact must be a ToolArtifact or None")
         object.__setattr__(self, "columns", columns)
         object.__setattr__(self, "limitation_reasons", limitations)
 
@@ -206,7 +199,6 @@ class LocalFileReadExecutor:
         return ToolOutput(
             kind=LOCAL_FILE_READ_EVIDENCE_KIND,
             data=result.tool_data(),
-            artifact=result.artifact,
         )
 
 

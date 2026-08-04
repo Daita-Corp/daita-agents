@@ -39,6 +39,13 @@ pipx install daita-agents
 daita
 ```
 
+If pipx would otherwise select a newer unsupported interpreter, choose an
+installed Python 3.11 or 3.12 explicitly:
+
+```bash
+pipx install --python python3.12 daita-agents
+```
+
 The first launch guides you through creating an agent, choosing a model,
 storing its API key in the OS keychain, and attaching a read only source. No
 credentials need to appear in CLI arguments or configuration files.
@@ -93,6 +100,22 @@ uses one tool free model request outside `AgentLoop` and places proposals in an
 inactive inbox. `/memory accept <id>` handles exactly one candidate through a
 fresh foreground run and the normal approval path. There is no bulk
 acceptance.
+
+File requests use the same direct loop. Exact SQL results can become CSV or
+XLSX artifacts, while attached cataloged CSV and JSON resources can be copied
+byte-for-byte without passing source bytes through the model. A later turn can
+use a bounded model-only `artifact_list` for the current conversation,
+`artifact_read` for a bounded preview, and `artifact_convert` for the supported
+Daita XLSX `Data` snapshot to CSV conversion. There is no public artifact
+inventory, CLI list command, hidden current-file pointer, or prompt keyword
+router.
+
+Local files are normally delivered automatically to the authorized default
+destination and reported with the verified saved path. Public recovery remains
+known-ID only through `Agent.read_artifact`, `Agent.save_artifact`, and
+`daita artifacts save`. Clearing conversations invalidates the corresponding
+internal artifact IDs but never deletes copies already delivered to user-owned
+directories.
 
 For the complete implementation boundaries, see [AGENTS.md](AGENTS.md).
 
@@ -217,8 +240,10 @@ Run the deterministic suite before submitting a change:
 .venv/bin/python -m mypy src/daita tests
 ```
 
-`tests/pipx_lifecycle_smoke.py` additionally builds and exercises an isolated
-pipx installation; it may download declared dependencies.
+`tests/pipx_lifecycle_smoke.py` additionally builds a fresh wheel and exercises
+an isolated pipx install, dependency check, real XLSX runtime, reinstall, state
+preservation, and uninstall. It is a required release gate on both Python 3.11
+and 3.12 and may download declared dependencies.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
 [SECURITY.md](SECURITY.md) for private vulnerability reporting.

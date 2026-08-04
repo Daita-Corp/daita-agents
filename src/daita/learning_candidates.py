@@ -50,7 +50,6 @@ from .semantics import (
     SEMANTIC_STATEMENT_MAX_UTF8_BYTES,
     ResourceRevisionBinding,
     SemanticAnnotation,
-    SemanticAnnotationView,
     SemanticKind,
     SemanticSubject,
     inspect_semantic_annotations,

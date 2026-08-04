@@ -156,6 +156,17 @@ write requires an explicit design for validation, authorization,
 transactionality, idempotency, uncertain outcomes, and recovery; approval
 alone is not such a design.
 
+Artifact continuity is model-led through the existing capability/runtime path.
+`artifact_list` exposes only bounded safe metadata for the current conversation;
+it is not a public Python, CLI, TUI, or browser inventory. `artifact_read`
+returns only bounded previews, and `artifact_convert` currently supports only a
+verified Daita-generated XLSX `Data` snapshot to CSV. Conversion reads committed
+artifact bytes at the artifact-store boundary, inherits runtime-bound
+provenance and sensitivity, records its parent artifact ID, and commits through
+the normal artifact policy. Do not add prompt-intent classifiers, historical
+artifact-reference projections, a current-file pointer, raw model paths/bytes,
+or a second execution path to improve file reference continuity.
+
 ### Catalog and adapters
 
 `daita.catalog` owns normalized structural truth and catalog search, inspection,
@@ -293,16 +304,18 @@ daita
 ```
 
 `openai`, `anthropic`, `google-genai`, `asyncpg`, `sqlglot`, `keyring`,
-`prompt-toolkit`, and `rich` are default production dependencies. `dev` is the only
-optional dependency group; do not restore provider, keychain, database,
-parser, CLI, recommended, complete, aggregate, or other customer extras.
+`prompt-toolkit`, `rich`, and `XlsxWriter` are default production dependencies.
+`dev` is the only optional dependency group; do not restore provider, keychain,
+database, parser, CLI, recommended, complete, aggregate, or other customer
+extras.
 
 Default installation does not authorize eager imports. Import provider SDKs,
 `asyncpg`, `sqlglot`, `keyring`, `prompt_toolkit`, and Rich only inside the
-provider/client or terminal-selection boundary that first needs them—never at
-module import time. Importing `daita` or `daita.cli`, and running headless
-commands, must not load those integration packages before their execution
-boundary is used; all are still imported lazily.
+provider/client or terminal-selection boundary that first needs them, and
+XlsxWriter only inside the XLSX renderer boundary—never at module import time.
+Importing `daita` or `daita.cli`, and running headless commands, must not load
+those integration packages before their execution boundary is used; all are
+still imported lazily.
 
 If a default production dependency is missing or damaged, raise a normalized
 `ImportError` that points to the application repair command:

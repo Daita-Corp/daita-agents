@@ -282,6 +282,8 @@ async def test_memory_set_identity_projection_and_read_tools_never_ask_approval(
         assert resolved == capability
         definitions = await _runtime(agent).definitions(_run(agent))
         assert tuple(item.name for item in definitions) == (
+            "artifact_create_document",
+            "artifact_set_export_location",
             "memory_set",
             "skill_delete",
             "skill_save",

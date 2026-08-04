@@ -6,9 +6,15 @@ from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+import re
 from typing import Self
 
 from ._json import FrozenJsonObject
+from .artifacts.models import (
+    ArtifactDeliveryReceipt,
+    ArtifactDestination,
+    ArtifactPayload,
+)
 from .adapters.models import SourceRegistration
 from .adapters.postgresql import (
     PostgreSQLProbeResult,
@@ -108,7 +114,9 @@ class Agent:
         reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
+        downloads_directory: Path | None = None,
     ) -> Self:
+        _validate_downloads_directory(downloads_directory)
         return cls(
             await EmbeddedAgent.create(
                 name,
@@ -129,6 +137,7 @@ class Agent:
                 reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
+                downloads_directory=downloads_directory,
             )
         )
 
@@ -154,7 +163,9 @@ class Agent:
         reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
+        downloads_directory: Path | None = None,
     ) -> Self:
+        _validate_downloads_directory(downloads_directory)
         return cls(
             await EmbeddedAgent.open(
                 name,
@@ -175,6 +186,7 @@ class Agent:
                 reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
+                downloads_directory=downloads_directory,
             )
         )
 
@@ -263,6 +275,41 @@ class Agent:
         """Delete transcripts and candidate records, not approved knowledge."""
 
         return await self._embedded.clear_conversations()
+
+    async def read_artifact(self, artifact_id: str) -> ArtifactPayload:
+        _validate_artifact_id(artifact_id)
+        return await self._embedded.read_artifact(artifact_id)
+
+    async def save_artifact(
+        self,
+        artifact_id: str,
+        destination: Path | None = None,
+        *,
+        filename: str | None = None,
+    ) -> ArtifactDeliveryReceipt:
+        _validate_artifact_id(artifact_id)
+        if destination is not None and not isinstance(destination, Path):
+            raise TypeError("destination must be pathlib.Path or None")
+        if filename is not None and (
+            not isinstance(filename, str) or not filename or len(filename) > 120
+        ):
+            raise ValueError("filename must be 1 through 120 characters or None")
+        return await self._embedded.save_artifact(
+            artifact_id,
+            destination,
+            filename=filename,
+        )
+
+    async def export_destination(self) -> ArtifactDestination:
+        return await self._embedded.export_destination()
+
+    async def set_export_destination(self, directory: Path) -> ArtifactDestination:
+        if not isinstance(directory, Path):
+            raise TypeError("directory must be pathlib.Path")
+        return await self._embedded.set_export_destination(directory)
+
+    async def reset_export_destination(self) -> ArtifactDestination:
+        return await self._embedded.reset_export_destination()
 
     async def active_source(
         self,
@@ -531,6 +578,19 @@ class Agent:
 
     async def __aexit__(self, *args: object) -> None:
         await self.close()
+
+
+def _validate_artifact_id(value: str) -> None:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"artifact-[0-9a-f]{32}", value) is None
+    ):
+        raise ValueError("artifact_id must use artifact-<32 lowercase hex>")
+
+
+def _validate_downloads_directory(value: Path | None) -> None:
+    if value is not None and not isinstance(value, Path):
+        raise TypeError("downloads_directory must be pathlib.Path or None")
 
 
 __all__ = [

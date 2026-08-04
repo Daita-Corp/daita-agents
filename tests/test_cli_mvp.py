@@ -1069,22 +1069,25 @@ def test_future_cli_3_chat_uses_the_existing_exact_once_approval_path():
         )
         in stdout
     )
-    assert stdout.count("Approve this exact change once? [y/N]") == 1
+    assert stdout.count("Approve this exact change once? [y/n]") == 1
     assert memory == proposed
     assert len(provider.requests) == 2
 
 
 @pytest.mark.parametrize(
-    "approval_input",
+    ("approval_input", "prompt_count"),
     (
-        "n\n/exit\n",
-        "\n/exit\n",
-        "yes\n/exit\n",
-        "",
+        ("n\n/exit\n", 1),
+        ("\nn\n/exit\n", 2),
+        ("yes\nn\n/exit\n", 2),
+        ("a\nn\n/exit\n", 2),
     ),
-    ids=("deny", "default", "unrecognized", "eof"),
+    ids=("deny", "blank", "unrecognized", "old-tui-approve"),
 )
-def test_cli_3_chat_denies_every_answer_except_trimmed_y(approval_input: str):
+def test_cli_3_chat_requires_explicit_y_or_n(
+    approval_input: str,
+    prompt_count: int,
+):
     proposed = "This must not be stored."
     provider = MockModelProvider(
         (
@@ -1113,7 +1116,8 @@ def test_cli_3_chat_denies_every_answer_except_trimmed_y(approval_input: str):
 
     assert code == 0
     assert stderr == ""
-    assert stdout.count("Approve this exact change once? [y/N]") == 1
+    assert stdout.count("Approve this exact change once? [y/n]") == prompt_count
+    assert stdout.count("Enter y to approve or n to deny.") == prompt_count - 1
     assert memory == ""
     provider.assert_consumed()
 
@@ -1150,7 +1154,7 @@ def test_cli_3_chat_decides_each_exact_request_independently():
 
     assert code == 0
     assert stderr == ""
-    assert stdout.count("Approve this exact change once? [y/N]") == 2
+    assert stdout.count("Approve this exact change once? [y/n]") == 2
     assert first in stdout
     assert second in stdout
     assert memory == first
@@ -1273,11 +1277,13 @@ def test_cli_3_y_and_n_remain_ordinary_messages_outside_approval():
 def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
     commands = _subcommands(cli.build_parser())
     assert set(commands) == {
+        "artifacts",
         "create",
         "attach",
         "sources",
         "detach",
         "conversations",
+        "export-location",
         "delete",
         "run",
         "chat",

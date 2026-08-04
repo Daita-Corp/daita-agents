@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from daita.adapters import postgresql
+from daita.artifacts import renderers
 from daita.domains.data import sql
 from daita.llm.providers.anthropic import AnthropicMessagesProvider
 from daita.llm.providers.gemini import GeminiProvider
@@ -33,15 +34,17 @@ def test_default_distribution_contains_every_supported_production_dependency():
     project = _project_metadata()
 
     assert project["version"] == "1.0.0"
+    assert project["requires-python"] == ">=3.11,<3.13"
     assert set(project["dependencies"]) == {
-        "anthropic>=0.116.0",
-        "asyncpg>=0.30.0",
-        "google-genai>=1.73.1",
-        "keyring>=25.0.0",
-        "openai>=1.99.9",
+        "anthropic>=0.116.0,<1.0.0",
+        "asyncpg>=0.30.0,<1.0.0",
+        "google-genai>=1.73.1,<2.0.0",
+        "keyring>=25.0.0,<26.0.0",
+        "openai>=1.99.9,<2.0.0",
         "prompt-toolkit>=3.0.52,<4.0.0",
         "rich>=15.0.0,<16.0.0",
-        "sqlglot>=25.0.0",
+        "sqlglot>=30.14.0,<30.15.0",
+        "XlsxWriter>=3.2.5,<4.0.0",
     }
     assert set(project["optional-dependencies"]) == {"dev"}
     assert project["scripts"] == {"daita": "daita.cli:main"}
@@ -87,6 +90,7 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     smoke = (ROOT / "tests/pipx_lifecycle_smoke.py").read_text(encoding="utf-8")
 
     assert "python -m build" in smoke
+    assert '"--no-isolation"' not in smoke
     assert "PIPX_HOME" in smoke
     assert "PIPX_BIN_DIR" in smoke
     assert "daita --help" in smoke
@@ -99,6 +103,12 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     assert "cross-version smoke requires distinct baseline" in smoke
     assert "candidate wheels" in smoke
     assert "force-installs the candidate" in smoke
+    assert '"pip", "check"' in smoke
+    assert "import xlsxwriter" in smoke
+    assert "Workbook(" in smoke
+    assert '"Requires-Python"' in smoke
+    assert '">=3.11"' in smoke
+    assert '"<3.13"' in smoke
     assert '"create",' in smoke
     assert '"preservation-agent"' in smoke
     assert '"agent.toml"' in smoke
@@ -117,6 +127,16 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     assert "publish" not in smoke
     assert "$HOME" not in smoke
     assert "~/" not in smoke
+
+
+def test_ci_requires_clean_pipx_wheel_smoke_on_each_supported_python():
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "pipx-release:" in workflow
+    assert 'python-version: ["3.11", "3.12"]' in workflow
+    assert "python tests/pipx_lifecycle_smoke.py" in workflow
+    assert 'python -m pip install -e ".[dev]" pipx' in workflow
+    assert "[dev,sqlite]" not in workflow
 
 
 def _missing_import(module: str, action: Callable[[], object]) -> ImportError:
@@ -180,6 +200,15 @@ def test_missing_asyncpg_uses_pipx_repair_guidance():
     assert "daita-agents[" not in str(caught.value)
 
 
+def test_missing_xlsxwriter_uses_exact_pipx_repair_guidance():
+    with patch.object(renderers, "import_module", side_effect=ImportError):
+        with pytest.raises(ImportError) as caught:
+            renderers._load_xlsxwriter()
+
+    assert PIPX_REPAIR in str(caught.value)
+    assert "daita-agents[" not in str(caught.value)
+
+
 def test_package_cli_imports_and_headless_command_keep_integrations_lazy(tmp_path):
     script = """
 import builtins
@@ -194,6 +223,7 @@ blocked = {
     "prompt_toolkit",
     "rich",
     "sqlglot",
+    "xlsxwriter",
 }
 original = builtins.__import__
 
