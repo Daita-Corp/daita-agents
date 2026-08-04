@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast, TypedDict
 
 import pytest
 
@@ -43,6 +44,34 @@ class _EdgeSpec:
 class _CommittedGraph:
     resource_ids: dict[str, str]
     relationship_ids: dict[str, str]
+
+
+class _TraversalFieldPair(TypedDict):
+    ordinal: int
+    source_field: str
+    target_field: str
+
+
+class _TraversalStep(TypedDict):
+    relationship_id: str
+    direction: str
+    path_from_resource_id: str
+    path_to_resource_id: str
+    field_pairs: tuple[_TraversalFieldPair, ...]
+
+
+class _TraversalPath(TypedDict):
+    resource_ids: tuple[str, ...]
+    steps: tuple[_TraversalStep, ...]
+
+
+class _TraversalProjection(TypedDict):
+    paths: tuple[_TraversalPath, ...]
+    reachable: bool
+    truncated: bool
+    truncation_reason: str | None
+    visited_edges: int
+    visited_nodes: int
 
 
 @pytest.fixture
@@ -170,8 +199,8 @@ async def _traverse(
     max_paths: int = 8,
     max_nodes: int = 256,
     max_edges: int = 1_024,
-):
-    return await agent._embedded._catalog_service.traverse(
+) -> _TraversalProjection:
+    projection = await agent._embedded._catalog_service.traverse(
         CatalogTraversalRequest(
             agent_id=agent.id,
             from_resource_ids=tuple(graph.resource_ids[name] for name in from_names),
@@ -183,9 +212,12 @@ async def _traverse(
             max_edges=max_edges,
         )
     )
+    return cast(_TraversalProjection, projection)
 
 
-def _path_signature(projection) -> tuple[tuple[object, ...], ...]:
+def _path_signature(
+    projection: _TraversalProjection,
+) -> tuple[tuple[object, ...], ...]:
     return tuple(
         (
             path["resource_ids"],

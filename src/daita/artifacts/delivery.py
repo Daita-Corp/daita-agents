@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 import ctypes
-import errno
 import json
 import os
 from pathlib import Path

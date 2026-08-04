@@ -1007,6 +1007,8 @@ class DataToolRuntime:
         if (
             schema is None
             or schema.resource_kind != "file"
+            or schema.revision is None
+            or schema.source_revision is None
             or schema.revision != binding.resource_revision
             or schema.source_revision != binding.source_revision
             or binding.source_id != source_id

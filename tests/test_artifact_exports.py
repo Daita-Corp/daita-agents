@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
-import json
 from pathlib import Path
 import sqlite3
 import threading
@@ -33,7 +32,6 @@ from daita.artifacts.renderers import (
     MAX_CSV_COLUMNS,
     MAX_CSV_ROWS,
     MAX_CSV_SECONDS,
-    ExactCsvRenderer,
     render_exact_csv,
 )
 from daita.catalog.models import Sensitivity

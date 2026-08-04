@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import getpass
@@ -1251,7 +1251,8 @@ async def _active_source_for(
 ) -> Any:
     active_source = getattr(agent, "active_source", None)
     if callable(active_source):
-        return await active_source(conversation_id=conversation_id)
+        load_active_source = cast(Callable[..., Awaitable[Any]], active_source)
+        return await load_active_source(conversation_id=conversation_id)
     resolved_sources = (
         tuple(source for source in await agent.list_sources() if source.active)
         if sources is None
@@ -1964,8 +1965,9 @@ async def _chat_tui(
         list_skills = getattr(agent, "list_skills", None)
         if not callable(list_skills):
             return ()
+        load_skills = cast(Callable[[], Awaitable[tuple[Any, ...]]], list_skills)
         return tuple(
-            (summary.name, summary.description) for summary in await list_skills()
+            (summary.name, summary.description) for summary in await load_skills()
         )
 
     async def load_source_completions() -> tuple[tuple[str, str, str], ...]:

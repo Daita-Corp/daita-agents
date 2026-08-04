@@ -348,7 +348,7 @@ class _TabularExportExecutor:
         assert isinstance(source_id, str)
         assert isinstance(sql, str)
         assert isinstance(parameters, tuple)
-        assert format_name in {"csv", "xlsx"}
+        assert isinstance(format_name, str) and format_name in {"csv", "xlsx"}
         assert filename is None or isinstance(filename, str)
         completed = {"rows": 0, "columns": 0, "bytes": 0}
 
