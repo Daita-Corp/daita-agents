@@ -490,7 +490,9 @@ async def test_full_screen_resize_repaints_without_leaving_alternate_screen():
     assert output.alternate_exit_count == 1
 
 
-async def test_full_screen_transcript_uses_page_keys_and_mouse_wheel_for_scrolling():
+async def test_full_screen_transcript_uses_page_keys_and_mouse_wheel_for_scrolling(
+    monkeypatch: pytest.MonkeyPatch,
+):
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
     for index in range(50):
@@ -500,6 +502,20 @@ async def test_full_screen_transcript_uses_page_keys_and_mouse_wheel_for_scrolli
                 f"Transcript row {index:02d}",
             )
         )
+
+    canonical_renders = 0
+    original_canonical_assistant_text = terminal_tui._canonical_assistant_text
+
+    def counted_canonical_assistant_text(*args: Any, **kwargs: Any) -> str:
+        nonlocal canonical_renders
+        canonical_renders += 1
+        return original_canonical_assistant_text(*args, **kwargs)
+
+    monkeypatch.setattr(
+        terminal_tui,
+        "_canonical_assistant_text",
+        counted_canonical_assistant_text,
+    )
 
     async def no_message(message: str, conversation_id: str | None) -> Any:
         raise AssertionError((message, conversation_id))
@@ -532,17 +548,49 @@ async def test_full_screen_transcript_uses_page_keys_and_mouse_wheel_for_scrolli
 
         initial_content = content_window.content.create_content(98, None)
         initial_cursor_row = initial_content.cursor_position.y
+        initial_builds = state.transcript_viewport.projection_build_count
+        initial_canonical_renders = canonical_renders
+        assert (
+            state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.FOLLOWING
+        )
         render_counter = application.render_counter
         pipe.send_text("\x1b[5~")
         await _wait_until(lambda: application.render_counter > render_counter)
         page_up_content = content_window.content.create_content(98, None)
         assert page_up_content.cursor_position.y < initial_cursor_row
+        assert (
+            state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.REVIEWING
+        )
+
+        first_review_cursor_row = page_up_content.cursor_position.y
+        render_counter = application.render_counter
+        pipe.send_text("\x1b[5~")
+        await _wait_until(lambda: application.render_counter > render_counter)
+        second_page_up_content = content_window.content.create_content(98, None)
+        assert second_page_up_content.cursor_position.y < first_review_cursor_row
 
         render_counter = application.render_counter
         pipe.send_text("\x1b[6~")
         await _wait_until(lambda: application.render_counter > render_counter)
         page_down_content = content_window.content.create_content(98, None)
-        assert page_down_content.cursor_position.y == initial_cursor_row
+        assert page_down_content.cursor_position.y == first_review_cursor_row
+        assert (
+            state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.REVIEWING
+        )
+
+        render_counter = application.render_counter
+        pipe.send_text("\x1b[6~")
+        await _wait_until(lambda: application.render_counter > render_counter)
+        final_page_down_content = content_window.content.create_content(98, None)
+        assert final_page_down_content.cursor_position.y == initial_cursor_row
+        assert (
+            state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.FOLLOWING
+        )
+        latest_scroll = content_window.vertical_scroll
 
         scroll_up = MouseEvent(
             position=Point(x=1, y=1),
@@ -550,10 +598,19 @@ async def test_full_screen_transcript_uses_page_keys_and_mouse_wheel_for_scrolli
             button=MouseButton.NONE,
             modifiers=frozenset(),
         )
+        render_counter = application.render_counter
         assert content_window.content.mouse_handler(scroll_up) is None
-        mouse_up_content = content_window.content.create_content(98, None)
-        assert mouse_up_content.cursor_position.y == (
-            initial_cursor_row - terminal_tui._MOUSE_SCROLL_LINES
+        await _wait_until(lambda: application.render_counter > render_counter)
+        assert (
+            state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.REVIEWING
+        )
+        mouse_anchor = state.transcript_viewport.anchor
+        assert mouse_anchor is not None
+        assert (
+            1
+            <= latest_scroll - content_window.vertical_scroll
+            <= (terminal_tui._MOUSE_SCROLL_LINES)
         )
 
         scroll_down = MouseEvent(
@@ -562,13 +619,197 @@ async def test_full_screen_transcript_uses_page_keys_and_mouse_wheel_for_scrolli
             button=MouseButton.NONE,
             modifiers=frozenset(),
         )
+        render_counter = application.render_counter
         assert content_window.content.mouse_handler(scroll_down) is None
+        await _wait_until(lambda: application.render_counter > render_counter)
         mouse_down_content = content_window.content.create_content(98, None)
         assert mouse_down_content.cursor_position.y == initial_cursor_row
+        assert (
+            state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.FOLLOWING
+        )
+        assert state.transcript_viewport.projection_build_count == initial_builds
+        assert canonical_renders == initial_canonical_renders
 
         pipe.send_text("\x04")
         await task
         assert output.mouse_disable_count == 1
+
+
+async def test_ctrl_home_new_output_affordance_click_and_ctrl_end_follow_latest():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    for index in range(40):
+        state.append_plain("assistant", f"Transcript row {index:02d}")
+    original_texts = tuple(block.text for block in state.blocks)
+
+    async def no_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=no_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        main_shell = application.layout.container.children[0].content
+        indicator_window = main_shell.children[1].content
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+
+        pipe.send_text("\x1b[1;5H")
+        await _wait_until(
+            lambda: state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.REVIEWING
+        )
+        anchor = state.transcript_viewport.anchor
+        assert anchor is not None
+        projection = cast(Any, state.transcript_projection)
+        assert state.transcript_viewport.top_row(projection, viewport_rows=8) == 0
+        assert tuple(block.text for block in state.blocks) == original_texts
+
+        for index in range(3):
+            state.append_plain("assistant", f"new row {index}")
+        application.invalidate()
+        await _wait_until(lambda: "3 new items" in output.text)
+        assert state.transcript_viewport.anchor == anchor
+        assert state.transcript_viewport.unseen_items == 3
+
+        indicator_window.content.create_content(output.size.columns, 1)
+        click = MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        assert indicator_window.content.mouse_handler(click) is None
+        assert (
+            state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.FOLLOWING
+        )
+        assert state.transcript_viewport.unseen_items == 0
+
+        pipe.send_text("\x1b[1;5H")
+        await _wait_until(
+            lambda: state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.REVIEWING
+        )
+        pipe.send_text("\x1b[1;5F")
+        await _wait_until(
+            lambda: state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.FOLLOWING
+        )
+        pipe.send_text("\x04")
+        await task
+
+
+async def test_submit_while_reviewing_preserves_anchor_and_counts_new_blocks():
+    output = _RecordingOutput()
+    state = TerminalViewState(
+        "atlas",
+        "model",
+        "source",
+        conversation_id="conversation-one",
+    )
+    for index in range(40):
+        state.append_plain("assistant", f"earlier row {index}")
+    messages: list[str] = []
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        assert conversation_id == "conversation-one"
+        messages.append(message)
+        return _result("new answer")
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(pipe, output, state, run_message=run_message)
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+        pipe.send_text("\x1b[1;5H")
+        await _wait_until(
+            lambda: state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.REVIEWING
+        )
+        anchor = state.transcript_viewport.anchor
+
+        pipe.send_text("new question\r")
+        await _wait_until(lambda: messages == ["new question"] and not state.running)
+
+        assert (
+            state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.REVIEWING
+        )
+        assert state.transcript_viewport.anchor == anchor
+        assert state.transcript_viewport.unseen_items == 2
+        pipe.send_text("\x04")
+        await task
+
+
+def test_review_counter_counts_new_blocks_not_tool_status_or_initial_hydration():
+    runtime = terminal_tui._load_terminal_runtime()
+    capabilities = terminal_tui.TerminalCapabilities("none", True)
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_plain("assistant", "earlier output\n" * 10)
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=40,
+        capabilities=capabilities,
+    )
+    projection = cast(Any, state.transcript_projection)
+    state.transcript_viewport.review_start(projection)
+
+    state.apply_event(
+        _event(
+            AgentEventKind.TOOL_STARTED,
+            {"call_id": "call-new", "tool_name": "catalog_search"},
+        )
+    )
+    assert state.transcript_viewport.unseen_items == 1
+    state.apply_event(
+        _event(
+            AgentEventKind.TOOL_COMPLETED,
+            {
+                "call_id": "call-new",
+                "tool_name": "catalog_search",
+                "duration_ms": 5,
+                "success": True,
+            },
+        )
+    )
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=40,
+        capabilities=capabilities,
+    )
+    assert state.transcript_viewport.unseen_items == 1
+
+    call = ToolCall(id="call-history", name="catalog_search", arguments={"query": "x"})
+    history = _tool_transcript(
+        (call,),
+        (
+            ToolResultBlock(
+                call_id=call.id,
+                output={"kind": "catalog.search_result", "data": {"value": 1}},
+            ),
+        ),
+        run_id="run-history",
+    )
+    state.hydrate_transcript(history, run_id="run-history", initial=True)
+    assert state.transcript_viewport.unseen_items == 1
 
 
 def test_installed_prompt_toolkit_sgr_mouse_protocol_spike_is_deterministic():
@@ -1643,6 +1884,8 @@ def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_docum
     title_anchor = state.transcript_document.make_anchor(
         state.transcript_document.position(block_id, 0)
     )
+    state.transcript_viewport.review_start(cast(Any, state.transcript_projection))
+    viewport_anchor = state.transcript_viewport.anchor
 
     state.apply_event(
         _event(
@@ -1664,6 +1907,7 @@ def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_docum
     )
     assert block.presentation_id == block_id
     assert state.transcript_document.reconcile_anchor(title_anchor) is not None
+    assert state.transcript_viewport.anchor == viewport_anchor
 
     state.hydrate_transcript(transcript, run_id="run-one")
     terminal_tui._render_transcript_fragments(
@@ -1675,6 +1919,7 @@ def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_docum
     hydrated_block = next(block for block in state.blocks if block.kind == "tool")
     assert hydrated_block.presentation_id == block_id
     assert state.transcript_document.reconcile_anchor(title_anchor) is not None
+    assert state.transcript_viewport.anchor == viewport_anchor
     collapsed_text = state.transcript_document.text(block_id)
     expansion_start = collapsed_text.index("Ctrl+O expand")
     expansion_range = state.transcript_document.normalize_range(
@@ -1695,6 +1940,7 @@ def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_docum
 
     assert state.transcript_document.reconcile_anchor(title_anchor) is not None
     assert state.transcript_document.reconcile_range(expansion_range) is None
+    assert state.transcript_viewport.anchor == viewport_anchor
 
 
 @pytest.mark.parametrize("failure", ("load", "projection"))
@@ -1842,6 +2088,55 @@ def test_conversation_display_preserves_complete_messages_and_wraps_user_text():
     assert "_USER_END" in transcript
     assert "ASSISTANT_START" in transcript
     assert "ASSISTANT_END" in transcript
+
+
+def test_rich_markdown_rows_keep_exact_semantic_content_across_rewrap():
+    runtime = terminal_tui._load_terminal_runtime()
+    capabilities = terminal_tui.TerminalCapabilities("none", True)
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_plain(
+        "assistant",
+        """# Quarterly results
+
+| Region | Revenue | Margin |
+| --- | ---: | ---: |
+| North America with a very long label | 123456 | 42% |
+| Europe | 98765 | 38% |
+
+- A deliberately long bullet that wraps differently at narrow widths.
+""",
+    )
+
+    narrow_maps: list[Any] = []
+    narrow_fragments = terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=40,
+        capabilities=capabilities,
+        rendered_transcript_maps=narrow_maps,
+    )
+    narrow_lines = "".join(text for _style, text in narrow_fragments).split("\n")
+    europe_row = next(row for row, line in enumerate(narrow_lines) if "Europe" in line)
+    position = narrow_maps[0].position_for_row(europe_row)
+    assert position is not None
+    assert state.transcript_document.text(position.block_id)[
+        position.offset :
+    ].startswith("Europe")
+    anchor = state.transcript_document.make_anchor(position)
+
+    wide_maps: list[Any] = []
+    wide_fragments = terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=100,
+        capabilities=capabilities,
+        rendered_transcript_maps=wide_maps,
+    )
+    wide_lines = "".join(text for _style, text in wide_fragments).split("\n")
+    wide_row = wide_maps[0].row_for_anchor(state.transcript_document, anchor)
+
+    assert wide_row is not None
+    assert "Europe" in wide_lines[wide_row]
 
 
 def test_transcript_renderer_exercises_stable_semantic_projection_without_rewrap_churn():
@@ -2016,7 +2311,7 @@ def test_full_screen_shell_keeps_header_inside_the_active_layout():
         wide = rendered_header()
 
         assert application.full_screen is True
-        assert len(main_shell.children) == 5
+        assert len(main_shell.children) == 6
         assert narrow.count("DAITA") == 1
         assert wide.count("DAITA") == 1
         assert "atlas" in wide
@@ -2053,8 +2348,8 @@ def test_full_screen_has_no_embedded_scrollbars_and_composer_starts_one_line():
         )
         main_shell = application.layout.container.children[0].content
         transcript = main_shell.children[0]
-        approval = main_shell.children[1].content.children[1].children[1]
-        composer_frame = main_shell.children[2]
+        approval = main_shell.children[2].content.children[1].children[1]
+        composer_frame = main_shell.children[3]
         top, composer, bottom = composer_frame.children
         glyphs = terminal_tui._terminal_glyphs(
             terminal_tui._terminal_capabilities(output)
@@ -2071,7 +2366,10 @@ def test_full_screen_has_no_embedded_scrollbars_and_composer_starts_one_line():
         assert composer.height.min == 1
         assert composer.height.max == terminal_tui._MAX_COMPOSER_ROWS
         assert top_line == glyphs.horizontal * output.size.columns
-        assert bottom_line == glyphs.horizontal * output.size.columns
+        assert terminal_tui._display_width(bottom_line) == output.size.columns
+        assert "Wheel scroll" in bottom_line
+        assert "Page Up/Down review" in bottom_line
+        assert "Ctrl+End latest" in bottom_line
         assert glyphs.vertical not in top_line + bottom_line
         assert glyphs.top_left not in top_line
         assert glyphs.top_right not in top_line
@@ -2108,7 +2406,7 @@ async def test_composer_expands_and_shrinks_for_typed_wrapping_but_not_paste():
             )
         )
         composer = (
-            application.layout.container.children[0].content.children[2].children[1]
+            application.layout.container.children[0].content.children[3].children[1]
         )
         task = asyncio.create_task(terminal_tui._run_application(application))
         await _wait_until(
@@ -3191,6 +3489,57 @@ async def test_exact_approval_panel_reviews_complete_frozen_arguments_and_approv
         ("save this", None),
         ("follow-up", "conversation-one"),
     ]
+
+
+async def test_approval_presentation_and_resolution_preserve_reviewed_anchor():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    for index in range(30):
+        state.append_plain("assistant", f"earlier row {index}")
+    request = _approval_request({"name": "anchor-safe", "content": "safe"})
+    started = asyncio.Event()
+    request_approval = asyncio.Event()
+
+    async def fallback(unexpected: ApprovalRequest) -> ApprovalDecision:
+        raise AssertionError(unexpected)
+
+    approval_bridge = terminal_tui.TerminalApprovalBridge(fallback)
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del message, conversation_id
+        started.set()
+        await request_approval.wait()
+        assert await approval_bridge(request) is ApprovalDecision.DENY
+        return _result("approval resolved")
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            approval_bridge=approval_bridge,
+        )
+        pipe.send_text("run with approval\r")
+        await started.wait()
+        pipe.send_text("\x1b[1;5H")
+        await _wait_until(
+            lambda: state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.REVIEWING
+        )
+        anchor = state.transcript_viewport.anchor
+        request_approval.set()
+        await _wait_until(lambda: state.approval_panel is not None)
+        assert state.transcript_viewport.anchor == anchor
+        pipe.send_text("n")
+        await _wait_until(lambda: state.approval_panel is None and not state.running)
+        assert state.transcript_viewport.anchor == anchor
+        assert (
+            state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.REVIEWING
+        )
+        pipe.send_text("\x04")
+        await task
 
 
 @pytest.mark.parametrize(

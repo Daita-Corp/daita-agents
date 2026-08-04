@@ -62,6 +62,13 @@ class SemanticViewportAnchor:
     text: str
 
 
+class TranscriptFollowState(str, Enum):
+    """Whether the disposable transcript viewport follows or reviews output."""
+
+    FOLLOWING = "following"
+    REVIEWING = "reviewing"
+
+
 @dataclass(frozen=True, slots=True)
 class RenderedCoordinate:
     """A zero-based rendered row and terminal display cell."""
@@ -289,6 +296,7 @@ class TranscriptDocument:
 
     def __init__(self) -> None:
         self._next_id = 1
+        self._generation = 0
         self._order: list[PresentationBlockId] = []
         self._blocks: dict[PresentationBlockId, _BlockState] = {}
         self._retired: set[PresentationBlockId] = set()
@@ -301,6 +309,12 @@ class TranscriptDocument:
     def presentation_ids(self) -> tuple[PresentationBlockId, ...]:
         return tuple(self._order)
 
+    @property
+    def generation(self) -> int:
+        """Return the process-local mutation generation used by projection caches."""
+
+        return self._generation
+
     def contains(self, block_id: PresentationBlockId) -> bool:
         return block_id in self._blocks
 
@@ -311,6 +325,7 @@ class TranscriptDocument:
         block = _BlockState(block_id, text)
         self._blocks[block_id] = block
         self._order.append(block_id)
+        self._generation += 1
         return block.snapshot()
 
     def replace(self, block_id: PresentationBlockId, text: str) -> TranscriptBlock:
@@ -328,6 +343,7 @@ class TranscriptDocument:
         )
         block.text = text
         block.revision += 1
+        self._generation += 1
         return block.snapshot()
 
     def remove(self, block_id: PresentationBlockId) -> None:
@@ -335,13 +351,17 @@ class TranscriptDocument:
         del self._blocks[block_id]
         self._order.remove(block_id)
         self._retired.add(block_id)
+        self._generation += 1
 
     def reorder(self, block_ids: tuple[PresentationBlockId, ...]) -> None:
         if len(block_ids) != len(set(block_ids)):
             raise ValueError("transcript block order cannot repeat an ID")
         if set(block_ids) != set(self._blocks):
             raise ValueError("transcript block order must contain every current ID")
+        if tuple(self._order) == block_ids:
+            return
         self._order = list(block_ids)
+        self._generation += 1
 
     def text(self, block_id: PresentationBlockId) -> str:
         return self._require_block(block_id).text
@@ -623,6 +643,180 @@ class TranscriptDocument:
         return "\n".join(pieces)
 
 
+_MAX_UNSEEN_ITEMS = 9_999
+
+
+class TranscriptViewport:
+    """Pure semantic viewport truth for one disposable transcript document."""
+
+    def __init__(self) -> None:
+        self.state = TranscriptFollowState.FOLLOWING
+        self.anchor: SemanticViewportAnchor | None = None
+        self.unseen_items = 0
+        self._projection: TranscriptProjection | None = None
+        self._projection_document: TranscriptDocument | None = None
+        self._projection_generation = -1
+        self._projection_width = 0
+        self._projection_build_count = 0
+
+    @property
+    def projection(self) -> TranscriptProjection | None:
+        return self._projection
+
+    @property
+    def projection_build_count(self) -> int:
+        """Expose deterministic complete-projection work for performance tests."""
+
+        return self._projection_build_count
+
+    def projection_for(
+        self,
+        document: TranscriptDocument,
+        *,
+        width: int,
+    ) -> TranscriptProjection:
+        """Return one cached projection until text, order, or width changes."""
+
+        if not isinstance(document, TranscriptDocument):
+            raise TypeError("viewport document must be TranscriptDocument")
+        if not isinstance(width, int) or isinstance(width, bool) or width < 1:
+            raise ValueError("viewport projection width must be a positive integer")
+        if (
+            self._projection is None
+            or self._projection_document is not document
+            or self._projection_generation != document.generation
+            or self._projection_width != width
+        ):
+            self._projection = document.project(width)
+            self._projection_document = document
+            self._projection_generation = document.generation
+            self._projection_width = width
+            self._projection_build_count += 1
+        return self._projection
+
+    def record_appended(self, count: int = 1) -> None:
+        """Count genuinely appended blocks only while reviewing."""
+
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("appended transcript block count must be non-negative")
+        if self.state is TranscriptFollowState.REVIEWING:
+            self.unseen_items = min(
+                _MAX_UNSEEN_ITEMS,
+                self.unseen_items + count,
+            )
+
+    def follow_latest(self) -> None:
+        """Attach to the newest content and clear review-only notification state."""
+
+        self.state = TranscriptFollowState.FOLLOWING
+        self.anchor = None
+        self.unseen_items = 0
+
+    def review_start(self, projection: TranscriptProjection) -> None:
+        """Enter Reviewing at the first semantic transcript row."""
+
+        self._review_at(projection, 0)
+
+    def review_row(self, projection: TranscriptProjection, row: int) -> None:
+        """Enter Reviewing at one transiently resolved projection row."""
+
+        if not isinstance(projection, TranscriptProjection):
+            raise TypeError("viewport review requires TranscriptProjection")
+        if not isinstance(row, int) or isinstance(row, bool):
+            raise TypeError("viewport review row must be an integer")
+        self._review_at(projection, row)
+
+    def review_position(
+        self,
+        document: TranscriptDocument,
+        position: SemanticPosition,
+    ) -> None:
+        """Enter Reviewing at one renderer-resolved semantic position."""
+
+        if not isinstance(document, TranscriptDocument):
+            raise TypeError("viewport review requires TranscriptDocument")
+        current = document.reconcile_position(position)
+        if current is None:
+            raise ValueError(
+                "viewport review position must reference surviving content"
+            )
+        self.state = TranscriptFollowState.REVIEWING
+        self.anchor = document.make_anchor(current)
+
+    def top_row(
+        self,
+        projection: TranscriptProjection,
+        *,
+        viewport_rows: int,
+    ) -> int:
+        """Resolve semantic viewport truth to a transient projection row."""
+
+        if not isinstance(projection, TranscriptProjection):
+            raise TypeError("viewport resolution requires TranscriptProjection")
+        if (
+            not isinstance(viewport_rows, int)
+            or isinstance(viewport_rows, bool)
+            or viewport_rows < 1
+        ):
+            raise ValueError("viewport height must be a positive integer")
+        latest = max(0, projection.row_count - viewport_rows)
+        if self.state is TranscriptFollowState.FOLLOWING:
+            return latest
+        resolved = (
+            None if self.anchor is None else projection.resolve_anchor(self.anchor)
+        )
+        if resolved is None:
+            self.anchor = self._fallback_anchor(projection)
+            resolved = (
+                None if self.anchor is None else projection.resolve_anchor(self.anchor)
+            )
+        return min(latest, max(0, 0 if resolved is None else resolved.row))
+
+    def _review_at(self, projection: TranscriptProjection, row: int) -> None:
+        last_row = max(0, projection.row_count - 1)
+        anchor = projection.anchor_for_row(min(last_row, max(0, row)))
+        self.state = TranscriptFollowState.REVIEWING
+        if anchor is not None:
+            self.anchor = anchor
+
+    def _fallback_anchor(
+        self,
+        projection: TranscriptProjection,
+    ) -> SemanticViewportAnchor | None:
+        document = projection._document
+        blocks = document.blocks
+        if not blocks:
+            return None
+        prior_id = None if self.anchor is None else self.anchor.position.block_id
+        if prior_id is not None and document.contains(prior_id):
+            block_id = prior_id
+        else:
+            block_id = next(
+                (
+                    block.id
+                    for block in blocks
+                    if prior_id is None or block.id.value > prior_id.value
+                ),
+                blocks[-1].id,
+            )
+        return document.make_anchor(document.position(block_id, 0))
+
+
+def bounded_scroll_rows(rows: int, *, viewport_rows: int) -> int:
+    """Cap one navigation event to one rendered viewport."""
+
+    if not isinstance(rows, int) or isinstance(rows, bool):
+        raise TypeError("viewport row movement must be an integer")
+    if (
+        not isinstance(viewport_rows, int)
+        or isinstance(viewport_rows, bool)
+        or viewport_rows < 1
+    ):
+        raise ValueError("viewport height must be a positive integer")
+    direction = 1 if rows > 0 else -1 if rows < 0 else 0
+    return direction * min(abs(rows), viewport_rows)
+
+
 def _require_text(text: str) -> None:
     if not isinstance(text, str):
         raise TypeError("canonical selectable text must be a string")
@@ -713,6 +907,9 @@ __all__ = [
     "SemanticViewportAnchor",
     "TranscriptBlock",
     "TranscriptDocument",
+    "TranscriptFollowState",
     "TranscriptProjection",
+    "TranscriptViewport",
+    "bounded_scroll_rows",
     "interaction_owner",
 ]

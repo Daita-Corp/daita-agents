@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_left, bisect_right
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -24,8 +25,13 @@ from .loop.models import Transcript
 from .observation import AgentEvent, AgentEventKind
 from .terminal_transcript import (
     PresentationBlockId,
+    SemanticPosition,
+    SemanticViewportAnchor,
+    TranscriptFollowState,
     TranscriptDocument,
     TranscriptProjection,
+    TranscriptViewport,
+    bounded_scroll_rows,
 )
 
 MAX_COMPOSER_CHARACTERS = 16_384
@@ -297,6 +303,50 @@ class TerminalBlock:
 
 
 @dataclass(frozen=True, slots=True)
+class _RenderedTranscriptMap:
+    """Exact transient navigation positions for the currently rendered rows."""
+
+    row_positions: tuple[SemanticPosition, ...]
+    block_offsets: Mapping[PresentationBlockId, tuple[int, ...]]
+    block_rows: Mapping[PresentationBlockId, tuple[int, ...]]
+
+    def position_for_row(self, row: int) -> SemanticPosition | None:
+        if not self.row_positions:
+            return None
+        bounded = min(len(self.row_positions) - 1, max(0, row))
+        return self.row_positions[bounded]
+
+    def row_for_anchor(
+        self,
+        document: TranscriptDocument,
+        anchor: SemanticViewportAnchor | None,
+    ) -> int | None:
+        if anchor is None:
+            return None
+        current = document.reconcile_anchor(anchor)
+        if current is None:
+            return None
+        offsets = self.block_offsets.get(current.position.block_id)
+        rows = self.block_rows.get(current.position.block_id)
+        if not offsets or not rows:
+            return None
+        index = max(0, bisect_right(offsets, current.position.offset) - 1)
+        return rows[index]
+
+
+_EMPTY_RENDERED_TRANSCRIPT_MAP = _RenderedTranscriptMap((), {}, {})
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingRenderedBlockMap:
+    """One rendered block awaiting its stable document identity."""
+
+    block: TerminalBlock
+    rendered_start: int
+    row_offsets: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _ComposerDraft:
     """One process-local composer history entry with hidden pasted text."""
 
@@ -454,8 +504,14 @@ class TerminalViewState:
         repr=False,
         compare=False,
     )
-    transcript_projection: TranscriptProjection | None = field(
-        default=None,
+    transcript_viewport: TranscriptViewport = field(
+        default_factory=TranscriptViewport,
+        repr=False,
+        compare=False,
+    )
+    _transcript_render_generation: int = field(
+        default=0,
+        init=False,
         repr=False,
         compare=False,
     )
@@ -496,6 +552,21 @@ class TerminalViewState:
             if conversation_id is None
             else self._context_by_conversation.get(conversation_id)
         )
+
+    @property
+    def transcript_projection(self) -> TranscriptProjection | None:
+        """Expose the viewport-owned cached projection to the renderer."""
+
+        return self.transcript_viewport.projection
+
+    @property
+    def transcript_render_generation(self) -> int:
+        """Return the disposable content generation used by the TUI render cache."""
+
+        return self._transcript_render_generation
+
+    def _mark_transcript_dirty(self) -> None:
+        self._transcript_render_generation += 1
 
     def _remember_conversation_context(
         self,
@@ -626,7 +697,13 @@ class TerminalViewState:
             self.active_run_id = None
         self.notice = ""
 
-    def hydrate_transcript(self, transcript: Transcript, *, run_id: str) -> None:
+    def hydrate_transcript(
+        self,
+        transcript: Transcript,
+        *,
+        run_id: str,
+        initial: bool = False,
+    ) -> None:
         """Hydrate and canonically reorder one completed run's tool cards."""
 
         if not isinstance(transcript, Transcript):
@@ -744,7 +821,9 @@ class TerminalViewState:
                 )
                 for block in self.blocks
             ),
+            count_as_unseen=not initial,
         )
+        self._mark_transcript_dirty()
 
     def toggle_expanded_detail(self) -> bool:
         """Toggle the most recent completed hydrated card in this process."""
@@ -758,6 +837,7 @@ class TerminalViewState:
                 and card.details is not None
             ):
                 card.expanded = not card.expanded
+                self._mark_transcript_dirty()
                 return True
         return False
 
@@ -818,6 +898,7 @@ class TerminalViewState:
             card.duration_ms = None
             card.error_code = None
             self.run_status = "querying"
+            self._mark_transcript_dirty()
             return
         if event.kind is AgentEventKind.APPROVAL_REQUESTED:
             card = self._card_for_event(event)
@@ -827,6 +908,7 @@ class TerminalViewState:
             card.approval_outcome = None
             card.expanded = True
             self.run_status = "approval"
+            self._mark_transcript_dirty()
             return
         if event.kind is AgentEventKind.APPROVAL_DECIDED:
             card = self._card_for_event(event)
@@ -849,6 +931,7 @@ class TerminalViewState:
                     "approval_denied" if outcome == "denied" else "approval_failed"
                 )
                 self.run_status = "working"
+            self._mark_transcript_dirty()
             return
         if event.kind is AgentEventKind.TOOL_COMPLETED:
             card = self._card_for_event(event)
@@ -869,6 +952,7 @@ class TerminalViewState:
                     fallback="tool_failed",
                 )
             self.run_status = "working"
+            self._mark_transcript_dirty()
             return
         if event.kind is AgentEventKind.RUN_COMPLETED:
             self.run_duration_ms = _event_counter(event.data.get("duration_ms"))
@@ -954,6 +1038,7 @@ class TerminalViewState:
         exit_kind: str,
         reason: str,
     ) -> None:
+        changed = False
         for card in self.tool_cards.values():
             if card.run_id != run_id or card.state not in {
                 "queued",
@@ -968,6 +1053,9 @@ class TerminalViewState:
                 if exit_kind == "interrupted" or reason == "cancelled"
                 else "observation_incomplete"
             )
+            changed = True
+        if changed:
+            self._mark_transcript_dirty()
 
     def _append_block(self, block: TerminalBlock) -> None:
         """Admit one block to both disposable views under one stable identity."""
@@ -975,17 +1063,21 @@ class TerminalViewState:
         snapshot = self.transcript_document.append(block.text)
         block.presentation_id = snapshot.id
         self.blocks.append(block)
+        self.transcript_viewport.record_appended()
+        self._mark_transcript_dirty()
 
     def _sync_transcript_document(
         self,
         selectable_texts: Sequence[str],
         *,
         width: int | None = None,
+        count_as_unseen: bool = True,
     ) -> None:
         """Reconcile renderer-owned selectable projections without persisting them."""
 
         if len(selectable_texts) != len(self.blocks):
             raise ValueError("each terminal block requires one selectable projection")
+        prior_ids = set(self.transcript_document.presentation_ids)
         current_ids: list[PresentationBlockId] = []
         seen: set[PresentationBlockId] = set()
         for block, selectable_text in zip(
@@ -1009,8 +1101,15 @@ class TerminalViewState:
             if block_id not in seen:
                 self.transcript_document.remove(block_id)
         self.transcript_document.reorder(tuple(current_ids))
+        if count_as_unseen:
+            self.transcript_viewport.record_appended(
+                sum(block_id not in prior_ids for block_id in current_ids)
+            )
         if width is not None:
-            self.transcript_projection = self.transcript_document.project(width)
+            self.transcript_viewport.projection_for(
+                self.transcript_document,
+                width=width,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1969,9 +2068,11 @@ def _create_application(
     input_history: list[_ComposerDraft] = []
     history_position = 0
     history_draft = _ComposerDraft("")
-    transcript_scroll_offset = 0
     content_line_count = 1
     content_last_line_width = 0
+    rendered_transcript_map = _EMPTY_RENDERED_TRANSCRIPT_MAP
+    transcript_cache_key: tuple[int, int, int, ResponsiveProjection] | None = None
+    transcript_cache_fragments: list[tuple[str, str]] | None = None
     responsive_projection = _responsive_for_output(enhanced_output, state)
 
     def responsive() -> ResponsiveProjection:
@@ -2048,7 +2149,19 @@ def _create_application(
     composer.buffer.on_text_changed += enforce_bound
 
     def transcript_fragments() -> list[tuple[str, str]]:
+        nonlocal content_last_line_width, content_line_count
+        nonlocal rendered_transcript_map
+        nonlocal transcript_cache_fragments, transcript_cache_key
         projection = responsive()
+        key = (
+            state.transcript_render_generation,
+            state.transcript_document.generation,
+            len(state.blocks),
+            projection,
+        )
+        if transcript_cache_key == key and transcript_cache_fragments is not None:
+            return transcript_cache_fragments
+        row_maps: list[_RenderedTranscriptMap] = []
         try:
             fragments = _render_transcript_fragments(
                 runtime,
@@ -2057,15 +2170,29 @@ def _create_application(
                 responsive=projection,
                 capabilities=capabilities,
                 glyphs=glyphs,
+                rendered_transcript_maps=row_maps,
             )
         except Exception:
             state.notice = "Some terminal content could not be rendered."
+            rendered_transcript_map = _EMPTY_RENDERED_TRANSCRIPT_MAP
             fragments = [
                 (
                     "class:tui.status.failure",
                     f"\n {glyphs.failure} Content unavailable\n",
                 )
             ]
+        else:
+            rendered_transcript_map = (
+                row_maps[0] if row_maps else _EMPTY_RENDERED_TRANSCRIPT_MAP
+            )
+        content_line_count, content_last_line_width = _fragment_line_metrics(fragments)
+        transcript_cache_key = (
+            state.transcript_render_generation,
+            state.transcript_document.generation,
+            len(state.blocks),
+            projection,
+        )
+        transcript_cache_fragments = fragments
         return fragments
 
     semantic_style = runtime["Style"].from_dict(_semantic_style_rules(capabilities))
@@ -2306,7 +2433,7 @@ def _create_application(
 
     @keys.add("c-m", eager=True)
     def submit(event: Any) -> None:
-        nonlocal history_position, history_draft, transcript_scroll_offset
+        nonlocal history_position, history_draft
         nonlocal pasted_texts, next_paste_number
         if state.approval_panel is not None:
             remind_approval(event.app)
@@ -2340,7 +2467,6 @@ def _create_application(
         input_history.append(current_composer_draft(text=display_message))
         history_position = len(input_history)
         history_draft = _ComposerDraft("")
-        transcript_scroll_offset = 0
         composer.buffer.reset(append_to_history=True)
         pasted_texts = {}
         next_paste_number = 1
@@ -2455,12 +2581,30 @@ def _create_application(
             )
         )
 
+    def current_transcript_projection() -> TranscriptProjection | None:
+        if state.blocks:
+            transcript_fragments()
+        return state.transcript_projection
+
     def scroll_transcript(lines: int) -> None:
-        nonlocal transcript_scroll_offset
-        transcript_scroll_offset = min(
-            max(0, content_line_count - 1),
-            max(0, transcript_scroll_offset + lines),
-        )
+        projection = current_transcript_projection()
+        if projection is None:
+            return
+        height = _viewport_height(content_window)
+        direction = -1 if lines > 0 else 1 if lines < 0 else 0
+        movement = bounded_scroll_rows(direction * abs(lines), viewport_rows=height)
+        current = viewport_rendered_top(content_window)
+        latest = max(0, content_line_count - height)
+        target = min(latest, max(0, current + movement))
+        if direction > 0 and target >= latest:
+            state.transcript_viewport.follow_latest()
+        elif target != current:
+            position = rendered_transcript_map.position_for_row(target)
+            if position is not None:
+                state.transcript_viewport.review_position(
+                    state.transcript_document,
+                    position,
+                )
 
     @keys.add("pageup", eager=True)
     def page_up(event: Any) -> None:
@@ -2478,6 +2622,24 @@ def _create_application(
             panel.move(max(1, _viewport_height(approval_window)))
         else:
             scroll_transcript(-_viewport_height(content_window))
+        invalidate(event.app)
+
+    @keys.add("c-home", eager=True)
+    def transcript_home(event: Any) -> None:
+        if state.approval_panel is not None:
+            remind_approval(event.app)
+            return
+        projection = current_transcript_projection()
+        if projection is not None:
+            state.transcript_viewport.review_start(projection)
+        invalidate(event.app)
+
+    @keys.add("c-end", eager=True)
+    def transcript_end(event: Any) -> None:
+        if state.approval_panel is not None:
+            remind_approval(event.app)
+            return
+        state.transcript_viewport.follow_latest()
         invalidate(event.app)
 
     @keys.add("c-o", eager=True)
@@ -2619,10 +2781,10 @@ def _create_application(
     ) -> list[tuple[str, str]]:
         projection = responsive()
         width = max(2, projection.columns)
-        if not corners:
+        if not corners and not title:
             return [("", glyphs.horizontal * width)]
-        left = glyphs.top_left if top else glyphs.bottom_left
-        right = glyphs.top_right if top else glyphs.bottom_right
+        left = (glyphs.top_left if top else glyphs.bottom_left) if corners else ""
+        right = (glyphs.top_right if top else glyphs.bottom_right) if corners else ""
         safe_title = _sanitize_terminal_text(
             title,
             maximum=max(0, width - 6),
@@ -2633,17 +2795,22 @@ def _create_application(
             middle = f"{glyphs.horizontal} {safe_title} "
             fill = glyphs.horizontal * max(
                 0,
-                width - _display_width(middle) - 2,
+                width - _display_width(middle) - _display_width(left + right),
             )
             line = left + middle + fill + right
         else:
-            line = left + (glyphs.horizontal * max(0, width - 2)) + right
+            line = (
+                left
+                + (glyphs.horizontal * max(0, width - _display_width(left + right)))
+                + right
+            )
         return [("", line)]
 
     def bordered(
         body: Any,
         *,
         title: str = "",
+        bottom_title: str = "",
         style: str = "class:tui.frame",
         sides: bool = True,
     ) -> Any:
@@ -2685,6 +2852,7 @@ def _create_application(
                     runtime["FormattedTextControl"](
                         lambda: border_fragments(
                             top=False,
+                            title=bottom_title,
                             corners=sides,
                         )
                     ),
@@ -2695,7 +2863,14 @@ def _create_application(
             ]
         )
 
-    composer_frame = bordered(composer, sides=False)
+    navigation_help = glyphs.separator.join(
+        ("Wheel scroll", "Page Up/Down review", "Ctrl+End latest")
+    )
+    composer_frame = bordered(
+        composer,
+        bottom_title=navigation_help,
+        sides=False,
+    )
     approval_container = runtime["ConditionalContainer"](
         bordered(
             approval_window,
@@ -2866,23 +3041,55 @@ def _create_application(
                 glyphs=glyphs,
             )
         elif state.blocks:
-            fragments = transcript_fragments()
+            return transcript_fragments()
         else:
             fragments = empty_shell_fragments()
-        rendered = "".join(text for _style, text in fragments)
-        lines = rendered.split("\n")
-        content_line_count = max(1, len(lines))
-        content_last_line_width = len(lines[-1])
+        content_line_count, content_last_line_width = _fragment_line_metrics(fragments)
         return fragments
 
+    def viewport_rendered_top(window: Any) -> int:
+        height = _viewport_height(window)
+        if state.transcript_viewport.state is TranscriptFollowState.FOLLOWING:
+            return max(0, content_line_count - height)
+        projection = state.transcript_projection
+        if projection is None:
+            return 0
+        state.transcript_viewport.top_row(
+            projection,
+            viewport_rows=height,
+        )
+        rendered_row = rendered_transcript_map.row_for_anchor(
+            state.transcript_document,
+            state.transcript_viewport.anchor,
+        )
+        return min(
+            max(0, content_line_count - height),
+            max(0, 0 if rendered_row is None else rendered_row),
+        )
+
     def shell_content_cursor() -> Any:
+        following = state.transcript_viewport.state is TranscriptFollowState.FOLLOWING
         return runtime["Point"](
-            x=(content_last_line_width if transcript_scroll_offset == 0 else 0),
-            y=max(0, content_line_count - 1 - transcript_scroll_offset),
+            x=content_last_line_width if following else 0,
+            y=(
+                max(0, content_line_count - 1)
+                if following
+                else viewport_rendered_top(content_window)
+            ),
         )
 
     def transcript_mouse_handler(mouse_event: Any) -> Any:
         event_type = mouse_event.event_type
+        panel = state.approval_panel
+        if panel is not None:
+            if event_type == runtime["MouseEventType"].SCROLL_UP:
+                panel.move(-_MOUSE_SCROLL_LINES)
+            elif event_type == runtime["MouseEventType"].SCROLL_DOWN:
+                panel.move(_MOUSE_SCROLL_LINES)
+            else:
+                return NotImplemented
+            invalidate(application)
+            return None
         if event_type == runtime["MouseEventType"].SCROLL_UP:
             scroll_transcript(_MOUSE_SCROLL_LINES)
         elif event_type == runtime["MouseEventType"].SCROLL_DOWN:
@@ -2904,11 +3111,49 @@ def _create_application(
         wrap_lines=False,
         always_hide_cursor=True,
         height=runtime["Dimension"](weight=1),
+        get_vertical_scroll=viewport_rendered_top,
         style="class:tui.transcript",
+    )
+
+    def new_output_visible() -> bool:
+        return (
+            state.approval_panel is None
+            and state.transcript_viewport.state is TranscriptFollowState.REVIEWING
+            and state.transcript_viewport.unseen_items > 0
+        )
+
+    def activate_new_output(mouse_event: Any) -> Any:
+        if mouse_event.event_type != runtime["MouseEventType"].MOUSE_UP:
+            return NotImplemented
+        state.transcript_viewport.follow_latest()
+        invalidate(application)
+        return None
+
+    def new_output_fragments() -> list[Any]:
+        count = state.transcript_viewport.unseen_items
+        marker = "↓" if capabilities.unicode else "v"
+        return [
+            (
+                "class:tui.new-output",
+                f"{marker} {count} new {'item' if count == 1 else 'items'} ",
+                activate_new_output,
+            )
+        ]
+
+    new_output = runtime["ConditionalContainer"](
+        runtime["Window"](
+            runtime["FormattedTextControl"](new_output_fragments),
+            height=1,
+            dont_extend_height=True,
+            align="RIGHT",
+            style="class:tui.new-output",
+        ),
+        filter=runtime["Condition"](new_output_visible),
     )
     main_shell = runtime["HSplit"](
         [
             content_window,
+            new_output,
             approval_container,
             composer_frame,
             command_menu,
@@ -3956,6 +4201,135 @@ def _truncate_middle_display_text(
     return left + marker + reversed_right[::-1]
 
 
+def _fragment_line_metrics(fragments: Sequence[tuple[str, str]]) -> tuple[int, int]:
+    """Count rendered rows without joining an unchanged transcript again."""
+
+    line_count = 1
+    last_line_width = 0
+    for _style, text in fragments:
+        newline_count = text.count("\n")
+        line_count += newline_count
+        if newline_count:
+            last_line_width = len(text.rpartition("\n")[2])
+        else:
+            last_line_width += len(text)
+    return line_count, last_line_width
+
+
+def _semantic_offsets_for_rendered_lines(
+    lines: Sequence[str],
+    canonical_text: str,
+) -> tuple[int, ...]:
+    """Align visible content rows to stable canonical word offsets in order."""
+
+    canonical_tokens = tuple(re.finditer(r"\w+", canonical_text, flags=re.UNICODE))
+    occurrences: dict[str, list[int]] = {}
+    for index, match in enumerate(canonical_tokens):
+        occurrences.setdefault(match.group(0), []).append(index)
+
+    cursor = 0
+    matched: list[int | None] = []
+    for line in lines:
+        semantic_offset: int | None = None
+        for visible in re.finditer(r"\w+", line, flags=re.UNICODE):
+            indexes = occurrences.get(visible.group(0))
+            if not indexes:
+                continue
+            occurrence = bisect_left(indexes, cursor)
+            if occurrence >= len(indexes):
+                continue
+            token_index = indexes[occurrence]
+            semantic_offset = canonical_tokens[token_index].start()
+            cursor = token_index + 1
+            break
+        matched.append(semantic_offset)
+
+    if not matched:
+        return ()
+    known = [(row, offset) for row, offset in enumerate(matched) if offset is not None]
+    if not known:
+        if len(matched) == 1:
+            return (0,)
+        return tuple(
+            len(canonical_text) * row // (len(matched) - 1)
+            for row in range(len(matched))
+        )
+
+    resolved = [0] * len(matched)
+    first_row, first_offset = known[0]
+    if first_row:
+        for row in range(first_row):
+            resolved[row] = first_offset * row // first_row
+    for row, offset in known:
+        resolved[row] = offset
+    for (left_row, left_offset), (right_row, right_offset) in zip(
+        known,
+        known[1:],
+    ):
+        distance = right_row - left_row
+        for row in range(left_row + 1, right_row):
+            resolved[row] = left_offset + (
+                (right_offset - left_offset) * (row - left_row) // distance
+            )
+    last_row, last_offset = known[-1]
+    final_row = len(matched) - 1
+    if last_row < final_row:
+        distance = final_row - last_row
+        for row in range(last_row + 1, len(matched)):
+            resolved[row] = last_offset + (
+                (len(canonical_text) - last_offset) * (row - last_row) // distance
+            )
+    return tuple(resolved)
+
+
+def _build_rendered_transcript_map(
+    document: TranscriptDocument,
+    pending: Sequence[_PendingRenderedBlockMap],
+    *,
+    line_count: int,
+) -> _RenderedTranscriptMap:
+    """Resolve stable semantic positions for every current rendered row."""
+
+    row_positions: list[SemanticPosition | None] = [None] * max(1, line_count)
+    block_offsets: dict[PresentationBlockId, tuple[int, ...]] = {}
+    block_rows: dict[PresentationBlockId, tuple[int, ...]] = {}
+    for item in pending:
+        block_id = item.block.presentation_id
+        if block_id is None or not document.contains(block_id):
+            continue
+        text_length = len(document.text(block_id))
+        for local_row, offset in enumerate(item.row_offsets):
+            rendered_row = item.rendered_start + local_row
+            if rendered_row >= len(row_positions):
+                break
+            row_positions[rendered_row] = document.position(
+                block_id,
+                min(text_length, max(0, offset)),
+            )
+
+        inverse: dict[int, int] = {0: item.rendered_start}
+        for local_row, offset in enumerate(item.row_offsets):
+            inverse[min(text_length, max(0, offset))] = item.rendered_start + local_row
+        ordered = tuple(sorted(inverse.items()))
+        block_offsets[block_id] = tuple(offset for offset, _row in ordered)
+        block_rows[block_id] = tuple(row for _offset, row in ordered)
+
+    first = next((position for position in row_positions if position is not None), None)
+    if first is None:
+        return _EMPTY_RENDERED_TRANSCRIPT_MAP
+    current = first
+    resolved_positions: list[SemanticPosition] = []
+    for position in row_positions:
+        if position is not None:
+            current = position
+        resolved_positions.append(current)
+    return _RenderedTranscriptMap(
+        tuple(resolved_positions),
+        block_offsets,
+        block_rows,
+    )
+
+
 def _render_transcript_fragments(
     runtime: dict[str, Any],
     state: TerminalViewState,
@@ -3964,6 +4338,7 @@ def _render_transcript_fragments(
     responsive: ResponsiveProjection | None = None,
     capabilities: TerminalCapabilities | None = None,
     glyphs: TerminalGlyphs | None = None,
+    rendered_transcript_maps: list[_RenderedTranscriptMap] | None = None,
 ) -> list[tuple[str, str]]:
     capabilities = capabilities or _terminal_capabilities()
     glyphs = glyphs or _terminal_glyphs(capabilities)
@@ -3977,10 +4352,16 @@ def _render_transcript_fragments(
         )
     fragments: list[tuple[str, str]] = [("", "\n")]
     selectable_texts: list[str] = []
+    rendered_row = 1
+    pending_maps: list[_PendingRenderedBlockMap] = []
     for block in state.blocks:
+        fragment_index = len(fragments)
+        rendered_start = rendered_row
         selectable_text = block.text
+        presentation_rows = 0
         if block.kind == "user":
             fragments.append(("class:tui.user.label", " You\n"))
+            presentation_rows = 1
             fragments.extend(
                 _render_user_message_fragments(
                     runtime,
@@ -3992,6 +4373,7 @@ def _render_transcript_fragments(
             fragments.append(("", "\n"))
         elif block.kind == "assistant":
             fragments.append(("class:tui.assistant.label", " Daita\n"))
+            presentation_rows = 1
             fragments.extend(
                 _render_markdown_fragments(
                     runtime,
@@ -4033,6 +4415,7 @@ def _render_transcript_fragments(
                     ),
                 ]
             )
+            presentation_rows = 1
         elif block.kind == "tool":
             try:
                 card = block.tool_card or state.tool_cards.get(block.text)
@@ -4068,8 +4451,37 @@ def _render_transcript_fragments(
                     ("class:tui.local", f" {block.text}\n\n"),
                 ]
             )
+            presentation_rows = 1
         selectable_texts.append(selectable_text)
+        rendered_text = "".join(text for _style, text in fragments[fragment_index:])
+        rendered_rows = rendered_text.count("\n")
+        rendered_lines = rendered_text.split("\n")
+        if rendered_text.endswith("\n"):
+            rendered_lines.pop()
+        for index in range(min(presentation_rows, len(rendered_lines))):
+            rendered_lines[index] = ""
+        row_offsets = _semantic_offsets_for_rendered_lines(
+            rendered_lines,
+            selectable_text,
+        )
+        pending_maps.append(
+            _PendingRenderedBlockMap(
+                block,
+                rendered_start,
+                row_offsets,
+            )
+        )
+        rendered_row += rendered_rows
     state._sync_transcript_document(tuple(selectable_texts), width=width)
+    if rendered_transcript_maps is not None:
+        rendered_transcript_maps.clear()
+        rendered_transcript_maps.append(
+            _build_rendered_transcript_map(
+                state.transcript_document,
+                pending_maps,
+                line_count=rendered_row + 1,
+            )
+        )
     return fragments
 
 
@@ -4894,6 +5306,7 @@ def _semantic_style_rules(
             "tui.composer.frame": "",
             "tui.frame": "",
             "tui.resize": "bold",
+            "tui.new-output": "bold underline",
             "tui.command-menu": "",
             "tui.command-menu.rule": "",
             "tui.command-menu.marker": "",
@@ -4954,6 +5367,7 @@ def _semantic_style_rules(
         "tui.composer.frame": "",
         "tui.frame": colors["focus"],
         "tui.resize": f"bold {colors['warning']}",
+        "tui.new-output": f"bold underline {colors['focus']}",
         "tui.command-menu": "",
         "tui.command-menu.rule": colors["muted"],
         "tui.command-menu.marker": colors["muted"],

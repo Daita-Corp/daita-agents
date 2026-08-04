@@ -5,6 +5,9 @@ from daita.terminal_transcript import (
     InteractionOwner,
     RenderedCoordinate,
     TranscriptDocument,
+    TranscriptFollowState,
+    TranscriptViewport,
+    bounded_scroll_rows,
     interaction_owner,
 )
 
@@ -232,3 +235,97 @@ def test_future_interaction_precedence_is_explicit_but_dormant():
         is InteractionOwner.APPROVAL
     )
     assert interaction_owner(frozenset()) is None
+
+
+def test_viewport_starts_following_and_bounded_upward_navigation_reviews():
+    document = TranscriptDocument()
+    document.append("\n".join(f"row-{index}" for index in range(30)))
+    viewport = TranscriptViewport()
+    projection = viewport.projection_for(document, width=20)
+
+    latest = viewport.top_row(projection, viewport_rows=8)
+    moved = bounded_scroll_rows(-100, viewport_rows=8)
+    viewport.review_row(projection, latest + moved)
+
+    assert latest == projection.row_count - 8
+    assert viewport.state is TranscriptFollowState.REVIEWING
+    assert viewport.anchor is not None
+    assert moved == -8
+
+
+def test_scrolling_to_latest_resumes_following_and_resets_unseen_items():
+    document = TranscriptDocument()
+    document.append("\n".join(f"row-{index}" for index in range(20)))
+    viewport = TranscriptViewport()
+    projection = viewport.projection_for(document, width=40)
+    latest = viewport.top_row(projection, viewport_rows=6)
+    viewport.review_row(projection, latest - 5)
+    viewport.record_appended(3)
+
+    viewport.follow_latest()
+
+    assert viewport.state is TranscriptFollowState.FOLLOWING
+    assert viewport.anchor is None
+    assert viewport.unseen_items == 0
+
+
+def test_append_while_reviewing_keeps_anchor_and_counts_bounded_new_blocks():
+    document = TranscriptDocument()
+    document.append("\n".join(f"row-{index}" for index in range(20)))
+    viewport = TranscriptViewport()
+    before = viewport.projection_for(document, width=20)
+    latest = viewport.top_row(before, viewport_rows=5)
+    viewport.review_row(before, latest - 4)
+    anchor = viewport.anchor
+    top = viewport.top_row(before, viewport_rows=5)
+
+    document.append("new output")
+    viewport.record_appended(3)
+    after = viewport.projection_for(document, width=20)
+
+    assert viewport.anchor == anchor
+    assert viewport.top_row(after, viewport_rows=5) == top
+    assert viewport.unseen_items == 3
+
+
+def test_review_anchor_survives_rewrap_and_following_keeps_latest_visible():
+    document = TranscriptDocument()
+    document.append("alpha beta gamma delta epsilon")
+    viewport = TranscriptViewport()
+    wide = viewport.projection_for(document, width=20)
+    viewport.review_row(wide, 1)
+    anchor = viewport.anchor
+
+    narrow = viewport.projection_for(document, width=8)
+    reviewed_top = viewport.top_row(narrow, viewport_rows=2)
+    viewport.follow_latest()
+    document.append("latest")
+    latest = viewport.projection_for(document, width=8)
+
+    assert viewport.anchor is None
+    assert anchor is not None
+    assert document.reconcile_anchor(anchor) is not None
+    assert reviewed_top > 0
+    assert viewport.top_row(latest, viewport_rows=2) == latest.row_count - 2
+
+
+def test_pure_navigation_reuses_one_complete_long_transcript_projection():
+    document = TranscriptDocument()
+    document.append("\n".join(f"row-{index:05d}" for index in range(20_000)))
+    viewport = TranscriptViewport()
+    projection = viewport.projection_for(document, width=100)
+
+    for movement in (-3, -3, 3, -3, 3):
+        bounded = bounded_scroll_rows(movement, viewport_rows=40)
+        current = viewport.top_row(projection, viewport_rows=40)
+        viewport.review_row(projection, current + bounded)
+        assert viewport.projection_for(document, width=100) is projection
+
+    assert viewport.projection_build_count == 1
+
+
+def test_every_navigation_event_is_capped_to_one_rendered_viewport():
+    assert bounded_scroll_rows(-100, viewport_rows=8) == -8
+    assert bounded_scroll_rows(100, viewport_rows=8) == 8
+    assert bounded_scroll_rows(-3, viewport_rows=8) == -3
+    assert bounded_scroll_rows(3, viewport_rows=2) == 2

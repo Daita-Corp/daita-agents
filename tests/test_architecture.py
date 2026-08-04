@@ -787,6 +787,24 @@ def test_rich_is_lazy_and_owned_only_by_the_focused_terminal_tui():
     )
 
 
+def test_phase_a_viewport_state_is_disposable_and_has_one_semantic_owner():
+    assert _class_owners("TranscriptViewport") == {"terminal_transcript.py"}
+    assert _class_owners("TranscriptFollowState") == {"terminal_transcript.py"}
+    tui = (PACKAGE / "terminal_tui.py").read_text(encoding="utf-8")
+    assert "transcript_scroll_offset" not in tui
+    assert "TranscriptViewport" in tui
+    assert "SemanticViewportAnchor" in (PACKAGE / "terminal_transcript.py").read_text(
+        encoding="utf-8"
+    )
+    for owner in (PACKAGE / "loop", PACKAGE / "storage"):
+        text = _python_text(owner)
+        assert "TranscriptViewport" not in text
+        assert "TranscriptFollowState" not in text
+    assert "transcript_viewport" not in (PACKAGE / "terminal_selection.py").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_schema_multi_selector_has_no_data_runtime_or_persisted_state_owner():
     selector_path = PACKAGE / "terminal_selection.py"
     selector_tree = ast.parse(selector_path.read_text(encoding="utf-8"))
