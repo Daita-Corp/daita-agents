@@ -37,7 +37,11 @@ from ...capabilities import (
     ToolOutput,
     ToolOutputValidationError,
 )
-from ...catalog.models import Sensitivity
+from ...catalog.models import (
+    CATALOG_CONTEXT_DEFAULT_LIMIT,
+    CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
+    Sensitivity,
+)
 from ...memory.capabilities import MEMORY_SET_CAPABILITY_ID, MEMORY_SET_TOOL_NAME
 from ...observation import (
     AgentEvent,
@@ -1876,66 +1880,38 @@ class DataToolRuntime:
                     {},
                 )
         if capability.id == CATALOG_SEARCH_CAPABILITY_ID:
-            query = arguments.get("query")
-            limit = arguments.get("limit", 12)
-            if (
-                not isinstance(query, str)
-                or not query.strip()
-                or len(query) > 1_024
-                or not isinstance(limit, int)
-                or isinstance(limit, bool)
-                or not 1 <= limit <= 50
-            ):
+            search_query = cast(str, arguments["query"])
+            if not search_query.strip():
                 return (
                     "catalog_invalid_search",
-                    "Catalog search requires a non-empty query and limit from 1 to 50.",
+                    "Catalog search requires a non-empty query.",
                     {},
                 )
         if capability.id == CATALOG_INSPECT_CAPABILITY_ID:
-            resource_id = arguments.get("resource_id")
-            if not isinstance(resource_id, str) or not resource_id.strip():
+            inspect_resource_id = cast(str, arguments["resource_id"])
+            if not inspect_resource_id.strip():
                 return (
                     "catalog_invalid_resource",
                     "Catalog inspection requires a resource_id.",
                     {},
                 )
         if capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
-            query = arguments.get("query")
-            resource_ids = arguments.get("resource_ids", ())
-            source_id = arguments.get("source_id")
-            limit = arguments.get("limit", 12)
-            include_relationships = arguments.get("include_relationships", True)
-            valid_query = query is None or (
-                isinstance(query, str) and bool(query.strip()) and len(query) <= 1_024
+            schema_query = cast(str | None, arguments.get("query"))
+            schema_resource_ids = cast(
+                tuple[str, ...], arguments.get("resource_ids", ())
             )
-            valid_resources = (
-                isinstance(resource_ids, tuple)
-                and len(resource_ids) <= 50
-                and len(resource_ids) == len(set(resource_ids))
-                and all(
-                    isinstance(resource_id, str) and bool(resource_id.strip())
-                    for resource_id in resource_ids
-                )
-            )
+            schema_source_id = cast(str | None, arguments.get("source_id"))
             if (
-                not valid_query
-                or not valid_resources
-                or (query is None and not resource_ids)
-                or (
-                    source_id is not None
-                    and (not isinstance(source_id, str) or not bool(source_id.strip()))
-                )
-                or not isinstance(limit, int)
-                or isinstance(limit, bool)
-                or not 1 <= limit <= 50
-                or not isinstance(include_relationships, bool)
+                (schema_query is not None and not schema_query.strip())
+                or any(not resource_id.strip() for resource_id in schema_resource_ids)
+                or (schema_query is None and not schema_resource_ids)
+                or (schema_source_id is not None and not schema_source_id.strip())
             ):
                 return (
                     "catalog_invalid_schema",
                     (
                         "Catalog schema requires a non-empty query or explicit "
-                        "resource IDs, optional current source scope, and a limit "
-                        "from 1 to 50."
+                        "resource IDs and an optional non-empty current source scope."
                     ),
                     {},
                 )
@@ -2321,8 +2297,8 @@ class DataToolRuntime:
             return False
         catalog = await self._catalog.catalog_context(
             run.agent_id,
-            run.message[:4_000],
-            limit=12,
+            run.message[:CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS],
+            limit=CATALOG_CONTEXT_DEFAULT_LIMIT,
             source_ids=(() if run.source_id is None else (run.source_id,)),
         )
         resources = catalog.get("resources")

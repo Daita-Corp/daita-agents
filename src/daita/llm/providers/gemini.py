@@ -303,10 +303,8 @@ class GeminiProvider:
                 if len(candidates) > 1:
                     raise ValueError("stream must contain at most one candidate")
                 if not candidates:
-                    if chunk_usage is None:
-                        raise ValueError(
-                            "empty stream candidates require terminal usage"
-                        )
+                    # Native streams may contain metadata-only or heartbeat
+                    # responses. They carry no canonical model output.
                     continue
                 candidate = candidates[0]
                 native_finish = _field(candidate, "finish_reason", None)

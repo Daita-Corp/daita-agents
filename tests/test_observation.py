@@ -19,12 +19,14 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelStreamCompleted,
+    ModelTextDelta,
     ModelUsage,
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
+from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
 from daita.llm.pricing import (
     CostBasis,
     CostEstimate,
@@ -134,6 +136,7 @@ def _kinds(events):
 def test_event_contract_is_immutable_bounded_and_deeply_frozen():
     assert tuple(AgentEventKind) == (
         AgentEventKind.RUN_STARTED,
+        AgentEventKind.MODEL_TEXT_DELTA,
         AgentEventKind.MODEL_COMPLETED,
         AgentEventKind.TOOL_STARTED,
         AgentEventKind.APPROVAL_REQUESTED,
@@ -181,6 +184,10 @@ def test_event_contract_is_immutable_bounded_and_deeply_frozen():
         lambda: replace(
             event,
             data=FrozenJsonObject.from_mapping({"provider_id": 1}),
+        ),
+        lambda: replace(
+            event,
+            data=FrozenJsonObject.from_mapping({"model_call_index": 0}),
         ),
     )
     for construct in invalid:
@@ -239,12 +246,18 @@ async def test_text_run_order_payloads_and_durable_boundaries():
     model_data = events[1].data.to_dict()
     assert set(model_data) == {
         "provider_id",
+        "model_call_index",
+        "has_text",
+        "has_tool_calls",
         "duration_ms",
         "input_tokens",
         "context_input_tokens",
         "output_tokens",
     }
     assert model_data["provider_id"] == "mock:observed"
+    assert model_data["model_call_index"] == 1
+    assert model_data["has_text"] is True
+    assert model_data["has_tool_calls"] is False
     assert isinstance(model_data["duration_ms"], int)
     assert model_data["duration_ms"] >= 0
     assert model_data["input_tokens"] == 7
@@ -420,6 +433,54 @@ async def test_observer_exceptions_do_not_change_result_or_transcript():
         MessageRole.ASSISTANT,
     )
     assert await store.result(result.run_id) == result
+
+
+async def test_stream_fragments_are_bounded_and_observer_failure_is_non_directive():
+    observed: list[AgentEvent] = []
+
+    def broken_after_recording(event: AgentEvent) -> None:
+        observed.append(event)
+        if event.kind is AgentEventKind.MODEL_TEXT_DELTA:
+            raise RuntimeError("fragment observer failure")
+
+    final = _stop("canonical final")
+    provider = MockStreamingModelProvider(
+        (
+            (
+                ModelTextDelta("x" * 2_050),
+                ModelStreamCompleted(final),
+            ),
+        )
+    )
+    store = InMemoryTranscriptStore()
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools(),
+        transcripts=store,
+        observer=broken_after_recording,
+        clock=lambda: NOW,
+        stream_model_calls=True,
+    )
+
+    result = await loop.run(_run(run_id="run-stream-observed"))
+
+    fragment_lengths = []
+    for event in observed:
+        if event.kind is not AgentEventKind.MODEL_TEXT_DELTA:
+            continue
+        fragment = event.data["text"]
+        assert isinstance(fragment, str)
+        fragment_lengths.append(len(fragment))
+    assert fragment_lengths == [1_024, 1_024, 2]
+    assert result.kind is LoopExitKind.COMPLETED
+    assert result.final_text == "canonical final"
+    transcript = await store.load(result.run_id)
+    assert tuple(message.role for message in transcript.messages) == (
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+    )
+    assert all("x" * 16 not in repr(message) for message in transcript.messages)
 
 
 async def test_failed_start_emits_nothing():

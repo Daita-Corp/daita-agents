@@ -805,6 +805,59 @@ def test_phase_a_viewport_state_is_disposable_and_has_one_semantic_owner():
     )
 
 
+def test_phase_b_streaming_keeps_partial_state_disposable_and_provider_neutral():
+    loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
+    tui = (PACKAGE / "terminal_tui.py").read_text(encoding="utf-8")
+    observation = (PACKAGE / "observation.py").read_text(encoding="utf-8")
+    storage = _python_text(PACKAGE / "storage")
+    selection = (PACKAGE / "terminal_selection.py").read_text(encoding="utf-8")
+
+    assert "ModelStreamCompleted" in loop
+    assert "ModelTextDelta" in loop
+    assert "stream_model_calls" in loop
+    assert "assistant.partial" in tui
+    assert "MODEL_TEXT_DELTA" in observation
+    assert "assistant.partial" not in storage
+    assert "MODEL_TEXT_DELTA" not in storage
+    assert "assistant.partial" not in selection
+    for provider in ("openai", "anthropic", "gemini", "grok", "ollama"):
+        assert provider not in loop.lower()
+
+    top_level_imports = _imports(PACKAGE / "terminal_tui.py")
+    assert not any(
+        module == sdk or module.startswith(f"{sdk}.")
+        for module in top_level_imports
+        for sdk in ("openai", "anthropic", "google", "google.genai")
+    )
+
+
+def test_native_stream_grammars_end_inside_provider_adapters():
+    provider_root = PACKAGE / "llm" / "providers"
+    owners = {
+        "response.output_text.delta": provider_root / "openai.py",
+        "content_block_delta": provider_root / "anthropic.py",
+        "generate_content_stream": provider_root / "gemini.py",
+        "stream_options": provider_root / "openai_compatible.py",
+    }
+    generic_runtime = "\n".join(
+        (
+            (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8"),
+            (PACKAGE / "llm" / "routing.py").read_text(encoding="utf-8"),
+            (PACKAGE / "observation.py").read_text(encoding="utf-8"),
+            _python_text(PACKAGE / "storage"),
+        )
+    )
+
+    for native_marker, owner in owners.items():
+        assert native_marker in owner.read_text(encoding="utf-8")
+        assert native_marker not in generic_runtime
+
+    for specialization in ("grok.py", "ollama.py"):
+        text = (provider_root / specialization).read_text(encoding="utf-8")
+        assert "OpenAICompatibleProvider" in text
+        assert "async def stream(" not in text
+
+
 def test_schema_multi_selector_has_no_data_runtime_or_persisted_state_owner():
     selector_path = PACKAGE / "terminal_selection.py"
     selector_tree = ast.parse(selector_path.read_text(encoding="utf-8"))

@@ -16,6 +16,7 @@ _MAX_DATA_STRING_CHARACTERS = 1_024
 
 class AgentEventKind(str, Enum):
     RUN_STARTED = "run.started"
+    MODEL_TEXT_DELTA = "model.text_delta"
     MODEL_COMPLETED = "model.completed"
     TOOL_STARTED = "tool.started"
     APPROVAL_REQUESTED = "approval.requested"
@@ -26,7 +27,7 @@ class AgentEventKind(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class AgentEvent:
-    """One bounded, immutable, non-durable observation of completed work."""
+    """One bounded, immutable, non-durable observation of execution activity."""
 
     kind: AgentEventKind
     occurred_at: datetime
@@ -85,6 +86,12 @@ def _validate_data(value: FrozenJsonValue, *, key: str | None = None) -> None:
         not isinstance(value, int) or isinstance(value, bool) or value < 0
     ):
         raise ValueError("event duration_ms must be a non-negative integer")
+    if key == "model_call_index" and (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 1_000_000
+    ):
+        raise ValueError("event model_call_index must be a bounded positive integer")
     if isinstance(value, FrozenJsonObject):
         for item_key, item in value.items():
             if not item_key or len(item_key) > _MAX_DATA_KEY_CHARACTERS:

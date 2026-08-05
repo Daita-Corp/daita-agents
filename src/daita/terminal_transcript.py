@@ -705,6 +705,14 @@ class TranscriptViewport:
                 self.unseen_items + count,
             )
 
+    def record_removed(self, count: int = 1) -> None:
+        """Remove only presentation items previously counted while reviewing."""
+
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("removed transcript block count must be non-negative")
+        if self.state is TranscriptFollowState.REVIEWING:
+            self.unseen_items = max(0, self.unseen_items - count)
+
     def follow_latest(self) -> None:
         """Attach to the newest content and clear review-only notification state."""
 

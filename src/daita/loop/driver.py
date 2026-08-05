@@ -15,12 +15,15 @@ from ..artifacts.models import (
     artifact_delivery_receipt_from_mapping,
     artifact_ref_from_mapping,
 )
-from ..llm.errors import ContextWindowExceeded, ModelProviderError
+from ..llm.errors import ContextWindowExceeded, ModelProviderError, ProviderErrorCode
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
     ModelRequest,
     ModelResponse,
+    ModelStreamCompleted,
+    ModelTextDelta,
+    ModelToolCallDelta,
     ModelUsage,
     TextBlock,
     ToolCall,
@@ -130,6 +133,7 @@ class AgentLoop:
         limits: LoopLimits = LoopLimits(),
         clock: Callable[[], datetime] = _utc_now,
         observer: AgentObserver | None = None,
+        stream_model_calls: bool = False,
     ) -> None:
         if not isinstance(limits, LoopLimits):
             raise TypeError("limits must be LoopLimits")
@@ -137,6 +141,8 @@ class AgentLoop:
             raise TypeError("clock must be callable")
         if observer is not None and not callable(observer):
             raise TypeError("observer must be callable or None")
+        if not isinstance(stream_model_calls, bool):
+            raise TypeError("stream_model_calls must be a boolean")
         self._model = model
         self._context_builder = context_builder
         self._tools = tools
@@ -144,6 +150,7 @@ class AgentLoop:
         self._limits = limits
         self._clock = clock
         self._observer = observer
+        self._stream_model_calls = stream_model_calls
 
     async def run(
         self,
@@ -218,7 +225,12 @@ class AgentLoop:
                     if self._observer is not None
                     else None
                 )
-                response = await _before(deadline, self._model.generate(request))
+                response = await self._model_response(
+                    request,
+                    run,
+                    model_call_index=step,
+                    deadline=deadline,
+                )
                 model_duration_ms = (
                     _duration_ms(model_started) if model_started is not None else None
                 )
@@ -228,7 +240,12 @@ class AgentLoop:
                 messages = (*messages, assistant)
                 if self._observer is not None:
                     assert model_duration_ms is not None
-                    self._emit_model_completed(run, response, model_duration_ms)
+                    self._emit_model_completed(
+                        run,
+                        response,
+                        model_duration_ms,
+                        model_call_index=step,
+                    )
 
                 if not response.tool_calls:
                     assert response.text is not None
@@ -403,7 +420,12 @@ class AgentLoop:
                 if self._observer is not None
                 else None
             )
-            response = await _before(deadline, self._model.generate(request))
+            response = await self._model_response(
+                request,
+                run,
+                model_call_index=steps + 1,
+                deadline=deadline,
+            )
         except ModelProviderError as error:
             usage = _add_usage(usage, error.usage)
             return await self._finish(
@@ -424,7 +446,12 @@ class AgentLoop:
         await self._transcripts.append(run.id, assistant)
         if self._observer is not None:
             assert model_duration_ms is not None
-            self._emit_model_completed(run, response, model_duration_ms)
+            self._emit_model_completed(
+                run,
+                response,
+                model_duration_ms,
+                model_call_index=steps + 1,
+            )
         if response.text is None:
             return await self._finish(
                 run,
@@ -514,18 +541,93 @@ class AgentLoop:
         run: RunInput,
         response: ModelResponse,
         duration_ms: int,
+        *,
+        model_call_index: int,
     ) -> None:
         self._emit(
             AgentEventKind.MODEL_COMPLETED,
             run,
             {
                 "provider_id": response.provider_id or self._model.provider_id,
+                "model_call_index": model_call_index,
+                "has_text": response.text is not None,
+                "has_tool_calls": bool(response.tool_calls),
                 "duration_ms": duration_ms,
                 "input_tokens": response.usage.input_tokens,
                 "context_input_tokens": response.request_input_tokens,
                 "output_tokens": response.usage.output_tokens,
             },
         )
+
+    async def _model_response(
+        self,
+        request: ModelRequest,
+        run: RunInput,
+        *,
+        model_call_index: int,
+        deadline: float,
+    ) -> ModelResponse:
+        stream = getattr(self._model, "stream", None)
+        if not self._stream_model_calls or not callable(stream):
+            return await _before(deadline, self._model.generate(request))
+
+        async def consume() -> ModelResponse:
+            completed: ModelResponse | None = None
+            async for event in stream(request):
+                if completed is not None:
+                    raise ModelProviderError(
+                        ProviderErrorCode.MALFORMED_RESPONSE,
+                        "model stream continued after its canonical completion",
+                        provider_id=self._model.provider_id,
+                    )
+                if isinstance(event, ModelTextDelta):
+                    self._emit_model_text_delta(
+                        run,
+                        event.text,
+                        model_call_index=model_call_index,
+                    )
+                elif isinstance(event, ModelToolCallDelta):
+                    pass
+                elif isinstance(event, ModelStreamCompleted):
+                    completed = event.response
+                else:
+                    raise ModelProviderError(
+                        ProviderErrorCode.MALFORMED_RESPONSE,
+                        "model stream returned an unsupported canonical event",
+                        provider_id=self._model.provider_id,
+                    )
+                # A deterministic or local provider may have an immediately-ready
+                # iterator. Yield so presentation, input, and cancellation remain
+                # responsive even for a high-rate canonical stream.
+                await asyncio.sleep(0)
+            if completed is None:
+                raise ModelProviderError(
+                    ProviderErrorCode.MALFORMED_RESPONSE,
+                    "model stream ended without its canonical completion",
+                    provider_id=self._model.provider_id,
+                )
+            return completed
+
+        return await _before(deadline, consume())
+
+    def _emit_model_text_delta(
+        self,
+        run: RunInput,
+        text: str,
+        *,
+        model_call_index: int,
+    ) -> None:
+        if self._observer is None:
+            return
+        for offset in range(0, len(text), 1_024):
+            self._emit(
+                AgentEventKind.MODEL_TEXT_DELTA,
+                run,
+                {
+                    "model_call_index": model_call_index,
+                    "text": text[offset : offset + 1_024],
+                },
+            )
 
     def _emit(
         self,

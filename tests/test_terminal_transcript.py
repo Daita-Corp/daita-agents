@@ -269,6 +269,19 @@ def test_scrolling_to_latest_resumes_following_and_resets_unseen_items():
     assert viewport.unseen_items == 0
 
 
+def test_reviewing_unseen_count_reconciles_disposable_block_removal():
+    document = TranscriptDocument()
+    document.append("older")
+    viewport = TranscriptViewport()
+    viewport.review_start(viewport.projection_for(document, width=20))
+
+    viewport.record_appended()
+    viewport.record_removed()
+
+    assert viewport.state is TranscriptFollowState.REVIEWING
+    assert viewport.unseen_items == 0
+
+
 def test_append_while_reviewing_keeps_anchor_and_counts_bounded_new_blocks():
     document = TranscriptDocument()
     document.append("\n".join(f"row-{index}" for index in range(20)))

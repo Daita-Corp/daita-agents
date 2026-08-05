@@ -15,6 +15,7 @@ import unicodedata
 
 from .._json import FrozenJsonObject
 from .models import (
+    CATALOG_MAX_LIMIT,
     CATALOG_TRAVERSAL_MAX_EDGES,
     CATALOG_TRAVERSAL_MAX_NODES,
     CATALOG_TRAVERSAL_MAX_PATHS,
@@ -233,9 +234,11 @@ class CatalogService:
         if (
             not isinstance(limit, int)
             or isinstance(limit, bool)
-            or not 1 <= limit <= 50
+            or not 1 <= limit <= CATALOG_MAX_LIMIT
         ):
-            raise ValueError("catalog preview limit must be from 1 through 50")
+            raise ValueError(
+                f"catalog preview limit must be from 1 through {CATALOG_MAX_LIMIT}"
+            )
         active_source_ids = tuple(
             sorted(
                 registration.id
@@ -749,7 +752,7 @@ class CatalogService:
                     ResourceKind.VIEW,
                     ResourceKind.FILE,
                 ),
-                limit=50,
+                limit=CATALOG_MAX_LIMIT,
             )
             search = self._search_indexes(
                 search_request,
@@ -2053,7 +2056,9 @@ class CatalogService:
                 agent_id=agent_id,
                 query=query,
                 source_ids=source_ids,
-                limit=(50 if resource_ids else min(limit, 50)),
+                limit=(
+                    CATALOG_MAX_LIMIT if resource_ids else min(limit, CATALOG_MAX_LIMIT)
+                ),
             )
         )
         hits = tuple(

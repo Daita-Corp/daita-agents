@@ -250,8 +250,9 @@ class OpenAIResponsesProvider:
             async for event in cast(AsyncIterator[object], stream):
                 event_type = _required_text(_field(event, "type"), "stream event type")
                 if event_type == "response.output_text.delta":
-                    delta = _nonempty_fragment(_field(event, "delta"), "text delta")
-                    yield ModelTextDelta(delta)
+                    delta = _stream_fragment(_field(event, "delta"), "text delta")
+                    if delta:
+                        yield ModelTextDelta(delta)
                 elif event_type == "response.output_item.added":
                     item = _field(event, "item")
                     if _field(item, "type", None) != "function_call":
@@ -259,10 +260,12 @@ class OpenAIResponsesProvider:
                     index = _nonnegative_int(
                         _field(event, "output_index"), "output index"
                     )
-                    provider_call_id = _required_text(
-                        _field(item, "call_id"), "provider call_id"
+                    provider_call_id = _optional_stream_identity(
+                        _field(item, "call_id", None), "provider call_id"
                     )
-                    name = _required_text(_field(item, "name"), "function name")
+                    name = _optional_stream_identity(
+                        _field(item, "name", None), "function name"
+                    )
                     canonical_id = canonical_ids_by_index.get(index)
                     if canonical_id is None:
                         canonical_id = self._id_factory("call")
@@ -270,9 +273,13 @@ class OpenAIResponsesProvider:
                             raise ValueError("id_factory returned a duplicate call ID")
                         allocated_ids.add(canonical_id)
                         canonical_ids_by_index[index] = canonical_id
-                    canonical_ids_by_provider_call_id[provider_call_id] = canonical_id
-                    provider_call_ids_by_index[index] = provider_call_id
-                    names_by_index[index] = name
+                    if provider_call_id is not None:
+                        canonical_ids_by_provider_call_id[provider_call_id] = (
+                            canonical_id
+                        )
+                        provider_call_ids_by_index[index] = provider_call_id
+                    if name is not None:
+                        names_by_index[index] = name
                     yield ModelToolCallDelta(
                         index=index,
                         arguments_delta="",
@@ -284,6 +291,11 @@ class OpenAIResponsesProvider:
                     index = _nonnegative_int(
                         _field(event, "output_index"), "output index"
                     )
+                    arguments_delta = _stream_fragment(
+                        _field(event, "delta"), "function arguments delta"
+                    )
+                    if not arguments_delta:
+                        continue
                     canonical_id = canonical_ids_by_index.get(index)
                     if canonical_id is None:
                         canonical_id = self._id_factory("call")
@@ -293,9 +305,7 @@ class OpenAIResponsesProvider:
                         canonical_ids_by_index[index] = canonical_id
                     yield ModelToolCallDelta(
                         index=index,
-                        arguments_delta=_required_text(
-                            _field(event, "delta"), "function arguments delta"
-                        ),
+                        arguments_delta=arguments_delta,
                         id=canonical_id,
                         name=names_by_index.get(index),
                         provider_call_id=provider_call_ids_by_index.get(index),
@@ -638,7 +648,9 @@ def _message_text(item: object) -> list[str]:
     for part in content:
         part_type = _required_text(_field(part, "type"), "message part type")
         if part_type == "output_text":
-            text.append(_required_text(_field(part, "text"), "output text"))
+            value = _stream_fragment(_field(part, "text"), "output text")
+            if value.strip():
+                text.append(value)
         elif part_type == "refusal":
             raise ModelProviderError(
                 ProviderErrorCode.CONTENT_BLOCKED,
@@ -807,10 +819,15 @@ def _optional_text(value: object, label: str) -> str | None:
     return _required_text(value, label)
 
 
-def _nonempty_fragment(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{label} must be a non-empty string")
+def _stream_fragment(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be text")
     return value
+
+
+def _optional_stream_identity(value: object, label: str) -> str | None:
+    fragment = _stream_fragment(value, label) if value is not None else ""
+    return fragment if fragment.strip() else None
 
 
 def _nonnegative_int(value: object, label: str) -> int:

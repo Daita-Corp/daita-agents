@@ -987,6 +987,190 @@ def test_observer_bridge_only_enqueues_until_the_tui_consumes_events():
     assert bridge.drain() == (started,)
 
 
+def test_stream_fragments_coalesce_into_one_stable_partial_block():
+    bridge = TerminalObserverBridge()
+    state = TerminalViewState("atlas", "model", "source")
+    state.apply_event(_event(AgentEventKind.RUN_STARTED, {"agent_id": "agent-live"}))
+    before = state.transcript_render_generation
+    for fragment in ("The ", "ordered ", "answer"):
+        bridge(
+            _event(
+                AgentEventKind.MODEL_TEXT_DELTA,
+                {"model_call_index": 1, "text": fragment},
+            )
+        )
+
+    assert terminal_tui._project_pending_events(bridge, state) == 3
+
+    assert state.transcript_render_generation == before + 1
+    assert len(state.blocks) == 1
+    partial = state.blocks[0]
+    assert partial.kind == "assistant.partial"
+    assert partial.text == "The ordered answer"
+    partial_id = partial.presentation_id
+
+    for _ in range(1_000):
+        bridge(
+            _event(
+                AgentEventKind.MODEL_TEXT_DELTA,
+                {"model_call_index": 1, "text": "."},
+            )
+        )
+    before = state.transcript_render_generation
+    assert terminal_tui._project_pending_events(bridge, state) == 1_000
+    assert state.transcript_render_generation == before + 1
+    assert len(state.blocks) == 1
+    assert state.blocks[0].presentation_id == partial_id
+    assert state.blocks[0].text.endswith("." * 1_000)
+    assert terminal_tui._STREAM_REPAINT_INTERVAL_SECONDS >= 1 / 30
+
+
+def test_streaming_follows_latest_and_preserves_reviewing_anchor():
+    following = TerminalViewState("atlas", "model", "source")
+    following.append_user("question")
+    following.apply_model_text_delta("run-following", 1, "progressive text")
+
+    assert (
+        following.transcript_viewport.state
+        is terminal_tui.TranscriptFollowState.FOLLOWING
+    )
+    assert following.blocks[-1].text == "progressive text"
+
+    reviewing = TerminalViewState("atlas", "model", "source")
+    reviewing.append_user("older question")
+    reviewing.append_plain("assistant", "older answer")
+    projection = reviewing.transcript_viewport.projection_for(
+        reviewing.transcript_document,
+        width=40,
+    )
+    reviewing.transcript_viewport.review_start(projection)
+    anchor = reviewing.transcript_viewport.anchor
+    assert anchor is not None
+    reviewing.apply_model_text_delta("run-reviewing", 1, "first")
+    reviewing.apply_model_text_delta("run-reviewing", 1, " second")
+
+    assert (
+        reviewing.transcript_viewport.state
+        is terminal_tui.TranscriptFollowState.REVIEWING
+    )
+    assert reviewing.transcript_viewport.anchor == anchor
+    assert reviewing.transcript_document.reconcile_anchor(anchor) == anchor
+    assert reviewing.transcript_viewport.unseen_items == 1
+
+
+def test_final_response_reconciles_partial_identity_without_duplication():
+    state = TerminalViewState("atlas", "model", "source")
+    state.apply_event(_event(AgentEventKind.RUN_STARTED, {"agent_id": "agent-live"}))
+    state.apply_model_text_delta("run-live", 1, "draft projection")
+    partial_id = state.blocks[0].presentation_id
+    assert partial_id is not None
+    state.apply_event(
+        _event(
+            AgentEventKind.MODEL_COMPLETED,
+            {
+                "model_call_index": 1,
+                "has_text": True,
+                "has_tool_calls": False,
+                "provider_id": "mock:streaming",
+                "duration_ms": 1,
+                "input_tokens": 1,
+                "output_tokens": 1,
+            },
+        )
+    )
+    state.apply_event(
+        _event(
+            AgentEventKind.RUN_COMPLETED,
+            {"exit_kind": "completed", "reason": "completed"},
+        )
+    )
+
+    state.apply_result(_result("Exact canonical final.", run_id="run-live"))
+
+    assistant_blocks = [
+        block for block in state.blocks if block.kind.startswith("assistant")
+    ]
+    assert len(assistant_blocks) == 1
+    assert assistant_blocks[0].kind == "assistant"
+    assert assistant_blocks[0].presentation_id == partial_id
+    assert assistant_blocks[0].text == "Exact canonical final."
+    assert state.transcript_document.text(partial_id) == "Exact canonical final."
+
+
+def test_failed_stream_removes_partial_and_marks_it_unrecorded():
+    state = TerminalViewState("atlas", "model", "source")
+    state.apply_event(_event(AgentEventKind.RUN_STARTED, {"agent_id": "agent-live"}))
+    state.apply_model_text_delta("run-live", 1, "unrecorded draft")
+    state.apply_event(
+        _event(
+            AgentEventKind.RUN_COMPLETED,
+            {"exit_kind": "failed", "reason": "provider_unavailable"},
+        )
+    )
+    failed = SimpleNamespace(
+        run_id="run-live",
+        conversation_id="conversation-live",
+        final_text=None,
+        kind=SimpleNamespace(value="failed"),
+        reason="provider_unavailable",
+        steps=0,
+        usage=SimpleNamespace(
+            total_tokens=0,
+            cost_estimate=CostEstimate.unavailable(),
+        ),
+        artifact_deliveries=(),
+    )
+
+    state.apply_result(failed)
+
+    assert all(block.kind != "assistant.partial" for block in state.blocks)
+    assert all("unrecorded draft" not in block.text for block in state.blocks)
+    assert state.blocks[-1].text == "failed: provider_unavailable"
+    assert state.notice == (
+        "Partial assistant output was interrupted and was not recorded."
+    )
+
+
+def test_high_rate_fragments_do_not_delay_tool_and_approval_projection():
+    bridge = TerminalObserverBridge()
+    state = TerminalViewState("atlas", "model", "source")
+    bridge(_event(AgentEventKind.RUN_STARTED, {"agent_id": "agent-live"}))
+    for _ in range(2_000):
+        bridge(
+            _event(
+                AgentEventKind.MODEL_TEXT_DELTA,
+                {"model_call_index": 1, "text": "x"},
+            )
+        )
+    bridge(
+        _event(
+            AgentEventKind.TOOL_STARTED,
+            {
+                "call_id": "call-live",
+                "tool_name": "skill_save",
+                "capability_id": "skills.write",
+            },
+        )
+    )
+    bridge(
+        _event(
+            AgentEventKind.APPROVAL_REQUESTED,
+            {
+                "call_id": "call-live",
+                "tool_name": "skill_save",
+                "capability_id": "skills.write",
+            },
+        )
+    )
+
+    assert terminal_tui._project_pending_events(bridge, state) == 2_003
+
+    assert state.tool_cards["call-live"].state == "approval"
+    assert state.run_status == "approval"
+    assert all(block.kind != "assistant.partial" for block in state.blocks)
+    assert state.transcript_render_generation < 20
+
+
 def test_initial_status_reports_zero_cost_before_the_first_run():
     state = TerminalViewState("atlas", "gpt-5.6-sol", "source")
     glyphs = terminal_tui._terminal_glyphs(
@@ -2366,10 +2550,7 @@ def test_full_screen_has_no_embedded_scrollbars_and_composer_starts_one_line():
         assert composer.height.min == 1
         assert composer.height.max == terminal_tui._MAX_COMPOSER_ROWS
         assert top_line == glyphs.horizontal * output.size.columns
-        assert terminal_tui._display_width(bottom_line) == output.size.columns
-        assert "Wheel scroll" in bottom_line
-        assert "Page Up/Down review" in bottom_line
-        assert "Ctrl+End latest" in bottom_line
+        assert bottom_line == glyphs.horizontal * output.size.columns
         assert glyphs.vertical not in top_line + bottom_line
         assert glyphs.top_left not in top_line
         assert glyphs.top_right not in top_line
@@ -2894,6 +3075,96 @@ async def test_ctrl_c_cancels_active_run_and_returns_to_composer():
     assert output.show_count >= 1
     assert output.alternate_enter_count == 1
     assert output.alternate_exit_count == 1
+
+
+async def test_submit_shows_user_block_and_working_state_before_run_progress():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        assert message == "show feedback"
+        assert conversation_id is None
+        entered.set()
+        await release.wait()
+        return _result("done")
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(pipe, output, state, run_message=run_message)
+        pipe.send_text("show feedback\r")
+        await entered.wait()
+
+        assert [(block.kind, block.text) for block in state.blocks] == [
+            ("user", "show feedback")
+        ]
+        assert state.running is True
+        assert state.run_status == "working"
+
+        release.set()
+        await _wait_until(lambda: not state.running)
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result.action == "exit"
+    assert [block.kind for block in state.blocks] == [
+        "user",
+        "metadata",
+        "assistant",
+    ]
+
+
+async def test_ctrl_c_removes_streaming_partial_and_reports_unrecorded_notice():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    bridge = TerminalObserverBridge()
+    started = asyncio.Event()
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del message, conversation_id
+        bridge(_event(AgentEventKind.RUN_STARTED, {"agent_id": "agent-live"}))
+        bridge(
+            _event(
+                AgentEventKind.MODEL_TEXT_DELTA,
+                {"model_call_index": 1, "text": "unrecorded live draft"},
+            )
+        )
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            bridge(
+                _event(
+                    AgentEventKind.RUN_COMPLETED,
+                    {"exit_kind": "interrupted", "reason": "cancelled"},
+                )
+            )
+            raise
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            observer_bridge=bridge,
+        )
+        pipe.send_text("cancel stream\r")
+        await started.wait()
+        await _wait_until(
+            lambda: any(block.kind == "assistant.partial" for block in state.blocks)
+        )
+        pipe.send_text("\x03")
+        await _wait_until(lambda: not state.running)
+        assert all(block.kind != "assistant.partial" for block in state.blocks)
+        assert all("unrecorded live draft" not in block.text for block in state.blocks)
+        assert state.notice == (
+            "Partial assistant output was interrupted and was not recorded."
+        )
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result.action == "exit"
 
 
 async def test_cancellation_settles_observed_run_and_live_tool_card():

@@ -55,6 +55,7 @@ _MAX_QUEUED_EVENTS = 4_096
 _MAX_EVENT_COUNTER = 999_999_999_999
 _MAX_TRACKED_CONTEXT_CONVERSATIONS = 64
 _ANIMATION_INTERVAL_SECONDS = 0.12
+_STREAM_REPAINT_INTERVAL_SECONDS = 1 / 30
 _RUNNING_GLYPHS = ("◐", "◓", "◑", "◒")
 _ASCII_RUNNING_GLYPHS = ("~", "-", "~", "+")
 _STARTUP_WORDMARK = (
@@ -520,6 +521,36 @@ class TerminalViewState:
         repr=False,
         compare=False,
     )
+    _partial_assistant_block_id: PresentationBlockId | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _partial_assistant_run_id: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _partial_model_call_index: int | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _partial_counted_unseen: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _unrecorded_partial_run_id: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         for value, field_name in (
@@ -599,6 +630,52 @@ class TerminalViewState:
     def append_user(self, message: str) -> None:
         self.append_plain("user", message, maximum=None)
 
+    def apply_model_text_delta(
+        self,
+        run_id: str,
+        model_call_index: int,
+        text: str,
+    ) -> None:
+        """Append one coalesced fragment batch to the sole disposable partial."""
+
+        if not isinstance(run_id, str) or not run_id:
+            return
+        if (
+            not isinstance(model_call_index, int)
+            or isinstance(model_call_index, bool)
+            or model_call_index < 1
+        ):
+            return
+        safe = _sanitize_terminal_text(
+            text,
+            maximum=None,
+            preserve_lines=True,
+            fallback="",
+        )
+        if not safe:
+            return
+        block = self._partial_assistant_block()
+        if block is None or (
+            self._partial_assistant_run_id,
+            self._partial_model_call_index,
+        ) != (run_id, model_call_index):
+            self._remove_partial_assistant()
+            counted_unseen = (
+                self.transcript_viewport.state is TranscriptFollowState.REVIEWING
+            )
+            block = TerminalBlock("assistant.partial", safe)
+            self._append_block(block)
+            self._partial_assistant_block_id = block.presentation_id
+            self._partial_assistant_run_id = run_id
+            self._partial_model_call_index = model_call_index
+            self._partial_counted_unseen = counted_unseen
+            self._unrecorded_partial_run_id = None
+            return
+        block.text += safe
+        assert block.presentation_id is not None
+        self.transcript_document.replace(block.presentation_id, block.text)
+        self._mark_transcript_dirty()
+
     def append_local(self, presentation: str, value: object) -> None:
         kind = (
             f"local.{presentation}"
@@ -618,6 +695,7 @@ class TerminalViewState:
                     f"Conversation  {candidate_conversation}",
                 )
 
+        result_run_id = getattr(result, "run_id", None)
         final_text = getattr(result, "final_text", None)
         if final_text is not None:
             safe_answer = _sanitize_terminal_text(
@@ -635,7 +713,18 @@ class TerminalViewState:
                 fallback="failed",
             )
             safe_answer = f"{kind or 'failed'}: {reason}"
-        self._append_block(TerminalBlock("assistant", safe_answer))
+        if final_text is not None and self._reconcile_partial_assistant(
+            result_run_id,
+            safe_answer,
+        ):
+            pass
+        else:
+            if final_text is None and isinstance(result_run_id, str):
+                self._remove_partial_assistant(
+                    run_id=result_run_id,
+                    unrecorded=True,
+                )
+            self._append_block(TerminalBlock("assistant", safe_answer))
         for receipt in tuple(getattr(result, "artifact_deliveries", ())):
             filename = getattr(receipt, "filename", None)
             saved_path = getattr(receipt, "saved_path", None)
@@ -676,7 +765,6 @@ class TerminalViewState:
                 fallback="failed",
             )
         )
-        result_run_id = getattr(result, "run_id", None)
         if (
             isinstance(result_run_id, str)
             and result_run_id
@@ -695,7 +783,16 @@ class TerminalViewState:
             )
             self._settle_run_cards(result_run_id, result_kind, result_reason)
             self.active_run_id = None
-        self.notice = ""
+        if (
+            isinstance(result_run_id, str)
+            and self._unrecorded_partial_run_id == result_run_id
+        ):
+            self.notice = (
+                "Partial assistant output was interrupted and was not recorded."
+            )
+            self._unrecorded_partial_run_id = None
+        else:
+            self.notice = ""
 
     def hydrate_transcript(
         self,
@@ -847,6 +944,8 @@ class TerminalViewState:
         if not isinstance(event, AgentEvent):
             raise TypeError("terminal event must be AgentEvent")
         if event.kind is AgentEventKind.RUN_STARTED:
+            self._remove_partial_assistant()
+            self._unrecorded_partial_run_id = None
             self.active_run_id = event.run_id
             self.running = True
             self.run_status = "working"
@@ -859,7 +958,26 @@ class TerminalViewState:
             self.estimated_cost = "cost unavailable"
             self.animation_frame = 0
             return
+        if event.kind is AgentEventKind.MODEL_TEXT_DELTA:
+            fields = _model_text_event_fields(event)
+            if fields is not None:
+                model_call_index, text = fields
+                self.apply_model_text_delta(event.run_id, model_call_index, text)
+            return
         if event.kind is AgentEventKind.MODEL_COMPLETED:
+            completed_model_call_index = _event_counter(
+                event.data.get("model_call_index")
+            )
+            if (
+                completed_model_call_index is not None
+                and self._partial_assistant_run_id == event.run_id
+                and (
+                    self._partial_model_call_index != completed_model_call_index
+                    or event.data.get("has_tool_calls") is True
+                    or event.data.get("has_text") is not True
+                )
+            ):
+                self._remove_partial_assistant(run_id=event.run_id)
             self.model_duration_ms = _event_counter(event.data.get("duration_ms"))
             context_input_tokens = _event_counter(
                 event.data.get("context_input_tokens")
@@ -891,6 +1009,7 @@ class TerminalViewState:
                 self.run_status = "working"
             return
         if event.kind is AgentEventKind.TOOL_STARTED:
+            self._remove_partial_assistant(run_id=event.run_id)
             card = self._card_for_event(event)
             if card is None:
                 return
@@ -977,19 +1096,92 @@ class TerminalViewState:
                 maximum=128,
                 fallback=exit_kind,
             )
+            if exit_kind != "completed":
+                self._remove_partial_assistant(
+                    run_id=event.run_id,
+                    unrecorded=True,
+                )
             self._settle_run_cards(event.run_id, exit_kind, reason)
             if self.active_run_id == event.run_id:
                 self.active_run_id = None
             self.running = False
             self.run_status = "ready" if exit_kind == "completed" else exit_kind
 
-    def settle_cancelled_run(self) -> None:
+    def settle_cancelled_run(self) -> bool:
+        removed_partial = self._remove_partial_assistant(
+            run_id=self.active_run_id,
+            unrecorded=True,
+        )
+        had_unrecorded_partial = (
+            removed_partial or self._unrecorded_partial_run_id is not None
+        )
         run_id = self.active_run_id
         if run_id is not None:
             self._settle_run_cards(run_id, "interrupted", "cancelled")
             self.active_run_id = None
             self.run_status = "interrupted"
         self.running = False
+        return had_unrecorded_partial
+
+    def _partial_assistant_block(self) -> TerminalBlock | None:
+        block_id = self._partial_assistant_block_id
+        if block_id is None:
+            return None
+        for block in self.blocks:
+            if block.presentation_id == block_id and block.kind == "assistant.partial":
+                return block
+        self._clear_partial_assistant_identity()
+        return None
+
+    def _remove_partial_assistant(
+        self,
+        *,
+        run_id: str | None = None,
+        unrecorded: bool = False,
+    ) -> bool:
+        if run_id is not None and self._partial_assistant_run_id != run_id:
+            return False
+        block = self._partial_assistant_block()
+        partial_run_id = self._partial_assistant_run_id
+        if block is None:
+            return False
+        self.blocks.remove(block)
+        if block.presentation_id is not None and self.transcript_document.contains(
+            block.presentation_id
+        ):
+            self.transcript_document.remove(block.presentation_id)
+        if self._partial_counted_unseen:
+            self.transcript_viewport.record_removed()
+        self._clear_partial_assistant_identity()
+        if unrecorded:
+            self._unrecorded_partial_run_id = partial_run_id
+        self._mark_transcript_dirty()
+        return True
+
+    def _reconcile_partial_assistant(
+        self,
+        run_id: object,
+        finalized_text: str,
+    ) -> bool:
+        if not isinstance(run_id, str) or self._partial_assistant_run_id != run_id:
+            return False
+        block = self._partial_assistant_block()
+        if block is None:
+            return False
+        block.kind = "assistant"
+        block.text = finalized_text
+        assert block.presentation_id is not None
+        self.transcript_document.replace(block.presentation_id, finalized_text)
+        self._clear_partial_assistant_identity()
+        self._unrecorded_partial_run_id = None
+        self._mark_transcript_dirty()
+        return True
+
+    def _clear_partial_assistant_identity(self) -> None:
+        self._partial_assistant_block_id = None
+        self._partial_assistant_run_id = None
+        self._partial_model_call_index = None
+        self._partial_counted_unseen = False
 
     def _card_for_event(self, event: AgentEvent) -> ToolCardState | None:
         call_id = _event_text(
@@ -2331,8 +2523,12 @@ def _create_application(
             result = await run_message(message, state.conversation_id)
             _project_pending_events(observer_bridge, state)
             if result is None:
-                state.settle_cancelled_run()
-                state.notice = "Run interrupted; returning to the composer."
+                partial_removed = state.settle_cancelled_run()
+                state.notice = (
+                    "Partial assistant output was interrupted and was not recorded."
+                    if partial_removed
+                    else "Run interrupted; returning to the composer."
+                )
             else:
                 hydration_notice = ""
                 run_id = getattr(result, "run_id", None)
@@ -2360,8 +2556,12 @@ def _create_application(
                     state.notice = hydration_notice
         except asyncio.CancelledError:
             _project_pending_events(observer_bridge, state)
-            state.settle_cancelled_run()
-            state.notice = "Run interrupted; returning to the composer."
+            partial_removed = state.settle_cancelled_run()
+            state.notice = (
+                "Partial assistant output was interrupted and was not recorded."
+                if partial_removed
+                else "Run interrupted; returning to the composer."
+            )
         except TerminalUserInputError as error:
             state.append_plain("local", str(error))
             state.run_status = "ready"
@@ -2863,14 +3063,7 @@ def _create_application(
             ]
         )
 
-    navigation_help = glyphs.separator.join(
-        ("Wheel scroll", "Page Up/Down review", "Ctrl+End latest")
-    )
-    composer_frame = bordered(
-        composer,
-        bottom_title=navigation_help,
-        sides=False,
-    )
+    composer_frame = bordered(composer, sides=False)
     approval_container = runtime["ConditionalContainer"](
         bordered(
             approval_window,
@@ -3232,16 +3425,21 @@ async def _consume_observer_events(
     state: TerminalViewState,
     application: Any,
 ) -> None:
+    loop = asyncio.get_running_loop()
+    last_animation = loop.time()
     while True:
         projected = _project_pending_events(bridge, state)
-        if state.running:
+        now = loop.time()
+        animate = state.running and now - last_animation >= _ANIMATION_INTERVAL_SECONDS
+        if animate:
             state.animation_frame = (state.animation_frame + 1) % len(_RUNNING_GLYPHS)
-        if projected or state.running:
+            last_animation = now
+        if projected or animate:
             try:
                 application.invalidate()
             except Exception:
                 pass
-        await asyncio.sleep(_ANIMATION_INTERVAL_SECONDS)
+        await asyncio.sleep(_STREAM_REPAINT_INTERVAL_SECONDS)
 
 
 def _project_pending_events(
@@ -3253,12 +3451,40 @@ def _project_pending_events(
     except Exception:
         return 0
     projected = 0
+    fragment_key: tuple[str, int] | None = None
+    fragment_text: list[str] = []
+
+    def flush_fragments() -> None:
+        nonlocal fragment_key, fragment_text
+        if fragment_key is not None and fragment_text:
+            try:
+                state.apply_model_text_delta(
+                    fragment_key[0],
+                    fragment_key[1],
+                    "".join(fragment_text),
+                )
+            except Exception:
+                pass
+        fragment_key = None
+        fragment_text = []
+
     for event in pending:
+        fields = _model_text_event_fields(event)
+        if fields is not None:
+            key = (event.run_id, fields[0])
+            if fragment_key is not None and fragment_key != key:
+                flush_fragments()
+            fragment_key = key
+            fragment_text.append(fields[1])
+            projected += 1
+            continue
+        flush_fragments()
         try:
             state.apply_event(event)
         except Exception:
             continue
         projected += 1
+    flush_fragments()
     return projected
 
 
@@ -4371,7 +4597,7 @@ def _render_transcript_fragments(
                 )
             )
             fragments.append(("", "\n"))
-        elif block.kind == "assistant":
+        elif block.kind in {"assistant", "assistant.partial"}:
             fragments.append(("class:tui.assistant.label", " Daita\n"))
             presentation_rows = 1
             fragments.extend(
@@ -5491,6 +5717,21 @@ def _event_counter(value: object) -> int | None:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         return None
     return min(value, _MAX_EVENT_COUNTER)
+
+
+def _model_text_event_fields(event: AgentEvent) -> tuple[int, str] | None:
+    if event.kind is not AgentEventKind.MODEL_TEXT_DELTA:
+        return None
+    model_call_index = _event_counter(event.data.get("model_call_index"))
+    text = event.data.get("text")
+    if (
+        model_call_index is None
+        or model_call_index < 1
+        or not isinstance(text, str)
+        or not text
+    ):
+        return None
+    return model_call_index, text
 
 
 def _event_text(value: object, *, maximum: int, fallback: str) -> str:

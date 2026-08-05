@@ -404,6 +404,7 @@ def _model_configuration(
         max_output_tokens=max_output,
         supports_tools=profile.supports_tools,
         supports_parallel_tools=profile.supports_parallel_tools,
+        supports_streaming=profile.supports_streaming,
     )
 
 
