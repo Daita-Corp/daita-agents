@@ -366,6 +366,25 @@ def test_drag_selection_normalizes_semantic_anchors_and_survives_rewrap():
     assert selection.text == selected.text
 
 
+def test_new_drag_replaces_the_previous_range_and_cross_control_release_preserves_extension():
+    document = TranscriptDocument()
+    block = document.append("first second third")
+    selection = TranscriptSelection()
+    selection.begin(document, document.position(block.id, 0))
+    selection.finish(document, document.position(block.id, len("first")))
+
+    selection.begin(document, document.position(block.id, len("first ")))
+
+    assert selection.text == ""
+    assert selection.dragging is True
+    selection.extend(document, document.position(block.id, len("first second")))
+    selected = selection.end_drag()
+    assert selected is not None
+    assert selected.text == "second"
+    assert selection.dragging is False
+    assert selection.text == "second"
+
+
 def test_selection_reconciles_append_but_clears_replaced_or_removed_text():
     document = TranscriptDocument()
     block = document.append("visible summary\nhidden detail")

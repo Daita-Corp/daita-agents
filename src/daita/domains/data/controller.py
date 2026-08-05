@@ -42,6 +42,7 @@ from ...catalog.models import (
     CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
     Sensitivity,
 )
+from ...errors import PluginError
 from ...memory.capabilities import MEMORY_SET_CAPABILITY_ID, MEMORY_SET_TOOL_NAME
 from ...observation import (
     AgentEvent,
@@ -517,11 +518,7 @@ class DataToolRuntime:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            result = _error(
-                call,
-                "tool_execution_failed",
-                f"{type(error).__name__}: {error}",
-            )
+            result = _exception_result(call, error)
         self._emit_tool_completed(run, call, result, started)
         if cancelled_after_mutation:
             raise asyncio.CancelledError
@@ -2392,6 +2389,8 @@ def _exception_result(call: ToolCall, error: BaseException) -> ToolResultBlock:
         return _error(call, "invalid_tool_result", str(error))
     if isinstance(error, ArtifactError):
         return _error(call, error.code, error.message, error.details)
+    if isinstance(error, PluginError):
+        return _error(call, error.error_code, str(error))
     return _error(
         call,
         "tool_execution_failed",

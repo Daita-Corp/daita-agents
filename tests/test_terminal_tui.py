@@ -691,13 +691,40 @@ async def test_ctrl_home_new_output_affordance_click_and_ctrl_end_follow_latest(
         assert state.transcript_viewport.unseen_items == 3
 
         indicator_window.content.create_content(output.size.columns, 1)
-        click = MouseEvent(
+        transcript_press = MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        cross_control_release = MouseEvent(
             position=Point(x=0, y=0),
             event_type=MouseEventType.MOUSE_UP,
             button=MouseButton.LEFT,
             modifiers=frozenset(),
         )
-        assert indicator_window.content.mouse_handler(click) is None
+        assert main_shell.children[0].content.mouse_handler(transcript_press) is None
+        assert indicator_window.content.mouse_handler(cross_control_release) is None
+        assert (
+            state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.REVIEWING
+        )
+        assert state.transcript_viewport.unseen_items == 3
+
+        press = MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        release = MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        assert indicator_window.content.mouse_handler(press) is None
+        assert indicator_window.content.mouse_handler(release) is None
         assert (
             state.transcript_viewport.state
             is terminal_tui.TranscriptFollowState.FOLLOWING
@@ -1264,6 +1291,7 @@ async def test_mouse_drag_highlights_and_ctrl_c_copies_without_cancelling_run(
         assert content_window.content.mouse_handler(move) is None
         assert content_window.content.mouse_handler(up) is None
         assert state.transcript_selection.text == "select"
+        assert state.transient_selection_hint == "Selected · Ctrl+C copy · Esc clear"
         await _wait_until(lambda: application.render_counter > render_counter)
         highlighted = content_window.content.create_content(98, None)
         assert any(
@@ -1294,6 +1322,276 @@ async def test_mouse_drag_highlights_and_ctrl_c_copies_without_cancelling_run(
 
     assert result.action == "exit"
     assert copied == ["select"]
+
+
+async def test_mouse_failure_is_presentation_only_during_an_active_run(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("select this text")
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del message, conversation_id
+        await asyncio.Event().wait()
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=run_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        content = application.layout.container.children[0].content.children[0].content
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+        content.create_content(98, None)
+        pipe.send_text("keep running\r")
+        await _wait_until(lambda: state.running and state.active_task is not None)
+        active = state.active_task
+
+        down = MouseEvent(
+            position=Point(x=1, y=2),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        move = MouseEvent(
+            position=Point(x=7, y=2),
+            event_type=MouseEventType.MOUSE_MOVE,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        assert content.mouse_handler(down) is None
+
+        def fail_mouse(*args: Any, **kwargs: Any) -> int:
+            del args, kwargs
+            raise RuntimeError("mouse failed")
+
+        monkeypatch.setattr(
+            terminal_tui,
+            "bounded_selection_auto_scroll",
+            fail_mouse,
+        )
+        assert content.mouse_handler(move) is None
+
+        assert state.notice == (
+            "Mouse interaction unavailable; keyboard controls remain active."
+        )
+        assert state.active_task is active
+        assert active is not None and not active.done()
+        assert state.running is True
+        pipe.send_text("\x03")
+        await _wait_until(lambda: not state.running)
+        pipe.send_text("\x04")
+        await task
+
+
+def test_selection_guidance_is_transient_status_not_permanent_footer_or_approval_chrome():
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("selected")
+    block = state.transcript_document.blocks[0]
+    state.transcript_selection.begin(
+        state.transcript_document,
+        state.transcript_document.position(block.id, 0),
+    )
+    state.transcript_selection.finish(
+        state.transcript_document,
+        state.transcript_document.position(block.id, len(block.text)),
+    )
+
+    permanent = "".join(
+        text for _style, text in terminal_tui._status_right_fragments(state)
+    )
+    assert "Ctrl+C copy" not in permanent
+    assert "Esc clear" not in permanent
+
+    state.transient_selection_hint = "Selected · Ctrl+C copy · Esc clear"
+    transient = "".join(
+        text for _style, text in terminal_tui._status_right_fragments(state)
+    )
+    assert "Selected · Ctrl+C copy · Esc clear" in transient
+
+    state.approval_panel = cast(
+        Any,
+        terminal_tui._approval_panel_for_request(_approval_request({"name": "safe"})),
+    )
+    approval_status = "".join(
+        text for _style, text in terminal_tui._status_right_fragments(state)
+    )
+    assert "Ctrl+C copy" not in approval_status
+
+
+def test_transcript_press_replaces_selection_and_blank_transcript_press_clears_it():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("alpha beta gamma")
+
+    async def no_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=no_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        content = application.layout.container.children[0].content.children[0].content
+        content.create_content(98, None)
+
+        def left(event_type: MouseEventType, *, x: int, y: int) -> MouseEvent:
+            return MouseEvent(
+                position=Point(x=x, y=y),
+                event_type=event_type,
+                button=MouseButton.LEFT,
+                modifiers=frozenset(),
+            )
+
+        assert content.mouse_handler(left(MouseEventType.MOUSE_DOWN, x=1, y=2)) is None
+        assert content.mouse_handler(left(MouseEventType.MOUSE_UP, x=6, y=2)) is None
+        assert state.transcript_selection.text == "alpha"
+
+        assert content.mouse_handler(left(MouseEventType.MOUSE_DOWN, x=7, y=2)) is None
+        assert state.transcript_selection.text == ""
+        assert state.transcript_selection.dragging is True
+        assert state.transient_selection_hint == ""
+        assert content.mouse_handler(left(MouseEventType.MOUSE_UP, x=11, y=2)) is None
+        assert state.transcript_selection.text == "beta"
+
+        assert content.mouse_handler(left(MouseEventType.MOUSE_DOWN, x=0, y=0)) is None
+        assert content.mouse_handler(left(MouseEventType.MOUSE_UP, x=0, y=0)) is None
+        assert state.transcript_selection.has_state is False
+        assert state.transient_selection_hint == ""
+
+
+async def test_command_menu_and_composer_clicks_exclusively_own_their_press_sequence():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("transcript selection")
+    block = state.transcript_document.blocks[0]
+
+    def restore_selection() -> None:
+        state.transcript_selection.begin(
+            state.transcript_document,
+            state.transcript_document.position(block.id, 0),
+        )
+        state.transcript_selection.finish(
+            state.transcript_document,
+            state.transcript_document.position(block.id, len("transcript")),
+        )
+
+    restore_selection()
+
+    async def no_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=no_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        main_shell = application.layout.container.children[0].content
+        transcript_control = main_shell.children[0].content
+        menu_control = main_shell.children[4].content.children[1].content
+        composer_control = application.layout.current_control
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+        transcript_control.create_content(98, None)
+        pipe.send_text("/")
+        await _wait_until(lambda: application.current_buffer.complete_state is not None)
+
+        transcript_press = MouseEvent(
+            position=Point(x=1, y=2),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        menu_release = MouseEvent(
+            position=Point(x=1, y=1),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        assert transcript_control.mouse_handler(transcript_press) is None
+        assert menu_control.mouse_handler(menu_release) is None
+        assert application.current_buffer.text == "/"
+        assert state.transcript_selection.dragging is False
+
+        restore_selection()
+        menu_press = MouseEvent(
+            position=Point(x=1, y=1),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        assert menu_control.mouse_handler(menu_press) is None
+        assert menu_control.mouse_handler(menu_release) is None
+        assert application.current_buffer.text != "/"
+        assert state.transcript_selection.text == "transcript"
+
+        state.transient_selection_hint = "Selected · Ctrl+C copy · Esc clear"
+        composer_press = MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        composer_release = MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        assert composer_control.mouse_handler(composer_press) is None
+        assert composer_control.mouse_handler(composer_release) is None
+        assert state.transcript_selection.text == "transcript"
+        assert state.transient_selection_hint == ""
+
+        application.current_buffer.reset()
+        pipe.send_text("\x04")
+        await task
 
 
 async def test_transcript_then_composer_copy_precedence_never_submits_draft(
@@ -2657,6 +2955,60 @@ def test_success_collapse_failure_expansion_and_toggles_are_process_local():
     assert second_state.tool_cards[failed.id].expanded is True
     assert second_state.tool_cards[succeeded.id].expanded is False
     assert transcript.messages[1].tool_calls == (failed, succeeded)
+
+
+def test_postgresql_connection_failure_has_distinct_tool_card_heading():
+    call = ToolCall(
+        id="call-postgresql-offline",
+        name="data_query_postgresql",
+        arguments={
+            "source_id": "source-postgresql",
+            "sql": "SELECT amount FROM public.orders",
+        },
+    )
+    result = ToolResultBlock(
+        call_id=call.id,
+        is_error=True,
+        output={
+            "error": {
+                "code": "postgresql_connect_failed",
+                "message": "PostgreSQL source could not be opened.",
+            }
+        },
+    )
+    details = terminal_tui._project_tool_details(call, result)
+    card = terminal_tui.ToolCardState(
+        run_id="run-postgresql-offline",
+        call_id=call.id,
+        capability_id="data.postgresql.query",
+        label="Query PostgreSQL",
+        state="failed",
+        error_code="postgresql_connect_failed",
+        details=details,
+    )
+
+    collapsed = "".join(
+        text
+        for _style, text in terminal_tui._render_tool_card_fragments(
+            card,
+            width=96,
+        )
+    )
+    card.expanded = True
+    expanded = "".join(
+        text
+        for _style, text in terminal_tui._render_tool_card_fragments(
+            card,
+            width=96,
+        )
+    )
+
+    assert details.summary.startswith("Connection unavailable · ")
+    assert "Connection unavailable" in collapsed
+    assert "Connection unavailable" in expanded
+    assert "PostgreSQL source could not be opened." in expanded
+    assert "database is running and reachable" in expanded
+    assert "PostgreSQLQueryError" not in collapsed + expanded
 
 
 def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_document():
@@ -4542,6 +4894,99 @@ async def test_explicit_n_denies_approval_without_submitting_the_composer():
     assert messages == ["review"]
     assert decisions == [ApprovalDecision.DENY]
     assert state.approval_panel is None
+
+
+async def test_approval_owns_all_clicks_without_mouse_decision_or_run_effect():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("selected evidence")
+    block = state.transcript_document.blocks[0]
+    state.transcript_selection.begin(
+        state.transcript_document,
+        state.transcript_document.position(block.id, 0),
+    )
+    state.transcript_selection.finish(
+        state.transcript_document,
+        state.transcript_document.position(block.id, len("selected")),
+    )
+    state.transient_selection_hint = "Selected · Ctrl+C copy · Esc clear"
+    request = _approval_request({"name": "bounded-skill", "content": "safe"})
+    decisions: list[ApprovalDecision] = []
+
+    async def fallback(unexpected: ApprovalRequest) -> ApprovalDecision:
+        raise AssertionError(unexpected)
+
+    approval_bridge = terminal_tui.TerminalApprovalBridge(fallback)
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del message, conversation_id
+        decisions.append(await approval_bridge(request))
+        return _result("handled")
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=run_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=approval_bridge,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        main_shell = application.layout.container.children[0].content
+        transcript_control = main_shell.children[0].content
+        approval_control = (
+            main_shell.children[2].content.children[1].children[1].content
+        )
+        composer_control = main_shell.children[3].children[1].content
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+        pipe.send_text("review\r")
+        await _wait_until(lambda: state.approval_panel is not None)
+        active = state.active_task
+        approval_focus = application.layout.current_control
+        assert state.transient_selection_hint == ""
+
+        def click(control: Any, *, x: int = 0, y: int = 0) -> None:
+            for event_type in (MouseEventType.MOUSE_DOWN, MouseEventType.MOUSE_UP):
+                event = MouseEvent(
+                    position=Point(x=x, y=y),
+                    event_type=event_type,
+                    button=MouseButton.LEFT,
+                    modifiers=frozenset(),
+                )
+                assert control.mouse_handler(event) is None
+
+        click(approval_control)
+        click(transcript_control, x=1, y=2)
+        click(composer_control)
+        pipe.send_text("\x1b[200~pasted\x1b[201~")
+        await asyncio.sleep(0.05)
+
+        assert decisions == []
+        assert state.approval_panel is not None
+        assert state.active_task is active
+        assert active is not None and not active.done()
+        assert state.transcript_selection.text == "selected"
+        assert application.current_buffer.text == ""
+        assert application.layout.current_control is approval_focus
+
+        pipe.send_text("n")
+        await _wait_until(lambda: decisions == [ApprovalDecision.DENY])
+        await _wait_until(lambda: not state.running)
+        pipe.send_text("\x04")
+        await task
+        approval_bridge.restore(approval_previous)
 
 
 @pytest.mark.parametrize(

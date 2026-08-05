@@ -844,6 +844,27 @@ def test_phase_c_transcript_selection_and_clipboard_stay_in_terminal_owners():
     )
 
 
+def test_phase_d_mouse_ownership_and_transient_guidance_stay_disposable_and_lazy():
+    transcript = (PACKAGE / "terminal_transcript.py").read_text(encoding="utf-8")
+    tui = (PACKAGE / "terminal_tui.py").read_text(encoding="utf-8")
+    menu_selection = (PACKAGE / "terminal_selection.py").read_text(encoding="utf-8")
+    durable_or_execution = _python_text(PACKAGE / "storage") + _python_text(
+        PACKAGE / "loop"
+    )
+
+    assert "def end_drag(" in transcript
+    assert "mouse_press_owner" in tui
+    assert "_SELECTION_COMPLETE_HINT" in tui
+    assert "transient_selection_hint" in tui
+    assert "mouse_press_owner" not in menu_selection + durable_or_execution
+    assert "transient_selection_hint" not in menu_selection + durable_or_execution
+    assert "prompt_toolkit" not in {
+        node.module
+        for node in ast.parse(tui).body
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+
+
 def test_phase_b_streaming_keeps_partial_state_disposable_and_provider_neutral():
     loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
     tui = (PACKAGE / "terminal_tui.py").read_text(encoding="utf-8")

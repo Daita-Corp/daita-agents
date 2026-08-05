@@ -704,6 +704,12 @@ class TranscriptSelection:
         self._drag_origin = None
         return selected
 
+    def end_drag(self) -> SemanticRange | None:
+        """End pointer capture while preserving any range already extended."""
+
+        self._drag_origin = None
+        return self.range
+
     def clear(self) -> bool:
         """Clear selection and drag state, returning whether anything changed."""
 

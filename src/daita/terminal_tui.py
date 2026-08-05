@@ -48,6 +48,10 @@ _MAX_COMPOSER_ROWS = 6
 _MOUSE_SCROLL_LINES = 3
 _SELECTION_AUTOSCROLL_LINES = 1
 _CLIPBOARD_TIMEOUT_SECONDS = 1.0
+_SELECTION_COMPLETE_HINT = "Selected · Ctrl+C copy · Esc clear"
+_MOUSE_FAILURE_NOTICE = (
+    "Mouse interaction unavailable; keyboard controls remain active."
+)
 _MAX_RENDER_CHARACTERS = 16_384
 _MAX_DETAIL_UTF8_BYTES = 16 * 1_024
 _MAX_CODE_VISIBLE_LINES = 80
@@ -186,6 +190,22 @@ _CAPABILITY_LABELS = {
     "skill.view": "Read skill",
     "skill.save": "Save skill",
     "skill.delete": "Delete skill",
+}
+_TOOL_ERROR_HEADINGS = {
+    "postgresql_connect_failed": "Connection unavailable",
+    "postgresql_credential_unavailable": "Credentials unavailable",
+    "postgresql_credential_invalid": "Credentials invalid",
+}
+_TOOL_ERROR_GUIDANCE = {
+    "postgresql_connect_failed": (
+        "Check that the database is running and reachable, then retry."
+    ),
+    "postgresql_credential_unavailable": (
+        "Check keychain access or replace the saved database password, then retry."
+    ),
+    "postgresql_credential_invalid": (
+        "Replace the saved database password, then retry."
+    ),
 }
 
 
@@ -619,6 +639,7 @@ class TerminalViewState:
     blocks: list[TerminalBlock] = field(default_factory=list)
     running: bool = False
     notice: str = ""
+    transient_selection_hint: str = ""
     steps: int = 0
     total_tokens: int = 0
     estimated_cost: str = "$0"
@@ -742,6 +763,7 @@ class TerminalViewState:
         had_state = self.transcript_selection.has_state
         survived = self.transcript_selection.reconcile(self.transcript_document)
         if had_state and not survived:
+            self.transient_selection_hint = ""
             self.notice = (
                 "Transcript selection cleared because visible content changed."
             )
@@ -2543,6 +2565,68 @@ def _create_application(
     transcript_cache_key: tuple[int, int, int, ResponsiveProjection] | None = None
     transcript_cache_fragments: list[tuple[str, str]] | None = None
     responsive_projection = _responsive_for_output(enhanced_output, state)
+    mouse_press_owner: str | None = None
+
+    def complete_captured_transcript_drag(*, show_hint: bool) -> None:
+        selected = state.transcript_selection.end_drag()
+        state.transient_selection_hint = (
+            _SELECTION_COMPLETE_HINT
+            if show_hint and selected is not None and bool(selected.text)
+            else ""
+        )
+
+    def mouse_action_owned(owner: str, event_type: Any) -> bool:
+        """Capture one press sequence for exactly one visible presentation owner."""
+
+        nonlocal mouse_press_owner
+        if event_type == runtime["MouseEventType"].MOUSE_DOWN:
+            if mouse_press_owner == "transcript" and owner != "transcript":
+                complete_captured_transcript_drag(show_hint=False)
+            mouse_press_owner = owner
+            state.transient_selection_hint = ""
+            return True
+        if event_type == runtime["MouseEventType"].MOUSE_MOVE:
+            return mouse_press_owner == owner
+        if event_type == runtime["MouseEventType"].MOUSE_UP:
+            previous_owner = mouse_press_owner
+            mouse_press_owner = None
+            if previous_owner == "transcript" and owner != "transcript":
+                complete_captured_transcript_drag(show_hint=True)
+            return previous_owner == owner
+        return True
+
+    def mouse_failed() -> None:
+        """Contain pointer failures inside disposable presentation state."""
+
+        nonlocal mouse_press_owner
+        mouse_press_owner = None
+        state.transcript_selection.end_drag()
+        state.transient_selection_hint = ""
+        state.notice = _MOUSE_FAILURE_NOTICE
+        try:
+            application.invalidate()
+        except Exception:
+            pass
+
+    def approval_owns_mouse(mouse_event: Any) -> bool:
+        panel = state.approval_panel
+        if panel is None:
+            return False
+        event_type = mouse_event.event_type
+        state.transient_selection_hint = ""
+        if event_type == runtime["MouseEventType"].SCROLL_UP:
+            panel.move(-_MOUSE_SCROLL_LINES)
+        elif event_type == runtime["MouseEventType"].SCROLL_DOWN:
+            panel.move(_MOUSE_SCROLL_LINES)
+        elif getattr(mouse_event.button, "name", "") == "LEFT":
+            owned = mouse_action_owned("approval", event_type)
+            if event_type == runtime["MouseEventType"].MOUSE_UP and owned:
+                remind_approval(application)
+                return True
+        else:
+            return True
+        application.invalidate()
+        return True
 
     def responsive() -> ResponsiveProjection:
         return responsive_projection
@@ -2616,6 +2700,32 @@ def _create_application(
             enforcing_bound = False
 
     composer.buffer.on_text_changed += enforce_bound
+
+    composer_mouse_handler_base = composer.control.mouse_handler
+
+    def composer_mouse_handler(mouse_event: Any) -> Any:
+        try:
+            if approval_owns_mouse(mouse_event):
+                return None
+            event_type = mouse_event.event_type
+            if getattr(mouse_event.button, "name", "") == "LEFT" and event_type in {
+                runtime["MouseEventType"].MOUSE_DOWN,
+                runtime["MouseEventType"].MOUSE_MOVE,
+                runtime["MouseEventType"].MOUSE_UP,
+            }:
+                if not mouse_action_owned("composer", event_type):
+                    return None
+            elif event_type in {
+                runtime["MouseEventType"].SCROLL_UP,
+                runtime["MouseEventType"].SCROLL_DOWN,
+            }:
+                state.transient_selection_hint = ""
+            return composer_mouse_handler_base(mouse_event)
+        except Exception:
+            mouse_failed()
+            return None
+
+    composer.control.mouse_handler = composer_mouse_handler
 
     def transcript_fragments() -> list[tuple[str, str]]:
         nonlocal content_last_line_width, content_line_count
@@ -2748,6 +2858,15 @@ def _create_application(
             ),
         ),
     )
+
+    def approval_mouse_handler(mouse_event: Any) -> Any:
+        try:
+            return None if approval_owns_mouse(mouse_event) else NotImplemented
+        except Exception:
+            mouse_failed()
+            return None
+
+    approval_control.mouse_handler = approval_mouse_handler
     approval_window = runtime["Window"](
         content=approval_control,
         wrap_lines=True,
@@ -2758,7 +2877,7 @@ def _create_application(
     approval_filter = runtime["Condition"](lambda: state.approval_panel is not None)
 
     async def present_approval(request: ApprovalRequest) -> ApprovalDecision:
-        nonlocal approval_waiter
+        nonlocal approval_waiter, mouse_press_owner
         async with approval_lock:
             panel = _approval_panel_for_request(request)
             if panel is None:
@@ -2773,6 +2892,9 @@ def _create_application(
             loop = asyncio.get_running_loop()
             waiter = loop.create_future()
             approval_waiter = waiter
+            mouse_press_owner = None
+            state.transcript_selection.end_drag()
+            state.transient_selection_hint = ""
             state.approval_panel = panel
             state.run_status = "approval"
             try:
@@ -2907,6 +3029,7 @@ def _create_application(
         state.running = True
         state.run_status = "working"
         state.notice = ""
+        state.transient_selection_hint = ""
         state.active_task = application.create_background_task(coroutine)
         invalidate(application)
 
@@ -2939,6 +3062,7 @@ def _create_application(
 
     def request_copy(application: Any, text: str) -> None:
         nonlocal clipboard_task
+        state.transient_selection_hint = ""
         if clipboard_task is not None and not clipboard_task.done():
             state.notice = "A clipboard copy is already in progress."
             invalidate(application)
@@ -3215,6 +3339,7 @@ def _create_application(
             remind_approval(event.app)
             return
         if state.transcript_selection.clear():
+            state.transient_selection_hint = ""
             state.notice = "Transcript selection cleared."
             invalidate(event.app)
             return
@@ -3507,6 +3632,43 @@ def _create_application(
         style="class:tui.command-menu",
     )
 
+    def command_menu_mouse_handler(mouse_event: Any) -> Any:
+        try:
+            if approval_owns_mouse(mouse_event):
+                return None
+            complete_state = command_menu_state()
+            if complete_state is None:
+                return NotImplemented
+            event_type = mouse_event.event_type
+            if event_type == runtime["MouseEventType"].SCROLL_UP:
+                state.transient_selection_hint = ""
+                composer.buffer.complete_previous()
+            elif event_type == runtime["MouseEventType"].SCROLL_DOWN:
+                state.transient_selection_hint = ""
+                composer.buffer.complete_next()
+            elif getattr(mouse_event.button, "name", "") == "LEFT" and event_type in {
+                runtime["MouseEventType"].MOUSE_DOWN,
+                runtime["MouseEventType"].MOUSE_MOVE,
+                runtime["MouseEventType"].MOUSE_UP,
+            }:
+                if not mouse_action_owned("command_menu", event_type):
+                    return None
+                if event_type != runtime["MouseEventType"].MOUSE_UP:
+                    return None
+                index = mouse_event.position.y
+                if 0 <= index < len(complete_state.completions):
+                    composer.buffer.go_to_completion(index)
+                    application.layout.focus(composer)
+            else:
+                return NotImplemented
+            invalidate(application)
+            return None
+        except Exception:
+            mouse_failed()
+            return None
+
+    command_menu_rows.content.mouse_handler = command_menu_mouse_handler
+
     def command_menu_rule() -> Any:
         return runtime["Window"](
             height=1,
@@ -3600,90 +3762,97 @@ def _create_application(
         )
 
     def transcript_mouse_handler(mouse_event: Any) -> Any:
-        event_type = mouse_event.event_type
-        panel = state.approval_panel
-        if panel is not None:
+        try:
+            if approval_owns_mouse(mouse_event):
+                return None
+            event_type = mouse_event.event_type
+            left_button = getattr(mouse_event.button, "name", "") == "LEFT"
             if event_type == runtime["MouseEventType"].SCROLL_UP:
-                panel.move(-_MOUSE_SCROLL_LINES)
+                state.transient_selection_hint = ""
+                scroll_transcript(_MOUSE_SCROLL_LINES)
             elif event_type == runtime["MouseEventType"].SCROLL_DOWN:
-                panel.move(_MOUSE_SCROLL_LINES)
+                state.transient_selection_hint = ""
+                scroll_transcript(-_MOUSE_SCROLL_LINES)
+            elif event_type == runtime["MouseEventType"].MOUSE_DOWN and left_button:
+                mouse_action_owned("transcript", event_type)
+                transcript_fragments()
+                position = rendered_transcript_map.position_for_cell(
+                    mouse_event.position.y,
+                    mouse_event.position.x,
+                )
+                if position is None:
+                    state.transcript_selection.clear()
+                else:
+                    state.transcript_selection.begin(
+                        state.transcript_document,
+                        position,
+                    )
+                    state.notice = ""
+            elif event_type == runtime["MouseEventType"].MOUSE_MOVE and left_button:
+                if not mouse_action_owned("transcript", event_type):
+                    return None
+                if not state.transcript_selection.dragging:
+                    return None
+                height = _viewport_height(content_window)
+                top = viewport_rendered_top(content_window)
+                movement = bounded_selection_auto_scroll(
+                    mouse_event.position.y,
+                    viewport_top=top,
+                    viewport_rows=height,
+                )
+                if movement < 0:
+                    scroll_transcript(_SELECTION_AUTOSCROLL_LINES)
+                elif movement > 0:
+                    scroll_transcript(-_SELECTION_AUTOSCROLL_LINES)
+                target_row = max(0, mouse_event.position.y + movement)
+                position = rendered_transcript_map.position_for_cell(
+                    target_row,
+                    mouse_event.position.x,
+                )
+                if position is not None:
+                    try:
+                        state.transcript_selection.extend(
+                            state.transcript_document,
+                            position,
+                        )
+                    except (RuntimeError, ValueError):
+                        state.transcript_selection.clear()
+                state.notice = ""
+            elif event_type == runtime["MouseEventType"].MOUSE_UP and left_button:
+                if not mouse_action_owned("transcript", event_type):
+                    return None
+                if not state.transcript_selection.dragging:
+                    return None
+                transcript_fragments()
+                position = rendered_transcript_map.position_for_cell(
+                    mouse_event.position.y,
+                    mouse_event.position.x,
+                )
+                if position is None:
+                    state.transcript_selection.clear()
+                    state.transient_selection_hint = ""
+                else:
+                    try:
+                        selected = state.transcript_selection.finish(
+                            state.transcript_document,
+                            position,
+                        )
+                    except (RuntimeError, ValueError):
+                        state.transcript_selection.clear()
+                        state.transient_selection_hint = ""
+                    else:
+                        state.transient_selection_hint = (
+                            _SELECTION_COMPLETE_HINT
+                            if selected is not None and bool(selected.text)
+                            else ""
+                        )
             else:
                 return NotImplemented
             invalidate(application)
             return None
-        if event_type == runtime["MouseEventType"].SCROLL_UP:
-            scroll_transcript(_MOUSE_SCROLL_LINES)
-        elif event_type == runtime["MouseEventType"].SCROLL_DOWN:
-            scroll_transcript(-_MOUSE_SCROLL_LINES)
-        elif (
-            event_type == runtime["MouseEventType"].MOUSE_DOWN
-            and mouse_event.button.name == "LEFT"
-        ):
-            transcript_fragments()
-            position = rendered_transcript_map.position_for_cell(
-                mouse_event.position.y,
-                mouse_event.position.x,
-            )
-            if position is None:
-                state.transcript_selection.clear()
-            else:
-                state.transcript_selection.begin(
-                    state.transcript_document,
-                    position,
-                )
-                state.notice = ""
-        elif (
-            event_type == runtime["MouseEventType"].MOUSE_MOVE
-            and state.transcript_selection.dragging
-        ):
-            height = _viewport_height(content_window)
-            top = viewport_rendered_top(content_window)
-            movement = bounded_selection_auto_scroll(
-                mouse_event.position.y,
-                viewport_top=top,
-                viewport_rows=height,
-            )
-            if movement < 0:
-                scroll_transcript(_SELECTION_AUTOSCROLL_LINES)
-            elif movement > 0:
-                scroll_transcript(-_SELECTION_AUTOSCROLL_LINES)
-            target_row = max(0, mouse_event.position.y + movement)
-            position = rendered_transcript_map.position_for_cell(
-                target_row,
-                mouse_event.position.x,
-            )
-            if position is not None:
-                try:
-                    state.transcript_selection.extend(
-                        state.transcript_document,
-                        position,
-                    )
-                except (RuntimeError, ValueError):
-                    state.transcript_selection.clear()
-            state.notice = ""
-        elif (
-            event_type == runtime["MouseEventType"].MOUSE_UP
-            and state.transcript_selection.dragging
-        ):
-            transcript_fragments()
-            position = rendered_transcript_map.position_for_cell(
-                mouse_event.position.y,
-                mouse_event.position.x,
-            )
-            if position is None:
-                state.transcript_selection.clear()
-            else:
-                try:
-                    state.transcript_selection.finish(
-                        state.transcript_document,
-                        position,
-                    )
-                except (RuntimeError, ValueError):
-                    state.transcript_selection.clear()
-        else:
-            return NotImplemented
-        invalidate(application)
-        return None
+        except Exception:
+            mouse_failed()
+            return None
 
     def create_transcript_content(
         control: Any,
@@ -3742,11 +3911,25 @@ def _create_application(
         )
 
     def activate_new_output(mouse_event: Any) -> Any:
-        if mouse_event.event_type != runtime["MouseEventType"].MOUSE_UP:
-            return NotImplemented
-        state.transcript_viewport.follow_latest()
-        invalidate(application)
-        return None
+        try:
+            if approval_owns_mouse(mouse_event):
+                return None
+            event_type = mouse_event.event_type
+            if getattr(mouse_event.button, "name", "") != "LEFT" or event_type not in {
+                runtime["MouseEventType"].MOUSE_DOWN,
+                runtime["MouseEventType"].MOUSE_MOVE,
+                runtime["MouseEventType"].MOUSE_UP,
+            }:
+                return NotImplemented
+            if not mouse_action_owned("jump_to_latest", event_type):
+                return None
+            if event_type == runtime["MouseEventType"].MOUSE_UP:
+                state.transcript_viewport.follow_latest()
+                invalidate(application)
+            return None
+        except Exception:
+            mouse_failed()
+            return None
 
     def new_output_fragments() -> list[Any]:
         count = state.transcript_viewport.unseen_items
@@ -4193,7 +4376,8 @@ def _project_tool_details(
             if error_details not in (None, {}, [])
             else None
         )
-        summary = _one_logical_line(f"{error_code} · {error_message}")
+        error_heading = _TOOL_ERROR_HEADINGS.get(error_code, error_code)
+        summary = _one_logical_line(f"{error_heading} · {error_message}")
         arguments_text, fitted_error_message, result_text = _fit_detail_text_budget(
             arguments_text,
             error_message,
@@ -5710,9 +5894,14 @@ def _render_tool_details(
             )
         )
     if details.error_message is not None:
+        error_heading = _TOOL_ERROR_HEADINGS.get(card.error_code or "", "Error")
+        error_lines = [error_heading, details.error_message]
+        error_guidance = _TOOL_ERROR_GUIDANCE.get(card.error_code or "")
+        if error_guidance is not None:
+            error_lines.append(error_guidance)
         fragments.extend(
             _card_plain_lines(
-                ("Error", details.error_message),
+                error_lines,
                 style=border_style,
                 glyphs=glyphs,
                 bordered=responsive.bordered_cards,
@@ -6096,12 +6285,15 @@ def _status_right_fragments(
     *,
     projection: StatusProjection | None = None,
 ) -> list[tuple[str, str]]:
-    if state.notice:
+    notice = state.notice or (
+        state.transient_selection_hint if state.approval_panel is None else ""
+    )
+    if notice:
         return [
             (
                 "class:tui.status.notice",
                 _sanitize_terminal_text(
-                    state.notice,
+                    notice,
                     maximum=256,
                     preserve_lines=False,
                     fallback="",
@@ -6133,9 +6325,12 @@ def _status_single_line_fragments(
     fragments = [(_status_state_style(state), f" {projection.left}")]
     suffix = ""
     suffix_style = "class:tui.status.meta"
-    if state.notice:
+    notice = state.notice or (
+        state.transient_selection_hint if state.approval_panel is None else ""
+    )
+    if notice:
         suffix = _sanitize_terminal_text(
-            state.notice,
+            notice,
             maximum=128,
             preserve_lines=False,
             fallback="",

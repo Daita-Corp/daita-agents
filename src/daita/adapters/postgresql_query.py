@@ -29,12 +29,14 @@ from ..domains.data.export_capabilities import (
 )
 from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_postgresql_read
+from ..errors import PluginError
 from ..security import SecretProvider, default_secret_provider
 from .postgresql import (
     _DEFAULT_MAX_COLUMNS,
     _DEFAULT_MAX_INDEXES,
     _DEFAULT_MAX_RELATIONSHIPS,
     _DEFAULT_MAX_RESOURCES,
+    PostgreSQLSourceError,
     _close_postgresql_connection,
     _connect,
     _load_structure,
@@ -49,7 +51,7 @@ _MAX_VALUE_DEPTH = 32
 _BOUNDED_RESULT_MARKER = "/* daita:postgresql.bounded_result */"
 
 
-class PostgreSQLQueryError(RuntimeError):
+class PostgreSQLQueryError(PluginError):
     """Normalized query-boundary failure without connector error leakage."""
 
     def __init__(self, code: str, message: str) -> None:
@@ -58,7 +60,7 @@ class PostgreSQLQueryError(RuntimeError):
         if not isinstance(message, str) or not message.strip():
             raise ValueError("query error message must be a non-empty string")
         self.code = code
-        super().__init__(message)
+        super().__init__(message, plugin_id="postgresql", error_code=code)
 
 
 class PostgreSQLQueryBackend:
@@ -165,6 +167,7 @@ class PostgreSQLQueryBackend:
         connection = None
         transaction = None
         transaction_finished = False
+        connection_failure: tuple[str, str] | None = None
         query_failed = False
         columns: tuple[str, ...] = ()
         rows: tuple[Mapping[str, object], ...] = ()
@@ -217,6 +220,11 @@ class PostgreSQLQueryBackend:
             raise
         except PostgreSQLQueryError:
             raise
+        except PostgreSQLSourceError as error:
+            # The connection boundary has already removed connector diagnostics.
+            # Retain only its safe code and message, then raise a fresh query error
+            # after the original exception context has ended.
+            connection_failure = (error.code, str(error))
         except Exception:
             # Driver and server errors can carry SQL, bound values, DSNs, or
             # credentials.  Cross the boundary only after the original
@@ -237,6 +245,8 @@ class PostgreSQLQueryBackend:
                         timeout_seconds=self._cleanup_timeout_seconds,
                     )
 
+        if connection_failure is not None:
+            raise PostgreSQLQueryError(*connection_failure)
         if query_failed:
             raise PostgreSQLQueryError(
                 "postgresql_query_failed",
@@ -332,6 +342,7 @@ class PostgreSQLQueryBackend:
         connection = None
         transaction = None
         transaction_finished = False
+        connection_failure: tuple[str, str] | None = None
         query_failed = False
         content = b""
         columns: tuple[str, ...] = ()
@@ -428,6 +439,8 @@ class PostgreSQLQueryBackend:
             raise
         except (ArtifactError, PostgreSQLQueryError):
             raise
+        except PostgreSQLSourceError as error:
+            connection_failure = (error.code, str(error))
         except Exception:
             query_failed = True
         finally:
@@ -444,6 +457,8 @@ class PostgreSQLQueryBackend:
                         connection,
                         timeout_seconds=self._cleanup_timeout_seconds,
                     )
+        if connection_failure is not None:
+            raise PostgreSQLQueryError(*connection_failure)
         if query_failed:
             raise PostgreSQLQueryError(
                 "postgresql_query_failed",
