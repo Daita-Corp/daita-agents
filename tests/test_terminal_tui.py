@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 from datetime import datetime, timezone
 from decimal import Decimal
 import io
@@ -860,6 +861,645 @@ def test_installed_prompt_toolkit_sgr_mouse_protocol_spike_is_deterministic():
         modifiers=frozenset(),
     )
     assert not hasattr(mouse_event, "click_count")
+
+
+def test_rendered_selection_maps_wide_combining_and_emoji_cells_exactly():
+    runtime = terminal_tui._load_terminal_runtime()
+    capabilities = terminal_tui.TerminalCapabilities("none", True)
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("e\u0301界🙂x")
+    maps: list[Any] = []
+
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=20,
+        capabilities=capabilities,
+        rendered_transcript_maps=maps,
+    )
+    rendered_map = maps[0]
+    block = state.transcript_document.blocks[0]
+
+    assert rendered_map.position_for_cell(2, 1) == state.transcript_document.position(
+        block.id, 0
+    )
+    assert rendered_map.position_for_cell(2, 2) == state.transcript_document.position(
+        block.id, 2
+    )
+    assert rendered_map.position_for_cell(2, 3) == state.transcript_document.position(
+        block.id, 2
+    )
+    assert rendered_map.position_for_cell(2, 4) == state.transcript_document.position(
+        block.id, 3
+    )
+    assert rendered_map.position_for_cell(2, 5) == state.transcript_document.position(
+        block.id, 3
+    )
+    assert rendered_map.position_for_cell(2, 7) == state.transcript_document.position(
+        block.id, len(block.text)
+    )
+
+    state.transcript_selection.begin(
+        state.transcript_document,
+        rendered_map.position_for_cell(2, 1),
+    )
+    state.transcript_selection.finish(
+        state.transcript_document,
+        rendered_map.position_for_cell(2, 7),
+    )
+    highlighted = terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=20,
+        capabilities=capabilities,
+    )
+
+    assert state.transcript_selection.text == "e\u0301界🙂x"
+    assert (
+        "".join(
+            text
+            for style, text in highlighted
+            if "class:tui.transcript.selection" in style
+        )
+        == "e\u0301界🙂x"
+    )
+
+
+def test_drag_mapping_across_wrapped_blocks_copies_logical_text_once():
+    runtime = terminal_tui._load_terminal_runtime()
+    capabilities = terminal_tui.TerminalCapabilities("none", True)
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("alpha beta gamma delta epsilon zeta eta theta")
+    state.append_user("path /tmp/data.csv\n| east | 42 |")
+    maps: list[Any] = []
+    fragments = terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=20,
+        capabilities=capabilities,
+        rendered_transcript_maps=maps,
+    )
+    lines = "".join(text for _style, text in fragments).splitlines()
+    start_row = next(row for row, line in enumerate(lines) if "beta" in line)
+    end_row = next(row for row, line in enumerate(lines) if "42" in line)
+    start_cell = lines[start_row].index("beta")
+    end_cell = lines[end_row].index("42") + len("42")
+    rendered_map = maps[0]
+    start = rendered_map.position_for_cell(start_row, start_cell)
+    end = rendered_map.position_for_cell(end_row, end_cell)
+    assert start is not None and end is not None
+
+    state.transcript_selection.begin(state.transcript_document, start)
+    selected = state.transcript_selection.finish(state.transcript_document, end)
+    assert selected is not None
+
+    first, second = state.transcript_document.blocks
+    expected = state.transcript_document.normalize_range(
+        state.transcript_document.position(first.id, first.text.index("beta")),
+        state.transcript_document.position(
+            second.id,
+            second.text.index("42") + len("42"),
+        ),
+    )
+    assert selected.text == expected.text
+    assert selected.text.count("beta") == 1
+    assert selected.text.count("42") == 1
+
+
+def test_selection_copy_text_is_wrap_stable_and_visible_projection_changes_clear_it():
+    runtime = terminal_tui._load_terminal_runtime()
+    capabilities = terminal_tui.TerminalCapabilities("none", True)
+    state = TerminalViewState("atlas", "model", "source")
+    logical = "SELECT café, 界, 🙂 FROM /tmp/very-long-path/data.csv\n| east | 42 |"
+    state.append_user(logical)
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=24,
+        capabilities=capabilities,
+    )
+    block = state.transcript_document.blocks[0]
+    state.transcript_selection.begin(
+        state.transcript_document,
+        state.transcript_document.position(block.id, 0),
+    )
+    state.transcript_selection.finish(
+        state.transcript_document,
+        state.transcript_document.position(block.id, len(logical)),
+    )
+
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=100,
+        capabilities=capabilities,
+    )
+    assert state.transcript_selection.text == logical
+
+    state.blocks[0].text = "SELECT café, 界, 🙂"
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=40,
+        capabilities=capabilities,
+    )
+    assert state.transcript_selection.active is False
+    assert state.notice == (
+        "Transcript selection cleared because visible content changed."
+    )
+
+
+def test_streaming_append_preserves_selection_and_cancellation_removal_clears_it():
+    runtime = terminal_tui._load_terminal_runtime()
+    capabilities = terminal_tui.TerminalCapabilities("none", True)
+    state = TerminalViewState("atlas", "model", "source")
+    state.apply_model_text_delta("run-stream", 1, "draft answer")
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=40,
+        capabilities=capabilities,
+    )
+    block = state.transcript_document.blocks[0]
+    start = state.transcript_document.text(block.id).index("draft")
+    state.transcript_selection.begin(
+        state.transcript_document,
+        state.transcript_document.position(block.id, start),
+    )
+    state.transcript_selection.finish(
+        state.transcript_document,
+        state.transcript_document.position(block.id, start + len("draft")),
+    )
+
+    state.apply_model_text_delta("run-stream", 1, " continues")
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=20,
+        capabilities=capabilities,
+    )
+
+    assert state.transcript_selection.text == "draft"
+    state.settle_cancelled_run()
+    assert state.transcript_selection.has_state is False
+
+
+def test_collapsed_tool_payload_and_approval_arguments_are_not_selectable():
+    runtime = terminal_tui._load_terminal_runtime()
+    capabilities = terminal_tui.TerminalCapabilities("none", True)
+    state = TerminalViewState("atlas", "model", "source")
+    secret = "hidden-approval-token"
+    card = terminal_tui.ToolCardState(
+        run_id="run-safe",
+        call_id="call-safe",
+        capability_id="data.sqlite.query",
+        label="Query SQLite",
+        state="succeeded",
+        details=terminal_tui.ToolCardDetails(
+            summary="3 rows returned",
+            arguments_text=f'{{"token":"{secret}"}}',
+            result_text=secret,
+        ),
+        expanded=False,
+    )
+    state.blocks.append(terminal_tui.TerminalBlock("tool", card.call_id, card))
+    state.approval_panel = terminal_tui.ApprovalPanelState(
+        "skill_save",
+        "skills.write",
+        f'{{"token":"{secret}"}}',
+    )
+
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=80,
+        capabilities=capabilities,
+    )
+
+    selectable = "\n".join(
+        state.transcript_document.text(block.id)
+        for block in state.transcript_document.blocks
+    )
+    assert "3 rows returned" in selectable
+    assert secret not in selectable
+
+
+def test_clipboard_priority_and_osc52_tmux_encoding_are_bounded_and_safe():
+    assert terminal_tui._clipboard_mechanism(platform="darwin", environ={}) == (
+        "pbcopy"
+    )
+    assert (
+        terminal_tui._clipboard_mechanism(
+            platform="darwin", environ={"SSH_TTY": "/dev/pts/1"}
+        )
+        == "osc52"
+    )
+    assert (
+        terminal_tui._clipboard_mechanism(
+            platform="darwin", environ={"TMUX": "/tmp/tmux"}
+        )
+        == "pbcopy"
+    )
+    assert (
+        terminal_tui._clipboard_mechanism(
+            platform="linux", environ={"TMUX": "/tmp/tmux"}
+        )
+        == "osc52"
+    )
+
+    payload = b"visible\x1b]52;c;inert\x07"
+    plain = terminal_tui._osc52_sequence(payload, tmux=False)
+    wrapped = terminal_tui._osc52_sequence(payload, tmux=True)
+    encoded = plain.removeprefix("\x1b]52;c;").removesuffix("\x07")
+
+    assert base64.b64decode(encoded) == payload
+    assert plain.count("\x1b") == 1
+    assert wrapped == f"\x1bPtmux;\x1b{plain}\x1b\\"
+    assert (
+        len(
+            terminal_tui._osc52_sequence(
+                b"x" * terminal_tui.MAX_CLIPBOARD_UTF8_BYTES,
+                tmux=True,
+            ).encode("ascii")
+        )
+        < 88_000
+    )
+
+
+async def test_clipboard_acknowledgement_failure_and_utf8_bound_are_truthful(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = _RecordingOutput()
+    seen: list[bytes] = []
+
+    def acknowledge(payload: bytes) -> terminal_tui.ClipboardResult:
+        seen.append(payload)
+        return terminal_tui.ClipboardResult("copied", "pbcopy", "Copied")
+
+    monkeypatch.setattr(terminal_tui, "_copy_with_pbcopy", acknowledge)
+    copied = await terminal_tui._deliver_clipboard(
+        "café🙂",
+        output=output,
+        platform="darwin",
+        environ={},
+    )
+    requested = await terminal_tui._deliver_clipboard(
+        "remote",
+        output=output,
+        platform="linux",
+        environ={"SSH_TTY": "/dev/pts/1"},
+    )
+    oversized = await terminal_tui._deliver_clipboard(
+        "é" * (terminal_tui.MAX_CLIPBOARD_UTF8_BYTES // 2 + 1),
+        output=output,
+        platform="darwin",
+        environ={},
+    )
+
+    assert seen == ["café🙂".encode("utf-8")]
+    assert copied == terminal_tui.ClipboardResult("copied", "pbcopy", "Copied")
+    assert requested.status == "requested"
+    assert requested.message == "Copy request sent to terminal"
+    assert oversized.status == "failure"
+    assert "64 KiB UTF-8 limit" in oversized.message
+    assert seen == ["café🙂".encode("utf-8")]
+
+
+def test_failed_osc52_delivery_does_not_mutate_selection():
+    class BrokenOutput:
+        def write_raw(self, data: str) -> None:
+            del data
+            raise OSError("blocked")
+
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("keep selected")
+    block = state.transcript_document.blocks[0]
+    state.transcript_selection.begin(
+        state.transcript_document,
+        state.transcript_document.position(block.id, 0),
+    )
+    state.transcript_selection.finish(
+        state.transcript_document,
+        state.transcript_document.position(block.id, len(block.text)),
+    )
+
+    result = terminal_tui._send_osc52_request(
+        BrokenOutput(),
+        state.transcript_selection.text.encode("utf-8"),
+        tmux=False,
+    )
+
+    assert result.status == "failure"
+    assert "often Shift" in result.message
+    assert state.transcript_selection.text == "keep selected"
+
+
+async def test_mouse_drag_highlights_and_ctrl_c_copies_without_cancelling_run(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("select this text")
+    copied: list[str] = []
+
+    async def deliver(
+        text: str,
+        **kwargs: Any,
+    ) -> terminal_tui.ClipboardResult:
+        del kwargs
+        copied.append(text)
+        return terminal_tui.ClipboardResult("failure", "test", "Copy failed in test.")
+
+    monkeypatch.setattr(terminal_tui, "_deliver_clipboard", deliver)
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del message, conversation_id
+        await asyncio.Event().wait()
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=run_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        content_window = application.layout.container.children[0].content.children[0]
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+        content_window.content.create_content(98, None)
+
+        down = MouseEvent(
+            position=Point(x=1, y=2),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        move = MouseEvent(
+            position=Point(x=7, y=2),
+            event_type=MouseEventType.MOUSE_MOVE,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        up = MouseEvent(
+            position=Point(x=7, y=2),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        render_counter = application.render_counter
+        assert content_window.content.mouse_handler(down) is None
+        assert content_window.content.mouse_handler(move) is None
+        assert content_window.content.mouse_handler(up) is None
+        assert state.transcript_selection.text == "select"
+        await _wait_until(lambda: application.render_counter > render_counter)
+        highlighted = content_window.content.create_content(98, None)
+        assert any(
+            "class:tui.transcript.selection" in style
+            for row in range(highlighted.line_count)
+            for style, _text in highlighted.get_line(row)
+        )
+
+        pipe.send_text("keep running\r")
+        await _wait_until(lambda: state.running and state.active_task is not None)
+        active = state.active_task
+        pipe.send_text("\x03")
+        await _wait_until(lambda: copied == ["select"])
+
+        assert active is state.active_task
+        assert active is not None and not active.done()
+        assert state.running is True
+        assert state.transcript_selection.text == "select"
+        assert state.notice == "Copy failed in test."
+
+        pipe.send_text("\x1b")
+        await _wait_until(lambda: not state.transcript_selection.has_state)
+        assert active is not None and not active.done()
+        pipe.send_text("\x03")
+        await _wait_until(lambda: not state.running)
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result.action == "exit"
+    assert copied == ["select"]
+
+
+async def test_transcript_then_composer_copy_precedence_never_submits_draft(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("transcript")
+    block = state.transcript_document.blocks[0]
+    state.transcript_selection.begin(
+        state.transcript_document,
+        state.transcript_document.position(block.id, 0),
+    )
+    state.transcript_selection.finish(
+        state.transcript_document,
+        state.transcript_document.position(block.id, len(block.text)),
+    )
+    copied: list[str] = []
+    submitted: list[str] = []
+
+    async def deliver(
+        text: str,
+        **kwargs: Any,
+    ) -> terminal_tui.ClipboardResult:
+        del kwargs
+        copied.append(text)
+        if text == "draft":
+            return terminal_tui.ClipboardResult(
+                "failure", "test", "Copy failed in test."
+            )
+        return terminal_tui.ClipboardResult("copied", "test", "Copied")
+
+    monkeypatch.setattr(terminal_tui, "_deliver_clipboard", deliver)
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del conversation_id
+        submitted.append(message)
+        return _result("unexpected")
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=run_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+        pipe.send_text("draft remains")
+        await _wait_until(lambda: application.current_buffer.text == "draft remains")
+        application.current_buffer.cursor_position = 0
+        application.current_buffer.start_selection()
+        application.current_buffer.cursor_position = len("draft")
+
+        pipe.send_text("\x03")
+        await _wait_until(lambda: copied == ["transcript"])
+        assert application.current_buffer.selection_state is not None
+
+        pipe.send_text("\x1b")
+        await _wait_until(lambda: not state.transcript_selection.active)
+        assert application.current_buffer.selection_state is not None
+        pipe.send_text("\x03")
+        await _wait_until(lambda: copied == ["transcript", "draft"])
+
+        assert submitted == []
+        assert application.current_buffer.text == "draft remains"
+        assert application.current_buffer.selection_state is not None
+        assert [item.text for item in state.blocks] == ["transcript"]
+        application.current_buffer.reset()
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result.action == "exit"
+    assert submitted == []
+
+
+async def test_selection_drag_auto_scrolls_only_one_row_per_mouse_event():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("\n".join(f"row-{index:03d}" for index in range(100)))
+
+    async def no_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=no_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        content_window = application.layout.container.children[0].content.children[0]
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(
+            lambda: output.alternate_enter_count == 1
+            and content_window.render_info is not None
+        )
+        initial_top = content_window.vertical_scroll
+        down = MouseEvent(
+            position=Point(x=1, y=initial_top + 2),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        move = MouseEvent(
+            position=Point(x=1, y=initial_top),
+            event_type=MouseEventType.MOUSE_MOVE,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+
+        assert content_window.content.mouse_handler(down) is None
+        assert content_window.content.mouse_handler(move) is None
+        await _wait_until(lambda: content_window.vertical_scroll != initial_top)
+
+        assert initial_top - content_window.vertical_scroll == 1
+        assert state.transcript_selection.active is True
+        application.current_buffer.reset()
+        pipe.send_text("\x04")
+        await task
+
+
+def test_selection_highlight_work_is_lazy_per_requested_viewport_row(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("\n".join(f"row-{index:05d}" for index in range(20_000)))
+    block = state.transcript_document.blocks[0]
+    state.transcript_selection.begin(
+        state.transcript_document,
+        state.transcript_document.position(block.id, 0),
+    )
+    state.transcript_selection.finish(
+        state.transcript_document,
+        state.transcript_document.position(block.id, len("row-00000")),
+    )
+    highlighted_rows = 0
+    original = terminal_tui._highlight_transcript_line
+
+    def counted_highlight(*args: Any, **kwargs: Any) -> list[tuple[str, str]]:
+        nonlocal highlighted_rows
+        highlighted_rows += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(terminal_tui, "_highlight_transcript_line", counted_highlight)
+
+    async def no_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=no_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        content_control = (
+            application.layout.container.children[0].content.children[0].content
+        )
+        content = content_control.create_content(98, None)
+
+        for row in range(2, 12):
+            content.get_line(row)
+
+    assert highlighted_rows == 10
+    assert state.transcript_viewport.projection_build_count == 1
 
 
 async def test_terminal_controller_projects_themed_local_command_results(

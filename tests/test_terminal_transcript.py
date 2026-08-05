@@ -6,8 +6,10 @@ from daita.terminal_transcript import (
     RenderedCoordinate,
     TranscriptDocument,
     TranscriptFollowState,
+    TranscriptSelection,
     TranscriptViewport,
     bounded_scroll_rows,
+    bounded_selection_auto_scroll,
     interaction_owner,
 )
 
@@ -342,3 +344,69 @@ def test_every_navigation_event_is_capped_to_one_rendered_viewport():
     assert bounded_scroll_rows(100, viewport_rows=8) == 8
     assert bounded_scroll_rows(-3, viewport_rows=8) == -3
     assert bounded_scroll_rows(3, viewport_rows=2) == 2
+
+
+def test_drag_selection_normalizes_semantic_anchors_and_survives_rewrap():
+    document = TranscriptDocument()
+    first = document.append("café e\u0301界🙂 `/tmp/data.csv`")
+    second = document.append("| region | total |\n| east | 42 |")
+    selection = TranscriptSelection()
+    selection.begin(document, document.position(second.id, 13))
+    selected = selection.finish(document, document.position(first.id, 5))
+
+    assert selected is not None
+    assert selected.start == document.position(first.id, 5)
+    assert selected.end == document.position(second.id, 13)
+    assert selection.text == "e\u0301界🙂 `/tmp/data.csv`\n| region | to"
+
+    wide = document.project(80)
+    narrow = document.project(8)
+    assert wide.to_rendered(selected.end) != narrow.to_rendered(selected.end)
+    assert selection.reconcile(document) is True
+    assert selection.text == selected.text
+
+
+def test_selection_reconciles_append_but_clears_replaced_or_removed_text():
+    document = TranscriptDocument()
+    block = document.append("visible summary\nhidden detail")
+    selection = TranscriptSelection()
+    selection.begin(document, document.position(block.id, 0))
+    selection.finish(document, document.position(block.id, len("visible summary")))
+
+    document.replace(block.id, "visible summary\nhidden detail\nnew suffix")
+    assert selection.reconcile(document) is True
+    assert selection.text == "visible summary"
+
+    document.replace(block.id, "different summary")
+    assert selection.reconcile(document) is False
+    assert selection.active is False
+
+    later = document.append("later")
+    selection.begin(document, document.position(later.id, 0))
+    selection.finish(document, document.position(later.id, len("later")))
+    document.remove(later.id)
+    assert selection.reconcile(document) is False
+    assert selection.has_state is False
+
+
+def test_selection_auto_scroll_is_bounded_to_one_row_per_drag_event():
+    assert bounded_selection_auto_scroll(10, viewport_top=10, viewport_rows=8) == -1
+    assert bounded_selection_auto_scroll(17, viewport_top=10, viewport_rows=8) == 1
+    assert bounded_selection_auto_scroll(13, viewport_top=10, viewport_rows=8) == 0
+    assert bounded_selection_auto_scroll(10, viewport_top=10, viewport_rows=1) == 0
+
+
+def test_viewport_navigation_keeps_selection_outside_the_visible_rows():
+    document = TranscriptDocument()
+    block = document.append("\n".join(f"row-{index:03d}" for index in range(100)))
+    selection = TranscriptSelection()
+    selection.begin(document, document.position(block.id, 0))
+    selection.finish(document, document.position(block.id, len("row-000")))
+    viewport = TranscriptViewport()
+    projection = viewport.projection_for(document, width=20)
+
+    viewport.review_row(projection, 75)
+
+    assert viewport.top_row(projection, viewport_rows=10) == 75
+    assert selection.text == "row-000"
+    assert selection.reconcile(document) is True

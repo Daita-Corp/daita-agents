@@ -643,6 +643,98 @@ class TranscriptDocument:
         return "\n".join(pieces)
 
 
+class TranscriptSelection:
+    """One disposable mouse selection over canonical transcript text."""
+
+    def __init__(self) -> None:
+        self.range: SemanticRange | None = None
+        self._drag_origin: SemanticPosition | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.range is not None and bool(self.range.text)
+
+    @property
+    def dragging(self) -> bool:
+        return self._drag_origin is not None
+
+    @property
+    def has_state(self) -> bool:
+        return self.active or self.dragging
+
+    @property
+    def text(self) -> str:
+        return "" if self.range is None else self.range.text
+
+    def begin(
+        self,
+        document: TranscriptDocument,
+        position: SemanticPosition,
+    ) -> None:
+        """Start a new drag at one surviving semantic boundary."""
+
+        if not isinstance(document, TranscriptDocument):
+            raise TypeError("transcript selection requires TranscriptDocument")
+        current = document.normalize_range(position, position).start
+        self.range = None
+        self._drag_origin = current
+
+    def extend(
+        self,
+        document: TranscriptDocument,
+        position: SemanticPosition,
+    ) -> SemanticRange | None:
+        """Normalize the drag endpoints in current document order."""
+
+        origin = self._drag_origin
+        if origin is None:
+            raise RuntimeError("transcript selection drag has not started")
+        selected = document.normalize_range(origin, position)
+        self.range = selected if selected.text else None
+        return self.range
+
+    def finish(
+        self,
+        document: TranscriptDocument,
+        position: SemanticPosition,
+    ) -> SemanticRange | None:
+        """Finish a drag without converting it to screen coordinates."""
+
+        selected = self.extend(document, position)
+        self._drag_origin = None
+        return selected
+
+    def clear(self) -> bool:
+        """Clear selection and drag state, returning whether anything changed."""
+
+        changed = self.has_state
+        self.range = None
+        self._drag_origin = None
+        return changed
+
+    def reconcile(self, document: TranscriptDocument) -> bool:
+        """Keep only exact selected text and surviving drag boundaries."""
+
+        if not isinstance(document, TranscriptDocument):
+            raise TypeError("transcript selection requires TranscriptDocument")
+        if self.range is not None:
+            current = document.reconcile_range(self.range)
+            if current is None:
+                self.clear()
+                return False
+            self.range = current
+        if self._drag_origin is not None:
+            try:
+                self._drag_origin = document.normalize_range(
+                    self._drag_origin,
+                    self._drag_origin,
+                ).start
+            except ValueError:
+                self.clear()
+                return False
+        return True
+
+
 _MAX_UNSEEN_ITEMS = 9_999
 
 
@@ -825,6 +917,34 @@ def bounded_scroll_rows(rows: int, *, viewport_rows: int) -> int:
     return direction * min(abs(rows), viewport_rows)
 
 
+def bounded_selection_auto_scroll(
+    pointer_row: int,
+    *,
+    viewport_top: int,
+    viewport_rows: int,
+) -> int:
+    """Return at most one auto-scroll row for one drag movement event."""
+
+    for value, label in (
+        (pointer_row, "pointer row"),
+        (viewport_top, "viewport top"),
+        (viewport_rows, "viewport height"),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"selection {label} must be an integer")
+    if pointer_row < 0 or viewport_top < 0:
+        raise ValueError("selection rows must be non-negative")
+    if viewport_rows < 1:
+        raise ValueError("selection viewport height must be positive")
+    if viewport_rows == 1:
+        return 0
+    if pointer_row <= viewport_top:
+        return -1
+    if pointer_row >= viewport_top + viewport_rows - 1:
+        return 1
+    return 0
+
+
 def _require_text(text: str) -> None:
     if not isinstance(text, str):
         raise TypeError("canonical selectable text must be a string")
@@ -917,7 +1037,9 @@ __all__ = [
     "TranscriptDocument",
     "TranscriptFollowState",
     "TranscriptProjection",
+    "TranscriptSelection",
     "TranscriptViewport",
     "bounded_scroll_rows",
+    "bounded_selection_auto_scroll",
     "interaction_owner",
 ]

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from bisect import bisect_left, bisect_right
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 import io
 import json
 import os
@@ -24,20 +26,28 @@ from .llm.pricing import CostEstimate, format_cost_estimate
 from .loop.models import Transcript
 from .observation import AgentEvent, AgentEventKind
 from .terminal_transcript import (
+    _cluster_cell_width,
+    _next_grapheme_end,
     PresentationBlockId,
     SemanticPosition,
+    SemanticRange,
     SemanticViewportAnchor,
     TranscriptFollowState,
     TranscriptDocument,
     TranscriptProjection,
+    TranscriptSelection,
     TranscriptViewport,
     bounded_scroll_rows,
+    bounded_selection_auto_scroll,
 )
 
 MAX_COMPOSER_CHARACTERS = 16_384
 MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
+MAX_CLIPBOARD_UTF8_BYTES = 64 * 1_024
 _MAX_COMPOSER_ROWS = 6
 _MOUSE_SCROLL_LINES = 3
+_SELECTION_AUTOSCROLL_LINES = 1
+_CLIPBOARD_TIMEOUT_SECONDS = 1.0
 _MAX_RENDER_CHARACTERS = 16_384
 _MAX_DETAIL_UTF8_BYTES = 16 * 1_024
 _MAX_CODE_VISIBLE_LINES = 80
@@ -304,12 +314,63 @@ class TerminalBlock:
 
 
 @dataclass(frozen=True, slots=True)
+class ClipboardResult:
+    """Truthful outcome of one bounded terminal clipboard delivery attempt."""
+
+    status: str
+    mechanism: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RenderedSelectionRow:
+    """Semantic offsets for each terminal-cell boundary in one visible row."""
+
+    block_id: PresentationBlockId
+    revision: int
+    cell_offsets: tuple[int, ...]
+    first_selectable_cell: int
+    last_selectable_cell: int
+
+    def position_for_cell(self, cell: int) -> SemanticPosition:
+        bounded = min(len(self.cell_offsets) - 1, max(0, cell))
+        return SemanticPosition(
+            self.block_id,
+            self.cell_offsets[bounded],
+            self.revision,
+        )
+
+    def selected_cells(self, start: int, end: int) -> tuple[int, int] | None:
+        if start >= end or len(self.cell_offsets) < 2:
+            return None
+        row_start = self.cell_offsets[0]
+        row_end = self.cell_offsets[-1]
+        if end <= row_start or start >= row_end:
+            return None
+        first = (
+            self.first_selectable_cell
+            if start <= row_start
+            else bisect_left(self.cell_offsets, start)
+        )
+        last = (
+            self.last_selectable_cell
+            if end >= row_end
+            else bisect_left(self.cell_offsets, end)
+        )
+        first = max(self.first_selectable_cell, first)
+        last = min(self.last_selectable_cell, last)
+        return None if last <= first else (first, last)
+
+
+@dataclass(frozen=True, slots=True)
 class _RenderedTranscriptMap:
     """Exact transient navigation positions for the currently rendered rows."""
 
     row_positions: tuple[SemanticPosition, ...]
     block_offsets: Mapping[PresentationBlockId, tuple[int, ...]]
     block_rows: Mapping[PresentationBlockId, tuple[int, ...]]
+    selection_rows: tuple[_RenderedSelectionRow | None, ...]
+    block_indexes: Mapping[PresentationBlockId, int]
 
     def position_for_row(self, row: int) -> SemanticPosition | None:
         if not self.row_positions:
@@ -334,8 +395,78 @@ class _RenderedTranscriptMap:
         index = max(0, bisect_right(offsets, current.position.offset) - 1)
         return rows[index]
 
+    def position_for_cell(self, row: int, cell: int) -> SemanticPosition | None:
+        if not isinstance(row, int) or isinstance(row, bool):
+            raise TypeError("rendered row must be an integer")
+        if not isinstance(cell, int) or isinstance(cell, bool):
+            raise TypeError("rendered cell must be an integer")
+        if row < 0 or row >= len(self.selection_rows) or cell < 0:
+            return None
+        selected_row = self.selection_rows[row]
+        return None if selected_row is None else selected_row.position_for_cell(cell)
 
-_EMPTY_RENDERED_TRANSCRIPT_MAP = _RenderedTranscriptMap((), {}, {})
+    def selected_cells(
+        self,
+        document: TranscriptDocument,
+        selected: SemanticRange,
+    ) -> dict[int, tuple[int, int]]:
+        current = document.reconcile_range(selected)
+        if current is None:
+            return {}
+        start_index = self.block_indexes[current.start.block_id]
+        end_index = self.block_indexes[current.end.block_id]
+        ranges: dict[int, tuple[int, int]] = {}
+        for row, row_map in enumerate(self.selection_rows):
+            if row_map is None:
+                continue
+            block_index = self.block_indexes.get(row_map.block_id)
+            if block_index is None or not start_index <= block_index <= end_index:
+                continue
+            local_start = current.start.offset if block_index == start_index else 0
+            local_end = (
+                current.end.offset
+                if block_index == end_index
+                else len(document.text(row_map.block_id))
+            )
+            cells = row_map.selected_cells(local_start, local_end)
+            if cells is not None:
+                ranges[row] = cells
+        return ranges
+
+    def selected_cells_for_row(
+        self,
+        document: TranscriptDocument,
+        selected: SemanticRange,
+        row: int,
+    ) -> tuple[int, int] | None:
+        """Resolve one rendered row without scanning the transcript."""
+
+        if row < 0 or row >= len(self.selection_rows):
+            return None
+        row_map = self.selection_rows[row]
+        current = document.reconcile_range(selected)
+        if row_map is None or current is None:
+            return None
+        block_index = self.block_indexes.get(row_map.block_id)
+        start_index = self.block_indexes.get(current.start.block_id)
+        end_index = self.block_indexes.get(current.end.block_id)
+        if (
+            block_index is None
+            or start_index is None
+            or end_index is None
+            or not start_index <= block_index <= end_index
+        ):
+            return None
+        local_start = current.start.offset if block_index == start_index else 0
+        local_end = (
+            current.end.offset
+            if block_index == end_index
+            else len(document.text(row_map.block_id))
+        )
+        return row_map.selected_cells(local_start, local_end)
+
+
+_EMPTY_RENDERED_TRANSCRIPT_MAP = _RenderedTranscriptMap((), {}, {}, (), {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,6 +476,7 @@ class _PendingRenderedBlockMap:
     block: TerminalBlock
     rendered_start: int
     row_offsets: tuple[int, ...]
+    rendered_lines: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,6 +642,11 @@ class TerminalViewState:
         repr=False,
         compare=False,
     )
+    transcript_selection: TranscriptSelection = field(
+        default_factory=TranscriptSelection,
+        repr=False,
+        compare=False,
+    )
     _transcript_render_generation: int = field(
         default=0,
         init=False,
@@ -599,6 +736,17 @@ class TerminalViewState:
     def _mark_transcript_dirty(self) -> None:
         self._transcript_render_generation += 1
 
+    def reconcile_transcript_selection(self) -> bool:
+        """Clear a selection rather than copying text no longer projected."""
+
+        had_state = self.transcript_selection.has_state
+        survived = self.transcript_selection.reconcile(self.transcript_document)
+        if had_state and not survived:
+            self.notice = (
+                "Transcript selection cleared because visible content changed."
+            )
+        return survived
+
     def _remember_conversation_context(
         self,
         conversation_id: str,
@@ -671,9 +819,12 @@ class TerminalViewState:
             self._partial_counted_unseen = counted_unseen
             self._unrecorded_partial_run_id = None
             return
+        prior_text = block.text
         block.text += safe
         assert block.presentation_id is not None
-        self.transcript_document.replace(block.presentation_id, block.text)
+        if self.transcript_document.text(block.presentation_id) == prior_text:
+            self.transcript_document.replace(block.presentation_id, block.text)
+            self.reconcile_transcript_selection()
         self._mark_transcript_dirty()
 
     def append_local(self, presentation: str, value: object) -> None:
@@ -1150,6 +1301,7 @@ class TerminalViewState:
             block.presentation_id
         ):
             self.transcript_document.remove(block.presentation_id)
+            self.reconcile_transcript_selection()
         if self._partial_counted_unseen:
             self.transcript_viewport.record_removed()
         self._clear_partial_assistant_identity()
@@ -1168,10 +1320,13 @@ class TerminalViewState:
         block = self._partial_assistant_block()
         if block is None:
             return False
+        prior_text = block.text
         block.kind = "assistant"
         block.text = finalized_text
         assert block.presentation_id is not None
-        self.transcript_document.replace(block.presentation_id, finalized_text)
+        if self.transcript_document.text(block.presentation_id) == prior_text:
+            self.transcript_document.replace(block.presentation_id, finalized_text)
+            self.reconcile_transcript_selection()
         self._clear_partial_assistant_identity()
         self._unrecorded_partial_run_id = None
         self._mark_transcript_dirty()
@@ -1293,6 +1448,7 @@ class TerminalViewState:
             if block_id not in seen:
                 self.transcript_document.remove(block_id)
         self.transcript_document.reorder(tuple(current_ids))
+        self.reconcile_transcript_selection()
         if count_as_unseen:
             self.transcript_viewport.record_appended(
                 sum(block_id not in prior_ids for block_id in current_ids)
@@ -2066,7 +2222,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
             VSplit,
             Window,
         )
-        from prompt_toolkit.layout.controls import FormattedTextControl
+        from prompt_toolkit.layout.controls import FormattedTextControl, UIContent
         from prompt_toolkit.layout.dimension import Dimension
         from prompt_toolkit.mouse_events import MouseEventType
         from prompt_toolkit.output import create_output
@@ -2111,12 +2267,133 @@ def _load_terminal_runtime() -> dict[str, Any]:
         "TextArea": TextArea,
         "Text": Text,
         "Theme": Theme,
+        "UIContent": UIContent,
         "VSplit": VSplit,
         "Window": Window,
         "create_input": create_input,
         "create_output": create_output,
         "in_terminal": in_terminal,
     }
+
+
+_FORCE_SELECTION_GUIDANCE = (
+    "Hold your terminal's selection bypass modifier (often Shift) "
+    "to use terminal-owned selection."
+)
+
+
+def _clipboard_mechanism(
+    *,
+    platform: str,
+    environ: Mapping[str, str],
+) -> str:
+    """Choose one reviewed clipboard path without probing arbitrary commands."""
+
+    if environ.get("SSH_TTY") or environ.get("SSH_CONNECTION"):
+        return "osc52"
+    return "pbcopy" if platform == "darwin" else "osc52"
+
+
+def _osc52_sequence(payload: bytes, *, tmux: bool) -> str:
+    """Encode text so selected control-shaped data cannot become terminal syntax."""
+
+    if len(payload) > MAX_CLIPBOARD_UTF8_BYTES:
+        raise ValueError("clipboard payload exceeds the 64 KiB UTF-8 limit")
+    encoded = base64.b64encode(payload).decode("ascii")
+    request = f"\x1b]52;c;{encoded}\x07"
+    return f"\x1bPtmux;\x1b{request}\x1b\\" if tmux else request
+
+
+def _copy_with_pbcopy(payload: bytes) -> ClipboardResult:
+    """Invoke the exact local macOS clipboard utility with a fixed timeout."""
+
+    try:
+        import subprocess
+
+        completed = subprocess.run(
+            ("/usr/bin/pbcopy",),
+            input=payload,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=_CLIPBOARD_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return ClipboardResult(
+            "failure",
+            "pbcopy",
+            f"Copy failed. {_FORCE_SELECTION_GUIDANCE}",
+        )
+    if completed.returncode != 0:
+        return ClipboardResult(
+            "failure",
+            "pbcopy",
+            f"Copy failed. {_FORCE_SELECTION_GUIDANCE}",
+        )
+    return ClipboardResult("copied", "pbcopy", "Copied")
+
+
+def _send_osc52_request(
+    output: Any,
+    payload: bytes,
+    *,
+    tmux: bool,
+) -> ClipboardResult:
+    """Send one bounded, unacknowledged terminal clipboard request."""
+
+    try:
+        output.write_raw(_osc52_sequence(payload, tmux=tmux))
+        output.flush()
+    except Exception:
+        return ClipboardResult(
+            "failure",
+            "osc52-tmux" if tmux else "osc52",
+            f"Copy failed. {_FORCE_SELECTION_GUIDANCE}",
+        )
+    return ClipboardResult(
+        "requested",
+        "osc52-tmux" if tmux else "osc52",
+        "Copy request sent to terminal",
+    )
+
+
+async def _deliver_clipboard(
+    text: str,
+    *,
+    output: Any,
+    platform: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> ClipboardResult:
+    """Deliver only one bounded visible selection through the chosen path."""
+
+    if not isinstance(text, str) or not text:
+        return ClipboardResult("failure", "none", "Copy failed: selection is empty.")
+    payload = text.encode("utf-8")
+    if len(payload) > MAX_CLIPBOARD_UTF8_BYTES:
+        return ClipboardResult(
+            "failure",
+            "none",
+            "Copy failed: selection exceeds the 64 KiB UTF-8 limit.",
+        )
+    environment = os.environ if environ is None else environ
+    mechanism = _clipboard_mechanism(
+        platform=sys.platform if platform is None else platform,
+        environ=environment,
+    )
+    if mechanism == "pbcopy":
+        try:
+            return await asyncio.to_thread(_copy_with_pbcopy, payload)
+        except Exception:
+            return ClipboardResult(
+                "failure",
+                "pbcopy",
+                f"Copy failed. {_FORCE_SELECTION_GUIDANCE}",
+            )
+    return _send_osc52_request(
+        output,
+        payload,
+        tmux=bool(environment.get("TMUX")),
+    )
 
 
 def _create_application(
@@ -2351,46 +2628,52 @@ def _create_application(
             len(state.blocks),
             projection,
         )
-        if transcript_cache_key == key and transcript_cache_fragments is not None:
-            return transcript_cache_fragments
-        row_maps: list[_RenderedTranscriptMap] = []
-        try:
-            fragments = _render_transcript_fragments(
-                runtime,
-                state,
-                width=projection.content_width,
-                responsive=projection,
-                capabilities=capabilities,
-                glyphs=glyphs,
-                rendered_transcript_maps=row_maps,
-            )
-        except Exception:
-            state.notice = "Some terminal content could not be rendered."
-            rendered_transcript_map = _EMPTY_RENDERED_TRANSCRIPT_MAP
-            fragments = [
-                (
-                    "class:tui.status.failure",
-                    f"\n {glyphs.failure} Content unavailable\n",
+        if transcript_cache_key != key or transcript_cache_fragments is None:
+            row_maps: list[_RenderedTranscriptMap] = []
+            try:
+                fragments = _render_transcript_fragments(
+                    runtime,
+                    state,
+                    width=projection.content_width,
+                    responsive=projection,
+                    capabilities=capabilities,
+                    glyphs=glyphs,
+                    rendered_transcript_maps=row_maps,
+                    highlight_selection=False,
                 )
-            ]
-        else:
-            rendered_transcript_map = (
-                row_maps[0] if row_maps else _EMPTY_RENDERED_TRANSCRIPT_MAP
+            except Exception:
+                state.notice = "Some terminal content could not be rendered."
+                rendered_transcript_map = _EMPTY_RENDERED_TRANSCRIPT_MAP
+                fragments = [
+                    (
+                        "class:tui.status.failure",
+                        f"\n {glyphs.failure} Content unavailable\n",
+                    )
+                ]
+            else:
+                rendered_transcript_map = (
+                    row_maps[0] if row_maps else _EMPTY_RENDERED_TRANSCRIPT_MAP
+                )
+            content_line_count, content_last_line_width = _fragment_line_metrics(
+                fragments
             )
-        content_line_count, content_last_line_width = _fragment_line_metrics(fragments)
-        transcript_cache_key = (
-            state.transcript_render_generation,
-            state.transcript_document.generation,
-            len(state.blocks),
-            projection,
-        )
-        transcript_cache_fragments = fragments
-        return fragments
+            transcript_cache_key = (
+                state.transcript_render_generation,
+                state.transcript_document.generation,
+                len(state.blocks),
+                projection,
+            )
+            transcript_cache_fragments = fragments
+
+        assert transcript_cache_key is not None
+        assert transcript_cache_fragments is not None
+        return transcript_cache_fragments
 
     semantic_style = runtime["Style"].from_dict(_semantic_style_rules(capabilities))
 
     approval_waiter: asyncio.Future[ApprovalDecision] | None = None
     approval_lock = asyncio.Lock()
+    clipboard_task: asyncio.Task[Any] | None = None
 
     def clear_approval_view() -> None:
         state.approval_panel = None
@@ -2631,6 +2914,39 @@ def _create_application(
         state.notice = "Press Y to approve once or N to deny."
         invalidate(application)
 
+    def composer_selection_text() -> str:
+        if composer.buffer.selection_state is None:
+            return ""
+        _document, clipboard_data = composer.buffer.document.cut_selection()
+        return clipboard_data.text
+
+    async def copy_text(application: Any, text: str) -> None:
+        nonlocal clipboard_task
+        try:
+            result = await _deliver_clipboard(text, output=enhanced_output)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            result = ClipboardResult(
+                "failure",
+                "none",
+                f"Copy failed. {_FORCE_SELECTION_GUIDANCE}",
+            )
+        finally:
+            clipboard_task = None
+        state.notice = result.message
+        invalidate(application)
+
+    def request_copy(application: Any, text: str) -> None:
+        nonlocal clipboard_task
+        if clipboard_task is not None and not clipboard_task.done():
+            state.notice = "A clipboard copy is already in progress."
+            invalidate(application)
+            return
+        clipboard_task = application.create_background_task(
+            copy_text(application, text)
+        )
+
     @keys.add("c-m", eager=True)
     def submit(event: Any) -> None:
         nonlocal history_position, history_draft
@@ -2752,6 +3068,13 @@ def _create_application(
     def interrupt(event: Any) -> None:
         if state.approval_panel is not None:
             cancel_approval()
+            return
+        if state.transcript_selection.active:
+            request_copy(event.app, state.transcript_selection.text)
+            return
+        composer_text = composer_selection_text()
+        if composer_text:
+            request_copy(event.app, composer_text)
             return
         active = state.active_task
         if active is not None and not active.done():
@@ -2882,6 +3205,7 @@ def _create_application(
 
     escape_filter = runtime["Condition"](
         lambda: state.approval_panel is not None
+        or state.transcript_selection.has_state
         or composer.buffer.complete_state is not None
     )
 
@@ -2889,6 +3213,10 @@ def _create_application(
     def escape(event: Any) -> None:
         if state.approval_panel is not None:
             remind_approval(event.app)
+            return
+        if state.transcript_selection.clear():
+            state.notice = "Transcript selection cleared."
+            invalidate(event.app)
             return
         if composer.buffer.complete_state is not None:
             composer.buffer.cancel_completion()
@@ -3287,12 +3615,110 @@ def _create_application(
             scroll_transcript(_MOUSE_SCROLL_LINES)
         elif event_type == runtime["MouseEventType"].SCROLL_DOWN:
             scroll_transcript(-_MOUSE_SCROLL_LINES)
+        elif (
+            event_type == runtime["MouseEventType"].MOUSE_DOWN
+            and mouse_event.button.name == "LEFT"
+        ):
+            transcript_fragments()
+            position = rendered_transcript_map.position_for_cell(
+                mouse_event.position.y,
+                mouse_event.position.x,
+            )
+            if position is None:
+                state.transcript_selection.clear()
+            else:
+                state.transcript_selection.begin(
+                    state.transcript_document,
+                    position,
+                )
+                state.notice = ""
+        elif (
+            event_type == runtime["MouseEventType"].MOUSE_MOVE
+            and state.transcript_selection.dragging
+        ):
+            height = _viewport_height(content_window)
+            top = viewport_rendered_top(content_window)
+            movement = bounded_selection_auto_scroll(
+                mouse_event.position.y,
+                viewport_top=top,
+                viewport_rows=height,
+            )
+            if movement < 0:
+                scroll_transcript(_SELECTION_AUTOSCROLL_LINES)
+            elif movement > 0:
+                scroll_transcript(-_SELECTION_AUTOSCROLL_LINES)
+            target_row = max(0, mouse_event.position.y + movement)
+            position = rendered_transcript_map.position_for_cell(
+                target_row,
+                mouse_event.position.x,
+            )
+            if position is not None:
+                try:
+                    state.transcript_selection.extend(
+                        state.transcript_document,
+                        position,
+                    )
+                except (RuntimeError, ValueError):
+                    state.transcript_selection.clear()
+            state.notice = ""
+        elif (
+            event_type == runtime["MouseEventType"].MOUSE_UP
+            and state.transcript_selection.dragging
+        ):
+            transcript_fragments()
+            position = rendered_transcript_map.position_for_cell(
+                mouse_event.position.y,
+                mouse_event.position.x,
+            )
+            if position is None:
+                state.transcript_selection.clear()
+            else:
+                try:
+                    state.transcript_selection.finish(
+                        state.transcript_document,
+                        position,
+                    )
+                except (RuntimeError, ValueError):
+                    state.transcript_selection.clear()
         else:
             return NotImplemented
         invalidate(application)
         return None
 
-    content_control = runtime["FormattedTextControl"](
+    def create_transcript_content(
+        control: Any,
+        width: int,
+        height: int | None,
+    ) -> Any:
+        base = runtime["FormattedTextControl"].create_content(control, width, height)
+        selected = state.transcript_selection.range
+
+        def get_line(row: int) -> list[tuple[str, str]]:
+            selected_cells = (
+                None
+                if selected is None
+                else rendered_transcript_map.selected_cells_for_row(
+                    state.transcript_document,
+                    selected,
+                    row,
+                )
+            )
+            return _highlight_transcript_line(base.get_line(row), selected_cells)
+
+        return runtime["UIContent"](
+            get_line=get_line,
+            line_count=base.line_count,
+            cursor_position=base.cursor_position,
+            menu_position=base.menu_position,
+            show_cursor=base.show_cursor,
+        )
+
+    transcript_control_type = type(
+        "TranscriptFormattedTextControl",
+        (runtime["FormattedTextControl"],),
+        {"create_content": create_transcript_content},
+    )
+    content_control = transcript_control_type(
         shell_content_fragments,
         focusable=False,
         show_cursor=False,
@@ -4508,6 +4934,79 @@ def _semantic_offsets_for_rendered_lines(
     return tuple(resolved)
 
 
+def _display_clusters(value: str) -> tuple[tuple[str, int, int, int], ...]:
+    """Return grapheme text, code-point bounds, and terminal-cell width."""
+
+    clusters: list[tuple[str, int, int, int]] = []
+    offset = 0
+    while offset < len(value):
+        end = _next_grapheme_end(value, offset)
+        cluster = value[offset:end]
+        clusters.append((cluster, offset, end, max(0, _cluster_cell_width(cluster))))
+        offset = end
+    return tuple(clusters)
+
+
+def _rendered_row_cell_offsets(
+    line: str,
+    canonical_text: str,
+    *,
+    start: int,
+    end: int,
+) -> tuple[tuple[int, ...], int, int]:
+    """Align one bounded rendered row to monotonic canonical text boundaries."""
+
+    start = min(len(canonical_text), max(0, start))
+    end = min(len(canonical_text), max(start, end))
+    visible = _display_clusters(line)
+    logical = _display_clusters(canonical_text[start:end])
+    cell_count = sum(cluster[3] for cluster in visible)
+    if cell_count < 1 or not logical or start == end:
+        return (start,), 0, 0
+
+    offsets: list[int | None] = [None] * (cell_count + 1)
+    offsets[0] = start
+    visible_cells: list[int] = []
+    cell = 0
+    for _text, _cluster_start, _cluster_end, width in visible:
+        visible_cells.append(cell)
+        cell += width
+
+    matcher = SequenceMatcher(
+        None,
+        tuple(cluster[0] for cluster in visible),
+        tuple(cluster[0] for cluster in logical),
+        autojunk=False,
+    )
+    matched_cells: list[tuple[int, int]] = []
+    for visible_index, logical_index, size in matcher.get_matching_blocks():
+        for matched in range(size):
+            actual = visible[visible_index + matched]
+            semantic = logical[logical_index + matched]
+            first_cell = visible_cells[visible_index + matched]
+            width = actual[3]
+            semantic_start = start + semantic[1]
+            semantic_end = start + semantic[2]
+            if width:
+                matched_cells.append((first_cell, first_cell + width))
+            offsets[first_cell] = semantic_start
+            for inner_cell in range(1, width):
+                offsets[first_cell + inner_cell] = semantic_start
+            offsets[first_cell + width] = semantic_end
+
+    offsets[-1] = end
+    prior = start
+    resolved: list[int] = []
+    for value in offsets:
+        if value is not None:
+            prior = min(end, max(prior, value))
+        resolved.append(prior)
+    resolved[-1] = end
+    first_selectable = min((cells[0] for cells in matched_cells), default=0)
+    last_selectable = max((cells[1] for cells in matched_cells), default=0)
+    return tuple(resolved), first_selectable, last_selectable
+
+
 def _build_rendered_transcript_map(
     document: TranscriptDocument,
     pending: Sequence[_PendingRenderedBlockMap],
@@ -4517,6 +5016,7 @@ def _build_rendered_transcript_map(
     """Resolve stable semantic positions for every current rendered row."""
 
     row_positions: list[SemanticPosition | None] = [None] * max(1, line_count)
+    selection_rows: list[_RenderedSelectionRow | None] = [None] * max(1, line_count)
     block_offsets: dict[PresentationBlockId, tuple[int, ...]] = {}
     block_rows: dict[PresentationBlockId, tuple[int, ...]] = {}
     for item in pending:
@@ -4532,6 +5032,36 @@ def _build_rendered_transcript_map(
                 block_id,
                 min(text_length, max(0, offset)),
             )
+
+        canonical_text = document.text(block_id)
+        revision = document.position(block_id, 0).revision
+        for local_row, line in enumerate(item.rendered_lines):
+            rendered_row = item.rendered_start + local_row
+            if rendered_row >= len(selection_rows) or not line:
+                continue
+            start = min(text_length, max(0, item.row_offsets[local_row]))
+            end = text_length
+            for later_offset in item.row_offsets[local_row + 1 :]:
+                candidate = min(text_length, max(0, later_offset))
+                if candidate > start:
+                    end = candidate
+                    break
+            cell_offsets, first_selectable, last_selectable = (
+                _rendered_row_cell_offsets(
+                    line,
+                    canonical_text,
+                    start=start,
+                    end=end,
+                )
+            )
+            if len(cell_offsets) > 1 and cell_offsets[-1] > cell_offsets[0]:
+                selection_rows[rendered_row] = _RenderedSelectionRow(
+                    block_id,
+                    revision,
+                    cell_offsets,
+                    first_selectable,
+                    last_selectable,
+                )
 
         inverse: dict[int, int] = {0: item.rendered_start}
         for local_row, offset in enumerate(item.row_offsets):
@@ -4553,7 +5083,137 @@ def _build_rendered_transcript_map(
         tuple(resolved_positions),
         block_offsets,
         block_rows,
+        tuple(selection_rows),
+        {block_id: index for index, block_id in enumerate(document.presentation_ids)},
     )
+
+
+def _highlight_transcript_fragments(
+    fragments: Sequence[tuple[str, str]],
+    rendered_map: _RenderedTranscriptMap,
+    document: TranscriptDocument,
+    selected: SemanticRange | None,
+) -> list[tuple[str, str]]:
+    """Overlay selection style without changing or copying transcript text."""
+
+    if selected is None:
+        return list(fragments)
+    selected_rows = rendered_map.selected_cells(document, selected)
+    if not selected_rows:
+        return list(fragments)
+
+    highlighted: list[tuple[str, str]] = []
+    row = 0
+    cell = 0
+    previous_selected = False
+
+    def append(style: str, text: str) -> None:
+        if not text:
+            return
+        if highlighted and highlighted[-1][0] == style:
+            prior_style, prior_text = highlighted[-1]
+            highlighted[-1] = (prior_style, prior_text + text)
+        else:
+            highlighted.append((style, text))
+
+    for style, text in fragments:
+        part_start = 0
+        for index, character in enumerate(text):
+            if character != "\n":
+                continue
+            part = text[part_start:index]
+            for cluster, _start, _end, width in _display_clusters(part):
+                selected_cells = selected_rows.get(row)
+                is_selected = (
+                    previous_selected
+                    if width == 0
+                    else (
+                        selected_cells is not None
+                        and cell < selected_cells[1]
+                        and cell + width > selected_cells[0]
+                    )
+                )
+                append(
+                    (
+                        f"{style} class:tui.transcript.selection".strip()
+                        if is_selected
+                        else style
+                    ),
+                    cluster,
+                )
+                cell += width
+                if width:
+                    previous_selected = is_selected
+            append(style, "\n")
+            row += 1
+            cell = 0
+            previous_selected = False
+            part_start = index + 1
+        for cluster, _start, _end, width in _display_clusters(text[part_start:]):
+            selected_cells = selected_rows.get(row)
+            is_selected = (
+                previous_selected
+                if width == 0
+                else (
+                    selected_cells is not None
+                    and cell < selected_cells[1]
+                    and cell + width > selected_cells[0]
+                )
+            )
+            append(
+                (
+                    f"{style} class:tui.transcript.selection".strip()
+                    if is_selected
+                    else style
+                ),
+                cluster,
+            )
+            cell += width
+            if width:
+                previous_selected = is_selected
+    return highlighted
+
+
+def _highlight_transcript_line(
+    fragments: Sequence[tuple[str, str]],
+    selected_cells: tuple[int, int] | None,
+) -> list[tuple[str, str]]:
+    """Style one requested viewport row in work proportional to that row."""
+
+    if selected_cells is None:
+        return list(fragments)
+    highlighted: list[tuple[str, str]] = []
+    cell = 0
+    previous_selected = False
+
+    def append(style: str, text: str) -> None:
+        if not text:
+            return
+        if highlighted and highlighted[-1][0] == style:
+            prior_style, prior_text = highlighted[-1]
+            highlighted[-1] = (prior_style, prior_text + text)
+        else:
+            highlighted.append((style, text))
+
+    for style, text in fragments:
+        for cluster, _start, _end, width in _display_clusters(text):
+            is_selected = (
+                previous_selected
+                if width == 0
+                else (cell < selected_cells[1] and cell + width > selected_cells[0])
+            )
+            append(
+                (
+                    f"{style} class:tui.transcript.selection".strip()
+                    if is_selected
+                    else style
+                ),
+                cluster,
+            )
+            cell += width
+            if width:
+                previous_selected = is_selected
+    return highlighted
 
 
 def _render_transcript_fragments(
@@ -4565,6 +5225,7 @@ def _render_transcript_fragments(
     capabilities: TerminalCapabilities | None = None,
     glyphs: TerminalGlyphs | None = None,
     rendered_transcript_maps: list[_RenderedTranscriptMap] | None = None,
+    highlight_selection: bool = True,
 ) -> list[tuple[str, str]]:
     capabilities = capabilities or _terminal_capabilities()
     glyphs = glyphs or _terminal_glyphs(capabilities)
@@ -4695,18 +5356,25 @@ def _render_transcript_fragments(
                 block,
                 rendered_start,
                 row_offsets,
+                tuple(rendered_lines),
             )
         )
         rendered_row += rendered_rows
     state._sync_transcript_document(tuple(selectable_texts), width=width)
+    rendered_map = _build_rendered_transcript_map(
+        state.transcript_document,
+        pending_maps,
+        line_count=rendered_row + 1,
+    )
     if rendered_transcript_maps is not None:
         rendered_transcript_maps.clear()
-        rendered_transcript_maps.append(
-            _build_rendered_transcript_map(
-                state.transcript_document,
-                pending_maps,
-                line_count=rendered_row + 1,
-            )
+        rendered_transcript_maps.append(rendered_map)
+    if highlight_selection and state.transcript_selection.range is not None:
+        return _highlight_transcript_fragments(
+            fragments,
+            rendered_map,
+            state.transcript_document,
+            state.transcript_selection.range,
         )
     return fragments
 
@@ -5530,6 +6198,7 @@ def _semantic_style_rules(
             "tui.prompt": "bold",
             "tui.composer": "",
             "tui.composer.frame": "",
+            "tui.transcript.selection": "reverse",
             "tui.frame": "",
             "tui.resize": "bold",
             "tui.new-output": "bold underline",
@@ -5591,6 +6260,7 @@ def _semantic_style_rules(
         "tui.prompt": f"bold {colors['focus']}",
         "tui.composer": "",
         "tui.composer.frame": "",
+        "tui.transcript.selection": "reverse",
         "tui.frame": colors["focus"],
         "tui.resize": f"bold {colors['warning']}",
         "tui.new-output": f"bold underline {colors['focus']}",
@@ -5868,6 +6538,8 @@ def _restore_terminal(output: Any) -> None:
 
 
 __all__ = [
+    "ClipboardResult",
+    "MAX_CLIPBOARD_UTF8_BYTES",
     "MAX_COMPOSER_CHARACTERS",
     "TerminalApplicationResult",
     "TerminalCommandResult",

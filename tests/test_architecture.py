@@ -805,6 +805,45 @@ def test_phase_a_viewport_state_is_disposable_and_has_one_semantic_owner():
     )
 
 
+def test_phase_c_transcript_selection_and_clipboard_stay_in_terminal_owners():
+    transcript = (PACKAGE / "terminal_transcript.py").read_text(encoding="utf-8")
+    tui_path = PACKAGE / "terminal_tui.py"
+    tui = tui_path.read_text(encoding="utf-8")
+    menu_selection = (PACKAGE / "terminal_selection.py").read_text(encoding="utf-8")
+    storage = _python_text(PACKAGE / "storage")
+    loop = _python_text(PACKAGE / "loop")
+
+    assert _class_owners("TranscriptSelection") == {"terminal_transcript.py"}
+    assert _class_owners("ClipboardResult") == {"terminal_tui.py"}
+    assert "SemanticRange" in transcript
+    assert "transcript_selection" in tui
+    assert "OSC 52" not in storage + loop
+    assert "transcript_selection" not in menu_selection
+
+    tree = ast.parse(tui)
+    top_level_imports = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert "subprocess" not in top_level_imports
+    pbcopy = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_copy_with_pbcopy"
+    )
+    assert any(
+        isinstance(node, ast.Import)
+        and any(alias.name == "subprocess" for alias in node.names)
+        for node in ast.walk(pbcopy)
+    )
+
+
 def test_phase_b_streaming_keeps_partial_state_disposable_and_provider_neutral():
     loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
     tui = (PACKAGE / "terminal_tui.py").read_text(encoding="utf-8")
