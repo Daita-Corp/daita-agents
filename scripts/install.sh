@@ -265,7 +265,7 @@ validate_home() {
     esac
     [[ -d "$HOME" ]] || fail "HOME does not exist: $HOME"
     [[ ! -L "$HOME" ]] || fail "a symlink HOME is not supported"
-    HOME_REAL=$(CDPATH= cd -P -- "$HOME" && pwd -P)
+    HOME_REAL=$(CDPATH='' cd -P -- "$HOME" && pwd -P)
     [[ "$HOME_REAL" = /* && "$HOME_REAL" != "/" ]] || fail "HOME resolved unsafely"
 
     LOCAL_ROOT="$HOME_REAL/.local"
@@ -993,9 +993,9 @@ ensure_path() {
     fi
     {
         printf '%s\n' "$PATH_START"
-        printf 'case ":$PATH:" in\n'
+        printf "case \":\$PATH:\" in\n"
         printf '  *:%q:*) ;;\n' "$PUBLIC_BIN_DIR"
-        printf '  *) export PATH=%q:"$PATH" ;;\n' "$PUBLIC_BIN_DIR"
+        printf "  *) export PATH=%q:\"\$PATH\" ;;\n" "$PUBLIC_BIN_DIR"
         printf 'esac\n'
         printf '%s\n' "$PATH_END"
     } >>"$suffix"
