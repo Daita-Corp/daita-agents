@@ -31,10 +31,8 @@ become more useful over time without giving up human control.
 
 ## Quick start
 
-The managed one-line installer is implemented but has not been promoted: its
-immutable wheel, `uv`, and managed-Python release literals and its required
-clean-machine and real-terminal evidence are not yet complete. Until that
-release gate passes, the supported installation remains the direct pipx path.
+The first managed installer release targets macOS on Apple Silicon and Intel,
+plus glibc Linux on x86_64 and arm64.
 
 You need Python 3.11 or 3.12 and
 [pipx](https://pipx.pypa.io/stable/installation/).
@@ -234,20 +232,18 @@ Use `pipx reinstall daita-agents` to repair missing or damaged application
 dependencies. Uninstalling the application does not delete existing agent
 homes or credentials stored in the OS keychain.
 
-The managed installer candidate owns only `~/.local/bin/daita` and
+The managed installer owns only `~/.local/bin/daita` and
 `~/.local/share/daita`; application data remains separately owned under
 `~/.daita`. Its install, verify, repair, rollback, and uninstall actions never
-roll back or delete application data or OS-keychain entries. Once the Phase G
-publication and platform gates pass, the reviewed stable command will be:
+roll back or delete application data or OS-keychain entries. Once published,
+the stable command will be:
 
 ```bash
 curl -fsSL --proto '=https' --tlsv1.2 https://daita-tech.io/install.sh | bash
 ```
 
-That endpoint must not be treated as released until the repository's
-unresolved artifact literals are replaced, the immutable installer is
-published and verified, and the stable endpoint serves those exact reviewed
-bytes. See [the managed installer release status](docs/MANAGED_INSTALLER_RELEASE.md).
+The public endpoint is not live yet. See
+[the managed installer release status](docs/MANAGED_INSTALLER_RELEASE.md).
 
 Daita 0.19.0 and earlier belong to a different legacy framework family. A
 0.x-to-1.0 migration is unsupported. Preserve or archive legacy `~/.daita`
