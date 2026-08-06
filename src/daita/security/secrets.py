@@ -9,7 +9,7 @@ import os
 import re
 from typing import Protocol, TypeVar, cast, runtime_checkable
 
-from .._installation import PIPX_REPAIR_GUIDANCE
+from .._installation import repair_guidance
 from ..errors import ConfigError
 
 _ENVIRONMENT_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,127}\Z")
@@ -163,7 +163,7 @@ class KeychainSecretProvider:
             except ImportError:
                 raise ImportError(
                     "Daita's keychain runtime dependency is unavailable. "
-                    f"{PIPX_REPAIR_GUIDANCE}"
+                    f"{repair_guidance()}"
                 ) from None
             self._client = cast(_KeyringClient, keyring)
         return self._client

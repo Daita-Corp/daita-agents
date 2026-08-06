@@ -19,7 +19,7 @@ from uuid import UUID
 from xml.etree import ElementTree
 from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
-from .._installation import PIPX_REPAIR_GUIDANCE
+from .._installation import repair_guidance
 from .._json import canonical_json
 from ..catalog.models import Sensitivity
 from .models import (
@@ -1026,13 +1026,13 @@ def _load_xlsxwriter() -> Any:
         module = import_module("xlsxwriter")
     except (ImportError, AttributeError) as error:
         raise ImportError(
-            "Daita's XLSX runtime dependency is unavailable. " f"{PIPX_REPAIR_GUIDANCE}"
+            "Daita's XLSX runtime dependency is unavailable. " f"{repair_guidance()}"
         ) from error
     if not callable(getattr(module, "Workbook", None)) or not str(
         getattr(module, "__version__", "")
     ).startswith("3."):
         raise ImportError(
-            "Daita's XLSX runtime dependency is unavailable. " f"{PIPX_REPAIR_GUIDANCE}"
+            "Daita's XLSX runtime dependency is unavailable. " f"{repair_guidance()}"
         )
     return module
 

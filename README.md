@@ -31,6 +31,11 @@ become more useful over time without giving up human control.
 
 ## Quick start
 
+The managed one-line installer is implemented but has not been promoted: its
+immutable wheel, `uv`, and managed-Python release literals and its required
+clean-machine and real-terminal evidence are not yet complete. Until that
+release gate passes, the supported installation remains the direct pipx path.
+
 You need Python 3.11 or 3.12 and
 [pipx](https://pipx.pypa.io/stable/installation/).
 
@@ -229,6 +234,26 @@ Use `pipx reinstall daita-agents` to repair missing or damaged application
 dependencies. Uninstalling the application does not delete existing agent
 homes or credentials stored in the OS keychain.
 
+The managed installer candidate owns only `~/.local/bin/daita` and
+`~/.local/share/daita`; application data remains separately owned under
+`~/.daita`. Its install, verify, repair, rollback, and uninstall actions never
+roll back or delete application data or OS-keychain entries. Once the Phase G
+publication and platform gates pass, the reviewed stable command will be:
+
+```bash
+curl -fsSL --proto '=https' --tlsv1.2 https://daita-tech.io/install.sh | bash
+```
+
+That endpoint must not be treated as released until the repository's
+unresolved artifact literals are replaced, the immutable installer is
+published and verified, and the stable endpoint serves those exact reviewed
+bytes. See [the managed installer release status](docs/MANAGED_INSTALLER_RELEASE.md).
+
+Daita 0.19.0 and earlier belong to a different legacy framework family. A
+0.x-to-1.0 migration is unsupported. Preserve or archive legacy `~/.daita`
+data and explicitly remove the old application before a clean 1.0 install;
+the managed installer does not adopt, migrate, delete, or overwrite it.
+
 ## Development
 
 ```bash
@@ -247,10 +272,13 @@ Run the deterministic suite before submitting a change:
 .venv/bin/python -m mypy src/daita tests
 ```
 
-`tests/pipx_lifecycle_smoke.py` additionally builds a fresh wheel and exercises
-an isolated pipx install, dependency check, real XLSX runtime, reinstall, state
-preservation, and uninstall. It is a required release gate on both Python 3.11
-and 3.12 and may download declared dependencies.
+Release CI builds the candidate wheel once, then passes those exact bytes to
+both `tests/managed_installer_lifecycle_smoke.py` and
+`tests/pipx_lifecycle_smoke.py`. The managed smoke uses deterministic local
+downloads and verifies install, repeat, repair, rollback, verification,
+uninstall, and data preservation. The pipx smoke exercises dependency checks,
+the real XLSX runtime, reinstall, state preservation, and uninstall on Python
+3.11 and 3.12 and may download declared dependencies.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
 [SECURITY.md](SECURITY.md) for private vulnerability reporting.

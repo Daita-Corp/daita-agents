@@ -12,6 +12,11 @@ from unittest.mock import patch
 import pytest
 
 from daita.adapters import postgresql
+from daita._installation import (
+    MANAGED_REPAIR_GUIDANCE,
+    PIPX_REPAIR_GUIDANCE,
+    _is_trusted_managed_runtime,
+)
 from daita.artifacts import renderers
 from daita.domains.data import sql
 from daita.llm.providers.anthropic import AnthropicMessagesProvider
@@ -135,8 +140,25 @@ def test_ci_requires_clean_pipx_wheel_smoke_on_each_supported_python():
     assert "pipx-release:" in workflow
     assert 'python-version: ["3.11", "3.12"]' in workflow
     assert "python tests/pipx_lifecycle_smoke.py" in workflow
+    assert "python tests/managed_installer_lifecycle_smoke.py" in workflow
+    assert "--candidate-wheel" in workflow
+    assert "python -m build --wheel --outdir dist" in workflow
     assert 'python -m pip install -e ".[dev]" pipx' in workflow
     assert "[dev,sqlite]" not in workflow
+
+
+def test_managed_installer_documentation_is_explicitly_pre_publication():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    status = (ROOT / "docs" / "MANAGED_INSTALLER_RELEASE.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "has not been promoted" in readme
+    assert "UNRESOLVED_*" in status
+    assert "Unverified; not claimed" in status
+    assert "0.x-to-1.0 migration is unsupported" in readme
+    assert "does not adopt, migrate, delete, or overwrite" in readme
+    assert "No step in this repository change publishes" in status
 
 
 def _missing_import(module: str, action: Callable[[], object]) -> ImportError:
@@ -207,6 +229,46 @@ def test_missing_xlsxwriter_uses_exact_pipx_repair_guidance():
 
     assert PIPX_REPAIR in str(caught.value)
     assert "daita-agents[" not in str(caught.value)
+
+
+def test_managed_repair_guidance_requires_a_verified_runtime_topology(tmp_path: Path):
+    home = tmp_path / "home"
+    generation = home / ".local" / "share" / "daita" / "generations" / "1.0.0-fixture-1"
+    runtime = generation / "tool" / "daita-agents"
+    runtime.mkdir(parents=True)
+    root = home / ".local" / "share" / "daita"
+    state = root / "install-state"
+    state.mkdir()
+    (state / "owner").write_text(
+        "marker=daita-managed-install-v1\n" f"root={root}\n",
+        encoding="utf-8",
+    )
+    (generation / "manifest").write_text(
+        "marker=daita-managed-install-v1\n",
+        encoding="utf-8",
+    )
+    (root / "current").symlink_to("generations/1.0.0-fixture-1")
+    environment = {"DAITA_MANAGED_INSTALL_ROOT": str(root)}
+
+    assert _is_trusted_managed_runtime(
+        environ=environment,
+        executable=runtime,
+        home=home,
+    )
+    assert "https://daita-tech.io/install.sh" in MANAGED_REPAIR_GUIDANCE
+    assert "--repair --no-onboard" in MANAGED_REPAIR_GUIDANCE
+    assert "pipx reinstall daita-agents" in PIPX_REPAIR_GUIDANCE
+
+
+def test_arbitrary_managed_environment_value_keeps_pipx_guidance(tmp_path: Path):
+    home = tmp_path / "home"
+    home.mkdir()
+
+    assert not _is_trusted_managed_runtime(
+        environ={"DAITA_MANAGED_INSTALL_ROOT": str(tmp_path / "arbitrary")},
+        executable=sys.executable,
+        home=home,
+    )
 
 
 def test_package_cli_imports_and_headless_command_keep_integrations_lazy(tmp_path):

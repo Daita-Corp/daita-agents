@@ -189,7 +189,7 @@ def test_current_parser_keeps_the_existing_one_shot_surface_green():
 
     assert _surface(parser) == (
         (),
-        frozenset({"-h", "--help", "--root", "--agent"}),
+        frozenset({"-h", "--help", "--version", "--root", "--agent"}),
     )
     assert {"create", "attach", "sources", "run"} <= set(commands)
     assert _surface(commands["create"]) == (

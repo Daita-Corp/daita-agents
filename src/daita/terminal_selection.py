@@ -8,7 +8,7 @@ import sys
 from typing import Any, Generic, TextIO, TypeVar
 import unicodedata
 
-from ._installation import PIPX_REPAIR_GUIDANCE
+from ._installation import repair_guidance
 
 _Value = TypeVar("_Value")
 _MAX_OPTIONS = 128
@@ -326,7 +326,7 @@ def _load_prompt_toolkit() -> dict[str, Any]:
     except ImportError as error:
         raise ImportError(
             "Daita's terminal runtime dependency is unavailable. "
-            f"{PIPX_REPAIR_GUIDANCE}"
+            f"{repair_guidance()}"
         ) from error
 
     return {

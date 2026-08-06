@@ -11,7 +11,7 @@ import re
 import sys
 from typing import Any, TextIO
 
-from .._installation import PIPX_REPAIR_GUIDANCE
+from .._installation import repair_guidance
 from ..capabilities import ApprovalDecision, ApprovalRequest
 from ..loop.models import Transcript
 from ..observation import AgentEvent, AgentEventKind
@@ -460,7 +460,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
     except (AttributeError, ImportError) as error:
         raise ImportError(
             "Daita's terminal runtime dependency is unavailable. "
-            f"{PIPX_REPAIR_GUIDANCE}"
+            f"{repair_guidance()}"
         ) from error
 
     return {
