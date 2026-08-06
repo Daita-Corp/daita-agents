@@ -371,7 +371,8 @@ async def test_returning_keyboard_selection_skips_onboarding_and_writes_no_dupli
     text = output.getvalue()
     assert "Agent     customer" in text
     assert "Model     OpenAI · returning-model · configured" in text
-    assert "Source    Retained source · cataloged" in text
+    assert "Connections  1" in text
+    assert "Retained source" not in text
     assert "Status" in text and "Ready" in text
     assert "Ask a question about your data" in text
     assert "returning answer" in text

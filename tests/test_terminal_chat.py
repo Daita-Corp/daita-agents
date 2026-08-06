@@ -572,6 +572,12 @@ async def test_local_status_commands_are_bounded_secret_free_and_never_modeled(
     assert "Sources" in text
     assert "Settings" in text
     assert "Commands" in text
+    assert "Wheel or Page Up/Page Down review" in text
+    assert "Esc Esc clear input" in text
+    assert "Animated status shows the active tool" in text
+    assert "Approvals accept only Y or N" in text
+    assert "copy request was sent, not that it succeeded" in text
+    assert "terminal's bypass modifier (often Shift)" in text
     assert "\x1b" not in text
     assert "\u202e" not in text
     assert "x" * 129 not in text

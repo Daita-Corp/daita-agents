@@ -13,8 +13,7 @@ def _startup_state(
     model: str = "gpt-5.6-sol",
     home: str = "/Users/demo/.daita/agents/atlas",
     source_count: int = 2,
-    source_types: tuple[str, ...] = ("PostgreSQL", "SQLite"),
-    source_names: tuple[str, ...] = ("Warehouse", "Reporting"),
+    source_summary: str = "2 sources",
     resource_count: int = 24,
     relationship_count: int = 3,
     read_capabilities: tuple[str, ...] = (
@@ -27,15 +26,13 @@ def _startup_state(
     return terminal_tui.TerminalViewState(
         agent_label="atlas",
         model_label=model,
-        source_summary="2 sources",
+        source_summary=source_summary,
         startup=terminal_tui.TerminalStartupInfo(
             version="1.0.0",
             provider_label="OpenAI",
             model_status="configured",
             agent_home=home,
             source_count=source_count,
-            source_types=source_types,
-            source_names=source_names,
             resource_count=resource_count,
             relationship_count=relationship_count,
             read_capabilities=read_capabilities,
@@ -98,13 +95,36 @@ def test_startup_ascii_and_no_color_modes_preserve_semantic_information():
     assert "\x1b" not in ascii_rendered + no_color_rendered
 
 
+def test_startup_shows_connection_count_without_connection_names():
+    state = _startup_state(
+        source_count=2,
+        source_summary="Warehouse, Reporting",
+    )
+    capabilities = terminal_tui.TerminalCapabilities("truecolor", True)
+
+    wide = terminal_tui._render_startup_text(
+        state,
+        width=120,
+        capabilities=capabilities,
+    )
+    compact = terminal_tui._render_startup_text(
+        state,
+        width=50,
+        capabilities=capabilities,
+    )
+
+    assert "Connections" in wide and "2" in wide
+    assert "Connections: 2" in compact
+    assert "Warehouse" not in wide + compact
+    assert "Reporting" not in wide + compact
+
+
 def test_startup_long_values_are_bounded_and_credential_shapes_are_redacted():
     state = _startup_state(
         model="model-" + "x" * 180,
         home="/Users/demo/" + "/very-long-directory" * 20 + "/atlas",
         source_count=1,
-        source_types=("PostgreSQL",),
-        source_names=("warehouse password=hunter2 " + "x" * 180,),
+        source_summary="warehouse password=hunter2 " + "x" * 180,
         warnings=("API_KEY=super-secret must be replaced before launch",),
     )
 
@@ -127,8 +147,6 @@ def test_startup_long_values_are_bounded_and_credential_shapes_are_redacted():
 def test_startup_empty_catalog_has_an_actionable_bounded_warning():
     state = _startup_state(
         source_count=0,
-        source_types=(),
-        source_names=(),
         resource_count=0,
         relationship_count=0,
         read_capabilities=(),
@@ -141,7 +159,7 @@ def test_startup_empty_catalog_has_an_actionable_bounded_warning():
         capabilities=terminal_tui.TerminalCapabilities("none", False),
     )
 
-    assert "0 cataloged | none attached" in rendered
+    assert "Connections" in rendered and "0" in rendered
     assert "0 resources | 0 relationships" in rendered
     assert "None until a source is added" in rendered
     assert "/source add" in rendered
@@ -185,8 +203,6 @@ state = terminal_tui.TerminalViewState(
         "configured",
         "/tmp/atlas",
         0,
-        (),
-        (),
         0,
         0,
         (),

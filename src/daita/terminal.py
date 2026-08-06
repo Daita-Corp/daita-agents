@@ -2601,14 +2601,6 @@ async def _ready_view_state(
             fallback="source",
         )
         adapter_counts[adapter_id] = adapter_counts.get(adapter_id, 0) + 1
-    source_types = tuple(
-        (
-            f"{count} {_SOURCE_TYPE_LABELS.get(adapter_id, adapter_id)}"
-            if count > 1
-            else _SOURCE_TYPE_LABELS.get(adapter_id, adapter_id)
-        )
-        for adapter_id, count in sorted(adapter_counts.items())
-    )
     read_capabilities: list[str] = []
     if sources:
         read_capabilities.append("Catalog search & inspection")
@@ -2654,11 +2646,6 @@ async def _ready_view_state(
                 fallback="unavailable",
             ),
             source_count=len(sources),
-            source_types=source_types,
-            source_names=tuple(
-                _safe_display(source.display_name, fallback="source")
-                for source in sources[:3]
-            ),
             resource_count=summary.resource_count,
             relationship_count=summary.relationship_count,
             read_capabilities=tuple(read_capabilities),
@@ -2800,6 +2787,19 @@ def _write_chat_help(output_stream: TextIO) -> None:
         "/agent delete",
         "/help",
         "/exit",
+    ):
+        print(f"  {line}", file=output_stream)
+    print("Controls", file=output_stream)
+    for line in (
+        "Enter submit · Ctrl-J newline · Esc Esc clear input · Ctrl-D exit",
+        "Wheel or Page Up/Page Down review · Ctrl-Home start · Ctrl-End latest",
+        "Animated status shows the active tool · Ctrl-O show/hide tool results",
+        "Drag select · Ctrl-C copy selection · Esc clear selection",
+        "Without a selection, Ctrl-C cancels the active run",
+        "Approvals accept only Y or N; other input does not decide",
+        "OSC 52 reports only that a copy request was sent, not that it succeeded",
+        "If pointer or copy support is unavailable, use terminal-owned selection",
+        "with the terminal's bypass modifier (often Shift) and copy command",
     ):
         print(f"  {line}", file=output_stream)
 

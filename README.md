@@ -63,9 +63,16 @@ Run `daita` again for a returning launch. Daita reopens the only agent
 automatically or shows a picker when several exist. Use `daita --agent atlas`
 to select one directly.
 
-Inside the terminal, use `/help` to see available commands. Press Enter to
-submit, Ctrl-J for a newline, Ctrl-C to cancel an active run, and Ctrl-D to
-exit from an empty prompt.
+Inside the terminal, use `/help` to see available commands and shipped
+controls. Press Enter to submit, Ctrl-J for a newline, and Ctrl-D to exit from
+an empty prompt. Press Escape twice to clear the current input. Ctrl-C copies
+an application-owned selection; without a selection it cancels an active run.
+The animated status shows the active tool without filling the transcript with
+tool cards. After a run, press Ctrl-O to show or hide that run's recorded tool
+calls and results. Clipboard requests that a terminal cannot acknowledge are
+reported as requests, not successful copies. If pointer or clipboard support
+is unavailable, use the terminal's own selection bypass modifier (often
+Shift) and copy command.
 
 ## How it works
 

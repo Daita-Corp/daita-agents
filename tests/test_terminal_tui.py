@@ -39,6 +39,9 @@ from daita.llm.models import (
 from daita.llm.pricing import CostBasis, CostEstimate
 from daita.loop.models import RunInput, Transcript
 from daita.observation import AgentEvent, AgentEventKind
+from daita.tui import clipboard as tui_clipboard
+from daita.tui import application as tui_application
+from daita.tui import transcript_view as tui_transcript_view
 from daita.terminal_tui import (
     MAX_COMPOSER_CHARACTERS,
     TerminalApplicationResult,
@@ -60,6 +63,9 @@ class _RecordingOutput(DummyOutput):
         self.autowrap_count = 0
         self.mouse_enable_count = 0
         self.mouse_disable_count = 0
+        self.bracketed_paste_disable_count = 0
+        self.cursor_key_reset_count = 0
+        self.cursor_shape_reset_count = 0
         self.flush_count = 0
         self.size = Size(rows=30, columns=100)
         self.size_checks = 0
@@ -94,6 +100,15 @@ class _RecordingOutput(DummyOutput):
 
     def disable_mouse_support(self) -> None:
         self.mouse_disable_count += 1
+
+    def disable_bracketed_paste(self) -> None:
+        self.bracketed_paste_disable_count += 1
+
+    def reset_cursor_key_mode(self) -> None:
+        self.cursor_key_reset_count += 1
+
+    def reset_cursor_shape(self) -> None:
+        self.cursor_shape_reset_count += 1
 
     def flush(self) -> None:
         self.flush_count += 1
@@ -318,8 +333,6 @@ async def test_ready_tui_emits_startup_before_any_transcript_blocks():
             model_status="configured",
             agent_home="/tmp/daita/atlas",
             source_count=1,
-            source_types=("SQLite",),
-            source_names=("Warehouse",),
             resource_count=12,
             relationship_count=2,
             read_capabilities=(
@@ -363,8 +376,6 @@ def test_ready_tui_reflows_live_startup_when_terminal_width_changes():
             model_status="configured",
             agent_home="/tmp/daita/agents/atlas",
             source_count=1,
-            source_types=("SQLite",),
-            source_names=("Warehouse",),
             resource_count=12,
             relationship_count=2,
             read_capabilities=(
@@ -442,8 +453,6 @@ async def test_full_screen_resize_repaints_without_leaving_alternate_screen():
             model_status="configured",
             agent_home="/tmp/daita/agents/atlas",
             source_count=1,
-            source_types=("SQLite",),
-            source_names=("Warehouse",),
             resource_count=12,
             relationship_count=2,
             read_capabilities=("Catalog search & inspection", "SQLite queries"),
@@ -505,7 +514,7 @@ async def test_full_screen_transcript_uses_page_keys_and_mouse_wheel_for_scrolli
         )
 
     canonical_renders = 0
-    original_canonical_assistant_text = terminal_tui._canonical_assistant_text
+    original_canonical_assistant_text = tui_transcript_view._canonical_assistant_text
 
     def counted_canonical_assistant_text(*args: Any, **kwargs: Any) -> str:
         nonlocal canonical_renders
@@ -513,7 +522,7 @@ async def test_full_screen_transcript_uses_page_keys_and_mouse_wheel_for_scrolli
         return original_canonical_assistant_text(*args, **kwargs)
 
     monkeypatch.setattr(
-        terminal_tui,
+        tui_transcript_view,
         "_canonical_assistant_text",
         counted_canonical_assistant_text,
     )
@@ -805,7 +814,7 @@ def test_review_counter_counts_new_blocks_not_tool_status_or_initial_hydration()
             {"call_id": "call-new", "tool_name": "catalog_search"},
         )
     )
-    assert state.transcript_viewport.unseen_items == 1
+    assert state.transcript_viewport.unseen_items == 0
     state.apply_event(
         _event(
             AgentEventKind.TOOL_COMPLETED,
@@ -823,7 +832,7 @@ def test_review_counter_counts_new_blocks_not_tool_status_or_initial_hydration()
         width=40,
         capabilities=capabilities,
     )
-    assert state.transcript_viewport.unseen_items == 1
+    assert state.transcript_viewport.unseen_items == 0
 
     call = ToolCall(id="call-history", name="catalog_search", arguments={"query": "x"})
     history = _tool_transcript(
@@ -837,7 +846,7 @@ def test_review_counter_counts_new_blocks_not_tool_status_or_initial_hydration()
         run_id="run-history",
     )
     state.hydrate_transcript(history, run_id="run-history", initial=True)
-    assert state.transcript_viewport.unseen_items == 1
+    assert state.transcript_viewport.unseen_items == 0
 
 
 def test_installed_prompt_toolkit_sgr_mouse_protocol_spike_is_deterministic():
@@ -1107,7 +1116,9 @@ def test_collapsed_tool_payload_and_approval_arguments_are_not_selectable():
         state.transcript_document.text(block.id)
         for block in state.transcript_document.blocks
     )
-    assert "3 rows returned" in selectable
+    assert "1 tool call" in selectable
+    assert "Ctrl-O view results" in selectable
+    assert "3 rows returned" not in selectable
     assert secret not in selectable
 
 
@@ -1163,7 +1174,7 @@ async def test_clipboard_acknowledgement_failure_and_utf8_bound_are_truthful(
         seen.append(payload)
         return terminal_tui.ClipboardResult("copied", "pbcopy", "Copied")
 
-    monkeypatch.setattr(terminal_tui, "_copy_with_pbcopy", acknowledge)
+    monkeypatch.setattr(tui_clipboard, "copy_with_pbcopy", acknowledge)
     copied = await terminal_tui._deliver_clipboard(
         "café🙂",
         output=output,
@@ -1237,7 +1248,7 @@ async def test_mouse_drag_highlights_and_ctrl_c_copies_without_cancelling_run(
         copied.append(text)
         return terminal_tui.ClipboardResult("failure", "test", "Copy failed in test.")
 
-    monkeypatch.setattr(terminal_tui, "_deliver_clipboard", deliver)
+    monkeypatch.setattr(tui_application, "_deliver_clipboard", deliver)
 
     async def run_message(message: str, conversation_id: str | None) -> Any:
         del message, conversation_id
@@ -1382,7 +1393,7 @@ async def test_mouse_failure_is_presentation_only_during_an_active_run(
             raise RuntimeError("mouse failed")
 
         monkeypatch.setattr(
-            terminal_tui,
+            tui_application,
             "bounded_selection_auto_scroll",
             fail_mouse,
         )
@@ -1624,7 +1635,7 @@ async def test_transcript_then_composer_copy_precedence_never_submits_draft(
             )
         return terminal_tui.ClipboardResult("copied", "test", "Copied")
 
-    monkeypatch.setattr(terminal_tui, "_deliver_clipboard", deliver)
+    monkeypatch.setattr(tui_application, "_deliver_clipboard", deliver)
 
     async def run_message(message: str, conversation_id: str | None) -> Any:
         del conversation_id
@@ -1740,12 +1751,13 @@ async def test_selection_drag_auto_scrolls_only_one_row_per_mouse_event():
         await task
 
 
-def test_selection_highlight_work_is_lazy_per_requested_viewport_row(
+async def test_long_transcript_navigation_work_is_bounded_to_viewport_overscan(
     monkeypatch: pytest.MonkeyPatch,
 ):
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
-    state.append_user("\n".join(f"row-{index:05d}" for index in range(20_000)))
+    text = "\n".join(f"/tmp/daita/data/file-{index:05d}.csv" for index in range(20_000))
+    state.append_user(text)
     block = state.transcript_document.blocks[0]
     state.transcript_selection.begin(
         state.transcript_document,
@@ -1757,13 +1769,31 @@ def test_selection_highlight_work_is_lazy_per_requested_viewport_row(
     )
     highlighted_rows = 0
     original = terminal_tui._highlight_transcript_line
+    runtime = terminal_tui._load_terminal_runtime()
+    base_content_builds = 0
+    original_base_create = runtime["FormattedTextControl"].create_content
 
     def counted_highlight(*args: Any, **kwargs: Any) -> list[tuple[str, str]]:
         nonlocal highlighted_rows
         highlighted_rows += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(terminal_tui, "_highlight_transcript_line", counted_highlight)
+    def counted_base_create(control: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal base_content_builds
+        if type(control).__name__ == "TranscriptFormattedTextControl":
+            base_content_builds += 1
+        return original_base_create(control, *args, **kwargs)
+
+    monkeypatch.setattr(
+        tui_application,
+        "_highlight_transcript_line",
+        counted_highlight,
+    )
+    monkeypatch.setattr(
+        runtime["FormattedTextControl"],
+        "create_content",
+        counted_base_create,
+    )
 
     async def no_message(message: str, conversation_id: str | None) -> Any:
         raise AssertionError((message, conversation_id))
@@ -1777,7 +1807,7 @@ def test_selection_highlight_work_is_lazy_per_requested_viewport_row(
     with create_pipe_input() as pipe:
         application, _approval_previous, _deny_pending = (
             terminal_tui._create_application(
-                terminal_tui._load_terminal_runtime(),
+                runtime,
                 state,
                 run_message=no_message,
                 load_transcript=None,
@@ -1791,13 +1821,33 @@ def test_selection_highlight_work_is_lazy_per_requested_viewport_row(
         content_control = (
             application.layout.container.children[0].content.children[0].content
         )
-        content = content_control.create_content(98, None)
+        content_window = application.layout.container.children[0].content.children[0]
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(
+            lambda: output.alternate_enter_count == 1
+            and content_window.render_info is not None
+        )
+        assert len(text.encode("utf-8")) < 2 * 1_024 * 1_024
+        viewport_rows = content_window.render_info.window_height
+        initial_builds = state.transcript_viewport.projection_build_count
+        initial_base_content_builds = base_content_builds
+        highlighted_rows = 0
+        render_counter = application.render_counter
 
-        for row in range(2, 12):
-            content.get_line(row)
+        scroll_up = MouseEvent(
+            position=Point(x=1, y=1),
+            event_type=MouseEventType.SCROLL_UP,
+            button=MouseButton.NONE,
+            modifiers=frozenset(),
+        )
+        assert content_control.mouse_handler(scroll_up) is None
+        await _wait_until(lambda: application.render_counter > render_counter)
 
-    assert highlighted_rows == 10
-    assert state.transcript_viewport.projection_build_count == 1
+        assert 0 < highlighted_rows <= viewport_rows * 3
+        assert state.transcript_viewport.projection_build_count == initial_builds == 1
+        assert base_content_builds == initial_base_content_builds == 1
+        pipe.send_text("\x04")
+        await task
 
 
 async def test_terminal_controller_projects_themed_local_command_results(
@@ -2336,6 +2386,28 @@ def test_concurrent_tool_completion_preserves_start_order_and_sibling_failure():
                 },
             )
         )
+    terminal_tui._project_pending_events(bridge, state)
+    glyphs = terminal_tui._terminal_glyphs(
+        terminal_tui.TerminalCapabilities("truecolor", True)
+    )
+    active_status = terminal_tui._status_projection(
+        state,
+        width=120,
+        mode="full",
+        glyphs=glyphs,
+    )
+    assert "calling Read data file (+2)" in active_status.left
+    state.animation_frame += 1
+    next_status = terminal_tui._status_projection(
+        state,
+        width=120,
+        mode="full",
+        glyphs=glyphs,
+    )
+    assert "calling Read data file (+2)" in next_status.left
+    assert next_status.left != active_status.left
+    assert state.toggle_tool_history() is False
+
     for call_id, success, error_code, duration_ms in (
         ("call-third", True, None, 8),
         ("call-second", False, "unknown_column", 13),
@@ -2353,6 +2425,12 @@ def test_concurrent_tool_completion_preserves_start_order_and_sibling_failure():
                 },
             )
         )
+    bridge(
+        _event(
+            AgentEventKind.RUN_COMPLETED,
+            {"exit_kind": "completed", "reason": "completed"},
+        )
+    )
     terminal_tui._project_pending_events(bridge, state)
 
     assert [block.text for block in state.blocks if block.kind == "tool"] == [
@@ -2373,10 +2451,24 @@ def test_concurrent_tool_completion_preserves_start_order_and_sibling_failure():
             width=96,
         )
     )
-    assert rendered.index("Search catalog") < rendered.index("Query SQLite")
-    assert rendered.index("Query SQLite") < rendered.index("Read data file")
-    assert "unknown_column" in rendered
-    assert "13ms" in rendered
+    assert "3 tool calls" in rendered
+    assert "1 failed" in rendered
+    assert "Search catalog" not in rendered
+    assert "unknown_column" not in rendered
+
+    assert state.toggle_tool_history() is True
+    expanded = "".join(
+        text
+        for _, text in terminal_tui._render_transcript_fragments(
+            terminal_tui._load_terminal_runtime(),
+            state,
+            width=96,
+        )
+    )
+    assert expanded.index("Search catalog") < expanded.index("Query SQLite")
+    assert expanded.index("Query SQLite") < expanded.index("Read data file")
+    assert "unknown_column" in expanded
+    assert "13ms" in expanded
 
 
 def test_tool_event_fields_are_bounded_and_sanitized_before_rendering():
@@ -2447,7 +2539,14 @@ def test_projection_and_card_rendering_fail_closed_without_touching_run_result(
         del args, kwargs
         raise RuntimeError("render failed")
 
-    monkeypatch.setattr(terminal_tui, "_render_tool_card_fragments", broken_renderer)
+    monkeypatch.setattr(
+        tui_transcript_view,
+        "_render_tool_card_fragments",
+        broken_renderer,
+    )
+    card = state.tool_cards["call-live"]
+    card.state = "succeeded"
+    state.tool_history_run_id = card.run_id
     rendered = "".join(
         text
         for _, text in terminal_tui._render_transcript_fragments(
@@ -2915,7 +3014,7 @@ def test_result_previews_obey_every_stage_three_rendering_bound():
     assert sum(fragment.count("\n") for _style, fragment in bounded_code) == 80
 
 
-def test_success_collapse_failure_expansion_and_toggles_are_process_local():
+def test_tool_history_is_hidden_by_default_and_toggles_per_process():
     failed = ToolCall(id="call-failed", name="failed_tool", arguments={"value": 1})
     succeeded = ToolCall(
         id="call-succeeded",
@@ -2947,14 +3046,213 @@ def test_success_collapse_failure_expansion_and_toggles_are_process_local():
     assert first_state.tool_cards[failed.id].expanded is True
     assert first_state.tool_cards[succeeded.id].expanded is False
 
-    assert first_state.toggle_expanded_detail() is True
+    collapsed = "".join(
+        text
+        for _style, text in terminal_tui._render_transcript_fragments(
+            terminal_tui._load_terminal_runtime(),
+            first_state,
+            width=96,
+        )
+    )
+    assert "2 tool calls" in collapsed
+    assert "1 failed" in collapsed
+    assert "recorded failure" not in collapsed
+
+    assert first_state.toggle_tool_history() is True
+    assert first_state.tool_history_run_id == "run-one"
+    assert first_state.tool_cards[failed.id].expanded is True
     assert first_state.tool_cards[succeeded.id].expanded is True
+    expanded = "".join(
+        text
+        for _style, text in terminal_tui._render_transcript_fragments(
+            terminal_tui._load_terminal_runtime(),
+            first_state,
+            width=96,
+        )
+    )
+    assert expanded.index("failed_tool") < expanded.index("successful_tool")
+    assert "recorded failure" in expanded
+
+    assert first_state.toggle_tool_history() is True
+    assert first_state.tool_history_run_id is None
+    assert (
+        first_state.transcript_viewport.state
+        is terminal_tui.TranscriptFollowState.FOLLOWING
+    )
 
     second_state = TerminalViewState("atlas", "model", "source")
     second_state.hydrate_transcript(transcript, run_id="run-one")
     assert second_state.tool_cards[failed.id].expanded is True
     assert second_state.tool_cards[succeeded.id].expanded is False
+    assert second_state.tool_history_run_id is None
     assert transcript.messages[1].tool_calls == (failed, succeeded)
+
+
+async def test_ctrl_o_opens_and_hides_the_latest_completed_tool_run():
+    output = _RecordingOutput()
+    call = ToolCall(
+        id="call-keyboard-history",
+        name="data_query_sqlite",
+        arguments={"source_id": "source-one", "sql": "SELECT 1 AS value"},
+    )
+    transcript = _tool_transcript(
+        (call,),
+        (
+            ToolResultBlock(
+                call_id=call.id,
+                output={
+                    "kind": "data.sqlite.query_result",
+                    "data": {
+                        "columns": ["value"],
+                        "rows": [{"value": 1}],
+                        "total_rows": 1,
+                    },
+                },
+            ),
+        ),
+        run_id="run-keyboard-history",
+    )
+    state = TerminalViewState("atlas", "model", "source")
+    state.hydrate_transcript(transcript, run_id="run-keyboard-history")
+
+    async def no_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(pipe, output, state, run_message=no_message)
+        await _wait_until(
+            lambda: any(
+                "Ctrl-O view results" in block.text
+                for block in state.transcript_document.blocks
+            )
+        )
+
+        pipe.send_text("\x0f")
+        await _wait_until(
+            lambda: state.tool_history_run_id == "run-keyboard-history"
+            and any(
+                "SELECT 1 AS value" in block.text
+                for block in state.transcript_document.blocks
+            )
+        )
+        assert state.notice == "Tool results shown; Ctrl-O hides them."
+
+        pipe.send_text("\x0f")
+        await _wait_until(
+            lambda: state.tool_history_run_id is None
+            and any(
+                "Ctrl-O view results" in block.text
+                for block in state.transcript_document.blocks
+            )
+        )
+        assert state.notice == "Tool results hidden."
+
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result.action == "exit"
+
+
+async def test_live_tool_status_transitions_to_summary_before_results_open():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    observer = TerminalObserverBridge()
+    finish_tool = asyncio.Event()
+    call = ToolCall(
+        id="call-live-status",
+        name="data_query_sqlite",
+        arguments={"source_id": "source-one", "sql": "SELECT 1 AS value"},
+    )
+    transcript = _tool_transcript(
+        (call,),
+        (
+            ToolResultBlock(
+                call_id=call.id,
+                output={
+                    "kind": "data.sqlite.query_result",
+                    "data": {
+                        "columns": ["value"],
+                        "rows": [{"value": 1}],
+                        "total_rows": 1,
+                    },
+                },
+            ),
+        ),
+        run_id="run-live",
+    )
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        assert message == "question"
+        assert conversation_id is None
+        observer(_event(AgentEventKind.RUN_STARTED, {"agent_id": "agent-live"}))
+        observer(
+            _event(
+                AgentEventKind.TOOL_STARTED,
+                {
+                    "call_id": call.id,
+                    "tool_name": call.name,
+                    "capability_id": "data.sqlite.query",
+                },
+            )
+        )
+        await finish_tool.wait()
+        observer(
+            _event(
+                AgentEventKind.TOOL_COMPLETED,
+                {
+                    "call_id": call.id,
+                    "tool_name": call.name,
+                    "success": True,
+                    "duration_ms": 8,
+                },
+            )
+        )
+        observer(
+            _event(
+                AgentEventKind.RUN_COMPLETED,
+                {"exit_kind": "completed", "reason": "completed"},
+            )
+        )
+        return _result("Final answer.", run_id="run-live")
+
+    async def load_transcript(run_id: str) -> Transcript:
+        assert run_id == "run-live"
+        return transcript
+
+    with create_pipe_input() as pipe:
+        task = await _run_shell(
+            pipe,
+            output,
+            state,
+            run_message=run_message,
+            load_transcript=load_transcript,
+            observer_bridge=observer,
+        )
+        pipe.send_text("question\r")
+        await _wait_until(lambda: state.active_tool_activity() is not None)
+        await asyncio.sleep(0.1)
+        assert "call Query SQLite" in output.text
+        tool_block = next(block for block in state.blocks if block.kind == "tool")
+        assert tool_block.presentation_id is not None
+        assert state.transcript_document.text(tool_block.presentation_id) == ""
+
+        finish_tool.set()
+        await _wait_until(
+            lambda: not state.running
+            and "Final answer." in output.text
+            and "Ctrl-O view results" in output.text
+        )
+        assert "Recorded result" not in output.text
+
+        pipe.send_text("\x0f")
+        await _wait_until(
+            lambda: state.tool_history_run_id == "run-live"
+            and "Recorded result" in output.text
+        )
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result.action == "exit"
 
 
 def test_postgresql_connection_failure_has_distinct_tool_card_heading():
@@ -3011,7 +3309,64 @@ def test_postgresql_connection_failure_has_distinct_tool_card_heading():
     assert "PostgreSQLQueryError" not in collapsed + expanded
 
 
-def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_document():
+def test_expanded_tool_and_error_details_inherit_readable_application_text():
+    runtime = terminal_tui._load_terminal_runtime()
+    capabilities = terminal_tui.TerminalCapabilities("truecolor", True)
+    cards = (
+        terminal_tui.ToolCardState(
+            run_id="run-success",
+            call_id="call-success",
+            capability_id="data.sqlite.query",
+            label="Query SQLite",
+            state="succeeded",
+            details=terminal_tui.ToolCardDetails(
+                summary="One row returned",
+                code="SELECT value FROM records",
+                code_language="sql",
+                arguments_text='{"sql":"SELECT value FROM records"}',
+                result_text='{"value":"visible"}',
+            ),
+            expanded=True,
+        ),
+        terminal_tui.ToolCardState(
+            run_id="run-failure",
+            call_id="call-failure",
+            capability_id="data.postgresql.query",
+            label="Query PostgreSQL",
+            state="failed",
+            error_code="postgresql_connect_failed",
+            details=terminal_tui.ToolCardDetails(
+                summary="Connection unavailable",
+                arguments_text='{"source_id":"source-postgresql"}',
+                error_message="PostgreSQL source could not be opened.",
+            ),
+            expanded=True,
+        ),
+    )
+
+    for card in cards:
+        border_style = (
+            "class:tui.tool.success"
+            if card.state == "succeeded"
+            else "class:tui.tool.failure"
+        )
+        fragments = terminal_tui._render_tool_card_fragments(
+            card,
+            width=96,
+            runtime=runtime,
+            capabilities=capabilities,
+        )
+        body_styles = [
+            style for style, text in fragments if text.strip() and style != border_style
+        ]
+
+        assert body_styles
+        assert all(style.split()[0] == "class:tui.tool.text" for style in body_styles)
+        assert all("#000000" not in style for style in body_styles)
+        assert all("bg:" not in style for style in body_styles)
+
+
+def test_live_tool_status_then_history_toggle_reconcile_the_rendered_document():
     runtime = terminal_tui._load_terminal_runtime()
     capabilities = terminal_tui.TerminalCapabilities("none", True)
     state = TerminalViewState("atlas", "model", "source")
@@ -3038,6 +3393,13 @@ def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_docum
     )
     state.apply_event(
         _event(
+            AgentEventKind.RUN_STARTED,
+            {"agent_id": "agent-live"},
+            run_id="run-one",
+        )
+    )
+    state.apply_event(
+        _event(
             AgentEventKind.TOOL_STARTED,
             {
                 "call_id": call.id,
@@ -3056,12 +3418,14 @@ def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_docum
     block = next(block for block in state.blocks if block.kind == "tool")
     block_id = block.presentation_id
     assert block_id is not None
-    assert state.transcript_document.text(block_id).startswith("Query SQLite\n")
-    title_anchor = state.transcript_document.make_anchor(
-        state.transcript_document.position(block_id, 0)
+    assert state.transcript_document.text(block_id) == ""
+    status = terminal_tui._status_projection(
+        state,
+        width=120,
+        mode="full",
+        glyphs=terminal_tui._terminal_glyphs(capabilities),
     )
-    state.transcript_viewport.review_start(cast(Any, state.transcript_projection))
-    viewport_anchor = state.transcript_viewport.anchor
+    assert "calling Query SQLite" in status.left
 
     state.apply_event(
         _event(
@@ -3082,8 +3446,31 @@ def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_docum
         capabilities=capabilities,
     )
     assert block.presentation_id == block_id
-    assert state.transcript_document.reconcile_anchor(title_anchor) is not None
-    assert state.transcript_viewport.anchor == viewport_anchor
+    assert state.transcript_document.text(block_id) == ""
+
+    state.apply_event(
+        _event(
+            AgentEventKind.RUN_COMPLETED,
+            {"exit_kind": "completed", "reason": "completed"},
+            run_id="run-one",
+        )
+    )
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=96,
+        capabilities=capabilities,
+    )
+    summary_text = state.transcript_document.text(block_id)
+    assert summary_text.startswith("1 tool call")
+    summary_start = summary_text.index("Ctrl-O view results")
+    summary_range = state.transcript_document.normalize_range(
+        state.transcript_document.position(block_id, summary_start),
+        state.transcript_document.position(
+            block_id,
+            summary_start + len("Ctrl-O view results"),
+        ),
+    )
 
     state.hydrate_transcript(transcript, run_id="run-one")
     terminal_tui._render_transcript_fragments(
@@ -3094,19 +3481,9 @@ def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_docum
     )
     hydrated_block = next(block for block in state.blocks if block.kind == "tool")
     assert hydrated_block.presentation_id == block_id
-    assert state.transcript_document.reconcile_anchor(title_anchor) is not None
-    assert state.transcript_viewport.anchor == viewport_anchor
-    collapsed_text = state.transcript_document.text(block_id)
-    expansion_start = collapsed_text.index("Ctrl+O expand")
-    expansion_range = state.transcript_document.normalize_range(
-        state.transcript_document.position(block_id, expansion_start),
-        state.transcript_document.position(
-            block_id,
-            expansion_start + len("Ctrl+O expand"),
-        ),
-    )
+    assert state.transcript_document.text(block_id).startswith("1 tool call")
 
-    assert state.toggle_expanded_detail() is True
+    assert state.toggle_tool_history() is True
     terminal_tui._render_transcript_fragments(
         runtime,
         state,
@@ -3114,9 +3491,22 @@ def test_live_tool_mutation_hydration_and_expansion_reconcile_the_rendered_docum
         capabilities=capabilities,
     )
 
-    assert state.transcript_document.reconcile_anchor(title_anchor) is not None
-    assert state.transcript_document.reconcile_range(expansion_range) is None
-    assert state.transcript_viewport.anchor == viewport_anchor
+    expanded_text = state.transcript_document.text(block_id)
+    assert expanded_text.startswith("Query SQLite\n")
+    assert "SELECT 1 AS value" in expanded_text
+    assert state.transcript_document.reconcile_range(summary_range) is None
+
+    assert state.toggle_tool_history() is True
+    terminal_tui._render_transcript_fragments(
+        runtime,
+        state,
+        width=96,
+        capabilities=capabilities,
+    )
+    assert state.transcript_document.text(block_id).startswith("1 tool call")
+    assert (
+        state.transcript_viewport.state is terminal_tui.TranscriptFollowState.FOLLOWING
+    )
 
 
 @pytest.mark.parametrize("failure", ("load", "projection"))
@@ -3357,12 +3747,10 @@ def test_transcript_renderer_exercises_stable_semantic_projection_without_rewrap
     assert "?[2J" in narrow + wide
 
 
-def test_green_identity_focus_theme_uses_semantic_styles(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    monkeypatch.delenv("NO_COLOR", raising=False)
-
-    rules = terminal_tui._semantic_style_rules()
+def test_green_identity_focus_theme_uses_semantic_styles():
+    rules = terminal_tui._semantic_style_rules(
+        terminal_tui.TerminalCapabilities("truecolor", True)
+    )
 
     assert rules["tui.identity"] == "bold #22c55e"
     assert rules["tui.prompt"] == "bold #4ade80"
@@ -3623,6 +4011,55 @@ async def test_composer_expands_and_shrinks_for_typed_wrapping_but_not_paste():
         await task
 
 
+async def test_double_escape_clears_the_full_composer_without_submitting():
+    output = _RecordingOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    submitted: list[str] = []
+
+    async def run_message(message: str, conversation_id: str | None) -> Any:
+        del conversation_id
+        submitted.append(message)
+        return _result("handled")
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=run_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+
+        pipe.send_text("\x1b[200~first line\nsecond line\x1b[201~")
+        await _wait_until(lambda: application.current_buffer.text == "[Pasted Text #1]")
+        pipe.send_text("\x1b\x1b")
+        await _wait_until(lambda: application.current_buffer.text == "")
+
+        assert state.notice == "Input cleared."
+        assert submitted == []
+
+        pipe.send_text("replacement\r")
+        await _wait_until(lambda: submitted == ["replacement"] and not state.running)
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result.action == "exit"
+
+
 def test_responsive_metadata_and_status_collapse_order_are_deterministic():
     state = TerminalViewState(
         "atlas",
@@ -3738,6 +4175,87 @@ def test_no_color_and_bounded_color_depth_projection_keep_semantic_text():
             assert any("ansi" in value for value in rules.values())
 
 
+def test_unknown_terminal_capabilities_fail_down_to_visible_safe_fallbacks():
+    class UnknownOutput:
+        encoding = None
+
+        def get_default_color_depth(self) -> Any:
+            raise OSError("color unavailable")
+
+        def get_size(self) -> Any:
+            raise OSError("size unavailable")
+
+    output = UnknownOutput()
+    capabilities = terminal_tui._terminal_capabilities(output, environ={})
+    size = terminal_tui._terminal_size(output)
+    projection = terminal_tui._responsive_projection(*size)
+    message = "".join(
+        text
+        for _style, text in terminal_tui._resize_message_fragments(
+            projection,
+            glyphs=terminal_tui._terminal_glyphs(capabilities),
+        )
+    )
+
+    assert capabilities == terminal_tui.TerminalCapabilities("none", False)
+    assert size == (32, 1)
+    assert projection.usable is False
+    assert "Terminal too small (32x1)" in message
+    assert "Resize to at least 32x8" in message
+
+
+async def test_unavailable_mouse_reporting_keeps_keyboard_navigation_active():
+    class NoMouseOutput(_RecordingOutput):
+        def __getattribute__(self, name: str) -> Any:
+            if name in {"enable_mouse_support", "disable_mouse_support"}:
+                raise AttributeError(name)
+            return super().__getattribute__(name)
+
+    output = NoMouseOutput()
+    state = TerminalViewState("atlas", "model", "source")
+    state.append_user("\n".join(f"row-{index:03d}" for index in range(100)))
+
+    async def no_message(message: str, conversation_id: str | None) -> Any:
+        raise AssertionError((message, conversation_id))
+
+    async def no_command(
+        command: str,
+        conversation_id: str | None,
+    ) -> TerminalCommandResult:
+        raise AssertionError((command, conversation_id))
+
+    with create_pipe_input() as pipe:
+        application, _approval_previous, _deny_pending = (
+            terminal_tui._create_application(
+                terminal_tui._load_terminal_runtime(),
+                state,
+                run_message=no_message,
+                load_transcript=None,
+                handle_command=no_command,
+                observer_bridge=TerminalObserverBridge(),
+                approval_bridge=None,
+                enhanced_input=pipe,
+                enhanced_output=output,
+            )
+        )
+        task = asyncio.create_task(terminal_tui._run_application(application))
+        await _wait_until(lambda: output.alternate_enter_count == 1)
+        assert application.mouse_support() is False
+        assert state.notice == (
+            "Mouse interaction unavailable; keyboard controls remain active."
+        )
+        pipe.send_text("\x1b[5~")
+        await _wait_until(
+            lambda: state.transcript_viewport.state
+            is terminal_tui.TranscriptFollowState.REVIEWING
+        )
+        pipe.send_text("\x04")
+        result = await task
+
+    assert result.action == "exit"
+    assert output.mouse_enable_count == 0
+
+
 def test_ascii_projection_replaces_every_structural_border_and_state_glyph():
     capabilities = terminal_tui.TerminalCapabilities("16", False)
     glyphs = terminal_tui._terminal_glyphs(capabilities)
@@ -3801,7 +4319,7 @@ async def test_composer_enforces_the_existing_input_bound(
     monkeypatch: pytest.MonkeyPatch,
 ):
     input_bound = 64
-    monkeypatch.setattr(terminal_tui, "MAX_COMPOSER_CHARACTERS", input_bound)
+    monkeypatch.setattr(tui_application, "MAX_COMPOSER_CHARACTERS", input_bound)
     output = _RecordingOutput()
     state = TerminalViewState("atlas", "model", "source")
     submitted: list[str] = []
@@ -4255,7 +4773,7 @@ async def test_very_small_terminal_blocks_submission_until_resize(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(
-        terminal_tui,
+        tui_application,
         "_terminal_size_polling_interval",
         lambda: 0.01,
     )
@@ -4292,7 +4810,7 @@ async def test_resize_idle_running_and_approving_preserves_focus_and_view_state(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(
-        terminal_tui,
+        tui_application,
         "_terminal_size_polling_interval",
         lambda: 0.01,
     )
@@ -4336,7 +4854,7 @@ async def test_resize_idle_running_and_approving_preserves_focus_and_view_state(
         raise AssertionError(message)
 
     applications: list[Any] = []
-    original_create_application = terminal_tui._create_application
+    original_create_application = tui_application._create_application
 
     def capture_application(*args: Any, **kwargs: Any) -> Any:
         created = original_create_application(*args, **kwargs)
@@ -4344,7 +4862,7 @@ async def test_resize_idle_running_and_approving_preserves_focus_and_view_state(
         return created
 
     monkeypatch.setattr(
-        terminal_tui,
+        tui_application,
         "_create_application",
         capture_application,
     )
@@ -4418,7 +4936,9 @@ async def test_terminal_state_is_restored_after_application_exceptions(
     state = TerminalViewState("atlas", "model", "source")
 
     async def fail(application: Any) -> Any:
-        del application
+        application.renderer._in_alternate_screen = True
+        application.renderer._mouse_support_enabled = True
+        application.renderer._bracketed_paste_enabled = True
         raise error
 
     async def run_message(message: str, conversation_id: str | None) -> Any:
@@ -4430,7 +4950,7 @@ async def test_terminal_state_is_restored_after_application_exceptions(
     ) -> TerminalCommandResult:
         raise AssertionError((command, conversation_id))
 
-    monkeypatch.setattr(terminal_tui, "_run_application", fail)
+    monkeypatch.setattr(tui_application, "_run_application", fail)
     with create_pipe_input() as pipe:
         with pytest.raises(type(error)):
             await run_terminal_tui(
@@ -4445,9 +4965,13 @@ async def test_terminal_state_is_restored_after_application_exceptions(
             )
 
     assert output.show_count >= 1
-    assert output.alternate_exit_count == 0
+    assert output.alternate_exit_count == 1
+    assert output.mouse_disable_count == 1
+    assert output.bracketed_paste_disable_count == 1
     assert output.attribute_reset_count >= 1
     assert output.autowrap_count >= 1
+    assert output.cursor_key_reset_count >= 1
+    assert output.cursor_shape_reset_count >= 1
     assert output.flush_count >= 1
 
 
@@ -4458,18 +4982,26 @@ async def test_rendering_failure_waits_for_active_execution_without_cancelling_i
     state = TerminalViewState("atlas", "model", "source")
     completed = False
     cancelled = False
+    restored_before_completion = False
 
     async def authoritative_execution() -> None:
-        nonlocal completed, cancelled
+        nonlocal completed, cancelled, restored_before_completion
         try:
             await asyncio.sleep(0.02)
+            restored_before_completion = (
+                output.alternate_exit_count == 1
+                and output.mouse_disable_count == 1
+                and output.bracketed_paste_disable_count == 1
+            )
             completed = True
         except asyncio.CancelledError:
             cancelled = True
             raise
 
     async def fail(application: Any) -> Any:
-        del application
+        application.renderer._in_alternate_screen = True
+        application.renderer._mouse_support_enabled = True
+        application.renderer._bracketed_paste_enabled = True
         state.running = True
         state.active_task = asyncio.create_task(authoritative_execution())
         raise RuntimeError("renderer failed")
@@ -4483,7 +5015,7 @@ async def test_rendering_failure_waits_for_active_execution_without_cancelling_i
     ) -> TerminalCommandResult:
         raise AssertionError((command, conversation_id))
 
-    monkeypatch.setattr(terminal_tui, "_run_application", fail)
+    monkeypatch.setattr(tui_application, "_run_application", fail)
     with create_pipe_input() as pipe:
         with pytest.raises(RuntimeError, match="renderer failed"):
             await run_terminal_tui(
@@ -4499,8 +5031,32 @@ async def test_rendering_failure_waits_for_active_execution_without_cancelling_i
 
     assert completed is True
     assert cancelled is False
+    assert restored_before_completion is True
     assert output.show_count >= 1
-    assert output.alternate_exit_count == 0
+    assert output.alternate_exit_count == 1
+    assert output.mouse_disable_count == 1
+    assert output.bracketed_paste_disable_count == 1
+
+
+def test_terminal_mode_restoration_falls_back_when_renderer_reset_fails():
+    output = _RecordingOutput()
+
+    def fail_reset() -> None:
+        raise OSError("renderer reset failed")
+
+    application = SimpleNamespace(renderer=SimpleNamespace(reset=fail_reset))
+
+    terminal_tui._restore_application(application, output)
+
+    assert output.alternate_exit_count == 1
+    assert output.mouse_disable_count == 1
+    assert output.bracketed_paste_disable_count == 1
+    assert output.show_count == 1
+    assert output.cursor_key_reset_count == 1
+    assert output.cursor_shape_reset_count == 1
+    assert output.attribute_reset_count == 1
+    assert output.autowrap_count == 1
+    assert output.flush_count == 1
 
 
 async def test_pre_admission_application_failure_restores_output_and_falls_back(
@@ -4522,7 +5078,7 @@ async def test_pre_admission_application_failure_restores_output_and_falls_back(
     ) -> TerminalCommandResult:
         raise AssertionError((command, conversation_id))
 
-    monkeypatch.setattr(terminal_tui, "_create_application", fail)
+    monkeypatch.setattr(tui_application, "_create_application", fail)
     with create_pipe_input() as pipe:
         with pytest.raises(terminal_tui.TerminalTUIUnavailable):
             await run_terminal_tui(
@@ -4991,7 +5547,17 @@ async def test_approval_owns_all_clicks_without_mouse_decision_or_run_effect():
 
 @pytest.mark.parametrize(
     "key",
-    ("a", "d", "x", "\r", " ", "\x1b", "\x1b[I", "\x1b[?1;2c"),
+    (
+        "a",
+        "d",
+        "x",
+        "\r",
+        " ",
+        "\x1b",
+        "\x1b\x1b",
+        "\x1b[I",
+        "\x1b[?1;2c",
+    ),
     ids=(
         "old-approve",
         "old-deny",
@@ -4999,6 +5565,7 @@ async def test_approval_owns_all_clicks_without_mouse_decision_or_run_effect():
         "enter",
         "space",
         "escape",
+        "double-escape",
         "terminal-focus-event",
         "terminal-device-response",
     ),
@@ -5132,7 +5699,11 @@ async def test_approval_rendering_failure_propagates_without_a_false_denial(
         render_attempted.set()
         raise RuntimeError(panel.tool_name)
 
-    monkeypatch.setattr(terminal_tui, "_render_approval_panel_fragments", fail_render)
+    monkeypatch.setattr(
+        tui_application,
+        "_render_approval_panel_fragments",
+        fail_render,
+    )
 
     async def run_message(message: str, conversation_id: str | None) -> Any:
         del message, conversation_id
@@ -5436,7 +6007,7 @@ async def test_at_dropdown_opens_filters_and_inserts_one_run_source_selector(
     state = TerminalViewState("atlas", "model", "First source")
     messages: list[str] = []
     applications: list[Any] = []
-    original_create_application = terminal_tui._create_application
+    original_create_application = tui_application._create_application
 
     def capture_application(*args: Any, **kwargs: Any) -> Any:
         created = original_create_application(*args, **kwargs)
@@ -5444,7 +6015,7 @@ async def test_at_dropdown_opens_filters_and_inserts_one_run_source_selector(
         return created
 
     monkeypatch.setattr(
-        terminal_tui,
+        tui_application,
         "_create_application",
         capture_application,
     )
@@ -5673,7 +6244,7 @@ async def test_slash_dropdown_opens_filters_and_supports_arrow_navigation(
     state = TerminalViewState("atlas", "model", "source")
     commands: list[str] = []
     applications: list[Any] = []
-    original_create_application = terminal_tui._create_application
+    original_create_application = tui_application._create_application
 
     def capture_application(*args: Any, **kwargs: Any) -> Any:
         created = original_create_application(*args, **kwargs)
@@ -5681,7 +6252,7 @@ async def test_slash_dropdown_opens_filters_and_supports_arrow_navigation(
         return created
 
     monkeypatch.setattr(
-        terminal_tui,
+        tui_application,
         "_create_application",
         capture_application,
     )

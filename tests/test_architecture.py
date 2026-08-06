@@ -699,11 +699,11 @@ def test_terminal_presentation_modules_are_the_only_lazy_prompt_toolkit_owners()
         for path in PACKAGE.rglob("*.py")
         if "prompt_toolkit" in path.read_text(encoding="utf-8")
     }
-    assert owners == {"terminal_selection.py", "terminal_tui.py"}
+    assert owners == {"terminal_selection.py", "tui/application.py"}
 
     for owner, loader in (
         ("terminal_selection.py", "_load_prompt_toolkit"),
-        ("terminal_tui.py", "_load_terminal_runtime"),
+        ("tui/application.py", "_load_terminal_runtime"),
     ):
         tree = ast.parse((PACKAGE / owner).read_text(encoding="utf-8"))
         imported_modules = {
@@ -749,6 +749,22 @@ def test_terminal_presentation_modules_are_the_only_lazy_prompt_toolkit_owners()
         )
 
 
+def test_terminal_tui_facade_has_one_cohesive_owner_per_presentation_concern():
+    facade = ast.parse((PACKAGE / "terminal_tui.py").read_text(encoding="utf-8"))
+
+    assert not any(
+        isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        for node in facade.body
+    )
+    assert _class_owners("TerminalCapabilities") == {"tui/capabilities.py"}
+    assert _class_owners("ClipboardResult") == {"tui/clipboard.py"}
+    assert _class_owners("TerminalViewState") == {"tui/state.py"}
+    assert _class_owners("StatusProjection") == {"tui/shell.py"}
+    assert _class_owners("ToolCardState") == {"tui/tool_view.py"}
+    assert _class_owners("_RenderedTranscriptMap") == {"tui/transcript_view.py"}
+    assert _class_owners("TerminalApplicationResult") == {"tui/application.py"}
+
+
 def test_rich_is_lazy_and_owned_only_by_the_focused_terminal_tui():
     owners = {
         path.relative_to(PACKAGE).as_posix()
@@ -758,9 +774,9 @@ def test_rich_is_lazy_and_owned_only_by_the_focused_terminal_tui():
             for line in path.read_text(encoding="utf-8").splitlines()
         )
     }
-    assert owners == {"terminal_tui.py"}
+    assert owners == {"tui/application.py"}
 
-    tree = ast.parse((PACKAGE / "terminal_tui.py").read_text(encoding="utf-8"))
+    tree = ast.parse((PACKAGE / "tui" / "application.py").read_text(encoding="utf-8"))
     top_level_imports = {
         node.module
         for node in tree.body
@@ -790,9 +806,9 @@ def test_rich_is_lazy_and_owned_only_by_the_focused_terminal_tui():
 def test_phase_a_viewport_state_is_disposable_and_has_one_semantic_owner():
     assert _class_owners("TranscriptViewport") == {"terminal_transcript.py"}
     assert _class_owners("TranscriptFollowState") == {"terminal_transcript.py"}
-    tui = (PACKAGE / "terminal_tui.py").read_text(encoding="utf-8")
-    assert "transcript_scroll_offset" not in tui
-    assert "TranscriptViewport" in tui
+    state = (PACKAGE / "tui" / "state.py").read_text(encoding="utf-8")
+    assert "transcript_scroll_offset" not in state
+    assert "TranscriptViewport" in state
     assert "SemanticViewportAnchor" in (PACKAGE / "terminal_transcript.py").read_text(
         encoding="utf-8"
     )
@@ -807,20 +823,21 @@ def test_phase_a_viewport_state_is_disposable_and_has_one_semantic_owner():
 
 def test_phase_c_transcript_selection_and_clipboard_stay_in_terminal_owners():
     transcript = (PACKAGE / "terminal_transcript.py").read_text(encoding="utf-8")
-    tui_path = PACKAGE / "terminal_tui.py"
-    tui = tui_path.read_text(encoding="utf-8")
+    state = (PACKAGE / "tui" / "state.py").read_text(encoding="utf-8")
+    clipboard_path = PACKAGE / "tui" / "clipboard.py"
+    clipboard = clipboard_path.read_text(encoding="utf-8")
     menu_selection = (PACKAGE / "terminal_selection.py").read_text(encoding="utf-8")
     storage = _python_text(PACKAGE / "storage")
     loop = _python_text(PACKAGE / "loop")
 
     assert _class_owners("TranscriptSelection") == {"terminal_transcript.py"}
-    assert _class_owners("ClipboardResult") == {"terminal_tui.py"}
+    assert _class_owners("ClipboardResult") == {"tui/clipboard.py"}
     assert "SemanticRange" in transcript
-    assert "transcript_selection" in tui
+    assert "transcript_selection" in state
     assert "OSC 52" not in storage + loop
     assert "transcript_selection" not in menu_selection
 
-    tree = ast.parse(tui)
+    tree = ast.parse(clipboard)
     top_level_imports = {
         node.module
         for node in tree.body
@@ -835,7 +852,7 @@ def test_phase_c_transcript_selection_and_clipboard_stay_in_terminal_owners():
     pbcopy = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_copy_with_pbcopy"
+        if isinstance(node, ast.FunctionDef) and node.name == "copy_with_pbcopy"
     )
     assert any(
         isinstance(node, ast.Import)
@@ -846,28 +863,29 @@ def test_phase_c_transcript_selection_and_clipboard_stay_in_terminal_owners():
 
 def test_phase_d_mouse_ownership_and_transient_guidance_stay_disposable_and_lazy():
     transcript = (PACKAGE / "terminal_transcript.py").read_text(encoding="utf-8")
-    tui = (PACKAGE / "terminal_tui.py").read_text(encoding="utf-8")
+    application = (PACKAGE / "tui" / "application.py").read_text(encoding="utf-8")
+    state = (PACKAGE / "tui" / "state.py").read_text(encoding="utf-8")
     menu_selection = (PACKAGE / "terminal_selection.py").read_text(encoding="utf-8")
     durable_or_execution = _python_text(PACKAGE / "storage") + _python_text(
         PACKAGE / "loop"
     )
 
     assert "def end_drag(" in transcript
-    assert "mouse_press_owner" in tui
-    assert "_SELECTION_COMPLETE_HINT" in tui
-    assert "transient_selection_hint" in tui
+    assert "mouse_press_owner" in application
+    assert "_SELECTION_COMPLETE_HINT" in application
+    assert "transient_selection_hint" in state
     assert "mouse_press_owner" not in menu_selection + durable_or_execution
     assert "transient_selection_hint" not in menu_selection + durable_or_execution
     assert "prompt_toolkit" not in {
         node.module
-        for node in ast.parse(tui).body
+        for node in ast.parse(application).body
         if isinstance(node, ast.ImportFrom) and node.module
     }
 
 
 def test_phase_b_streaming_keeps_partial_state_disposable_and_provider_neutral():
     loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
-    tui = (PACKAGE / "terminal_tui.py").read_text(encoding="utf-8")
+    state = (PACKAGE / "tui" / "state.py").read_text(encoding="utf-8")
     observation = (PACKAGE / "observation.py").read_text(encoding="utf-8")
     storage = _python_text(PACKAGE / "storage")
     selection = (PACKAGE / "terminal_selection.py").read_text(encoding="utf-8")
@@ -875,7 +893,7 @@ def test_phase_b_streaming_keeps_partial_state_disposable_and_provider_neutral()
     assert "ModelStreamCompleted" in loop
     assert "ModelTextDelta" in loop
     assert "stream_model_calls" in loop
-    assert "assistant.partial" in tui
+    assert "assistant.partial" in state
     assert "MODEL_TEXT_DELTA" in observation
     assert "assistant.partial" not in storage
     assert "MODEL_TEXT_DELTA" not in storage
@@ -883,7 +901,7 @@ def test_phase_b_streaming_keeps_partial_state_disposable_and_provider_neutral()
     for provider in ("openai", "anthropic", "gemini", "grok", "ollama"):
         assert provider not in loop.lower()
 
-    top_level_imports = _imports(PACKAGE / "terminal_tui.py")
+    top_level_imports = _imports(PACKAGE / "tui" / "application.py")
     assert not any(
         module == sdk or module.startswith(f"{sdk}.")
         for module in top_level_imports
