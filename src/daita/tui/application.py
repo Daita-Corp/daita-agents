@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
-import json
+from dataclasses import dataclass
 import os
 import re
 import sys
@@ -14,7 +13,6 @@ from typing import Any, TextIO
 from .._installation import repair_guidance
 from ..capabilities import ApprovalDecision, ApprovalRequest
 from ..loop.models import Transcript
-from ..observation import AgentEvent, AgentEventKind
 from ..terminal_transcript import (
     TranscriptFollowState,
     TranscriptProjection,
@@ -24,13 +22,11 @@ from ..terminal_transcript import (
 from .capabilities import (
     MAX_RENDER_WIDTH as _MAX_RENDER_WIDTH,
     MIN_RENDER_WIDTH as _MIN_RENDER_WIDTH,
-    MIN_USABLE_COLUMNS as _MIN_USABLE_COLUMNS,
     RUNNING_GLYPHS as _RUNNING_GLYPHS,
     ResponsiveProjection,
     TerminalCapabilities,
     TerminalGlyphs,
     mouse_reporting_available as _mouse_reporting_available,
-    responsive_projection as _responsive_projection,
     terminal_capabilities as _terminal_capabilities,
     terminal_glyphs as _terminal_glyphs,
     terminal_size as _terminal_size,
@@ -40,101 +36,51 @@ from .clipboard import (
     FORCE_SELECTION_GUIDANCE as _FORCE_SELECTION_GUIDANCE,
     MAX_CLIPBOARD_UTF8_BYTES,
     ClipboardResult,
-    clipboard_mechanism as _clipboard_mechanism,
-    copy_with_pbcopy as _copy_with_pbcopy,
     deliver_clipboard as _deliver_clipboard,
-    osc52_sequence as _osc52_sequence,
-    send_osc52_request as _send_osc52_request,
 )
 from .rendering import (
-    render_markdown_ansi as _render_markdown_ansi,
-    render_markdown_fragments as _render_markdown_fragments,
     render_markdown_text as _render_markdown_text_with_runtime,
-    render_user_message_fragments as _render_user_message_fragments,
-    rich_theme_rules as _rich_theme_rules,
     semantic_style_rules as _semantic_style_rules,
 )
 from .state import (
-    MAX_EVENT_COUNTER as _MAX_EVENT_COUNTER,
-    ApprovalPanelState,
     TerminalApprovalBridge,
-    TerminalBlock,
     TerminalObserverBridge,
     TerminalStartupInfo,
     TerminalViewState,
-    _artifact_delivery_messages,
-    _completed_tool_pairs,
-    _event_counter,
-    _event_text,
     _model_text_event_fields,
-    _optional_event_text,
 )
 from .shell import (
-    MAX_APPROVAL_DOCUMENT_CHARACTERS,
     StatusProjection,
-    _BUILTIN_SLASH_COMMAND_ROOTS,
-    _SLASH_COMMAND_COMPLETIONS,
-    _SLASH_COMMAND_DESCRIPTIONS,
-    _SLASH_COMMAND_INSERTIONS,
-    _SLASH_COMMAND_SURFACE,
     _approval_panel_for_request,
-    _contains_sensitive_key,
-    _context_progress_text,
-    _format_token_count,
     _render_approval_panel_fragments,
     _resize_message_fragments,
     _responsive_for_output,
-    _setup_prompt_text,
-    _slash_command_completion_surface,
     _slash_command_menu_fragments,
     _slash_completion_maps,
     _status_left_fragments,
     _status_projection,
     _status_right_fragments,
     _status_single_line_fragments,
-    _status_state_style,
-    _stream_is_interactive,
-    _text_stream_width,
     _write_setup_prompt as _write_setup_prompt_impl,
     _write_setup_status as _write_setup_status_impl,
 )
 from .text import (
-    MAX_RENDER_CHARACTERS as _MAX_RENDER_CHARACTERS,
     display_width as _display_width,
     sanitize_terminal_text as _sanitize_terminal_text,
-    truncate_display_text as _truncate_display_text,
 )
 from .tool_view import (
-    _CAPABILITY_LABELS,
-    _SENSITIVE_KEY_PARTS,
     ToolCardDetails,
     ToolCardState,
     ToolTablePreview,
-    _canonical_tool_card_text,
-    _card_rich_lines,
-    _project_tool_details,
     _render_tool_card_fragments as _render_tool_card_fragments_impl,
-    _render_tool_run_summary_fragments,
-    _tool_result_error_code,
-    _tool_run_summary_text,
 )
 from .transcript_view import (
     _EMPTY_RENDERED_TRANSCRIPT_MAP,
-    _PendingRenderedBlockMap,
-    _RenderedSelectionRow,
     _RenderedTranscriptMap,
-    _build_rendered_transcript_map,
-    _canonical_assistant_text,
     _fragment_line_metrics,
-    _highlight_transcript_fragments,
     _highlight_transcript_line,
     _render_startup_fragments,
-    _render_startup_text,
     _render_transcript_fragments,
-    _rendered_row_cell_offsets,
-    _semantic_offsets_for_rendered_lines,
-    _startup_cell,
-    _startup_safe_text,
 )
 
 MAX_COMPOSER_CHARACTERS = 16_384

@@ -38,7 +38,6 @@ from daita.catalog import (
     catalog_resource_id,
 )
 from daita.catalog.capabilities import (
-    CATALOG_INSPECT_CAPABILITY_ID,
     CATALOG_SCHEMA_CAPABILITY_ID,
     CATALOG_SCHEMA_EVIDENCE_KIND,
     CATALOG_SEARCH_CAPABILITY_ID,

@@ -12,7 +12,7 @@ from ..security import (
 )
 from .errors import ModelProviderError, ProviderErrorCode
 from .models import ModelRequest, ModelResponse, ModelStreamEvent
-from .protocols import ModelProvider
+from .protocols import ModelProvider, StreamingModelProvider
 from .providers import (
     AnthropicProvider,
     GeminiProvider,
@@ -108,14 +108,15 @@ class _LazyProvider:
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         provider = await self._resolve(request)
-        stream = getattr(provider, "stream", None)
-        if not self._candidate.profile.supports_streaming or not callable(stream):
+        if not self._candidate.profile.supports_streaming or not isinstance(
+            provider, StreamingModelProvider
+        ):
             raise ModelProviderError(
                 ProviderErrorCode.INVALID_REQUEST,
                 "configured provider route does not support streaming",
                 provider_id=self.provider_id,
             )
-        async for event in stream(request):
+        async for event in provider.stream(request):
             yield event
 
     async def _resolve(self, request: ModelRequest) -> ModelProvider:

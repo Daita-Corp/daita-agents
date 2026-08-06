@@ -18,7 +18,11 @@ from .models import (
     ModelUsage,
 )
 from .pricing import aggregate_cost_estimates
-from .protocols import ModelProvider, provider_has_complete_pricing
+from .protocols import (
+    ModelProvider,
+    StreamingModelProvider,
+    provider_has_complete_pricing,
+)
 
 _TRANSIENT = frozenset(
     {
@@ -246,14 +250,15 @@ class ModelRouter:
         for registration in self._candidates:
             if not _eligible(registration, request):
                 continue
-            stream = getattr(registration.provider, "stream", None)
-            if not registration.profile.supports_streaming or not callable(stream):
+            if not registration.profile.supports_streaming or not isinstance(
+                registration.provider, StreamingModelProvider
+            ):
                 continue
             for attempt in range(self._retry_policy.attempts):
                 emitted = False
                 try:
                     completed = False
-                    async for event in stream(request):
+                    async for event in registration.provider.stream(request):
                         if completed:
                             raise ModelProviderError(
                                 ProviderErrorCode.MALFORMED_RESPONSE,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from .models import ModelRequest, ModelResponse, ModelStreamEvent
 
@@ -17,6 +17,7 @@ class ModelProvider(Protocol):
     async def generate(self, request: ModelRequest) -> ModelResponse: ...
 
 
+@runtime_checkable
 class StreamingModelProvider(ModelProvider, Protocol):
     def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]: ...
 

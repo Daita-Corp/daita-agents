@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+# This module intentionally re-exports the legacy terminal surface while the
+# implementation lives under ``daita.tui``. Most compatibility names are
+# accessed by importers rather than by this module itself.
+# pyright: reportUnusedImport=false
+
 from .terminal_transcript import (
     TranscriptFollowState,
     bounded_selection_auto_scroll,

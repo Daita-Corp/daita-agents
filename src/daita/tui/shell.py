@@ -13,7 +13,6 @@ from .capabilities import (
     MAX_RENDER_WIDTH as _MAX_RENDER_WIDTH,
     MIN_USABLE_COLUMNS as _MIN_USABLE_COLUMNS,
     ResponsiveProjection,
-    TerminalCapabilities,
     TerminalGlyphs,
     responsive_projection as _responsive_projection,
     terminal_capabilities as _terminal_capabilities,

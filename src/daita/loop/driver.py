@@ -30,7 +30,11 @@ from ..llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from ..llm.protocols import ModelProvider, provider_has_complete_pricing
+from ..llm.protocols import (
+    ModelProvider,
+    StreamingModelProvider,
+    provider_has_complete_pricing,
+)
 from ..llm.pricing import (
     CostEstimate,
     CostEstimateStatus,
@@ -567,13 +571,15 @@ class AgentLoop:
         model_call_index: int,
         deadline: float,
     ) -> ModelResponse:
-        stream = getattr(self._model, "stream", None)
-        if not self._stream_model_calls or not callable(stream):
-            return await _before(deadline, self._model.generate(request))
+        model = self._model
+        if not self._stream_model_calls or not isinstance(
+            model, StreamingModelProvider
+        ):
+            return await _before(deadline, model.generate(request))
 
         async def consume() -> ModelResponse:
             completed: ModelResponse | None = None
-            async for event in stream(request):
+            async for event in model.stream(request):
                 if completed is not None:
                     raise ModelProviderError(
                         ProviderErrorCode.MALFORMED_RESPONSE,

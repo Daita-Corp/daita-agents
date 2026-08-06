@@ -14,6 +14,7 @@ import pytest
 from daita import (
     Agent,
     ApprovalDecision,
+    ApprovalRequest,
     DocumentCandidateContent,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
@@ -45,6 +46,7 @@ from daita.llm.models import (
     ModelRequest,
     ModelResponse,
     ModelUsage,
+    TextBlock,
     ToolCall,
     ToolResultBlock,
 )
@@ -251,7 +253,7 @@ async def test_explicit_review_creates_only_inactive_idempotent_candidate(tmp_pa
             block.text
             for message in foreground.requests[1].messages
             for block in message.content
-            if hasattr(block, "text")
+            if isinstance(block, TextBlock)
         )
         assert "<untrusted-learning-candidate>" not in ordinary_prompt
         assert "Booked revenue excludes completed refunds." not in ordinary_prompt
@@ -412,7 +414,7 @@ async def test_acceptance_uses_fresh_foreground_approval_and_marks_only_on_succe
             block.text
             for message in foreground.requests[1].messages
             for block in message.content
-            if hasattr(block, "text")
+            if isinstance(block, TextBlock)
         )
         assert "<untrusted-learning-candidate>" in acceptance_prompt
         assert "not active memory" in acceptance_prompt
@@ -440,7 +442,7 @@ async def test_denied_acceptance_has_no_active_effect_and_remains_awaiting(tmp_p
     )
     reviewer = MockModelProvider([_review_response("run-1", text=content)])
 
-    async def deny(_request):
+    async def deny(request: ApprovalRequest) -> ApprovalDecision:
         return ApprovalDecision.DENY
 
     agent = await Agent.create(
@@ -1149,7 +1151,7 @@ async def test_reviewer_request_excludes_secret_shaped_input_material(tmp_path):
             block.text
             for message in reviewer.requests[0].messages
             for block in message.content
-            if hasattr(block, "text")
+            if isinstance(block, TextBlock)
         )
         assert memory_secret not in rendered_request
         assert profile_secret not in rendered_request
@@ -1230,7 +1232,7 @@ async def test_reviewer_redacts_secret_values_inside_bounded_tool_results(tmp_pa
             block.text
             for message in reviewer.requests[0].messages
             for block in message.content
-            if hasattr(block, "text")
+            if isinstance(block, TextBlock)
         )
         assert tool_result_secret not in rendered_request
     finally:

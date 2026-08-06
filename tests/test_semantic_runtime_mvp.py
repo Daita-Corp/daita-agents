@@ -13,7 +13,6 @@ from daita import (
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
-    ModelRequest,
     ModelResponse,
     TextBlock,
     ToolCall,

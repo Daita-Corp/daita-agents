@@ -14,7 +14,6 @@ remains a local exact artifact and is never uploaded.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 from pathlib import Path
 import subprocess

@@ -32,7 +32,6 @@ from .rendering import (
 from .state import TerminalBlock, TerminalViewState
 from .text import (
     display_clusters as _display_clusters,
-    display_width as _display_width,
     pad_display_text as _pad_display_text,
     sanitize_terminal_text as _sanitize_terminal_text,
     truncate_display_text as _truncate_display_text,
