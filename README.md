@@ -242,7 +242,8 @@ the stable command will be:
 curl -fsSL --proto '=https' --tlsv1.2 https://daita-tech.io/install.sh | bash
 ```
 
-The public endpoint is not live yet. See
+The managed installer has not been promoted to the public endpoint, which is
+not live yet. See
 [the managed installer release status](docs/MANAGED_INSTALLER_RELEASE.md).
 
 Daita 0.19.0 and earlier belong to a different legacy framework family. A
