@@ -4,11 +4,16 @@ Run from the repository root:
 
     .venv/bin/python tests/pipx_lifecycle_smoke.py
 
-Version 1.0.0 has no predecessor, so the default procedure builds one local
-artifact with the equivalent of ``python -m build`` and exercises install,
-reinstall, and uninstall through ``pipx install``, ``pipx reinstall``, and
-``pipx uninstall``. For every later release, pass the immediately preceding
-wheel and the candidate wheel:
+Version 1.0.0 has no predecessor, so pass its once-built candidate wheel and
+exercise install, reinstall, and uninstall through ``pipx install``,
+``pipx reinstall``, and ``pipx uninstall``:
+
+    .venv/bin/python tests/pipx_lifecycle_smoke.py \
+        --candidate-wheel /path/to/candidate.whl
+
+With no arguments, the developer convenience path still builds one local
+artifact with the equivalent of ``python -m build``. For every later release,
+pass the immediately preceding wheel and the candidate wheel:
 
     .venv/bin/python tests/pipx_lifecycle_smoke.py \
         --baseline-wheel /path/to/previous.whl \
@@ -43,8 +48,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--baseline-wheel", type=Path)
     parser.add_argument("--candidate-wheel", type=Path)
     arguments = parser.parse_args()
-    if (arguments.baseline_wheel is None) != (arguments.candidate_wheel is None):
-        parser.error("--baseline-wheel and --candidate-wheel must be supplied together")
+    if arguments.baseline_wheel is not None and arguments.candidate_wheel is None:
+        parser.error("--baseline-wheel requires --candidate-wheel")
     return arguments
 
 
@@ -147,7 +152,7 @@ def main() -> int:
         ):
             directory.mkdir()
 
-        if arguments.baseline_wheel is None:
+        if arguments.candidate_wheel is None:
             _run(
                 [
                     sys.executable,
@@ -161,6 +166,10 @@ def main() -> int:
             candidate_wheel = _single_artifact(distribution, ".whl")
             baseline_wheel = candidate_wheel
             sdist: Path | None = _single_artifact(distribution, ".tar.gz")
+        elif arguments.baseline_wheel is None:
+            candidate_wheel = arguments.candidate_wheel.resolve(strict=True)
+            baseline_wheel = candidate_wheel
+            sdist = None
         else:
             baseline_wheel = arguments.baseline_wheel.resolve(strict=True)
             candidate_wheel = arguments.candidate_wheel.resolve(strict=True)
@@ -202,6 +211,14 @@ def main() -> int:
         )
         if "usage: daita" not in help_result.stdout:
             raise AssertionError("installed daita --help did not render CLI usage")
+        version_result = _run(
+            [str(command), "--version"],
+            cwd=outside_checkout,
+            env=environment,
+        )
+        expected_version_output = f"daita {_wheel_version(baseline_wheel)}\n"
+        if version_result.stdout != expected_version_output:
+            raise AssertionError("installed daita --version did not match the wheel")
         _run(
             [
                 str(command),

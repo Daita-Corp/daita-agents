@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
+from typing import cast
 
 import pytest
 
@@ -39,12 +40,24 @@ from daita.catalog import (
 from daita.catalog.capabilities import (
     CATALOG_SCHEMA_CAPABILITY_ID,
     CATALOG_SCHEMA_EVIDENCE_KIND,
+    CATALOG_SEARCH_CAPABILITY_ID,
     CATALOG_TRAVERSE_CAPABILITY_ID,
+)
+from daita.catalog.models import (
+    CATALOG_MAX_LIMIT,
+    CATALOG_RESOURCE_ID_MAX_CHARACTERS,
+    CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT,
+    CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
+    CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+    CATALOG_SOURCE_ID_MAX_CHARACTERS,
+    CATALOG_TOOL_DEFAULT_LIMIT,
+    CATALOG_TOOL_QUERY_MAX_CHARACTERS,
 )
 from daita.catalog.protocols import (
     CatalogResourceNotFoundError,
     CatalogStoreError,
 )
+from daita.domains.data.controller import DataToolRuntime
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -53,6 +66,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
+from daita.loop.models import RunInput
 import daita.storage.sqlite as sqlite_store
 import daita.catalog.service as catalog_service
 
@@ -1377,6 +1391,226 @@ async def test_schema_capability_validates_output_and_is_smaller_than_inspection
                 for item in _mapping_sequence(output.data["relationships"])
             }
         ) == len(_mapping_sequence(output.data["relationships"]))
+    finally:
+        await agent.close()
+
+
+async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_explicit(
+    tmp_path: Path,
+):
+    agent = await Agent.create("catalog-input-contracts", root=tmp_path)
+    try:
+        registry: CapabilityRegistry = agent._embedded._capabilities
+        search_definition = registry.tool_definition("catalog_search")
+        schema_definition = registry.tool_definition("catalog_schema")
+        inspect_definition = registry.tool_definition("catalog_inspect")
+
+        search_properties = search_definition.input_schema["properties"]
+        schema_properties = schema_definition.input_schema["properties"]
+        inspect_properties = inspect_definition.input_schema["properties"]
+        assert isinstance(search_properties, Mapping)
+        assert isinstance(schema_properties, Mapping)
+        assert isinstance(inspect_properties, Mapping)
+
+        query_rule = {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": CATALOG_TOOL_QUERY_MAX_CHARACTERS,
+        }
+        source_rule = {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": CATALOG_SOURCE_ID_MAX_CHARACTERS,
+        }
+        limit_rule = {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": CATALOG_MAX_LIMIT,
+            "default": CATALOG_TOOL_DEFAULT_LIMIT,
+        }
+        assert canonical_json(search_properties["query"]) == canonical_json(query_rule)
+        assert canonical_json(search_properties["source_id"]) == canonical_json(
+            source_rule
+        )
+        assert canonical_json(search_properties["limit"]) == canonical_json(limit_rule)
+        assert canonical_json(search_properties["resource_kinds"]) == canonical_json(
+            {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [kind.value for kind in ResourceKind],
+                },
+                "maxItems": len(ResourceKind),
+                "uniqueItems": True,
+                "default": [],
+            }
+        )
+
+        assert "Provide a non-empty query or resource_ids" in (
+            schema_definition.description
+        )
+        assert canonical_json(schema_properties["query"]) == canonical_json(query_rule)
+        assert canonical_json(schema_properties["source_id"]) == canonical_json(
+            source_rule
+        )
+        assert canonical_json(schema_properties["limit"]) == canonical_json(limit_rule)
+        assert canonical_json(schema_properties["resource_ids"]) == canonical_json(
+            {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": CATALOG_RESOURCE_ID_MAX_CHARACTERS,
+                },
+                "maxItems": CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+                "uniqueItems": True,
+                "default": [],
+            }
+        )
+        assert canonical_json(
+            schema_properties["include_relationships"]
+        ) == canonical_json(
+            {
+                "type": "boolean",
+                "default": True,
+            }
+        )
+        assert canonical_json(inspect_properties["resource_id"]) == canonical_json(
+            {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": CATALOG_RESOURCE_ID_MAX_CHARACTERS,
+            }
+        )
+
+        for capability_id in (
+            CATALOG_SEARCH_CAPABILITY_ID,
+            CATALOG_SCHEMA_CAPABILITY_ID,
+        ):
+            with pytest.raises(CapabilityInputError) as invalid_limit:
+                registry.validate_arguments(
+                    capability_id,
+                    {"query": "orders", "limit": 100},
+                )
+            assert invalid_limit.value.code == "invalid_argument_value"
+            assert invalid_limit.value.details.to_dict() == {
+                "constraint": "maximum",
+                "name": "limit",
+            }
+
+        with pytest.raises(CapabilityInputError) as invalid_kind:
+            registry.validate_arguments(
+                CATALOG_SEARCH_CAPABILITY_ID,
+                {"query": "orders", "resource_kinds": ("spreadsheet",)},
+            )
+        assert invalid_kind.value.details.to_dict() == {
+            "constraint": "enum",
+            "name": "resource_kinds[0]",
+        }
+
+        with pytest.raises(CapabilityInputError) as duplicate_resources:
+            registry.validate_arguments(
+                CATALOG_SCHEMA_CAPABILITY_ID,
+                {
+                    "resource_ids": ("resource-a", "resource-a"),
+                    "limit": CATALOG_TOOL_DEFAULT_LIMIT,
+                },
+            )
+        assert duplicate_resources.value.details.to_dict() == {
+            "constraint": "uniqueItems",
+            "name": "resource_ids",
+        }
+
+        assert CatalogSearchRequest(agent_id="agent", query="orders").limit == (
+            CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT
+        )
+        assert CatalogSchemaRequest(agent_id="agent", query="orders").limit == (
+            CATALOG_TOOL_DEFAULT_LIMIT
+        )
+        internal_context_query = "q" * (CATALOG_TOOL_QUERY_MAX_CHARACTERS + 1)
+        assert (
+            CatalogSearchRequest(agent_id="agent", query=internal_context_query).query
+            == internal_context_query
+        )
+        oversized_search_query = "q" * (CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS + 1)
+        with pytest.raises(ValueError, match="catalog search query exceeds"):
+            CatalogSearchRequest(agent_id="agent", query=oversized_search_query)
+        oversized_tool_query = "q" * (CATALOG_TOOL_QUERY_MAX_CHARACTERS + 1)
+        with pytest.raises(ValueError, match="catalog schema query exceeds"):
+            CatalogSchemaRequest(agent_id="agent", query=oversized_tool_query)
+    finally:
+        await agent.close()
+
+
+async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "catalog-invalid-input.sqlite"
+    _fixture_database(database)
+    provider = _InventoryProvider()
+    profile = ModelProfile(
+        id=provider.provider_id,
+        context_window_tokens=80_000,
+        max_output_tokens=2_000,
+        supports_tools=True,
+    )
+    agent = await Agent.create(
+        "catalog-invalid-input",
+        root=tmp_path,
+        model=provider,
+        model_profile=profile,
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        catalog_execution_calls = 0
+
+        async def unexpected_schema_execution(*args: object, **kwargs: object):
+            nonlocal catalog_execution_calls
+            del args, kwargs
+            catalog_execution_calls += 1
+            raise AssertionError("invalid catalog schema input reached execution")
+
+        monkeypatch.setattr(
+            catalog_service.CatalogService,
+            "schema_slice",
+            unexpected_schema_execution,
+        )
+        loop = agent._embedded._loop
+        assert loop is not None
+        runtime = cast(DataToolRuntime, loop._tools)
+        run = RunInput(
+            id="catalog-invalid-input-run",
+            agent_id=agent.id,
+            message="inspect catalog",
+            created_at=_OBSERVED_AT,
+            conversation_id="catalog-invalid-input-conversation",
+            source_id=source.id,
+        )
+        results = await runtime.execute_all(
+            run,
+            (
+                ToolCall(
+                    id="invalid-limit",
+                    name="catalog_schema",
+                    arguments={"source_id": source.id, "limit": 100},
+                ),
+                ToolCall(
+                    id="missing-selector",
+                    name="catalog_schema",
+                    arguments={
+                        "source_id": source.id,
+                        "limit": CATALOG_MAX_LIMIT,
+                    },
+                ),
+            ),
+        )
+
+        error_codes = tuple(
+            _mapping(_mapping(result.output)["error"])["code"] for result in results
+        )
+        assert error_codes == ("invalid_argument_value", "catalog_invalid_schema")
+        assert catalog_execution_calls == 0
     finally:
         await agent.close()
 

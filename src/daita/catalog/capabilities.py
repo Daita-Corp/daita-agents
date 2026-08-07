@@ -14,6 +14,13 @@ from ..capabilities import (
     ToolView,
 )
 from .models import (
+    CATALOG_MAX_LIMIT,
+    CATALOG_RESOURCE_ID_MAX_CHARACTERS,
+    CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH,
+    CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+    CATALOG_SOURCE_ID_MAX_CHARACTERS,
+    CATALOG_TOOL_DEFAULT_LIMIT,
+    CATALOG_TOOL_QUERY_MAX_CHARACTERS,
     CATALOG_TRAVERSAL_DEFAULT_DEPTH,
     CATALOG_TRAVERSAL_DEFAULT_EDGES,
     CATALOG_TRAVERSAL_DEFAULT_NODES,
@@ -22,7 +29,6 @@ from .models import (
     CATALOG_TRAVERSAL_MAX_EDGES,
     CATALOG_TRAVERSAL_MAX_NODES,
     CATALOG_TRAVERSAL_MAX_PATHS,
-    CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS,
     CATALOG_TRAVERSAL_MAX_RESOURCE_IDS,
     CatalogSchemaRequest,
     CatalogSearchRequest,
@@ -65,7 +71,7 @@ class CatalogSearchExecutor:
             ResourceKind(value)
             for value in _string_tuple_argument(request, "resource_kinds", ())
         )
-        limit = _integer_argument(request, "limit", 12)
+        limit = _integer_argument(request, "limit", CATALOG_TOOL_DEFAULT_LIMIT)
         result = await self._service.search(
             CatalogSearchRequest(
                 agent_id=self._agent_id,
@@ -148,9 +154,13 @@ class CatalogSchemaExecutor:
                     (),
                 ),
                 source_id=source_id,
-                limit=_integer_argument(request, "limit", 12),
+                limit=_integer_argument(request, "limit", CATALOG_TOOL_DEFAULT_LIMIT),
                 include_relationships=include_relationships,
-                max_join_depth=_integer_argument(request, "max_join_depth", 3),
+                max_join_depth=_integer_argument(
+                    request,
+                    "max_join_depth",
+                    CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH,
+                ),
             )
         )
         return ToolOutput(
@@ -220,10 +230,32 @@ def catalog_declarations(
         input_schema={
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
-                "source_id": {"type": "string"},
-                "resource_kinds": {"type": "array"},
-                "limit": {"type": "integer"},
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": CATALOG_TOOL_QUERY_MAX_CHARACTERS,
+                },
+                "source_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": CATALOG_SOURCE_ID_MAX_CHARACTERS,
+                },
+                "resource_kinds": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [kind.value for kind in ResourceKind],
+                    },
+                    "maxItems": len(ResourceKind),
+                    "uniqueItems": True,
+                    "default": [],
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": CATALOG_MAX_LIMIT,
+                    "default": CATALOG_TOOL_DEFAULT_LIMIT,
+                },
             },
             "required": ["query"],
             "additionalProperties": False,
@@ -237,22 +269,48 @@ def catalog_declarations(
     schema = Capability(
         id=CATALOG_SCHEMA_CAPABILITY_ID,
         description=(
-            "SQL schema, bridges, paths, and exact join fields. Do not use with "
-            "catalog_traverse."
+            "SQL schema, bridges, paths, and exact join fields. Provide a non-empty "
+            "query or resource_ids. Do not use with catalog_traverse."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "query": {"type": "string"},
-                "resource_ids": {"type": "array"},
-                "source_id": {"type": "string"},
-                "limit": {"type": "integer"},
-                "include_relationships": {"type": "boolean"},
+                "query": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": CATALOG_TOOL_QUERY_MAX_CHARACTERS,
+                },
+                "resource_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": CATALOG_RESOURCE_ID_MAX_CHARACTERS,
+                    },
+                    "maxItems": CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+                    "uniqueItems": True,
+                    "default": [],
+                },
+                "source_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": CATALOG_SOURCE_ID_MAX_CHARACTERS,
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": CATALOG_MAX_LIMIT,
+                    "default": CATALOG_TOOL_DEFAULT_LIMIT,
+                },
+                "include_relationships": {
+                    "type": "boolean",
+                    "default": True,
+                },
                 "max_join_depth": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": CATALOG_TRAVERSAL_MAX_DEPTH,
-                    "default": 3,
+                    "default": CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH,
                 },
             },
             "additionalProperties": False,
@@ -268,7 +326,13 @@ def catalog_declarations(
         description="Get full catalog facets, freshness, containment, or diagnostics.",
         input_schema={
             "type": "object",
-            "properties": {"resource_id": {"type": "string"}},
+            "properties": {
+                "resource_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": CATALOG_RESOURCE_ID_MAX_CHARACTERS,
+                }
+            },
             "required": ["resource_id"],
             "additionalProperties": False,
         },
@@ -313,7 +377,7 @@ def catalog_declarations(
                     "items": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS,
+                        "maxLength": CATALOG_RESOURCE_ID_MAX_CHARACTERS,
                     },
                     "minItems": 1,
                     "maxItems": CATALOG_TRAVERSAL_MAX_RESOURCE_IDS,
@@ -324,7 +388,7 @@ def catalog_declarations(
                     "items": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS,
+                        "maxLength": CATALOG_RESOURCE_ID_MAX_CHARACTERS,
                     },
                     "minItems": 1,
                     "maxItems": CATALOG_TRAVERSAL_MAX_RESOURCE_IDS,

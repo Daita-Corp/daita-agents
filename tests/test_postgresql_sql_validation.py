@@ -338,7 +338,9 @@ def test_external_state_and_untrusted_namespace_functions_fail_closed(
 
     assert not result.valid
     issue = next(item for item in result.issues if item.code == "function_not_allowed")
-    assert function_name in issue.details["functions"]
+    denied_functions = issue.details["functions"]
+    assert isinstance(denied_functions, tuple)
+    assert function_name in denied_functions
 
 
 @pytest.mark.parametrize(

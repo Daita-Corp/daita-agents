@@ -8,6 +8,8 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelStreamCompleted,
+    ModelTextDelta,
     ModelUsage,
     TextBlock,
 )
@@ -16,7 +18,7 @@ from daita.llm.pricing import (
     CostEstimate,
     CostEstimateStatus,
 )
-from daita.llm.providers.mock import MockModelProvider
+from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
 
 
@@ -28,13 +30,14 @@ def request():
     )
 
 
-def registration(provider):
+def registration(provider, *, streaming=False):
     return ModelProviderRegistration(
         provider=provider,
         profile=ModelProfile(
             id=provider.provider_id,
             context_window_tokens=10_000,
             max_output_tokens=1_000,
+            supports_streaming=streaming,
         ),
     )
 
@@ -167,3 +170,91 @@ async def test_router_preserves_unavailable_estimate_when_all_attempts_fail():
         assert error.usage.cost_estimate.amount_usd is None
     else:
         raise AssertionError("router should preserve the final provider failure")
+
+
+async def test_router_retries_stream_before_progress_and_aggregates_completion():
+    provider = MockStreamingModelProvider(
+        (
+            ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                usage=priced_usage("0.01", input_tokens=2, output_tokens=0),
+            ),
+            (
+                ModelTextDelta("ok"),
+                ModelStreamCompleted(
+                    ModelResponse(
+                        finish_reason=FinishReason.STOP,
+                        text="ok",
+                        usage=priced_usage(
+                            "0.02",
+                            input_tokens=3,
+                            output_tokens=1,
+                        ),
+                    )
+                ),
+            ),
+        )
+    )
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    router = ModelRouter(
+        (registration(provider, streaming=True),),
+        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0.1),
+        sleep=sleep,
+    )
+
+    events = [event async for event in router.stream(request())]
+
+    assert delays == [0.1]
+    assert events[0] == ModelTextDelta("ok")
+    assert isinstance(events[1], ModelStreamCompleted)
+    assert events[1].response.text == "ok"
+    assert events[1].response.usage.input_tokens == 5
+    assert events[1].response.usage.cost_estimate.amount_usd == Decimal("0.03")
+    assert router.model_profile.supports_streaming is True
+
+
+async def test_router_never_retries_or_falls_back_after_stream_progress():
+    first = MockStreamingModelProvider(
+        (
+            (
+                ModelTextDelta("visible"),
+                ModelProviderError(ProviderErrorCode.PROVIDER_UNAVAILABLE),
+            ),
+        ),
+        provider_id="mock:first-stream",
+    )
+    second = MockStreamingModelProvider(
+        (
+            (
+                ModelTextDelta("must not appear"),
+                ModelStreamCompleted(
+                    ModelResponse(finish_reason=FinishReason.STOP, text="fallback")
+                ),
+            ),
+        ),
+        provider_id="mock:second-stream",
+    )
+    router = ModelRouter(
+        (
+            registration(first, streaming=True),
+            registration(second, streaming=True),
+        ),
+        retry_policy=RetryPolicy(attempts=3, backoff_seconds=0),
+    )
+    events = []
+
+    try:
+        async for event in router.stream(request()):
+            events.append(event)
+    except ModelProviderError as error:
+        assert error.code is ProviderErrorCode.PROVIDER_UNAVAILABLE
+    else:
+        raise AssertionError("visible stream failure must remain authoritative")
+
+    assert events == [ModelTextDelta("visible")]
+    assert len(first.requests) == 1
+    assert second.requests == ()

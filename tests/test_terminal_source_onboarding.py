@@ -119,7 +119,9 @@ async def test_terminal_onboards_local_sources_and_renders_polished_ready_screen
     assert "Stage 4 status" not in text
     assert "Agent     atlas" in text
     assert "Model     OpenAI · test-model · configured" in text
-    assert "Source    Fixture" in text and " · cataloged" in text
+    assert "Connections  1" in text
+    assert "Fixture SQLite" not in text
+    assert "Fixture files" not in text
     expected_resources = "1 resource" if source_kind == "sqlite" else "2 resources"
     assert "Catalog   " in text and expected_resources in text
     assert "Status" in text and "Ready" in text
@@ -729,7 +731,8 @@ async def test_terminal_skips_source_onboarding_when_an_active_source_exists(
 
     assert result == 0
     assert "Select a data source" not in output.getvalue()
-    assert "Existing" in output.getvalue()
+    assert "Connections  1" in output.getvalue()
+    assert "Existing" not in output.getvalue()
     assert "Stage 4 status" not in output.getvalue()
     assert "Status" in output.getvalue() and "Ready" in output.getvalue()
 
@@ -791,7 +794,7 @@ async def test_empty_repair_can_add_another_source_and_recompute_readiness(
     assert result == 0
     text = output.getvalue()
     assert "Not ready" in text
-    assert "Sources   2 cataloged" in text
+    assert "Connections  2" in text
     assert "Catalog   1 resource" in text
     assert "Status" in text and "Ready" in text
 

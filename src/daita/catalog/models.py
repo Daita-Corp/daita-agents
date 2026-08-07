@@ -22,6 +22,16 @@ _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
 _RELATIONSHIP_ID = re.compile(r"catalog-relationship:sha256:[0-9a-f]{64}\Z")
 
+CATALOG_CONTEXT_DEFAULT_LIMIT = 12
+CATALOG_MAX_LIMIT = 50
+CATALOG_RESOURCE_ID_MAX_CHARACTERS = 256
+CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT = 20
+CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS = 4_000
+CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH = 3
+CATALOG_SCHEMA_MAX_RESOURCE_IDS = 50
+CATALOG_SOURCE_ID_MAX_CHARACTERS = 256
+CATALOG_TOOL_DEFAULT_LIMIT = 12
+CATALOG_TOOL_QUERY_MAX_CHARACTERS = 1_024
 CATALOG_TRAVERSAL_DEFAULT_DEPTH = 4
 CATALOG_TRAVERSAL_DEFAULT_EDGES = 200
 CATALOG_TRAVERSAL_DEFAULT_NODES = 100
@@ -30,7 +40,6 @@ CATALOG_TRAVERSAL_MAX_DEPTH = 6
 CATALOG_TRAVERSAL_MAX_EDGES = 2_000
 CATALOG_TRAVERSAL_MAX_NODES = 1_000
 CATALOG_TRAVERSAL_MAX_PATHS = 8
-CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS = 256
 CATALOG_TRAVERSAL_MAX_RESOURCE_IDS = 16
 
 _RecordT = TypeVar("_RecordT")
@@ -1051,27 +1060,32 @@ class CatalogSchemaRequest:
     query: str | None = None
     resource_ids: tuple[str, ...] = ()
     source_id: str | None = None
-    limit: int = 12
+    limit: int = CATALOG_TOOL_DEFAULT_LIMIT
     include_relationships: bool = True
-    max_join_depth: int = 3
+    max_join_depth: int = CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH
 
     def __post_init__(self) -> None:
         _required_text(self.agent_id, "catalog schema agent_id")
         if self.query is not None:
-            _required_text(
-                self.query,
-                "catalog schema query",
-                maximum=1_024,
-            )
+            if not isinstance(self.query, str):
+                raise TypeError("catalog schema query must be a string")
+            if not self.query.strip():
+                raise ValueError("catalog schema query must be non-empty")
+            if len(self.query) > CATALOG_TOOL_QUERY_MAX_CHARACTERS:
+                raise ValueError(
+                    "catalog schema query exceeds "
+                    f"{CATALOG_TOOL_QUERY_MAX_CHARACTERS} characters"
+                )
         resource_ids = _text_tuple(
             self.resource_ids,
             "catalog schema resource_ids",
-            maximum_items=50,
+            maximum_items=CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+            maximum_characters=CATALOG_RESOURCE_ID_MAX_CHARACTERS,
         )
         _optional_text(
             self.source_id,
             "catalog schema source_id",
-            maximum=256,
+            maximum=CATALOG_SOURCE_ID_MAX_CHARACTERS,
         )
         if self.query is None and not resource_ids:
             raise ValueError(
@@ -1080,9 +1094,11 @@ class CatalogSchemaRequest:
         if (
             not isinstance(self.limit, int)
             or isinstance(self.limit, bool)
-            or not 1 <= self.limit <= 50
+            or not 1 <= self.limit <= CATALOG_MAX_LIMIT
         ):
-            raise ValueError("catalog schema limit must be from 1 through 50")
+            raise ValueError(
+                f"catalog schema limit must be from 1 through {CATALOG_MAX_LIMIT}"
+            )
         if not isinstance(self.include_relationships, bool):
             raise TypeError("catalog schema include_relationships must be a boolean")
         if (
@@ -1103,14 +1119,19 @@ class CatalogSearchRequest:
     query: str
     source_ids: tuple[str, ...] = ()
     resource_kinds: tuple[ResourceKind, ...] = ()
-    limit: int = 20
+    limit: int = CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT
 
     def __post_init__(self) -> None:
         _required_text(self.agent_id, "catalog search agent_id")
         if not isinstance(self.query, str):
             raise TypeError("catalog search query must be a string")
-        if len(self.query) > 4_000:
-            raise ValueError("catalog search query exceeds 4000 characters")
+        if not self.query.strip():
+            raise ValueError("catalog search query must be non-empty")
+        if len(self.query) > CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS:
+            raise ValueError(
+                "catalog search query exceeds "
+                f"{CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS} characters"
+            )
         sources = _text_tuple(
             self.source_ids,
             "catalog search source_ids",
@@ -1128,9 +1149,11 @@ class CatalogSearchRequest:
         if (
             not isinstance(self.limit, int)
             or isinstance(self.limit, bool)
-            or not 1 <= self.limit <= 50
+            or not 1 <= self.limit <= CATALOG_MAX_LIMIT
         ):
-            raise ValueError("catalog search limit must be from 1 through 50")
+            raise ValueError(
+                f"catalog search limit must be from 1 through {CATALOG_MAX_LIMIT}"
+            )
         object.__setattr__(self, "source_ids", sources)
         object.__setattr__(self, "resource_kinds", kinds)
 
@@ -1230,14 +1253,14 @@ class CatalogTraversalRequest:
             self.from_resource_ids,
             "catalog traversal from_resource_ids",
             maximum_items=CATALOG_TRAVERSAL_MAX_RESOURCE_IDS,
-            maximum_characters=CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS,
+            maximum_characters=CATALOG_RESOURCE_ID_MAX_CHARACTERS,
             allow_empty=False,
         )
         to_ids = _text_tuple(
             self.to_resource_ids,
             "catalog traversal to_resource_ids",
             maximum_items=CATALOG_TRAVERSAL_MAX_RESOURCE_IDS,
-            maximum_characters=CATALOG_TRAVERSAL_MAX_RESOURCE_ID_CHARACTERS,
+            maximum_characters=CATALOG_RESOURCE_ID_MAX_CHARACTERS,
             allow_empty=False,
         )
         if isinstance(self.relationship_kinds, (str, bytes)):

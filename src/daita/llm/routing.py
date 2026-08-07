@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 
 from ..security import SecretReference
@@ -13,10 +13,16 @@ from .models import (
     ModelRequest,
     ModelResponse,
     ModelSensitivity,
+    ModelStreamCompleted,
+    ModelStreamEvent,
     ModelUsage,
 )
 from .pricing import aggregate_cost_estimates
-from .protocols import ModelProvider, provider_has_complete_pricing
+from .protocols import (
+    ModelProvider,
+    StreamingModelProvider,
+    provider_has_complete_pricing,
+)
 
 _TRANSIENT = frozenset(
     {
@@ -128,7 +134,7 @@ class ModelRoute:
             supports_structured_output=all(
                 item.supports_structured_output for item in profiles
             ),
-            supports_streaming=False,
+            supports_streaming=all(item.supports_streaming for item in profiles),
             supports_reasoning=all(item.supports_reasoning for item in profiles),
             supports_vision=all(item.supports_vision for item in profiles),
             supports_documents=all(item.supports_documents for item in profiles),
@@ -234,6 +240,85 @@ class ModelRouter:
         raise ModelProviderError(
             ProviderErrorCode.INVALID_REQUEST,
             "no configured provider can handle this request",
+        )
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        """Route one canonical stream without retrying after visible progress."""
+
+        last_error: ModelProviderError | None = None
+        attempt_usage: list[ModelUsage] = []
+        for registration in self._candidates:
+            if not _eligible(registration, request):
+                continue
+            if not registration.profile.supports_streaming or not isinstance(
+                registration.provider, StreamingModelProvider
+            ):
+                continue
+            for attempt in range(self._retry_policy.attempts):
+                emitted = False
+                try:
+                    completed = False
+                    async for event in registration.provider.stream(request):
+                        if completed:
+                            raise ModelProviderError(
+                                ProviderErrorCode.MALFORMED_RESPONSE,
+                                "provider stream continued after completion",
+                                provider_id=registration.provider.provider_id,
+                            )
+                        if isinstance(event, ModelStreamCompleted):
+                            completed = True
+                            attempt_usage.append(event.response.usage)
+                            yield ModelStreamCompleted(
+                                replace(
+                                    event.response,
+                                    usage=_aggregate_usage(attempt_usage),
+                                )
+                            )
+                            return
+                        else:
+                            emitted = True
+                            yield event
+                    if not completed:
+                        raise ModelProviderError(
+                            ProviderErrorCode.MALFORMED_RESPONSE,
+                            "provider stream ended without a canonical completion",
+                            provider_id=registration.provider.provider_id,
+                        )
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except ModelProviderError as error:
+                    last_error = error
+                    attempt_usage.append(error.usage)
+                    if emitted:
+                        raise ModelProviderError(
+                            error.code,
+                            str(error),
+                            provider_id=error.provider_id,
+                            retry_after_seconds=error.retry_after_seconds,
+                            usage=_aggregate_usage(attempt_usage),
+                        ) from None
+                    if error.code not in _TRANSIENT:
+                        break
+                    if attempt + 1 < self._retry_policy.attempts:
+                        delay = (
+                            error.retry_after_seconds
+                            if error.retry_after_seconds is not None
+                            else self._retry_policy.backoff_seconds * (2**attempt)
+                        )
+                        if delay:
+                            await self._sleep(delay)
+        if last_error is not None:
+            raise ModelProviderError(
+                last_error.code,
+                str(last_error),
+                provider_id=last_error.provider_id,
+                retry_after_seconds=last_error.retry_after_seconds,
+                usage=_aggregate_usage(attempt_usage),
+            )
+        raise ModelProviderError(
+            ProviderErrorCode.INVALID_REQUEST,
+            "no configured provider can stream this request",
         )
 
 

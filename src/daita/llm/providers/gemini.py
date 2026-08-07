@@ -12,7 +12,7 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from ..._json import FrozenJsonObject, canonical_json
-from ..._installation import PIPX_REPAIR_GUIDANCE
+from ..._installation import repair_guidance
 from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from ..models import (
     CanonicalMessage,
@@ -144,7 +144,7 @@ class GeminiProvider:
             except ImportError as error:
                 raise ImportError(
                     "Daita's Gemini runtime dependency is unavailable. "
-                    f"{PIPX_REPAIR_GUIDANCE}"
+                    f"{repair_guidance()}"
                 ) from error
             self._client = cast(_GeminiClient, genai.Client(api_key=self._api_key))
         return self._client
@@ -303,10 +303,8 @@ class GeminiProvider:
                 if len(candidates) > 1:
                     raise ValueError("stream must contain at most one candidate")
                 if not candidates:
-                    if chunk_usage is None:
-                        raise ValueError(
-                            "empty stream candidates require terminal usage"
-                        )
+                    # Native streams may contain metadata-only or heartbeat
+                    # responses. They carry no canonical model output.
                     continue
                 candidate = candidates[0]
                 native_finish = _field(candidate, "finish_reason", None)

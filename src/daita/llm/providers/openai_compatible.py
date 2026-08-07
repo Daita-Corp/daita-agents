@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from ..._json import FrozenJsonObject, canonical_json
-from ..._installation import PIPX_REPAIR_GUIDANCE
+from ..._installation import repair_guidance
 from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from ..models import (
     CanonicalMessage,
@@ -176,7 +176,7 @@ class OpenAICompatibleProvider:
             except ImportError as error:
                 raise ImportError(
                     "Daita's OpenAI-compatible runtime dependency is unavailable. "
-                    f"{PIPX_REPAIR_GUIDANCE}"
+                    f"{repair_guidance()}"
                 ) from error
             self._client = cast(
                 _OpenAICompatibleClient,
@@ -327,12 +327,15 @@ class OpenAICompatibleProvider:
                 chunk_usage = _field(chunk, "usage", None)
                 if chunk_usage is not None:
                     usage_value = chunk_usage
-                choices = _sequence(_field(chunk, "choices"), "stream choices")
+                choices = _sequence(
+                    _field(chunk, "choices", ()),
+                    "stream choices",
+                )
                 if len(choices) > 1:
                     raise ValueError("stream must contain at most one choice")
                 if not choices:
-                    if chunk_usage is None:
-                        raise ValueError("empty stream choice requires terminal usage")
+                    # OpenAI-compatible servers may emit metadata-only or
+                    # heartbeat chunks. Terminal validity is checked below.
                     continue
                 choice = choices[0]
                 choice_index = _field(choice, "index", 0)
@@ -439,7 +442,10 @@ class OpenAICompatibleProvider:
                 state = tool_states[index]
                 if state.provider_call_id is None or state.name is None:
                     raise ValueError("stream tool call is missing identity")
-                arguments_value = json.loads("".join(state.argument_fragments))
+                encoded_arguments = "".join(state.argument_fragments)
+                arguments_value = (
+                    {} if not encoded_arguments else json.loads(encoded_arguments)
+                )
                 if not isinstance(arguments_value, dict):
                     raise ValueError("stream tool arguments must decode to an object")
                 calls.append(

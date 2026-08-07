@@ -13,7 +13,7 @@ import re
 from typing import Any
 from urllib.parse import quote
 
-from .._installation import PIPX_REPAIR_GUIDANCE
+from .._installation import repair_guidance
 from .._json import canonical_json
 from ..capabilities import ExtensionDeclarations
 from ..catalog.models import (
@@ -1078,7 +1078,7 @@ def _load_asyncpg() -> Any:
     except ImportError as error:
         raise ImportError(
             "Daita's PostgreSQL runtime dependency is unavailable. "
-            f"{PIPX_REPAIR_GUIDANCE}"
+            f"{repair_guidance()}"
         ) from error
 
 

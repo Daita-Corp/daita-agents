@@ -12,7 +12,7 @@ from typing import Protocol, cast
 from uuid import uuid4
 
 from ..._json import FrozenJsonObject, canonical_json
-from ..._installation import PIPX_REPAIR_GUIDANCE
+from ..._installation import repair_guidance
 from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from ..models import (
     CanonicalMessage,
@@ -40,6 +40,7 @@ from ..pricing import (
 
 _CONTINUATION_KEY = "anthropic_continuation"
 _OPAQUE_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
+_NONCONTENT_STREAM_BLOCK_TYPES = frozenset({"fallback"})
 _STREAM_MISSING = object()
 
 
@@ -54,9 +55,9 @@ class _MessageStreamManager(Protocol):
 
     async def __aexit__(
         self,
-        exc_type: object,
-        exc_value: object,
-        traceback: object,
+        _exc_type: object,
+        _exc_value: object,
+        _traceback: object,
     ) -> bool | None: ...
 
 
@@ -140,7 +141,7 @@ class AnthropicMessagesProvider:
             except ImportError as error:
                 raise ImportError(
                     "Daita's Anthropic runtime dependency is unavailable. "
-                    f"{PIPX_REPAIR_GUIDANCE}"
+                    f"{repair_guidance()}"
                 ) from error
             self._client = cast(
                 _AnthropicClient,
@@ -535,7 +536,6 @@ class _AnthropicBillingUsage:
 
 @dataclass(slots=True)
 class _StreamBlockState:
-    native_index: int
     block_type: str
     text_fragments: list[str] = field(default_factory=list)
     tool_index: int | None = None
@@ -644,7 +644,17 @@ class _AnthropicStreamDecoder:
         if event_type == "message_start":
             self._consume_message_start(event)
             return []
-        if not self._started:
+        if (
+            event_type
+            in {
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            }
+            and not self._started
+        ):
             raise ValueError("stream content preceded message_start")
         if event_type == "content_block_start":
             return self._consume_block_start(event)
@@ -659,7 +669,9 @@ class _AnthropicStreamDecoder:
         if event_type == "message_stop":
             self._consume_message_stop()
             return []
-        raise ValueError("stream contains an unsupported event type")
+        # Anthropic may add event types without a version change. Unknown
+        # lifecycle or metadata events are not canonical model output.
+        return []
 
     def finish(self) -> ModelResponse:
         if not self._started or not self._terminal:
@@ -788,7 +800,7 @@ class _AnthropicStreamDecoder:
             _field(content_block, "type"),
             "content block type",
         )
-        state = _StreamBlockState(native_index=index, block_type=block_type)
+        state = _StreamBlockState(block_type=block_type)
         self._blocks[index] = state
         if block_type == "text":
             initial_text = _text_value(
@@ -848,6 +860,8 @@ class _AnthropicStreamDecoder:
                 block_type,
             )
             return []
+        if block_type in _NONCONTENT_STREAM_BLOCK_TYPES:
+            return []
         raise ValueError("stream contains an unsupported content block")
 
     def _consume_block_delta(
@@ -892,14 +906,9 @@ class _AnthropicStreamDecoder:
     def _consume_block_stop(self, event: object) -> None:
         index = _nonnegative_int(_field(event, "index"), "content block index")
         state = self._open_block(index)
-        if state.block_type == "text":
-            if not "".join(state.text_fragments).strip():
-                raise ValueError("streamed text block is empty")
-        elif state.block_type == "tool_use":
+        if state.block_type == "tool_use":
             encoded_arguments = "".join(state.arguments_fragments)
-            if not encoded_arguments:
-                raise ValueError("streamed tool-use arguments are missing")
-            arguments = json.loads(encoded_arguments)
+            arguments = {} if not encoded_arguments else json.loads(encoded_arguments)
             if not isinstance(arguments, dict):
                 raise ValueError("streamed tool-use arguments must be an object")
             if (
@@ -930,7 +939,10 @@ class _AnthropicStreamDecoder:
             if state.opaque_block is None:
                 raise ValueError("redacted thinking block is missing")
             self._opaque_blocks.append((index, state.opaque_block))
-        else:
+        elif (
+            state.block_type != "text"
+            and state.block_type not in _NONCONTENT_STREAM_BLOCK_TYPES
+        ):
             raise ValueError("stream contains an unsupported content block")
         state.closed = True
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 import re
 
 from ..security import (
@@ -10,8 +11,8 @@ from ..security import (
     default_secret_provider,
 )
 from .errors import ModelProviderError, ProviderErrorCode
-from .models import ModelRequest, ModelResponse
-from .protocols import ModelProvider
+from .models import ModelRequest, ModelResponse, ModelStreamEvent
+from .protocols import ModelProvider, StreamingModelProvider
 from .providers import (
     AnthropicProvider,
     GeminiProvider,
@@ -102,6 +103,23 @@ class _LazyProvider:
         )
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
+        provider = await self._resolve(request)
+        return await provider.generate(request)
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        provider = await self._resolve(request)
+        if not self._candidate.profile.supports_streaming or not isinstance(
+            provider, StreamingModelProvider
+        ):
+            raise ModelProviderError(
+                ProviderErrorCode.INVALID_REQUEST,
+                "configured provider route does not support streaming",
+                provider_id=self.provider_id,
+            )
+        async for event in provider.stream(request):
+            yield event
+
+    async def _resolve(self, request: ModelRequest) -> ModelProvider:
         if not self.supports_request_policy(request):
             raise ModelProviderError(
                 ProviderErrorCode.INVALID_REQUEST,
@@ -127,7 +145,7 @@ class _LazyProvider:
                 base_url=self._candidate.base_url,
                 max_output_tokens=self._candidate.profile.max_output_tokens,
             )
-        return await self._provider.generate(request)
+        return self._provider
 
 
 def _secret_provider_error_code(

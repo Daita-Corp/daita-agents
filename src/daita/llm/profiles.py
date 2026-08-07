@@ -17,6 +17,7 @@ _REVIEWED_MODEL_PROFILES = {
             context_window_tokens=1_050_000,
             max_output_tokens=128_000,
             supports_tools=True,
+            supports_streaming=True,
             supports_reasoning=True,
         ),
         ModelProfile(
@@ -24,6 +25,7 @@ _REVIEWED_MODEL_PROFILES = {
             context_window_tokens=1_050_000,
             max_output_tokens=128_000,
             supports_tools=True,
+            supports_streaming=True,
             supports_reasoning=True,
         ),
         ModelProfile(
@@ -31,6 +33,7 @@ _REVIEWED_MODEL_PROFILES = {
             context_window_tokens=1_050_000,
             max_output_tokens=128_000,
             supports_tools=True,
+            supports_streaming=True,
             supports_reasoning=True,
         ),
         ModelProfile(
@@ -38,6 +41,7 @@ _REVIEWED_MODEL_PROFILES = {
             context_window_tokens=1_048_576,
             max_output_tokens=65_536,
             supports_tools=True,
+            supports_streaming=True,
             supports_reasoning=True,
         ),
         ModelProfile(
@@ -45,6 +49,7 @@ _REVIEWED_MODEL_PROFILES = {
             context_window_tokens=1_048_576,
             max_output_tokens=65_536,
             supports_tools=True,
+            supports_streaming=True,
             supports_reasoning=True,
         ),
         ModelProfile(
@@ -52,6 +57,7 @@ _REVIEWED_MODEL_PROFILES = {
             context_window_tokens=1_048_576,
             max_output_tokens=65_536,
             supports_tools=True,
+            supports_streaming=True,
             supports_reasoning=True,
         ),
     )

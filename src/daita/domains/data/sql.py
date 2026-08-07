@@ -12,7 +12,7 @@ import hashlib
 import re
 from typing import Any, Literal
 
-from ..._installation import PIPX_REPAIR_GUIDANCE
+from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json
 
 _SqlDialect = Literal["sqlite", "postgresql"]
@@ -590,11 +590,11 @@ def _load_sqlglot(dialect: _SqlDialect = "sqlite") -> tuple[Any, Any]:
         if dialect == "postgresql":
             raise ImportError(
                 "Daita's PostgreSQL SQL validation dependency is unavailable. "
-                f"{PIPX_REPAIR_GUIDANCE}"
+                f"{repair_guidance()}"
             ) from error
         raise ImportError(
             "Daita's SQLite SQL validation dependency is unavailable. "
-            f"{PIPX_REPAIR_GUIDANCE}"
+            f"{repair_guidance()}"
         ) from error
     return sqlglot, exp
 

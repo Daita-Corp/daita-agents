@@ -841,6 +841,11 @@ class EmbeddedAgent:
                 limits=limits,
                 clock=clock,
                 observer=observer,
+                stream_model_calls=(
+                    model_profile.supports_streaming
+                    if model_profile is not None
+                    else False
+                ),
             )
         )
         return cls(
@@ -2238,6 +2243,7 @@ def _model_profile(
         max_output_tokens=max_output_tokens,
         supports_tools=True,
         supports_parallel_tools=False,
+        supports_streaming=provider in _BUILTIN_PROVIDERS,
     )
 
 

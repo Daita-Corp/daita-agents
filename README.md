@@ -31,6 +31,9 @@ become more useful over time without giving up human control.
 
 ## Quick start
 
+The first managed installer release targets macOS on Apple Silicon and Intel,
+plus glibc Linux on x86_64 and arm64.
+
 You need Python 3.11 or 3.12 and
 [pipx](https://pipx.pypa.io/stable/installation/).
 
@@ -63,9 +66,16 @@ Run `daita` again for a returning launch. Daita reopens the only agent
 automatically or shows a picker when several exist. Use `daita --agent atlas`
 to select one directly.
 
-Inside the terminal, use `/help` to see available commands. Press Enter to
-submit, Ctrl-J for a newline, Ctrl-C to cancel an active run, and Ctrl-D to
-exit from an empty prompt.
+Inside the terminal, use `/help` to see available commands and shipped
+controls. Press Enter to submit, Ctrl-J for a newline, and Ctrl-D to exit from
+an empty prompt. Press Escape twice to clear the current input. Ctrl-C copies
+an application-owned selection; without a selection it cancels an active run.
+The animated status shows the active tool without filling the transcript with
+tool cards. After a run, press Ctrl-O to show or hide that run's recorded tool
+calls and results. Clipboard requests that a terminal cannot acknowledge are
+reported as requests, not successful copies. If pointer or clipboard support
+is unavailable, use the terminal's own selection bypass modifier (often
+Shift) and copy command.
 
 ## How it works
 
@@ -222,6 +232,25 @@ Use `pipx reinstall daita-agents` to repair missing or damaged application
 dependencies. Uninstalling the application does not delete existing agent
 homes or credentials stored in the OS keychain.
 
+The managed installer owns only `~/.local/bin/daita` and
+`~/.local/share/daita`; application data remains separately owned under
+`~/.daita`. Its install, verify, repair, rollback, and uninstall actions never
+roll back or delete application data or OS-keychain entries. Once published,
+the stable command will be:
+
+```bash
+curl -fsSL --proto '=https' --tlsv1.2 https://daita-tech.io/install.sh | bash
+```
+
+The managed installer has not been promoted to the public endpoint, which is
+not live yet. See
+[the managed installer release status](docs/MANAGED_INSTALLER_RELEASE.md).
+
+Daita 0.19.0 and earlier belong to a different legacy framework family. A
+0.x-to-1.0 migration is unsupported. Preserve or archive legacy `~/.daita`
+data and explicitly remove the old application before a clean 1.0 install;
+the managed installer does not adopt, migrate, delete, or overwrite it.
+
 ## Development
 
 ```bash
@@ -240,10 +269,13 @@ Run the deterministic suite before submitting a change:
 .venv/bin/python -m mypy src/daita tests
 ```
 
-`tests/pipx_lifecycle_smoke.py` additionally builds a fresh wheel and exercises
-an isolated pipx install, dependency check, real XLSX runtime, reinstall, state
-preservation, and uninstall. It is a required release gate on both Python 3.11
-and 3.12 and may download declared dependencies.
+Release CI builds the candidate wheel once, then passes those exact bytes to
+both `tests/managed_installer_lifecycle_smoke.py` and
+`tests/pipx_lifecycle_smoke.py`. The managed smoke uses deterministic local
+downloads and verifies install, repeat, repair, rollback, verification,
+uninstall, and data preservation. The pipx smoke exercises dependency checks,
+the real XLSX runtime, reinstall, state preservation, and uninstall on Python
+3.11 and 3.12 and may download declared dependencies.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
 [SECURITY.md](SECURITY.md) for private vulnerability reporting.

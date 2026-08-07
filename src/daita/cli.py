@@ -32,6 +32,7 @@ from . import (
     SQLiteSource,
     Skill,
     SkillSummary,
+    __version__,
     create_llm_provider,
 )
 from .artifacts.models import (
@@ -148,6 +149,7 @@ def _learning_candidate_mapping(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="daita")
+    parser.add_argument("--version", action="version", version=f"daita {__version__}")
     parser.add_argument("--root", type=Path)
     parser.add_argument("--agent", help="agent to open in terminal mode")
     commands = parser.add_subparsers(dest="command")
@@ -404,6 +406,7 @@ def _model_configuration(
         max_output_tokens=max_output,
         supports_tools=profile.supports_tools,
         supports_parallel_tools=profile.supports_parallel_tools,
+        supports_streaming=profile.supports_streaming,
     )
 
 

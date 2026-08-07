@@ -15,6 +15,10 @@ from ...catalog.capabilities import (
     CATALOG_SEARCH_EVIDENCE_KIND,
     CATALOG_TRAVERSE_EVIDENCE_KIND,
 )
+from ...catalog.models import (
+    CATALOG_CONTEXT_DEFAULT_LIMIT,
+    CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
+)
 from ...llm.errors import ContextWindowExceeded
 from ...llm.models import (
     CanonicalMessage,
@@ -173,7 +177,7 @@ class DataContextBuilder:
         skills: SkillContextReader | None = None,
         semantics: SemanticContextReader | None = None,
         artifact_destinations: ArtifactDestinationContextReader | None = None,
-        catalog_limit: int = 12,
+        catalog_limit: int = CATALOG_CONTEXT_DEFAULT_LIMIT,
         retain_messages: int = 40,
     ) -> None:
         if not isinstance(profile, ModelProfile):
@@ -222,9 +226,6 @@ class DataContextBuilder:
         self._profile = profile
         self._catalog_limit = catalog_limit
         self._selected_learning_candidates: dict[str, tuple[str, str]] = {}
-        # Retained only as a compatible constructor validation seam. Stage 1's
-        # fixed history ceiling and whole-request budget own actual selection.
-        self._retain_messages = retain_messages
 
     def select_learning_candidate(
         self,
@@ -1225,8 +1226,8 @@ def _catalog_query(
     current_message: str,
     prior_turns: tuple[tuple[CanonicalMessage, ...], ...],
 ) -> str:
-    query = current_message[:4_000]
-    if len(query) >= 4_000:
+    query = current_message[:CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS]
+    if len(query) >= CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS:
         return query
     prior_user = next(
         (
