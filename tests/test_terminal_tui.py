@@ -3543,7 +3543,7 @@ async def test_hydration_failures_do_not_change_the_authoritative_loop_exit(
         monkeypatch.setattr(
             TerminalViewState,
             "hydrate_transcript",
-            lambda self, loaded_transcript, *, run_id: (_ for _ in ()).throw(
+            lambda self, _loaded_transcript, *, run_id: (_ for _ in ()).throw(
                 RuntimeError("projection failed")
             ),
         )

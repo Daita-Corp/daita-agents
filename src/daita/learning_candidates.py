@@ -2883,10 +2883,6 @@ def _estimated_review_input_tokens(request: ModelRequest) -> int:
     return math.ceil(len(data) / 4) + 1_024
 
 
-def _candidate_content_mapping(content: LearningCandidateContent) -> object:
-    return _json_value(content)
-
-
 def _fingerprint(value: object) -> str:
     return sha256(canonical_json(_json_value(value)).encode("utf-8")).hexdigest()
 

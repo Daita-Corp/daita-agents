@@ -49,9 +49,9 @@ class _AnthropicStreamManager:
 
     async def __aexit__(
         self,
-        exc_type: object,
-        exc_value: object,
-        traceback: object,
+        _exc_type: object,
+        _exc_value: object,
+        _traceback: object,
     ) -> bool | None:
         return None
 

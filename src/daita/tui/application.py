@@ -20,8 +20,6 @@ from ..terminal_transcript import (
     bounded_selection_auto_scroll,
 )
 from .capabilities import (
-    MAX_RENDER_WIDTH as _MAX_RENDER_WIDTH,
-    MIN_RENDER_WIDTH as _MIN_RENDER_WIDTH,
     RUNNING_GLYPHS as _RUNNING_GLYPHS,
     ResponsiveProjection,
     TerminalCapabilities,
@@ -2232,11 +2230,6 @@ def _clear_current_task_cancellation() -> None:
         return
     while current.cancelling():
         current.uncancel()
-
-
-def _render_width(output: Any) -> int:
-    columns, _rows = _terminal_size(output)
-    return max(_MIN_RENDER_WIDTH, min(columns - 2, _MAX_RENDER_WIDTH))
 
 
 def _viewport_height(window: Any) -> int:

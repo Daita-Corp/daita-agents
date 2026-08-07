@@ -248,7 +248,6 @@ class ExactCsvRenderer:
         self._clock = clock
         self._deadline = clock() + float(max_seconds)
         self._max_rows = max_rows
-        self._max_columns = max_columns
         self._max_bytes = max_bytes
         self._columns = _validated_csv_columns(tuple(columns), max_columns)
         self._rows = 0

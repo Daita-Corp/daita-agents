@@ -226,9 +226,6 @@ class DataContextBuilder:
         self._profile = profile
         self._catalog_limit = catalog_limit
         self._selected_learning_candidates: dict[str, tuple[str, str]] = {}
-        # Retained only as a compatible constructor validation seam. Stage 1's
-        # fixed history ceiling and whole-request budget own actual selection.
-        self._retain_messages = retain_messages
 
     def select_learning_candidate(
         self,

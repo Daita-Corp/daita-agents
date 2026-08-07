@@ -55,9 +55,9 @@ class _MessageStreamManager(Protocol):
 
     async def __aexit__(
         self,
-        exc_type: object,
-        exc_value: object,
-        traceback: object,
+        _exc_type: object,
+        _exc_value: object,
+        _traceback: object,
     ) -> bool | None: ...
 
 
@@ -536,7 +536,6 @@ class _AnthropicBillingUsage:
 
 @dataclass(slots=True)
 class _StreamBlockState:
-    native_index: int
     block_type: str
     text_fragments: list[str] = field(default_factory=list)
     tool_index: int | None = None
@@ -801,7 +800,7 @@ class _AnthropicStreamDecoder:
             _field(content_block, "type"),
             "content block type",
         )
-        state = _StreamBlockState(native_index=index, block_type=block_type)
+        state = _StreamBlockState(block_type=block_type)
         self._blocks[index] = state
         if block_type == "text":
             initial_text = _text_value(
