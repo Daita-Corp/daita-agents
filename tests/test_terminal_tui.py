@@ -3,14 +3,14 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import inspect
+import io
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
-import io
-import inspect
-import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast, TextIO
+from typing import Any, TextIO, cast
 
 import pytest
 from prompt_toolkit.data_structures import Point, Size
@@ -39,9 +39,6 @@ from daita.llm.models import (
 from daita.llm.pricing import CostBasis, CostEstimate
 from daita.loop.models import RunInput, Transcript
 from daita.observation import AgentEvent, AgentEventKind
-from daita.tui import clipboard as tui_clipboard
-from daita.tui import application as tui_application
-from daita.tui import transcript_view as tui_transcript_view
 from daita.terminal_tui import (
     MAX_COMPOSER_CHARACTERS,
     TerminalApplicationResult,
@@ -50,6 +47,11 @@ from daita.terminal_tui import (
     TerminalSuspendBridge,
     TerminalViewState,
     run_terminal_tui,
+)
+from daita.tui import (
+    application as tui_application,
+    clipboard as tui_clipboard,
+    transcript_view as tui_transcript_view,
 )
 
 
@@ -1746,6 +1748,15 @@ async def test_selection_drag_auto_scrolls_only_one_row_per_mouse_event():
 
         assert initial_top - content_window.vertical_scroll == 1
         assert state.transcript_selection.active is True
+        selected_while_dragging = state.transcript_selection.text
+        release = MouseEvent(
+            position=move.position,
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        assert content_window.content.mouse_handler(release) is None
+        assert state.transcript_selection.text == selected_while_dragging
         application.current_buffer.reset()
         pipe.send_text("\x04")
         await task

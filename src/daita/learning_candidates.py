@@ -9,15 +9,15 @@ approval-gated capabilities.
 from __future__ import annotations
 
 import asyncio
+import json
+import math
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
-import json
-import math
-import re
 from typing import Protocol, cast
 
 from ._json import FrozenJsonObject, canonical_json

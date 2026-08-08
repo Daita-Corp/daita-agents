@@ -2,32 +2,32 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-import re
 from typing import Self
 
 from ._json import FrozenJsonObject
-from .artifacts.models import (
-    ArtifactDeliveryReceipt,
-    ArtifactDestination,
-    ArtifactPayload,
-)
 from .adapters.models import SourceRegistration
 from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
 )
 from .adapters.protocols import ResourceSource
+from .artifacts.models import (
+    ArtifactDeliveryReceipt,
+    ArtifactDestination,
+    ArtifactPayload,
+)
+from .capabilities import ApprovalHandler
 from .catalog.models import (
     CatalogResource,
     CatalogSearchRequest,
     CatalogSearchResult,
     CatalogSummary,
 )
-from .capabilities import ApprovalHandler
 from .config import AgentConfig
 from .hosting.embedded import (
     AgentAlreadyExistsError,
@@ -41,9 +41,6 @@ from .hosting.embedded import (
     HostActiveError,
     SourceSelectionError,
 )
-from .llm.models import ModelProfile
-from .llm.protocols import ModelProvider
-from .llm.routing import ModelRoute
 from .learning_candidates import (
     LearningCandidateContent,
     LearningCandidateRejectionReason,
@@ -51,6 +48,10 @@ from .learning_candidates import (
     LearningCandidateView,
     LearningReviewResult,
 )
+from .llm.models import ModelProfile
+from .llm.protocols import ModelProvider
+from .llm.routing import ModelRoute
+from .llm.subscription_auth import CodexDevicePrompt
 from .loop.driver import ContextBuilder, ToolRuntime
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
 from .observation import AgentObserver
@@ -218,12 +219,28 @@ class Agent:
             model=model,
         )
 
+    async def authenticate_model_subscription(
+        self,
+        *,
+        provider: str,
+        on_verification: Callable[[CodexDevicePrompt], None],
+        on_progress: Callable[[str], None] | None = None,
+    ) -> str:
+        """Return an opaque subscription credential for model configuration."""
+
+        return await self._embedded.authenticate_model_subscription(
+            provider=provider,
+            on_verification=on_verification,
+            on_progress=on_progress,
+        )
+
     async def configure_model(
         self,
         *,
         provider: str,
         model: str,
         api_key: str | None = None,
+        subscription_credential: str | None = None,
         base_url: str | None = None,
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
@@ -231,18 +248,22 @@ class Agent:
         """Validate and persist one model route for the next open."""
 
         credential = api_key
+        subscription_secret = subscription_credential
         api_key = None
+        subscription_credential = None
         try:
             return await self._embedded.configure_model(
                 provider=provider,
                 model=model,
                 api_key=credential,
+                subscription_credential=subscription_secret,
                 base_url=base_url,
                 context_window_tokens=context_window_tokens,
                 max_output_tokens=max_output_tokens,
             )
         finally:
             credential = None
+            subscription_secret = None
 
     async def run(
         self,

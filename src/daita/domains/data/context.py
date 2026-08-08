@@ -55,10 +55,6 @@ from .controller import (
     POSTGRESQL_QUERY_EVIDENCE_KIND,
     SQLITE_QUERY_EVIDENCE_KIND,
 )
-from .file_capabilities import (
-    LOCAL_FILE_READ_EVIDENCE_KIND,
-    LOCAL_FILE_READ_TOOL_NAME,
-)
 from .export_capabilities import (
     ARTIFACT_CONVERT_TOOL_NAME,
     ARTIFACT_LIST_TOOL_NAME,
@@ -69,6 +65,10 @@ from .export_capabilities import (
     LOCAL_FILE_COPY_TOOL_NAME,
     POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
     SQLITE_TABULAR_EXPORT_TOOL_NAME,
+)
+from .file_capabilities import (
+    LOCAL_FILE_READ_EVIDENCE_KIND,
+    LOCAL_FILE_READ_TOOL_NAME,
 )
 
 _MAXIMUM_PRIOR_COMPLETED_RUNS = 8

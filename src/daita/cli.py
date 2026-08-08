@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass, field, replace
-from decimal import Decimal, InvalidOperation
 import json
 import os
-from pathlib import Path
 import shlex
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Protocol, Sequence
 
 from . import (
@@ -23,15 +23,15 @@ from . import (
     ApprovalHandler,
     ApprovalRequest,
     ArtifactError,
-    LocalDirectorySource,
-    LoopExit,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningCandidateView,
+    LocalDirectorySource,
+    LoopExit,
     PostgreSQLSource,
-    SQLiteSource,
     Skill,
     SkillSummary,
+    SQLiteSource,
     __version__,
     create_llm_provider,
 )
@@ -39,6 +39,10 @@ from .artifacts.models import (
     artifact_delivery_receipt_to_mapping,
     artifact_destination_to_mapping,
     artifact_ref_to_mapping,
+)
+from .learning_candidates import (
+    LEARNING_REVIEW_MAX_TOTAL_TOKENS,
+    learning_candidate_content_to_mapping,
 )
 from .llm import (
     CostEstimate,
@@ -48,10 +52,6 @@ from .llm import (
     format_cost_estimate,
 )
 from .llm.profiles import reviewed_model_profile
-from .learning_candidates import (
-    LEARNING_REVIEW_MAX_TOTAL_TOKENS,
-    learning_candidate_content_to_mapping,
-)
 from .security import SecretReference
 from .skills import validate_skill_name
 from .terminal import (

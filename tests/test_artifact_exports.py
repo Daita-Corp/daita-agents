@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+import threading
+import time as time_module
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
-import sqlite3
-import threading
-import time as time_module
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID
@@ -18,8 +18,10 @@ import pytest
 
 from daita import Agent, SQLiteSource
 from daita._json import canonical_json
-from daita.adapters import postgresql_query as postgresql_query_module
-from daita.adapters import sqlite_query as sqlite_query_module
+from daita.adapters import (
+    postgresql_query as postgresql_query_module,
+    sqlite_query as sqlite_query_module,
+)
 from daita.adapters.models import SourceRegistration
 from daita.artifacts.models import (
     ArtifactAuthorship,
@@ -35,7 +37,6 @@ from daita.artifacts.renderers import (
     render_exact_csv,
 )
 from daita.catalog.models import Sensitivity
-from daita.domains.data.sql import ResourceSchema
 from daita.domains.data.export_capabilities import (
     POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
     POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
@@ -43,6 +44,7 @@ from daita.domains.data.export_capabilities import (
     SQLITE_TABULAR_EXPORT_TOOL_NAME,
     artifact_extension_declarations,
 )
+from daita.domains.data.sql import ResourceSchema
 from daita.llm.models import (
     FinishReason,
     MessageRole,

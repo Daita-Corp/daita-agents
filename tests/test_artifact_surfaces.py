@@ -3,17 +3,17 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
 import pytest
 
-from daita import Agent, ArtifactDeliveryReceipt
+import daita.artifacts.delivery as delivery_module
+from daita import Agent, ArtifactDeliveryReceipt, cli, terminal_tui
 from daita.artifacts.models import (
     ArtifactAuthorship,
     ArtifactProvenance,
     ArtifactRef,
 )
 from daita.catalog.models import Sensitivity
-from daita import cli, terminal_tui
-import daita.artifacts.delivery as delivery_module
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,

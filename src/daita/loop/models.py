@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-import math
 
 from ..artifacts.models import ArtifactDeliveryReceipt, ArtifactRef
 from ..llm.models import CanonicalMessage, ModelUsage

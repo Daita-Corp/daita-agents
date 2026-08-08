@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
 import os
 import re
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Protocol, TypeVar, cast, runtime_checkable
 
 from .._installation import repair_guidance
@@ -336,6 +336,32 @@ class CompositeSecretProvider:
         raise SecretResolutionError(
             "secret_not_found",
             "The configured secret is unavailable.",
+        )
+
+    async def set(self, reference: SecretReference, value: str) -> None:
+        """Mutate the first explicitly composed keychain store."""
+
+        _keychain_reference(reference)
+        for provider in self._providers:
+            if isinstance(provider, KeychainStore):
+                await provider.set(reference, value)
+                return
+        raise SecretResolutionError(
+            "secret_provider_unavailable",
+            "The configured secret providers do not include a keychain store.",
+        )
+
+    async def delete(self, reference: SecretReference) -> None:
+        """Delete through the first explicitly composed keychain store."""
+
+        _keychain_reference(reference)
+        for provider in self._providers:
+            if isinstance(provider, KeychainStore):
+                await provider.delete(reference)
+                return
+        raise SecretResolutionError(
+            "secret_provider_unavailable",
+            "The configured secret providers do not include a keychain store.",
         )
 
     def __repr__(self) -> str:

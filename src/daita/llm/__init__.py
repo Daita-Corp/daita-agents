@@ -20,7 +20,6 @@ from .models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from .protocols import ModelProvider, StreamingModelProvider
 from .pricing import (
     CostBasis,
     CostComponent,
@@ -29,6 +28,7 @@ from .pricing import (
     aggregate_cost_estimates,
     format_cost_estimate,
 )
+from .protocols import ModelProvider, StreamingModelProvider
 from .providers import (
     AnthropicProvider,
     GeminiProvider,

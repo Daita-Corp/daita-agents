@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import io
 import json
-from pathlib import Path
 import sqlite3
+import stat
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
-from daita import Agent, SQLiteSource
+import daita.hosting.embedded as embedded
+from daita import Agent, SQLiteSource, cli, terminal
 from daita.adapters.models import SourceRegistration
 from daita.agent import AgentHomeError
 from daita.llm.models import (
@@ -20,8 +22,6 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import KeychainSecretProvider, SecretReference
 from daita.skills import Skill
-from daita import cli, terminal
-import daita.hosting.embedded as embedded
 
 NOW = datetime(2026, 7, 29, tzinfo=timezone.utc)
 
@@ -93,6 +93,19 @@ def _validation_response(provider_id: str) -> ModelResponse:
 def _database(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("CREATE TABLE records (id INTEGER PRIMARY KEY)")
+
+
+async def test_agent_state_root_and_database_are_owner_only(tmp_path: Path) -> None:
+    root = tmp_path / "state-root"
+    root.mkdir(mode=0o755)
+
+    agent = await Agent.create("atlas", root=root)
+    try:
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE(agent.home.stat().st_mode) == 0o700
+        assert stat.S_IMODE((agent.home / "state.db").stat().st_mode) == 0o600
+    finally:
+        await agent.close()
 
 
 async def test_clear_conversations_removes_transcript_derived_state_only(

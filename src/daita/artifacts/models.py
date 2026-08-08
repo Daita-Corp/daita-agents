@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-import re
-import unicodedata
 
 from .._json import FrozenJsonObject
 from ..catalog.models import Sensitivity

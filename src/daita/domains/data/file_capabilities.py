@@ -9,8 +9,8 @@ from ..._json import FrozenJsonObject
 from ...capabilities import (
     AccessMode,
     Capability,
-    ExtensionDeclarations,
     Executor,
+    ExtensionDeclarations,
     ToolApplicability,
     ToolExecution,
     ToolOutput,

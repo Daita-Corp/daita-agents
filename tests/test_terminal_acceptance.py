@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 import io
-from pathlib import Path
 import re
 import sqlite3
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
+import daita.hosting.embedded as embedded
 from daita import Agent, SQLiteSource
 from daita.agent import PostgreSQLProbeResult
 from daita.llm.models import (
@@ -25,7 +26,6 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import SecretReference
 from daita.terminal import run_terminal_application
-import daita.hosting.embedded as embedded
 
 
 class _FakeKeychain:
@@ -271,7 +271,7 @@ async def test_first_run_keyboard_postgresql_path_reaches_grounded_chat(
         for local_text in (
             "Select an agent",
             "Select a model provider",
-            "Select an OpenAI model",
+            "Select an OpenAI API model",
             "Select a source type",
             "Select one or more schemas",
             "Space toggle",
@@ -370,7 +370,7 @@ async def test_returning_keyboard_selection_skips_onboarding_and_writes_no_dupli
     assert code == 0
     text = output.getvalue()
     assert "Agent     customer" in text
-    assert "Model     OpenAI · returning-model · configured" in text
+    assert "Model     OpenAI API · returning-model · configured" in text
     assert "Connections  1" in text
     assert "Retained source" not in text
     assert "Status" in text and "Ready" in text

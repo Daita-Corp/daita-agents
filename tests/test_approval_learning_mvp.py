@@ -1,8 +1,8 @@
 import asyncio
+import threading
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
-import threading
 from typing import cast
 
 import pytest
@@ -17,6 +17,7 @@ from daita.capabilities import (
     SideEffectExecutor,
     ToolExecution,
 )
+from daita.domains.data.controller import DataToolRuntime
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -29,7 +30,6 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
-from daita.domains.data.controller import DataToolRuntime
 from daita.memory import MEMORY_MAX_CHARACTERS, USER_MAX_CHARACTERS
 from daita.memory.capabilities import (
     MEMORY_SET_CAPABILITY_ID,

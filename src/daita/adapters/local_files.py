@@ -4,20 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import csv
-from collections.abc import Mapping
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from hashlib import sha256
 import io
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
 import stat
 import threading
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from hashlib import sha256
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
 from .._json import canonical_json
+from ..capabilities import ExtensionDeclarations
 from ..catalog.models import (
     CatalogFacet,
     CatalogRelationship,
@@ -36,7 +37,6 @@ from ..catalog.models import (
     TabularFacet,
     catalog_resource_id,
 )
-from ..capabilities import ExtensionDeclarations
 from ..catalog.protocols import CatalogStore
 from ..domains.data.export_capabilities import (
     LocalFileCopyIncompleteError,

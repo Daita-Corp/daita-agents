@@ -32,12 +32,12 @@ import argparse
 import hashlib
 import importlib.util
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import zipfile
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_ENTRY_POINT = "daita.cli:main"

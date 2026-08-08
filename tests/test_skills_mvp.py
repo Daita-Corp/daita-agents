@@ -1,14 +1,15 @@
 import asyncio
+import os
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import fields
 from datetime import datetime, timezone
 from hashlib import sha256
-import os
 from pathlib import Path
-import sqlite3
 
 import pytest
 
+import daita.skills.store as skill_module
 from daita import Agent, SQLiteSource
 from daita.llm.models import (
     FinishReason,
@@ -42,7 +43,6 @@ from daita.skills.capabilities import (
     SKILL_VIEW_OUTPUT_KIND,
     SKILL_VIEW_TOOL_NAME,
 )
-import daita.skills.store as skill_module
 
 NOW = datetime(2026, 7, 22, tzinfo=timezone.utc)
 

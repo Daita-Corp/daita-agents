@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
-from collections.abc import Mapping
 import json
 import sqlite3
 import threading
+from collections import defaultdict
+from collections.abc import Mapping
 from datetime import datetime, timezone
 
 import pytest

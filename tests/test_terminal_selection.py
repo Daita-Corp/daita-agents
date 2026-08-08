@@ -11,10 +11,7 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from daita import Agent
-from daita import terminal
-from daita import terminal_selection
-from daita import terminal_tui
+from daita import Agent, terminal, terminal_selection, terminal_tui
 from daita.terminal_selection import (
     SelectionCancelled,
     SelectionOption,
@@ -755,6 +752,20 @@ async def test_provider_source_and_repair_pickers_use_shared_keyboard_selector()
     assert await choose(terminal._select_catalog_repair, "\x1b[B\r") == "exit"
 
 
+def test_provider_labels_distinguish_api_subscription_and_local_routes():
+    assert terminal._PROVIDERS == (
+        ("openai", "OpenAI API"),
+        ("anthropic", "Anthropic API"),
+        ("gemini", "Gemini API"),
+        ("grok", "xAI (Grok) API"),
+        ("ollama", "Ollama local"),
+        ("codex", "Codex subscription"),
+        ("claude-code", "Claude Code subscription"),
+        ("grok-build", "Grok Build subscription"),
+        ("custom", "Custom API (OpenAI-compatible)"),
+    )
+
+
 _EXPECTED_MODEL_SUGGESTIONS = {
     "openai": ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
     "anthropic": (
@@ -762,6 +773,13 @@ _EXPECTED_MODEL_SUGGESTIONS = {
         "claude-sonnet-5",
         "claude-haiku-4-5-20251001",
     ),
+    "codex": ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
+    "claude-code": (
+        "claude-sonnet-5",
+        "claude-opus-4-8",
+        "claude-haiku-4-5-20251001",
+    ),
+    "grok-build": ("grok-4.5",),
     "gemini": (
         "gemini-3.6-flash",
         "gemini-3.5-flash",

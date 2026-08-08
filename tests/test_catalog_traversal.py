@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast, TypedDict
+from typing import TypedDict, cast
 
 import pytest
 
+import daita.catalog.service as catalog_service
 from daita import Agent, SQLiteSource
+from daita.capabilities import ToolExecution
 from daita.catalog import (
     CATALOG_TRAVERSE_EVIDENCE_KIND,
     CatalogResource,
@@ -25,8 +27,6 @@ from daita.catalog import (
 )
 from daita.catalog.models import CatalogRelationship
 from daita.catalog.protocols import CatalogResourceNotFoundError, CatalogStoreError
-import daita.catalog.service as catalog_service
-from daita.capabilities import ToolExecution
 
 _OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
 

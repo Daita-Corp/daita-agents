@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 import builtins
-from collections.abc import Callable, Mapping, Sequence
-from pathlib import Path
 import subprocess
 import sys
 import tomllib
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
-from daita.adapters import postgresql
+from daita import terminal_selection, terminal_tui
 from daita._installation import (
     MANAGED_REPAIR_GUIDANCE,
     PIPX_REPAIR_GUIDANCE,
     _is_trusted_managed_runtime,
 )
+from daita.adapters import postgresql
 from daita.artifacts import renderers
 from daita.domains.data import sql
 from daita.llm.providers.anthropic import AnthropicMessagesProvider
@@ -24,7 +25,6 @@ from daita.llm.providers.gemini import GeminiProvider
 from daita.llm.providers.openai import OpenAIResponsesProvider
 from daita.llm.providers.openai_compatible import OpenAICompatibleProvider
 from daita.security import KeychainSecretProvider
-from daita import terminal_selection, terminal_tui
 
 ROOT = Path(__file__).parents[1]
 PIPX_REPAIR = "pipx reinstall daita-agents"

@@ -16,7 +16,6 @@ from .capabilities import (
     CatalogTraverseExecutor,
     catalog_declarations,
 )
-
 from .models import (
     CatalogFacet,
     CatalogPath,
@@ -28,9 +27,9 @@ from .models import (
     CatalogSearchHit,
     CatalogSearchRequest,
     CatalogSearchResult,
+    CatalogSummary,
     CatalogSync,
     CatalogSyncStatus,
-    CatalogSummary,
     CatalogTraversalRequest,
     CatalogTraversalResult,
     CatalogTraversalTruncationReason,

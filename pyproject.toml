@@ -41,6 +41,7 @@ dev = [
     "openpyxl>=3.1.0,<4.0.0",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.26.0",
+    "ruff>=0.16.2,<0.17.0",
     "types-openpyxl>=3.1.0,<4.0.0",
     "wheel>=0.45.0",
 ]
@@ -73,6 +74,10 @@ markers = [
 [tool.black]
 line-length = 88
 target-version = ["py311"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-first-party = ["_shared"]
 
 [tool.pyright]
 include = ["src/daita", "tests"]

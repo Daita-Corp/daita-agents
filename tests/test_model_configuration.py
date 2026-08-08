@@ -1,17 +1,17 @@
 import asyncio
-from collections.abc import Callable
 import io
 import json
-from pathlib import Path
 import subprocess
 import sys
+from collections.abc import Callable
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from daita import Agent, LoopLimits
+import daita.hosting.embedded as embedded
+from daita import Agent, LoopLimits, terminal
 from daita.agent import AgentModelConfigurationError
-from daita import terminal
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.factory import create_model_route_provider
 from daita.llm.models import (
@@ -24,8 +24,8 @@ from daita.llm.models import (
     TextBlock,
     ToolCall,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.llm.profiles import reviewed_model_profile
+from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelRoute, ModelRouteCandidate, RetryPolicy
 from daita.security import (
     EmptySecretProvider,
@@ -34,7 +34,6 @@ from daita.security import (
     SecretResolutionError,
 )
 from daita.terminal import run_terminal_application
-import daita.hosting.embedded as embedded
 
 
 class _FakeKeychain:
@@ -638,7 +637,7 @@ async def test_validation_failure_returns_to_same_provider_model_menu(tmp_path):
     )
 
     assert result == 0
-    assert output.getvalue().count("Select an OpenAI model") == 2
+    assert output.getvalue().count("Select an OpenAI API model") == 2
     assert output.getvalue().count("Select a model provider") == 1
     assert "The API key was rejected. Replace it and retry." in output.getvalue()
     reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
@@ -1221,6 +1220,32 @@ async def test_ollama_does_not_request_an_api_key(tmp_path):
     assert "✓ Model configuration validated" in output.getvalue()
 
 
+async def test_grok_build_terminal_selection_validates_without_api_key(tmp_path):
+    provider_id = "grok-build:grok-4.5"
+    output = io.StringIO()
+
+    result = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO("atlas\n8\n1\n500000\n8192\n"),
+        output_stream=output,
+        hidden_input=lambda prompt: (_ for _ in ()).throw(
+            AssertionError(f"unexpected API-key prompt: {prompt}")
+        ),
+        keychain=_FakeKeychain(),
+        model_validator=_provider(provider_id),
+    )
+
+    assert result == 0
+    text = output.getvalue()
+    assert "Grok Build subscription" in text
+    assert "small amount of subscription allowance" in text
+    assert "✓ Model configuration validated" in text
+    persisted = json.loads(
+        (tmp_path / "agents" / "atlas" / "config.json").read_text(encoding="utf-8")
+    )
+    assert persisted["model_route"]["candidates"][0]["secret_reference"] is None
+
+
 async def test_custom_terminal_provider_requires_and_persists_base_url(tmp_path):
     output = io.StringIO()
     keychain = _FakeKeychain()
@@ -1228,7 +1253,7 @@ async def test_custom_terminal_provider_requires_and_persists_base_url(tmp_path)
         root=tmp_path,
         input_stream=io.StringIO(
             "atlas\n"
-            "6\n"
+            "9\n"
             "acme\n"
             "acme-model\n"
             "8192\n"
@@ -1274,7 +1299,7 @@ async def test_existing_persisted_route_skips_onboarding_without_health_claim(
     assert result == 0
     assert "Select a model provider" not in output.getvalue()
     assert "Select a data source" in output.getvalue()
-    assert "OpenAI · test-model · configured" not in output.getvalue()
+    assert "OpenAI API · test-model · configured" not in output.getvalue()
     assert "provider health was not checked this launch" not in output.getvalue()
 
 

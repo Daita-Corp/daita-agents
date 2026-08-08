@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import Mapping
-from dataclasses import dataclass
 import os
 import sys
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 MAX_CLIPBOARD_UTF8_BYTES = 64 * 1_024

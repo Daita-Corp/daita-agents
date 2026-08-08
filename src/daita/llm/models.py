@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-import re
 
 from .._json import FrozenJsonObject, canonical_json
 from .pricing import CostEstimate

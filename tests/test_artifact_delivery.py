@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
-from pathlib import Path
 import sqlite3
 import threading
+from collections import defaultdict
+from pathlib import Path
 
 import pytest
 
-from daita import Agent, ArtifactError, LocalDirectorySource
 import daita.artifacts.delivery as delivery_module
+from daita import Agent, ArtifactError, LocalDirectorySource
 from daita.artifacts.models import (
+    SYSTEM_DOWNLOADS_DESTINATION_ID,
     DestinationAuthorization,
     DestinationAvailability,
-    SYSTEM_DOWNLOADS_DESTINATION_ID,
 )
 from daita.llm.models import (
     FinishReason,

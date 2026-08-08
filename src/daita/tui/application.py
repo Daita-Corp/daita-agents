@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
 import os
 import re
 import sys
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, TextIO
 
 from .._installation import repair_guidance
@@ -40,13 +40,6 @@ from .rendering import (
     render_markdown_text as _render_markdown_text_with_runtime,
     semantic_style_rules as _semantic_style_rules,
 )
-from .state import (
-    TerminalApprovalBridge,
-    TerminalObserverBridge,
-    TerminalStartupInfo,
-    TerminalViewState,
-    _model_text_event_fields,
-)
 from .shell import (
     StatusProjection,
     _approval_panel_for_request,
@@ -62,6 +55,13 @@ from .shell import (
     _write_setup_prompt as _write_setup_prompt_impl,
     _write_setup_status as _write_setup_status_impl,
 )
+from .state import (
+    TerminalApprovalBridge,
+    TerminalObserverBridge,
+    TerminalStartupInfo,
+    TerminalViewState,
+    _model_text_event_fields,
+)
 from .text import (
     display_width as _display_width,
     sanitize_terminal_text as _sanitize_terminal_text,
@@ -74,11 +74,11 @@ from .tool_view import (
 )
 from .transcript_view import (
     _EMPTY_RENDERED_TRANSCRIPT_MAP,
-    _RenderedTranscriptMap,
     _fragment_line_metrics,
     _highlight_transcript_line,
     _render_startup_fragments,
     _render_transcript_fragments,
+    _RenderedTranscriptMap,
 )
 
 MAX_COMPOSER_CHARACTERS = 16_384
@@ -381,6 +381,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
         from prompt_toolkit.history import InMemoryHistory
         from prompt_toolkit.input import create_input
         from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.keys import Keys
         from prompt_toolkit.layout import Layout
         from prompt_toolkit.layout.containers import (
             ConditionalContainer,
@@ -394,7 +395,6 @@ def _load_terminal_runtime() -> dict[str, Any]:
         from prompt_toolkit.output import create_output
         from prompt_toolkit.styles import Style
         from prompt_toolkit.widgets import Frame, TextArea
-        from prompt_toolkit.keys import Keys
         from rich.console import Console
         from rich.markdown import Markdown
         from rich.syntax import Syntax
@@ -619,9 +619,12 @@ def _create_application(
     transcript_base_content: Any = None
     responsive_projection = _responsive_for_output(enhanced_output, state)
     mouse_press_owner: str | None = None
+    transcript_drag_last_pointer: tuple[int, int] | None = None
 
     def complete_captured_transcript_drag(*, show_hint: bool) -> None:
+        nonlocal transcript_drag_last_pointer
         selected = state.transcript_selection.end_drag()
+        transcript_drag_last_pointer = None
         state.transient_selection_hint = (
             _SELECTION_COMPLETE_HINT
             if show_hint and selected is not None and bool(selected.text)
@@ -651,8 +654,9 @@ def _create_application(
     def mouse_failed() -> None:
         """Contain pointer failures inside disposable presentation state."""
 
-        nonlocal mouse_press_owner
+        nonlocal mouse_press_owner, transcript_drag_last_pointer
         mouse_press_owner = None
+        transcript_drag_last_pointer = None
         state.transcript_selection.end_drag()
         state.transient_selection_hint = ""
         state.notice = _MOUSE_FAILURE_NOTICE
@@ -1840,6 +1844,7 @@ def _create_application(
         )
 
     def transcript_mouse_handler(mouse_event: Any) -> Any:
+        nonlocal transcript_drag_last_pointer
         try:
             if approval_owns_mouse(mouse_event):
                 return None
@@ -1853,6 +1858,7 @@ def _create_application(
                 scroll_transcript(-_MOUSE_SCROLL_LINES)
             elif event_type == runtime["MouseEventType"].MOUSE_DOWN and left_button:
                 mouse_action_owned("transcript", event_type)
+                transcript_drag_last_pointer = None
                 transcript_fragments()
                 position = rendered_transcript_map.position_for_cell(
                     mouse_event.position.y,
@@ -1893,8 +1899,13 @@ def _create_application(
                             state.transcript_document,
                             position,
                         )
+                        transcript_drag_last_pointer = (
+                            mouse_event.position.x,
+                            mouse_event.position.y,
+                        )
                     except (RuntimeError, ValueError):
                         state.transcript_selection.clear()
+                        transcript_drag_last_pointer = None
                 state.notice = ""
             elif event_type == runtime["MouseEventType"].MOUSE_UP and left_button:
                 if not mouse_action_owned("transcript", event_type):
@@ -1911,9 +1922,17 @@ def _create_application(
                     state.transient_selection_hint = ""
                 else:
                     try:
-                        selected = state.transcript_selection.finish(
-                            state.transcript_document,
-                            position,
+                        pointer = (
+                            mouse_event.position.x,
+                            mouse_event.position.y,
+                        )
+                        selected = (
+                            state.transcript_selection.end_drag()
+                            if pointer == transcript_drag_last_pointer
+                            else state.transcript_selection.finish(
+                                state.transcript_document,
+                                position,
+                            )
                         )
                     except (RuntimeError, ValueError):
                         state.transcript_selection.clear()
@@ -1924,6 +1943,7 @@ def _create_application(
                             if selected is not None and bool(selected.text)
                             else ""
                         )
+                transcript_drag_last_pointer = None
             else:
                 return NotImplemented
             invalidate(application)

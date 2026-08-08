@@ -7,20 +7,22 @@ attached sources, current catalog snapshots, and exact run transcripts.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import re
+import sqlite3
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
-import json
 from pathlib import Path
-import re
-import sqlite3
-import threading
 from typing import Any, TypeVar
 
 from .._json import FrozenJsonObject
+from ..adapters.models import SourceRegistration
 from ..artifacts.models import (
     ArtifactAuthorship,
     ArtifactDeliveryReceipt,
@@ -29,16 +31,15 @@ from ..artifacts.models import (
     ArtifactResourceBinding,
     artifact_ref_from_mapping,
 )
-from ..adapters.models import SourceRegistration
 from ..catalog.models import (
     CatalogFacet,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
     CatalogSnapshotRef,
+    CatalogSummary,
     CatalogSync,
     CatalogSyncStatus,
-    CatalogSummary,
     FacetKind,
     RelationshipDirection,
     RelationshipFieldPair,
@@ -51,10 +52,10 @@ from ..catalog.models import (
 from ..catalog.protocols import CatalogStoreError
 from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..learning_candidates import (
-    DocumentCandidateContent,
     LEARNING_CANDIDATE_MAX_RECORDS,
     LEARNING_REVIEW_MAX_PROPOSALS,
     LEARNING_REVIEW_MAX_STAMPS,
+    DocumentCandidateContent,
     LearningCandidate,
     LearningCandidateAction,
     LearningCandidateError,
@@ -2125,6 +2126,7 @@ def _initialize(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         _validate_existing_state(path)
+        os.chmod(path, 0o600)
         return
     with _connect(path) as connection:
         connection.executescript("""
@@ -2181,6 +2183,7 @@ def _initialize(path: Path) -> None:
             """)
         connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS runs_conversation_turn
                ON runs(agent_id, conversation_id, turn_index)""")
+    os.chmod(path, 0o600)
 
 
 def _validate_existing_state(path: Path) -> None:

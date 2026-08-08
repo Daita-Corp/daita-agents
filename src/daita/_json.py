@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
 import json
 import math
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from typing import TypeAlias, Union
 
 JsonScalar: TypeAlias = None | bool | int | float | str

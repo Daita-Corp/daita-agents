@@ -3,30 +3,23 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
-from datetime import datetime, timezone
-from decimal import Decimal
 import errno
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import stat
 import tomllib
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
 from typing import Self, TypeVar, cast
 from uuid import uuid4
 
 from .._json import FrozenJsonObject
-from ..artifacts.delivery import LocalArtifactDelivery
-from ..artifacts.models import (
-    ArtifactDeliveryReceipt,
-    ArtifactDestination,
-    ArtifactPayload,
-)
-from ..artifacts.store import AgentHomeArtifactStore
 from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySource
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
@@ -34,6 +27,14 @@ from ..adapters.postgresql_query import PostgreSQLQueryBackend
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.sqlite import SQLiteSource
 from ..adapters.sqlite_query import SQLiteQueryBackend
+from ..artifacts.delivery import LocalArtifactDelivery
+from ..artifacts.models import (
+    ArtifactDeliveryReceipt,
+    ArtifactDestination,
+    ArtifactPayload,
+)
+from ..artifacts.store import AgentHomeArtifactStore
+from ..capabilities import ApprovalHandler, CapabilityRegistry
 from ..catalog.capabilities import catalog_declarations
 from ..catalog.models import (
     CatalogResource,
@@ -44,7 +45,6 @@ from ..catalog.models import (
     CatalogSyncStatus,
 )
 from ..catalog.service import CatalogService
-from ..capabilities import ApprovalHandler, CapabilityRegistry
 from ..config import AgentConfig
 from ..domains.data import (
     CatalogDataView,
@@ -58,6 +58,16 @@ from ..domains.data import (
 from ..domains.data.context import _project_completed_history
 from ..errors import AgentError
 from ..identity import AgentIdentity
+from ..learning_candidates import (
+    LEARNING_REVIEW_MAX_TOTAL_TOKENS,
+    LearningCandidate,
+    LearningCandidateContent,
+    LearningCandidateRejectionReason,
+    LearningCandidateStatus,
+    LearningCandidateView,
+    LearningReviewResult,
+    OneShotCandidateReviewer,
+)
 from ..llm.errors import ModelProviderError, ProviderErrorCode
 from ..llm.factory import create_model_route_provider
 from ..llm.models import (
@@ -79,16 +89,7 @@ from ..llm.routing import (
     ModelRouter,
     RetryPolicy,
 )
-from ..learning_candidates import (
-    LEARNING_REVIEW_MAX_TOTAL_TOKENS,
-    LearningCandidate,
-    LearningCandidateContent,
-    LearningCandidateRejectionReason,
-    LearningCandidateStatus,
-    LearningCandidateView,
-    LearningReviewResult,
-    OneShotCandidateReviewer,
-)
+from ..llm.subscription_auth import CodexDevicePrompt, login_codex_subscription
 from ..loop.driver import (
     AgentLoop,
     ContextBuilder,
@@ -130,7 +131,11 @@ _REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 25_000
 _CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS = LEARNING_REVIEW_MAX_TOTAL_TOKENS // 4
 _PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _SOURCE_ALIAS_SEPARATOR = re.compile(r"[^a-z0-9]+")
-_BUILTIN_PROVIDERS = frozenset({"openai", "anthropic", "gemini", "grok", "ollama"})
+_SUBSCRIPTION_PROVIDERS = frozenset({"codex", "claude-code", "grok-build"})
+_SUBSCRIPTION_CREDENTIAL_PROVIDERS = frozenset({"codex"})
+_BUILTIN_PROVIDERS = frozenset(
+    {"openai", "anthropic", "gemini", "grok", "ollama", *_SUBSCRIPTION_PROVIDERS}
+)
 _T = TypeVar("_T")
 
 
@@ -893,12 +898,32 @@ class EmbeddedAgent:
             raise ValueError("model must be non-empty text")
         return reviewed_model_profile(f"{provider}:{model}") is None
 
+    async def authenticate_model_subscription(
+        self,
+        *,
+        provider: str,
+        on_verification: Callable[[CodexDevicePrompt], None],
+        on_progress: Callable[[str], None] | None = None,
+    ) -> str:
+        """Run one provider-owned subscription login without persisting it."""
+
+        self._require_open()
+        if provider != "codex":
+            raise ValueError(
+                "integrated subscription login is available only for Codex"
+            )
+        return await login_codex_subscription(
+            on_verification=on_verification,
+            on_progress=on_progress,
+        )
+
     async def configure_model(
         self,
         *,
         provider: str,
         model: str,
         api_key: str | None = None,
+        subscription_credential: str | None = None,
         base_url: str | None = None,
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
@@ -909,18 +934,43 @@ class EmbeddedAgent:
         the agent before using the replacement route.
         """
 
-        provider_name, model_name, endpoint, requires_key = _admit_model_selection(
-            provider,
-            model,
-            base_url,
+        provider_name, model_name, endpoint, requires_credential = (
+            _admit_model_selection(
+                provider,
+                model,
+                base_url,
+            )
         )
-        if requires_key:
+        requires_subscription_credential = (
+            provider_name in _SUBSCRIPTION_CREDENTIAL_PROVIDERS
+        )
+        if requires_subscription_credential:
+            if api_key is not None:
+                raise ValueError("Codex subscription login does not accept an API key")
+            if (
+                not isinstance(subscription_credential, str)
+                or not subscription_credential
+            ):
+                raise ValueError("Codex requires a Daita subscription login")
+            credential_value = subscription_credential
+        elif requires_credential:
+            if subscription_credential is not None:
+                raise ValueError("API providers do not accept a subscription login")
             if not isinstance(api_key, str) or not api_key:
                 raise ValueError("API key is required for this provider")
-            if len(api_key.encode("utf-8")) > 64 * 1_024:
-                raise ValueError("API key exceeds its 64 KiB bound")
-        elif api_key is not None:
-            raise ValueError("Ollama does not accept an API key during onboarding")
+            credential_value = api_key
+        else:
+            if api_key is not None or subscription_credential is not None:
+                raise ValueError(
+                    "this subscription or local provider does not accept a "
+                    "credential during onboarding"
+                )
+            credential_value = None
+        if (
+            credential_value is not None
+            and len(credential_value.encode("utf-8")) > 64 * 1_024
+        ):
+            raise ValueError("provider credential exceeds its 64 KiB bound")
 
         async with self._mutation_lock:
             self._require_open()
@@ -936,7 +986,7 @@ class EmbeddedAgent:
                 # replacement commit both succeed.
                 previous = None
             reference: SecretReference | None = None
-            if requires_key:
+            if requires_credential:
                 reference = SecretReference.keychain(
                     _credential_account(
                         self.identity.id,
@@ -956,9 +1006,10 @@ class EmbeddedAgent:
             committed = False
             try:
                 if reference is not None:
-                    assert api_key is not None
-                    credential = api_key
+                    assert credential_value is not None
+                    credential = credential_value
                     api_key = None
+                    subscription_credential = None
                     try:
                         await self._keychain.set(reference, credential)
                     finally:
@@ -2217,7 +2268,12 @@ def _admit_model_selection(
     provider_id = f"{provider_name}:{model_name}"
     if len(provider_id) > 256:
         raise ValueError("model identity exceeds its 256 character bound")
-    return provider_name, model_name, endpoint, provider_name != "ollama"
+    return (
+        provider_name,
+        model_name,
+        endpoint,
+        provider_name not in {"ollama", "claude-code", "grok-build"},
+    )
 
 
 def _model_profile(
@@ -2242,8 +2298,12 @@ def _model_profile(
         context_window_tokens=context_window_tokens,
         max_output_tokens=max_output_tokens,
         supports_tools=True,
-        supports_parallel_tools=False,
-        supports_streaming=provider in _BUILTIN_PROVIDERS,
+        supports_parallel_tools=provider in _SUBSCRIPTION_PROVIDERS,
+        supports_structured_output=provider in _SUBSCRIPTION_PROVIDERS,
+        supports_streaming=(
+            provider in _BUILTIN_PROVIDERS and provider not in _SUBSCRIPTION_PROVIDERS
+        ),
+        supports_reasoning=provider in _SUBSCRIPTION_PROVIDERS,
     )
 
 
@@ -2446,7 +2506,7 @@ async def _validate_model_route(
             tools=(
                 ToolDefinition(
                     name=_MODEL_VALIDATION_TOOL_NAME,
-                    description="Prove native tool-call compatibility.",
+                    description="Prove provider tool-call compatibility.",
                     input_schema={
                         "type": "object",
                         "properties": {},
@@ -2675,7 +2735,7 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
         provider_name, separator, model_name = provider_id.partition(":")
         if not separator:
             raise ValueError("provider ID is incomplete")
-        _, _, admitted_url, requires_key = _admit_model_selection(
+        _, _, admitted_url, requires_credential = _admit_model_selection(
             provider_name,
             model_name,
             base_url,
@@ -2698,9 +2758,11 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
         reference = (
             None if reference_value is None else SecretReference.parse(reference_value)
         )
-        if requires_key and (reference is None or reference.scheme != "keychain"):
+        if requires_credential and (
+            reference is None or reference.scheme != "keychain"
+        ):
             raise ValueError("persisted provider credential reference is incomplete")
-        if requires_key and (
+        if requires_credential and (
             reference is None
             or not _credential_reference_is_owned(
                 reference,
@@ -2711,8 +2773,11 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
             raise ValueError(
                 "persisted provider credential reference belongs to another agent"
             )
-        if not requires_key and reference is not None:
-            raise ValueError("Ollama configuration cannot contain a credential")
+        if not requires_credential and reference is not None:
+            raise ValueError(
+                "local or client-owned subscription configuration cannot contain "
+                "a credential"
+            )
         allowed = tuple(ModelSensitivity(cast(str, item)) for item in raw_allowed)
         if len(allowed) != len(set(allowed)):
             raise ValueError("allowed sensitivities cannot repeat")
@@ -2881,6 +2946,7 @@ def _admit_agent_home(
     run = home / "run"
     run.mkdir(mode=0o700, exist_ok=True)
     for path, label in (
+        (state_root, "agent state root"),
         (agents_root, "agents directory"),
         (home, "agent home"),
         (run, "agent run directory"),

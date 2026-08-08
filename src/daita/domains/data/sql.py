@@ -6,10 +6,10 @@ does not open a source, invoke an executor, or persist runtime state.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
 import hashlib
 import re
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ..._installation import repair_guidance

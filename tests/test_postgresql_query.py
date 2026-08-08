@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import traceback
 from collections.abc import Mapping
 from datetime import datetime, timezone
-import traceback
 
 import pytest
 

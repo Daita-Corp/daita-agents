@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from enum import Enum
 import math
+from enum import Enum
 from typing import cast
 
 from ..errors import (
@@ -41,6 +41,7 @@ class ProviderErrorCode(str, Enum):
     OUTPUT_LIMIT = "output_limit"
     MALFORMED_RESPONSE = "malformed_response"
     CONFIGURATION_ERROR = "configuration_error"
+    LOCAL_ACCESS_ERROR = "local_access_error"
 
 
 class ModelProviderError(LLMError):

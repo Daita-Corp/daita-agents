@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 import getpass
 import io
 import json
 import os
-from pathlib import Path
 import shlex
 import subprocess
 import sys
 import tempfile
-from typing import Any, cast, TextIO
 import unicodedata
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any, TextIO, cast
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from . import (
@@ -25,6 +25,7 @@ from . import (
     SemanticAnnotationState,
     SemanticAnnotationView,
     __version__,
+    terminal_tui,
 )
 from .agent import (
     Agent,
@@ -32,6 +33,7 @@ from .agent import (
     AgentModelConfigurationError,
     AgentNameError,
     AgentNotFoundError,
+    CodexDevicePrompt,
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
     SourceSelectionError,
@@ -50,7 +52,6 @@ from .learning_candidates import (
 )
 from .security import KeychainStore
 from .skills import Skill, validate_skill_name
-from . import terminal_tui
 from .terminal_selection import (
     SelectionCancelled,
     SelectionOption,
@@ -59,14 +60,18 @@ from .terminal_selection import (
 )
 
 _PROVIDERS = (
-    ("openai", "OpenAI"),
-    ("anthropic", "Anthropic"),
-    ("gemini", "Gemini"),
-    ("grok", "Grok"),
-    ("ollama", "Ollama"),
-    ("custom", "Custom OpenAI-compatible"),
+    ("openai", "OpenAI API"),
+    ("anthropic", "Anthropic API"),
+    ("gemini", "Gemini API"),
+    ("grok", "xAI (Grok) API"),
+    ("ollama", "Ollama local"),
+    ("codex", "Codex subscription"),
+    ("claude-code", "Claude Code subscription"),
+    ("grok-build", "Grok Build subscription"),
+    ("custom", "Custom API (OpenAI-compatible)"),
 )
 _BUILTIN_PROVIDER_IDS = frozenset(provider for provider, _ in _PROVIDERS[:-1])
+_SUBSCRIPTION_PROVIDER_IDS = frozenset({"codex", "claude-code", "grok-build"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +128,61 @@ _MODEL_SUGGESTIONS = {
             "Claude Haiku 4.5",
             "Low-latency near-frontier model",
             "Fast",
+        ),
+    ),
+    "codex": (
+        _ModelSuggestion(
+            "codex",
+            "gpt-5.6-sol",
+            "GPT-5.6 Sol",
+            "Connect ChatGPT to Daita and use the subscription allowance",
+            "Recommended",
+        ),
+        _ModelSuggestion(
+            "codex",
+            "gpt-5.6-terra",
+            "GPT-5.6 Terra",
+            "Balanced Codex model through Daita's ChatGPT connection",
+            "Balanced",
+        ),
+        _ModelSuggestion(
+            "codex",
+            "gpt-5.6-luna",
+            "GPT-5.6 Luna",
+            "Efficient Codex model through Daita's ChatGPT connection",
+            "Fast",
+        ),
+    ),
+    "claude-code": (
+        _ModelSuggestion(
+            "claude-code",
+            "claude-sonnet-5",
+            "Claude Sonnet 5",
+            "Use Claude through an existing Claude Code subscription login",
+            "Recommended",
+        ),
+        _ModelSuggestion(
+            "claude-code",
+            "claude-opus-4-8",
+            "Claude Opus 4.8",
+            "Complex work through the signed-in Claude Code client",
+            "Strong",
+        ),
+        _ModelSuggestion(
+            "claude-code",
+            "claude-haiku-4-5-20251001",
+            "Claude Haiku 4.5",
+            "Low-latency work through the signed-in Claude Code client",
+            "Fast",
+        ),
+    ),
+    "grok-build": (
+        _ModelSuggestion(
+            "grok-build",
+            "grok-4.5",
+            "Grok 4.5",
+            "Use Grok 4.5 through an existing Grok Build subscription login",
+            "Recommended",
         ),
     ),
     "gemini": (
@@ -193,6 +253,34 @@ _VALIDATION_ERRORS = {
     "output_limit": (
         "The model exhausted its validation output budget before calling the tool."
     ),
+}
+_SUBSCRIPTION_VALIDATION_ERRORS = {
+    "authentication_error": (
+        "The {client} subscription login was rejected. Sign in again and retry."
+    ),
+    "configuration_error": (
+        "The official {client} client could not start: it may be missing, "
+        "incompatible, or out of date. Install or update the client, run "
+        "{login_command}, and retry."
+    ),
+    "local_access_error": (
+        "The official {client} client cannot access its local login/state files. "
+        "Exit Daita and launch it from macOS Terminal or iTerm, not from a "
+        "sandboxed terminal inside another application, then retry."
+    ),
+    "rate_limit_error": "The {client} subscription allowance is currently exhausted.",
+    "model_not_found": "This {client} subscription cannot access {model}.",
+    "provider_unavailable": "The signed-in {client} client could not complete validation.",
+    "timeout": "The signed-in {client} client did not respond before the timeout.",
+    "invalid_request": "The {client} client rejected this model configuration.",
+    "output_limit": (
+        "The model exhausted its validation output budget before proposing the tool."
+    ),
+}
+_SUBSCRIPTION_CLIENTS = {
+    "codex": ("ChatGPT", "sign in through Daita"),
+    "claude-code": ("Claude Code", "claude auth login"),
+    "grok-build": ("Grok Build", "grok login"),
 }
 _MODEL_SETUP_ERRORS = {
     "secret_provider_unavailable": (
@@ -880,16 +968,74 @@ async def _configure_selected_model(
             output_stream,
         )
     api_key: str | None = None
-    if provider != "ollama":
+    subscription_credential: str | None = None
+    if provider != "ollama" and provider not in _SUBSCRIPTION_PROVIDER_IDS:
         while not api_key:
             api_key = hidden_input("API key: ")
             if not api_key:
                 print("API key cannot be empty.", file=output_stream)
+    if provider == "codex":
+        print(file=output_stream)
+        print(
+            "Connect Daita to ChatGPT. Codex does not need to be installed.",
+            file=output_stream,
+        )
+
+        def show_verification(prompt: CodexDevicePrompt) -> None:
+            print(file=output_stream)
+            print(
+                f"Open {prompt.verification_url}",
+                file=output_stream,
+            )
+            print(f"Enter code: {prompt.user_code}", file=output_stream)
+            print(file=output_stream)
+
+        def show_login_progress(message: str) -> None:
+            terminal_tui._write_setup_status(
+                output_stream,
+                f"◐ {message}",
+                role="progress",
+            )
+
+        try:
+            subscription_credential = await agent.authenticate_model_subscription(
+                provider=provider,
+                on_verification=show_verification,
+                on_progress=show_login_progress,
+            )
+            terminal_tui._write_setup_status(
+                output_stream,
+                "✓ ChatGPT authorization complete",
+                role="success",
+            )
+        except LLMError as error:
+            if error.error_code == "timeout":
+                message = "ChatGPT authorization timed out. Start again to retry."
+            elif error.error_code == "provider_unavailable":
+                message = "Daita could not reach ChatGPT login. Check your connection."
+            else:
+                message = "ChatGPT authorization failed. Start again to retry."
+            terminal_tui._write_setup_status(output_stream, message, role="error")
+            return False
     print(file=output_stream)
-    print(
-        "Validation contacts the provider and may incur a tiny API charge.",
-        file=output_stream,
-    )
+    if provider in _SUBSCRIPTION_PROVIDER_IDS:
+        if provider == "codex":
+            print(
+                "Validation uses the ChatGPT account connected to Daita and "
+                "consumes a small amount of subscription allowance.",
+                file=output_stream,
+            )
+        else:
+            print(
+                "Validation uses the signed-in official client and consumes a "
+                "small amount of subscription allowance.",
+                file=output_stream,
+            )
+    else:
+        print(
+            "Validation contacts the provider and may incur a tiny API charge.",
+            file=output_stream,
+        )
     terminal_tui._write_setup_status(
         output_stream,
         "◐ Validating model configuration",
@@ -901,6 +1047,7 @@ async def _configure_selected_model(
                 provider=provider,
                 model=model,
                 api_key=api_key,
+                subscription_credential=subscription_credential,
                 base_url=base_url,
                 context_window_tokens=context_window_tokens,
                 max_output_tokens=max_output_tokens,
@@ -913,8 +1060,15 @@ async def _configure_selected_model(
             return True
         finally:
             api_key = None
+            subscription_credential = None
     except LLMError as error:
-        template = _VALIDATION_ERRORS.get(error.error_code)
+        if provider in _SUBSCRIPTION_PROVIDER_IDS:
+            template = _SUBSCRIPTION_VALIDATION_ERRORS.get(error.error_code)
+            client, login_command = _SUBSCRIPTION_CLIENTS[provider]
+        else:
+            template = _VALIDATION_ERRORS.get(error.error_code)
+            client = "provider"
+            login_command = ""
         if template is None:
             print(
                 "The provider could not validate this configuration.",
@@ -924,6 +1078,8 @@ async def _configure_selected_model(
             print(
                 template.format(
                     model=_safe_display(model, fallback="this model"),
+                    client=client,
+                    login_command=login_command,
                 ),
                 file=output_stream,
             )

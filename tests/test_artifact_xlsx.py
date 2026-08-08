@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+import threading
+import time as time_module
+import warnings
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import date, datetime, time, timedelta, timezone
@@ -8,12 +12,8 @@ from decimal import Decimal
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
-import sqlite3
-import threading
-import time as time_module
 from typing import Any
 from uuid import UUID
-import warnings
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import openpyxl
@@ -21,12 +21,12 @@ import pytest
 
 from daita import Agent, SQLiteSource
 from daita._json import canonical_json
-from daita.adapters import postgresql_query as postgresql_query_module
-from daita.adapters import sqlite_query as sqlite_query_module
+from daita.adapters import (
+    postgresql_query as postgresql_query_module,
+    sqlite_query as sqlite_query_module,
+)
 from daita.artifacts.models import ArtifactAuthorship, ArtifactError
 from daita.artifacts.renderers import (
-    ExactXlsxProvenance,
-    ExactXlsxRenderer,
     MAX_XLSX_BYTES,
     MAX_XLSX_COLUMNS,
     MAX_XLSX_MEMBERS,
@@ -34,6 +34,8 @@ from daita.artifacts.renderers import (
     MAX_XLSX_SECONDS,
     MAX_XLSX_UNCOMPRESSED_BYTES,
     XLSX_MEDIA_TYPE,
+    ExactXlsxProvenance,
+    ExactXlsxRenderer,
     read_exact_xlsx_data,
     render_exact_xlsx,
     verify_exact_xlsx,

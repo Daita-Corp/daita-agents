@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import io
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,8 +11,7 @@ import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from daita import Agent, SQLiteSource
-from daita import terminal
+from daita import Agent, SQLiteSource, terminal
 from daita.agent import PostgreSQLProbeResult, PostgreSQLSourceError
 from daita.llm.models import (
     FinishReason,
@@ -118,7 +117,7 @@ async def test_terminal_onboards_local_sources_and_renders_polished_ready_screen
     assert "Stage 2 status" not in text
     assert "Stage 4 status" not in text
     assert "Agent     atlas" in text
-    assert "Model     OpenAI · test-model · configured" in text
+    assert "Model     OpenAI API · test-model · configured" in text
     assert "Connections  1" in text
     assert "Fixture SQLite" not in text
     assert "Fixture files" not in text

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
+import re
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from html import unescape
-import json
-import os
 from pathlib import Path
-import re
 
 import pytest
 

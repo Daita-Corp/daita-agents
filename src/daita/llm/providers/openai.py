@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
-import json
 from typing import Protocol, cast
 from uuid import uuid4
 
-from ..._json import FrozenJsonObject, canonical_json, thaw_json
 from ..._installation import repair_guidance
+from ..._json import FrozenJsonObject, canonical_json, thaw_json
 from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from ..models import (
     CanonicalMessage,
@@ -47,6 +47,21 @@ class _ResponsesResource(Protocol):
 class _OpenAIClient(Protocol):
     @property
     def responses(self) -> _ResponsesResource: ...
+
+
+class _ResponseOutputOverride:
+    """Retain terminal response metadata while supplying streamed output items."""
+
+    __slots__ = ("_response", "output")
+
+    def __init__(self, response: object, output: tuple[object, ...]) -> None:
+        self._response = response
+        self.output = output
+
+    def __getattr__(self, name: str) -> object:
+        if isinstance(self._response, Mapping) and name in self._response:
+            return self._response[name]
+        return getattr(self._response, name)
 
 
 def _new_id(prefix: str) -> str:
@@ -244,6 +259,7 @@ class OpenAIResponsesProvider:
         canonical_ids_by_provider_call_id: dict[str, str] = {}
         provider_call_ids_by_index: dict[int, str] = {}
         names_by_index: dict[int, str] = {}
+        completed_items_by_index: dict[int, object] = {}
         allocated_ids: set[str] = set()
         completed = False
         try:
@@ -310,13 +326,33 @@ class OpenAIResponsesProvider:
                         name=names_by_index.get(index),
                         provider_call_id=provider_call_ids_by_index.get(index),
                     )
+                elif event_type == "response.output_item.done":
+                    index = _nonnegative_int(
+                        _field(event, "output_index"), "output index"
+                    )
+                    completed_items_by_index[index] = _field(event, "item")
                 elif event_type in {
                     "response.completed",
                     "response.incomplete",
                     "response.failed",
                 }:
+                    native_response = _field(event, "response")
+                    native_output = _field(native_response, "output", ())
+                    if (
+                        isinstance(native_output, Sequence)
+                        and not isinstance(native_output, (str, bytes))
+                        and not native_output
+                        and completed_items_by_index
+                    ):
+                        native_response = _ResponseOutputOverride(
+                            native_response,
+                            tuple(
+                                completed_items_by_index[index]
+                                for index in sorted(completed_items_by_index)
+                            ),
+                        )
                     response = self._decode_response(
-                        _field(event, "response"),
+                        native_response,
                         requested_at=requested_at,
                         canonical_ids_by_index=canonical_ids_by_index,
                         canonical_ids_by_provider_call_id=(

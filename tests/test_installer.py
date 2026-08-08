@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tarfile
-from typing import Mapping
 import zipfile
+from pathlib import Path
+from typing import Mapping
 
 import pytest
-
 from installer_fixtures import (
     INSTALLER_SOURCE,
     create_installer_fixture,

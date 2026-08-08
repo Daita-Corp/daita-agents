@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-import sqlite3
 from typing import cast
 
 import pytest
 
+import daita.catalog.service as catalog_service
+import daita.storage.sqlite as sqlite_store
 from daita import Agent, LocalDirectorySource, SQLiteSource
 from daita._json import FrozenJsonObject, canonical_json
 from daita.capabilities import (
@@ -46,9 +48,9 @@ from daita.catalog.capabilities import (
 from daita.catalog.models import (
     CATALOG_MAX_LIMIT,
     CATALOG_RESOURCE_ID_MAX_CHARACTERS,
+    CATALOG_SCHEMA_MAX_RESOURCE_IDS,
     CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT,
     CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
-    CATALOG_SCHEMA_MAX_RESOURCE_IDS,
     CATALOG_SOURCE_ID_MAX_CHARACTERS,
     CATALOG_TOOL_DEFAULT_LIMIT,
     CATALOG_TOOL_QUERY_MAX_CHARACTERS,
@@ -67,8 +69,6 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import RunInput
-import daita.storage.sqlite as sqlite_store
-import daita.catalog.service as catalog_service
 
 _OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
 

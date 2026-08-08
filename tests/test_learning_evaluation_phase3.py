@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-import sqlite3
 from typing import Mapping
 
 import pytest
@@ -14,11 +14,11 @@ from daita import Agent, ApprovalDecision, ApprovalRequest
 from daita._json import FrozenJsonObject
 from daita.catalog import CatalogResource
 from daita.evaluation import (
+    EVALUATION_MAX_CASES,
+    EVALUATION_MAX_EVENTS_PER_OUTCOME,
     BenchmarkJudgment,
     BenchmarkOutcome,
     BenchmarkVariant,
-    EVALUATION_MAX_CASES,
-    EVALUATION_MAX_EVENTS_PER_OUTCOME,
     RunMeasurement,
     build_learning_effectiveness_report,
     measure_observer_events,

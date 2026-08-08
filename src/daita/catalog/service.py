@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import unicodedata
 from bisect import bisect_left
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-import re
 from types import MappingProxyType
 from typing import TYPE_CHECKING
-import unicodedata
 
 from .._json import FrozenJsonObject
 from .models import (
@@ -26,10 +26,10 @@ from .models import (
     CatalogResource,
     CatalogResourceRevision,
     CatalogSchemaRequest,
-    CatalogSnapshotRef,
     CatalogSearchHit,
     CatalogSearchRequest,
     CatalogSearchResult,
+    CatalogSnapshotRef,
     CatalogSummary,
     CatalogSync,
     CatalogSyncStatus,

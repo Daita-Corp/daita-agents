@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 import re
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 from ..security import (
+    KeychainStore,
     SecretProvider,
     SecretResolutionError,
     default_secret_provider,
@@ -15,7 +16,10 @@ from .models import ModelRequest, ModelResponse, ModelStreamEvent
 from .protocols import ModelProvider, StreamingModelProvider
 from .providers import (
     AnthropicProvider,
+    ClaudeCodeSubscriptionProvider,
+    CodexSubscriptionProvider,
     GeminiProvider,
+    GrokBuildSubscriptionProvider,
     GrokProvider,
     OllamaProvider,
     OpenAICompatibleProvider,
@@ -35,6 +39,8 @@ def create_llm_provider(
     model_id: str,
     *,
     api_key: str | None = None,
+    subscription_credential: str | None = None,
+    credential_updater: Callable[[str], Awaitable[None]] | None = None,
     base_url: str | None = None,
     max_output_tokens: int = 1_024,
 ) -> ModelProvider:
@@ -43,6 +49,12 @@ def create_llm_provider(
         raise ValueError("model_id must use provider:model form")
     if not isinstance(max_output_tokens, int) or max_output_tokens < 1:
         raise ValueError("max_output_tokens must be positive")
+    if provider_name != "codex" and subscription_credential is not None:
+        raise ValueError(
+            "subscription_credential is only accepted by subscription providers"
+        )
+    if provider_name != "codex" and credential_updater is not None:
+        raise ValueError("credential_updater is only accepted by Codex")
     if provider_name == "openai":
         _fixed_endpoint(provider_name, base_url)
         return OpenAIProvider(
@@ -51,6 +63,30 @@ def create_llm_provider(
     if provider_name == "anthropic":
         _fixed_endpoint(provider_name, base_url)
         return AnthropicProvider(model, api_key=api_key, max_tokens=max_output_tokens)
+    if provider_name == "codex":
+        _fixed_endpoint(provider_name, base_url)
+        if api_key is not None:
+            raise ValueError("codex does not accept an API key")
+        if subscription_credential is None:
+            raise ValueError("codex requires a Daita subscription login")
+        return CodexSubscriptionProvider(
+            model,
+            credential=subscription_credential,
+            credential_updater=credential_updater,
+            max_output_tokens=max_output_tokens,
+        )
+    if provider_name == "claude-code":
+        _subscription_auth_only(provider_name, api_key, base_url)
+        return ClaudeCodeSubscriptionProvider(
+            model,
+            max_output_tokens=max_output_tokens,
+        )
+    if provider_name == "grok-build":
+        _subscription_auth_only(provider_name, api_key, base_url)
+        return GrokBuildSubscriptionProvider(
+            model,
+            max_output_tokens=max_output_tokens,
+        )
     if provider_name == "gemini":
         _fixed_endpoint(provider_name, base_url)
         return GeminiProvider(
@@ -82,6 +118,16 @@ def _fixed_endpoint(provider: str, base_url: str | None) -> None:
         raise ValueError(f"{provider} uses its fixed endpoint")
 
 
+def _subscription_auth_only(
+    provider: str,
+    api_key: str | None,
+    base_url: str | None,
+) -> None:
+    _fixed_endpoint(provider, base_url)
+    if api_key is not None:
+        raise ValueError(f"{provider} uses the official client's subscription login")
+
+
 class _LazyProvider:
     def __init__(self, candidate: ModelRouteCandidate, secrets: SecretProvider) -> None:
         self._candidate = candidate
@@ -99,7 +145,15 @@ class _LazyProvider:
         return (
             request.allow_parallel_tool_calls is None
             or self._candidate.base_url is not None
-            or provider_name in {"openai", "grok", "ollama"}
+            or provider_name
+            in {
+                "openai",
+                "grok",
+                "ollama",
+                "codex",
+                "claude-code",
+                "grok-build",
+            }
         )
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
@@ -127,8 +181,9 @@ class _LazyProvider:
             )
         if self._provider is None:
             reference = self._candidate.secret_reference
+            provider_name = self.provider_id.partition(":")[0]
             try:
-                api_key = (
+                credential = (
                     None
                     if reference is None
                     else await self._secrets.resolve(reference)
@@ -139,9 +194,25 @@ class _LazyProvider:
                     "The configured provider credential could not be resolved.",
                     provider_id=self.provider_id,
                 ) from None
+            credential_updater: Callable[[str], Awaitable[None]] | None = None
+            if provider_name == "codex" and reference is not None:
+
+                async def update_credential(value: str) -> None:
+                    if not isinstance(self._secrets, KeychainStore):
+                        raise SecretResolutionError(
+                            "secret_provider_unavailable",
+                            "The configured keychain cannot update the login.",
+                        )
+                    await self._secrets.set(reference, value)
+
+                credential_updater = update_credential
             self._provider = create_llm_provider(
                 self._candidate.provider_id,
-                api_key=api_key,
+                api_key=(credential if provider_name != "codex" else None),
+                subscription_credential=(
+                    credential if provider_name == "codex" else None
+                ),
+                credential_updater=credential_updater,
                 base_url=self._candidate.base_url,
                 max_output_tokens=self._candidate.profile.max_output_tokens,
             )

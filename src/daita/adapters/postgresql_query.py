@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network
-import math
 from typing import Any, cast
 from uuid import UUID
 

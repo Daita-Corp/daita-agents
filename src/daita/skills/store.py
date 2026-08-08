@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
+import stat
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from hashlib import sha256
-import os
 from pathlib import Path
-import re
-import stat
 from typing import TypeVar
 from uuid import uuid4
 

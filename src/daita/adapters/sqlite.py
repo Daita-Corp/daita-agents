@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime
 import os
-from pathlib import Path
 import re
 import sqlite3
 import stat
 import threading
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
+from ..capabilities import ExtensionDeclarations
 from ..catalog.models import (
     CatalogFacet,
     CatalogRelationship,
@@ -31,7 +32,6 @@ from ..catalog.models import (
     TabularIndex,
     catalog_resource_id,
 )
-from ..capabilities import ExtensionDeclarations
 from ..domains.data.capabilities import sqlite_query_extension_declarations
 from .models import (
     DiscoveryRequest,

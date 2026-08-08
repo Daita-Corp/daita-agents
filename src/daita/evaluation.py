@@ -6,11 +6,11 @@ observer events, then pass them to these pure aggregation and rendering helpers.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from decimal import Decimal, InvalidOperation
 from enum import Enum
-import re
 from typing import cast
 
 from .learning_candidates import (

@@ -6,16 +6,15 @@ from __future__ import annotations
 # implementation lives under ``daita.tui``. Most compatibility names are
 # accessed by importers rather than by this module itself.
 # pyright: reportUnusedImport=false
-
 from .terminal_transcript import (
     TranscriptFollowState,
     bounded_selection_auto_scroll,
 )
 from .tui.application import (
-    MAX_COMPOSER_CHARACTERS,
     _MAX_COMPOSER_ROWS,
     _MOUSE_SCROLL_LINES,
     _STREAM_REPAINT_INTERVAL_SECONDS,
+    MAX_COMPOSER_CHARACTERS,
     TerminalApplicationResult,
     TerminalCommandResult,
     TerminalSuspendBridge,
@@ -56,9 +55,9 @@ from .tui.rendering import (
     semantic_style_rules as _semantic_style_rules,
 )
 from .tui.shell import (
+    _SLASH_COMMAND_COMPLETIONS,
     MAX_APPROVAL_DOCUMENT_CHARACTERS,
     StatusProjection,
-    _SLASH_COMMAND_COMPLETIONS,
     _approval_panel_for_request,
     _context_progress_text,
     _render_approval_panel_fragments,

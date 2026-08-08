@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import subprocess
 import tempfile
+from pathlib import Path
 
 from installer_fixtures import (
     InstallerFixture,

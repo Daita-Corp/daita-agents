@@ -1,10 +1,10 @@
 import copy
+import json
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from importlib import resources
-import json
 
 import pytest
 
@@ -12,6 +12,7 @@ from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
     ModelRequest,
+    ModelUsage,
     TextBlock,
 )
 from daita.llm.pricing import (
@@ -32,12 +33,12 @@ from daita.llm.pricing import (
     select_pricing_schedule,
     validate_pricing_schedules,
 )
-from daita.llm.providers.grok import GrokProvider
 from daita.llm.providers.anthropic import AnthropicProvider
 from daita.llm.providers.gemini import (
     GeminiProvider,
     _decode_usage as decode_gemini_usage,
 )
+from daita.llm.providers.grok import GrokProvider
 from daita.llm.providers.openai import (
     OpenAIProvider,
     _billable_quantities as openai_billable_quantities,
@@ -45,7 +46,6 @@ from daita.llm.providers.openai import (
 )
 from daita.llm.providers.openai_compatible import OpenAICompatibleProvider
 from daita.loop.models import LoopExit, LoopExitKind, RunInput
-from daita.llm.models import ModelUsage
 from daita.storage.sqlite import SQLiteStateStore
 
 NOW = datetime(2026, 7, 26, 12, tzinfo=timezone.utc)

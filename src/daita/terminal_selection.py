@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 import sys
-from typing import Any, Generic, TextIO, TypeVar
 import unicodedata
+from dataclasses import dataclass
+from typing import Any, Generic, TextIO, TypeVar
 
 from ._installation import repair_guidance
 
@@ -319,8 +319,8 @@ def _load_prompt_toolkit() -> dict[str, Any]:
         from prompt_toolkit.input import create_input
         from prompt_toolkit.key_binding import KeyBindings
         from prompt_toolkit.layout import Layout
-        from prompt_toolkit.layout.controls import FormattedTextControl
         from prompt_toolkit.layout.containers import Window
+        from prompt_toolkit.layout.controls import FormattedTextControl
         from prompt_toolkit.output import create_output
         from prompt_toolkit.styles import Style
     except ImportError as error:
