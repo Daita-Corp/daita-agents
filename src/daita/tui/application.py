@@ -619,9 +619,12 @@ def _create_application(
     transcript_base_content: Any = None
     responsive_projection = _responsive_for_output(enhanced_output, state)
     mouse_press_owner: str | None = None
+    transcript_drag_last_pointer: tuple[int, int] | None = None
 
     def complete_captured_transcript_drag(*, show_hint: bool) -> None:
+        nonlocal transcript_drag_last_pointer
         selected = state.transcript_selection.end_drag()
+        transcript_drag_last_pointer = None
         state.transient_selection_hint = (
             _SELECTION_COMPLETE_HINT
             if show_hint and selected is not None and bool(selected.text)
@@ -651,8 +654,9 @@ def _create_application(
     def mouse_failed() -> None:
         """Contain pointer failures inside disposable presentation state."""
 
-        nonlocal mouse_press_owner
+        nonlocal mouse_press_owner, transcript_drag_last_pointer
         mouse_press_owner = None
+        transcript_drag_last_pointer = None
         state.transcript_selection.end_drag()
         state.transient_selection_hint = ""
         state.notice = _MOUSE_FAILURE_NOTICE
@@ -1840,6 +1844,7 @@ def _create_application(
         )
 
     def transcript_mouse_handler(mouse_event: Any) -> Any:
+        nonlocal transcript_drag_last_pointer
         try:
             if approval_owns_mouse(mouse_event):
                 return None
@@ -1853,6 +1858,7 @@ def _create_application(
                 scroll_transcript(-_MOUSE_SCROLL_LINES)
             elif event_type == runtime["MouseEventType"].MOUSE_DOWN and left_button:
                 mouse_action_owned("transcript", event_type)
+                transcript_drag_last_pointer = None
                 transcript_fragments()
                 position = rendered_transcript_map.position_for_cell(
                     mouse_event.position.y,
@@ -1893,8 +1899,13 @@ def _create_application(
                             state.transcript_document,
                             position,
                         )
+                        transcript_drag_last_pointer = (
+                            mouse_event.position.x,
+                            mouse_event.position.y,
+                        )
                     except (RuntimeError, ValueError):
                         state.transcript_selection.clear()
+                        transcript_drag_last_pointer = None
                 state.notice = ""
             elif event_type == runtime["MouseEventType"].MOUSE_UP and left_button:
                 if not mouse_action_owned("transcript", event_type):
@@ -1911,9 +1922,17 @@ def _create_application(
                     state.transient_selection_hint = ""
                 else:
                     try:
-                        selected = state.transcript_selection.finish(
-                            state.transcript_document,
-                            position,
+                        pointer = (
+                            mouse_event.position.x,
+                            mouse_event.position.y,
+                        )
+                        selected = (
+                            state.transcript_selection.end_drag()
+                            if pointer == transcript_drag_last_pointer
+                            else state.transcript_selection.finish(
+                                state.transcript_document,
+                                position,
+                            )
                         )
                     except (RuntimeError, ValueError):
                         state.transcript_selection.clear()
@@ -1924,6 +1943,7 @@ def _create_application(
                             if selected is not None and bool(selected.text)
                             else ""
                         )
+                transcript_drag_last_pointer = None
             else:
                 return NotImplemented
             invalidate(application)

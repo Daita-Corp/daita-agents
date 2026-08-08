@@ -755,11 +755,30 @@ async def test_provider_source_and_repair_pickers_use_shared_keyboard_selector()
     assert await choose(terminal._select_catalog_repair, "\x1b[B\r") == "exit"
 
 
+def test_provider_labels_distinguish_api_subscription_and_local_routes():
+    assert terminal._PROVIDERS == (
+        ("openai", "OpenAI API"),
+        ("anthropic", "Anthropic API"),
+        ("gemini", "Gemini API"),
+        ("grok", "xAI (Grok) API"),
+        ("ollama", "Ollama local"),
+        ("codex", "Codex subscription"),
+        ("claude-code", "Claude Code subscription"),
+        ("custom", "Custom API (OpenAI-compatible)"),
+    )
+
+
 _EXPECTED_MODEL_SUGGESTIONS = {
     "openai": ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
     "anthropic": (
         "claude-opus-4-8",
         "claude-sonnet-5",
+        "claude-haiku-4-5-20251001",
+    ),
+    "codex": ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
+    "claude-code": (
+        "claude-sonnet-5",
+        "claude-opus-4-8",
         "claude-haiku-4-5-20251001",
     ),
     "gemini": (

@@ -338,6 +338,32 @@ class CompositeSecretProvider:
             "The configured secret is unavailable.",
         )
 
+    async def set(self, reference: SecretReference, value: str) -> None:
+        """Mutate the first explicitly composed keychain store."""
+
+        _keychain_reference(reference)
+        for provider in self._providers:
+            if isinstance(provider, KeychainStore):
+                await provider.set(reference, value)
+                return
+        raise SecretResolutionError(
+            "secret_provider_unavailable",
+            "The configured secret providers do not include a keychain store.",
+        )
+
+    async def delete(self, reference: SecretReference) -> None:
+        """Delete through the first explicitly composed keychain store."""
+
+        _keychain_reference(reference)
+        for provider in self._providers:
+            if isinstance(provider, KeychainStore):
+                await provider.delete(reference)
+                return
+        raise SecretResolutionError(
+            "secret_provider_unavailable",
+            "The configured secret providers do not include a keychain store.",
+        )
+
     def __repr__(self) -> str:
         return f"CompositeSecretProvider(provider_count={len(self._providers)})"
 

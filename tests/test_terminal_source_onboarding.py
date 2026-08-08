@@ -118,7 +118,7 @@ async def test_terminal_onboards_local_sources_and_renders_polished_ready_screen
     assert "Stage 2 status" not in text
     assert "Stage 4 status" not in text
     assert "Agent     atlas" in text
-    assert "Model     OpenAI · test-model · configured" in text
+    assert "Model     OpenAI API · test-model · configured" in text
     assert "Connections  1" in text
     assert "Fixture SQLite" not in text
     assert "Fixture files" not in text

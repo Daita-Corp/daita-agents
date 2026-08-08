@@ -271,7 +271,7 @@ async def test_first_run_keyboard_postgresql_path_reaches_grounded_chat(
         for local_text in (
             "Select an agent",
             "Select a model provider",
-            "Select an OpenAI model",
+            "Select an OpenAI API model",
             "Select a source type",
             "Select one or more schemas",
             "Space toggle",
@@ -370,7 +370,7 @@ async def test_returning_keyboard_selection_skips_onboarding_and_writes_no_dupli
     assert code == 0
     text = output.getvalue()
     assert "Agent     customer" in text
-    assert "Model     OpenAI · returning-model · configured" in text
+    assert "Model     OpenAI API · returning-model · configured" in text
     assert "Connections  1" in text
     assert "Retained source" not in text
     assert "Status" in text and "Ready" in text

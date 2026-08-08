@@ -14,6 +14,7 @@ from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -2125,6 +2126,7 @@ def _initialize(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         _validate_existing_state(path)
+        os.chmod(path, 0o600)
         return
     with _connect(path) as connection:
         connection.executescript("""
@@ -2181,6 +2183,7 @@ def _initialize(path: Path) -> None:
             """)
         connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS runs_conversation_turn
                ON runs(agent_id, conversation_id, turn_index)""")
+    os.chmod(path, 0o600)
 
 
 def _validate_existing_state(path: Path) -> None:

@@ -25,7 +25,7 @@ become more useful over time without giving up human control.
 | | |
 | --- | --- |
 | **Talk to real data** | Query SQLite, PostgreSQL, CSV, and JSON without writing SQL. |
-| **Use your preferred model** | OpenAI, Anthropic, Gemini, Grok, Ollama, or a custom OpenAI compatible endpoint. |
+| **Use your preferred model** | OpenAI, Anthropic, Gemini, Grok, Ollama, a custom OpenAI compatible endpoint, or an existing Codex/Claude Code subscription. |
 | **Keep useful context** | Persist conversations, user approved memory, and reusable Markdown skills. |
 | **Stay in control** | Validate SQL against the current catalog and approve agent proposed local changes. |
 
@@ -49,10 +49,18 @@ installed Python 3.11 or 3.12 explicitly:
 pipx install --python python3.12 daita-agents
 ```
 
-The first launch guides you through creating an agent, choosing a model,
-storing its API key in the OS keychain, and attaching a read only source. No
-credentials need to appear in CLI arguments or configuration files.
-Local Ollama models do not require an API key.
+The first launch guides you through creating an agent, choosing a model, and
+attaching a read only source. API-backed models store their key in the OS
+keychain; local Ollama models need no key. Choosing **Codex subscription** starts
+a ChatGPT device-code sign-in inside Daita—installing the Codex CLI is not
+required. **Claude Code subscription** uses the installed, signed-in Claude Code
+client, so run `claude auth login` before selecting it.
+
+Subscription calls consume the allowance and follow the model availability of
+the connected plan. Daita keeps all data tools inside its validated direct loop
+for both transports. See
+[Subscription model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) for the exact
+boundary and setup details.
 
 Once setup is complete, ask a question:
 

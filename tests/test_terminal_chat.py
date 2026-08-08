@@ -163,7 +163,7 @@ async def test_ready_agent_enters_chat_and_explicitly_continues_one_conversation
     assert "Status" in text and "Ready" in text
     assert text.count("Agent") == 1
     assert "atlas" in text
-    assert text.count("OpenAI · test-model · configured") == 1
+    assert text.count("OpenAI API · test-model · configured") == 1
     assert "provider health was not checked this launch" not in text
     assert "Stage 2 status" not in text
     assert "Stage 4 status" not in text

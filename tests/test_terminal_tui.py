@@ -1746,6 +1746,15 @@ async def test_selection_drag_auto_scrolls_only_one_row_per_mouse_event():
 
         assert initial_top - content_window.vertical_scroll == 1
         assert state.transcript_selection.active is True
+        selected_while_dragging = state.transcript_selection.text
+        release = MouseEvent(
+            position=move.position,
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+        assert content_window.content.mouse_handler(release) is None
+        assert state.transcript_selection.text == selected_while_dragging
         application.current_buffer.reset()
         pipe.send_text("\x04")
         await task

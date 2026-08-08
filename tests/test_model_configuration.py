@@ -638,7 +638,7 @@ async def test_validation_failure_returns_to_same_provider_model_menu(tmp_path):
     )
 
     assert result == 0
-    assert output.getvalue().count("Select an OpenAI model") == 2
+    assert output.getvalue().count("Select an OpenAI API model") == 2
     assert output.getvalue().count("Select a model provider") == 1
     assert "The API key was rejected. Replace it and retry." in output.getvalue()
     reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
@@ -1228,7 +1228,7 @@ async def test_custom_terminal_provider_requires_and_persists_base_url(tmp_path)
         root=tmp_path,
         input_stream=io.StringIO(
             "atlas\n"
-            "6\n"
+            "8\n"
             "acme\n"
             "acme-model\n"
             "8192\n"
@@ -1274,7 +1274,7 @@ async def test_existing_persisted_route_skips_onboarding_without_health_claim(
     assert result == 0
     assert "Select a model provider" not in output.getvalue()
     assert "Select a data source" in output.getvalue()
-    assert "OpenAI · test-model · configured" not in output.getvalue()
+    assert "OpenAI API · test-model · configured" not in output.getvalue()
     assert "provider health was not checked this launch" not in output.getvalue()
 
 
