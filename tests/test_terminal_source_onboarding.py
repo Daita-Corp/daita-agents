@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import io
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,8 +11,7 @@ import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from daita import Agent, SQLiteSource
-from daita import terminal
+from daita import Agent, SQLiteSource, terminal
 from daita.agent import PostgreSQLProbeResult, PostgreSQLSourceError
 from daita.llm.models import (
     FinishReason,

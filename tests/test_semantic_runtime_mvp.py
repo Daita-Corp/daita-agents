@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping
 from datetime import datetime, timezone
-import sqlite3
 
 from daita import (
     Agent,

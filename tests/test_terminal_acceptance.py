@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 import io
-from pathlib import Path
 import re
 import sqlite3
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
+import daita.hosting.embedded as embedded
 from daita import Agent, SQLiteSource
 from daita.agent import PostgreSQLProbeResult
 from daita.llm.models import (
@@ -25,7 +26,6 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import SecretReference
 from daita.terminal import run_terminal_application
-import daita.hosting.embedded as embedded
 
 
 class _FakeKeychain:

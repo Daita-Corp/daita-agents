@@ -8,10 +8,10 @@ document when that application exits.
 
 from __future__ import annotations
 
+import unicodedata
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from enum import Enum
-import unicodedata
 
 
 @dataclass(frozen=True, order=True, slots=True)

@@ -3,17 +3,25 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-from pathlib import Path
 import re
 import sqlite3
+from pathlib import Path
 from typing import Any, TextIO, cast
 
 import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from daita import Agent, ApprovalDecision, ApprovalRequest, Skill, SQLiteSource
-from daita import terminal, terminal_tui
+import daita.hosting.embedded as embedded
+from daita import (
+    Agent,
+    ApprovalDecision,
+    ApprovalRequest,
+    Skill,
+    SQLiteSource,
+    terminal,
+    terminal_tui,
+)
 from daita._json import FrozenJsonObject
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
@@ -29,7 +37,6 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import LoopExitKind
 from daita.security import SecretReference
 from daita.terminal import run_terminal_application
-import daita.hosting.embedded as embedded
 
 
 class _Keychain:

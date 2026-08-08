@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-import math
-import re
 from typing import Protocol, TypeVar
 
 from ._json import FrozenJsonObject, canonical_json

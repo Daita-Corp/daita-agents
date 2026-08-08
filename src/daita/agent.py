@@ -2,32 +2,32 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-import re
 from typing import Self
 
 from ._json import FrozenJsonObject
-from .artifacts.models import (
-    ArtifactDeliveryReceipt,
-    ArtifactDestination,
-    ArtifactPayload,
-)
 from .adapters.models import SourceRegistration
 from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
 )
 from .adapters.protocols import ResourceSource
+from .artifacts.models import (
+    ArtifactDeliveryReceipt,
+    ArtifactDestination,
+    ArtifactPayload,
+)
+from .capabilities import ApprovalHandler
 from .catalog.models import (
     CatalogResource,
     CatalogSearchRequest,
     CatalogSearchResult,
     CatalogSummary,
 )
-from .capabilities import ApprovalHandler
 from .config import AgentConfig
 from .hosting.embedded import (
     AgentAlreadyExistsError,
@@ -41,10 +41,6 @@ from .hosting.embedded import (
     HostActiveError,
     SourceSelectionError,
 )
-from .llm.models import ModelProfile
-from .llm.protocols import ModelProvider
-from .llm.routing import ModelRoute
-from .llm.subscription_auth import CodexDevicePrompt
 from .learning_candidates import (
     LearningCandidateContent,
     LearningCandidateRejectionReason,
@@ -52,6 +48,10 @@ from .learning_candidates import (
     LearningCandidateView,
     LearningReviewResult,
 )
+from .llm.models import ModelProfile
+from .llm.protocols import ModelProvider
+from .llm.routing import ModelRoute
+from .llm.subscription_auth import CodexDevicePrompt
 from .loop.driver import ContextBuilder, ToolRuntime
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
 from .observation import AgentObserver

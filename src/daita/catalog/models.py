@@ -7,13 +7,13 @@ refresh cannot silently turn an observation into a different resource.
 
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
-import math
-import re
 from typing import TypeVar
 
 from .._json import FrozenJsonObject, canonical_json

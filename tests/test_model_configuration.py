@@ -1,17 +1,17 @@
 import asyncio
-from collections.abc import Callable
 import io
 import json
-from pathlib import Path
 import subprocess
 import sys
+from collections.abc import Callable
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from daita import Agent, LoopLimits
+import daita.hosting.embedded as embedded
+from daita import Agent, LoopLimits, terminal
 from daita.agent import AgentModelConfigurationError
-from daita import terminal
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.factory import create_model_route_provider
 from daita.llm.models import (
@@ -24,8 +24,8 @@ from daita.llm.models import (
     TextBlock,
     ToolCall,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.llm.profiles import reviewed_model_profile
+from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelRoute, ModelRouteCandidate, RetryPolicy
 from daita.security import (
     EmptySecretProvider,
@@ -34,7 +34,6 @@ from daita.security import (
     SecretResolutionError,
 )
 from daita.terminal import run_terminal_application
-import daita.hosting.embedded as embedded
 
 
 class _FakeKeychain:

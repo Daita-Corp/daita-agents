@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
+import sqlite3
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from decimal import Decimal
-import io
-import json
-import sqlite3
 
 import pytest
 
@@ -19,7 +19,9 @@ from daita import (
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningReviewStatus,
+    terminal,
 )
+from daita.evaluation import CandidateReviewMeasurement, CandidateReviewReport
 from daita.learning_candidates import (
     LEARNING_CANDIDATE_MAX_RECORDS,
     LEARNING_CANDIDATE_MAX_SUPPORTING_RUNS,
@@ -39,7 +41,6 @@ from daita.learning_candidates import (
     learning_candidate_content_from_mapping,
     learning_candidate_content_to_mapping,
 )
-from daita.evaluation import CandidateReviewMeasurement, CandidateReviewReport
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -52,7 +53,6 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
-from daita import terminal
 
 
 class _BlockingReviewer:

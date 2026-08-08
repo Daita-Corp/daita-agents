@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 import getpass
 import io
 import json
 import os
-from pathlib import Path
 import shlex
 import subprocess
 import sys
 import tempfile
-from typing import Any, cast, TextIO
 import unicodedata
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any, TextIO, cast
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from . import (
@@ -25,6 +25,7 @@ from . import (
     SemanticAnnotationState,
     SemanticAnnotationView,
     __version__,
+    terminal_tui,
 )
 from .agent import (
     Agent,
@@ -51,7 +52,6 @@ from .learning_candidates import (
 )
 from .security import KeychainStore
 from .skills import Skill, validate_skill_name
-from . import terminal_tui
 from .terminal_selection import (
     SelectionCancelled,
     SelectionOption,

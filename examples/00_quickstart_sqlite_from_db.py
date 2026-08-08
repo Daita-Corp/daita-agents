@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-from daita import SQLiteSource
-
 from _shared import (
     ScriptedModel,
     create_offline_agent,
@@ -15,6 +13,7 @@ from _shared import (
     seed_sales_database,
     tool_response,
 )
+from daita import SQLiteSource
 
 
 async def run() -> None:

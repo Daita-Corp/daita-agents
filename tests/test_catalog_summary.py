@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+import threading
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import sqlite3
-import threading
 
 import pytest
 
+import daita.catalog.service as catalog_service
+import daita.storage.sqlite as sqlite_store
 from daita import Agent, CatalogSummary, SQLiteSource
 from daita.adapters.models import SourceRegistration
 from daita.catalog import (
@@ -19,11 +21,9 @@ from daita.catalog import (
 )
 from daita.catalog.models import CatalogSnapshotRef
 from daita.catalog.protocols import CatalogStoreError
-import daita.catalog.service as catalog_service
 from daita.llm.models import FinishReason, ModelProfile, ModelResponse
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
-import daita.storage.sqlite as sqlite_store
 
 
 def _database(path: Path, *, with_tables: bool = True) -> None:

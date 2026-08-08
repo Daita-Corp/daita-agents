@@ -11,8 +11,8 @@ from decimal import Decimal
 from typing import Protocol, cast
 from uuid import uuid4
 
-from ..._json import FrozenJsonObject, canonical_json
 from ..._installation import repair_guidance
+from ..._json import FrozenJsonObject, canonical_json
 from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from ..models import (
     CanonicalMessage,

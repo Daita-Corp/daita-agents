@@ -8,8 +8,10 @@ from typing import cast
 
 import pytest
 
-from daita import Agent
-from daita import terminal
+import daita.llm.providers.codex as codex_provider
+import daita.llm.providers.subscription_cli as claude_cli
+import daita.llm.subscription_auth as subscription_auth
+from daita import Agent, terminal
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.factory import create_llm_provider
 from daita.llm.models import (
@@ -22,21 +24,18 @@ from daita.llm.models import (
     ToolCall,
     ToolDefinition,
 )
+from daita.llm.pricing import CostEstimateStatus
 from daita.llm.providers import (
     ClaudeCodeSubscriptionProvider,
     CodexSubscriptionProvider,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.llm.pricing import CostEstimateStatus
 from daita.llm.subscription_auth import (
     CodexDevicePrompt,
     CodexOAuthCredential,
     login_codex_subscription,
 )
 from daita.security import SecretReference
-import daita.llm.providers.codex as codex_provider
-import daita.llm.providers.subscription_cli as claude_cli
-import daita.llm.subscription_auth as subscription_auth
 
 
 def _jwt(account_id: str = "account-1", *, expires_at: int | None = None) -> str:

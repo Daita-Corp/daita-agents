@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Mapping
 
 PIPX_REPAIR_GUIDANCE = "Repair it with: pipx reinstall daita-agents"

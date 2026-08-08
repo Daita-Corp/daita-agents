@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-import re
 from typing import Any
 
 from ..terminal_transcript import (

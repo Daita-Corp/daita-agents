@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from decimal import Decimal
 import io
 import os
+from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+import daita.hosting.embedded as embedded
 from daita import Agent
 from daita._json import canonical_json
 from daita.llm.models import (
@@ -20,7 +21,6 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import SecretReference
 from daita.terminal import run_terminal_application
-import daita.hosting.embedded as embedded
 
 pytestmark = [
     pytest.mark.acceptance,

@@ -1,14 +1,21 @@
+import sqlite3
+from collections.abc import Mapping
 from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
-import sqlite3
-from collections.abc import Mapping
 
 import pytest
 
 import daita
 from daita import Agent
 from daita._json import FrozenJsonObject, canonical_json
+from daita.domains.data.context import (
+    _HISTORY_OMISSION_MARKER,
+    _MAXIMUM_PRIOR_UTF8_BYTES,
+    DataContextBuilder,
+    _neutral_message,
+    _project_completed_history,
+)
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     CanonicalMessage,
@@ -31,13 +38,6 @@ from daita.loop import (
     LoopExitKind,
     RunInput,
     Transcript,
-)
-from daita.domains.data.context import (
-    DataContextBuilder,
-    _HISTORY_OMISSION_MARKER,
-    _MAXIMUM_PRIOR_UTF8_BYTES,
-    _neutral_message,
-    _project_completed_history,
 )
 from daita.storage.sqlite import SQLiteStateStore
 

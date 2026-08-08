@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import gzip
 import hashlib
-from pathlib import Path
 import sys
 import tarfile
 import textwrap
 import zipfile
+from dataclasses import dataclass
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER_SOURCE = ROOT / "scripts" / "install.sh"

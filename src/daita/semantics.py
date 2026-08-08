@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 from html import escape
-import re
-import unicodedata
 from typing import Protocol
 
 from ._json import FrozenJsonObject, canonical_json

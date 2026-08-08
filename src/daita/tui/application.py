@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
 import os
 import re
 import sys
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, TextIO
 
 from .._installation import repair_guidance
@@ -40,13 +40,6 @@ from .rendering import (
     render_markdown_text as _render_markdown_text_with_runtime,
     semantic_style_rules as _semantic_style_rules,
 )
-from .state import (
-    TerminalApprovalBridge,
-    TerminalObserverBridge,
-    TerminalStartupInfo,
-    TerminalViewState,
-    _model_text_event_fields,
-)
 from .shell import (
     StatusProjection,
     _approval_panel_for_request,
@@ -62,6 +55,13 @@ from .shell import (
     _write_setup_prompt as _write_setup_prompt_impl,
     _write_setup_status as _write_setup_status_impl,
 )
+from .state import (
+    TerminalApprovalBridge,
+    TerminalObserverBridge,
+    TerminalStartupInfo,
+    TerminalViewState,
+    _model_text_event_fields,
+)
 from .text import (
     display_width as _display_width,
     sanitize_terminal_text as _sanitize_terminal_text,
@@ -74,11 +74,11 @@ from .tool_view import (
 )
 from .transcript_view import (
     _EMPTY_RENDERED_TRANSCRIPT_MAP,
-    _RenderedTranscriptMap,
     _fragment_line_metrics,
     _highlight_transcript_line,
     _render_startup_fragments,
     _render_transcript_fragments,
+    _RenderedTranscriptMap,
 )
 
 MAX_COMPOSER_CHARACTERS = 16_384
@@ -381,6 +381,7 @@ def _load_terminal_runtime() -> dict[str, Any]:
         from prompt_toolkit.history import InMemoryHistory
         from prompt_toolkit.input import create_input
         from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.keys import Keys
         from prompt_toolkit.layout import Layout
         from prompt_toolkit.layout.containers import (
             ConditionalContainer,
@@ -394,7 +395,6 @@ def _load_terminal_runtime() -> dict[str, Any]:
         from prompt_toolkit.output import create_output
         from prompt_toolkit.styles import Style
         from prompt_toolkit.widgets import Frame, TextArea
-        from prompt_toolkit.keys import Keys
         from rich.console import Console
         from rich.markdown import Markdown
         from rich.syntax import Syntax

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from hashlib import sha256
-import re
 from typing import TypeVar
 
 from .._json import FrozenJsonObject, canonical_json

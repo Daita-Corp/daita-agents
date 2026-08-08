@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import base64
+import math
+import re
+import stat
+import time as time_module
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -10,10 +14,6 @@ from decimal import Decimal
 from hashlib import sha256
 from importlib import import_module
 from io import BytesIO
-import math
-import re
-import stat
-import time as time_module
 from typing import Any, NoReturn, cast
 from uuid import UUID
 from xml.etree import ElementTree

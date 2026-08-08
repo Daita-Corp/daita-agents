@@ -3,30 +3,23 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
-from datetime import datetime, timezone
-from decimal import Decimal
 import errno
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import stat
 import tomllib
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
+from datetime import datetime, timezone
+from decimal import Decimal
+from pathlib import Path
 from typing import Self, TypeVar, cast
 from uuid import uuid4
 
 from .._json import FrozenJsonObject
-from ..artifacts.delivery import LocalArtifactDelivery
-from ..artifacts.models import (
-    ArtifactDeliveryReceipt,
-    ArtifactDestination,
-    ArtifactPayload,
-)
-from ..artifacts.store import AgentHomeArtifactStore
 from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySource
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
@@ -34,6 +27,14 @@ from ..adapters.postgresql_query import PostgreSQLQueryBackend
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.sqlite import SQLiteSource
 from ..adapters.sqlite_query import SQLiteQueryBackend
+from ..artifacts.delivery import LocalArtifactDelivery
+from ..artifacts.models import (
+    ArtifactDeliveryReceipt,
+    ArtifactDestination,
+    ArtifactPayload,
+)
+from ..artifacts.store import AgentHomeArtifactStore
+from ..capabilities import ApprovalHandler, CapabilityRegistry
 from ..catalog.capabilities import catalog_declarations
 from ..catalog.models import (
     CatalogResource,
@@ -44,7 +45,6 @@ from ..catalog.models import (
     CatalogSyncStatus,
 )
 from ..catalog.service import CatalogService
-from ..capabilities import ApprovalHandler, CapabilityRegistry
 from ..config import AgentConfig
 from ..domains.data import (
     CatalogDataView,
@@ -58,6 +58,16 @@ from ..domains.data import (
 from ..domains.data.context import _project_completed_history
 from ..errors import AgentError
 from ..identity import AgentIdentity
+from ..learning_candidates import (
+    LEARNING_REVIEW_MAX_TOTAL_TOKENS,
+    LearningCandidate,
+    LearningCandidateContent,
+    LearningCandidateRejectionReason,
+    LearningCandidateStatus,
+    LearningCandidateView,
+    LearningReviewResult,
+    OneShotCandidateReviewer,
+)
 from ..llm.errors import ModelProviderError, ProviderErrorCode
 from ..llm.factory import create_model_route_provider
 from ..llm.models import (
@@ -80,16 +90,6 @@ from ..llm.routing import (
     RetryPolicy,
 )
 from ..llm.subscription_auth import CodexDevicePrompt, login_codex_subscription
-from ..learning_candidates import (
-    LEARNING_REVIEW_MAX_TOTAL_TOKENS,
-    LearningCandidate,
-    LearningCandidateContent,
-    LearningCandidateRejectionReason,
-    LearningCandidateStatus,
-    LearningCandidateView,
-    LearningReviewResult,
-    OneShotCandidateReviewer,
-)
 from ..loop.driver import (
     AgentLoop,
     ContextBuilder,

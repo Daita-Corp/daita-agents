@@ -11,10 +11,7 @@ from prompt_toolkit.data_structures import Size
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from daita import Agent
-from daita import terminal
-from daita import terminal_selection
-from daita import terminal_tui
+from daita import Agent, terminal, terminal_selection, terminal_tui
 from daita.terminal_selection import (
     SelectionCancelled,
     SelectionOption,

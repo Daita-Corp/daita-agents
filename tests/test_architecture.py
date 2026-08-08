@@ -1,10 +1,9 @@
 import ast
+import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
-import sqlite3
 
 import daita
-
 from daita.capabilities import AccessMode
 from daita.storage.sqlite import SQLiteStateStore
 

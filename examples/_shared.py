@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-import sqlite3
 from tempfile import TemporaryDirectory
 
 from daita import Agent

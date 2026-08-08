@@ -9,16 +9,9 @@ from .artifacts import (
     ArtifactPayload,
     ArtifactRef,
 )
-from .catalog import CatalogSummary
 from .capabilities import ApprovalDecision, ApprovalHandler, ApprovalRequest
+from .catalog import CatalogSummary
 from .config import AgentConfig
-from .llm import (
-    ModelRoute,
-    ModelRouteCandidate,
-    RetryPolicy,
-    create_llm_provider,
-)
-from .loop import ConversationRun, LoopExit, LoopExitKind, LoopLimits, Transcript
 from .learning_candidates import (
     DocumentCandidateContent,
     LearningCandidate,
@@ -33,6 +26,13 @@ from .learning_candidates import (
     SemanticCandidateContent,
     SkillCandidateContent,
 )
+from .llm import (
+    ModelRoute,
+    ModelRouteCandidate,
+    RetryPolicy,
+    create_llm_provider,
+)
+from .loop import ConversationRun, LoopExit, LoopExitKind, LoopLimits, Transcript
 from .observation import AgentEvent, AgentEventKind, AgentObserver
 from .semantics import (
     ResourceRevisionBinding,

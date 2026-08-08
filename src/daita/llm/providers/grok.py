@@ -10,9 +10,9 @@ from ..models import ModelRequest, ModelUsage
 from ..pricing import provider_reported_cost_estimate
 from .openai_compatible import (
     OpenAICompatibleProvider,
-    _OpenAICompatibleClient,
     _decode_usage,
     _field,
+    _OpenAICompatibleClient,
 )
 
 _XAI_BASE_URL = "https://api.x.ai/v1"

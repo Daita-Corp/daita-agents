@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-import json
 from typing import Any
 
 from .._json import freeze_json, thaw_json

@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 import json
 import math
 import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode

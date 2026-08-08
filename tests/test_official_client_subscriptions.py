@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from pathlib import Path
 import stat
 import sys
+from pathlib import Path
 
 import pytest
 
+import daita.llm.providers.subscription_cli as subscription_cli
 from daita import Agent
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.factory import create_llm_provider
@@ -29,7 +30,6 @@ from daita.llm.providers import (
     GrokProvider,
 )
 from daita.llm.providers.mock import MockModelProvider
-import daita.llm.providers.subscription_cli as subscription_cli
 
 
 def _request() -> ModelRequest:

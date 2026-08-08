@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from hashlib import sha256
 from importlib import import_module
 from itertools import islice
-import re
 from typing import Any
 from urllib.parse import quote
 

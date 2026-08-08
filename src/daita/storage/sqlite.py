@@ -7,21 +7,22 @@ attached sources, current catalog snapshots, and exact run transcripts.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import re
+import sqlite3
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
-import json
-import os
 from pathlib import Path
-import re
-import sqlite3
-import threading
 from typing import Any, TypeVar
 
 from .._json import FrozenJsonObject
+from ..adapters.models import SourceRegistration
 from ..artifacts.models import (
     ArtifactAuthorship,
     ArtifactDeliveryReceipt,
@@ -30,16 +31,15 @@ from ..artifacts.models import (
     ArtifactResourceBinding,
     artifact_ref_from_mapping,
 )
-from ..adapters.models import SourceRegistration
 from ..catalog.models import (
     CatalogFacet,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
     CatalogSnapshotRef,
+    CatalogSummary,
     CatalogSync,
     CatalogSyncStatus,
-    CatalogSummary,
     FacetKind,
     RelationshipDirection,
     RelationshipFieldPair,
@@ -52,10 +52,10 @@ from ..catalog.models import (
 from ..catalog.protocols import CatalogStoreError
 from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..learning_candidates import (
-    DocumentCandidateContent,
     LEARNING_CANDIDATE_MAX_RECORDS,
     LEARNING_REVIEW_MAX_PROPOSALS,
     LEARNING_REVIEW_MAX_STAMPS,
+    DocumentCandidateContent,
     LearningCandidate,
     LearningCandidateAction,
     LearningCandidateError,

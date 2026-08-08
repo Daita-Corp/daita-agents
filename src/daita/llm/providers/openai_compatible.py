@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import json
+import re
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
-import ipaddress
-import json
-import re
 from typing import Protocol, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from ..._json import FrozenJsonObject, canonical_json
 from ..._installation import repair_guidance
+from ..._json import FrozenJsonObject, canonical_json
 from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from ..models import (
     CanonicalMessage,

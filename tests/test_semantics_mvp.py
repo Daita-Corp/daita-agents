@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-import sqlite3
 
 import pytest
 

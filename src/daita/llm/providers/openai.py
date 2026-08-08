@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
-import json
 from typing import Protocol, cast
 from uuid import uuid4
 
-from ..._json import FrozenJsonObject, canonical_json, thaw_json
 from ..._installation import repair_guidance
+from ..._json import FrozenJsonObject, canonical_json, thaw_json
 from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
 from ..models import (
     CanonicalMessage,

@@ -2,19 +2,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import threading
 from collections import defaultdict
 from collections.abc import Mapping
 from copy import copy
 from hashlib import sha256
 from pathlib import Path
-import threading
 from typing import cast
 
 import pytest
 
-from daita import Agent, ArtifactError, LocalDirectorySource
-from daita import cli
 import daita.adapters.local_files as local_files_module
+from daita import Agent, ArtifactError, LocalDirectorySource, cli
 from daita.artifacts.models import ArtifactAuthorship
 from daita.capabilities import CapabilityInputError, CapabilityRegistry
 from daita.domains.data.export_capabilities import (

@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import csv
-from pathlib import Path
 import sqlite3
-
-from daita import SQLiteSource
+from pathlib import Path
 
 from _shared import (
     ScriptedModel,
@@ -17,6 +15,7 @@ from _shared import (
     parser,
     tool_response,
 )
+from daita import SQLiteSource
 
 ROWS = (
     ("1001", "Ada Lovelace", "complete", "120.00"),

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime, timezone
-import json
-import sqlite3
 
 import pytest
 

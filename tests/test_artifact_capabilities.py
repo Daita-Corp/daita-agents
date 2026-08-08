@@ -8,9 +8,9 @@ from typing import cast
 
 import pytest
 
+import daita.domains.data.controller as data_controller
 from daita import Agent, ApprovalDecision, ApprovalRequest, ArtifactError
 from daita._json import FrozenJsonObject
-import daita.domains.data.controller as data_controller
 from daita.domains.data.context import DataContextBuilder
 from daita.domains.data.export_capabilities import (
     ARTIFACT_CONVERT_TOOL_NAME,
@@ -22,8 +22,8 @@ from daita.domains.data.export_capabilities import (
     artifact_extension_declarations,
 )
 from daita.llm.models import (
-    FinishReason,
     CanonicalMessage,
+    FinishReason,
     MessageRole,
     ModelProfile,
     ModelResponse,

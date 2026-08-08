@@ -52,6 +52,7 @@ jobs:
           python-version: "3.11"
       - run: python -m pip install -e ".[dev]"
       - run: python -m black --check src tests
+      - run: python -m ruff check --select I .
       - run: python -m mypy src/daita tests
       - run: bash -n scripts/install.sh
       - run: shellcheck scripts/install.sh

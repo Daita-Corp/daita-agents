@@ -7,9 +7,9 @@ messages or depending on provider/adapter exceptions.
 
 from __future__ import annotations
 
-from enum import Enum
 import math
 import re
+from enum import Enum
 
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 

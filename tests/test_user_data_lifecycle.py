@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import io
 import json
-from pathlib import Path
 import sqlite3
 import stat
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
-from daita import Agent, SQLiteSource
+import daita.hosting.embedded as embedded
+from daita import Agent, SQLiteSource, cli, terminal
 from daita.adapters.models import SourceRegistration
 from daita.agent import AgentHomeError
 from daita.llm.models import (
@@ -21,8 +22,6 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import KeychainSecretProvider, SecretReference
 from daita.skills import Skill
-from daita import cli, terminal
-import daita.hosting.embedded as embedded
 
 NOW = datetime(2026, 7, 29, tzinfo=timezone.utc)
 

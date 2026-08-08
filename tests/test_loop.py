@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from daita.agent import Agent
+from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -15,7 +16,6 @@ from daita.llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
 from daita.loop import (
     AgentLoop,

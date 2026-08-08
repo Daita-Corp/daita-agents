@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
 import os
 import re
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Protocol, TypeVar, cast, runtime_checkable
 
 from .._installation import repair_guidance

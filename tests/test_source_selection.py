@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
-import sqlite3
 
 from daita import Agent, LocalDirectorySource, SQLiteSource
 from daita.llm.models import (

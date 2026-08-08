@@ -8,6 +8,8 @@ history. No pricing data is downloaded at runtime.
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
@@ -15,8 +17,6 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
 from importlib import resources
-import json
-import re
 from typing import TypeVar, cast
 from urllib.parse import urlsplit
 

@@ -1,12 +1,13 @@
 import asyncio
+import os
+import sqlite3
 from collections.abc import Mapping
 from datetime import datetime, timezone
-import os
 from pathlib import Path
-import sqlite3
 
 import pytest
 
+import daita.memory.store as memory_module
 from daita import Agent
 from daita.llm.models import (
     FinishReason,
@@ -26,7 +27,6 @@ from daita.memory import (
     MemoryStore,
     MemoryValidationError,
 )
-import daita.memory.store as memory_module
 
 NOW = datetime(2026, 7, 22, tzinfo=timezone.utc)
 

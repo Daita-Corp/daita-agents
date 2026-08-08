@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import io
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
-import io
-import sqlite3
 
 from daita import (
     Agent,
@@ -18,6 +18,8 @@ from daita import (
     SemanticFieldReference,
     SemanticKind,
     SemanticSubject,
+    cli,
+    terminal_tui,
 )
 from daita.llm.models import (
     FinishReason,
@@ -34,7 +36,6 @@ from daita.terminal import (
     _handle_knowledge_command,
     _learning_invocation_message,
 )
-from daita import cli, terminal_tui
 
 NOW = datetime(2026, 7, 28, 16, tzinfo=timezone.utc)
 

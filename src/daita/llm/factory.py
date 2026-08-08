@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable
 import re
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 from ..security import (
     KeychainStore,

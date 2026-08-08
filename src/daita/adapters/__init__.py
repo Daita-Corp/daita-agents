@@ -1,5 +1,8 @@
 """Portable resource-adapter contracts and built-in sources."""
 
+# Import order is intentional: the shared records initialize catalog models before
+# source modules import the capability registry, avoiding a package-init cycle.
+# isort: off
 from .models import (
     DiscoveryRequest,
     DiscoveryResult,
@@ -35,6 +38,8 @@ from .postgresql import (
     PostgreSQLSourceError,
 )
 from .postgresql_query import PostgreSQLQueryBackend, PostgreSQLQueryError
+
+# isort: on
 
 __all__ = [
     "DiscoveryLimitError",
