@@ -764,6 +764,7 @@ def test_provider_labels_distinguish_api_subscription_and_local_routes():
         ("ollama", "Ollama local"),
         ("codex", "Codex subscription"),
         ("claude-code", "Claude Code subscription"),
+        ("grok-build", "Grok Build subscription"),
         ("custom", "Custom API (OpenAI-compatible)"),
     )
 
@@ -781,6 +782,7 @@ _EXPECTED_MODEL_SUGGESTIONS = {
         "claude-opus-4-8",
         "claude-haiku-4-5-20251001",
     ),
+    "grok-build": ("grok-4.5",),
     "gemini": (
         "gemini-3.6-flash",
         "gemini-3.5-flash",

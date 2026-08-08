@@ -19,6 +19,7 @@ from .providers import (
     ClaudeCodeSubscriptionProvider,
     CodexSubscriptionProvider,
     GeminiProvider,
+    GrokBuildSubscriptionProvider,
     GrokProvider,
     OllamaProvider,
     OpenAICompatibleProvider,
@@ -80,6 +81,12 @@ def create_llm_provider(
             model,
             max_output_tokens=max_output_tokens,
         )
+    if provider_name == "grok-build":
+        _subscription_auth_only(provider_name, api_key, base_url)
+        return GrokBuildSubscriptionProvider(
+            model,
+            max_output_tokens=max_output_tokens,
+        )
     if provider_name == "gemini":
         _fixed_endpoint(provider_name, base_url)
         return GeminiProvider(
@@ -138,7 +145,15 @@ class _LazyProvider:
         return (
             request.allow_parallel_tool_calls is None
             or self._candidate.base_url is not None
-            or provider_name in {"openai", "grok", "ollama", "codex", "claude-code"}
+            or provider_name
+            in {
+                "openai",
+                "grok",
+                "ollama",
+                "codex",
+                "claude-code",
+                "grok-build",
+            }
         )
 
     async def generate(self, request: ModelRequest) -> ModelResponse:

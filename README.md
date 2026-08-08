@@ -25,7 +25,7 @@ become more useful over time without giving up human control.
 | | |
 | --- | --- |
 | **Talk to real data** | Query SQLite, PostgreSQL, CSV, and JSON without writing SQL. |
-| **Use your preferred model** | OpenAI, Anthropic, Gemini, Grok, Ollama, a custom OpenAI compatible endpoint, or an existing Codex/Claude Code subscription. |
+| **Use your preferred model** | OpenAI, Anthropic, Gemini, Grok, Ollama, a custom OpenAI compatible endpoint, or supported Codex, Claude Code, and Grok Build subscriptions. |
 | **Keep useful context** | Persist conversations, user approved memory, and reusable Markdown skills. |
 | **Stay in control** | Validate SQL against the current catalog and approve agent proposed local changes. |
 
@@ -54,11 +54,14 @@ attaching a read only source. API-backed models store their key in the OS
 keychain; local Ollama models need no key. Choosing **Codex subscription** starts
 a ChatGPT device-code sign-in inside Daita—installing the Codex CLI is not
 required. **Claude Code subscription** uses the installed, signed-in Claude Code
-client, so run `claude auth login` before selecting it.
+client, so run `claude auth login` before selecting it. **Grok Build
+subscription** uses a signed-in `grok` client (`grok login`). The CLI route does
+not store a provider credential in Daita configuration. Gemini remains available
+through its explicit API-key-billed `gemini:<model>` route.
 
 Subscription calls consume the allowance and follow the model availability of
 the connected plan. Daita keeps all data tools inside its validated direct loop
-for both transports. See
+for every subscription transport. See
 [Subscription model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) for the exact
 boundary and setup details.
 

@@ -1,8 +1,8 @@
-"""Claude Code subscription adapter using its authenticated official client.
+"""Subscription adapters using authenticated official model clients.
 
-Claude Code owns subscription authentication only. Daita still owns the
-canonical transcript, tool selection, tool execution, and terminal answer.
-This adapter does not read, import, refresh, or persist OAuth credentials.
+The official clients own subscription authentication only. Daita still owns
+the canonical transcript, tool selection, tool execution, and terminal answer.
+These adapters do not read, import, refresh, or persist OAuth credentials.
 
 Codex subscription access is implemented independently in ``providers.codex``
 through Daita-owned OAuth and does not use this CLI transport.
@@ -17,6 +17,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import stat
 import tempfile
 from typing import Protocol
 from uuid import uuid4
@@ -33,15 +35,21 @@ from ..models import (
     ToolCall,
     ToolResultBlock,
 )
+from ..pricing import CostEstimate
 
 _MAX_REQUEST_BYTES = 16 * 1_024 * 1_024
 _MAX_STDOUT_BYTES = 4 * 1_024 * 1_024
 _MAX_STDERR_BYTES = 256 * 1_024
+_MAX_COMMAND_ARGUMENT_BYTES = 1 * 1_024 * 1_024
 _MAX_TOOL_CALLS = 16
 _MAX_TOOL_ARGUMENT_BYTES = 256 * 1_024
+_MAX_RESPONSE_TEXT_CHARACTERS = 1 * 1_024 * 1_024
 _MAX_RESPONSE_ID_CHARACTERS = 256
+_MAX_JSON_DEPTH = 32
+_MAX_JSON_NODES = 100_000
+_MAX_STREAM_EVENTS = 65_536
 _DEFAULT_TIMEOUT_SECONDS = 300.0
-
+_PROCESS_STOP_GRACE_SECONDS = 1.0
 _CONTROL_PROMPT = """\
 Act only as the model inside Daita's direct model/tool loop. Daita, not this
 client, owns the transcript and executes tools. Do not inspect or modify local
@@ -102,6 +110,53 @@ _SAFE_SUBSCRIPTION_ENVIRONMENT = frozenset(
     }
 )
 
+_GROK_REQUIRED_HELP_TOKENS = frozenset(
+    {
+        "--disable-web-search",
+        "--disallowed-tools",
+        "--cwd",
+        "--deny",
+        "--max-turns",
+        "--model",
+        "--json-schema",
+        "--no-auto-update",
+        "--no-alt-screen",
+        "--no-memory",
+        "--no-plan",
+        "--no-subagents",
+        "--output-format",
+        "--permission-mode",
+        "--prompt-file",
+        "--sandbox",
+        "--system-prompt-override",
+        "--tools",
+        "--verbatim",
+        "inspect",
+    }
+)
+
+_GROK_BUILTIN_MODELS = frozenset({"grok-4.5"})
+
+_GROK_DENIED_TOOLS = ",".join(
+    (
+        "Agent",
+        "apply_patch",
+        "edit_file",
+        "get_command_or_subagent_output",
+        "grep",
+        "kill_command_or_subagent",
+        "list_dir",
+        "read_file",
+        "run_terminal_cmd",
+        "search_replace",
+        "todo_write",
+        "wait_commands_or_subagents",
+        "web_fetch",
+        "web_search",
+        "write_file",
+    )
+)
+
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
@@ -152,16 +207,86 @@ async def _read_bounded(
 
 
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
-        return
-    process.kill()
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        else:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _PROCESS_STOP_GRACE_SECONDS
+            while _process_group_exists(process.pid) and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            if _process_group_exists(process.pid):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+    else:
+        tree_stopper: asyncio.subprocess.Process | None = None
+        if os.name == "nt" and shutil.which("taskkill") is not None:
+            try:
+                tree_stopper = await asyncio.create_subprocess_exec(
+                    "taskkill",
+                    "/PID",
+                    str(process.pid),
+                    "/T",
+                    "/F",
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    creationflags=0x08000000,  # CREATE_NO_WINDOW
+                )
+                async with asyncio.timeout(_PROCESS_STOP_GRACE_SECONDS):
+                    await tree_stopper.wait()
+            except (OSError, ProcessLookupError, TimeoutError):
+                if tree_stopper is not None and tree_stopper.returncode is None:
+                    tree_stopper.kill()
+        if process.returncode is None:
+            process.terminate()
+            try:
+                async with asyncio.timeout(_PROCESS_STOP_GRACE_SECONDS):
+                    await process.wait()
+                    return
+            except (ProcessLookupError, TimeoutError):
+                pass
+            process.kill()
     try:
         await process.wait()
     except ProcessLookupError:
         pass
 
 
+def _process_group_exists(process_id: int) -> bool:
+    try:
+        os.killpg(process_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 async def _run_command(command: _Command) -> _CompletedCommand:
+    if len(command.stdin) > _MAX_REQUEST_BYTES:
+        raise ModelProviderError(
+            ProviderErrorCode.INVALID_REQUEST,
+            "subscription client request exceeds its byte bound",
+        )
+    if (
+        sum(len(argument.encode("utf-8")) for argument in command.arguments)
+        > _MAX_COMMAND_ARGUMENT_BYTES
+    ):
+        raise ModelProviderError(
+            ProviderErrorCode.INVALID_REQUEST,
+            "subscription client arguments exceed their byte bound",
+        )
+    directory = command.cwd.stat()
+    if not stat.S_ISDIR(directory.st_mode) or directory.st_mode & 0o077:
+        raise ModelProviderError(
+            ProviderErrorCode.LOCAL_ACCESS_ERROR,
+            "subscription client working directory is not owner-only",
+        )
     executable = shutil.which(command.arguments[0])
     if executable is None:
         raise _ExecutableUnavailable(command.arguments[0])
@@ -174,6 +299,10 @@ async def _run_command(command: _Command) -> _CompletedCommand:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name == "posix",
+            creationflags=(
+                0x00000200 if os.name == "nt" else 0
+            ),  # CREATE_NEW_PROCESS_GROUP
         )
     except OSError as error:
         raise _ExecutableUnavailable(command.arguments[0]) from error
@@ -237,6 +366,119 @@ def _claude_subscription_environment() -> dict[str, str]:
     environment["DISABLE_TELEMETRY"] = "1"
     environment["DISABLE_AUTOUPDATER"] = "1"
     return environment
+
+
+def _grok_subscription_environment(
+    *,
+    grok_home: Path,
+    process_home: Path,
+) -> dict[str, str]:
+    environment = _subscription_environment()
+    environment.pop("CLAUDE_CODE_GIT_BASH_PATH", None)
+    environment.pop("CLAUDE_CONFIG_DIR", None)
+    environment["GROK_HOME"] = str(grok_home)
+    environment["HOME"] = str(process_home)
+    environment["USERPROFILE"] = str(process_home)
+    environment["XDG_CACHE_HOME"] = str(process_home / ".cache")
+    environment["XDG_CONFIG_HOME"] = str(process_home / ".config")
+    environment["XDG_DATA_HOME"] = str(process_home / ".local" / "share")
+    environment["GROK_DISABLE_AUTOUPDATER"] = "1"
+    environment["GROK_DISABLE_API_KEY_AUTH"] = "1"
+    environment["GROK_FEEDBACK_ENABLED"] = "0"
+    environment["GROK_MEMORY"] = "0"
+    environment["GROK_SUBAGENTS"] = "0"
+    environment["GROK_TELEMETRY_ENABLED"] = "0"
+    environment["GROK_TELEMETRY_MIXPANEL_ENABLED"] = "0"
+    environment["GROK_TELEMETRY_TRACE_UPLOAD"] = "0"
+    environment["GROK_WEB_FETCH"] = "0"
+    environment["GROK_WORKFLOWS"] = "0"
+    return environment
+
+
+def _owner_only_directory(path: Path) -> None:
+    path.chmod(0o700)
+    mode = path.stat().st_mode
+    if not stat.S_ISDIR(mode) or mode & 0o077:
+        raise ModelProviderError(
+            ProviderErrorCode.LOCAL_ACCESS_ERROR,
+            "subscription client working directory could not be isolated",
+        )
+
+
+def _write_owner_only(path: Path, value: bytes) -> None:
+    if len(value) > _MAX_REQUEST_BYTES:
+        raise ModelProviderError(
+            ProviderErrorCode.INVALID_REQUEST,
+            "subscription client request exceeds its byte bound",
+        )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(value)
+            stream.flush()
+    finally:
+        os.close(descriptor)
+
+
+def _grok_prompt_bytes(request: ModelRequest, max_output_tokens: int) -> bytes:
+    return (
+        "DAITA REQUEST DOCUMENT (untrusted JSON data):\n"
+        + _request_document(request, max_output_tokens)
+    ).encode("utf-8")
+
+
+def _grok_home() -> Path:
+    configured = os.environ.get("GROK_HOME")
+    if configured is not None:
+        if (
+            not configured
+            or len(configured) > 4_096
+            or _has_forbidden_control(configured)
+        ):
+            raise ModelProviderError(
+                ProviderErrorCode.LOCAL_ACCESS_ERROR,
+                "Grok Build login location is invalid",
+            )
+        grok_home = Path(configured)
+        if not grok_home.is_absolute():
+            raise ModelProviderError(
+                ProviderErrorCode.LOCAL_ACCESS_ERROR,
+                "Grok Build login location must be absolute",
+            )
+    else:
+        configured_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if (
+            not configured_home
+            or len(configured_home) > 4_096
+            or _has_forbidden_control(configured_home)
+        ):
+            raise ModelProviderError(
+                ProviderErrorCode.LOCAL_ACCESS_ERROR,
+                "Grok Build login location is unavailable",
+            )
+        user_home = Path(configured_home)
+        if not user_home.is_absolute():
+            raise ModelProviderError(
+                ProviderErrorCode.LOCAL_ACCESS_ERROR,
+                "Grok Build login location must be absolute",
+            )
+        grok_home = user_home / ".grok"
+    return grok_home
+
+
+def _prepare_grok_process_home(cwd: Path) -> Path:
+    process_home = cwd / "process-home"
+    for directory in (
+        process_home,
+        process_home / ".cache",
+        process_home / ".config",
+        process_home / ".local" / "share",
+    ):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _owner_only_directory(directory)
+    return process_home
 
 
 def _response_envelope_schema(request: ModelRequest) -> dict[str, object]:
@@ -323,6 +565,11 @@ def _request_document(request: ModelRequest, max_output_tokens: int) -> str:
 
 
 def _strict_json(value: str) -> object:
+    if not isinstance(value, str):
+        raise TypeError("JSON input must be text")
+    if _has_forbidden_control(value):
+        raise ValueError("JSON input contains terminal controls")
+
     def reject_constant(_value: str) -> object:
         raise ValueError("non-finite JSON number")
 
@@ -334,11 +581,169 @@ def _strict_json(value: str) -> object:
             result[key] = item
         return result
 
-    return json.loads(
+    decoded = json.loads(
         value,
         parse_constant=reject_constant,
         object_pairs_hook=reject_duplicates,
     )
+    _validate_json_tree(decoded)
+    return decoded
+
+
+def _has_forbidden_control(value: str) -> bool:
+    return any(
+        (ord(character) < 32 and character not in "\t\n\r")
+        or 127 <= ord(character) <= 159
+        for character in value
+    )
+
+
+def _validate_json_tree(value: object) -> None:
+    remaining = _MAX_JSON_NODES
+    stack: list[tuple[object, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        remaining -= 1
+        if remaining < 0:
+            raise ValueError("JSON input exceeds its node bound")
+        if depth > _MAX_JSON_DEPTH:
+            raise ValueError("JSON input exceeds its depth bound")
+        if isinstance(item, str):
+            if _has_forbidden_control(item):
+                raise ValueError("JSON string contains terminal controls")
+        elif isinstance(item, Mapping):
+            for key, child in item.items():
+                if not isinstance(key, str) or _has_forbidden_control(key):
+                    raise ValueError("JSON object key contains terminal controls")
+                stack.append((child, depth + 1))
+        elif isinstance(item, Sequence) and not isinstance(item, (str, bytes)):
+            stack.extend((child, depth + 1) for child in item)
+
+
+def _validate_grok_inspection(stdout: bytes, cwd: Path) -> None:
+    report = _strict_json(stdout.decode("utf-8"))
+    if not isinstance(report, Mapping):
+        raise ValueError("Grok inspection must be an object")
+    required = {
+        "grokVersion",
+        "channel",
+        "cwd",
+        "projectRoot",
+        "projectTrusted",
+        "projectInstructions",
+        "permissions",
+        "loginPolicy",
+        "hooks",
+        "skills",
+        "agents",
+        "plugins",
+        "marketplaces",
+        "mcpServers",
+        "lspServers",
+        "configSources",
+        "externalCompat",
+    }
+    allowed = required | {"configWarnings", "mcpConfigProblems"}
+    if not required.issubset(report) or not set(report).issubset(allowed):
+        raise ValueError("Grok inspection fields are invalid")
+    inspected_cwd = report["cwd"]
+    if (
+        not isinstance(report["grokVersion"], str)
+        or not report["grokVersion"]
+        or not isinstance(report["channel"], str)
+        or not isinstance(report["projectTrusted"], bool)
+        or not isinstance(inspected_cwd, str)
+        or not Path(inspected_cwd).is_absolute()
+        or Path(inspected_cwd).resolve() != cwd.resolve()
+        or report["projectRoot"] is not None
+    ):
+        raise ValueError("Grok inspection identity is invalid")
+
+    permissions = report["permissions"]
+    if not isinstance(permissions, Mapping):
+        raise ValueError("Grok permission inspection is invalid")
+    permission_fields = {
+        "sources",
+        "loaded",
+        "skipped",
+        "mcpServerAllowlist",
+        "marketplaceAllowlist",
+        "managedSettingsExists",
+        "managedSettingsActive",
+    }
+    allowed_permission_fields = permission_fields | {
+        "managedSettingsPath",
+        "enforced",
+    }
+    if not permission_fields.issubset(permissions) or not set(permissions).issubset(
+        allowed_permission_fields
+    ):
+        raise ValueError("Grok permission inspection fields are invalid")
+    if (
+        permissions["sources"] != []
+        or permissions["loaded"] != 0
+        or permissions["skipped"] != []
+        or permissions["mcpServerAllowlist"] != []
+        or permissions["marketplaceAllowlist"] != []
+        or permissions["managedSettingsExists"] is not False
+        or permissions["managedSettingsActive"] is not False
+        or permissions.get("enforced", []) != []
+    ):
+        raise ValueError("Grok permission configuration is active")
+
+    login_policy = report["loginPolicy"]
+    if (
+        not isinstance(login_policy, Mapping)
+        or set(login_policy)
+        != {
+            "disableApiKeyAuth",
+            "forceLoginTeamUuid",
+            "apiKeyAuthDisabled",
+        }
+        or login_policy.get("disableApiKeyAuth") is not True
+        or login_policy.get("apiKeyAuthDisabled") is not True
+    ):
+        raise ValueError("Grok API-key authentication is not disabled")
+
+    config_sources = report["configSources"]
+    if not isinstance(config_sources, Mapping) or set(config_sources) != {"layers"}:
+        raise ValueError("Grok config-source inspection is invalid")
+    layers = config_sources["layers"]
+    if not isinstance(layers, Sequence) or isinstance(layers, (str, bytes)):
+        raise ValueError("Grok config layers must be an array")
+    for layer in layers:
+        if (
+            not isinstance(layer, Mapping)
+            or set(layer) != {"role", "path", "note"}
+            or not isinstance(layer["role"], str)
+            or not isinstance(layer["path"], str)
+            or layer["note"] != "empty"
+        ):
+            raise ValueError("Grok has an active or invalid config layer")
+
+    for field in (
+        "projectInstructions",
+        "hooks",
+        "plugins",
+        "marketplaces",
+        "mcpServers",
+        "lspServers",
+        "configWarnings",
+        "mcpConfigProblems",
+    ):
+        if report.get(field, []) != []:
+            raise ValueError("Grok discovered an external execution surface")
+    for field in ("skills", "agents"):
+        entries = report[field]
+        if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
+            raise ValueError("Grok extension inspection is invalid")
+        for entry in entries:
+            source = entry.get("source") if isinstance(entry, Mapping) else None
+            if not isinstance(source, Mapping) or source.get("type") not in {
+                "builtin",
+                "bundled",
+            }:
+                raise ValueError("Grok discovered a non-bundled extension")
 
 
 def _nonnegative_integer(value: object, field: str) -> int:
@@ -355,7 +760,9 @@ def _optional_usage_integer(value: object, field: str) -> int:
 
 def _usage_from_claude(value: object) -> ModelUsage:
     if value is None:
-        return ModelUsage()
+        return ModelUsage(
+            cost_estimate=CostEstimate.unavailable("subscription_billing")
+        )
     if not isinstance(value, Mapping):
         raise ValueError("Claude usage must be an object")
     uncached = _optional_usage_integer(value.get("input_tokens"), "input tokens")
@@ -371,6 +778,35 @@ def _usage_from_claude(value: object) -> ModelUsage:
         output_tokens=output,
         cache_read_tokens=cache_read,
         cache_write_tokens=cache_write,
+        cost_estimate=CostEstimate.unavailable("subscription_billing"),
+    )
+
+
+def _usage_from_grok(value: object) -> ModelUsage:
+    if value is None:
+        return ModelUsage(
+            cost_estimate=CostEstimate.unavailable("subscription_billing")
+        )
+    if not isinstance(value, Mapping):
+        raise ValueError("Grok usage must be an object")
+    uncached = _optional_usage_integer(value.get("input_tokens"), "input tokens")
+    cache_read = _optional_usage_integer(
+        value.get("cache_read_input_tokens"), "cache read input tokens"
+    )
+    cache_write = _optional_usage_integer(
+        value.get("cache_creation_input_tokens"), "cache creation input tokens"
+    )
+    output = _optional_usage_integer(value.get("output_tokens"), "output tokens")
+    reasoning = _optional_usage_integer(
+        value.get("reasoning_tokens"), "reasoning tokens"
+    )
+    return ModelUsage(
+        input_tokens=uncached + cache_read + cache_write,
+        output_tokens=output,
+        reasoning_tokens=reasoning,
+        cache_read_tokens=cache_read,
+        cache_write_tokens=cache_write,
+        cost_estimate=CostEstimate.unavailable("subscription_billing"),
     )
 
 
@@ -397,6 +833,7 @@ def _decode_model_output(
     id_factory: Callable[[str], str],
     transport: str,
 ) -> ModelResponse:
+    _validate_json_tree(payload)
     if request.response_schema is not None:
         if request.tools:
             raise ValueError("structured output cannot be combined with tools")
@@ -425,6 +862,8 @@ def _decode_model_output(
         raise ValueError("response envelope kind is invalid")
     if not isinstance(text, str):
         raise ValueError("response envelope text is invalid")
+    if len(text) > _MAX_RESPONSE_TEXT_CHARACTERS or _has_forbidden_control(text):
+        raise ValueError("response envelope text exceeds its safety bound")
     response_text = text if text.strip() else None
     if not isinstance(native_calls, Sequence) or isinstance(native_calls, (str, bytes)):
         raise ValueError("response envelope tool_calls must be an array")
@@ -483,8 +922,12 @@ def _raise_command_failure(
             "not logged in",
             "not authenticated",
             "authentication",
+            "configured authentication type",
+            "login first",
             "login required",
             "please log in",
+            "run grok login",
+            "sign in",
             "unauthorized",
         )
     ):
@@ -494,7 +937,14 @@ def _raise_command_failure(
         )
     if any(
         marker in diagnostic
-        for marker in ("rate limit", "rate_limit", "quota", "usage limit")
+        for marker in (
+            "allowance",
+            "capacity exhausted",
+            "rate limit",
+            "rate_limit",
+            "quota",
+            "usage limit",
+        )
     ):
         raise ModelProviderError(
             ProviderErrorCode.RATE_LIMIT_ERROR,
@@ -680,6 +1130,254 @@ class ClaudeCodeSubscriptionProvider:
         )
 
 
+class GrokBuildSubscriptionProvider:
+    """Use a signed-in Grok Build client while retaining Daita's direct loop."""
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        max_output_tokens: int = 1_024,
+        executable: str = "grok",
+        runner: _CommandRunner = _run_command,
+        id_factory: Callable[[str], str] = _new_id,
+        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
+        _validate_provider_arguments(
+            model,
+            max_output_tokens=max_output_tokens,
+            executable=executable,
+            runner=runner,
+            id_factory=id_factory,
+            timeout_seconds=timeout_seconds,
+        )
+        if model.strip() not in _GROK_BUILTIN_MODELS:
+            raise ValueError(
+                "Grok Build subscription requires a reviewed built-in model"
+            )
+        self.model = model.strip()
+        self.max_output_tokens = max_output_tokens
+        self._executable = executable
+        self._runner = runner
+        self._id_factory = id_factory
+        self._timeout_seconds = float(timeout_seconds)
+        self._compatible_client = False
+
+    @property
+    def provider_id(self) -> str:
+        return f"grok-build:{self.model}"
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return request.response_schema is None or not request.tools
+
+    def has_complete_pricing(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return False
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        failure: ModelProviderError | None = None
+        try:
+            return await self._generate(request)
+        except asyncio.CancelledError:
+            raise
+        except ModelProviderError as error:
+            failure = error
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
+            failure = ModelProviderError(
+                ProviderErrorCode.MALFORMED_RESPONSE,
+                "Grok Build subscription client returned a malformed response",
+                provider_id=self.provider_id,
+            )
+        except Exception:
+            failure = ModelProviderError(
+                ProviderErrorCode.PROVIDER_UNAVAILABLE,
+                "Grok Build subscription provider boundary failed",
+                provider_id=self.provider_id,
+            )
+        assert failure is not None
+        raise detached_provider_error(failure)
+
+    async def _generate(self, request: ModelRequest) -> ModelResponse:
+        if not self.supports_request_policy(request):
+            raise ModelProviderError(
+                ProviderErrorCode.INVALID_REQUEST,
+                "Grok Build subscription cannot combine tools and structured output",
+                provider_id=self.provider_id,
+            )
+        prompt = _grok_prompt_bytes(request, self.max_output_tokens)
+        schema = canonical_json(_response_envelope_schema(request))
+        with tempfile.TemporaryDirectory(prefix="daita-grok-") as temporary:
+            cwd = Path(temporary)
+            _owner_only_directory(cwd)
+            prompt_path = cwd / "request.txt"
+            _write_owner_only(prompt_path, prompt)
+            process_home = _prepare_grok_process_home(cwd)
+            environment = _grok_subscription_environment(
+                grok_home=_grok_home(),
+                process_home=process_home,
+            )
+            try:
+                await self._ensure_compatible_client(cwd, environment)
+                result = await self._runner(
+                    _Command(
+                        arguments=(
+                            self._executable,
+                            "--prompt-file",
+                            str(prompt_path),
+                            "--verbatim",
+                            "--model",
+                            self.model,
+                            "--cwd",
+                            str(cwd),
+                            "--output-format",
+                            "streaming-json",
+                            "--json-schema",
+                            schema,
+                            "--system-prompt-override",
+                            _CONTROL_PROMPT,
+                            "--tools",
+                            "",
+                            "--disallowed-tools",
+                            _GROK_DENIED_TOOLS,
+                            "--max-turns",
+                            "1",
+                            "--permission-mode",
+                            "dontAsk",
+                            "--deny",
+                            "Bash",
+                            "--deny",
+                            "Edit",
+                            "--deny",
+                            "Write",
+                            "--deny",
+                            "Read",
+                            "--deny",
+                            "Grep",
+                            "--deny",
+                            "Glob",
+                            "--deny",
+                            "NotebookRead",
+                            "--deny",
+                            "NotebookEdit",
+                            "--deny",
+                            "WebFetch",
+                            "--deny",
+                            "WebSearch",
+                            "--deny",
+                            "MCPTool",
+                            "--sandbox",
+                            "strict",
+                            "--no-plan",
+                            "--no-subagents",
+                            "--no-memory",
+                            "--disable-web-search",
+                            "--no-auto-update",
+                            "--no-alt-screen",
+                        ),
+                        stdin=b"",
+                        cwd=cwd,
+                        environment=environment,
+                        timeout_seconds=self._timeout_seconds,
+                    )
+                )
+            except _ExecutableUnavailable:
+                raise ModelProviderError(
+                    ProviderErrorCode.CONFIGURATION_ERROR,
+                    "Grok Build is not installed; install or update it and run grok login",
+                    provider_id=self.provider_id,
+                ) from None
+        if result.returncode != 0:
+            _raise_command_failure("Grok Build", result)
+        payload, response_id, usage = _decode_grok_result(result.stdout, self.model)
+        return _decode_model_output(
+            payload,
+            request=request,
+            provider_id=self.provider_id,
+            provider_response_id=response_id,
+            usage=usage,
+            id_factory=self._id_factory,
+            transport="grok_build_cli",
+        )
+
+    async def _ensure_compatible_client(
+        self,
+        cwd: Path,
+        environment: Mapping[str, str],
+    ) -> None:
+        if not self._compatible_client:
+            help_result = await self._runner(
+                _Command(
+                    arguments=(self._executable, "--help"),
+                    stdin=b"",
+                    cwd=cwd,
+                    environment=environment,
+                    timeout_seconds=min(self._timeout_seconds, 30.0),
+                )
+            )
+            if help_result.returncode != 0:
+                raise ModelProviderError(
+                    ProviderErrorCode.CONFIGURATION_ERROR,
+                    "Grok Build could not report its features; update Grok Build",
+                    provider_id=self.provider_id,
+                )
+            help_text = help_result.stdout.decode("utf-8")
+            if (
+                _has_forbidden_control(help_text)
+                or "streaming-json" not in help_text.split()
+                or not _GROK_REQUIRED_HELP_TOKENS.issubset(help_text.split())
+            ):
+                raise ModelProviderError(
+                    ProviderErrorCode.CONFIGURATION_ERROR,
+                    "Grok Build is incompatible; update Grok Build and run grok login",
+                    provider_id=self.provider_id,
+                )
+            self._compatible_client = True
+        await self._inspect_configuration(cwd, environment)
+
+    async def _inspect_configuration(
+        self,
+        cwd: Path,
+        environment: Mapping[str, str],
+    ) -> None:
+        result = await self._runner(
+            _Command(
+                arguments=(self._executable, "inspect", "--json"),
+                stdin=b"",
+                cwd=cwd,
+                environment=environment,
+                timeout_seconds=min(self._timeout_seconds, 30.0),
+            )
+        )
+        if result.returncode != 0:
+            _raise_command_failure("Grok Build", result)
+        try:
+            _validate_grok_inspection(result.stdout, cwd)
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            OSError,
+        ):
+            raise ModelProviderError(
+                ProviderErrorCode.CONFIGURATION_ERROR,
+                "Grok Build configuration could not prove subscription-only isolation; remove custom configuration and extensions",
+                provider_id=self.provider_id,
+            ) from None
+
+
 def _validate_provider_arguments(
     model: str,
     *,
@@ -734,4 +1432,115 @@ def _decode_claude_result(stdout: bytes) -> tuple[object, str | None, ModelUsage
     return payload, response_id, usage
 
 
-__all__ = ["ClaudeCodeSubscriptionProvider"]
+def _decode_grok_result(
+    stdout: bytes,
+    requested_model: str,
+) -> tuple[object, str | None, ModelUsage]:
+    text = stdout.decode("utf-8")
+    if _has_forbidden_control(text):
+        raise ValueError("Grok result contains terminal controls")
+    lines = tuple(line for line in text.splitlines() if line.strip())
+    if not lines or len(lines) > _MAX_STREAM_EVENTS:
+        raise ValueError("Grok result has an invalid event count")
+    events = tuple(_strict_json(line) for line in lines)
+    if any(not isinstance(event, Mapping) for event in events):
+        raise ValueError("Grok result events must be objects")
+    mappings = tuple(event for event in events if isinstance(event, Mapping))
+    response_length = 0
+    usage_events: list[Mapping[str, object]] = []
+    end_events: list[Mapping[str, object]] = []
+    available_command_events = 0
+    for event in mappings:
+        event_type = event.get("type")
+        if event_type == "text":
+            chunk = event.get("data")
+            if not isinstance(chunk, str):
+                raise ValueError("Grok text event is invalid")
+            response_length += len(chunk)
+            if response_length > _MAX_RESPONSE_TEXT_CHARACTERS:
+                raise ValueError("Grok response exceeds its safety bound")
+        elif event_type == "thought":
+            if not isinstance(event.get("data"), str):
+                raise ValueError("Grok thought event is invalid")
+        elif event_type == "usage":
+            usage_events.append(event)
+        elif event_type == "available_commands":
+            available_command_events += 1
+            commands = event.get("commands")
+            tools = event.get("tools")
+            if (
+                available_command_events > 1
+                or not isinstance(commands, Sequence)
+                or isinstance(commands, (str, bytes))
+                or tools != []
+            ):
+                raise ModelProviderError(
+                    ProviderErrorCode.CONFIGURATION_ERROR,
+                    "Grok Build exposed a native capability despite Daita's isolation boundary",
+                )
+        elif event_type == "end":
+            end_events.append(event)
+        elif event_type == "error":
+            raise ModelProviderError(
+                ProviderErrorCode.PROVIDER_UNAVAILABLE,
+                "Grok Build subscription turn failed",
+            )
+        elif event_type == "max_turns_reached" or (
+            isinstance(event_type, str) and event_type.startswith("auto_compact_")
+        ):
+            raise ModelProviderError(
+                ProviderErrorCode.OUTPUT_LIMIT,
+                "Grok Build did not finish within the single-turn boundary",
+            )
+        else:
+            raise ModelProviderError(
+                ProviderErrorCode.CONFIGURATION_ERROR,
+                "Grok Build emitted an unsupported event; update Grok Build and verify native tools are disabled",
+            )
+    if len(end_events) != 1 or end_events[0] is not mappings[-1]:
+        raise ValueError("Grok result must end with one end event")
+    if len(usage_events) != 1:
+        raise ValueError("Grok result must contain one model usage event")
+    usage_event = usage_events[0]
+    if usage_event.get("stopReason") != "end_turn":
+        raise ModelProviderError(
+            ProviderErrorCode.PROVIDER_UNAVAILABLE,
+            "Grok Build subscription turn failed",
+        )
+    _usage_from_grok(usage_event.get("usage"))
+    _bounded_response_id(usage_event.get("messageId"))
+    result = end_events[0]
+    if result.get("stopReason") != "end_turn":
+        raise ModelProviderError(
+            ProviderErrorCode.PROVIDER_UNAVAILABLE,
+            "Grok Build subscription turn failed",
+        )
+    if _nonnegative_integer(result.get("num_turns"), "turn count") != 1:
+        raise ModelProviderError(
+            ProviderErrorCode.CONFIGURATION_ERROR,
+            "Grok Build exceeded Daita's single-turn client boundary",
+        )
+    model_usage = result.get("modelUsage")
+    if not isinstance(model_usage, Mapping) or requested_model not in model_usage:
+        raise ModelProviderError(
+            ProviderErrorCode.CONFIGURATION_ERROR,
+            "Grok Build did not confirm the requested built-in model; remove custom-provider configuration",
+        )
+    if not isinstance(model_usage[requested_model], Mapping):
+        raise ValueError("Grok model usage must be an object")
+    if (
+        "structuredOutput" not in result
+        or result.get("structuredOutputError") is not None
+    ):
+        raise ValueError("Grok result did not contain validated structured output")
+    payload = result["structuredOutput"]
+    _validate_json_tree(payload)
+    response_id = _bounded_response_id(result.get("requestId", result.get("sessionId")))
+    usage = _usage_from_grok(result.get("usage"))
+    return payload, response_id, usage
+
+
+__all__ = [
+    "ClaudeCodeSubscriptionProvider",
+    "GrokBuildSubscriptionProvider",
+]

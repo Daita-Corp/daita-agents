@@ -67,10 +67,11 @@ _PROVIDERS = (
     ("ollama", "Ollama local"),
     ("codex", "Codex subscription"),
     ("claude-code", "Claude Code subscription"),
+    ("grok-build", "Grok Build subscription"),
     ("custom", "Custom API (OpenAI-compatible)"),
 )
 _BUILTIN_PROVIDER_IDS = frozenset(provider for provider, _ in _PROVIDERS[:-1])
-_SUBSCRIPTION_PROVIDER_IDS = frozenset({"codex", "claude-code"})
+_SUBSCRIPTION_PROVIDER_IDS = frozenset({"codex", "claude-code", "grok-build"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +176,15 @@ _MODEL_SUGGESTIONS = {
             "Fast",
         ),
     ),
+    "grok-build": (
+        _ModelSuggestion(
+            "grok-build",
+            "grok-4.5",
+            "Grok 4.5",
+            "Use Grok 4.5 through an existing Grok Build subscription login",
+            "Recommended",
+        ),
+    ),
     "gemini": (
         _ModelSuggestion(
             "gemini",
@@ -270,6 +280,7 @@ _SUBSCRIPTION_VALIDATION_ERRORS = {
 _SUBSCRIPTION_CLIENTS = {
     "codex": ("ChatGPT", "sign in through Daita"),
     "claude-code": ("Claude Code", "claude auth login"),
+    "grok-build": ("Grok Build", "grok login"),
 }
 _MODEL_SETUP_ERRORS = {
     "secret_provider_unavailable": (

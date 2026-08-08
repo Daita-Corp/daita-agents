@@ -7,7 +7,10 @@ from .grok import GrokProvider
 from .ollama import OllamaProvider
 from .openai import OpenAIProvider, OpenAIResponsesProvider
 from .openai_compatible import OpenAICompatibleProvider
-from .subscription_cli import ClaudeCodeSubscriptionProvider
+from .subscription_cli import (
+    ClaudeCodeSubscriptionProvider,
+    GrokBuildSubscriptionProvider,
+)
 
 __all__ = [
     "AnthropicMessagesProvider",
@@ -15,6 +18,7 @@ __all__ = [
     "ClaudeCodeSubscriptionProvider",
     "CodexSubscriptionProvider",
     "GeminiProvider",
+    "GrokBuildSubscriptionProvider",
     "GrokProvider",
     "OllamaProvider",
     "OpenAICompatibleProvider",

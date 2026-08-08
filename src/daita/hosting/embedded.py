@@ -131,7 +131,7 @@ _REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 25_000
 _CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS = LEARNING_REVIEW_MAX_TOTAL_TOKENS // 4
 _PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _SOURCE_ALIAS_SEPARATOR = re.compile(r"[^a-z0-9]+")
-_SUBSCRIPTION_PROVIDERS = frozenset({"codex", "claude-code"})
+_SUBSCRIPTION_PROVIDERS = frozenset({"codex", "claude-code", "grok-build"})
 _SUBSCRIPTION_CREDENTIAL_PROVIDERS = frozenset({"codex"})
 _BUILTIN_PROVIDERS = frozenset(
     {"openai", "anthropic", "gemini", "grok", "ollama", *_SUBSCRIPTION_PROVIDERS}
@@ -2272,7 +2272,7 @@ def _admit_model_selection(
         provider_name,
         model_name,
         endpoint,
-        provider_name not in {"ollama", "claude-code"},
+        provider_name not in {"ollama", "claude-code", "grok-build"},
     )
 
 

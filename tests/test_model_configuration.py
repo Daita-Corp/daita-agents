@@ -1221,6 +1221,32 @@ async def test_ollama_does_not_request_an_api_key(tmp_path):
     assert "✓ Model configuration validated" in output.getvalue()
 
 
+async def test_grok_build_terminal_selection_validates_without_api_key(tmp_path):
+    provider_id = "grok-build:grok-4.5"
+    output = io.StringIO()
+
+    result = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO("atlas\n8\n1\n500000\n8192\n"),
+        output_stream=output,
+        hidden_input=lambda prompt: (_ for _ in ()).throw(
+            AssertionError(f"unexpected API-key prompt: {prompt}")
+        ),
+        keychain=_FakeKeychain(),
+        model_validator=_provider(provider_id),
+    )
+
+    assert result == 0
+    text = output.getvalue()
+    assert "Grok Build subscription" in text
+    assert "small amount of subscription allowance" in text
+    assert "✓ Model configuration validated" in text
+    persisted = json.loads(
+        (tmp_path / "agents" / "atlas" / "config.json").read_text(encoding="utf-8")
+    )
+    assert persisted["model_route"]["candidates"][0]["secret_reference"] is None
+
+
 async def test_custom_terminal_provider_requires_and_persists_base_url(tmp_path):
     output = io.StringIO()
     keychain = _FakeKeychain()
@@ -1228,7 +1254,7 @@ async def test_custom_terminal_provider_requires_and_persists_base_url(tmp_path)
         root=tmp_path,
         input_stream=io.StringIO(
             "atlas\n"
-            "8\n"
+            "9\n"
             "acme\n"
             "acme-model\n"
             "8192\n"
