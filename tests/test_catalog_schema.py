@@ -1347,6 +1347,7 @@ async def test_schema_capability_validates_output_and_is_smaller_than_inspection
         output = await executor.execute(
             ToolExecution(
                 run_id="schema-capability",
+                call_id="schema-capability-call",
                 capability_id=capability.id,
                 arguments={
                     "resource_ids": tuple(resource.id for resource in resources),

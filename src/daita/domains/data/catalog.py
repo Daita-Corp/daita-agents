@@ -108,6 +108,45 @@ class CatalogDataView:
                 and not isinstance(ordinal, bool)
                 and ordinal > 0
             )
+            ordered_primary_key_columns = tuple(
+                name for _, name in sorted(primary_key_columns)
+            )
+            column_nullability: tuple[tuple[str, bool], ...] = tuple(
+                (name, nullable)
+                for column in raw_columns
+                if isinstance(column, FrozenJsonObject)
+                and isinstance((name := column.get("name")), str)
+                and isinstance((nullable := column.get("nullable")), bool)
+            )
+            column_type_provenance: tuple[tuple[str, str, str], ...] = tuple(
+                (name, namespace, native_name)
+                for column in raw_columns
+                if isinstance(column, FrozenJsonObject)
+                and isinstance((name := column.get("name")), str)
+                and isinstance((namespace := column.get("native_type_namespace")), str)
+                and isinstance((native_name := column.get("native_type_name")), str)
+            )
+            identity_columns = tuple(
+                name
+                for column in raw_columns
+                if isinstance(column, FrozenJsonObject)
+                and isinstance((name := column.get("name")), str)
+                and column.get("identity") is True
+            )
+            generated_columns = tuple(
+                name
+                for column in raw_columns
+                if isinstance(column, FrozenJsonObject)
+                and isinstance((name := column.get("name")), str)
+                and column.get("generated") is True
+            )
+            updatable_columns = tuple(
+                name
+                for column in raw_columns
+                if isinstance(column, FrozenJsonObject)
+                and isinstance((name := column.get("name")), str)
+                and column.get("updatable") is True
+            )
             unique_key_columns: list[str] = []
             if len(primary_key_columns) == 1 and primary_key_columns[0][0] == 1:
                 unique_key_columns.append(primary_key_columns[0][1])
@@ -147,7 +186,13 @@ class CatalogDataView:
                     sensitivity_class=resource.sensitivity.value,
                     writable=resource.kind is ResourceKind.TABLE,
                     unique_key_columns=tuple(unique_key_columns),
+                    primary_key_columns=ordered_primary_key_columns,
                     column_declared_types=column_declared_types,
+                    column_nullability=column_nullability,
+                    column_type_provenance=column_type_provenance,
+                    identity_columns=identity_columns,
+                    generated_columns=generated_columns,
+                    updatable_columns=updatable_columns,
                 )
             )
         return tuple(sorted(schemas, key=lambda item: (item.name, item.resource_id)))

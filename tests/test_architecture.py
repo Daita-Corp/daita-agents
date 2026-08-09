@@ -475,6 +475,49 @@ async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branc
         await agent.close()
 
 
+async def test_database_write_phase_one_registers_and_projects_no_write_tool(tmp_path):
+    agent = await daita.Agent.create("database-write-phase-one", root=tmp_path)
+    try:
+        registry = agent._embedded._capabilities
+        capability_ids = {
+            registry.resolve_tool(name)[1].id for name in registry.tool_names
+        }
+        forbidden_tools = {
+            "data_preview_postgresql_update",
+            "data_update_postgresql",
+            "data_preview_sqlite_update",
+            "data_update_sqlite",
+        }
+        forbidden_capabilities = {
+            "data.postgresql.update_impact",
+            "data.postgresql.update",
+            "data.sqlite.update_impact",
+            "data.sqlite.update",
+        }
+
+        assert forbidden_tools.isdisjoint(registry.tool_names)
+        assert forbidden_capabilities.isdisjoint(capability_ids)
+
+        controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+            encoding="utf-8"
+        )
+        for dormant_name in forbidden_tools | forbidden_capabilities:
+            assert dormant_name not in controller
+        assert "postgresql_write" not in _python_text(PACKAGE)
+        assert "set_source_write_access" in _class_methods(
+            PACKAGE / "agent.py", "Agent"
+        )
+        assert "set_source_write_access" in _class_methods(
+            PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
+        )
+        assert "set_source_write_access" not in controller
+        assert "set_source_write_access" not in (
+            PACKAGE / "domains" / "data" / "context.py"
+        ).read_text(encoding="utf-8")
+    finally:
+        await agent.close()
+
+
 def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
     controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
         encoding="utf-8"
@@ -1202,6 +1245,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
         }
 
         assert tables == {
+            "database_write_receipts",
             "learning_candidates",
             "messages",
             "metadata",
@@ -1212,6 +1256,13 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "syncs",
         }
         assert columns == {
+            "database_write_receipts": (
+                "agent_id",
+                "id",
+                "run_id",
+                "call_id",
+                "data",
+            ),
             "learning_candidates": ("agent_id", "id", "data"),
             "messages": ("run_id", "position", "data"),
             "metadata": ("key", "data"),

@@ -1829,6 +1829,7 @@ class EmbeddedAgent:
         schemas: tuple[str, ...],
         port: int = 5432,
         ssl_mode: str = "require",
+        write_access: bool = False,
         name: str | None = None,
     ) -> SourceRegistration:
         """Construct and attach one ordinary selected-schema PostgreSQL source."""
@@ -1842,10 +1843,30 @@ class EmbeddedAgent:
                 credential=credential,
                 schemas=schemas,
                 ssl_mode=ssl_mode,
+                write_access=write_access,
                 name=name,
                 secret_provider=self._secret_provider or self._keychain,
             )
         )
+
+    async def set_source_write_access(
+        self,
+        source_id: str,
+        enabled: bool,
+    ) -> SourceRegistration:
+        """Mutate one user-owned source admission under the shared lock."""
+
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a boolean")
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._store.set_source_write_access(
+                self.identity.id,
+                source_id,
+                enabled,
+            )
 
     async def detach(self, source_id: str) -> SourceRegistration:
         async with self._mutation_lock:
@@ -2056,9 +2077,9 @@ def _source_from_registration(
             "ssl_mode",
             "username",
         }
-        allowed = required | {"credential_ref"}
+        allowed = required | {"credential_ref", "write_access"}
         fields = set(configuration)
-        if fields != required and fields != allowed:
+        if not required <= fields or not fields <= allowed:
             raise AgentHomeError("PostgreSQL source configuration is invalid")
         raw_schemas = configuration["schemas"]
         if not isinstance(raw_schemas, tuple) or any(
@@ -2067,6 +2088,9 @@ def _source_from_registration(
             raise AgentHomeError("PostgreSQL source configuration is invalid")
         raw_reference = configuration.get("credential_ref")
         if raw_reference is not None and not isinstance(raw_reference, str):
+            raise AgentHomeError("PostgreSQL source configuration is invalid")
+        raw_write_access = configuration.get("write_access", False)
+        if not isinstance(raw_write_access, bool):
             raise AgentHomeError("PostgreSQL source configuration is invalid")
         try:
             reference = (
@@ -2080,6 +2104,7 @@ def _source_from_registration(
                 credential=reference,
                 schemas=cast(tuple[str, ...], raw_schemas),
                 ssl_mode=_configuration_text(configuration, "ssl_mode"),
+                write_access=raw_write_access,
                 name=registration.display_name,
                 secret_provider=secret_provider,
             )

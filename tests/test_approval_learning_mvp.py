@@ -338,19 +338,31 @@ async def test_approval_executes_the_exact_frozen_invocation_once(
 
     agent = await _agent(tmp_path, "exact", approval_handler=approve)
     store = agent._embedded._memory_store
+    registry = agent._embedded._capabilities
+    _, capability = registry.resolve_tool(MEMORY_SET_TOOL_NAME)
+    _, executor = registry.resolve_execution(capability.id)
+    original_execute = executor.execute
     original = store.replace_from_tool
     executions: list[tuple[str, str]] = []
+    tool_executions: list[ToolExecution] = []
+
+    async def capture_execution(request: ToolExecution):
+        tool_executions.append(request)
+        return await original_execute(request)
 
     async def counted(target, content):
         executions.append((target, content))
         await original(target, content)
 
+    monkeypatch.setattr(executor, "execute", capture_execution)
     monkeypatch.setattr(store, "replace_from_tool", counted)
     try:
         content = "exact replacement 日本語"
         result = (await _execute(agent, _memory_call(content=content)))[0]
         assert not result.is_error
         assert executions == [("memory", content)]
+        assert len(tool_executions) == 1
+        assert tool_executions[0].call_id == "write"
         assert len(requests) == 1
         assert requests[0].capability_id == MEMORY_SET_CAPABILITY_ID
         assert dict(requests[0].arguments) == {
@@ -1330,6 +1342,7 @@ async def test_skill_preflight_fingerprints_document_state_and_complete_index(
         )
         execution = ToolExecution(
             run_id=request.run_id,
+            call_id=request.call_id,
             capability_id=request.capability_id,
             arguments=request.arguments,
         )
@@ -1353,6 +1366,7 @@ async def test_skill_preflight_fingerprints_document_state_and_complete_index(
         )
         replacement_execution = ToolExecution(
             run_id=request.run_id,
+            call_id=replacement_call.id,
             capability_id=request.capability_id,
             arguments=FrozenJsonObject.from_mapping(dict(replacement_call.arguments)),
         )

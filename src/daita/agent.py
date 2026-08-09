@@ -540,6 +540,7 @@ class Agent:
         schemas: tuple[str, ...],
         port: int = 5432,
         ssl_mode: str = "require",
+        write_access: bool = False,
         name: str | None = None,
     ) -> SourceRegistration:
         return await self._embedded.attach_postgresql(
@@ -550,8 +551,22 @@ class Agent:
             schemas=schemas,
             port=port,
             ssl_mode=ssl_mode,
+            write_access=write_access,
             name=name,
         )
+
+    async def set_source_write_access(
+        self,
+        source_id: str,
+        enabled: bool,
+    ) -> SourceRegistration:
+        """Set one exact user-owned PostgreSQL write-admission flag."""
+
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a boolean")
+        return await self._embedded.set_source_write_access(source_id, enabled)
 
     async def detach(self, source_id: str) -> SourceRegistration:
         return await self._embedded.detach(source_id)

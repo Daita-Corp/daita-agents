@@ -430,13 +430,17 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
     for name, expected in expected_columns.items():
         columns = by_name[name]["columns"]
         assert isinstance(columns, tuple)
+        expected_display = tuple(
+            (column_name, native_type.rpartition("|")[2], nullable)
+            for column_name, native_type, nullable in expected
+        )
         assert (
             tuple(
                 (column["name"], column["type"], column["nullable"])
                 for column in columns
                 if isinstance(column, Mapping)
             )
-            == expected
+            == expected_display
         )
     expected_primary_keys = {
         "analytics.regions": ("region_code",),

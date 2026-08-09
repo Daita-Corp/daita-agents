@@ -245,10 +245,22 @@ class ResourceSchema:
     sensitivity_class: str = field(default="unknown", compare=False)
     writable: bool = field(default=False, compare=False)
     unique_key_columns: tuple[str, ...] = field(default=(), compare=False)
+    primary_key_columns: tuple[str, ...] = field(default=(), compare=False)
     column_declared_types: tuple[tuple[str, str], ...] = field(
         default=(),
         compare=False,
     )
+    column_nullability: tuple[tuple[str, bool], ...] = field(
+        default=(),
+        compare=False,
+    )
+    column_type_provenance: tuple[tuple[str, str, str], ...] = field(
+        default=(),
+        compare=False,
+    )
+    identity_columns: tuple[str, ...] = field(default=(), compare=False)
+    generated_columns: tuple[str, ...] = field(default=(), compare=False)
+    updatable_columns: tuple[str, ...] = field(default=(), compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -304,6 +316,14 @@ class ResourceSchema:
             raise ValueError("resource unique key columns must be unique")
         if any(item not in set(columns) for item in unique_key_columns):
             raise ValueError("resource unique key columns must exist in columns")
+        primary_key_columns = tuple(
+            _required_text(item, "resource primary key column")
+            for item in self.primary_key_columns
+        )
+        if len(set(primary_key_columns)) != len(primary_key_columns):
+            raise ValueError("resource primary key columns must be unique")
+        if any(item not in set(columns) for item in primary_key_columns):
+            raise ValueError("resource primary key columns must exist in columns")
         if isinstance(self.column_declared_types, (str, bytes)):
             raise TypeError("resource column_declared_types must be a sequence")
         raw_column_declared_types = tuple(self.column_declared_types)
@@ -337,15 +357,99 @@ class ResourceSchema:
             for column in columns
             if column in declared_type_by_column
         )
+        if isinstance(self.column_nullability, (str, bytes)):
+            raise TypeError("resource column_nullability must be a sequence")
+        nullable_by_column: dict[str, bool] = {}
+        for nullability_item in tuple(self.column_nullability):
+            if (
+                not isinstance(nullability_item, (tuple, list))
+                or len(nullability_item) != 2
+            ):
+                raise ValueError(
+                    "resource column_nullability must contain column/boolean pairs"
+                )
+            column = _required_text(nullability_item[0], "resource nullability column")
+            nullable = nullability_item[1]
+            if column not in set(columns):
+                raise ValueError("resource nullability columns must exist in columns")
+            if column in nullable_by_column:
+                raise ValueError("resource nullability columns must be unique")
+            if not isinstance(nullable, bool):
+                raise TypeError("resource column nullability must be boolean")
+            nullable_by_column[column] = nullable
+        canonical_nullability = tuple(
+            (column, nullable_by_column[column])
+            for column in columns
+            if column in nullable_by_column
+        )
+        if isinstance(self.column_type_provenance, (str, bytes)):
+            raise TypeError("resource column_type_provenance must be a sequence")
+        provenance_by_column: dict[str, tuple[str, str]] = {}
+        for provenance_item in tuple(self.column_type_provenance):
+            if (
+                not isinstance(provenance_item, (tuple, list))
+                or len(provenance_item) != 3
+            ):
+                raise ValueError(
+                    "resource column_type_provenance must contain "
+                    "column/namespace/name triples"
+                )
+            column = _required_text(
+                provenance_item[0], "resource type provenance column"
+            )
+            namespace = _required_text(
+                provenance_item[1], "resource type provenance namespace"
+            )
+            native_name = _required_text(
+                provenance_item[2], "resource type provenance name"
+            )
+            if column not in set(columns):
+                raise ValueError(
+                    "resource type provenance columns must exist in columns"
+                )
+            if column in provenance_by_column:
+                raise ValueError("resource type provenance columns must be unique")
+            if len(namespace) > 128 or len(native_name) > 128:
+                raise ValueError("resource type provenance must be bounded")
+            provenance_by_column[column] = (namespace, native_name)
+        canonical_provenance = tuple(
+            (column, *provenance_by_column[column])
+            for column in columns
+            if column in provenance_by_column
+        )
+        structural_column_sets: dict[str, tuple[str, ...]] = {}
+        for field_name, values in (
+            ("identity_columns", self.identity_columns),
+            ("generated_columns", self.generated_columns),
+            ("updatable_columns", self.updatable_columns),
+        ):
+            if isinstance(values, (str, bytes)):
+                raise TypeError(f"resource {field_name} must be a sequence")
+            selected = tuple(
+                _required_text(item, f"resource {field_name} item") for item in values
+            )
+            if len(selected) != len(set(selected)):
+                raise ValueError(f"resource {field_name} must be unique")
+            if any(item not in set(columns) for item in selected):
+                raise ValueError(f"resource {field_name} must exist in columns")
+            selected_set = set(selected)
+            structural_column_sets[field_name] = tuple(
+                column for column in columns if column in selected_set
+            )
         object.__setattr__(self, "columns", columns)
         object.__setattr__(self, "aliases", aliases)
         object.__setattr__(self, "sensitivity_class", sensitivity_class.casefold())
         object.__setattr__(self, "unique_key_columns", unique_key_columns)
+        object.__setattr__(self, "primary_key_columns", primary_key_columns)
         object.__setattr__(
             self,
             "column_declared_types",
             canonical_declared_types,
         )
+        object.__setattr__(self, "column_nullability", canonical_nullability)
+        object.__setattr__(self, "column_type_provenance", canonical_provenance)
+        for field_name, values in structural_column_sets.items():
+            object.__setattr__(self, field_name, values)
 
     @property
     def lookup_names(self) -> frozenset[str]:

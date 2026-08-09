@@ -834,6 +834,7 @@ async def test_traversal_capability_validates_the_explicit_truncation_contract(
     output = await executor.execute(
         ToolExecution(
             run_id="catalog-traversal-capability",
+            call_id="catalog-traversal-call",
             capability_id=capability.id,
             arguments={
                 "from_resource_ids": (graph.resource_ids["a"],),

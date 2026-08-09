@@ -119,13 +119,6 @@ SQLITE_QUERY_CAPABILITY_ID = "data.sqlite.query"
 SQLITE_QUERY_EVIDENCE_KIND = "data.sqlite.query_result"
 POSTGRESQL_QUERY_CAPABILITY_ID = "data.postgresql.query"
 POSTGRESQL_QUERY_EVIDENCE_KIND = "data.postgresql.query_result"
-SQLITE_UPDATE_IMPACT_CAPABILITY_ID = "data.sqlite.update_impact"
-SQLITE_UPDATE_IMPACT_EVIDENCE_KIND = "data.sqlite.update_impact"
-SQLITE_UPDATE_IMPACT_TOOL_NAME = "data_preview_sqlite_update"
-SQLITE_UPDATE_CAPABILITY_ID = "data.sqlite.update"
-SQLITE_UPDATE_EVIDENCE_KIND = "data.sqlite.update_result"
-SQLITE_UPDATE_TOOL_NAME = "data_update_sqlite"
-
 _MVP_CAPABILITIES = frozenset(
     {
         CATALOG_SEARCH_CAPABILITY_ID,
@@ -422,6 +415,7 @@ class DataToolRuntime:
                 raise ValueError("tool execution identity changed")
             execution = ToolExecution(
                 run_id=run.id,
+                call_id=call.id,
                 capability_id=capability.id,
                 arguments=arguments,
                 conversation_id=run.conversation_id or run.id,

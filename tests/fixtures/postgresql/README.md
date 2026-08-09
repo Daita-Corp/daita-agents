@@ -105,6 +105,41 @@ selection, catalog summary, and one grounded read-only query. Its model
 provider and OS keychain boundaries are fakes: it makes no live provider call
 and writes no real keychain entry. Only PostgreSQL I/O goes to the fixture.
 
+## Optional live database-write unavailability gate
+
+One opt-in test sends an explicit
+update request to a real OpenAI model while recording every projected tool,
+then verifies that no database-write or write-access control-plane tool was
+offered and that the complete target-table snapshot did not change.
+
+Start the fixture first. If the repository `.env` contains `OPENAI_API_KEY`,
+load it without placing the key in a command argument, then explicitly
+authorize the live provider and fixture boundaries:
+
+```bash
+set -a
+source .env
+set +a
+export DAITA_RUN_LIVE_DATABASE_WRITE_GUARD=1
+export DAITA_FIXTURE_POSTGRES_PASSWORD=daita_fixture_password
+
+.venv/bin/python -m pytest tests/test_database_write_unavailable_live.py \
+  -m "requires_llm and requires_db" -v -s
+```
+
+The default model is the release-reviewed `openai:gpt-5.6-terra`. Override it
+only with another release-reviewed OpenAI identity using
+`DAITA_DATABASE_WRITE_GUARD_MODEL_ID`. The default per-run estimated-cost limit
+is USD 0.20 and can be lowered with
+`DAITA_DATABASE_WRITE_GUARD_MAX_COST_USD`.
+
+The fixture credential is independently read-only, but the test also checks
+the application boundary before each paid model request. An accidentally
+projected write tool therefore fails the test before external model I/O. The
+provider guard also refuses to transmit any successful PostgreSQL row result;
+the real model receives the synthetic fixture's catalog metadata, the test
+prompt, and at most structured read-validation errors.
+
 ## Optional live learning confidence gate
 
 The required learning exit gate remains offline:

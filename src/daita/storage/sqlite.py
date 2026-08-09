@@ -1,7 +1,8 @@
 """Small SQLite state store for one embedded agent.
 
 The database persists only product state the MVP actually uses: identity,
-attached sources, current catalog snapshots, and exact run transcripts.
+attached sources, current catalog snapshots, exact run transcripts, and the
+minimal receipt needed to classify an external database-write attempt.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import re
 import sqlite3
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -21,7 +22,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, TypeVar
 
-from .._json import FrozenJsonObject
+from .._json import FrozenJsonObject, canonical_json
 from ..adapters.models import SourceRegistration
 from ..artifacts.models import (
     ArtifactAuthorship,
@@ -105,7 +106,252 @@ _CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH = 64
 _ACTIVE_SOURCE_KEY_PREFIX = "active_source:"
 _LEARNING_REVIEW_STAMPS_KEY_PREFIX = "learning_review_stamps:"
 _T = TypeVar("_T")
+_DATABASE_WRITE_RECEIPT_ID = re.compile(r"database-write-receipt:sha256:[0-9a-f]{64}\Z")
+_DATABASE_WRITE_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_DATABASE_WRITE_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
+_DATABASE_WRITE_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
+_DATABASE_WRITE_ERROR_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z")
+
+
+class DatabaseWriteOutcome(str, Enum):
+    STARTED = "started"
+    COMMITTED = "committed"
+    NOT_COMMITTED = "not_committed"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+class DatabaseWriteReceiptConflictError(RuntimeError):
+    """The durable receipt identity or immutable terminal state conflicts."""
+
+
+def _database_write_text(value: str, name: str, *, maximum: int = 512) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{name} must be non-empty text without surrounding space")
+    if len(value) > maximum:
+        raise ValueError(f"{name} exceeds {maximum} characters")
+    return value
+
+
+def _database_write_aware(value: datetime, name: str) -> datetime:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise ValueError(f"{name} must be timezone-aware")
+    return value
+
+
+def database_write_receipt_id(
+    *,
+    agent_id: str,
+    run_id: str,
+    call_id: str,
+    capability_id: str,
+    intent_sha256: str,
+) -> str:
+    identity = {
+        "agent_id": _database_write_text(agent_id, "receipt agent_id"),
+        "call_id": _database_write_text(call_id, "receipt call_id"),
+        "capability_id": _database_write_text(
+            capability_id, "receipt capability_id", maximum=128
+        ),
+        "intent_sha256": intent_sha256,
+        "run_id": _database_write_text(run_id, "receipt run_id"),
+    }
+    if (
+        not isinstance(intent_sha256, str)
+        or _DATABASE_WRITE_HASH.fullmatch(intent_sha256) is None
+    ):
+        raise ValueError("receipt intent_sha256 must be a sha256 hash")
+    digest = sha256(canonical_json(identity).encode("utf-8")).hexdigest()
+    return f"database-write-receipt:sha256:{digest}"
+
+
+@dataclass(frozen=True, slots=True)
+class DatabaseWriteReceipt:
+    """Bounded durable metadata for one exact external database-write attempt."""
+
+    receipt_id: str
+    agent_id: str
+    run_id: str
+    call_id: str
+    capability_id: str
+    source_id: str
+    resource_id: str
+    intent_sha256: str
+    preview_fingerprint: str
+    outcome: DatabaseWriteOutcome
+    affected_rows: int | None
+    normalized_error_code: str | None
+    started_at: datetime
+    completed_at: datetime | None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.receipt_id, str)
+            or _DATABASE_WRITE_RECEIPT_ID.fullmatch(self.receipt_id) is None
+        ):
+            raise ValueError("receipt_id must be a canonical database-write receipt id")
+        _database_write_text(self.agent_id, "receipt agent_id")
+        _database_write_text(self.run_id, "receipt run_id")
+        _database_write_text(self.call_id, "receipt call_id")
+        _database_write_text(self.capability_id, "receipt capability_id", maximum=128)
+        if (
+            not isinstance(self.source_id, str)
+            or _DATABASE_WRITE_SOURCE_ID.fullmatch(self.source_id) is None
+        ):
+            raise ValueError("receipt source_id must be a canonical source id")
+        if (
+            not isinstance(self.resource_id, str)
+            or _DATABASE_WRITE_RESOURCE_ID.fullmatch(self.resource_id) is None
+        ):
+            raise ValueError("receipt resource_id must be a canonical resource id")
+        for value, name in (
+            (self.intent_sha256, "intent_sha256"),
+            (self.preview_fingerprint, "preview_fingerprint"),
+        ):
+            if (
+                not isinstance(value, str)
+                or _DATABASE_WRITE_HASH.fullmatch(value) is None
+            ):
+                raise ValueError(f"receipt {name} must be a sha256 hash")
+        if not isinstance(self.outcome, DatabaseWriteOutcome):
+            raise TypeError("receipt outcome must be a DatabaseWriteOutcome")
+        _database_write_aware(self.started_at, "receipt started_at")
+        if self.completed_at is not None:
+            _database_write_aware(self.completed_at, "receipt completed_at")
+            if self.completed_at < self.started_at:
+                raise ValueError("receipt cannot complete before it starts")
+        expected_id = database_write_receipt_id(
+            agent_id=self.agent_id,
+            run_id=self.run_id,
+            call_id=self.call_id,
+            capability_id=self.capability_id,
+            intent_sha256=self.intent_sha256,
+        )
+        if self.receipt_id != expected_id:
+            raise ValueError("receipt_id does not match its execution identity")
+        if self.normalized_error_code is not None and (
+            not isinstance(self.normalized_error_code, str)
+            or _DATABASE_WRITE_ERROR_CODE.fullmatch(self.normalized_error_code) is None
+        ):
+            raise ValueError("receipt normalized_error_code is invalid")
+        if self.affected_rows is not None and (
+            not isinstance(self.affected_rows, int)
+            or isinstance(self.affected_rows, bool)
+        ):
+            raise TypeError("receipt affected_rows must be an integer or None")
+        if self.outcome is DatabaseWriteOutcome.STARTED:
+            if any(
+                value is not None
+                for value in (
+                    self.affected_rows,
+                    self.normalized_error_code,
+                    self.completed_at,
+                )
+            ):
+                raise ValueError("started receipt cannot contain terminal fields")
+        elif self.outcome is DatabaseWriteOutcome.COMMITTED:
+            if (
+                self.affected_rows != 1
+                or self.normalized_error_code is not None
+                or self.completed_at is None
+            ):
+                raise ValueError("committed receipt must record one affected row")
+        elif self.outcome is DatabaseWriteOutcome.NOT_COMMITTED:
+            if (
+                self.affected_rows != 0
+                or self.normalized_error_code is None
+                or self.completed_at is None
+            ):
+                raise ValueError(
+                    "not_committed receipt must record zero rows and an error code"
+                )
+        elif (
+            self.affected_rows is not None
+            or self.normalized_error_code != "write_outcome_unknown"
+            or self.completed_at is None
+        ):
+            raise ValueError(
+                "outcome_unknown receipt must omit affected rows and use its stable code"
+            )
+
+    @classmethod
+    def start(
+        cls,
+        *,
+        agent_id: str,
+        run_id: str,
+        call_id: str,
+        capability_id: str,
+        source_id: str,
+        resource_id: str,
+        intent_sha256: str,
+        preview_fingerprint: str,
+        started_at: datetime,
+    ) -> DatabaseWriteReceipt:
+        return cls(
+            receipt_id=database_write_receipt_id(
+                agent_id=agent_id,
+                run_id=run_id,
+                call_id=call_id,
+                capability_id=capability_id,
+                intent_sha256=intent_sha256,
+            ),
+            agent_id=agent_id,
+            run_id=run_id,
+            call_id=call_id,
+            capability_id=capability_id,
+            source_id=source_id,
+            resource_id=resource_id,
+            intent_sha256=intent_sha256,
+            preview_fingerprint=preview_fingerprint,
+            outcome=DatabaseWriteOutcome.STARTED,
+            affected_rows=None,
+            normalized_error_code=None,
+            started_at=started_at,
+            completed_at=None,
+        )
+
+    def finish(
+        self,
+        outcome: DatabaseWriteOutcome,
+        *,
+        completed_at: datetime,
+        affected_rows: int | None,
+        normalized_error_code: str | None,
+    ) -> DatabaseWriteReceipt:
+        if self.outcome is not DatabaseWriteOutcome.STARTED:
+            raise ValueError("only a started receipt can reach a terminal outcome")
+        if outcome is DatabaseWriteOutcome.STARTED:
+            raise ValueError("receipt terminal outcome cannot be started")
+        return replace(
+            self,
+            outcome=outcome,
+            affected_rows=affected_rows,
+            normalized_error_code=normalized_error_code,
+            completed_at=completed_at,
+        )
+
+    def as_started(self) -> DatabaseWriteReceipt:
+        return replace(
+            self,
+            outcome=DatabaseWriteOutcome.STARTED,
+            affected_rows=None,
+            normalized_error_code=None,
+            completed_at=None,
+        )
+
+
 _V1_TABLE_DEFINITIONS = {
+    "database_write_receipts": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("run_id", "TEXT", 1, None, 0),
+        ("call_id", "TEXT", 1, None, 0),
+        ("data", "TEXT", 1, None, 0),
+    ),
     "learning_candidates": (
         ("agent_id", "TEXT", 1, None, 1),
         ("id", "TEXT", 1, None, 2),
@@ -212,9 +458,20 @@ class SQLiteStateStore:
         self._decoded_catalog_snapshot_lock = asyncio.Lock()
 
     @classmethod
-    async def open(cls, path: str | Path, **_: object) -> SQLiteStateStore:
+    async def open(
+        cls,
+        path: str | Path,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        **_: object,
+    ) -> SQLiteStateStore:
         resolved = Path(path).resolve()
         await asyncio.to_thread(_initialize, resolved)
+        await asyncio.to_thread(
+            _recover_started_database_write_receipts,
+            resolved,
+            clock or (lambda: datetime.now(timezone.utc)),
+        )
         return cls(resolved)
 
     async def close(self) -> None:
@@ -300,6 +557,168 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
+    async def load_database_write_receipt(
+        self,
+        agent_id: str,
+        receipt_id: str,
+    ) -> DatabaseWriteReceipt | None:
+        _database_write_text(agent_id, "receipt agent_id")
+        if (
+            not isinstance(receipt_id, str)
+            or _DATABASE_WRITE_RECEIPT_ID.fullmatch(receipt_id) is None
+        ):
+            raise ValueError("receipt_id must be a canonical database-write receipt id")
+
+        def read() -> DatabaseWriteReceipt | None:
+            with _connect(self.path) as connection:
+                row = connection.execute(
+                    """SELECT data FROM database_write_receipts
+                       WHERE agent_id = ? AND id = ?""",
+                    (agent_id, receipt_id),
+                ).fetchone()
+            return (
+                None if row is None else _expect(_loads(row[0]), DatabaseWriteReceipt)
+            )
+
+        return await asyncio.to_thread(read)
+
+    async def load_database_write_receipt_for_call(
+        self,
+        agent_id: str,
+        run_id: str,
+        call_id: str,
+    ) -> DatabaseWriteReceipt | None:
+        _database_write_text(agent_id, "receipt agent_id")
+        _database_write_text(run_id, "receipt run_id")
+        _database_write_text(call_id, "receipt call_id")
+
+        def read() -> DatabaseWriteReceipt | None:
+            with _connect(self.path) as connection:
+                row = connection.execute(
+                    """SELECT data FROM database_write_receipts
+                       WHERE agent_id = ? AND run_id = ? AND call_id = ?""",
+                    (agent_id, run_id, call_id),
+                ).fetchone()
+            return (
+                None if row is None else _expect(_loads(row[0]), DatabaseWriteReceipt)
+            )
+
+        return await asyncio.to_thread(read)
+
+    async def start_database_write_receipt(
+        self,
+        receipt: DatabaseWriteReceipt,
+    ) -> DatabaseWriteReceipt:
+        if not isinstance(receipt, DatabaseWriteReceipt):
+            raise TypeError("receipt must be a DatabaseWriteReceipt")
+        if receipt.outcome is not DatabaseWriteOutcome.STARTED:
+            raise ValueError(
+                "database write execution must begin with a started receipt"
+            )
+
+        def write() -> DatabaseWriteReceipt:
+            with _connect(self.path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    """SELECT data FROM database_write_receipts
+                       WHERE agent_id = ?
+                         AND (id = ? OR (run_id = ? AND call_id = ?))""",
+                    (
+                        receipt.agent_id,
+                        receipt.receipt_id,
+                        receipt.run_id,
+                        receipt.call_id,
+                    ),
+                ).fetchone()
+                if current is not None:
+                    raise DatabaseWriteReceiptConflictError(
+                        "execution identity already has a receipt"
+                    )
+                connection.execute(
+                    """INSERT INTO database_write_receipts(
+                           agent_id, id, run_id, call_id, data
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        receipt.agent_id,
+                        receipt.receipt_id,
+                        receipt.run_id,
+                        receipt.call_id,
+                        _dumps(receipt),
+                    ),
+                )
+                return receipt
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+        result = worker.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def finish_database_write_receipt(
+        self,
+        receipt: DatabaseWriteReceipt,
+    ) -> DatabaseWriteReceipt:
+        if not isinstance(receipt, DatabaseWriteReceipt):
+            raise TypeError("receipt must be a DatabaseWriteReceipt")
+        if receipt.outcome is DatabaseWriteOutcome.STARTED:
+            raise ValueError(
+                "finish requires a terminal receipt, not a started receipt"
+            )
+
+        def write() -> DatabaseWriteReceipt:
+            with _connect(self.path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """SELECT data FROM database_write_receipts
+                       WHERE agent_id = ?
+                         AND (id = ? OR (run_id = ? AND call_id = ?))""",
+                    (
+                        receipt.agent_id,
+                        receipt.receipt_id,
+                        receipt.run_id,
+                        receipt.call_id,
+                    ),
+                ).fetchone()
+                if row is None:
+                    raise DatabaseWriteReceiptConflictError(
+                        "started receipt does not exist"
+                    )
+                current = _expect(_loads(row[0]), DatabaseWriteReceipt)
+                if current.outcome is not DatabaseWriteOutcome.STARTED:
+                    if current == receipt:
+                        return current
+                    raise DatabaseWriteReceiptConflictError(
+                        "terminal receipt is immutable"
+                    )
+                if current != receipt.as_started():
+                    raise DatabaseWriteReceiptConflictError(
+                        "terminal receipt does not match its started identity"
+                    )
+                connection.execute(
+                    """UPDATE database_write_receipts SET data = ?
+                       WHERE agent_id = ? AND id = ?""",
+                    (_dumps(receipt), receipt.agent_id, receipt.receipt_id),
+                )
+                return receipt
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+        result = worker.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
     async def load_active_source_id(self, agent_id: str) -> str | None:
         def read() -> str | None:
             with _connect(self.path) as connection:
@@ -356,6 +775,90 @@ class SQLiteStateStore:
         if cancelled:
             raise asyncio.CancelledError
         return registration
+
+    async def set_source_write_access(
+        self,
+        agent_id: str,
+        source_id: str,
+        enabled: bool,
+    ) -> SourceRegistration:
+        """Atomically replace only one owned PostgreSQL admission flag."""
+
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("agent_id must be a non-empty string")
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a boolean")
+        gate = _CatalogCommitGate()
+
+        def write() -> SourceRegistration | None:
+            connection = _connect(self.path)
+            try:
+                if not gate.start(connection):
+                    return None
+                row = connection.execute(
+                    "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
+                    (agent_id, source_id),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(
+                        "source must be an active PostgreSQL source owned by this agent"
+                    )
+                current = _expect(_loads(row[0]), SourceRegistration)
+                if (
+                    current.agent_id != agent_id
+                    or current.id != source_id
+                    or current.adapter_id != "postgresql"
+                    or not current.active
+                ):
+                    raise ValueError(
+                        "source must be an active PostgreSQL source owned by this agent"
+                    )
+                current_flag = current.configuration.get("write_access", False)
+                if not isinstance(current_flag, bool):
+                    raise ValueError("PostgreSQL source write_access is invalid")
+                if current_flag is enabled and "write_access" in current.configuration:
+                    connection.commit()
+                    return current
+                configuration = dict(current.configuration)
+                configuration["write_access"] = enabled
+                updated = replace(current, configuration=configuration)
+                connection.execute(
+                    "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
+                    (_dumps(updated), agent_id, source_id),
+                )
+                connection.commit()
+                return updated
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled = False
+        cancelled_before_start = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+                cancelled_before_start = (
+                    gate.cancel_before_start() or cancelled_before_start
+                )
+        updated = worker.result()
+        if cancelled_before_start:
+            if updated is not None:
+                raise AssertionError("cancelled source admission transaction committed")
+            raise asyncio.CancelledError
+        if updated is None:
+            raise AssertionError(
+                "source admission transaction stopped without cancellation"
+            )
+        if cancelled:
+            raise asyncio.CancelledError
+        return updated
 
     async def detach_source(
         self, agent_id: str, source_id: str, detached_at: datetime
@@ -2140,6 +2643,15 @@ def _initialize(path: Path) -> None:
                 data TEXT NOT NULL,
                 PRIMARY KEY(agent_id, id)
             );
+            CREATE TABLE IF NOT EXISTS database_write_receipts (
+                agent_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY(agent_id, id),
+                UNIQUE(agent_id, run_id, call_id)
+            );
             CREATE TABLE IF NOT EXISTS syncs (
                 agent_id TEXT NOT NULL,
                 id TEXT NOT NULL,
@@ -2260,6 +2772,50 @@ def _validate_existing_state(path: Path) -> None:
         raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE) from None
 
 
+def _recover_started_database_write_receipts(
+    path: Path,
+    clock: Callable[[], datetime],
+) -> None:
+    try:
+        with _connect_read_only(path) as connection:
+            rows = tuple(
+                connection.execute(
+                    "SELECT agent_id, id, data FROM database_write_receipts"
+                )
+            )
+        started = tuple(
+            (agent_id, receipt_id, receipt)
+            for agent_id, receipt_id, data in rows
+            if (receipt := _expect(_loads(data), DatabaseWriteReceipt)).outcome
+            is DatabaseWriteOutcome.STARTED
+        )
+        if not started:
+            return
+        completed_at = _database_write_aware(clock(), "receipt recovery completed_at")
+        with _connect(path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for agent_id, receipt_id, receipt in started:
+                recovered = receipt.finish(
+                    DatabaseWriteOutcome.OUTCOME_UNKNOWN,
+                    completed_at=completed_at,
+                    affected_rows=None,
+                    normalized_error_code="write_outcome_unknown",
+                )
+                result = connection.execute(
+                    """UPDATE database_write_receipts SET data = ?
+                       WHERE agent_id = ? AND id = ? AND data = ?""",
+                    (_dumps(recovered), agent_id, receipt_id, _dumps(receipt)),
+                )
+                if result.rowcount != 1:
+                    raise RuntimeError(
+                        "database write receipt changed during startup recovery"
+                    )
+    except RuntimeError:
+        raise
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE) from None
+
+
 def _connect(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=30)
     connection.execute("PRAGMA foreign_keys = ON")
@@ -2286,6 +2842,7 @@ _RECORD_TYPES: dict[str, type[Any]] = {
     for record in (
         AgentIdentity,
         SourceRegistration,
+        DatabaseWriteReceipt,
         CatalogFacet,
         RelationshipFieldPair,
         CatalogRelationship,
@@ -2342,6 +2899,7 @@ _ENUM_TYPES: dict[str, type[Enum]] = {
         LearningCandidateRejectionReason,
         LearningCandidateTarget,
         LearningCandidateAction,
+        DatabaseWriteOutcome,
     )
 }
 

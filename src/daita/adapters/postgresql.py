@@ -123,6 +123,9 @@ SELECT
     c.ordinal_position AS ordinal,
     (c.is_nullable = 'YES') AS nullable,
     c.column_default AS default_expression,
+    (a.attidentity <> '') AS is_identity,
+    (a.attgenerated <> '') AS is_generated,
+    (c.is_updatable = 'YES') AS is_updatable,
     pk.primary_key_ordinal
 FROM information_schema.columns AS c
 JOIN pg_namespace AS n ON n.nspname = c.table_schema
@@ -310,6 +313,7 @@ class PostgreSQLSource:
     port: int = 5432
     schemas: tuple[str, ...] = ("public",)
     ssl_mode: str = "require"
+    write_access: bool = False
     name: str | None = None
     secret_provider: SecretProvider = field(
         default_factory=default_secret_provider,
@@ -341,6 +345,8 @@ class PostgreSQLSource:
         schemas = _schemas(self.schemas)
         if self.ssl_mode not in _SSL_MODES:
             raise ValueError("ssl_mode is not supported")
+        if not isinstance(self.write_access, bool):
+            raise TypeError("write_access must be a boolean")
         if self.credential is not None and not isinstance(
             self.credential, SecretReference
         ):
@@ -741,7 +747,7 @@ async def _load_structure(
                 "PostgreSQL discovery column limit exceeded",
             )
         columns = tuple(_column(row) for row in column_rows)
-        if any(not _is_supported_query_type(column.native_type) for column in columns):
+        if any(not _is_supported_query_type(column) for column in columns):
             # Custom/extension type output functions are executable database
             # code.  Until their provenance is a durable catalog contract,
             # omit the entire table rather than advertise an unsafe partial
@@ -926,20 +932,25 @@ def _column(row: Mapping[str, object]) -> TabularColumn:
     display_type = _row_text(row, "native_type")
     return TabularColumn(
         name=_row_text(row, "column_name"),
-        native_type=f"{type_schema}.{type_name}|{display_type}",
+        native_type=display_type,
+        native_type_namespace=type_schema,
+        native_type_name=type_name,
         ordinal=ordinal - 1,
         nullable=_row_bool(row, "nullable"),
         primary_key_ordinal=(
             None if primary is None else _positive_int(primary, "primary_key_ordinal")
         ),
         default_expression=_optional_row_text(row, "default_expression"),
+        identity=_row_bool(row, "is_identity"),
+        generated=_row_bool(row, "is_generated"),
+        updatable=_row_bool(row, "is_updatable"),
     )
 
 
-def _is_supported_query_type(native_type: str) -> bool:
-    provenance = native_type.partition("|")[0]
-    namespace, separator, name = provenance.partition(".")
-    if separator != "." or namespace != "pg_catalog" or not name:
+def _is_supported_query_type(column: TabularColumn) -> bool:
+    namespace = column.native_type_namespace
+    name = column.native_type_name
+    if namespace != "pg_catalog" or name is None:
         return False
     element = name[1:] if name.startswith("_") else name
     return element in _SUPPORTED_QUERY_TYPE_NAMES
@@ -1014,6 +1025,7 @@ def _source_configuration(source: PostgreSQLSource) -> dict[str, object]:
         "schemas": source.schemas,
         "ssl_mode": source.ssl_mode,
         "username": source.username,
+        "write_access": source.write_access,
     }
     if source.credential is not None:
         configuration["credential_ref"] = source.credential.to_uri()

@@ -110,6 +110,7 @@ async def test_artifact_list_is_bounded_newest_first_and_metadata_only() -> None
     output = await ArtifactListExecutor(cast(AgentHomeArtifactStore, _Store())).execute(
         ToolExecution(
             run_id="run-current",
+            call_id="call-current",
             capability_id="artifact.list",
             conversation_id="conversation-00000000000000000000000000000001",
         )
