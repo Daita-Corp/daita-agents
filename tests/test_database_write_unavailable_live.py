@@ -9,6 +9,11 @@ from pathlib import Path
 import pytest
 
 from daita import Agent, LoopLimits, create_llm_provider
+from daita.capabilities import ApprovalDecision, ApprovalRequest
+from daita.domains.data.capabilities import (
+    POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
+    POSTGRESQL_UPDATE_TOOL_NAME,
+)
 from daita.llm.models import (
     CanonicalMessage,
     ModelRequest,
@@ -30,10 +35,19 @@ _DATABASE_PORT = "DAITA_FIXTURE_POSTGRES_PORT"
 _DEFAULT_MODEL_ID = "openai:gpt-5.6-terra"
 _FORBIDDEN_MODEL_TOOLS = frozenset(
     {
-        "data_update_postgresql",
         "data_preview_sqlite_update",
         "data_update_sqlite",
         "set_source_write_access",
+    }
+)
+_ALLOWED_MODEL_CALLS = frozenset(
+    {
+        "catalog_search",
+        "catalog_schema",
+        "catalog_inspect",
+        "catalog_traverse",
+        POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
+        POSTGRESQL_UPDATE_TOOL_NAME,
     }
 )
 
@@ -54,7 +68,7 @@ pytestmark = [
 
 
 class _GuardedRecordingProvider:
-    """Capture real requests and fail before I/O if a write surface appears."""
+    """Capture real requests and constrain calls to the write-validation path."""
 
     def __init__(self, delegate: ModelProvider) -> None:
         self._delegate = delegate
@@ -75,8 +89,10 @@ class _GuardedRecordingProvider:
         forbidden = sorted(projected & _FORBIDDEN_MODEL_TOOLS)
         if forbidden:
             raise AssertionError(
-                f"database-write surface was projected to the model: {forbidden}"
+                f"an unrelated mutation surface was projected to the model: {forbidden}"
             )
+        assert POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME in projected
+        assert POSTGRESQL_UPDATE_TOOL_NAME in projected
         calls = {
             call.id: call.name
             for message in request.messages
@@ -93,7 +109,15 @@ class _GuardedRecordingProvider:
                 "live write guard refuses to send PostgreSQL row results to OpenAI"
             )
         self.requests.append(request)
-        return await self._delegate.generate(request)
+        response = await self._delegate.generate(request)
+        unexpected = sorted(
+            {call.name for call in response.tool_calls} - _ALLOWED_MODEL_CALLS
+        )
+        if unexpected:
+            raise AssertionError(
+                f"live write guard selected an unexpected tool: {unexpected}"
+            )
+        return response
 
 
 def _required_environment(name: str) -> str:
@@ -160,7 +184,9 @@ def _tool_results(
     }
 
 
-async def test_live_openai_cannot_write_when_write_access_is_enabled(tmp_path: Path):
+async def test_live_openai_cannot_write_with_read_only_database_role(
+    tmp_path: Path,
+) -> None:
     api_key = _required_environment(_MODEL_KEY)
     database_password = _required_environment(_DATABASE_PASSWORD)
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
@@ -181,12 +207,21 @@ async def test_live_openai_cannot_write_when_write_access_is_enabled(tmp_path: P
     if not before:
         pytest.fail("fixture customer snapshot is missing its write target")
 
+    approvals: list[ApprovalRequest] = []
+
+    async def reject_unexpected_approval(
+        request: ApprovalRequest,
+    ) -> ApprovalDecision:
+        approvals.append(request)
+        return ApprovalDecision.DENY
+
     agent = await Agent.create(
         "live-database-write-guard",
         root=tmp_path,
         model=provider,
         model_profile=profile,
         secret_provider=EnvironmentSecretProvider(),
+        approval_handler=reject_unexpected_approval,
         limits=LoopLimits(
             max_steps=8,
             max_total_tokens=20_000,
@@ -209,14 +244,25 @@ async def test_live_openai_cannot_write_when_write_access_is_enabled(tmp_path: P
         assert enabled.configuration["write_access"] is True
 
         exit = await agent.run(
-            "Toggle analytics.customers customer_id = 1 from its current is_active "
-            "value to the opposite value. Perform the database update now; do not "
-            "read the row first, call a read-only query tool, or merely show SQL or "
-            "instructions. If no available tool can write to PostgreSQL, explain "
-            "that the change cannot be performed.",
+            "Set analytics.customers customer_id = 1 is_active to the confirmed "
+            "exact boolean value false. Use only the PostgreSQL update-preview and "
+            "PostgreSQL update tools; do not call a query tool, merely show SQL, or "
+            "claim success without a committed update result. If the database role "
+            "cannot pass the write guardrails, explain that the change was not "
+            "committed.",
             source_id=source.id,
         )
         transcript = await agent.transcript(exit.run_id)
+        update_receipts = []
+        for call in _tool_calls(transcript):
+            if call.name == POSTGRESQL_UPDATE_TOOL_NAME:
+                update_receipts.append(
+                    await agent._embedded._store.load_database_write_receipt_for_call(
+                        agent.id,
+                        exit.run_id,
+                        call.id,
+                    )
+                )
     finally:
         await agent.close()
 
@@ -229,8 +275,22 @@ async def test_live_openai_cannot_write_when_write_access_is_enabled(tmp_path: P
         )
         for request in provider.requests
     )
+    assert all(
+        {
+            POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
+            POSTGRESQL_UPDATE_TOOL_NAME,
+        }.issubset({definition.name for definition in request.tools})
+        for request in provider.requests
+    )
     results = _tool_results(transcript.messages)
-    for call in _tool_calls(transcript):
-        if call.name in _FORBIDDEN_MODEL_TOOLS:
-            assert results[call.id].is_error is True
+    write_calls = tuple(
+        call
+        for call in _tool_calls(transcript)
+        if call.name
+        in {POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME, POSTGRESQL_UPDATE_TOOL_NAME}
+    )
+    assert write_calls
+    assert all(results[call.id].is_error is True for call in write_calls)
+    assert approvals == []
+    assert all(receipt is None for receipt in update_receipts)
     assert after == before

@@ -1,4 +1,4 @@
-"""Read-only SQL and typed PostgreSQL update-preview declarations."""
+"""SQL reads and the typed PostgreSQL single-row update declarations."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from ..._json import FrozenJsonObject, canonical_json
 from ...capabilities import (
     AccessMode,
     Capability,
+    CapabilityInputError,
     Executor,
     ExtensionDeclarations,
     ToolApplicability,
@@ -21,6 +22,8 @@ from .controller import (
     POSTGRESQL_QUERY_EVIDENCE_KIND,
     POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
     POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
+    POSTGRESQL_UPDATE_CAPABILITY_ID,
+    POSTGRESQL_UPDATE_EVIDENCE_KIND,
     SQLITE_QUERY_CAPABILITY_ID,
     SQLITE_QUERY_EVIDENCE_KIND,
 )
@@ -30,6 +33,7 @@ from .sql import (
     MAX_SQL_PARAMETERS,
     POSTGRESQL_UPDATE_MAX_ASSIGNMENTS,
     PostgreSQLUpdateCell,
+    PostgreSQLUpdateCommand,
     PostgreSQLUpdateIntent,
 )
 
@@ -37,6 +41,8 @@ SQLITE_QUERY_EXECUTOR_ID = "data.sqlite.query.executor"
 POSTGRESQL_QUERY_EXECUTOR_ID = "data.postgresql.query.executor"
 POSTGRESQL_UPDATE_PREVIEW_EXECUTOR_ID = "data.postgresql.update_impact.executor"
 POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME = "data_preview_postgresql_update"
+POSTGRESQL_UPDATE_EXECUTOR_ID = "data.postgresql.update.executor"
+POSTGRESQL_UPDATE_TOOL_NAME = "data_update_postgresql"
 _MAX_PREVIEW_OUTPUT_BYTES = 256 * 1_024
 
 
@@ -254,6 +260,67 @@ class PostgreSQLUpdatePreview:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PostgreSQLUpdateResult:
+    """One positively acknowledged committed PostgreSQL update."""
+
+    receipt_id: str
+    source_id: str
+    resource_id: str
+    source_revision: str
+    resource_revision: str
+    preview_fingerprint: str
+    intent_sha256: str
+    returned: tuple[PostgreSQLUpdateCell, ...]
+    committed_at: str
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.receipt_id, "update result receipt_id"),
+            (self.source_id, "update result source_id"),
+            (self.resource_id, "update result resource_id"),
+            (self.source_revision, "update result source_revision"),
+            (self.resource_revision, "update result resource_revision"),
+            (self.committed_at, "update result committed_at"),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be non-empty text")
+        for value, name in (
+            (self.preview_fingerprint, "preview_fingerprint"),
+            (self.intent_sha256, "intent_sha256"),
+        ):
+            if (
+                not isinstance(value, str)
+                or len(value) != 71
+                or not value.startswith("sha256:")
+            ):
+                raise ValueError(f"update result {name} must be a sha256 hash")
+        returned = tuple(self.returned)
+        if not returned or any(
+            not isinstance(item, PostgreSQLUpdateCell) for item in returned
+        ):
+            raise ValueError("update result must contain bounded returned cells")
+        object.__setattr__(self, "returned", returned)
+
+    def tool_data(self) -> FrozenJsonObject:
+        return FrozenJsonObject.from_mapping(
+            {
+                "receipt_id": self.receipt_id,
+                "outcome": "committed",
+                "source_id": self.source_id,
+                "resource_id": self.resource_id,
+                "source_revision": self.source_revision,
+                "resource_revision": self.resource_revision,
+                "preview_fingerprint": self.preview_fingerprint,
+                "intent_sha256": self.intent_sha256,
+                "affected_rows": 1,
+                "returned": tuple(item.to_payload() for item in self.returned),
+                "committed_at": self.committed_at,
+                "trust_classification": "untrusted_data",
+            }
+        )
+
+
 class SqlReadBackend(Protocol):
     async def execute_read(
         self,
@@ -284,6 +351,16 @@ class PostgreSQLUpdatePreviewBackend(Protocol):
     ) -> PostgreSQLUpdatePreview: ...
 
 
+class PostgreSQLUpdateBackend(PostgreSQLUpdatePreviewBackend, Protocol):
+    async def execute_update(
+        self,
+        *,
+        agent_id: str,
+        execution: ToolExecution,
+        command: PostgreSQLUpdateCommand,
+    ) -> PostgreSQLUpdateResult: ...
+
+
 @dataclass(frozen=True, slots=True)
 class SQLiteQueryDeclarations:
     capabilities: tuple[Capability, ...]
@@ -300,6 +377,13 @@ class PostgreSQLQueryDeclarations:
 
 @dataclass(frozen=True, slots=True)
 class PostgreSQLUpdatePreviewDeclarations:
+    capabilities: tuple[Capability, ...]
+    executors: tuple[Executor, ...]
+    tool_views: tuple[ToolView, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PostgreSQLUpdateDeclarations:
     capabilities: tuple[Capability, ...]
     executors: tuple[Executor, ...]
     tool_views: tuple[ToolView, ...]
@@ -385,6 +469,64 @@ class PostgreSQLUpdatePreviewExecutor:
         )
 
 
+class PostgreSQLUpdateExecutor:
+    executor_id = POSTGRESQL_UPDATE_EXECUTOR_ID
+
+    def __init__(self, agent_id: str, backend: PostgreSQLUpdateBackend) -> None:
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("update executor agent_id must be non-empty text")
+        if not callable(getattr(backend, "preview_update", None)) or not callable(
+            getattr(backend, "execute_update", None)
+        ):
+            raise TypeError(
+                "update backend must provide preview_update and execute_update"
+            )
+        self._agent_id = agent_id
+        self._backend = backend
+
+    async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
+        command = PostgreSQLUpdateCommand.from_mapping(request.arguments)
+        preview = await self._backend.preview_update(
+            agent_id=self._agent_id,
+            intent=command.intent,
+        )
+        if preview.would_affect != 1:
+            raise CapabilityInputError(
+                "write_target_not_found",
+                "The previewed primary-key target does not currently exist.",
+            )
+        if preview.fingerprint.preview_fingerprint != command.preview_fingerprint:
+            raise CapabilityInputError(
+                "write_preview_stale",
+                "The supplied preview fingerprint is not the exact current preview.",
+            )
+        return FrozenJsonObject.from_mapping(
+            {
+                "intent_sha256": preview.fingerprint.intent_sha256,
+                "preview_fingerprint": preview.fingerprint.preview_fingerprint,
+                "resource_revision": preview.resource_revision,
+                "row_version_sha256": preview.fingerprint.row_version_sha256,
+                "source_revision": preview.source_revision,
+                "statement_sha256": preview.fingerprint.statement_sha256,
+            }
+        )
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        command = PostgreSQLUpdateCommand.from_mapping(request.arguments)
+        result = await self._backend.execute_update(
+            agent_id=self._agent_id,
+            execution=request,
+            command=command,
+        )
+        if (
+            result.source_id != command.intent.source_id
+            or result.resource_id != command.intent.resource_id
+            or result.preview_fingerprint != command.preview_fingerprint
+        ):
+            raise ValueError("update backend returned a different update identity")
+        return ToolOutput(kind=POSTGRESQL_UPDATE_EVIDENCE_KIND, data=result.tool_data())
+
+
 def sqlite_query_declarations(
     agent_id: str, backend: SQLiteReadBackend
 ) -> SQLiteQueryDeclarations:
@@ -412,6 +554,19 @@ def postgresql_update_preview_declarations(
     executor = PostgreSQLUpdatePreviewExecutor(agent_id, backend)
     extension = postgresql_update_preview_extension_declarations()
     return PostgreSQLUpdatePreviewDeclarations(
+        extension.capabilities,
+        (executor,),
+        extension.tool_views,
+    )
+
+
+def postgresql_update_declarations(
+    agent_id: str,
+    backend: PostgreSQLUpdateBackend,
+) -> PostgreSQLUpdateDeclarations:
+    executor = PostgreSQLUpdateExecutor(agent_id, backend)
+    extension = postgresql_update_extension_declarations()
+    return PostgreSQLUpdateDeclarations(
         extension.capabilities,
         (executor,),
         extension.tool_views,
@@ -503,6 +658,84 @@ def postgresql_update_preview_extension_declarations() -> ExtensionDeclarations:
         (capability.executor_id,),
         (view,),
     )
+
+
+def postgresql_update_extension_declarations() -> ExtensionDeclarations:
+    cell_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            "column": {"type": "string", "minLength": 1, "maxLength": 256},
+            "value": {},
+        },
+        "required": ["column", "value"],
+        "additionalProperties": False,
+    }
+    capability = Capability(
+        id=POSTGRESQL_UPDATE_CAPABILITY_ID,
+        description=(
+            "Apply one approved literal PostgreSQL row update by its exact "
+            "cataloged primary key and current preview fingerprint."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "source_id": {
+                    "type": "string",
+                    "pattern": r"^source:sha256:[0-9a-f]{64}$",
+                },
+                "resource_id": {
+                    "type": "string",
+                    "pattern": r"^catalog-resource:sha256:[0-9a-f]{64}$",
+                },
+                "match": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": cell_schema,
+                },
+                "assignments": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": POSTGRESQL_UPDATE_MAX_ASSIGNMENTS,
+                    "items": cell_schema,
+                },
+                "preview_fingerprint": {
+                    "type": "string",
+                    "pattern": r"^sha256:[0-9a-f]{64}$",
+                },
+                "max_affected_rows": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1,
+                },
+            },
+            "required": [
+                "source_id",
+                "resource_id",
+                "match",
+                "assignments",
+                "preview_fingerprint",
+                "max_affected_rows",
+            ],
+            "additionalProperties": False,
+        },
+        output_kind=POSTGRESQL_UPDATE_EVIDENCE_KIND,
+        output_schema=_postgresql_update_output_schema(),
+        executor_id=POSTGRESQL_UPDATE_EXECUTOR_ID,
+        access_mode=AccessMode.WRITE,
+        side_effecting=True,
+    )
+    view = ToolView(
+        name=POSTGRESQL_UPDATE_TOOL_NAME,
+        capability_id=capability.id,
+        description=capability.description,
+        applicability=ToolApplicability(
+            source_adapter_ids=("postgresql",),
+            minimum_active_sources=1,
+            required_configuration_flags=("write_access",),
+        ),
+    )
+    return ExtensionDeclarations((capability,), (capability.executor_id,), (view,))
 
 
 def _query_declarations(
@@ -665,10 +898,66 @@ def _postgresql_update_preview_output_schema() -> dict[str, object]:
     }
 
 
+def _postgresql_update_output_schema() -> dict[str, object]:
+    cell_schema = {
+        "type": "object",
+        "properties": {"column": {"type": "string"}, "value": {}},
+        "required": ["column", "value"],
+        "additionalProperties": False,
+    }
+    hash_rule = {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"}
+    names = (
+        "receipt_id",
+        "outcome",
+        "source_id",
+        "resource_id",
+        "source_revision",
+        "resource_revision",
+        "preview_fingerprint",
+        "intent_sha256",
+        "affected_rows",
+        "returned",
+        "committed_at",
+        "trust_classification",
+    )
+    return {
+        "type": "object",
+        "properties": {
+            "receipt_id": {
+                "type": "string",
+                "pattern": r"^database-write-receipt:sha256:[0-9a-f]{64}$",
+            },
+            "outcome": {"type": "string", "enum": ["committed"]},
+            "source_id": {"type": "string"},
+            "resource_id": {"type": "string"},
+            "source_revision": {"type": "string"},
+            "resource_revision": {"type": "string"},
+            "preview_fingerprint": hash_rule,
+            "intent_sha256": hash_rule,
+            "affected_rows": {"type": "integer", "minimum": 1, "maximum": 1},
+            "returned": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": POSTGRESQL_UPDATE_MAX_ASSIGNMENTS + 1,
+                "items": cell_schema,
+            },
+            "committed_at": {"type": "string"},
+            "trust_classification": {
+                "type": "string",
+                "enum": ["untrusted_data"],
+            },
+        },
+        "required": list(names),
+        "additionalProperties": False,
+    }
+
+
 __all__ = [
     "POSTGRESQL_QUERY_EXECUTOR_ID",
     "POSTGRESQL_UPDATE_PREVIEW_EXECUTOR_ID",
     "POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME",
+    "POSTGRESQL_UPDATE_EXECUTOR_ID",
+    "POSTGRESQL_UPDATE_TOOL_NAME",
     "PostgreSQLQueryDeclarations",
     "PostgreSQLQueryExecutor",
     "PostgreSQLReadBackend",
@@ -679,6 +968,10 @@ __all__ = [
     "PostgreSQLUpdatePreviewChecks",
     "PostgreSQLUpdatePreviewDeclarations",
     "PostgreSQLUpdatePreviewExecutor",
+    "PostgreSQLUpdateBackend",
+    "PostgreSQLUpdateDeclarations",
+    "PostgreSQLUpdateExecutor",
+    "PostgreSQLUpdateResult",
     "SQLITE_QUERY_EXECUTOR_ID",
     "SQLiteQueryDeclarations",
     "SQLiteQueryExecutor",
@@ -688,6 +981,8 @@ __all__ = [
     "postgresql_query_extension_declarations",
     "postgresql_update_preview_declarations",
     "postgresql_update_preview_extension_declarations",
+    "postgresql_update_declarations",
+    "postgresql_update_extension_declarations",
     "sqlite_query_declarations",
     "sqlite_query_extension_declarations",
 ]

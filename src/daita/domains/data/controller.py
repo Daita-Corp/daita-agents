@@ -114,6 +114,7 @@ from .file_capabilities import (
     LOCAL_FILE_READ_EVIDENCE_KIND,
 )
 from .sql import (
+    PostgreSQLUpdateCommand,
     PostgreSQLUpdateIntent,
     ResourceSchema,
     validate_postgresql_read,
@@ -127,6 +128,8 @@ POSTGRESQL_QUERY_CAPABILITY_ID = "data.postgresql.query"
 POSTGRESQL_QUERY_EVIDENCE_KIND = "data.postgresql.query_result"
 POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID = "data.postgresql.update_impact"
 POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND = "data.postgresql.update_impact"
+POSTGRESQL_UPDATE_CAPABILITY_ID = "data.postgresql.update"
+POSTGRESQL_UPDATE_EVIDENCE_KIND = "data.postgresql.update_result"
 _MVP_CAPABILITIES = frozenset(
     {
         CATALOG_SEARCH_CAPABILITY_ID,
@@ -136,6 +139,7 @@ _MVP_CAPABILITIES = frozenset(
         SQLITE_QUERY_CAPABILITY_ID,
         POSTGRESQL_QUERY_CAPABILITY_ID,
         POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+        POSTGRESQL_UPDATE_CAPABILITY_ID,
         LOCAL_FILE_READ_CAPABILITY_ID,
         SKILL_VIEW_CAPABILITY_ID,
         SKILL_SAVE_CAPABILITY_ID,
@@ -1858,15 +1862,18 @@ class DataToolRuntime:
                     SKILL_DELETE_CAPABILITY_ID,
                     ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
                     ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
+                    POSTGRESQL_UPDATE_CAPABILITY_ID,
                 }
                 and capability.side_effecting
             ):
-                return None
-            return (
-                "write_not_enabled",
-                "Write tools are not enabled in the MVP agent loop.",
-                {"capability_id": capability.id},
-            )
+                if capability.id != POSTGRESQL_UPDATE_CAPABILITY_ID:
+                    return None
+            else:
+                return (
+                    "write_not_enabled",
+                    "Write tools are not enabled in the MVP agent loop.",
+                    {"capability_id": capability.id},
+                )
         if capability.id == SKILL_VIEW_CAPABILITY_ID:
             name = arguments.get("name")
             try:
@@ -1963,8 +1970,15 @@ class DataToolRuntime:
             POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         }:
             return await self._validate_sql(run, capability, arguments)
-        if capability.id == POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID:
-            return await self._validate_postgresql_update_preview(run, arguments)
+        if capability.id in {
+            POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+            POSTGRESQL_UPDATE_CAPABILITY_ID,
+        }:
+            return await self._validate_postgresql_update_call(
+                run,
+                arguments,
+                execution=capability.id == POSTGRESQL_UPDATE_CAPABILITY_ID,
+            )
         if capability.id in {
             LOCAL_FILE_READ_CAPABILITY_ID,
             LOCAL_FILE_COPY_CAPABILITY_ID,
@@ -1985,16 +1999,18 @@ class DataToolRuntime:
                 )
         return None
 
-    async def _validate_postgresql_update_preview(
+    async def _validate_postgresql_update_call(
         self,
         run: RunInput,
         arguments: Mapping[str, object],
+        *,
+        execution: bool,
     ) -> tuple[str, str, Mapping[str, object]] | None:
         source_id = arguments.get("source_id")
         if not isinstance(source_id, str):
             return (
                 "write_source_not_available",
-                "PostgreSQL update preview requires an exact current source.",
+                "PostgreSQL update requires an exact current source.",
                 {},
             )
         adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
@@ -2019,15 +2035,19 @@ class DataToolRuntime:
         if not eligible:
             return (
                 "write_access_not_enabled",
-                "PostgreSQL update preview requires user-owned write_access enablement.",
+                "PostgreSQL update requires user-owned write_access enablement.",
                 {"source_id": source_id},
             )
         try:
-            intent = PostgreSQLUpdateIntent.from_mapping(arguments)
+            intent = (
+                PostgreSQLUpdateCommand.from_mapping(arguments).intent
+                if execution
+                else PostgreSQLUpdateIntent.from_mapping(arguments)
+            )
         except (TypeError, ValueError):
             return (
                 "write_assignment_invalid",
-                "The PostgreSQL update preview intent is malformed.",
+                "The PostgreSQL update intent is malformed.",
                 {},
             )
         validation = validate_postgresql_update_intent(
@@ -2114,7 +2134,10 @@ class DataToolRuntime:
         resource_ids: tuple[object, ...] = ()
         if capability.id == CATALOG_INSPECT_CAPABILITY_ID:
             resource_ids = (arguments.get("resource_id"),)
-        elif capability.id == POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID:
+        elif capability.id in {
+            POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+            POSTGRESQL_UPDATE_CAPABILITY_ID,
+        }:
             resource_ids = (arguments.get("resource_id"),)
         elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
             value = arguments.get("resource_ids", ())
@@ -2458,7 +2481,13 @@ def _exception_result(call: ToolCall, error: BaseException) -> ToolResultBlock:
     if isinstance(error, ArtifactError):
         return _error(call, error.code, error.message, error.details)
     if isinstance(error, PluginError):
-        return _error(call, error.error_code, str(error))
+        details = getattr(error, "details", None)
+        return _error(
+            call,
+            error.error_code,
+            str(error),
+            details if isinstance(details, Mapping) else None,
+        )
     return _error(
         call,
         "tool_execution_failed",
@@ -2560,6 +2589,8 @@ __all__ = [
     "POSTGRESQL_QUERY_EVIDENCE_KIND",
     "POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID",
     "POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND",
+    "POSTGRESQL_UPDATE_CAPABILITY_ID",
+    "POSTGRESQL_UPDATE_EVIDENCE_KIND",
     "SQLITE_QUERY_CAPABILITY_ID",
     "SQLITE_QUERY_EVIDENCE_KIND",
 ]

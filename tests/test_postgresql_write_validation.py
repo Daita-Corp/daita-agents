@@ -346,7 +346,8 @@ def test_generated_update_sql_uses_only_quoted_catalog_identifiers_and_parameter
     assert statement.sql == (
         'UPDATE ONLY "public"."accounts" '
         'SET "status""; DROP TABLE accounts; --" = $1 '
-        'WHERE "account_id" = $2'
+        'WHERE "account_id" = $2 RETURNING "account_id", '
+        '"status""; DROP TABLE accounts; --"'
     )
     assert statement.parameters == (value, 42)
     assert value not in statement.sql

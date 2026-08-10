@@ -54,6 +54,7 @@ from ..domains.data import (
     artifact_capability_declarations,
     local_file_read_declarations,
     postgresql_query_declarations,
+    postgresql_update_declarations,
     postgresql_update_preview_declarations,
     sqlite_query_declarations,
 )
@@ -727,8 +728,14 @@ class EmbeddedAgent:
             store,
             data_view,
             secret_provider or keychain,
+            receipt_store=store,
+            clock=clock,
         )
         postgresql_preview = postgresql_update_preview_declarations(
+            identity.id,
+            postgresql_preview_backend,
+        )
+        postgresql_update = postgresql_update_declarations(
             identity.id,
             postgresql_preview_backend,
         )
@@ -789,6 +796,7 @@ class EmbeddedAgent:
                 *sqlite.capabilities,
                 *postgresql.capabilities,
                 *postgresql_preview.capabilities,
+                *postgresql_update.capabilities,
                 *local_files.capabilities,
                 *memory.capabilities,
                 *skills.capabilities,
@@ -800,6 +808,7 @@ class EmbeddedAgent:
                 *sqlite.executors,
                 *postgresql.executors,
                 *postgresql_preview.executors,
+                *postgresql_update.executors,
                 *local_files.executors,
                 *memory.executors,
                 *skills.executors,
@@ -811,6 +820,7 @@ class EmbeddedAgent:
                 *sqlite.tool_views,
                 *postgresql.tool_views,
                 *postgresql_preview.tool_views,
+                *postgresql_update.tool_views,
                 *local_files.tool_views,
                 *memory.tool_views,
                 *skills.tool_views,

@@ -817,8 +817,9 @@ async def test_public_agent_preview_vertical_slice_creates_no_write_receipt(
             for block in message.content
             if isinstance(block, TextBlock)
         )
-        assert "PostgreSQL update preview is read-only evidence only" in system_text
-        assert "database mutation remains unavailable" in system_text
+        assert "call the typed read-only preview first" in system_text
+        assert "runtime approval card is the sole confirmation" in system_text
+        assert "never retry automatically" in system_text
         tool_results = tuple(
             block
             for request in provider.requests

@@ -465,6 +465,7 @@ async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branc
         assert write_tools == {
             "artifact_save_local",
             "artifact_set_export_location",
+            "data_update_postgresql",
             "memory_set",
             "semantic_delete",
             "semantic_save",
@@ -475,7 +476,7 @@ async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branc
         await agent.close()
 
 
-async def test_database_write_phase_two_registers_only_read_only_postgresql_preview(
+async def test_database_write_phase_three_registers_only_the_postgresql_update_slice(
     tmp_path,
 ):
     agent = await daita.Agent.create("database-write-phase-two", root=tmp_path)
@@ -486,13 +487,13 @@ async def test_database_write_phase_two_registers_only_read_only_postgresql_prev
         }
         preview_tool = "data_preview_postgresql_update"
         preview_capability = "data.postgresql.update_impact"
+        update_tool = "data_update_postgresql"
+        update_capability = "data.postgresql.update"
         forbidden_tools = {
-            "data_update_postgresql",
             "data_preview_sqlite_update",
             "data_update_sqlite",
         }
         forbidden_capabilities = {
-            "data.postgresql.update",
             "data.sqlite.update_impact",
             "data.sqlite.update",
         }
@@ -502,6 +503,13 @@ async def test_database_write_phase_two_registers_only_read_only_postgresql_prev
         assert preview.id == preview_capability
         assert preview.access_mode is AccessMode.READ
         assert preview.side_effecting is False
+        assert update_tool in registry.tool_names
+        update = registry.resolve_tool(update_tool)[1]
+        assert update.id == update_capability
+        assert update.access_mode is AccessMode.WRITE
+        assert update.side_effecting is True
+        _, update_executor = registry.resolve_execution(update.id)
+        assert callable(getattr(update_executor, "preflight", None))
         assert forbidden_tools.isdisjoint(registry.tool_names)
         assert forbidden_capabilities.isdisjoint(capability_ids)
 
@@ -512,14 +520,29 @@ async def test_database_write_phase_two_registers_only_read_only_postgresql_prev
         for dormant_name in forbidden_tools | forbidden_capabilities:
             assert f'"{dormant_name}"' not in package_text
             assert f"'{dormant_name}'" not in package_text
-        assert "class PostgreSQLUpdateExecutor" not in package_text
+        assert "class PostgreSQLUpdateExecutor" in package_text
         write_backend = (PACKAGE / "adapters" / "postgresql_write.py").read_text(
             encoding="utf-8"
         )
-        assert "start_database_write_receipt" not in write_backend
-        assert "finish_database_write_receipt" not in write_backend
+        assert "start_database_write_receipt" in write_backend
+        assert "finish_database_write_receipt" in write_backend
         assert "database_write_receipts" not in write_backend
         assert "SideEffectExecutor" not in write_backend
+        assert "approval_handler" not in write_backend
+        assert "_execute_side_effect" in controller
+        assert "ApprovalRequest" in controller
+        capabilities_owner = (
+            PACKAGE / "domains" / "data" / "capabilities.py"
+        ).read_text(encoding="utf-8")
+        assert ".execute_update(" in capabilities_owner
+        assert ".execute_update(" not in controller
+        assert ".execute_update(" not in (PACKAGE / "loop" / "driver.py").read_text(
+            encoding="utf-8"
+        )
+        embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+        assert embedded.count("mutation_lock = asyncio.Lock()") == 1
+        assert "pending_database_write" not in package_text
+        assert "database_write_events" not in package_text
         assert "DbRuntime" not in package_text
         assert "RuntimeKernel" not in package_text
         assert "set_source_write_access" in _class_methods(

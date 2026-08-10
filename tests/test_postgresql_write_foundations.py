@@ -344,7 +344,9 @@ async def test_catalog_projection_round_trips_ordered_keys_and_column_write_fact
         await reopened.close()
 
 
-async def test_write_access_projects_only_the_postgresql_preview_tool(tmp_path):
+async def test_write_access_projects_only_the_postgresql_preview_and_update_tools(
+    tmp_path,
+):
     agent = await Agent.create("write-access-no-tool", root=tmp_path, clock=lambda: NOW)
     registration = _registration(agent.id)
     await agent._embedded._store.register_source(registration)
@@ -355,8 +357,8 @@ async def test_write_access_projects_only_the_postgresql_preview_tool(tmp_path):
         created_at=NOW,
     )
     preview = "data_preview_postgresql_update"
+    update = "data_update_postgresql"
     forbidden = {
-        "data_update_postgresql",
         "data_preview_sqlite_update",
         "data_update_sqlite",
     }
@@ -370,9 +372,9 @@ async def test_write_access_projects_only_the_postgresql_preview_tool(tmp_path):
             definition.name
             for definition in await agent._embedded._data_tool_runtime.definitions(run)
         }
-        assert preview not in before
+        assert {preview, update}.isdisjoint(before)
         assert forbidden.isdisjoint(after)
-        assert preview in after
-        assert after == before | {preview}
+        assert {preview, update}.issubset(after)
+        assert after == before | {preview, update}
     finally:
         await agent.close()

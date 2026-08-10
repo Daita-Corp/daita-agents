@@ -1,14 +1,16 @@
-"""Opt-in live-model confidence gate for PostgreSQL update preview.
+"""Opt-in live-model confidence gate for one PostgreSQL update.
 
 Run from the repository root after loading ``OPENAI_API_KEY`` into the
 environment::
 
-    DAITA_RUN_LIVE_POSTGRESQL_UPDATE_PREVIEW=1 \
+    DAITA_RUN_LIVE_POSTGRESQL_UPDATE_MODEL=1 \
       .venv/bin/python -m pytest \
-      tests/live/test_postgresql_update_preview_live.py -v -s
+      tests/live/test_postgresql_update_live.py -v -s
 
-The model call is live. PostgreSQL is a deterministic in-process fake so this
-test cannot mutate an external database and does not require ``requires_db``.
+The model call is live. PostgreSQL behavior is a deterministic in-process fake,
+so this test cannot mutate an external database and does not require
+``requires_db``. It certifies that a release-reviewed model can complete the
+public preview -> approval -> update -> committed-result transcript protocol.
 """
 
 from __future__ import annotations
@@ -27,16 +29,18 @@ from daita import Agent, LoopLimits, create_llm_provider
 from daita._json import canonical_json
 from daita.adapters import postgresql as postgresql_module
 from daita.adapters import postgresql_write as write_module
-from daita.adapters.models import (
-    DiscoveryRequest,
-    SourceRegistration,
-)
+from daita.adapters.models import DiscoveryRequest, SourceRegistration
+from daita.capabilities import ApprovalDecision, ApprovalRequest
 from daita.catalog.models import ResourceKind, TabularColumn, catalog_resource_id
 from daita.domains.data.capabilities import (
     POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
     POSTGRESQL_UPDATE_TOOL_NAME,
 )
-from daita.domains.data.controller import POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND
+from daita.domains.data.controller import (
+    POSTGRESQL_UPDATE_CAPABILITY_ID,
+    POSTGRESQL_UPDATE_EVIDENCE_KIND,
+    POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
+)
 from daita.llm.models import (
     CanonicalMessage,
     ModelRequest,
@@ -47,28 +51,31 @@ from daita.llm.models import (
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import ModelProvider, provider_has_complete_pricing
 from daita.loop.models import LoopExitKind, Transcript
+from daita.storage.sqlite import DatabaseWriteOutcome
 
-_AUTHORIZATION = "DAITA_RUN_LIVE_POSTGRESQL_UPDATE_PREVIEW"
-_MODEL_ID = "DAITA_POSTGRESQL_UPDATE_PREVIEW_MODEL_ID"
+_AUTHORIZATION = "DAITA_RUN_LIVE_POSTGRESQL_UPDATE_MODEL"
+_MODEL_ID = "DAITA_POSTGRESQL_UPDATE_MODEL_ID"
 _MODEL_KEY = "OPENAI_API_KEY"
-_MAX_COST = "DAITA_POSTGRESQL_UPDATE_PREVIEW_MAX_COST_USD"
+_MAX_COST = "DAITA_POSTGRESQL_UPDATE_MAX_COST_USD"
 _DEFAULT_MODEL_ID = "openai:gpt-5.6-terra"
-_NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
-_AGENT_ID = "agent-live-postgresql-update-preview"
-_NATIVE_IDENTITY = "postgresql:live-model-preview"
-_FORBIDDEN_MODEL_TOOLS = frozenset(
-    {
-        "data_preview_sqlite_update",
-        "data_update_sqlite",
-        "set_source_write_access",
-    }
-)
-_ALLOWED_CATALOG_TOOLS = frozenset(
+_NOW = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+_AGENT_ID = "agent-live-postgresql-update"
+_NATIVE_IDENTITY = "postgresql:live-model-update"
+_ALLOWED_MODEL_CALLS = frozenset(
     {
         "catalog_search",
         "catalog_schema",
         "catalog_inspect",
         "catalog_traverse",
+        POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
+        POSTGRESQL_UPDATE_TOOL_NAME,
+    }
+)
+_FORBIDDEN_MODEL_TOOLS = frozenset(
+    {
+        "data_preview_sqlite_update",
+        "data_update_sqlite",
+        "set_source_write_access",
     }
 )
 
@@ -80,19 +87,18 @@ pytestmark = [
         os.environ.get(_AUTHORIZATION) != "1",
         reason=(
             f"set {_AUTHORIZATION}=1 only after explicitly authorizing "
-            "one live OpenAI preview confidence run"
+            "one live OpenAI PostgreSQL update-protocol confidence run"
         ),
     ),
 ]
 
 
 class _ProjectionGuardProvider:
-    """Record paid requests and reject an unexpected model-facing surface."""
+    """Record paid requests and admit only the intended model tool path."""
 
     def __init__(self, delegate: ModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
-        self.preview_expected = False
 
     @property
     def provider_id(self) -> str:
@@ -106,28 +112,22 @@ class _ProjectionGuardProvider:
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         projected = {definition.name for definition in request.tools}
+        assert POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME in projected
+        assert POSTGRESQL_UPDATE_TOOL_NAME in projected
         forbidden = sorted(projected & _FORBIDDEN_MODEL_TOOLS)
         if forbidden:
             raise AssertionError(
-                f"database-mutation surface was projected to the model: {forbidden}"
+                f"an unrelated mutation surface was projected: {forbidden}"
             )
-        assert (
-            POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME in projected
-        ) is self.preview_expected
-        assert (POSTGRESQL_UPDATE_TOOL_NAME in projected) is self.preview_expected
         self.requests.append(request)
         response = await self._delegate.generate(request)
-        if response.tool_calls:
-            expected_calls = set(_ALLOWED_CATALOG_TOOLS)
-            if self.preview_expected:
-                expected_calls.add(POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME)
-            unexpected = sorted(
-                {call.name for call in response.tool_calls} - expected_calls
+        unexpected = sorted(
+            {call.name for call in response.tool_calls} - _ALLOWED_MODEL_CALLS
+        )
+        if unexpected:
+            raise AssertionError(
+                f"live update model selected an unexpected tool: {unexpected}"
             )
-            if unexpected:
-                raise AssertionError(
-                    f"live model selected an unexpected tool: {unexpected}"
-                )
         return response
 
 
@@ -145,14 +145,23 @@ class _Transaction:
         self._log.append(("transaction.rollback",))
 
 
-class _ReadOnlyPreviewConnection:
+class _Cursor:
+    def __init__(self, log: list[tuple[object, ...]]) -> None:
+        self._log = log
+
+    async def fetch(self, count: int) -> tuple[Mapping[str, object], ...]:
+        self._log.append(("cursor.fetch", count))
+        return ({"account_id": 42, "is_active": False},)[:count]
+
+
+class _UpdateConnection:
     def __init__(self) -> None:
         self.log: list[tuple[object, ...]] = []
-        self._transaction = _Transaction(self.log)
+        self.update_count = 0
 
     def transaction(self, **kwargs: object) -> _Transaction:
         self.log.append(("transaction", kwargs))
-        return self._transaction
+        return _Transaction(self.log)
 
     async def execute(self, sql: str, *parameters: object) -> str:
         self.log.append(("execute", sql, parameters))
@@ -207,6 +216,11 @@ class _ReadOnlyPreviewConnection:
             },
         )
 
+    async def cursor(self, sql: str, *parameters: object) -> _Cursor:
+        self.update_count += 1
+        self.log.append(("cursor", sql, parameters))
+        return _Cursor(self.log)
+
     async def close(self) -> None:
         self.log.append(("close",))
 
@@ -237,14 +251,14 @@ def _registration() -> SourceRegistration:
         agent_id=_AGENT_ID,
         adapter_id="postgresql",
         native_identity=_NATIVE_IDENTITY,
-        display_name="Synthetic Preview PostgreSQL",
+        display_name="Synthetic Update PostgreSQL",
         configuration={
-            "database": "synthetic_preview",
+            "database": "synthetic_update",
             "host": "synthetic.invalid",
             "port": 5432,
             "schemas": ("public",),
             "ssl_mode": "require",
-            "username": "synthetic_preview_role",
+            "username": "synthetic_update_role",
             "write_access": False,
         },
         attached_at=_NOW,
@@ -299,7 +313,7 @@ def _id_factory():
         if prefix == "agent":
             return _AGENT_ID
         counters[prefix] += 1
-        return f"{prefix}-live-preview-{counters[prefix]}"
+        return f"{prefix}-live-update-{counters[prefix]}"
 
     return next_id
 
@@ -319,24 +333,26 @@ def _tool_results(
     }
 
 
-def _patch_preview_io(
+def _patch_update_io(
     monkeypatch: pytest.MonkeyPatch,
-    connection: _ReadOnlyPreviewConnection,
+    connection: _UpdateConnection,
     structure: postgresql_module.PostgreSQLStructure,
 ) -> None:
     async def connect(*args: object, **kwargs: object) -> object:
         del args, kwargs
+        connection.log.append(("connect",))
         return connection
 
     async def load_structure(*args: object, **kwargs: object) -> object:
         del args, kwargs
+        connection.log.append(("structure",))
         return structure
 
     monkeypatch.setattr(write_module, "_connect", connect)
     monkeypatch.setattr(write_module, "_load_structure", load_structure)
 
 
-async def test_live_model_uses_only_enabled_read_only_postgresql_preview(
+async def test_live_model_previews_approves_and_commits_exact_postgresql_update(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -360,19 +376,42 @@ async def test_live_model_uses_only_enabled_read_only_postgresql_preview(
         ResourceKind.TABLE,
         "public.accounts",
     )
-    connection = _ReadOnlyPreviewConnection()
-    _patch_preview_io(monkeypatch, connection, structure)
+    expected_intent = {
+        "source_id": registration.id,
+        "resource_id": resource_id,
+        "match": [{"column": "account_id", "value": 42}],
+        "assignments": [{"column": "is_active", "value": False}],
+    }
+    connection = _UpdateConnection()
+    _patch_update_io(monkeypatch, connection, structure)
+    approvals: list[ApprovalRequest] = []
+
+    async def approve_exact_update(request: ApprovalRequest) -> ApprovalDecision:
+        approvals.append(request)
+        arguments = dict(request.arguments)
+        fingerprint = arguments.pop("preview_fingerprint", None)
+        expected = {**expected_intent, "max_affected_rows": 1}
+        eligible = (
+            request.tool_name == POSTGRESQL_UPDATE_TOOL_NAME
+            and request.capability_id == POSTGRESQL_UPDATE_CAPABILITY_ID
+            and canonical_json(arguments) == canonical_json(expected)
+            and isinstance(fingerprint, str)
+            and fingerprint.startswith("sha256:")
+            and len(fingerprint) == 71
+        )
+        return ApprovalDecision.APPROVE if eligible else ApprovalDecision.DENY
 
     agent = await Agent.create(
-        "live-postgresql-update-preview",
+        "live-postgresql-update",
         root=tmp_path,
         model=provider,
         model_profile=profile,
+        approval_handler=approve_exact_update,
         clock=lambda: _NOW,
         id_factory=_id_factory(),
         limits=LoopLimits(
-            max_steps=6,
-            max_total_tokens=20_000,
+            max_steps=8,
+            max_total_tokens=24_000,
             max_wall_time_seconds=120,
             max_estimated_cost_usd=_cost_limit(),
         ),
@@ -382,7 +421,7 @@ async def test_live_model_uses_only_enabled_read_only_postgresql_preview(
         DiscoveryRequest(
             agent_id=agent.id,
             source_id=registration.id,
-            sync_id="catalog-sync-live-preview",
+            sync_id="catalog-sync-live-update",
             requested_at=_NOW,
         ),
         structure,
@@ -391,130 +430,113 @@ async def test_live_model_uses_only_enabled_read_only_postgresql_preview(
     await agent._embedded._store.register_source(registration)
     await agent._embedded._store.commit_snapshot(snapshot)
     try:
-        disabled_exit = await agent.run(
-            "Can you preview changing public.accounts account_id 42 is_active to "
-            "false? The exact typed boolean value is confirmed. Do not query the "
-            "row and do not provide SQL. If the exact PostgreSQL update-preview "
-            "tool is unavailable, explain that preview is not enabled."
-        )
-        disabled_request_count = len(provider.requests)
-        disabled_transcript = await agent.transcript(disabled_exit.run_id)
-
         enabled = await agent.set_source_write_access(registration.id, True)
         assert enabled.configuration["write_access"] is True
-        provider.preview_expected = True
-        preview_exit = await agent.run(
-            "Use the PostgreSQL update-preview tool now. Preview exactly one "
-            "structured change to public.accounts: match account_id 42 and assign "
-            "is_active to the confirmed exact boolean value false. This message is "
-            "the user's confirmation of that literal. Use the exact source and "
-            "resource identities from the catalog. Do not query with SQL and do not "
-            "execute a database mutation. After the preview, state exactly 'No "
-            "database mutation was performed' and summarize the before and after "
-            "values."
+        exit = await agent.run(
+            "Perform exactly one PostgreSQL update to public.accounts. Match the "
+            "single primary-key row account_id 42 and assign is_active to the "
+            "confirmed exact boolean value false. First call the PostgreSQL "
+            "update-preview tool exactly once. Then copy its exact current preview "
+            "fingerprint into the PostgreSQL update tool with max_affected_rows 1. "
+            "Do not call a SQL query tool, do not invent SQL, and do not retry the "
+            "update. Only say the change committed after the update tool returns a "
+            "committed outcome and receipt.",
+            source_id=registration.id,
         )
-        preview_transcript = await agent.transcript(preview_exit.run_id)
-        preview_receipts = {
-            call.id: await agent._embedded._store.load_database_write_receipt_for_call(
+        transcript = await agent.transcript(exit.run_id)
+        calls = _tool_calls(transcript)
+        results = _tool_results(transcript.messages)
+        preview_calls = tuple(
+            call for call in calls if call.name == POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME
+        )
+        update_calls = tuple(
+            call for call in calls if call.name == POSTGRESQL_UPDATE_TOOL_NAME
+        )
+        receipt = (
+            await agent._embedded._store.load_database_write_receipt_for_call(
                 agent.id,
-                preview_exit.run_id,
-                call.id,
+                exit.run_id,
+                update_calls[0].id,
             )
-            for call in _tool_calls(preview_transcript)
-            if call.name == POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME
-        }
+            if len(update_calls) == 1
+            else None
+        )
     finally:
         await agent.close()
 
-    assert disabled_exit.kind is LoopExitKind.COMPLETED
-    assert all(
-        call.name != POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME
-        for call in _tool_calls(disabled_transcript)
+    assert exit.kind is LoopExitKind.COMPLETED, exit.reason
+    assert exit.final_text is not None
+    assert "committed" in exit.final_text.casefold()
+    assert provider.requests
+    assert len(preview_calls) == 1
+    assert len(update_calls) == 1
+    preview_call = preview_calls[0]
+    update_call = update_calls[0]
+    assert calls.index(preview_call) < calls.index(update_call)
+    assert canonical_json(preview_call.arguments) == canonical_json(expected_intent)
+    preview_result = results[preview_call.id]
+    assert preview_result.is_error is False
+    assert preview_result.output["kind"] == POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND
+    preview_data = preview_result.output["data"]
+    assert isinstance(preview_data, Mapping)
+    expected_update = {
+        **expected_intent,
+        "preview_fingerprint": preview_data["preview_fingerprint"],
+        "max_affected_rows": 1,
+    }
+    assert canonical_json(update_call.arguments) == canonical_json(expected_update)
+    assert len(approvals) == 1
+    assert approvals[0].run_id == exit.run_id
+    assert approvals[0].call_id == update_call.id
+    assert canonical_json(approvals[0].arguments) == canonical_json(expected_update)
+    update_result = results[update_call.id]
+    assert update_result.is_error is False
+    assert update_result.output["kind"] == POSTGRESQL_UPDATE_EVIDENCE_KIND
+    update_data = update_result.output["data"]
+    assert isinstance(update_data, Mapping)
+    assert update_data["outcome"] == "committed"
+    assert update_data["affected_rows"] == 1
+    assert canonical_json(update_data["returned"]) == canonical_json(
+        [
+            {"column": "account_id", "value": 42},
+            {"column": "is_active", "value": False},
+        ]
     )
-    assert all(
-        POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME
-        not in {definition.name for definition in request.tools}
-        for request in provider.requests[:disabled_request_count]
-    )
+    assert receipt is not None
+    assert receipt.outcome is DatabaseWriteOutcome.COMMITTED
+    assert receipt.call_id == update_call.id
+    assert receipt.preview_fingerprint == preview_data["preview_fingerprint"]
 
-    assert preview_exit.kind is LoopExitKind.COMPLETED
-    assert preview_exit.final_text is not None
-    assert "no database mutation was performed" in preview_exit.final_text.casefold()
-    enabled_requests = provider.requests[disabled_request_count:]
-    assert enabled_requests
-    assert all(
-        POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME
-        in {definition.name for definition in request.tools}
-        for request in enabled_requests
+    transaction_calls = tuple(
+        entry for entry in connection.log if entry[0] == "transaction"
     )
-    assert all(
-        POSTGRESQL_UPDATE_TOOL_NAME in {definition.name for definition in request.tools}
-        for request in enabled_requests
-    )
-    assert all(
-        call.name != POSTGRESQL_UPDATE_TOOL_NAME
-        for call in _tool_calls(preview_transcript)
-    )
-    assert all(
-        _FORBIDDEN_MODEL_TOOLS.isdisjoint(
-            definition.name for definition in request.tools
+    assert (
+        transaction_calls.count(
+            ("transaction", {"isolation": "repeatable_read", "readonly": True})
         )
-        for request in provider.requests
+        == 3
     )
-
-    results = _tool_results(preview_transcript.messages)
-    preview_calls = tuple(
-        call
-        for call in _tool_calls(preview_transcript)
-        if call.name == POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME
+    assert (
+        transaction_calls.count(("transaction", {"isolation": "repeatable_read"})) == 1
     )
-    successful_calls = tuple(
-        call
-        for call in preview_calls
-        if call.id in results and not results[call.id].is_error
-    )
-    assert len(successful_calls) == 1
-    successful_call = successful_calls[0]
-    assert canonical_json(successful_call.arguments) == canonical_json(
-        {
-            "source_id": registration.id,
-            "resource_id": resource_id,
-            "match": [{"column": "account_id", "value": 42}],
-            "assignments": [{"column": "is_active", "value": False}],
-        }
-    )
-    output = results[successful_call.id].output
-    assert output["kind"] == POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND
-    data = output["data"]
-    assert isinstance(data, Mapping)
-    assert data["would_affect"] == 1
-    assert canonical_json(data["before"]) == canonical_json(
-        [{"column": "is_active", "value": True}]
-    )
-    assert canonical_json(data["after"]) == canonical_json(
-        [{"column": "is_active", "value": False}]
-    )
-    assert preview_receipts
-    assert all(receipt is None for receipt in preview_receipts.values())
-
-    assert connection.log[0] == (
-        "transaction",
-        {"isolation": "repeatable_read", "readonly": True},
-    )
-    sql_calls = tuple(
+    locked_selects = tuple(
         entry
         for entry in connection.log
-        if entry[0] in {"execute", "fetch", "fetchrow"}
+        if entry[0] == "fetch" and "FOR UPDATE" in str(entry[1])
     )
-    rendered_sql = tuple(str(entry[1]) for entry in sql_calls)
-    assert not any(
-        sql.lstrip()
-        .upper()
-        .startswith(("INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP"))
-        for sql in rendered_sql
+    assert len(locked_selects) == 1
+    assert locked_selects[0][2] == (42,)
+    update_entries = tuple(entry for entry in connection.log if entry[0] == "cursor")
+    assert len(update_entries) == 1
+    assert update_entries[0][1] == (
+        'UPDATE ONLY "public"."accounts" SET "is_active" = $1 '
+        'WHERE "account_id" = $2 RETURNING "account_id", "is_active"'
     )
-    explain = next(sql for sql in rendered_sql if sql.startswith("EXPLAIN"))
-    assert "ANALYZE" not in explain
-    assert any("update_preview_row" in sql and "LIMIT 2" in sql for sql in rendered_sql)
-    assert ("transaction.commit",) in connection.log
-    assert connection.log[-1] == ("close",)
+    assert update_entries[0][2] == (False, 42)
+    assert connection.update_count == 1
+    assert ("cursor.fetch", 2) in connection.log
+    assert connection.log.count(("transaction.commit",)) == 4
+    assert ("transaction.rollback",) not in connection.log
+    serialized = canonical_json(update_result.output)
+    assert "synthetic.invalid" not in serialized
+    assert "synthetic_update_role" not in serialized

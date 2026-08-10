@@ -13,7 +13,11 @@ from ..security import (
 )
 from .errors import ModelProviderError, ProviderErrorCode
 from .models import ModelRequest, ModelResponse, ModelStreamEvent
-from .protocols import ModelProvider, StreamingModelProvider
+from .protocols import (
+    ModelProvider,
+    StreamingModelProvider,
+    provider_has_complete_pricing,
+)
 from .providers import (
     AnthropicProvider,
     ClaudeCodeSubscriptionProvider,
@@ -155,6 +159,19 @@ class _LazyProvider:
                 "grok-build",
             }
         )
+
+    def has_complete_pricing(self, request: ModelRequest) -> bool:
+        if self._provider is not None:
+            return provider_has_complete_pricing(self._provider, request)
+        provider_name = self.provider_id.partition(":")[0]
+        if provider_name == "codex":
+            return False
+        provider = create_llm_provider(
+            self._candidate.provider_id,
+            base_url=self._candidate.base_url,
+            max_output_tokens=self._candidate.profile.max_output_tokens,
+        )
+        return provider_has_complete_pricing(provider, request)
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         provider = await self._resolve(request)

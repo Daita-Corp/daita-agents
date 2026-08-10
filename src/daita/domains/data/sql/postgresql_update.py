@@ -142,6 +142,67 @@ class PostgreSQLUpdateIntent:
 
 
 @dataclass(frozen=True, slots=True)
+class PostgreSQLUpdateCommand:
+    """Exact approved update invocation, including preview and row bound."""
+
+    intent: PostgreSQLUpdateIntent
+    preview_fingerprint: str
+    max_affected_rows: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, PostgreSQLUpdateIntent):
+            raise TypeError("update command intent must be PostgreSQLUpdateIntent")
+        _require_sha256(self.preview_fingerprint, "preview_fingerprint")
+        if (
+            not isinstance(self.max_affected_rows, int)
+            or isinstance(self.max_affected_rows, bool)
+            or self.max_affected_rows != 1
+        ):
+            raise ValueError("max_affected_rows must be exactly one")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> PostgreSQLUpdateCommand:
+        if not isinstance(value, Mapping):
+            raise TypeError("PostgreSQL update command must be an object")
+        expected = {
+            "source_id",
+            "resource_id",
+            "match",
+            "assignments",
+            "preview_fingerprint",
+            "max_affected_rows",
+        }
+        if set(value) != expected:
+            raise ValueError(
+                "PostgreSQL update command requires the exact typed update, "
+                "preview_fingerprint, and max_affected_rows"
+            )
+        preview_fingerprint = value.get("preview_fingerprint")
+        max_affected_rows = value.get("max_affected_rows")
+        if not isinstance(preview_fingerprint, str):
+            raise TypeError("preview_fingerprint must be text")
+        return cls(
+            intent=PostgreSQLUpdateIntent.from_mapping(
+                {
+                    "source_id": value.get("source_id"),
+                    "resource_id": value.get("resource_id"),
+                    "match": value.get("match"),
+                    "assignments": value.get("assignments"),
+                }
+            ),
+            preview_fingerprint=preview_fingerprint,
+            max_affected_rows=max_affected_rows,  # type: ignore[arg-type]
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            **self.intent.to_payload(),
+            "preview_fingerprint": self.preview_fingerprint,
+            "max_affected_rows": self.max_affected_rows,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ValidatedPostgreSQLUpdate:
     """Catalog-bound, canonical one-row PostgreSQL update proposal."""
 
@@ -440,7 +501,12 @@ def render_postgresql_update_statement(
         f"{_postgresql_update_identifier(validated.schema_name)}."
         f"{_postgresql_update_identifier(validated.relation_name)} "
         f"SET {assignments} WHERE "
-        f"{_postgresql_update_identifier(primary_key.column)} = ${match_index}"
+        f"{_postgresql_update_identifier(primary_key.column)} = ${match_index} "
+        "RETURNING "
+        + ", ".join(
+            _postgresql_update_identifier(cell.column)
+            for cell in (primary_key, *validated.assignments)
+        )
     )
     shape = {
         "operation": "postgresql_update_one",
@@ -451,6 +517,10 @@ def render_postgresql_update_statement(
         "parameter_order": (
             *(cell.column for cell in validated.assignments),
             *(cell.column for cell in validated.match),
+        ),
+        "returning": (
+            primary_key.column,
+            *(cell.column for cell in validated.assignments),
         ),
     }
     return PostgreSQLUpdateStatement(
