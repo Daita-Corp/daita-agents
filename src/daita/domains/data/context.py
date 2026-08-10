@@ -53,8 +53,10 @@ from ...skills.capabilities import (
 )
 from .controller import (
     POSTGRESQL_QUERY_EVIDENCE_KIND,
+    POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
     SQLITE_QUERY_EVIDENCE_KIND,
 )
+from .capabilities import POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME
 from .export_capabilities import (
     ARTIFACT_CONVERT_TOOL_NAME,
     ARTIFACT_LIST_TOOL_NAME,
@@ -93,11 +95,16 @@ _CATALOG_EVIDENCE_KINDS = frozenset(
     }
 )
 _QUERY_EVIDENCE_KINDS = frozenset(
-    {SQLITE_QUERY_EVIDENCE_KIND, POSTGRESQL_QUERY_EVIDENCE_KIND}
+    {
+        SQLITE_QUERY_EVIDENCE_KIND,
+        POSTGRESQL_QUERY_EVIDENCE_KIND,
+        POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
+    }
 )
 _QUERY_TOOL_EVIDENCE_KINDS = {
     "data_query_sqlite": SQLITE_QUERY_EVIDENCE_KIND,
     "data_query_postgresql": POSTGRESQL_QUERY_EVIDENCE_KIND,
+    POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME: POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
 }
 _SIDE_EFFECT_EVIDENCE_KINDS = frozenset(
     {
@@ -842,6 +849,20 @@ def _project_historical_result(
                 "trust_classification",
             ),
         )
+    elif kind == POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND:
+        compact = _selected_result_fields(
+            data,
+            (
+                "source_id",
+                "source_revision",
+                "resource_id",
+                "resource_revision",
+                "resource_name",
+                "would_affect",
+                "warnings",
+                "trust_classification",
+            ),
+        )
     elif kind in _QUERY_EVIDENCE_KINDS:
         compact = _selected_result_fields(
             data,
@@ -1306,6 +1327,10 @@ def _request(
                     semantic_tools_available=any(
                         tool.name == "semantic_save" for tool in tools
                     ),
+                    postgresql_update_preview_available=any(
+                        tool.name == POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME
+                        for tool in tools
+                    ),
                     final=final,
                 )
             ),
@@ -1343,6 +1368,7 @@ def _system_prompt(
     artifact_tools_available: bool,
     artifact_default_tool_available: bool,
     semantic_tools_available: bool,
+    postgresql_update_preview_available: bool,
     final: bool,
 ) -> str:
     instructions = [
@@ -1421,6 +1447,16 @@ def _system_prompt(
             "and ask if evidence remains ambiguous."
         ),
     ]
+    if postgresql_update_preview_available:
+        instructions.append(
+            "PostgreSQL update preview is read-only evidence only. Use the typed "
+            "preview tool with exact current source/resource IDs, the complete "
+            "cataloged primary key, and literal assignments; never supply SQL, "
+            "identifiers not present in the catalog, or execution IDs. Report "
+            "would_affect and warnings, not that a change is guaranteed or applied. "
+            "A preview fingerprint is not approval or authority, and database "
+            "mutation remains unavailable in this release phase."
+        )
     if artifact_destinations:
         if artifact_tools_available:
             instructions.append(

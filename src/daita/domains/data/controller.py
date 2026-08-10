@@ -113,12 +113,20 @@ from .file_capabilities import (
     LOCAL_FILE_READ_CAPABILITY_ID,
     LOCAL_FILE_READ_EVIDENCE_KIND,
 )
-from .sql import ResourceSchema, validate_postgresql_read, validate_sqlite_read
+from .sql import (
+    PostgreSQLUpdateIntent,
+    ResourceSchema,
+    validate_postgresql_read,
+    validate_postgresql_update_intent,
+    validate_sqlite_read,
+)
 
 SQLITE_QUERY_CAPABILITY_ID = "data.sqlite.query"
 SQLITE_QUERY_EVIDENCE_KIND = "data.sqlite.query_result"
 POSTGRESQL_QUERY_CAPABILITY_ID = "data.postgresql.query"
 POSTGRESQL_QUERY_EVIDENCE_KIND = "data.postgresql.query_result"
+POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID = "data.postgresql.update_impact"
+POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND = "data.postgresql.update_impact"
 _MVP_CAPABILITIES = frozenset(
     {
         CATALOG_SEARCH_CAPABILITY_ID,
@@ -127,6 +135,7 @@ _MVP_CAPABILITIES = frozenset(
         CATALOG_TRAVERSE_CAPABILITY_ID,
         SQLITE_QUERY_CAPABILITY_ID,
         POSTGRESQL_QUERY_CAPABILITY_ID,
+        POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
         LOCAL_FILE_READ_CAPABILITY_ID,
         SKILL_VIEW_CAPABILITY_ID,
         SKILL_SAVE_CAPABILITY_ID,
@@ -1954,6 +1963,8 @@ class DataToolRuntime:
             POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         }:
             return await self._validate_sql(run, capability, arguments)
+        if capability.id == POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID:
+            return await self._validate_postgresql_update_preview(run, arguments)
         if capability.id in {
             LOCAL_FILE_READ_CAPABILITY_ID,
             LOCAL_FILE_COPY_CAPABILITY_ID,
@@ -1973,6 +1984,67 @@ class DataToolRuntime:
                     {"resource_id": resource_id, "source_id": source_id},
                 )
         return None
+
+    async def _validate_postgresql_update_preview(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+    ) -> tuple[str, str, Mapping[str, object]] | None:
+        source_id = arguments.get("source_id")
+        if not isinstance(source_id, str):
+            return (
+                "write_source_not_available",
+                "PostgreSQL update preview requires an exact current source.",
+                {},
+            )
+        adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
+        if adapter_id != "postgresql":
+            return (
+                "write_source_not_available",
+                "The selected source is not an active PostgreSQL source owned by this agent.",
+                {"source_id": source_id},
+            )
+        facts = await self._catalog.source_routing_facts(
+            run.agent_id,
+            ("write_access",),
+            (source_id,),
+        )
+        eligible = any(
+            fact.get("source_id") == source_id
+            and fact.get("adapter_id") == "postgresql"
+            and isinstance((flags := fact.get("configuration_flags")), Mapping)
+            and flags.get("write_access") is True
+            for fact in facts
+        )
+        if not eligible:
+            return (
+                "write_access_not_enabled",
+                "PostgreSQL update preview requires user-owned write_access enablement.",
+                {"source_id": source_id},
+            )
+        try:
+            intent = PostgreSQLUpdateIntent.from_mapping(arguments)
+        except (TypeError, ValueError):
+            return (
+                "write_assignment_invalid",
+                "The PostgreSQL update preview intent is malformed.",
+                {},
+            )
+        validation = validate_postgresql_update_intent(
+            intent,
+            resources=await self._catalog.resource_schemas(
+                run.agent_id,
+                source_id,
+            ),
+        )
+        if validation.valid:
+            return None
+        issue = validation.issues[0]
+        return (
+            issue.code,
+            issue.message,
+            {"source_id": source_id, "resource_id": intent.resource_id},
+        )
 
     async def _current_conversation_artifact_ref(
         self,
@@ -2041,6 +2113,8 @@ class DataToolRuntime:
             return semantic_scope_error
         resource_ids: tuple[object, ...] = ()
         if capability.id == CATALOG_INSPECT_CAPABILITY_ID:
+            resource_ids = (arguments.get("resource_id"),)
+        elif capability.id == POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID:
             resource_ids = (arguments.get("resource_id"),)
         elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
             value = arguments.get("resource_ids", ())
@@ -2484,6 +2558,8 @@ __all__ = [
     "DataToolRuntime",
     "POSTGRESQL_QUERY_CAPABILITY_ID",
     "POSTGRESQL_QUERY_EVIDENCE_KIND",
+    "POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID",
+    "POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND",
     "SQLITE_QUERY_CAPABILITY_ID",
     "SQLITE_QUERY_EVIDENCE_KIND",
 ]

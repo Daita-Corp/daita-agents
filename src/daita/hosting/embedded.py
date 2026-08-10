@@ -24,6 +24,7 @@ from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySour
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
 from ..adapters.postgresql_query import PostgreSQLQueryBackend
+from ..adapters.postgresql_write import PostgreSQLUpdatePreviewBackend
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.sqlite import SQLiteSource
 from ..adapters.sqlite_query import SQLiteQueryBackend
@@ -53,6 +54,7 @@ from ..domains.data import (
     artifact_capability_declarations,
     local_file_read_declarations,
     postgresql_query_declarations,
+    postgresql_update_preview_declarations,
     sqlite_query_declarations,
 )
 from ..domains.data.context import _project_completed_history
@@ -721,6 +723,15 @@ class EmbeddedAgent:
             identity.id,
             postgresql_backend,
         )
+        postgresql_preview_backend = PostgreSQLUpdatePreviewBackend(
+            store,
+            data_view,
+            secret_provider or keychain,
+        )
+        postgresql_preview = postgresql_update_preview_declarations(
+            identity.id,
+            postgresql_preview_backend,
+        )
         local_file_backend = LocalDirectoryReadBackend(store, store)
         local_files = local_file_read_declarations(identity.id, local_file_backend)
         mutation_lock = asyncio.Lock()
@@ -777,6 +788,7 @@ class EmbeddedAgent:
                 *catalog.capabilities,
                 *sqlite.capabilities,
                 *postgresql.capabilities,
+                *postgresql_preview.capabilities,
                 *local_files.capabilities,
                 *memory.capabilities,
                 *skills.capabilities,
@@ -787,6 +799,7 @@ class EmbeddedAgent:
                 *catalog.executors,
                 *sqlite.executors,
                 *postgresql.executors,
+                *postgresql_preview.executors,
                 *local_files.executors,
                 *memory.executors,
                 *skills.executors,
@@ -797,6 +810,7 @@ class EmbeddedAgent:
                 *catalog.tool_views,
                 *sqlite.tool_views,
                 *postgresql.tool_views,
+                *postgresql_preview.tool_views,
                 *local_files.tool_views,
                 *memory.tool_views,
                 *skills.tool_views,

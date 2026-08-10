@@ -475,35 +475,53 @@ async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branc
         await agent.close()
 
 
-async def test_database_write_phase_one_registers_and_projects_no_write_tool(tmp_path):
-    agent = await daita.Agent.create("database-write-phase-one", root=tmp_path)
+async def test_database_write_phase_two_registers_only_read_only_postgresql_preview(
+    tmp_path,
+):
+    agent = await daita.Agent.create("database-write-phase-two", root=tmp_path)
     try:
         registry = agent._embedded._capabilities
         capability_ids = {
             registry.resolve_tool(name)[1].id for name in registry.tool_names
         }
+        preview_tool = "data_preview_postgresql_update"
+        preview_capability = "data.postgresql.update_impact"
         forbidden_tools = {
-            "data_preview_postgresql_update",
             "data_update_postgresql",
             "data_preview_sqlite_update",
             "data_update_sqlite",
         }
         forbidden_capabilities = {
-            "data.postgresql.update_impact",
             "data.postgresql.update",
             "data.sqlite.update_impact",
             "data.sqlite.update",
         }
 
+        assert preview_tool in registry.tool_names
+        preview = registry.resolve_tool(preview_tool)[1]
+        assert preview.id == preview_capability
+        assert preview.access_mode is AccessMode.READ
+        assert preview.side_effecting is False
         assert forbidden_tools.isdisjoint(registry.tool_names)
         assert forbidden_capabilities.isdisjoint(capability_ids)
 
         controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
             encoding="utf-8"
         )
+        package_text = _python_text(PACKAGE)
         for dormant_name in forbidden_tools | forbidden_capabilities:
-            assert dormant_name not in controller
-        assert "postgresql_write" not in _python_text(PACKAGE)
+            assert f'"{dormant_name}"' not in package_text
+            assert f"'{dormant_name}'" not in package_text
+        assert "class PostgreSQLUpdateExecutor" not in package_text
+        write_backend = (PACKAGE / "adapters" / "postgresql_write.py").read_text(
+            encoding="utf-8"
+        )
+        assert "start_database_write_receipt" not in write_backend
+        assert "finish_database_write_receipt" not in write_backend
+        assert "database_write_receipts" not in write_backend
+        assert "SideEffectExecutor" not in write_backend
+        assert "DbRuntime" not in package_text
+        assert "RuntimeKernel" not in package_text
         assert "set_source_write_access" in _class_methods(
             PACKAGE / "agent.py", "Agent"
         )

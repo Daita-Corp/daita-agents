@@ -30,7 +30,6 @@ _DATABASE_PORT = "DAITA_FIXTURE_POSTGRES_PORT"
 _DEFAULT_MODEL_ID = "openai:gpt-5.6-terra"
 _FORBIDDEN_MODEL_TOOLS = frozenset(
     {
-        "data_preview_postgresql_update",
         "data_update_postgresql",
         "data_preview_sqlite_update",
         "data_update_sqlite",
