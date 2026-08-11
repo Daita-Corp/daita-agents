@@ -64,10 +64,10 @@ def test_customer_and_fixture_documentation_use_the_complete_pipx_install():
     assert "pipx upgrade daita-agents" in readme
     assert PIPX_REPAIR in readme
     assert "pipx uninstall daita-agents" in readme
-    assert "Local state has its own explicit format" in readme
-    assert "automatically migrates a" in readme
-    assert "supported older format" in readme
-    assert "No separate import, restore, or backup step" in readme
+    assert "Local state has its own immutable, checksummed migration journal" in readme
+    assert "automatically applies its known missing suffix" in readme
+    assert "supported journal prefix" in readme
+    assert "separate state command, import, restore, or backup step" in readme
     assert "leave the prior database unchanged" in readme
     assert "supported downgrade path" in readme
     assert "optional disaster recovery, not a compatibility mechanism" in readme
@@ -101,6 +101,7 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     )
 
     assert "python -m build" in smoke
+    assert "arguments.candidate_wheel is None" in smoke
     assert '"--no-isolation"' not in smoke
     assert "PIPX_HOME" in smoke
     assert "PIPX_BIN_DIR" in smoke
@@ -132,8 +133,15 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     assert "_home_hashes" in smoke
     assert "candidate_projection != baseline_projection" in smoke
     assert "_database_rows" in smoke
-    assert "STATE_FORMAT_VERSION" in smoke
+    assert "state_migrations" in smoke
+    assert "migration_rows" in smoke
+    assert "PRAGMA user_version" not in smoke
     assert '"artifact_create_document"' in smoke
+    assert '"artifact_save_local"' in smoke
+    assert "artifact_deliveries" in smoke
+    assert '"artifact_delivery"' in smoke
+    assert "DatabaseWriteReceipt.start" in smoke
+    assert '"receipt_id"' in smoke
     assert '"delivery-config.json"' in smoke
     assert '"Append after upgrade."' in smoke
     assert "pipx upgrade daita-agents" not in smoke
@@ -145,7 +153,9 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
 
     assert 'parser.add_argument("--baseline-wheel"' in managed
     assert "_database_rows" in managed
-    assert 'connection.execute("PRAGMA user_version")' in managed
+    assert "20260811_postgresql_write_admission" in managed
+    assert "state_migrations" in managed
+    assert "PRAGMA user_version" not in managed
     assert '"sources"' in managed
     assert "baseline_version == candidate_version" not in managed
 

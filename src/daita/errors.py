@@ -110,10 +110,11 @@ class AgentError(DaitaError):
 class StateCompatibilityCode(str, Enum):
     """Stable classification of local agent-home admission failures."""
 
-    NEWER_FORMAT = "state_format_newer"
-    LEGACY_FORMAT = "state_format_legacy"
+    NEWER_REVISION = "state_revision_newer"
+    LEGACY = "state_legacy"
     DAMAGED = "state_database_damaged"
-    MIGRATION_FAILED = "state_migration_failed"
+    REVISION_UNSUPPORTED = "state_revision_unsupported"
+    UPGRADE_FAILED = "state_upgrade_failed"
 
 
 class StateCompatibilityError(DaitaError):
@@ -125,29 +126,23 @@ class StateCompatibilityError(DaitaError):
         path: Path,
         message: str,
         *,
-        current_format: int,
-        found_format: int | None = None,
+        current_revision: str,
+        found_revision: str | None = None,
     ) -> None:
         if not isinstance(code, StateCompatibilityCode):
             raise TypeError("state compatibility code is invalid")
         if not isinstance(path, Path) or not path.is_absolute():
             raise ValueError("state compatibility path must be absolute")
-        if (
-            not isinstance(current_format, int)
-            or isinstance(current_format, bool)
-            or current_format < 1
+        if not isinstance(current_revision, str) or not current_revision.strip():
+            raise ValueError("current state revision must be non-empty text")
+        if found_revision is not None and (
+            not isinstance(found_revision, str) or not found_revision.strip()
         ):
-            raise ValueError("current state format must be a positive integer")
-        if found_format is not None and (
-            not isinstance(found_format, int)
-            or isinstance(found_format, bool)
-            or found_format < 0
-        ):
-            raise ValueError("found state format must be a non-negative integer")
+            raise ValueError("found state revision must be non-empty text")
         self.code = code
         self.path = path
-        self.found_format = found_format
-        self.current_format = current_format
+        self.found_revision = found_revision
+        self.current_revision = current_revision
         super().__init__(
             message,
             error_code=code.value,
@@ -159,8 +154,8 @@ class StateCompatibilityError(DaitaError):
             "code": self.code.value,
             "message": str(self),
             "state_path": str(self.path),
-            "found_format": self.found_format,
-            "current_format": self.current_format,
+            "found_revision": self.found_revision,
+            "current_revision": self.current_revision,
             "state_changed": False,
         }
 

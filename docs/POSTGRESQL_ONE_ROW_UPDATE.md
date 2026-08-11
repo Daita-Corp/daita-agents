@@ -44,9 +44,11 @@ automation should name an environment variable with `--password-env`; never
 place a password, connection URL containing a password, or administrator
 credential in command history, model text, source names, logs, or test output.
 
-Attachment always persists `write_access=false`. It cannot be combined with
-enablement. Rotating the secret changes the value behind the same approved
-secret reference; it does not broaden database grants or Daita admission.
+Attachment always begins with Daita admission disabled and cannot be combined
+with enablement. Admission is stored separately from connection configuration;
+the public registration's `write_access` field is a computed Boolean projection.
+Rotating the secret changes the value behind the same approved secret reference;
+it does not broaden database grants or Daita admission.
 
 ## Backup and recovery gate
 
@@ -78,9 +80,10 @@ if readiness.ready_for_preview:
     await agent.set_source_write_access(source_id, True)
 ```
 
-`set_source_write_access` changes only the persisted source-level Daita
-admission flag. It never changes PostgreSQL privileges. Always rerun readiness
-after enablement and before using a canary preview.
+`set_source_write_access` changes only the dedicated source-level Daita
+admission row. It never rewrites connection identity or changes PostgreSQL
+privileges. Refresh preserves that row; detachment deletes it atomically. Always
+rerun readiness after enablement and before using a canary preview.
 
 CLI:
 

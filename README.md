@@ -224,19 +224,21 @@ pipx reinstall daita-agents
 pipx uninstall daita-agents
 ```
 
-Local state has its own explicit format, independent of the package version.
-On the first normal launch after an upgrade, Daita automatically migrates a
-supported older format under the existing per-agent writer lock. The migration
-is one SQLite transaction: it validates the old schema and database health,
-applies the bounded format change, validates the target, and only then commits.
-No separate import, restore, or backup step is part of a routine upgrade.
+Local state has its own immutable, checksummed migration journal, independent
+of the package version. On the first normal launch after an upgrade, Daita
+validates the journal and automatically applies its known missing suffix under
+the existing per-agent writer lock. The upgrade is one SQLite transaction: it
+validates the exact source schema and database health, applies each bounded
+change, validates each target, stamps its checksum, and only then commits. No
+separate state command, import, restore, or backup step is part of a routine
+upgrade.
 
 The supported upgrade preserves agent identity, model configuration and secret
 references, settings, source registrations and current catalogs, the active
-source, complete conversations and results, artifacts, approved memory and user
-profile, skills, semantics, learning state, and database-write receipts. Secret
-values remain in their existing environment or OS keychain location and are
-never copied into the state database.
+source, PostgreSQL write admission, complete conversations and results,
+artifacts, approved memory and user profile, skills, semantics, learning state,
+and database-write receipts. Secret values remain in their existing environment
+or OS keychain location and are never copied into the state database.
 
 Before changing versions, an optional complete local backup can be made while
 Daita is closed:
@@ -250,13 +252,14 @@ contains agent homes but not secret values held by the OS keychain; those
 keychain entries remain installed and are referenced by the backed-up
 configuration.
 
-Current-format homes open without a schema write. A supported older format is
-migrated automatically. A newer format (an attempted package downgrade), a
-recognizable pre-1.0 home, and damaged or unexpected schema are reported as
-different errors in the CLI and terminal UI. Failed migrations roll back and
-leave the prior database unchanged. Install the same or a newer Daita release
-for a newer-format home; opening a migrated home with an older package is not a
-supported downgrade path. See the
+Current journaled homes open without a schema write. A supported journal prefix
+or exact historical preledger shape upgrades automatically. Unknown, reordered,
+gapped, or checksum-mismatched journals, newer state (an attempted package
+downgrade), recognizable pre-1.0 homes, and damaged or unexpected schemas are
+reported as distinct descriptive errors in the CLI and terminal UI. Failed
+upgrades roll back and leave the prior database unchanged. Install the same or
+a newer Daita release for newer state; opening an upgraded home with an older
+package is not a supported downgrade path. See the
 [local state upgrade contract](docs/LOCAL_STATE_UPGRADES.md) for diagnostics
 and the release certification procedure.
 

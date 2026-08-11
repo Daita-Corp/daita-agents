@@ -22,7 +22,7 @@ pass the immediately preceding wheel and the candidate wheel:
 The two-wheel procedure installs an actual prior build, creates real agent
 state, then force-installs the candidate into the same isolated pipx
 environment and opens the prior-build state with it. The wheels may have the
-same package version when certifying a state-format change made during release
+same package version when certifying a durable state revision made during release
 development; they must still be distinct artifacts. Pip may read a configured
 package index to resolve declared dependencies; the procedure never changes an
 index or uploads an artifact.
@@ -151,7 +151,7 @@ def main() -> int:
     pipx = shutil.which("pipx")
     if pipx is None:
         raise RuntimeError("pipx is required to run the isolated release smoke")
-    if importlib.util.find_spec("build") is None:
+    if arguments.candidate_wheel is None and importlib.util.find_spec("build") is None:
         raise RuntimeError("the development environment is missing the build package")
 
     with tempfile.TemporaryDirectory(prefix="daita-pipx-smoke-") as temporary:
@@ -290,7 +290,8 @@ assert len(content) > 0
         )
         seed_state = """
 import asyncio
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -307,6 +308,7 @@ from daita import (
     SemanticSubject,
     SQLiteSource,
 )
+from daita.adapters.models import SourceRegistration
 from daita.learning_candidates import (
     DocumentCandidateContent,
     LearningCandidate,
@@ -322,6 +324,19 @@ from daita.llm.models import (
     ToolCall,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.storage.sqlite import DatabaseWriteOutcome, DatabaseWriteReceipt
+
+
+def ids():
+    counts = defaultdict(int)
+
+    def create(prefix):
+        counts[prefix] += 1
+        if prefix in {"run", "conversation", "artifact", "destination"}:
+            return f"{prefix}-{counts[prefix]:032x}"
+        return f"{prefix}-{counts[prefix]}"
+
+    return create
 
 
 async def main():
@@ -353,6 +368,21 @@ async def main():
                     ),
                 ),
             ),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="upgrade-artifact-save",
+                        name="artifact_save_local",
+                        arguments={
+                            "artifact_id": (
+                                "artifact-00000000000000000000000000000001"
+                            ),
+                            "destination_id": "default",
+                        },
+                    ),
+                ),
+            ),
             ModelResponse(finish_reason=FinishReason.STOP, text="Baseline answer."),
         ),
         provider_id="mock:upgrade-baseline",
@@ -368,12 +398,33 @@ async def main():
         root=root,
         model=provider,
         model_profile=profile,
+        id_factory=ids(),
     )
     registration = await agent.attach(
         SQLiteSource(source_path, name="Upgrade source")
     )
-    run = await agent.run("Remember the baseline upgrade run.")
+    postgresql_registration = SourceRegistration.build(
+        agent_id=agent.id,
+        adapter_id="postgresql",
+        native_identity="postgresql:upgrade-warehouse",
+        display_name="Upgrade warehouse",
+        configuration={
+            "credential_ref": "env:DAITA_UPGRADE_TEST_PASSWORD",
+            "database": "warehouse",
+            "host": "db.example.test",
+            "port": 5432,
+            "schemas": ("public",),
+            "ssl_mode": "require",
+            "username": "reader",
+            "write_access": False,
+        },
+        attached_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+    )
+    await agent._embedded._store.register_source(postgresql_registration)
+    await agent.set_source_write_access(postgresql_registration.id, True)
     export_destination = await agent.set_export_destination(export_directory)
+    run = await agent.run("Remember the baseline upgrade run.")
+    assert len(run.artifact_deliveries) == 1
     await agent.set_memory("Fiscal year begins in February.\\n")
     await agent.set_user_profile("Prefer concise upgrade reports.\\n")
     await agent.save_skill(
@@ -383,6 +434,24 @@ async def main():
     )
     resource = (await agent.list_catalog_resources())[0]
     transcript = await agent.transcript(run.run_id)
+    receipt = DatabaseWriteReceipt.start(
+        agent_id=agent.id,
+        run_id=run.run_id,
+        call_id="upgrade-receipt-call",
+        capability_id="data.postgresql.update",
+        source_id=postgresql_registration.id,
+        resource_id=resource.id,
+        intent_sha256="sha256:" + "6" * 64,
+        preview_fingerprint="sha256:" + "7" * 64,
+        started_at=transcript.run.created_at,
+    ).finish(
+        DatabaseWriteOutcome.COMMITTED,
+        completed_at=transcript.run.created_at + timedelta(seconds=1),
+        affected_rows=1,
+        normalized_error_code=None,
+    )
+    await agent._embedded._store.start_database_write_receipt(receipt.as_started())
+    await agent._embedded._store.finish_database_write_receipt(receipt)
     annotation = SemanticAnnotation(
         id="upgrade-booked-at",
         agent_id=agent.id,
@@ -443,8 +512,10 @@ async def main():
         "conversation_id": run.conversation_id,
         "export_destination_id": export_destination.destination_id,
         "resource_id": resource.id,
+        "receipt_id": receipt.receipt_id,
         "run_id": run.run_id,
         "source_id": registration.id,
+        "write_admission_source_id": postgresql_registration.id,
     }
     await agent.close()
 
@@ -504,10 +575,14 @@ asyncio.run(main())
             preserved_home / "USER.md",
             preserved_home / "artifacts" / "delivery-config.json",
             preserved_home / "skills" / "upgrade-check" / "SKILL.md",
+            separate_agent_home / "upgrade-exports" / "upgrade-notes.txt",
         )
         if not all(path.is_file() for path in preserved_paths):
             raise AssertionError("installed daita did not create a real agent home")
         preserved_hashes = _home_hashes(preserved_home)
+        preserved_export_hash = _sha256(
+            separate_agent_home / "upgrade-exports" / "upgrade-notes.txt"
+        )
         preserved_database_rows = _database_rows(preserved_home / "state.db")
         inspect_state = """
 import asyncio
@@ -534,11 +609,30 @@ async def main():
     active = await agent.active_source()
     artifact = await agent.read_artifact(expected["artifact_id"])
     export_destination = await agent.export_destination()
+    receipt = await agent._embedded._store.load_database_write_receipt(
+        agent.id,
+        expected["receipt_id"],
+    )
+    assert receipt is not None
+    assert runs[0].result is not None
+    assert len(runs[0].result.artifact_deliveries) == 1
+    delivery = runs[0].result.artifact_deliveries[0]
     projection = {
         "active_source_id": None if active is None else active.id,
         "agent_id": agent.id,
         "artifact_content": artifact.content.decode("utf-8"),
         "artifact_id": artifact.ref.artifact_id,
+        "artifact_delivery": {
+            "artifact_id": delivery.artifact_id,
+            "byte_size": delivery.byte_size,
+            "content": Path(delivery.saved_path).read_text(encoding="utf-8"),
+            "delivered_at": delivery.delivered_at.isoformat(),
+            "destination_id": delivery.destination_id,
+            "filename": delivery.filename,
+            "renamed_for_collision": delivery.renamed_for_collision,
+            "saved_path": delivery.saved_path,
+            "sha256": delivery.sha256,
+        },
         "candidate_ids": [item.candidate.id for item in candidates],
         "catalog_relationship_count": summary.relationship_count,
         "catalog_resource_count": summary.resource_count,
@@ -546,6 +640,18 @@ async def main():
         "export_destination_id": export_destination.destination_id,
         "memory": await agent.read_memory(),
         "model_provider_id": agent.model_route.candidates[0].provider_id,
+        "receipt": {
+            "affected_rows": receipt.affected_rows,
+            "call_id": receipt.call_id,
+            "capability_id": receipt.capability_id,
+            "completed_at": receipt.completed_at.isoformat(),
+            "id": receipt.receipt_id,
+            "outcome": receipt.outcome.value,
+            "resource_id": receipt.resource_id,
+            "run_id": receipt.run_id,
+            "source_id": receipt.source_id,
+            "started_at": receipt.started_at.isoformat(),
+        },
         "run_answer": transcript.run.message,
         "run_result": runs[0].result.final_text,
         "semantic_ids": [item.annotation.id for item in semantics],
@@ -555,6 +661,25 @@ async def main():
             "name": skill.name,
         },
         "source_ids": [item.id for item in sources],
+        "source_registrations": [
+            {
+                "adapter_id": item.adapter_id,
+                "attached_at": item.attached_at.isoformat(),
+                "configuration": dict(item.configuration),
+                "detached_at": (
+                    None if item.detached_at is None else item.detached_at.isoformat()
+                ),
+                "display_name": item.display_name,
+                "id": item.id,
+                "native_identity": item.native_identity,
+            }
+            for item in sources
+        ],
+        "write_access_by_source": {
+            item.id: item.configuration.get("write_access")
+            for item in sources
+            if item.adapter_id == "postgresql"
+        },
         "user": await agent.read_user_profile(),
     }
     await agent.close()
@@ -664,6 +789,8 @@ assert any(item.startswith("XlsxWriter") for item in requirements)
             raise AssertionError(
                 "package replacement mutated agent state before candidate open"
             )
+        if _sha256(preserved_paths[-1]) != preserved_export_hash:
+            raise AssertionError("package replacement mutated the delivered artifact")
         _run(
             [
                 str(command),
@@ -708,33 +835,41 @@ assert any(item.startswith("XlsxWriter") for item in requirements)
             raise AssertionError(
                 "candidate open changed agent state outside the migrated database"
             )
+        if _sha256(preserved_paths[-1]) != preserved_export_hash:
+            raise AssertionError("candidate open changed the delivered artifact")
         migrated_database_rows = _database_rows(preserved_home / "state.db")
         if any(
             migrated_database_rows.get(table) != rows
             for table, rows in preserved_database_rows.items()
+            if table != "sources"
         ):
             raise AssertionError(
                 "candidate migration changed rows owned by the baseline format"
             )
-        state_format_check = """
+        migration_journal_check = """
 import sqlite3
 import sys
 from pathlib import Path
 
-from daita.storage.sqlite import STATE_FORMAT_VERSION
+from daita.storage.sqlite_migrations import migration_rows
 
 
 path = Path(sys.argv[1]) / "agents" / "preservation-agent" / "state.db"
 with sqlite3.connect(path) as connection:
-    state_format = connection.execute("PRAGMA user_version").fetchone()[0]
-assert state_format == STATE_FORMAT_VERSION
+    journal = tuple(
+        connection.execute(
+            "SELECT ordinal, migration_id, checksum "
+            "FROM state_migrations ORDER BY ordinal"
+        )
+    )
+assert journal == migration_rows()
 """
         _run(
             [
                 str(installed_python),
                 "-I",
                 "-c",
-                state_format_check,
+                migration_journal_check,
                 str(separate_agent_home),
             ],
             cwd=outside_checkout,
@@ -807,6 +942,8 @@ asyncio.run(main())
             raise AssertionError("pipx uninstall removed Daita-created agent state")
         if _home_hashes(preserved_home) != preserved_hashes:
             raise AssertionError("pipx uninstall changed Daita-created agent state")
+        if _sha256(preserved_paths[-1]) != preserved_export_hash:
+            raise AssertionError("pipx uninstall changed the delivered artifact")
 
         print(f"baseline wheel: {baseline_wheel.name}")
         print(f"candidate wheel: {candidate_wheel.name}")

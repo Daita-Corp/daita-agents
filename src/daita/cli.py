@@ -1646,11 +1646,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(str(error), file=sys.stderr)
             print(file=sys.stderr)
             print(f"State: {error.path}", file=sys.stderr)
-            print(
-                f"Format: {error.found_format if error.found_format is not None else 'unknown'} "
-                f"(this release: {error.current_format})",
-                file=sys.stderr,
-            )
+            print("Local data changed: no", file=sys.stderr)
         else:
             print(
                 json.dumps({"error": error.to_mapping()}, sort_keys=True),

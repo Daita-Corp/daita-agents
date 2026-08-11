@@ -32,8 +32,8 @@ Use this order of authority:
 
 ## What the product is
 
-The product is a persistent, read-only data agent built around one direct
-loop:
+The product is a persistent, read-first data agent with one narrowly bounded,
+explicitly enabled PostgreSQL one-row update, built around one direct loop:
 
 ```text
 user message -> model -> zero or more tool calls -> ordered tool results
@@ -65,7 +65,10 @@ src/daita/
   domains/data/        # context building, tool runtime, SQL validation
   catalog/             # normalized current source/resource truth
   adapters/            # bounded source admission, discovery, and read I/O
-  storage/sqlite.py    # minimal durable identity/catalog/transcript store
+  storage/sqlite.py    # sole durable state operation/admission boundary
+  storage/sqlite_schema.py     # exact current and supported historical schemas
+  storage/sqlite_codecs/       # explicit persisted-record family codecs
+  storage/sqlite_migrations/   # immutable journal, baseline, and preledger bridge
   security/            # secret references and lazy secret resolution
   config.py            # immutable runtime/model configuration records
   cli.py               # thin local CLI over the public embedded API
@@ -150,11 +153,14 @@ Do not let `AgentLoop`, `Agent`, a tool view, or model-authored text call source
 clients or executors directly. Do not infer capability behavior from tool-name
 strings when stable capability metadata owns it.
 
-All currently projected data capabilities are non-side-effecting reads.
-Arbitrary SQL mutation and external data writes are outside the MVP. A new data
-write requires an explicit design for validation, authorization,
-transactionality, idempotency, uncertain outcomes, and recovery; approval
-alone is not such a design.
+All currently projected data capabilities are non-side-effecting reads except
+the explicitly enabled PostgreSQL one-row update. That bounded write retains
+its resource-scoped readiness, current admission rechecks, preview fingerprint,
+exact once-only approval, one-row limit, and immutable receipt path. Arbitrary
+SQL mutation and every other external data write are outside the MVP. A new
+data write beyond this exact exception requires an explicit design for
+validation, authorization, transactionality, idempotency, uncertain outcomes,
+and recovery; approval alone is not such a design.
 
 Artifact continuity is model-led through the existing capability/runtime path.
 `artifact_list` exposes only bounded safe metadata for the current conversation;
@@ -184,12 +190,23 @@ apply at execution. Do not duplicate either system in a generic policy layer.
 ### Persistence
 
 `daita.storage.sqlite.SQLiteStateStore` persists only state used by the MVP:
-identity, sources, current catalog snapshots, run transcripts, and terminal
-results. It also owns the explicit local state-format marker and the finite,
-release-supported migrations needed to open the immediately preceding format.
-Migrations run atomically under the existing agent-home writer boundary and
-validate their source and target schemas; do not create a generic migration
-framework or move this ownership into hosting, the loop, or a new runtime.
+identity, sources, current catalog snapshots, run transcripts and terminal
+results, semantic annotations, learning review state, immutable database-write
+receipts, and PostgreSQL write admission. It is the sole owner of the immutable
+checksummed `state_migrations` journal, explicit persisted-record codecs, exact
+current/historical schemas, and the bounded preledger bridge. Migrations run
+atomically under the existing agent-home writer boundary and validate their
+source and target schemas. Put each durable change in one owner-local migration
+file; never edit an existing ID/checksum or create migration ownership in
+hosting, the loop, or a new runtime. The isolated preledger unit is the only
+code allowed to read the historical numeric marker, and only until its
+documented minimum-release removal gate is met.
+
+PostgreSQL write admission is owned only by
+`postgresql_write_admissions`, never by source connection JSON. Public source
+registrations expose `write_access` as a computed compatibility projection;
+connection reconstruction remains fail-closed, refresh preserves admission,
+and detach revokes it atomically.
 
 State mutation must remain atomic and cancellation-safe. Preserve the single
 agent-home writer boundary. Do not add event sourcing, replay projections,
@@ -397,7 +414,10 @@ specific agent loop.
 | `src/daita/domains/data/controller.py` | tool projection and execution boundary |
 | `src/daita/domains/data/sql.py` | catalog-scoped SQL validation |
 | `src/daita/catalog/service.py` | normalized catalog lifecycle |
-| `src/daita/storage/sqlite.py` | minimal durable candidate state |
+| `src/daita/storage/sqlite.py` | sole durable state operation/admission boundary |
+| `src/daita/storage/sqlite_schema.py` | exact physical schemas and validators |
+| `src/daita/storage/sqlite_codecs/` | explicit durable record-family codecs |
+| `src/daita/storage/sqlite_migrations/` | checksummed journal, baseline, and bounded bridge |
 | `src/daita/llm/routing.py` | normalized model retry/fallback ownership |
 | `tests/test_architecture.py` | prohibited-system and public-surface checks |
 

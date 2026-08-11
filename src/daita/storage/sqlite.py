@@ -8,28 +8,21 @@ minimal receipt needed to classify an external database-write attempt.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import sqlite3
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timezone
-from decimal import Decimal
-from enum import Enum
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TypeVar
 
-from .._json import FrozenJsonObject, canonical_json
+from .._json import FrozenJsonObject
 from ..adapters.models import SourceRegistration
 from ..artifacts.models import (
-    ArtifactAuthorship,
-    ArtifactDeliveryReceipt,
-    ArtifactProvenance,
     ArtifactRef,
-    ArtifactResourceBinding,
     artifact_ref_from_mapping,
 )
 from ..catalog.models import (
@@ -40,14 +33,7 @@ from ..catalog.models import (
     CatalogSnapshotRef,
     CatalogSummary,
     CatalogSync,
-    CatalogSyncStatus,
-    FacetKind,
-    RelationshipDirection,
-    RelationshipFieldPair,
     RelationshipKind,
-    RelationshipProvenance,
-    ResourceKind,
-    Sensitivity,
     SourceCatalogSnapshot,
 )
 from ..catalog.protocols import CatalogStoreError
@@ -57,428 +43,85 @@ from ..learning_candidates import (
     LEARNING_CANDIDATE_MAX_RECORDS,
     LEARNING_REVIEW_MAX_PROPOSALS,
     LEARNING_REVIEW_MAX_STAMPS,
-    DocumentCandidateContent,
     LearningCandidate,
-    LearningCandidateAction,
     LearningCandidateError,
     LearningCandidateNotFoundError,
     LearningCandidateRejectionReason,
     LearningCandidateReviewStamp,
-    LearningCandidateRunReference,
     LearningCandidateStatus,
-    LearningCandidateTarget,
     LearningReviewRunTail,
-    SemanticCandidateContent,
-    SkillCandidateContent,
 )
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
-    ModelUsage,
-    TextBlock,
-    ToolCall,
     ToolResultBlock,
-)
-from ..llm.pricing import (
-    CostBasis,
-    CostComponent,
-    CostEstimate,
-    CostEstimateStatus,
-    PricingModifier,
-    PricingUsageRange,
 )
 from ..loop.models import ConversationRun, LoopExit, LoopExitKind, RunInput, Transcript
 from ..semantics import (
     SEMANTIC_MAX_ANNOTATIONS,
-    ResourceRevisionBinding,
     SemanticAnnotation,
     SemanticDigestMismatchError,
-    SemanticEvidence,
-    SemanticEvidenceKind,
-    SemanticFieldReference,
-    SemanticKind,
     SemanticNotFoundError,
-    SemanticSubject,
     SemanticValidationError,
     semantic_annotation_sha256,
 )
+from .sqlite_codecs import (
+    decode_catalog_snapshot,
+    decode_catalog_sync,
+    decode_identifier,
+    decode_identity,
+    decode_learning_candidate,
+    decode_loop_exit,
+    decode_message,
+    decode_receipt,
+    decode_review_stamps,
+    decode_run_input,
+    decode_semantic_annotation,
+    decode_source,
+    encode_catalog_snapshot,
+    encode_catalog_sync,
+    encode_identifier,
+    encode_identity,
+    encode_learning_candidate,
+    encode_loop_exit,
+    encode_message,
+    encode_receipt,
+    encode_review_stamps,
+    encode_run_input,
+    encode_semantic_annotation,
+    encode_source,
+    persisted_source,
+    project_source_admission,
+)
+from .sqlite_migrations import (
+    CURRENT_REVISION,
+    MIGRATIONS,
+    MigrationJournalError,
+    MigrationJournalNewerError,
+    PreledgerAdmissionError,
+    PreledgerLegacyError,
+    PreledgerNewerError,
+    bridge as bridge_preledger,
+    create_current,
+    identify as identify_preledger,
+    inspect_journal,
+    upgrade_journaled,
+)
+from .sqlite_records import (
+    DatabaseWriteOutcome,
+    DatabaseWriteReceipt,
+    DatabaseWriteReceiptConflictError,
+    database_write_aware as _database_write_aware,
+    database_write_receipt_id,
+    database_write_text as _database_write_text,
+    validate_database_write_receipt_id,
+)
+from .sqlite_schema import CURRENT_TABLES, require_healthy, require_schema, table_names
 
 _CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH = 64
 _ACTIVE_SOURCE_KEY_PREFIX = "active_source:"
 _LEARNING_REVIEW_STAMPS_KEY_PREFIX = "learning_review_stamps:"
 _T = TypeVar("_T")
-_DATABASE_WRITE_RECEIPT_ID = re.compile(r"database-write-receipt:sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_ERROR_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z")
-
-
-class DatabaseWriteOutcome(str, Enum):
-    STARTED = "started"
-    COMMITTED = "committed"
-    NOT_COMMITTED = "not_committed"
-    OUTCOME_UNKNOWN = "outcome_unknown"
-
-
-class DatabaseWriteReceiptConflictError(RuntimeError):
-    """The durable receipt identity or immutable terminal state conflicts."""
-
-
-def _database_write_text(value: str, name: str, *, maximum: int = 512) -> str:
-    if not isinstance(value, str) or not value or value != value.strip():
-        raise ValueError(f"{name} must be non-empty text without surrounding space")
-    if len(value) > maximum:
-        raise ValueError(f"{name} exceeds {maximum} characters")
-    return value
-
-
-def _database_write_aware(value: datetime, name: str) -> datetime:
-    if (
-        not isinstance(value, datetime)
-        or value.tzinfo is None
-        or value.utcoffset() is None
-    ):
-        raise ValueError(f"{name} must be timezone-aware")
-    return value
-
-
-def database_write_receipt_id(
-    *,
-    agent_id: str,
-    run_id: str,
-    call_id: str,
-    capability_id: str,
-    intent_sha256: str,
-) -> str:
-    identity = {
-        "agent_id": _database_write_text(agent_id, "receipt agent_id"),
-        "call_id": _database_write_text(call_id, "receipt call_id"),
-        "capability_id": _database_write_text(
-            capability_id, "receipt capability_id", maximum=128
-        ),
-        "intent_sha256": intent_sha256,
-        "run_id": _database_write_text(run_id, "receipt run_id"),
-    }
-    if (
-        not isinstance(intent_sha256, str)
-        or _DATABASE_WRITE_HASH.fullmatch(intent_sha256) is None
-    ):
-        raise ValueError("receipt intent_sha256 must be a sha256 hash")
-    digest = sha256(canonical_json(identity).encode("utf-8")).hexdigest()
-    return f"database-write-receipt:sha256:{digest}"
-
-
-@dataclass(frozen=True, slots=True)
-class DatabaseWriteReceipt:
-    """Bounded durable metadata for one exact external database-write attempt."""
-
-    receipt_id: str
-    agent_id: str
-    run_id: str
-    call_id: str
-    capability_id: str
-    source_id: str
-    resource_id: str
-    intent_sha256: str
-    preview_fingerprint: str
-    outcome: DatabaseWriteOutcome
-    affected_rows: int | None
-    normalized_error_code: str | None
-    started_at: datetime
-    completed_at: datetime | None
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.receipt_id, str)
-            or _DATABASE_WRITE_RECEIPT_ID.fullmatch(self.receipt_id) is None
-        ):
-            raise ValueError("receipt_id must be a canonical database-write receipt id")
-        _database_write_text(self.agent_id, "receipt agent_id")
-        _database_write_text(self.run_id, "receipt run_id")
-        _database_write_text(self.call_id, "receipt call_id")
-        _database_write_text(self.capability_id, "receipt capability_id", maximum=128)
-        if (
-            not isinstance(self.source_id, str)
-            or _DATABASE_WRITE_SOURCE_ID.fullmatch(self.source_id) is None
-        ):
-            raise ValueError("receipt source_id must be a canonical source id")
-        if (
-            not isinstance(self.resource_id, str)
-            or _DATABASE_WRITE_RESOURCE_ID.fullmatch(self.resource_id) is None
-        ):
-            raise ValueError("receipt resource_id must be a canonical resource id")
-        for value, name in (
-            (self.intent_sha256, "intent_sha256"),
-            (self.preview_fingerprint, "preview_fingerprint"),
-        ):
-            if (
-                not isinstance(value, str)
-                or _DATABASE_WRITE_HASH.fullmatch(value) is None
-            ):
-                raise ValueError(f"receipt {name} must be a sha256 hash")
-        if not isinstance(self.outcome, DatabaseWriteOutcome):
-            raise TypeError("receipt outcome must be a DatabaseWriteOutcome")
-        _database_write_aware(self.started_at, "receipt started_at")
-        if self.completed_at is not None:
-            _database_write_aware(self.completed_at, "receipt completed_at")
-            if self.completed_at < self.started_at:
-                raise ValueError("receipt cannot complete before it starts")
-        expected_id = database_write_receipt_id(
-            agent_id=self.agent_id,
-            run_id=self.run_id,
-            call_id=self.call_id,
-            capability_id=self.capability_id,
-            intent_sha256=self.intent_sha256,
-        )
-        if self.receipt_id != expected_id:
-            raise ValueError("receipt_id does not match its execution identity")
-        if self.normalized_error_code is not None and (
-            not isinstance(self.normalized_error_code, str)
-            or _DATABASE_WRITE_ERROR_CODE.fullmatch(self.normalized_error_code) is None
-        ):
-            raise ValueError("receipt normalized_error_code is invalid")
-        if self.affected_rows is not None and (
-            not isinstance(self.affected_rows, int)
-            or isinstance(self.affected_rows, bool)
-        ):
-            raise TypeError("receipt affected_rows must be an integer or None")
-        if self.outcome is DatabaseWriteOutcome.STARTED:
-            if any(
-                value is not None
-                for value in (
-                    self.affected_rows,
-                    self.normalized_error_code,
-                    self.completed_at,
-                )
-            ):
-                raise ValueError("started receipt cannot contain terminal fields")
-        elif self.outcome is DatabaseWriteOutcome.COMMITTED:
-            if (
-                self.affected_rows != 1
-                or self.normalized_error_code is not None
-                or self.completed_at is None
-            ):
-                raise ValueError("committed receipt must record one affected row")
-        elif self.outcome is DatabaseWriteOutcome.NOT_COMMITTED:
-            if (
-                self.affected_rows != 0
-                or self.normalized_error_code is None
-                or self.completed_at is None
-            ):
-                raise ValueError(
-                    "not_committed receipt must record zero rows and an error code"
-                )
-        elif (
-            self.affected_rows is not None
-            or self.normalized_error_code != "write_outcome_unknown"
-            or self.completed_at is None
-        ):
-            raise ValueError(
-                "outcome_unknown receipt must omit affected rows and use its stable code"
-            )
-
-    @classmethod
-    def start(
-        cls,
-        *,
-        agent_id: str,
-        run_id: str,
-        call_id: str,
-        capability_id: str,
-        source_id: str,
-        resource_id: str,
-        intent_sha256: str,
-        preview_fingerprint: str,
-        started_at: datetime,
-    ) -> DatabaseWriteReceipt:
-        return cls(
-            receipt_id=database_write_receipt_id(
-                agent_id=agent_id,
-                run_id=run_id,
-                call_id=call_id,
-                capability_id=capability_id,
-                intent_sha256=intent_sha256,
-            ),
-            agent_id=agent_id,
-            run_id=run_id,
-            call_id=call_id,
-            capability_id=capability_id,
-            source_id=source_id,
-            resource_id=resource_id,
-            intent_sha256=intent_sha256,
-            preview_fingerprint=preview_fingerprint,
-            outcome=DatabaseWriteOutcome.STARTED,
-            affected_rows=None,
-            normalized_error_code=None,
-            started_at=started_at,
-            completed_at=None,
-        )
-
-    def finish(
-        self,
-        outcome: DatabaseWriteOutcome,
-        *,
-        completed_at: datetime,
-        affected_rows: int | None,
-        normalized_error_code: str | None,
-    ) -> DatabaseWriteReceipt:
-        if self.outcome is not DatabaseWriteOutcome.STARTED:
-            raise ValueError("only a started receipt can reach a terminal outcome")
-        if outcome is DatabaseWriteOutcome.STARTED:
-            raise ValueError("receipt terminal outcome cannot be started")
-        return replace(
-            self,
-            outcome=outcome,
-            affected_rows=affected_rows,
-            normalized_error_code=normalized_error_code,
-            completed_at=completed_at,
-        )
-
-    def as_started(self) -> DatabaseWriteReceipt:
-        return replace(
-            self,
-            outcome=DatabaseWriteOutcome.STARTED,
-            affected_rows=None,
-            normalized_error_code=None,
-            completed_at=None,
-        )
-
-
-STATE_FORMAT_VERSION = 3
-_UNVERSIONED_STATE_FORMAT = 0
-_LEGACY_TABLE_MARKERS = frozenset(
-    {
-        "evidence",
-        "events",
-        "operations",
-        "tasks",
-    }
-)
-
-_INITIAL_STATE_TABLE_DEFINITIONS = {
-    "learning_candidates": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "messages": (
-        ("run_id", "TEXT", 1, None, 1),
-        ("position", "INTEGER", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "metadata": (
-        ("key", "TEXT", 0, None, 1),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "runs": (
-        ("id", "TEXT", 0, None, 1),
-        ("agent_id", "TEXT", 1, None, 0),
-        ("conversation_id", "TEXT", 1, None, 0),
-        ("turn_index", "INTEGER", 1, None, 0),
-        ("input", "TEXT", 1, None, 0),
-        ("result", "TEXT", 0, None, 0),
-    ),
-    "semantic_annotations": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "snapshots": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("source_id", "TEXT", 1, None, 2),
-        ("sync_id", "TEXT", 1, None, 0),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "sources": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "syncs": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("source_id", "TEXT", 1, None, 0),
-        ("data", "TEXT", 1, None, 0),
-    ),
-}
-_RECEIPT_STATE_TABLE_DEFINITIONS = {
-    "database_write_receipts": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("run_id", "TEXT", 1, None, 0),
-        ("call_id", "TEXT", 1, None, 0),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "learning_candidates": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "messages": (
-        ("run_id", "TEXT", 1, None, 1),
-        ("position", "INTEGER", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "metadata": (
-        ("key", "TEXT", 0, None, 1),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "runs": (
-        ("id", "TEXT", 0, None, 1),
-        ("agent_id", "TEXT", 1, None, 0),
-        ("conversation_id", "TEXT", 1, None, 0),
-        ("turn_index", "INTEGER", 1, None, 0),
-        ("input", "TEXT", 1, None, 0),
-        ("result", "TEXT", 0, None, 0),
-    ),
-    "semantic_annotations": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "snapshots": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("source_id", "TEXT", 1, None, 2),
-        ("sync_id", "TEXT", 1, None, 0),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "sources": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "syncs": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("source_id", "TEXT", 1, None, 0),
-        ("data", "TEXT", 1, None, 0),
-    ),
-}
-_CURRENT_STATE_TABLE_DEFINITIONS = _RECEIPT_STATE_TABLE_DEFINITIONS
-_MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
-_NAMED_INDEXES = {
-    "runs_conversation_turn": (
-        "runs",
-        True,
-        ("agent_id", "conversation_id", "turn_index"),
-    )
-}
-
-_StateSchema = Mapping[str, tuple[tuple[object, ...], ...]]
-
-
-@dataclass(frozen=True, slots=True)
-class _StateMigration:
-    target_format: int
-    source_schema: _StateSchema
-    target_schema: _StateSchema
-    apply: Callable[[sqlite3.Connection], None]
-    validate_target: Callable[[sqlite3.Connection], None] | None = None
-
-    def __post_init__(self) -> None:
-        if self.target_format <= 0:
-            raise ValueError("migration target format must be positive")
 
 
 def _active_source_key(agent_id: str) -> str:
@@ -487,6 +130,15 @@ def _active_source_key(agent_id: str) -> str:
 
 def _learning_review_stamps_key(agent_id: str) -> str:
     return f"{_LEARNING_REVIEW_STAMPS_KEY_PREFIX}{agent_id}"
+
+
+def _decode_source_projection(
+    data: str,
+    admitted: object,
+) -> SourceRegistration:
+    if admitted not in (0, 1):
+        raise ValueError("stored PostgreSQL write admission projection is invalid")
+    return project_source_admission(decode_source(data), bool(admitted))
 
 
 class _CatalogCommitGate:
@@ -518,7 +170,9 @@ class _CatalogCommitGate:
 
 
 class SQLiteStateStore:
-    """Versioned persistence boundary for one admitted local agent home."""
+    """Sole persistence and upgrade boundary for one admitted agent home."""
+
+    current_revision = CURRENT_REVISION
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -565,7 +219,7 @@ class SQLiteStateStore:
                     "SELECT data FROM metadata WHERE key = 'identity'"
                 ).fetchone()
                 if row is not None:
-                    current = _expect(_loads(row[0]), AgentIdentity)
+                    current = decode_identity(row[0])
                     if current != identity:
                         raise AgentIdentityConflictError(
                             "state database already belongs to another agent"
@@ -573,7 +227,7 @@ class SQLiteStateStore:
                     return current
                 connection.execute(
                     "INSERT INTO metadata(key, data) VALUES ('identity', ?)",
-                    (_dumps(identity),),
+                    (encode_identity(identity),),
                 )
                 return identity
 
@@ -585,7 +239,7 @@ class SQLiteStateStore:
                 row = connection.execute(
                     "SELECT data FROM metadata WHERE key = 'identity'"
                 ).fetchone()
-            return None if row is None else _expect(_loads(row[0]), AgentIdentity)
+            return None if row is None else decode_identity(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -593,23 +247,28 @@ class SQLiteStateStore:
         self, registration: SourceRegistration
     ) -> SourceRegistration:
         def write() -> SourceRegistration:
+            stored = persisted_source(registration)
             with _connect(self.path) as connection:
                 row = connection.execute(
-                    "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
+                    """SELECT s.data, a.source_id IS NOT NULL
+                       FROM sources AS s
+                       LEFT JOIN postgresql_write_admissions AS a
+                         ON a.agent_id = s.agent_id AND a.source_id = s.id
+                       WHERE s.agent_id = ? AND s.id = ?""",
                     (registration.agent_id, registration.id),
                 ).fetchone()
                 if row is not None:
-                    current = _expect(_loads(row[0]), SourceRegistration)
-                    if current != registration:
+                    current = _decode_source_projection(row[0], row[1])
+                    if persisted_source(current) != stored:
                         raise ValueError(
                             f"source registration already exists: {registration.id}"
                         )
                     return current
                 connection.execute(
                     "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
-                    (registration.agent_id, registration.id, _dumps(registration)),
+                    (stored.agent_id, stored.id, encode_source(stored)),
                 )
-                return registration
+                return project_source_admission(stored, False)
 
         return await asyncio.to_thread(write)
 
@@ -619,10 +278,14 @@ class SQLiteStateStore:
         def read() -> SourceRegistration | None:
             with _connect(self.path) as connection:
                 row = connection.execute(
-                    "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
+                    """SELECT s.data, a.source_id IS NOT NULL
+                       FROM sources AS s
+                       LEFT JOIN postgresql_write_admissions AS a
+                         ON a.agent_id = s.agent_id AND a.source_id = s.id
+                       WHERE s.agent_id = ? AND s.id = ?""",
                     (agent_id, source_id),
                 ).fetchone()
-            return None if row is None else _expect(_loads(row[0]), SourceRegistration)
+            return None if row is None else _decode_source_projection(row[0], row[1])
 
         return await asyncio.to_thread(read)
 
@@ -630,10 +293,16 @@ class SQLiteStateStore:
         def read() -> tuple[SourceRegistration, ...]:
             with _connect(self.path) as connection:
                 rows = connection.execute(
-                    "SELECT data FROM sources WHERE agent_id = ? ORDER BY id",
+                    """SELECT s.data, a.source_id IS NOT NULL
+                       FROM sources AS s
+                       LEFT JOIN postgresql_write_admissions AS a
+                         ON a.agent_id = s.agent_id AND a.source_id = s.id
+                       WHERE s.agent_id = ? ORDER BY s.id""",
                     (agent_id,),
                 ).fetchall()
-            return tuple(_expect(_loads(row[0]), SourceRegistration) for row in rows)
+            return tuple(
+                _decode_source_projection(data, admitted) for data, admitted in rows
+            )
 
         return await asyncio.to_thread(read)
 
@@ -643,11 +312,7 @@ class SQLiteStateStore:
         receipt_id: str,
     ) -> DatabaseWriteReceipt | None:
         _database_write_text(agent_id, "receipt agent_id")
-        if (
-            not isinstance(receipt_id, str)
-            or _DATABASE_WRITE_RECEIPT_ID.fullmatch(receipt_id) is None
-        ):
-            raise ValueError("receipt_id must be a canonical database-write receipt id")
+        validate_database_write_receipt_id(receipt_id)
 
         def read() -> DatabaseWriteReceipt | None:
             with _connect(self.path) as connection:
@@ -656,9 +321,7 @@ class SQLiteStateStore:
                        WHERE agent_id = ? AND id = ?""",
                     (agent_id, receipt_id),
                 ).fetchone()
-            return (
-                None if row is None else _expect(_loads(row[0]), DatabaseWriteReceipt)
-            )
+            return None if row is None else decode_receipt(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -679,9 +342,7 @@ class SQLiteStateStore:
                        WHERE agent_id = ? AND run_id = ? AND call_id = ?""",
                     (agent_id, run_id, call_id),
                 ).fetchone()
-            return (
-                None if row is None else _expect(_loads(row[0]), DatabaseWriteReceipt)
-            )
+            return None if row is None else decode_receipt(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -723,7 +384,7 @@ class SQLiteStateStore:
                         receipt.receipt_id,
                         receipt.run_id,
                         receipt.call_id,
-                        _dumps(receipt),
+                        encode_receipt(receipt),
                     ),
                 )
                 return receipt
@@ -769,7 +430,7 @@ class SQLiteStateStore:
                     raise DatabaseWriteReceiptConflictError(
                         "started receipt does not exist"
                     )
-                current = _expect(_loads(row[0]), DatabaseWriteReceipt)
+                current = decode_receipt(row[0])
                 if current.outcome is not DatabaseWriteOutcome.STARTED:
                     if current == receipt:
                         return current
@@ -783,7 +444,7 @@ class SQLiteStateStore:
                 connection.execute(
                     """UPDATE database_write_receipts SET data = ?
                        WHERE agent_id = ? AND id = ?""",
-                    (_dumps(receipt), receipt.agent_id, receipt.receipt_id),
+                    (encode_receipt(receipt), receipt.agent_id, receipt.receipt_id),
                 )
                 return receipt
 
@@ -808,8 +469,8 @@ class SQLiteStateStore:
                 ).fetchone()
             if row is None:
                 return None
-            source_id = _loads(row[0])
-            if not isinstance(source_id, str) or not source_id:
+            source_id = decode_identifier(row[0])
+            if not source_id:
                 raise ValueError("stored active source id is invalid")
             return source_id
 
@@ -829,18 +490,22 @@ class SQLiteStateStore:
             with _connect(self.path) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
-                    "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
+                    """SELECT s.data, a.source_id IS NOT NULL
+                       FROM sources AS s
+                       LEFT JOIN postgresql_write_admissions AS a
+                         ON a.agent_id = s.agent_id AND a.source_id = s.id
+                       WHERE s.agent_id = ? AND s.id = ?""",
                     (agent_id, source_id),
                 ).fetchone()
                 if row is None:
                     raise ValueError("unknown active source for this agent")
-                registration = _expect(_loads(row[0]), SourceRegistration)
+                registration = _decode_source_projection(row[0], row[1])
                 if not registration.active:
                     raise ValueError("unknown active source for this agent")
                 connection.execute(
                     """INSERT INTO metadata(key, data) VALUES (?, ?)
                        ON CONFLICT(key) DO UPDATE SET data = excluded.data""",
-                    (_active_source_key(agent_id), _dumps(source_id)),
+                    (_active_source_key(agent_id), encode_identifier(source_id)),
                 )
                 return registration
 
@@ -862,7 +527,7 @@ class SQLiteStateStore:
         source_id: str,
         enabled: bool,
     ) -> SourceRegistration:
-        """Atomically replace only one owned PostgreSQL admission flag."""
+        """Atomically change only one owned PostgreSQL admission row."""
 
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("agent_id must be a non-empty string")
@@ -885,7 +550,7 @@ class SQLiteStateStore:
                     raise ValueError(
                         "source must be an active PostgreSQL source owned by this agent"
                     )
-                current = _expect(_loads(row[0]), SourceRegistration)
+                current = decode_source(row[0])
                 if (
                     current.agent_id != agent_id
                     or current.id != source_id
@@ -895,21 +560,20 @@ class SQLiteStateStore:
                     raise ValueError(
                         "source must be an active PostgreSQL source owned by this agent"
                     )
-                current_flag = current.configuration.get("write_access", False)
-                if not isinstance(current_flag, bool):
-                    raise ValueError("PostgreSQL source write_access is invalid")
-                if current_flag is enabled and "write_access" in current.configuration:
-                    connection.commit()
-                    return current
-                configuration = dict(current.configuration)
-                configuration["write_access"] = enabled
-                updated = replace(current, configuration=configuration)
-                connection.execute(
-                    "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
-                    (_dumps(updated), agent_id, source_id),
-                )
+                if enabled:
+                    connection.execute(
+                        """INSERT INTO postgresql_write_admissions(agent_id, source_id)
+                           VALUES (?, ?) ON CONFLICT(agent_id, source_id) DO NOTHING""",
+                        (agent_id, source_id),
+                    )
+                else:
+                    connection.execute(
+                        """DELETE FROM postgresql_write_admissions
+                           WHERE agent_id = ? AND source_id = ?""",
+                        (agent_id, source_id),
+                    )
                 connection.commit()
-                return updated
+                return project_source_admission(current, enabled)
             except BaseException:
                 connection.rollback()
                 raise
@@ -956,19 +620,26 @@ class SQLiteStateStore:
                 ).fetchone()
                 if row is None:
                     raise KeyError(f"unknown source: {source_id}")
-                current = _expect(_loads(row[0]), SourceRegistration)
+                current = decode_source(row[0])
                 detached = (
                     current if not current.active else current.detach(detached_at)
                 )
                 connection.execute(
                     "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
-                    (_dumps(detached), agent_id, source_id),
+                    (encode_source(detached), agent_id, source_id),
+                )
+                connection.execute(
+                    """DELETE FROM postgresql_write_admissions
+                       WHERE agent_id = ? AND source_id = ?""",
+                    (agent_id, source_id),
                 )
                 selection = connection.execute(
                     "SELECT data FROM metadata WHERE key = ?",
                     (_active_source_key(agent_id),),
                 ).fetchone()
-                selected_id = None if selection is None else _loads(selection[0])
+                selected_id = (
+                    None if selection is None else decode_identifier(selection[0])
+                )
                 if selected_id == source_id:
                     connection.execute(
                         "DELETE FROM metadata WHERE key = ?",
@@ -979,7 +650,7 @@ class SQLiteStateStore:
                         "SELECT data FROM sources WHERE agent_id = ? ORDER BY id",
                         (agent_id,),
                     ).fetchall():
-                        candidate = _expect(_loads(data), SourceRegistration)
+                        candidate = decode_source(data)
                         if candidate.active:
                             remaining.append(candidate)
                     if len(remaining) == 1:
@@ -987,11 +658,11 @@ class SQLiteStateStore:
                             "INSERT INTO metadata(key, data) VALUES (?, ?)",
                             (
                                 _active_source_key(agent_id),
-                                _dumps(remaining[0].id),
+                                encode_identifier(remaining[0].id),
                             ),
                         )
                 connection.commit()
-                return detached
+                return project_source_admission(detached, False)
             except BaseException:
                 connection.rollback()
                 raise
@@ -1027,7 +698,12 @@ class SQLiteStateStore:
                     """INSERT INTO syncs(agent_id, id, source_id, data)
                        VALUES (?, ?, ?, ?)
                        ON CONFLICT(agent_id, id) DO UPDATE SET data = excluded.data""",
-                    (sync.agent_id, sync.id, sync.source_id, _dumps(sync)),
+                    (
+                        sync.agent_id,
+                        sync.id,
+                        sync.source_id,
+                        encode_catalog_sync(sync),
+                    ),
                 )
                 return sync
 
@@ -1052,66 +728,77 @@ class SQLiteStateStore:
                 if not gate.start(connection):
                     return None
                 if registration is not None:
+                    stored_registration = persisted_source(registration)
                     row = connection.execute(
                         "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
-                        (registration.agent_id, registration.id),
+                        (stored_registration.agent_id, stored_registration.id),
                     ).fetchone()
                     if row is None:
                         connection.execute(
                             "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
                             (
-                                registration.agent_id,
-                                registration.id,
-                                _dumps(registration),
+                                stored_registration.agent_id,
+                                stored_registration.id,
+                                encode_source(stored_registration),
                             ),
                         )
                     else:
-                        current = _expect(_loads(row[0]), SourceRegistration)
-                        if current != registration:
+                        current = decode_source(row[0])
+                        if current != stored_registration:
                             if (
                                 current.active
-                                or not registration.active
-                                or current.adapter_id != registration.adapter_id
+                                or not stored_registration.active
+                                or current.adapter_id != stored_registration.adapter_id
                                 or current.native_identity
-                                != registration.native_identity
+                                != stored_registration.native_identity
                             ):
                                 raise ValueError(
                                     "source registration already exists: "
-                                    f"{registration.id}"
+                                    f"{stored_registration.id}"
                                 )
                             connection.execute(
                                 """UPDATE sources SET data = ?
                                    WHERE agent_id = ? AND id = ?""",
                                 (
-                                    _dumps(registration),
-                                    registration.agent_id,
-                                    registration.id,
+                                    encode_source(stored_registration),
+                                    stored_registration.agent_id,
+                                    stored_registration.id,
                                 ),
                             )
                     selection = connection.execute(
                         "SELECT 1 FROM metadata WHERE key = ?",
-                        (_active_source_key(registration.agent_id),),
+                        (_active_source_key(stored_registration.agent_id),),
                     ).fetchone()
                     if selection is None:
                         connection.execute(
                             "INSERT INTO metadata(key, data) VALUES (?, ?)",
                             (
-                                _active_source_key(registration.agent_id),
-                                _dumps(registration.id),
+                                _active_source_key(stored_registration.agent_id),
+                                encode_identifier(stored_registration.id),
                             ),
                         )
                 connection.execute(
                     """INSERT INTO syncs(agent_id, id, source_id, data)
                        VALUES (?, ?, ?, ?)
                        ON CONFLICT(agent_id, id) DO UPDATE SET data = excluded.data""",
-                    (sync.agent_id, sync.id, sync.source_id, _dumps(sync)),
+                    (
+                        sync.agent_id,
+                        sync.id,
+                        sync.source_id,
+                        encode_catalog_sync(sync),
+                    ),
                 )
                 connection.execute(
                     """INSERT INTO snapshots(agent_id, source_id, sync_id, data)
                        VALUES (?, ?, ?, ?)
                        ON CONFLICT(agent_id, source_id) DO UPDATE SET
                          sync_id = excluded.sync_id, data = excluded.data""",
-                    (sync.agent_id, sync.source_id, sync.id, _dumps(snapshot)),
+                    (
+                        sync.agent_id,
+                        sync.source_id,
+                        sync.id,
+                        encode_catalog_snapshot(snapshot),
+                    ),
                 )
                 _commit_catalog_transaction(connection)
                 return snapshot
@@ -1246,7 +933,7 @@ class SQLiteStateStore:
                     "SELECT data FROM syncs WHERE agent_id = ? AND id = ?",
                     (agent_id, sync_id),
                 ).fetchone()
-            return None if row is None else _expect(_loads(row[0]), CatalogSync)
+            return None if row is None else decode_catalog_sync(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -1378,7 +1065,7 @@ class SQLiteStateStore:
                 raise RuntimeError(
                     "stored semantic annotation collection exceeds bound"
                 )
-            return tuple(_expect(_loads(data), SemanticAnnotation) for (data,) in rows)
+            return tuple(decode_semantic_annotation(data) for (data,) in rows)
 
         return await asyncio.to_thread(read)
 
@@ -1399,7 +1086,7 @@ class SQLiteStateStore:
                        WHERE agent_id = ? AND id = ?""",
                     (agent_id, annotation_id),
                 ).fetchone()
-            return None if row is None else _expect(_loads(row[0]), SemanticAnnotation)
+            return None if row is None else decode_semantic_annotation(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -1453,14 +1140,13 @@ class SQLiteStateStore:
                     (agent_id, annotation.id),
                 ).fetchone()
                 changed = (
-                    row is None
-                    or _expect(_loads(row[0]), SemanticAnnotation) != annotation
+                    row is None or decode_semantic_annotation(row[0]) != annotation
                 )
                 connection.execute(
                     """INSERT INTO semantic_annotations(agent_id, id, data)
                        VALUES (?, ?, ?)
                        ON CONFLICT(agent_id, id) DO UPDATE SET data = excluded.data""",
-                    (agent_id, annotation.id, _dumps(annotation)),
+                    (agent_id, annotation.id, encode_semantic_annotation(annotation)),
                 )
                 connection.commit()
                 return changed
@@ -1594,7 +1280,7 @@ class SQLiteStateStore:
                 unreadable_run_count = 0
                 for run_id, turn_index, input_data, result_data in rows:
                     try:
-                        result = _expect(_loads(result_data), LoopExit)
+                        result = decode_loop_exit(result_data)
                         if result.kind is not LoopExitKind.COMPLETED:
                             continue
                         message_rows = connection.execute(
@@ -1605,10 +1291,9 @@ class SQLiteStateStore:
                         record = ConversationRun(
                             turn_index=int(turn_index),
                             transcript=Transcript(
-                                run=_expect(_loads(input_data), RunInput),
+                                run=decode_run_input(input_data),
                                 messages=tuple(
-                                    _expect(_loads(data), CanonicalMessage)
-                                    for (data,) in message_rows
+                                    decode_message(data) for (data,) in message_rows
                                 ),
                             ),
                             result=result,
@@ -1654,7 +1339,7 @@ class SQLiteStateStore:
                        WHERE agent_id = ? AND id = ?""",
                     (agent_id, candidate_id),
                 ).fetchone()
-            return None if row is None else _expect(_loads(row[0]), LearningCandidate)
+            return None if row is None else decode_learning_candidate(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -1744,7 +1429,7 @@ class SQLiteStateStore:
                 connection.execute(
                     """INSERT INTO learning_candidates(agent_id, id, data)
                        VALUES (?, ?, ?)""",
-                    (agent_id, candidate.id, _dumps(candidate)),
+                    (agent_id, candidate.id, encode_learning_candidate(candidate)),
                 )
                 by_id[candidate.id] = candidate
                 identities.add(candidate.candidate_identity_sha256)
@@ -1754,7 +1439,7 @@ class SQLiteStateStore:
                    ON CONFLICT(key) DO UPDATE SET data = excluded.data""",
                 (
                     _learning_review_stamps_key(agent_id),
-                    _dumps(tuple(merged_stamps)),
+                    encode_review_stamps(tuple(merged_stamps)),
                 ),
             )
             return tuple(inserted)
@@ -1825,7 +1510,7 @@ class SQLiteStateStore:
             connection.execute(
                 """UPDATE learning_candidates SET data = ?
                    WHERE agent_id = ? AND id = ?""",
-                (_dumps(candidate), agent_id, candidate.id),
+                (encode_learning_candidate(candidate), agent_id, candidate.id),
             )
             return candidate
 
@@ -1856,21 +1541,16 @@ class SQLiteStateStore:
                 current,
                 expected_fingerprint=expected_fingerprint,
             )
-            rejected = LearningCandidate(
-                **{
-                    **{
-                        field.name: getattr(current, field.name)
-                        for field in fields(current)
-                    },
-                    "status": LearningCandidateStatus.REJECTED,
-                    "updated_at": rejected_at,
-                    "rejection_reason": reason,
-                }
+            rejected = replace(
+                current,
+                status=LearningCandidateStatus.REJECTED,
+                updated_at=rejected_at,
+                rejection_reason=reason,
             )
             connection.execute(
                 """UPDATE learning_candidates SET data = ?
                    WHERE agent_id = ? AND id = ?""",
-                (_dumps(rejected), agent_id, candidate_id),
+                (encode_learning_candidate(rejected), agent_id, candidate_id),
             )
             return rejected
 
@@ -1898,20 +1578,15 @@ class SQLiteStateStore:
                 current,
                 expected_fingerprint=expected_fingerprint,
             )
-            accepted = LearningCandidate(
-                **{
-                    **{
-                        field.name: getattr(current, field.name)
-                        for field in fields(current)
-                    },
-                    "status": LearningCandidateStatus.ACCEPTED,
-                    "updated_at": accepted_at,
-                }
+            accepted = replace(
+                current,
+                status=LearningCandidateStatus.ACCEPTED,
+                updated_at=accepted_at,
             )
             connection.execute(
                 """UPDATE learning_candidates SET data = ?
                    WHERE agent_id = ? AND id = ?""",
-                (_dumps(accepted), agent_id, candidate_id),
+                (encode_learning_candidate(accepted), agent_id, candidate_id),
             )
             return accepted
 
@@ -1965,7 +1640,7 @@ class SQLiteStateStore:
                             run.agent_id,
                             run.conversation_id,
                             int(row[0]),
-                            _dumps(run),
+                            encode_run_input(run),
                         ),
                     )
                 except sqlite3.IntegrityError as error:
@@ -1990,7 +1665,7 @@ class SQLiteStateStore:
                     raise KeyError(f"unknown run: {run_id}")
                 connection.execute(
                     "INSERT INTO messages(run_id, position, data) VALUES (?, ?, ?)",
-                    (run_id, int(row[0]), _dumps(message)),
+                    (run_id, int(row[0]), encode_message(message)),
                 )
 
         await asyncio.to_thread(write)
@@ -2001,7 +1676,11 @@ class SQLiteStateStore:
                 cursor = connection.execute(
                     """UPDATE runs SET result = ?
                        WHERE id = ? AND conversation_id = ?""",
-                    (_dumps(result), result.run_id, result.conversation_id),
+                    (
+                        encode_loop_exit(result),
+                        result.run_id,
+                        result.conversation_id,
+                    ),
                 )
                 if cursor.rowcount != 1:
                     raise KeyError(f"unknown run: {result.run_id}")
@@ -2021,10 +1700,8 @@ class SQLiteStateStore:
                     (run_id,),
                 ).fetchall()
             return Transcript(
-                run=_expect(_loads(run_row[0]), RunInput),
-                messages=tuple(
-                    _expect(_loads(row[0]), CanonicalMessage) for row in rows
-                ),
+                run=decode_run_input(run_row[0]),
+                messages=tuple(decode_message(row[0]) for row in rows),
             )
 
         return await asyncio.to_thread(read)
@@ -2037,7 +1714,7 @@ class SQLiteStateStore:
                 ).fetchone()
             if row is None:
                 raise KeyError(f"unknown run: {run_id}")
-            return None if row[0] is None else _expect(_loads(row[0]), LoopExit)
+            return None if row[0] is None else decode_loop_exit(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -2080,7 +1757,7 @@ class SQLiteStateStore:
                 ).fetchall()
             refs: dict[str, ArtifactRef] = {}
             for stored_run_id, stored_conversation_id, data in rows:
-                message = _expect(_loads(data), CanonicalMessage)
+                message = decode_message(data)
                 if message.role is not MessageRole.TOOL:
                     continue
                 for block in message.content:
@@ -2139,16 +1816,13 @@ class SQLiteStateStore:
                         (run_id,),
                     ).fetchall()
                     transcript = Transcript(
-                        run=_expect(_loads(input_data), RunInput),
+                        run=decode_run_input(input_data),
                         messages=tuple(
-                            _expect(_loads(message[0]), CanonicalMessage)
-                            for message in message_rows
+                            decode_message(message[0]) for message in message_rows
                         ),
                     )
                     result = (
-                        None
-                        if result_data is None
-                        else _expect(_loads(result_data), LoopExit)
+                        None if result_data is None else decode_loop_exit(result_data)
                     )
                     records.append(
                         ConversationRun(
@@ -2264,7 +1938,7 @@ class SQLiteStateStore:
                 ).fetchone()
             if row is None:
                 return None
-            run = _expect(_loads(row[0]), RunInput)
+            run = decode_run_input(row[0])
             return run.conversation_source_id or run.source_id
 
         return await asyncio.to_thread(read)
@@ -2297,7 +1971,7 @@ class SQLiteStateStore:
                     exists = True
                     if result_data is None:
                         continue
-                    result = _expect(_loads(result_data), LoopExit)
+                    result = decode_loop_exit(result_data)
                     if result.kind is not LoopExitKind.COMPLETED:
                         continue
                     if len(records) >= limit:
@@ -2312,9 +1986,9 @@ class SQLiteStateStore:
                         ConversationRun(
                             turn_index=int(turn_index),
                             transcript=Transcript(
-                                run=_expect(_loads(input_data), RunInput),
+                                run=decode_run_input(input_data),
                                 messages=tuple(
-                                    _expect(_loads(message[0]), CanonicalMessage)
+                                    decode_message(message[0])
                                     for message in message_rows
                                 ),
                             ),
@@ -2429,7 +2103,7 @@ def _current_snapshot_row(
 
 
 def _decode_catalog_snapshot(value: str) -> SourceCatalogSnapshot:
-    return _expect(_loads(value), SourceCatalogSnapshot)
+    return decode_catalog_snapshot(value)
 
 
 def _validate_semantic_owner(
@@ -2456,7 +2130,7 @@ def _semantic_rows(
     if len(rows) > SEMANTIC_MAX_ANNOTATIONS:
         raise RuntimeError("stored semantic annotation collection exceeds bound")
     return tuple(
-        (annotation_id, _expect(_loads(data), SemanticAnnotation), data)
+        (annotation_id, decode_semantic_annotation(data), data)
         for annotation_id, data in rows
     )
 
@@ -2622,7 +2296,7 @@ def _learning_candidate_rows(
     ).fetchall()
     if len(rows) > LEARNING_CANDIDATE_MAX_RECORDS:
         raise RuntimeError("stored learning candidate collection exceeds bound")
-    values = tuple(_expect(_loads(data), LearningCandidate) for (data,) in rows)
+    values = tuple(decode_learning_candidate(data) for (data,) in rows)
     if any(item.agent_id != agent_id for item in values):
         raise RuntimeError("stored learning candidate owner is invalid")
     return values
@@ -2638,11 +2312,7 @@ def _learning_review_stamps(
     ).fetchone()
     if row is None:
         return ()
-    value = _loads(row[0])
-    if not isinstance(value, tuple) or any(
-        not isinstance(item, LearningCandidateReviewStamp) for item in value
-    ):
-        raise RuntimeError("stored learning review stamps are invalid")
+    value = decode_review_stamps(row[0])
     if len(value) > LEARNING_REVIEW_MAX_STAMPS or len(set(value)) != len(value):
         raise RuntimeError("stored learning review stamps exceed their bound")
     return value
@@ -2660,7 +2330,7 @@ def _load_learning_candidate_required(
     ).fetchone()
     if row is None:
         raise LearningCandidateNotFoundError(candidate_id)
-    candidate = _expect(_loads(row[0]), LearningCandidate)
+    candidate = decode_learning_candidate(row[0])
     _validate_learning_candidate_owner(agent_id, candidate)
     return candidate
 
@@ -2728,202 +2398,83 @@ def _initialize(path: Path) -> None:
         _admit_existing_state(path)
         return
     with _connect(path) as connection:
-        connection.executescript("""
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                data TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sources (
-                agent_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(agent_id, id)
-            );
-            CREATE TABLE IF NOT EXISTS database_write_receipts (
-                agent_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                run_id TEXT NOT NULL,
-                call_id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(agent_id, id),
-                UNIQUE(agent_id, run_id, call_id)
-            );
-            CREATE TABLE IF NOT EXISTS syncs (
-                agent_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                source_id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(agent_id, id)
-            );
-            CREATE TABLE IF NOT EXISTS snapshots (
-                agent_id TEXT NOT NULL,
-                source_id TEXT NOT NULL,
-                sync_id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(agent_id, source_id)
-            );
-            CREATE TABLE IF NOT EXISTS runs (
-                id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                conversation_id TEXT NOT NULL,
-                turn_index INTEGER NOT NULL,
-                input TEXT NOT NULL,
-                result TEXT
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-                position INTEGER NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(run_id, position)
-            );
-            CREATE TABLE IF NOT EXISTS semantic_annotations (
-                agent_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(agent_id, id)
-            );
-            CREATE TABLE IF NOT EXISTS learning_candidates (
-                agent_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(agent_id, id)
-            );
-            """)
-        connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS runs_conversation_turn
-               ON runs(agent_id, conversation_id, turn_index)""")
-        connection.execute(f"PRAGMA user_version = {STATE_FORMAT_VERSION}")
-        _require_schema(connection, _CURRENT_STATE_TABLE_DEFINITIONS)
-        _require_current_source_records(connection)
-        _require_healthy_database(connection)
+        create_current(connection)
     os.chmod(path, 0o600)
 
 
-def _state_migration_path(source_format: int) -> tuple[_StateMigration, ...]:
-    if not isinstance(source_format, int) or source_format <= 0:
-        raise ValueError("migration source format must be positive")
-    path: list[_StateMigration] = []
-    visited: set[int] = set()
-    current_format = source_format
-    while current_format != STATE_FORMAT_VERSION:
-        if current_format in visited or current_format > STATE_FORMAT_VERSION:
-            raise ValueError("state migration ledger is invalid")
-        visited.add(current_format)
-        step = _STATE_MIGRATIONS.get(current_format)
-        if (
-            step is None
-            or step.target_format <= current_format
-            or step.target_format > STATE_FORMAT_VERSION
-        ):
-            raise ValueError("no complete state migration path is available")
-        path.append(step)
-        current_format = step.target_format
-    return tuple(path)
-
-
-def _unversioned_state_format(connection: sqlite3.Connection) -> int | None:
-    matches = tuple(
-        state_format
-        for state_format, schema in _UNVERSIONED_STATE_SCHEMAS
-        if _schema_matches(connection, schema)
-    )
-    if len(matches) != 1:
-        return None
-    return matches[0]
-
-
 def _admit_existing_state(path: Path) -> None:
-    found_format: int | None = None
-    migration_source_format: int | None = None
     try:
-        with _connect_read_only(path) as connection:
-            found_format = _read_state_format(connection)
-            tables = _table_names(connection)
-            if found_format > STATE_FORMAT_VERSION:
-                raise StateCompatibilityError(
-                    StateCompatibilityCode.NEWER_FORMAT,
-                    path,
-                    (
-                        f"This agent home uses state format {found_format}, but this "
-                        f"Daita release supports through format {STATE_FORMAT_VERSION}. "
-                        "Install the same or a newer Daita release. No state was changed."
-                    ),
-                    current_format=STATE_FORMAT_VERSION,
-                    found_format=found_format,
-                )
-            if found_format == STATE_FORMAT_VERSION:
-                _require_schema(connection, _CURRENT_STATE_TABLE_DEFINITIONS)
-                _require_current_source_records(connection)
-                _require_healthy_database(connection)
-                return
-
-            if found_format == _UNVERSIONED_STATE_FORMAT:
-                migration_source_format = _unversioned_state_format(connection)
-            elif found_format < STATE_FORMAT_VERSION:
-                migration_source_format = found_format
-
-            if migration_source_format is not None:
-                try:
-                    path_to_current = _state_migration_path(migration_source_format)
-                except ValueError:
-                    path_to_current = ()
-                if path_to_current:
-                    _require_schema(connection, path_to_current[0].source_schema)
-                    _require_healthy_database(connection)
-                else:
-                    migration_source_format = None
-
-            if migration_source_format is None:
-                if tables & _LEGACY_TABLE_MARKERS:
-                    raise StateCompatibilityError(
-                        StateCompatibilityCode.LEGACY_FORMAT,
-                        path,
-                        (
-                            "This agent home belongs to the unsupported pre-1.0 Daita "
-                            "framework. Keep it intact and use a current-format agent "
-                            "home; this release will not overwrite or partially import it."
-                        ),
-                        current_format=STATE_FORMAT_VERSION,
-                        found_format=found_format,
-                    )
-                raise _damaged_state_error(path, found_format)
+        with _connect_read_only(path) as read_connection:
+            if "state_migrations" in table_names(read_connection):
+                applied = inspect_journal(read_connection)
+                if applied == len(MIGRATIONS):
+                    return
+                expected_preledger = None
+            else:
+                applied = None
+                expected_preledger = identify_preledger(read_connection)
+    except (MigrationJournalNewerError, PreledgerNewerError) as error:
+        raise StateCompatibilityError(
+            StateCompatibilityCode.NEWER_REVISION,
+            path,
+            (
+                "This local state was created by a newer Daita release. Install "
+                "the same or a newer package. No state was changed."
+            ),
+            current_revision=CURRENT_REVISION,
+            found_revision=(
+                error.found_revision
+                if isinstance(error, MigrationJournalNewerError)
+                else "newer-preledger-state"
+            ),
+        ) from None
+    except PreledgerLegacyError:
+        raise StateCompatibilityError(
+            StateCompatibilityCode.LEGACY,
+            path,
+            (
+                "This agent home belongs to the unsupported pre-1.0 Daita "
+                "framework. Keep it intact and use a current agent home; this "
+                "release will not overwrite or partially import it."
+            ),
+            current_revision=CURRENT_REVISION,
+            found_revision="pre-1.0-framework",
+        ) from None
+    except MigrationJournalError as error:
+        raise StateCompatibilityError(
+            StateCompatibilityCode.REVISION_UNSUPPORTED,
+            path,
+            (
+                "This local state has an unknown, incomplete, reordered, or edited "
+                "migration history. No state was changed. Install the matching "
+                "Daita release before continuing."
+            ),
+            current_revision=CURRENT_REVISION,
+            found_revision=error.found_revision or "invalid-journal",
+        ) from None
+    except PreledgerAdmissionError:
+        raise _damaged_state_error(
+            path,
+            "unsupported-preledger-state",
+        ) from None
     except StateCompatibilityError:
         raise
-    except (OSError, sqlite3.Error, ValueError):
-        raise _damaged_state_error(path, found_format) from None
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        raise _damaged_state_error(path, None) from None
 
-    assert found_format is not None
-    assert migration_source_format is not None
-    _migrate_existing_state(
-        path,
-        stored_format=found_format,
-        source_format=migration_source_format,
-    )
-
-
-def _migrate_existing_state(
-    path: Path,
-    *,
-    stored_format: int,
-    source_format: int,
-) -> None:
     connection: sqlite3.Connection | None = None
     try:
-        path_to_current = _state_migration_path(source_format)
         connection = _connect(path)
         connection.execute("BEGIN IMMEDIATE")
-        if _read_state_format(connection) != stored_format:
-            raise RuntimeError("state format changed during migration admission")
-        for step in path_to_current:
-            _require_schema(connection, step.source_schema)
-            _require_healthy_database(connection)
-            step.apply(connection)
-            connection.execute(f"PRAGMA user_version = {step.target_format}")
-            _require_schema(connection, step.target_schema)
-            if step.validate_target is not None:
-                step.validate_target(connection)
-            _require_healthy_database(connection)
-        if _read_state_format(connection) != STATE_FORMAT_VERSION:
-            raise RuntimeError("state migration did not reach the current format")
+        if applied is None:
+            assert expected_preledger is not None
+            bridge_preledger(connection, expected_preledger)
+        else:
+            if inspect_journal(connection) != applied:
+                raise RuntimeError("migration journal changed during admission")
+            upgrade_journaled(connection, applied)
+        require_schema(connection, CURRENT_TABLES)
+        require_healthy(connection)
         connection.commit()
     except BaseException as error:
         if connection is not None:
@@ -2931,216 +2482,39 @@ def _migrate_existing_state(
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
             raise
         raise StateCompatibilityError(
-            StateCompatibilityCode.MIGRATION_FAILED,
+            StateCompatibilityCode.UPGRADE_FAILED,
             path,
             (
-                "Daita could not complete the automatic local-state upgrade. "
-                "The migration transaction was rolled back and the existing state "
-                "was preserved. Reinstall the prior working Daita package before "
-                "continuing, then report this migration failure."
+                "Daita could not update the local state safely. No changes were "
+                "committed. Reinstall the prior working Daita package before "
+                "continuing, then report this upgrade failure."
             ),
-            current_format=STATE_FORMAT_VERSION,
-            found_format=stored_format,
+            current_revision=CURRENT_REVISION,
+            found_revision=(
+                expected_preledger.value
+                if applied is None and expected_preledger is not None
+                else "journal-prefix"
+            ),
         ) from None
     finally:
         if connection is not None:
             connection.close()
 
 
-def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
-    connection.execute("""CREATE TABLE database_write_receipts (
-               agent_id TEXT NOT NULL,
-               id TEXT NOT NULL,
-               run_id TEXT NOT NULL,
-               call_id TEXT NOT NULL,
-               data TEXT NOT NULL,
-               PRIMARY KEY(agent_id, id),
-               UNIQUE(agent_id, run_id, call_id)
-           )""")
-
-
-def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
-    rows = tuple(connection.execute("SELECT agent_id, id, data FROM sources"))
-    for agent_id, source_id, data in rows:
-        registration = _expect(_loads(data), SourceRegistration)
-        if registration.agent_id != agent_id or registration.id != source_id:
-            raise ValueError("stored source ownership is invalid")
-        if registration.adapter_id != "postgresql":
-            continue
-        write_access = registration.configuration.get("write_access", False)
-        if not isinstance(write_access, bool):
-            raise ValueError("stored PostgreSQL write_access is invalid")
-        if "write_access" in registration.configuration:
-            continue
-        migrated = replace(
-            registration,
-            configuration={
-                **dict(registration.configuration),
-                "write_access": False,
-            },
-        )
-        packed = json.loads(data)
-        if not isinstance(packed, dict):
-            raise ValueError("stored source payload is invalid")
-        fields_payload = packed.get("fields")
-        if not isinstance(fields_payload, dict):
-            raise ValueError("stored source fields are invalid")
-        configuration_payload = fields_payload.get("configuration")
-        if not isinstance(configuration_payload, dict):
-            raise ValueError("stored source configuration is invalid")
-        configuration_payload["write_access"] = False
-        migrated_data = json.dumps(packed, sort_keys=True, separators=(",", ":"))
-        if _expect(_loads(migrated_data), SourceRegistration) != migrated:
-            raise ValueError("migrated PostgreSQL source is invalid")
-        connection.execute(
-            "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
-            (migrated_data, agent_id, source_id),
-        )
-
-
-def _require_current_source_records(connection: sqlite3.Connection) -> None:
-    for agent_id, source_id, data in connection.execute(
-        "SELECT agent_id, id, data FROM sources"
-    ):
-        registration = _expect(_loads(data), SourceRegistration)
-        if registration.agent_id != agent_id or registration.id != source_id:
-            raise ValueError("stored source ownership is invalid")
-        if registration.adapter_id == "postgresql" and not isinstance(
-            registration.configuration.get("write_access"), bool
-        ):
-            raise ValueError("stored PostgreSQL write_access is invalid")
-
-
-_STATE_MIGRATIONS = {
-    1: _StateMigration(
-        target_format=2,
-        source_schema=_INITIAL_STATE_TABLE_DEFINITIONS,
-        target_schema=_RECEIPT_STATE_TABLE_DEFINITIONS,
-        apply=_migrate_v1_to_v2,
-    ),
-    2: _StateMigration(
-        target_format=3,
-        source_schema=_RECEIPT_STATE_TABLE_DEFINITIONS,
-        target_schema=_CURRENT_STATE_TABLE_DEFINITIONS,
-        apply=_migrate_v2_to_v3,
-        validate_target=_require_current_source_records,
-    ),
-}
-_UNVERSIONED_STATE_SCHEMAS = (
-    (1, _INITIAL_STATE_TABLE_DEFINITIONS),
-    (2, _RECEIPT_STATE_TABLE_DEFINITIONS),
-)
-
-
-def _read_state_format(connection: sqlite3.Connection) -> int:
-    row = connection.execute("PRAGMA user_version").fetchone()
-    if row is None or len(row) != 1 or not isinstance(row[0], int) or row[0] < 0:
-        raise sqlite3.DatabaseError("state format marker is invalid")
-    return int(row[0])
-
-
-def _table_names(connection: sqlite3.Connection) -> frozenset[str]:
-    return frozenset(
-        str(row[0])
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-        )
-    )
-
-
-def _schema_matches(
-    connection: sqlite3.Connection,
-    definitions: Mapping[str, tuple[tuple[object, ...], ...]],
-) -> bool:
-    try:
-        _require_schema(connection, definitions)
-    except (sqlite3.Error, ValueError):
-        return False
-    return True
-
-
-def _require_schema(
-    connection: sqlite3.Connection,
-    definitions: Mapping[str, tuple[tuple[object, ...], ...]],
-) -> None:
-    if _table_names(connection) != set(definitions):
-        raise ValueError("state tables do not match the declared format")
-    for table, expected in definitions.items():
-        actual = tuple(
-            (row[1], str(row[2]).upper(), row[3], row[4], row[5])
-            for row in connection.execute(f"PRAGMA table_info({table})")
-        )
-        if actual != expected:
-            raise ValueError(f"state table does not match its format: {table}")
-
-    messages_foreign_keys = tuple(
-        (row[2], row[3], row[4], row[5], row[6], row[7])
-        for row in connection.execute("PRAGMA foreign_key_list(messages)")
-    )
-    if messages_foreign_keys != _MESSAGES_FOREIGN_KEYS:
-        raise ValueError("state message ownership constraint is invalid")
-    for table in set(definitions) - {"messages"}:
-        if tuple(connection.execute(f"PRAGMA foreign_key_list({table})")):
-            raise ValueError(f"state table has unexpected foreign keys: {table}")
-
-    named_indexes = {
-        row[0]: row[1]
-        for row in connection.execute(
-            "SELECT name, tbl_name FROM sqlite_master "
-            "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
-        )
-    }
-    if named_indexes != {
-        name: definition[0] for name, definition in _NAMED_INDEXES.items()
-    }:
-        raise ValueError("state named indexes do not match the declared format")
-    for name, (table, expected_unique, expected_columns) in _NAMED_INDEXES.items():
-        indexes = {
-            row[1]: bool(row[2])
-            for row in connection.execute(f"PRAGMA index_list({table})")
-            if not str(row[1]).startswith("sqlite_autoindex")
-        }
-        if indexes != {name: expected_unique}:
-            raise ValueError(f"state index is invalid: {name}")
-        columns = tuple(
-            row[2] for row in connection.execute(f"PRAGMA index_info({name})")
-        )
-        if columns != expected_columns:
-            raise ValueError(f"state index columns are invalid: {name}")
-
-    extra_objects = tuple(
-        connection.execute(
-            "SELECT type, name FROM sqlite_master "
-            "WHERE type IN ('trigger', 'view') AND name NOT LIKE 'sqlite_%'"
-        )
-    )
-    if extra_objects:
-        raise ValueError("state database has unexpected triggers or views")
-
-
-def _require_healthy_database(connection: sqlite3.Connection) -> None:
-    quick_check = connection.execute("PRAGMA quick_check(1)").fetchone()
-    if quick_check != ("ok",):
-        raise ValueError("state database integrity check failed")
-    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-        raise ValueError("state database foreign-key check failed")
-
-
 def _damaged_state_error(
     path: Path,
-    found_format: int | None,
+    found_revision: str | None,
 ) -> StateCompatibilityError:
     return StateCompatibilityError(
         StateCompatibilityCode.DAMAGED,
         path,
         (
             "This agent state database is damaged or does not match its declared "
-            "Daita format. No state was changed. Run the matching Daita release's "
-            "diagnostics or restore the database through your normal recovery process."
+            "Daita revision. No state was changed. Reinstall the matching Daita "
+            "release or restore the database through your normal recovery process."
         ),
-        current_format=STATE_FORMAT_VERSION,
-        found_format=found_format,
+        current_revision=CURRENT_REVISION,
+        found_revision=found_revision,
     )
 
 
@@ -3158,8 +2532,7 @@ def _recover_started_database_write_receipts(
         started = tuple(
             (agent_id, receipt_id, receipt)
             for agent_id, receipt_id, data in rows
-            if (receipt := _expect(_loads(data), DatabaseWriteReceipt)).outcome
-            is DatabaseWriteOutcome.STARTED
+            if (receipt := decode_receipt(data)).outcome is DatabaseWriteOutcome.STARTED
         )
         if not started:
             return
@@ -3176,7 +2549,12 @@ def _recover_started_database_write_receipts(
                 result = connection.execute(
                     """UPDATE database_write_receipts SET data = ?
                        WHERE agent_id = ? AND id = ? AND data = ?""",
-                    (_dumps(recovered), agent_id, receipt_id, _dumps(receipt)),
+                    (
+                        encode_receipt(recovered),
+                        agent_id,
+                        receipt_id,
+                        encode_receipt(receipt),
+                    ),
                 )
                 if result.rowcount != 1:
                     raise RuntimeError(
@@ -3185,7 +2563,7 @@ def _recover_started_database_write_receipts(
     except RuntimeError:
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError):
-        raise _damaged_state_error(path, STATE_FORMAT_VERSION) from None
+        raise _damaged_state_error(path, CURRENT_REVISION) from None
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -3209,138 +2587,12 @@ def _commit_catalog_transaction(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
-_RECORD_TYPES: dict[str, type[Any]] = {
-    record.__name__: record
-    for record in (
-        AgentIdentity,
-        SourceRegistration,
-        DatabaseWriteReceipt,
-        CatalogFacet,
-        RelationshipFieldPair,
-        CatalogRelationship,
-        CatalogResourceRevision,
-        CatalogResource,
-        CatalogSync,
-        SourceCatalogSnapshot,
-        RunInput,
-        LoopExit,
-        ArtifactResourceBinding,
-        ArtifactProvenance,
-        ArtifactRef,
-        ArtifactDeliveryReceipt,
-        TextBlock,
-        ToolCall,
-        ToolResultBlock,
-        CanonicalMessage,
-        ModelUsage,
-        PricingModifier,
-        PricingUsageRange,
-        CostComponent,
-        CostEstimate,
-        SemanticFieldReference,
-        SemanticEvidence,
-        ResourceRevisionBinding,
-        SemanticSubject,
-        SemanticAnnotation,
-        DocumentCandidateContent,
-        SemanticCandidateContent,
-        SkillCandidateContent,
-        LearningCandidateRunReference,
-        LearningCandidateReviewStamp,
-        LearningCandidate,
-    )
-}
-_ENUM_TYPES: dict[str, type[Enum]] = {
-    enum.__name__: enum
-    for enum in (
-        CatalogSyncStatus,
-        FacetKind,
-        RelationshipDirection,
-        RelationshipKind,
-        RelationshipProvenance,
-        ResourceKind,
-        Sensitivity,
-        ArtifactAuthorship,
-        LoopExitKind,
-        MessageRole,
-        CostBasis,
-        CostEstimateStatus,
-        SemanticEvidenceKind,
-        SemanticKind,
-        LearningCandidateStatus,
-        LearningCandidateRejectionReason,
-        LearningCandidateTarget,
-        LearningCandidateAction,
-        DatabaseWriteOutcome,
-    )
-}
-
-
-def _pack(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {str(key): _pack(item) for key, item in value.items()}
-    if is_dataclass(value) and not isinstance(value, type):
-        return {
-            "__record__": type(value).__name__,
-            "fields": {
-                field.name: _pack(getattr(value, field.name)) for field in fields(value)
-            },
-        }
-    if isinstance(value, Enum):
-        return {"__enum__": type(value).__name__, "value": value.value}
-    if isinstance(value, datetime):
-        timestamp = value.isoformat()
-        offset = value.utcoffset()
-        if offset is not None and offset.total_seconds() == 0:
-            timestamp = (
-                value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-            )
-        return {"__datetime__": timestamp}
-    if isinstance(value, Decimal):
-        return {"__decimal__": str(value)}
-    if isinstance(value, (tuple, list)):
-        return [_pack(item) for item in value]
-    return value
-
-
-def _unpack(value: object) -> object:
-    if isinstance(value, list):
-        return tuple(_unpack(item) for item in value)
-    if not isinstance(value, dict):
-        return value
-    if "__datetime__" in value:
-        return datetime.fromisoformat(str(value["__datetime__"]))
-    if "__decimal__" in value:
-        return Decimal(str(value["__decimal__"]))
-    if "__enum__" in value:
-        enum = _ENUM_TYPES[str(value["__enum__"])]
-        return enum(value["value"])
-    if "__record__" in value:
-        record = _RECORD_TYPES[str(value["__record__"])]
-        raw_fields = value["fields"]
-        if not isinstance(raw_fields, dict):
-            raise ValueError("invalid stored record fields")
-        return record(**{name: _unpack(item) for name, item in raw_fields.items()})
-    return {key: _unpack(item) for key, item in value.items()}
-
-
-def _dumps(value: object) -> str:
-    return json.dumps(_pack(value), sort_keys=True, separators=(",", ":"))
-
-
-def _loads(value: str) -> object:
-    return _unpack(json.loads(value))
-
-
-def _expect(value: object, expected: type[Any]) -> Any:
-    if not isinstance(value, expected):
-        raise TypeError(f"stored value is not {expected.__name__}")
-    return value
-
-
 __all__ = [
-    "STATE_FORMAT_VERSION",
+    "DatabaseWriteOutcome",
+    "DatabaseWriteReceipt",
+    "DatabaseWriteReceiptConflictError",
     "SQLiteStateStore",
     "StateCompatibilityCode",
     "StateCompatibilityError",
+    "database_write_receipt_id",
 ]

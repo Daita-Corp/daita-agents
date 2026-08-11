@@ -2019,16 +2019,15 @@ async def test_schema_slice_reopens_with_one_decode_and_identical_payload(
     expected = canonical_json(await _schema(agent, resource_ids=resource_ids))
     await agent.close()
 
-    original_loads = sqlite_store._loads
+    original_decode = sqlite_store.decode_catalog_snapshot
     decode_count = 0
 
-    def counting_loads(value: str) -> object:
+    def counting_decode(value: str):
         nonlocal decode_count
-        if '"__record__":"SourceCatalogSnapshot"' in value:
-            decode_count += 1
-        return original_loads(value)
+        decode_count += 1
+        return original_decode(value)
 
-    monkeypatch.setattr(sqlite_store, "_loads", counting_loads)
+    monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", counting_decode)
     reopened = await Agent.open("catalog-schema-coherent-reopen", root=tmp_path)
     try:
         first = await _schema(reopened, resource_ids=resource_ids)
@@ -2197,23 +2196,22 @@ async def test_validation_schema_reopen_decodes_and_compiles_once(
     source_id = source.id
     await agent.close()
 
-    original_loads = sqlite_store._loads
+    original_decode = sqlite_store.decode_catalog_snapshot
     original_compile = catalog_service._compile_source_index
     decode_count = 0
     compile_count = 0
 
-    def counting_loads(value: str) -> object:
+    def counting_decode(value: str):
         nonlocal decode_count
-        if '"__record__":"SourceCatalogSnapshot"' in value:
-            decode_count += 1
-        return original_loads(value)
+        decode_count += 1
+        return original_decode(value)
 
     def counting_compile(snapshot):
         nonlocal compile_count
         compile_count += 1
         return original_compile(snapshot)
 
-    monkeypatch.setattr(sqlite_store, "_loads", counting_loads)
+    monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", counting_decode)
     monkeypatch.setattr(catalog_service, "_compile_source_index", counting_compile)
     reopened = await Agent.open("catalog-validation-reopen", root=tmp_path)
     try:

@@ -363,16 +363,22 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
             "learning_candidates",
             "messages",
             "metadata",
+            "postgresql_write_admissions",
             "runs",
             "semantic_annotations",
             "snapshots",
             "sources",
+            "state_migrations",
             "syncs",
         }
         for table in tables:
-            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[
-                0
-            ] == (1 if table == "metadata" else 0)
+            expected_rows = 1 if table == "metadata" else 0
+            if table == "state_migrations":
+                expected_rows = 2
+            assert (
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                == expected_rows
+            )
 
 
 def test_exact_document_limits_are_fixed():

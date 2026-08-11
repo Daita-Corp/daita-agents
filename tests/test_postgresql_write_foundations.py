@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -62,7 +63,7 @@ def _registration(
     )
 
 
-def test_postgresql_write_access_defaults_false_and_reconstructs_fail_closed():
+def test_postgresql_write_access_projection_never_changes_connection_identity():
     source = PostgreSQLSource(
         host="db.example.test",
         database="warehouse",
@@ -79,6 +80,14 @@ def test_postgresql_write_access_defaults_false_and_reconstructs_fail_closed():
     )
     assert isinstance(reconstructed, PostgreSQLSource)
     assert reconstructed.write_access is False
+
+    enabled_projection = _registration("agent-enabled", write_access=True)
+    enabled_connection = embedded_module._source_from_registration(
+        enabled_projection,
+        secret_provider=EmptySecretProvider(),
+    )
+    assert isinstance(enabled_connection, PostgreSQLSource)
+    assert enabled_connection.write_access is False
 
     invalid = replace(
         missing,
@@ -122,12 +131,25 @@ async def test_user_owned_source_write_access_toggle_uses_shared_lock_and_only_c
             configuration={**dict(registration.configuration), "write_access": True},
         )
         assert (await agent._embedded._store.load_source(agent.id, other.id)) == other
+        with sqlite3.connect(agent.home / "state.db") as connection:
+            source_data = connection.execute(
+                "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
+                (agent.id, registration.id),
+            ).fetchone()[0]
+            assert "write_access" not in source_data
+            assert connection.execute(
+                "SELECT agent_id, source_id FROM postgresql_write_admissions"
+            ).fetchone() == (agent.id, registration.id)
 
         disabled = await agent.set_source_write_access(registration.id, False)
         assert disabled == registration
         assert await agent.list_sources() == tuple(
             sorted((registration, other), key=lambda item: item.id)
         )
+        with sqlite3.connect(agent.home / "state.db") as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM postgresql_write_admissions"
+            ).fetchone() == (0,)
     finally:
         if lock.locked():
             lock.release()
@@ -179,37 +201,88 @@ async def test_enabled_source_write_access_round_trips_through_agent_reopen(tmp_
             secret_provider=EmptySecretProvider(),
         )
         assert isinstance(reconstructed, PostgreSQLSource)
-        assert reconstructed.write_access is True
+        assert reconstructed.write_access is False
+        with sqlite3.connect(reopened.home / "state.db") as connection:
+            source_data = connection.execute("SELECT data FROM sources").fetchone()[0]
+            assert "write_access" not in source_data
+            assert connection.execute(
+                "SELECT source_id FROM postgresql_write_admissions"
+            ).fetchone() == (registration.id,)
     finally:
         await reopened.close()
 
 
-@pytest.mark.parametrize("write_access", (None, True))
-async def test_postgresql_refresh_preserves_the_exact_persisted_registration(
+async def test_detach_revokes_admission_and_storage_reattachment_starts_read_only(
+    tmp_path,
+):
+    agent = await Agent.create("source-write-detach", root=tmp_path, clock=lambda: NOW)
+    registration = _registration(agent.id)
+    registered = await agent._embedded._store.register_source(registration)
+    await agent.set_source_write_access(registration.id, True)
+
+    detached = await agent.detach(registration.id)
+    assert detached.active is False
+    assert detached.configuration["write_access"] is False
+    with sqlite3.connect(agent.home / "state.db") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM postgresql_write_admissions"
+        ).fetchone() == (0,)
+
+    sync = CatalogSync(
+        id="catalog-sync-reattach",
+        agent_id=agent.id,
+        source_id=registration.id,
+        adapter_id="postgresql",
+        status=CatalogSyncStatus.SUCCEEDED,
+        started_at=NOW,
+        completed_at=NOW,
+        source_revision="catalog:sha256:" + "a" * 64,
+    )
+    await agent._embedded._store.commit_snapshot(
+        SourceCatalogSnapshot(sync=sync, resources=(), revisions=()),
+        registration=registered,
+    )
+    reattached = await agent._embedded._store.load_source(agent.id, registration.id)
+    try:
+        assert reattached is not None
+        assert reattached.active is True
+        assert reattached.configuration["write_access"] is False
+        with sqlite3.connect(agent.home / "state.db") as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM postgresql_write_admissions"
+            ).fetchone() == (0,)
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize("enabled", (False, True))
+async def test_postgresql_refresh_preserves_admission_outside_connection_identity(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
-    write_access: bool | None,
+    enabled: bool,
 ):
     agent = await Agent.create(
-        f"postgresql-refresh-{write_access}",
+        f"postgresql-refresh-{enabled}",
         root=tmp_path,
         clock=lambda: NOW,
     )
-    registration = _registration(agent.id, write_access=write_access)
-    await agent._embedded._store.register_source(registration)
-    canonical = replace(
-        registration,
-        configuration={
-            **dict(registration.configuration),
-            "write_access": False if write_access is None else write_access,
-        },
+    registration = _registration(agent.id)
+    registered = await agent._embedded._store.register_source(registration)
+    expected = (
+        await agent.set_source_write_access(registration.id, True)
+        if enabled
+        else registered
+    )
+    connection_registration = replace(
+        registered,
+        configuration={**dict(registered.configuration), "write_access": False},
     )
     closed = False
 
     class _Adapter:
         @property
         def registration(self) -> SourceRegistration:
-            return canonical
+            return connection_registration
 
         def declarations(self) -> ExtensionDeclarations:
             return ExtensionDeclarations()
@@ -253,7 +326,7 @@ async def test_postgresql_refresh_preserves_the_exact_persisted_registration(
         clock,
     ) -> _Adapter:
         del clock
-        assert source.write_access is (False if write_access is None else write_access)
+        assert source.write_access is False
         assert agent_id == agent.id
         assert attached_at == registration.attached_at
         return _Adapter()
@@ -261,11 +334,19 @@ async def test_postgresql_refresh_preserves_the_exact_persisted_registration(
     monkeypatch.setattr(PostgreSQLSource, "open", open_source)
     try:
         refreshed = await agent.refresh_source(registration.id)
-        assert refreshed == registration
+        assert refreshed == expected
         assert (
             await agent._embedded._store.load_source(agent.id, registration.id)
-            == registration
+            == expected
         )
+        with sqlite3.connect(agent.home / "state.db") as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM postgresql_write_admissions"
+            ).fetchone() == (int(enabled),)
+            assert (
+                "write_access"
+                not in connection.execute("SELECT data FROM sources").fetchone()[0]
+            )
         assert closed is True
     finally:
         await agent.close()

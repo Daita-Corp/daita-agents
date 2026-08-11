@@ -1,0 +1,285 @@
+"""Current and historical physical schemas owned by ``SQLiteStateStore``."""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Mapping
+
+TableSchema = Mapping[str, tuple[tuple[object, ...], ...]]
+
+INITIAL_TABLES: dict[str, tuple[tuple[object, ...], ...]] = {
+    "learning_candidates": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "messages": (
+        ("run_id", "TEXT", 1, None, 1),
+        ("position", "INTEGER", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "metadata": (
+        ("key", "TEXT", 0, None, 1),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "runs": (
+        ("id", "TEXT", 0, None, 1),
+        ("agent_id", "TEXT", 1, None, 0),
+        ("conversation_id", "TEXT", 1, None, 0),
+        ("turn_index", "INTEGER", 1, None, 0),
+        ("input", "TEXT", 1, None, 0),
+        ("result", "TEXT", 0, None, 0),
+    ),
+    "semantic_annotations": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "snapshots": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("source_id", "TEXT", 1, None, 2),
+        ("sync_id", "TEXT", 1, None, 0),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "sources": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "syncs": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("source_id", "TEXT", 1, None, 0),
+        ("data", "TEXT", 1, None, 0),
+    ),
+}
+
+RECEIPT_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("id", "TEXT", 1, None, 2),
+    ("run_id", "TEXT", 1, None, 0),
+    ("call_id", "TEXT", 1, None, 0),
+    ("data", "TEXT", 1, None, 0),
+)
+JOURNAL_TABLE = (
+    ("ordinal", "INTEGER", 1, None, 0),
+    ("migration_id", "TEXT", 1, None, 1),
+    ("checksum", "TEXT", 1, None, 0),
+)
+ADMISSION_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("source_id", "TEXT", 1, None, 2),
+)
+
+RECEIPT_TABLES = {**INITIAL_TABLES, "database_write_receipts": RECEIPT_TABLE}
+JOURNAL_INITIAL_TABLES = {**INITIAL_TABLES, "state_migrations": JOURNAL_TABLE}
+JOURNAL_RECEIPT_TABLES = {**RECEIPT_TABLES, "state_migrations": JOURNAL_TABLE}
+CURRENT_TABLES = {
+    **JOURNAL_RECEIPT_TABLES,
+    "postgresql_write_admissions": ADMISSION_TABLE,
+}
+
+MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
+ADMISSION_FOREIGN_KEYS = (
+    ("sources", "agent_id", "agent_id", "NO ACTION", "CASCADE", "NONE"),
+    ("sources", "source_id", "id", "NO ACTION", "CASCADE", "NONE"),
+)
+NAMED_INDEXES = {
+    "runs_conversation_turn": (
+        "runs",
+        True,
+        ("agent_id", "conversation_id", "turn_index"),
+    )
+}
+UNIQUE_CONSTRAINTS = {
+    "database_write_receipts": frozenset({("agent_id", "run_id", "call_id")}),
+    "state_migrations": frozenset({("ordinal",)}),
+}
+
+BASE_TABLE_SQL = """
+CREATE TABLE metadata (
+    key TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+);
+CREATE TABLE sources (
+    agent_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(agent_id, id)
+);
+CREATE TABLE syncs (
+    agent_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(agent_id, id)
+);
+CREATE TABLE snapshots (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    sync_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(agent_id, source_id)
+);
+CREATE TABLE runs (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    turn_index INTEGER NOT NULL,
+    input TEXT NOT NULL,
+    result TEXT
+);
+CREATE TABLE messages (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(run_id, position)
+);
+CREATE TABLE semantic_annotations (
+    agent_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(agent_id, id)
+);
+CREATE TABLE learning_candidates (
+    agent_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(agent_id, id)
+);
+CREATE UNIQUE INDEX runs_conversation_turn
+    ON runs(agent_id, conversation_id, turn_index);
+"""
+
+RECEIPT_TABLE_SQL = """
+CREATE TABLE database_write_receipts (
+    agent_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    call_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(agent_id, id),
+    UNIQUE(agent_id, run_id, call_id)
+)
+"""
+
+JOURNAL_TABLE_SQL = """
+CREATE TABLE state_migrations (
+    ordinal INTEGER NOT NULL UNIQUE,
+    migration_id TEXT NOT NULL PRIMARY KEY,
+    checksum TEXT NOT NULL
+)
+"""
+
+ADMISSION_TABLE_SQL = """
+CREATE TABLE postgresql_write_admissions (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    PRIMARY KEY (agent_id, source_id),
+    FOREIGN KEY (agent_id, source_id)
+        REFERENCES sources(agent_id, id)
+        ON DELETE CASCADE
+)
+"""
+
+
+def table_names(connection: sqlite3.Connection) -> frozenset[str]:
+    return frozenset(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    )
+
+
+def schema_matches(connection: sqlite3.Connection, definitions: TableSchema) -> bool:
+    try:
+        require_schema(connection, definitions)
+    except (sqlite3.Error, ValueError):
+        return False
+    return True
+
+
+def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> None:
+    if table_names(connection) != set(definitions):
+        raise ValueError("state tables do not match the declared revision")
+    for table, expected in definitions.items():
+        actual = tuple(
+            (row[1], str(row[2]).upper(), row[3], row[4], row[5])
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        )
+        if actual != expected:
+            raise ValueError(f"state table does not match its revision: {table}")
+
+    foreign_keys: dict[str, tuple[tuple[object, ...], ...]] = {
+        table: tuple(
+            (row[2], row[3], row[4], row[5], row[6], row[7])
+            for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+        )
+        for table in definitions
+    }
+    expected_foreign_keys: dict[str, tuple[tuple[object, ...], ...]] = {
+        "messages": MESSAGES_FOREIGN_KEYS,
+        **(
+            {"postgresql_write_admissions": ADMISSION_FOREIGN_KEYS}
+            if "postgresql_write_admissions" in definitions
+            else {}
+        ),
+    }
+    for table, actual_foreign_keys in foreign_keys.items():
+        if actual_foreign_keys != expected_foreign_keys.get(table, ()):
+            raise ValueError(f"state foreign keys are invalid: {table}")
+
+    for table in definitions:
+        actual_unique_constraints = frozenset(
+            tuple(
+                column[2]
+                for column in connection.execute(f"PRAGMA index_info({index[1]})")
+            )
+            for index in connection.execute(f"PRAGMA index_list({table})")
+            if index[3] == "u"
+        )
+        if actual_unique_constraints != UNIQUE_CONSTRAINTS.get(table, frozenset()):
+            raise ValueError(f"state unique constraints are invalid: {table}")
+
+    named_indexes = {
+        row[0]: row[1]
+        for row in connection.execute(
+            "SELECT name, tbl_name FROM sqlite_master "
+            "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    if named_indexes != {
+        name: definition[0] for name, definition in NAMED_INDEXES.items()
+    }:
+        raise ValueError("state named indexes do not match the declared revision")
+    for name, (table, expected_unique, expected_columns) in NAMED_INDEXES.items():
+        indexes = {
+            row[1]: bool(row[2])
+            for row in connection.execute(f"PRAGMA index_list({table})")
+            if not str(row[1]).startswith("sqlite_autoindex")
+        }
+        if indexes != {name: expected_unique}:
+            raise ValueError(f"state index is invalid: {name}")
+        columns = tuple(
+            row[2] for row in connection.execute(f"PRAGMA index_info({name})")
+        )
+        if columns != expected_columns:
+            raise ValueError(f"state index columns are invalid: {name}")
+
+    extra_objects = tuple(
+        connection.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE type IN ('trigger', 'view') AND name NOT LIKE 'sqlite_%'"
+        )
+    )
+    if extra_objects:
+        raise ValueError("state database has unexpected triggers or views")
+
+
+def require_healthy(connection: sqlite3.Connection) -> None:
+    if connection.execute("PRAGMA quick_check(1)").fetchone() != ("ok",):
+        raise ValueError("state database integrity check failed")
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise ValueError("state database foreign-key check failed")

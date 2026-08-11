@@ -1,0 +1,113 @@
+"""Checksummed ordered traversal for the SQLite-owned migration journal."""
+
+from __future__ import annotations
+
+import re
+import sqlite3
+
+from ..sqlite_schema import require_healthy, require_schema
+from .database_write_receipts import MIGRATION as RECEIPT_MIGRATION
+from .models import SQLiteMigration
+from .postgresql_write_admission import MIGRATION as ADMISSION_MIGRATION
+
+MIGRATIONS: tuple[SQLiteMigration, ...] = (
+    RECEIPT_MIGRATION,
+    ADMISSION_MIGRATION,
+)
+CURRENT_REVISION = MIGRATIONS[-1].migration_id
+
+
+class MigrationJournalError(ValueError):
+    """The stored journal is not an exact prefix of this immutable ledger."""
+
+    def __init__(self, reason: str, found_revision: str | None = None) -> None:
+        self.reason = reason
+        self.found_revision = found_revision
+        super().__init__(reason)
+
+
+class MigrationJournalNewerError(MigrationJournalError):
+    """The stored ledger is a valid extension of this release's exact prefix."""
+
+
+def insert_journal_row(
+    connection: sqlite3.Connection,
+    migration: SQLiteMigration,
+) -> None:
+    connection.execute(
+        """INSERT INTO state_migrations(ordinal, migration_id, checksum)
+           VALUES (?, ?, ?)""",
+        (migration.ordinal, migration.migration_id, migration.checksum),
+    )
+
+
+def inspect_journal(connection: sqlite3.Connection) -> int:
+    rows = tuple(connection.execute("""SELECT ordinal, migration_id, checksum
+               FROM state_migrations ORDER BY ordinal"""))
+    if not rows:
+        raise MigrationJournalError("migration journal is empty")
+    for position, (ordinal, migration_id, checksum) in enumerate(
+        rows[: len(MIGRATIONS)], start=1
+    ):
+        expected = MIGRATIONS[position - 1]
+        if ordinal != position:
+            raise MigrationJournalError(
+                "migration journal contains an ordinal gap", str(migration_id)
+            )
+        if migration_id != expected.migration_id:
+            raise MigrationJournalError(
+                "migration journal contains an unknown or reordered ID",
+                str(migration_id),
+            )
+        if checksum != expected.checksum:
+            raise MigrationJournalError(
+                "migration journal checksum does not match immutable history",
+                str(migration_id),
+            )
+    if len(rows) > len(MIGRATIONS):
+        for position, (ordinal, migration_id, checksum) in enumerate(
+            rows[len(MIGRATIONS) :], start=len(MIGRATIONS) + 1
+        ):
+            if (
+                ordinal != position
+                or not isinstance(migration_id, str)
+                or not migration_id.strip()
+                or not isinstance(checksum, str)
+                or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
+            ):
+                raise MigrationJournalError(
+                    "migration journal contains an invalid later entry",
+                    str(migration_id),
+                )
+        raise MigrationJournalNewerError(
+            "migration journal extends beyond this release",
+            str(rows[-1][1]),
+        )
+    applied = len(rows)
+    require_schema(connection, MIGRATIONS[applied - 1].target_schema)
+    validation = MIGRATIONS[applied - 1].validate_target
+    if validation is not None:
+        validation(connection)
+    require_healthy(connection)
+    return applied
+
+
+def upgrade_journaled(connection: sqlite3.Connection, applied: int) -> None:
+    if applied < 1 or applied >= len(MIGRATIONS):
+        raise ValueError("journaled upgrade requires a non-current known prefix")
+    for migration in MIGRATIONS[applied:]:
+        require_schema(connection, migration.source_schema)
+        require_healthy(connection)
+        migration.apply(connection)
+        insert_journal_row(connection, migration)
+        require_schema(connection, migration.target_schema)
+        if migration.validate_target is not None:
+            migration.validate_target(connection)
+        require_healthy(connection)
+
+
+def migration_rows() -> tuple[tuple[int, str, str], ...]:
+    return tuple(
+        (migration.ordinal, migration.migration_id, migration.checksum)
+        for migration in MIGRATIONS
+    )

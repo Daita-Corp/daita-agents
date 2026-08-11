@@ -136,7 +136,8 @@ export DAITA_RUN_POSTGRESQL_UPDATE_CERTIFICATION=1
 The administrator credential is consumed only by test-fixture setup and
 verification code. It is never passed to `Agent`, `PostgreSQLSource`, readiness,
 or a model tool. The Daita attachment uses only `daita_writer` and begins with
-`write_access=False`.
+its separately stored write admission disabled; the public source projection
+reports `write_access=False`.
 
 Only after DB-only certification passes, separately authorize the one paid
 model/database acceptance:

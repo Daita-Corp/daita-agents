@@ -122,10 +122,7 @@ from ..semantics import (
 )
 from ..skills import Skill, SkillStore, SkillSummary
 from ..skills.capabilities import skill_declarations
-from ..storage.sqlite import (
-    STATE_FORMAT_VERSION,
-    SQLiteStateStore,
-)
+from ..storage.sqlite import SQLiteStateStore
 
 _AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -1721,20 +1718,9 @@ class EmbeddedAgent:
         sync: CatalogSync | None = None
         try:
             if persisted_registration is not None:
-                comparable_configuration = dict(persisted_registration.configuration)
-                if (
-                    persisted_registration.adapter_id == "postgresql"
-                    and "write_access" not in comparable_configuration
-                    and opened_registration.configuration.get("write_access") is False
-                ):
-                    comparable_configuration["write_access"] = False
-                if (
-                    replace(
-                        persisted_registration,
-                        configuration=comparable_configuration,
-                    )
-                    != opened_registration
-                ):
+                if _source_connection_registration(
+                    persisted_registration
+                ) != _source_connection_registration(opened_registration):
                     raise ValueError(
                         "refreshed source registration disagrees with persisted identity"
                     )
@@ -2170,8 +2156,8 @@ def _source_from_registration(
         raw_reference = configuration.get("credential_ref")
         if raw_reference is not None and not isinstance(raw_reference, str):
             raise AgentHomeError("PostgreSQL source configuration is invalid")
-        raw_write_access = configuration.get("write_access", False)
-        if not isinstance(raw_write_access, bool):
+        effective_write_access = configuration.get("write_access", False)
+        if not isinstance(effective_write_access, bool):
             raise AgentHomeError("PostgreSQL source configuration is invalid")
         try:
             reference = (
@@ -2185,7 +2171,7 @@ def _source_from_registration(
                 credential=reference,
                 schemas=cast(tuple[str, ...], raw_schemas),
                 ssl_mode=_configuration_text(configuration, "ssl_mode"),
-                write_access=raw_write_access,
+                write_access=False,
                 name=registration.display_name,
                 secret_provider=secret_provider,
             )
@@ -2194,6 +2180,18 @@ def _source_from_registration(
                 "PostgreSQL source configuration is invalid"
             ) from error
     raise AgentHomeError("registered source adapter cannot be refreshed")
+
+
+def _source_connection_registration(
+    registration: SourceRegistration,
+) -> SourceRegistration:
+    """Exclude computed admission from immutable connection identity."""
+
+    if registration.adapter_id != "postgresql":
+        return registration
+    configuration = dict(registration.configuration)
+    configuration.pop("write_access", None)
+    return replace(registration, configuration=configuration)
 
 
 def _resolve_candidate_reviewer_profile(
@@ -3104,15 +3102,15 @@ def _reject_legacy_state_root(state_root: Path) -> None:
     if not any((state_root / marker).exists() for marker in _LEGACY_STATE_ROOT_MARKERS):
         return
     raise StateCompatibilityError(
-        StateCompatibilityCode.LEGACY_FORMAT,
+        StateCompatibilityCode.LEGACY,
         state_root,
         (
             "This local data directory belongs to the unsupported pre-1.0 Daita "
-            "framework. It was left unchanged. Use a separate current-format root "
+            "framework. It was left unchanged. Use a separate current root "
             "and keep this directory intact for a deliberate legacy export/import."
         ),
-        current_format=STATE_FORMAT_VERSION,
-        found_format=0,
+        current_revision=SQLiteStateStore.current_revision,
+        found_revision="pre-1.0-framework",
     )
 
 

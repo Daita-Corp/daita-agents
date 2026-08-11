@@ -42,18 +42,17 @@ def _database(path: Path, *, with_tables: bool = True) -> None:
 def _snapshot_decode_counter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Callable[[], int]:
-    original_loads = sqlite_store._loads
+    original_decode = sqlite_store.decode_catalog_snapshot
     counter_lock = threading.Lock()
     count = 0
 
-    def counting_loads(value: str) -> object:
+    def counting_decode(value: str):
         nonlocal count
-        if '"__record__":"SourceCatalogSnapshot"' in value:
-            with counter_lock:
-                count += 1
-        return original_loads(value)
+        with counter_lock:
+            count += 1
+        return original_decode(value)
 
-    monkeypatch.setattr(sqlite_store, "_loads", counting_loads)
+    monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", counting_decode)
     return lambda: count
 
 
@@ -703,17 +702,17 @@ async def test_failed_snapshot_decode_does_not_publish_a_cache_entry(
         source = await agent.attach(SQLiteSource(database))
         reader = SQLiteStateStore(agent.home / "state.db")
         ref = (await reader.list_current_snapshot_refs(agent.id, (source.id,)))[0]
-        original_loads = sqlite_store._loads
+        original_decode = sqlite_store.decode_catalog_snapshot
         fail_next_snapshot = True
 
-        def failing_loads(value: str) -> object:
+        def failing_decode(value: str):
             nonlocal fail_next_snapshot
-            if fail_next_snapshot and '"__record__":"SourceCatalogSnapshot"' in value:
+            if fail_next_snapshot:
                 fail_next_snapshot = False
                 raise ValueError("forced snapshot decode failure")
-            return original_loads(value)
+            return original_decode(value)
 
-        monkeypatch.setattr(sqlite_store, "_loads", failing_loads)
+        monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", failing_decode)
         with pytest.raises(ValueError, match="forced snapshot decode failure"):
             await reader.load_current_snapshot(ref)
         assert reader._decoded_catalog_snapshots == {}

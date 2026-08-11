@@ -354,6 +354,7 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
 def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
         encoding="utf-8"
     )
@@ -365,7 +366,7 @@ def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners(
     assert _class_owners("SemanticSubject") == {"semantics.py"}
     assert 'SEMANTIC_SAVE_TOOL_NAME = "semantic_save"' in semantics
     assert 'SEMANTIC_DELETE_TOOL_NAME = "semantic_delete"' in semantics
-    assert "CREATE TABLE IF NOT EXISTS semantic_annotations" in storage
+    assert "CREATE TABLE semantic_annotations" in schema
     assert "semantic_resource_facts" in controller
     assert "semantic_annotation_issue" in controller
     assert "bind_current_semantic_evidence" in controller
@@ -405,6 +406,7 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
         encoding="utf-8"
     )
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     evaluation = (PACKAGE / "evaluation.py").read_text(encoding="utf-8")
     candidates = (PACKAGE / "learning_candidates.py").read_text(encoding="utf-8")
     package_text = _python_text(PACKAGE)
@@ -421,7 +423,7 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
     assert "_semantic_maintenance_requested" in controller
     assert "capability.id in _SEMANTIC_CAPABILITIES" in controller
     assert "semantic_annotations" in storage
-    assert "CREATE TABLE IF NOT EXISTS learning_candidates" in storage
+    assert "CREATE TABLE learning_candidates" in schema
     assert "tools=()" in candidates
     assert "AgentLoop" not in candidates
     assert "DataToolRuntime" not in candidates
@@ -1299,15 +1301,14 @@ def test_pricing_semantics_have_one_provider_neutral_owner():
         assert provider not in pricing
 
 
-def test_state_format_migration_has_one_existing_owner():
-    storage_text = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
-    migration_owners = {
+def test_sqlite_journal_codecs_and_preledger_bridge_have_one_storage_owner():
+    pragma_owners = {
         path.relative_to(PACKAGE).as_posix()
         for path in PACKAGE.rglob("*.py")
         if "PRAGMA user_version" in path.read_text(encoding="utf-8")
-        or "_STATE_MIGRATIONS" in path.read_text(encoding="utf-8")
     }
-    assert migration_owners == {"storage/sqlite.py"}
+    assert pragma_owners == {"storage/sqlite_migrations/preledger.py"}
+    assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
 
     candidates = [PACKAGE / "loop", PACKAGE / "hosting"]
     candidates.extend(
@@ -1320,25 +1321,46 @@ def test_state_format_migration_has_one_existing_owner():
         for path in candidates
     ).lower()
     for term in (
-        "compatibility decoder",
-        "compatibility migration",
         "migration framework",
         "schema_version",
         "schema-version",
         "user_version",
+        "sqlite_migrations",
+        "sqlite_codecs",
     ):
         assert term not in text
 
-    assert not (PACKAGE / "storage" / "migrations").exists()
+    assert (PACKAGE / "storage" / "sqlite_migrations").is_dir()
+    assert (PACKAGE / "storage" / "sqlite_codecs").is_dir()
     assert not (PACKAGE / "migrations").exists()
-    assert "_STATE_MIGRATIONS" in storage_text
-    assert "_state_migration_path" in storage_text
-    for release_history_branch in (
-        "_PREVIOUS_STATE_FORMAT_VERSION",
-        "_FIRST_STATE_FORMAT_VERSION",
-        "_V3_TABLE_DEFINITIONS",
+    production = _python_text(PACKAGE)
+    for obsolete in (
+        "STATE_FORMAT_VERSION",
+        "_UNVERSIONED_STATE_FORMAT",
+        "_StateMigration",
+        "_STATE_MIGRATIONS",
+        "_state_migration_path",
+        "_unversioned_state_format",
+        "_migrate_existing_state",
+        "_migrate_v1_to_v2",
+        "_migrate_v2_to_v3",
+        "_require_current_source_records",
+        "_UNVERSIONED_STATE_SCHEMAS",
+        "_RECORD_TYPES",
+        "_ENUM_TYPES",
+        "def _pack(",
+        "def _unpack(",
+        "def _dumps(",
+        "def _loads(",
     ):
-        assert release_history_branch not in storage_text
+        assert obsolete not in production
+
+    for path in PACKAGE.rglob("*.py"):
+        relative = path.relative_to(PACKAGE).as_posix()
+        text = path.read_text(encoding="utf-8")
+        if not relative.startswith("storage/"):
+            assert "sqlite_migrations" not in text
+            assert "sqlite_codecs" not in text
 
 
 async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
@@ -1373,10 +1395,12 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "learning_candidates",
             "messages",
             "metadata",
+            "postgresql_write_admissions",
             "runs",
             "semantic_annotations",
             "snapshots",
             "sources",
+            "state_migrations",
             "syncs",
         }
         assert columns == {
@@ -1390,6 +1414,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "learning_candidates": ("agent_id", "id", "data"),
             "messages": ("run_id", "position", "data"),
             "metadata": ("key", "data"),
+            "postgresql_write_admissions": ("agent_id", "source_id"),
             "runs": (
                 "id",
                 "agent_id",
@@ -1401,6 +1426,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "semantic_annotations": ("agent_id", "id", "data"),
             "snapshots": ("agent_id", "source_id", "sync_id", "data"),
             "sources": ("agent_id", "id", "data"),
+            "state_migrations": ("ordinal", "migration_id", "checksum"),
             "syncs": ("agent_id", "id", "source_id", "data"),
         }
         assert named_indexes == {"runs_conversation_turn": "runs"}

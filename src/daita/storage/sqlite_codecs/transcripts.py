@@ -1,0 +1,499 @@
+"""Explicit SQLite codecs for transcript, message, usage, and result records."""
+
+from __future__ import annotations
+
+from ...llm.models import (
+    CanonicalMessage,
+    MessageRole,
+    ModelUsage,
+    TextBlock,
+    ToolCall,
+    ToolResultBlock,
+)
+from ...llm.pricing import (
+    CostBasis,
+    CostComponent,
+    CostEstimate,
+    CostEstimateStatus,
+    PricingModifier,
+    PricingUsageRange,
+)
+from ...loop.models import LoopExit, LoopExitKind, RunInput
+from .artifacts import (
+    decode_artifact_ref,
+    decode_delivery_receipt,
+    encode_artifact_ref,
+    encode_delivery_receipt,
+)
+from .common import (
+    JsonValue,
+    boolean,
+    datetime_decode,
+    datetime_encode,
+    decimal_decode,
+    decimal_encode,
+    dump_payload,
+    enum_decode,
+    enum_encode,
+    integer,
+    load_payload,
+    mapping,
+    optional_decimal_decode,
+    optional_decimal_encode,
+    optional_integer,
+    optional_text,
+    plain_decode,
+    plain_encode,
+    record,
+    record_fields,
+    sequence,
+    text,
+)
+
+
+def encode_run_input(value: RunInput) -> str:
+    if not isinstance(value, RunInput):
+        raise TypeError("run codec requires RunInput")
+    return dump_payload(_encode_run_input(value))
+
+
+def decode_run_input(value: str) -> RunInput:
+    return _decode_run_input(load_payload(value))
+
+
+def encode_message(value: CanonicalMessage) -> str:
+    if not isinstance(value, CanonicalMessage):
+        raise TypeError("message codec requires CanonicalMessage")
+    return dump_payload(_encode_message(value))
+
+
+def decode_message(value: str) -> CanonicalMessage:
+    return _decode_message(load_payload(value))
+
+
+def encode_loop_exit(value: LoopExit) -> str:
+    if not isinstance(value, LoopExit):
+        raise TypeError("loop-exit codec requires LoopExit")
+    return dump_payload(_encode_loop_exit(value))
+
+
+def decode_loop_exit(value: str) -> LoopExit:
+    return _decode_loop_exit(load_payload(value))
+
+
+def _encode_run_input(value: RunInput) -> dict[str, JsonValue]:
+    return record(
+        "RunInput",
+        {
+            "id": value.id,
+            "agent_id": value.agent_id,
+            "message": value.message,
+            "created_at": datetime_encode(value.created_at),
+            "conversation_id": value.conversation_id,
+            "source_id": value.source_id,
+            "conversation_source_id": value.conversation_source_id,
+        },
+    )
+
+
+def _decode_run_input(value: JsonValue) -> RunInput:
+    fields = record_fields(
+        value,
+        "RunInput",
+        ("id", "agent_id", "message", "created_at"),
+        optional={
+            "conversation_id": None,
+            "source_id": None,
+            "conversation_source_id": None,
+        },
+    )
+    return RunInput(
+        id=text(fields["id"], "run id"),
+        agent_id=text(fields["agent_id"], "run agent_id"),
+        message=text(fields["message"], "run message"),
+        created_at=datetime_decode(fields["created_at"]),
+        conversation_id=optional_text(fields["conversation_id"], "conversation id"),
+        source_id=optional_text(fields["source_id"], "run source_id"),
+        conversation_source_id=optional_text(
+            fields["conversation_source_id"], "conversation source_id"
+        ),
+    )
+
+
+def _encode_text_block(value: TextBlock) -> dict[str, JsonValue]:
+    return record("TextBlock", {"text": value.text})
+
+
+def _decode_text_block(value: JsonValue) -> TextBlock:
+    fields = record_fields(value, "TextBlock", ("text",))
+    return TextBlock(text(fields["text"], "message text"))
+
+
+def _encode_tool_call(value: ToolCall) -> dict[str, JsonValue]:
+    return record(
+        "ToolCall",
+        {
+            "id": value.id,
+            "name": value.name,
+            "arguments": plain_encode(value.arguments),
+            "provider_call_id": value.provider_call_id,
+        },
+    )
+
+
+def _decode_tool_call(value: JsonValue) -> ToolCall:
+    fields = record_fields(
+        value,
+        "ToolCall",
+        ("id", "name"),
+        optional={"arguments": {}, "provider_call_id": None},
+    )
+    arguments = plain_decode(mapping(fields["arguments"], "tool-call arguments"))
+    if not isinstance(arguments, dict):
+        raise ValueError("stored tool-call arguments are invalid")
+    return ToolCall(
+        id=text(fields["id"], "tool-call id"),
+        name=text(fields["name"], "tool-call name"),
+        arguments=arguments,
+        provider_call_id=optional_text(fields["provider_call_id"], "provider call id"),
+    )
+
+
+def _encode_tool_result(value: ToolResultBlock) -> dict[str, JsonValue]:
+    return record(
+        "ToolResultBlock",
+        {
+            "call_id": value.call_id,
+            "output": plain_encode(value.output),
+            "is_error": value.is_error,
+        },
+    )
+
+
+def _decode_tool_result(value: JsonValue) -> ToolResultBlock:
+    fields = record_fields(
+        value,
+        "ToolResultBlock",
+        ("call_id",),
+        optional={"output": {}, "is_error": False},
+    )
+    output = plain_decode(mapping(fields["output"], "tool-result output"))
+    if not isinstance(output, dict):
+        raise ValueError("stored tool-result output is invalid")
+    return ToolResultBlock(
+        call_id=text(fields["call_id"], "tool-result call_id"),
+        output=output,
+        is_error=boolean(fields["is_error"], "tool-result is_error"),
+    )
+
+
+def _encode_message(value: CanonicalMessage) -> dict[str, JsonValue]:
+    content: list[JsonValue] = []
+    for block in value.content:
+        if isinstance(block, TextBlock):
+            content.append(_encode_text_block(block))
+        elif isinstance(block, ToolResultBlock):
+            content.append(_encode_tool_result(block))
+        else:
+            raise TypeError("message contains an unsupported stored block")
+    return record(
+        "CanonicalMessage",
+        {
+            "role": enum_encode(value.role, "MessageRole"),
+            "content": content,
+            "tool_calls": [_encode_tool_call(item) for item in value.tool_calls],
+            "provider_id": value.provider_id,
+            "provider_metadata": plain_encode(value.provider_metadata),
+        },
+    )
+
+
+def _decode_message(value: JsonValue) -> CanonicalMessage:
+    fields = record_fields(
+        value,
+        "CanonicalMessage",
+        ("role",),
+        optional={
+            "content": [],
+            "tool_calls": [],
+            "provider_id": None,
+            "provider_metadata": {},
+        },
+    )
+    content: list[TextBlock | ToolResultBlock] = []
+    for item in sequence(fields["content"], "message content"):
+        if isinstance(item, dict) and item.get("__record__") == "TextBlock":
+            content.append(_decode_text_block(item))
+        elif isinstance(item, dict) and item.get("__record__") == "ToolResultBlock":
+            content.append(_decode_tool_result(item))
+        else:
+            raise ValueError("stored message content block is unsupported")
+    metadata = plain_decode(
+        mapping(fields["provider_metadata"], "message provider metadata")
+    )
+    if not isinstance(metadata, dict):
+        raise ValueError("stored message provider metadata is invalid")
+    return CanonicalMessage(
+        role=enum_decode(fields["role"], MessageRole, "MessageRole"),
+        content=tuple(content),
+        tool_calls=tuple(
+            _decode_tool_call(item)
+            for item in sequence(fields["tool_calls"], "message tool_calls")
+        ),
+        provider_id=optional_text(fields["provider_id"], "message provider_id"),
+        provider_metadata=metadata,
+    )
+
+
+def _encode_usage_range(value: PricingUsageRange) -> dict[str, JsonValue]:
+    return record(
+        "PricingUsageRange",
+        {
+            "metric": value.metric,
+            "minimum_inclusive": value.minimum_inclusive,
+            "maximum_inclusive": value.maximum_inclusive,
+        },
+    )
+
+
+def _decode_usage_range(value: JsonValue) -> PricingUsageRange:
+    fields = record_fields(
+        value,
+        "PricingUsageRange",
+        ("metric",),
+        optional={"minimum_inclusive": None, "maximum_inclusive": None},
+    )
+    return PricingUsageRange(
+        metric=text(fields["metric"], "pricing usage metric"),
+        minimum_inclusive=optional_integer(
+            fields["minimum_inclusive"], "pricing minimum"
+        ),
+        maximum_inclusive=optional_integer(
+            fields["maximum_inclusive"], "pricing maximum"
+        ),
+    )
+
+
+def _encode_modifier(value: PricingModifier) -> dict[str, JsonValue]:
+    return record(
+        "PricingModifier",
+        {"name": value.name, "multiplier": decimal_encode(value.multiplier)},
+    )
+
+
+def _decode_modifier(value: JsonValue) -> PricingModifier:
+    fields = record_fields(value, "PricingModifier", ("name", "multiplier"))
+    return PricingModifier(
+        name=text(fields["name"], "pricing modifier name"),
+        multiplier=decimal_decode(fields["multiplier"]),
+    )
+
+
+def _encode_cost_component(value: CostComponent) -> dict[str, JsonValue]:
+    return record(
+        "CostComponent",
+        {
+            "name": value.name,
+            "amount_usd": decimal_encode(value.amount_usd),
+            "basis": (
+                None if value.basis is None else enum_encode(value.basis, "CostBasis")
+            ),
+            "rate_schedule_id": value.rate_schedule_id,
+            "metric": value.metric,
+            "quantity": optional_decimal_encode(value.quantity),
+            "unit": value.unit,
+            "unit_size": value.unit_size,
+            "rate_usd": optional_decimal_encode(value.rate_usd),
+            "usage_range": (
+                None
+                if value.usage_range is None
+                else _encode_usage_range(value.usage_range)
+            ),
+            "modifiers": [_encode_modifier(item) for item in value.modifiers],
+        },
+    )
+
+
+def _decode_cost_component(value: JsonValue) -> CostComponent:
+    fields = record_fields(
+        value,
+        "CostComponent",
+        ("name", "amount_usd"),
+        optional={
+            "basis": None,
+            "rate_schedule_id": None,
+            "metric": None,
+            "quantity": None,
+            "unit": None,
+            "unit_size": None,
+            "rate_usd": None,
+            "usage_range": None,
+            "modifiers": [],
+        },
+    )
+    return CostComponent(
+        name=text(fields["name"], "cost component name"),
+        amount_usd=decimal_decode(fields["amount_usd"]),
+        basis=(
+            None
+            if fields["basis"] is None
+            else enum_decode(fields["basis"], CostBasis, "CostBasis")
+        ),
+        rate_schedule_id=optional_text(
+            fields["rate_schedule_id"], "cost rate schedule id"
+        ),
+        metric=optional_text(fields["metric"], "cost metric"),
+        quantity=optional_decimal_decode(fields["quantity"]),
+        unit=optional_text(fields["unit"], "cost unit"),
+        unit_size=optional_integer(fields["unit_size"], "cost unit size"),
+        rate_usd=optional_decimal_decode(fields["rate_usd"]),
+        usage_range=(
+            None
+            if fields["usage_range"] is None
+            else _decode_usage_range(fields["usage_range"])
+        ),
+        modifiers=tuple(
+            _decode_modifier(item)
+            for item in sequence(fields["modifiers"], "pricing modifiers")
+        ),
+    )
+
+
+def _encode_cost_estimate(value: CostEstimate) -> dict[str, JsonValue]:
+    return record(
+        "CostEstimate",
+        {
+            "amount_usd": optional_decimal_encode(value.amount_usd),
+            "status": enum_encode(value.status, "CostEstimateStatus"),
+            "basis": (
+                None if value.basis is None else enum_encode(value.basis, "CostBasis")
+            ),
+            "rate_schedule_id": value.rate_schedule_id,
+            "components": [_encode_cost_component(item) for item in value.components],
+            "code": value.code,
+        },
+    )
+
+
+def _decode_cost_estimate(value: JsonValue) -> CostEstimate:
+    fields = record_fields(
+        value,
+        "CostEstimate",
+        ("amount_usd", "status"),
+        optional={
+            "basis": None,
+            "rate_schedule_id": None,
+            "components": [],
+            "code": None,
+        },
+    )
+    return CostEstimate(
+        amount_usd=optional_decimal_decode(fields["amount_usd"]),
+        status=enum_decode(fields["status"], CostEstimateStatus, "CostEstimateStatus"),
+        basis=(
+            None
+            if fields["basis"] is None
+            else enum_decode(fields["basis"], CostBasis, "CostBasis")
+        ),
+        rate_schedule_id=optional_text(
+            fields["rate_schedule_id"], "estimate rate schedule id"
+        ),
+        components=tuple(
+            _decode_cost_component(item)
+            for item in sequence(fields["components"], "cost components")
+        ),
+        code=optional_text(fields["code"], "cost estimate code"),
+    )
+
+
+def _encode_model_usage(value: ModelUsage) -> dict[str, JsonValue]:
+    return record(
+        "ModelUsage",
+        {
+            "input_tokens": value.input_tokens,
+            "output_tokens": value.output_tokens,
+            "reasoning_tokens": value.reasoning_tokens,
+            "cache_read_tokens": value.cache_read_tokens,
+            "cache_write_tokens": value.cache_write_tokens,
+            "cost_estimate": _encode_cost_estimate(value.cost_estimate),
+        },
+    )
+
+
+def _decode_model_usage(value: JsonValue) -> ModelUsage:
+    fields = record_fields(
+        value,
+        "ModelUsage",
+        (),
+        optional={
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cost_estimate": _encode_cost_estimate(CostEstimate.unavailable()),
+        },
+    )
+    return ModelUsage(
+        input_tokens=integer(fields["input_tokens"], "input tokens"),
+        output_tokens=integer(fields["output_tokens"], "output tokens"),
+        reasoning_tokens=integer(fields["reasoning_tokens"], "reasoning tokens"),
+        cache_read_tokens=integer(fields["cache_read_tokens"], "cache read tokens"),
+        cache_write_tokens=integer(fields["cache_write_tokens"], "cache write tokens"),
+        cost_estimate=_decode_cost_estimate(fields["cost_estimate"]),
+    )
+
+
+def _encode_loop_exit(value: LoopExit) -> dict[str, JsonValue]:
+    return record(
+        "LoopExit",
+        {
+            "run_id": value.run_id,
+            "conversation_id": value.conversation_id,
+            "kind": enum_encode(value.kind, "LoopExitKind"),
+            "reason": value.reason,
+            "created_at": datetime_encode(value.created_at),
+            "final_text": value.final_text,
+            "steps": value.steps,
+            "usage": _encode_model_usage(value.usage),
+            "artifacts": [encode_artifact_ref(item) for item in value.artifacts],
+            "artifact_deliveries": [
+                encode_delivery_receipt(item) for item in value.artifact_deliveries
+            ],
+        },
+    )
+
+
+def _decode_loop_exit(value: JsonValue) -> LoopExit:
+    fields = record_fields(
+        value,
+        "LoopExit",
+        ("run_id", "conversation_id", "kind", "reason", "created_at"),
+        optional={
+            "final_text": None,
+            "steps": 0,
+            "usage": _encode_model_usage(ModelUsage()),
+            "artifacts": [],
+            "artifact_deliveries": [],
+        },
+    )
+    return LoopExit(
+        run_id=text(fields["run_id"], "loop-exit run_id"),
+        conversation_id=text(fields["conversation_id"], "loop-exit conversation_id"),
+        kind=enum_decode(fields["kind"], LoopExitKind, "LoopExitKind"),
+        reason=text(fields["reason"], "loop-exit reason"),
+        created_at=datetime_decode(fields["created_at"]),
+        final_text=optional_text(fields["final_text"], "loop-exit final text"),
+        steps=integer(fields["steps"], "loop-exit steps"),
+        usage=_decode_model_usage(fields["usage"]),
+        artifacts=tuple(
+            decode_artifact_ref(item)
+            for item in sequence(fields["artifacts"], "loop-exit artifacts")
+        ),
+        artifact_deliveries=tuple(
+            decode_delivery_receipt(item)
+            for item in sequence(
+                fields["artifact_deliveries"], "loop-exit artifact deliveries"
+            )
+        ),
+    )
