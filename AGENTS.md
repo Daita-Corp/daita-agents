@@ -185,8 +185,11 @@ apply at execution. Do not duplicate either system in a generic policy layer.
 
 `daita.storage.sqlite.SQLiteStateStore` persists only state used by the MVP:
 identity, sources, current catalog snapshots, run transcripts, and terminal
-results. The unreleased candidate intentionally has no backward-compatibility
-or schema-migration framework.
+results. It also owns the explicit local state-format marker and the finite,
+release-supported migrations needed to open the immediately preceding format.
+Migrations run atomically under the existing agent-home writer boundary and
+validate their source and target schemas; do not create a generic migration
+framework or move this ownership into hosting, the loop, or a new runtime.
 
 State mutation must remain atomic and cancellation-safe. Preserve the single
 agent-home writer boundary. Do not add event sourcing, replay projections,
@@ -218,8 +221,9 @@ Do not add or restore these mechanisms in order to implement an MVP feature:
 - background learning/review agents, memory provider registries, vector stores,
   skill activation state machines, or monitor schedulers;
 - trace trees, telemetry stores/exporters, or versioned telemetry payloads; or
-- schema/interaction versions, compatibility decoders, v1 fallbacks, or
-  migration machinery for the unreleased candidate.
+- interaction-protocol version frameworks, generic compatibility decoders,
+  root-framework v1 fallbacks, or migration machinery outside the existing
+  SQLite state-store owner.
 
 Fix a broken contract at its existing owner. Do not work around it with a
 parallel abstraction or a compatibility path to root v1.

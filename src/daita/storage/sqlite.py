@@ -51,6 +51,7 @@ from ..catalog.models import (
     SourceCatalogSnapshot,
 )
 from ..catalog.protocols import CatalogStoreError
+from ..errors import StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..learning_candidates import (
     LEARNING_CANDIDATE_MAX_RECORDS,
@@ -344,7 +345,64 @@ class DatabaseWriteReceipt:
         )
 
 
-_V1_TABLE_DEFINITIONS = {
+STATE_FORMAT_VERSION = 3
+_UNVERSIONED_STATE_FORMAT = 0
+_LEGACY_TABLE_MARKERS = frozenset(
+    {
+        "evidence",
+        "events",
+        "operations",
+        "tasks",
+    }
+)
+
+_INITIAL_STATE_TABLE_DEFINITIONS = {
+    "learning_candidates": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "messages": (
+        ("run_id", "TEXT", 1, None, 1),
+        ("position", "INTEGER", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "metadata": (
+        ("key", "TEXT", 0, None, 1),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "runs": (
+        ("id", "TEXT", 0, None, 1),
+        ("agent_id", "TEXT", 1, None, 0),
+        ("conversation_id", "TEXT", 1, None, 0),
+        ("turn_index", "INTEGER", 1, None, 0),
+        ("input", "TEXT", 1, None, 0),
+        ("result", "TEXT", 0, None, 0),
+    ),
+    "semantic_annotations": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "snapshots": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("source_id", "TEXT", 1, None, 2),
+        ("sync_id", "TEXT", 1, None, 0),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "sources": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("data", "TEXT", 1, None, 0),
+    ),
+    "syncs": (
+        ("agent_id", "TEXT", 1, None, 1),
+        ("id", "TEXT", 1, None, 2),
+        ("source_id", "TEXT", 1, None, 0),
+        ("data", "TEXT", 1, None, 0),
+    ),
+}
+_RECEIPT_STATE_TABLE_DEFINITIONS = {
     "database_write_receipts": (
         ("agent_id", "TEXT", 1, None, 1),
         ("id", "TEXT", 1, None, 2),
@@ -397,18 +455,30 @@ _V1_TABLE_DEFINITIONS = {
         ("data", "TEXT", 1, None, 0),
     ),
 }
-_V1_MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
-_V1_NAMED_INDEXES = {
+_CURRENT_STATE_TABLE_DEFINITIONS = _RECEIPT_STATE_TABLE_DEFINITIONS
+_MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
+_NAMED_INDEXES = {
     "runs_conversation_turn": (
         "runs",
         True,
         ("agent_id", "conversation_id", "turn_index"),
     )
 }
-_INCOMPATIBLE_STATE_MESSAGE = (
-    "state database is not compatible with this Daita release; "
-    "the agent home was preserved"
-)
+
+_StateSchema = Mapping[str, tuple[tuple[object, ...], ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class _StateMigration:
+    target_format: int
+    source_schema: _StateSchema
+    target_schema: _StateSchema
+    apply: Callable[[sqlite3.Connection], None]
+    validate_target: Callable[[sqlite3.Connection], None] | None = None
+
+    def __post_init__(self) -> None:
+        if self.target_format <= 0:
+            raise ValueError("migration target format must be positive")
 
 
 def _active_source_key(agent_id: str) -> str:
@@ -448,7 +518,7 @@ class _CatalogCommitGate:
 
 
 class SQLiteStateStore:
-    """One fixed-format persistence boundary for the launched v1 agent home."""
+    """Versioned persistence boundary for one admitted local agent home."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -466,12 +536,22 @@ class SQLiteStateStore:
         **_: object,
     ) -> SQLiteStateStore:
         resolved = Path(path).resolve()
-        await asyncio.to_thread(_initialize, resolved)
-        await asyncio.to_thread(
-            _recover_started_database_write_receipts,
-            resolved,
-            clock or (lambda: datetime.now(timezone.utc)),
-        )
+        resolved_clock = clock or (lambda: datetime.now(timezone.utc))
+
+        def admit() -> None:
+            _initialize(resolved)
+            _recover_started_database_write_receipts(resolved, resolved_clock)
+
+        worker = asyncio.create_task(asyncio.to_thread(admit))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+        worker.result()
+        if cancelled:
+            raise asyncio.CancelledError
         return cls(resolved)
 
     async def close(self) -> None:
@@ -988,9 +1068,25 @@ class SQLiteStateStore:
                     else:
                         current = _expect(_loads(row[0]), SourceRegistration)
                         if current != registration:
-                            raise ValueError(
-                                "source registration already exists: "
-                                f"{registration.id}"
+                            if (
+                                current.active
+                                or not registration.active
+                                or current.adapter_id != registration.adapter_id
+                                or current.native_identity
+                                != registration.native_identity
+                            ):
+                                raise ValueError(
+                                    "source registration already exists: "
+                                    f"{registration.id}"
+                                )
+                            connection.execute(
+                                """UPDATE sources SET data = ?
+                                   WHERE agent_id = ? AND id = ?""",
+                                (
+                                    _dumps(registration),
+                                    registration.agent_id,
+                                    registration.id,
+                                ),
                             )
                     selection = connection.execute(
                         "SELECT 1 FROM metadata WHERE key = ?",
@@ -2628,8 +2724,8 @@ async def _run_candidate_transaction(
 def _initialize(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
-        _validate_existing_state(path)
         os.chmod(path, 0o600)
+        _admit_existing_state(path)
         return
     with _connect(path) as connection:
         connection.executescript("""
@@ -2695,81 +2791,357 @@ def _initialize(path: Path) -> None:
             """)
         connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS runs_conversation_turn
                ON runs(agent_id, conversation_id, turn_index)""")
+        connection.execute(f"PRAGMA user_version = {STATE_FORMAT_VERSION}")
+        _require_schema(connection, _CURRENT_STATE_TABLE_DEFINITIONS)
+        _require_current_source_records(connection)
+        _require_healthy_database(connection)
     os.chmod(path, 0o600)
 
 
-def _validate_existing_state(path: Path) -> None:
+def _state_migration_path(source_format: int) -> tuple[_StateMigration, ...]:
+    if not isinstance(source_format, int) or source_format <= 0:
+        raise ValueError("migration source format must be positive")
+    path: list[_StateMigration] = []
+    visited: set[int] = set()
+    current_format = source_format
+    while current_format != STATE_FORMAT_VERSION:
+        if current_format in visited or current_format > STATE_FORMAT_VERSION:
+            raise ValueError("state migration ledger is invalid")
+        visited.add(current_format)
+        step = _STATE_MIGRATIONS.get(current_format)
+        if (
+            step is None
+            or step.target_format <= current_format
+            or step.target_format > STATE_FORMAT_VERSION
+        ):
+            raise ValueError("no complete state migration path is available")
+        path.append(step)
+        current_format = step.target_format
+    return tuple(path)
+
+
+def _unversioned_state_format(connection: sqlite3.Connection) -> int | None:
+    matches = tuple(
+        state_format
+        for state_format, schema in _UNVERSIONED_STATE_SCHEMAS
+        if _schema_matches(connection, schema)
+    )
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _admit_existing_state(path: Path) -> None:
+    found_format: int | None = None
+    migration_source_format: int | None = None
     try:
         with _connect_read_only(path) as connection:
-            tables = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            found_format = _read_state_format(connection)
+            tables = _table_names(connection)
+            if found_format > STATE_FORMAT_VERSION:
+                raise StateCompatibilityError(
+                    StateCompatibilityCode.NEWER_FORMAT,
+                    path,
+                    (
+                        f"This agent home uses state format {found_format}, but this "
+                        f"Daita release supports through format {STATE_FORMAT_VERSION}. "
+                        "Install the same or a newer Daita release. No state was changed."
+                    ),
+                    current_format=STATE_FORMAT_VERSION,
+                    found_format=found_format,
                 )
-            }
-            if tables != set(_V1_TABLE_DEFINITIONS):
-                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
-            for table, expected in _V1_TABLE_DEFINITIONS.items():
-                actual = tuple(
-                    (row[1], str(row[2]).upper(), row[3], row[4], row[5])
-                    for row in connection.execute(f"PRAGMA table_info({table})")
-                )
-                if actual != expected:
-                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+            if found_format == STATE_FORMAT_VERSION:
+                _require_schema(connection, _CURRENT_STATE_TABLE_DEFINITIONS)
+                _require_current_source_records(connection)
+                _require_healthy_database(connection)
+                return
 
-            messages_foreign_keys = tuple(
-                (row[2], row[3], row[4], row[5], row[6], row[7])
-                for row in connection.execute("PRAGMA foreign_key_list(messages)")
-            )
-            if messages_foreign_keys != _V1_MESSAGES_FOREIGN_KEYS:
-                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
-            for table in set(_V1_TABLE_DEFINITIONS) - {"messages"}:
-                if tuple(connection.execute(f"PRAGMA foreign_key_list({table})")):
-                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+            if found_format == _UNVERSIONED_STATE_FORMAT:
+                migration_source_format = _unversioned_state_format(connection)
+            elif found_format < STATE_FORMAT_VERSION:
+                migration_source_format = found_format
 
-            named_indexes = {
-                row[0]: row[1]
-                for row in connection.execute(
-                    "SELECT name, tbl_name FROM sqlite_master "
-                    "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
-                )
-            }
-            if named_indexes != {
-                name: definition[0] for name, definition in _V1_NAMED_INDEXES.items()
-            }:
-                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
-            for name, (
-                table,
-                expected_unique,
-                expected_columns,
-            ) in _V1_NAMED_INDEXES.items():
-                indexes = {
-                    row[1]: bool(row[2])
-                    for row in connection.execute(f"PRAGMA index_list({table})")
-                    if not str(row[1]).startswith("sqlite_autoindex")
-                }
-                if indexes != {name: expected_unique}:
-                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
-                columns = tuple(
-                    row[2] for row in connection.execute(f"PRAGMA index_info({name})")
-                )
-                if columns != expected_columns:
-                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+            if migration_source_format is not None:
+                try:
+                    path_to_current = _state_migration_path(migration_source_format)
+                except ValueError:
+                    path_to_current = ()
+                if path_to_current:
+                    _require_schema(connection, path_to_current[0].source_schema)
+                    _require_healthy_database(connection)
+                else:
+                    migration_source_format = None
 
-            extra_objects = tuple(
-                connection.execute(
-                    "SELECT type, name FROM sqlite_master "
-                    "WHERE type IN ('trigger', 'view') "
-                    "AND name NOT LIKE 'sqlite_%'"
-                )
-            )
-            if extra_objects:
-                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
-    except RuntimeError:
+            if migration_source_format is None:
+                if tables & _LEGACY_TABLE_MARKERS:
+                    raise StateCompatibilityError(
+                        StateCompatibilityCode.LEGACY_FORMAT,
+                        path,
+                        (
+                            "This agent home belongs to the unsupported pre-1.0 Daita "
+                            "framework. Keep it intact and use a current-format agent "
+                            "home; this release will not overwrite or partially import it."
+                        ),
+                        current_format=STATE_FORMAT_VERSION,
+                        found_format=found_format,
+                    )
+                raise _damaged_state_error(path, found_format)
+    except StateCompatibilityError:
         raise
-    except (OSError, sqlite3.Error):
-        raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE) from None
+    except (OSError, sqlite3.Error, ValueError):
+        raise _damaged_state_error(path, found_format) from None
+
+    assert found_format is not None
+    assert migration_source_format is not None
+    _migrate_existing_state(
+        path,
+        stored_format=found_format,
+        source_format=migration_source_format,
+    )
+
+
+def _migrate_existing_state(
+    path: Path,
+    *,
+    stored_format: int,
+    source_format: int,
+) -> None:
+    connection: sqlite3.Connection | None = None
+    try:
+        path_to_current = _state_migration_path(source_format)
+        connection = _connect(path)
+        connection.execute("BEGIN IMMEDIATE")
+        if _read_state_format(connection) != stored_format:
+            raise RuntimeError("state format changed during migration admission")
+        for step in path_to_current:
+            _require_schema(connection, step.source_schema)
+            _require_healthy_database(connection)
+            step.apply(connection)
+            connection.execute(f"PRAGMA user_version = {step.target_format}")
+            _require_schema(connection, step.target_schema)
+            if step.validate_target is not None:
+                step.validate_target(connection)
+            _require_healthy_database(connection)
+        if _read_state_format(connection) != STATE_FORMAT_VERSION:
+            raise RuntimeError("state migration did not reach the current format")
+        connection.commit()
+    except BaseException as error:
+        if connection is not None:
+            connection.rollback()
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise StateCompatibilityError(
+            StateCompatibilityCode.MIGRATION_FAILED,
+            path,
+            (
+                "Daita could not complete the automatic local-state upgrade. "
+                "The migration transaction was rolled back and the existing state "
+                "was preserved. Reinstall the prior working Daita package before "
+                "continuing, then report this migration failure."
+            ),
+            current_format=STATE_FORMAT_VERSION,
+            found_format=stored_format,
+        ) from None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    connection.execute("""CREATE TABLE database_write_receipts (
+               agent_id TEXT NOT NULL,
+               id TEXT NOT NULL,
+               run_id TEXT NOT NULL,
+               call_id TEXT NOT NULL,
+               data TEXT NOT NULL,
+               PRIMARY KEY(agent_id, id),
+               UNIQUE(agent_id, run_id, call_id)
+           )""")
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    rows = tuple(connection.execute("SELECT agent_id, id, data FROM sources"))
+    for agent_id, source_id, data in rows:
+        registration = _expect(_loads(data), SourceRegistration)
+        if registration.agent_id != agent_id or registration.id != source_id:
+            raise ValueError("stored source ownership is invalid")
+        if registration.adapter_id != "postgresql":
+            continue
+        write_access = registration.configuration.get("write_access", False)
+        if not isinstance(write_access, bool):
+            raise ValueError("stored PostgreSQL write_access is invalid")
+        if "write_access" in registration.configuration:
+            continue
+        migrated = replace(
+            registration,
+            configuration={
+                **dict(registration.configuration),
+                "write_access": False,
+            },
+        )
+        packed = json.loads(data)
+        if not isinstance(packed, dict):
+            raise ValueError("stored source payload is invalid")
+        fields_payload = packed.get("fields")
+        if not isinstance(fields_payload, dict):
+            raise ValueError("stored source fields are invalid")
+        configuration_payload = fields_payload.get("configuration")
+        if not isinstance(configuration_payload, dict):
+            raise ValueError("stored source configuration is invalid")
+        configuration_payload["write_access"] = False
+        migrated_data = json.dumps(packed, sort_keys=True, separators=(",", ":"))
+        if _expect(_loads(migrated_data), SourceRegistration) != migrated:
+            raise ValueError("migrated PostgreSQL source is invalid")
+        connection.execute(
+            "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
+            (migrated_data, agent_id, source_id),
+        )
+
+
+def _require_current_source_records(connection: sqlite3.Connection) -> None:
+    for agent_id, source_id, data in connection.execute(
+        "SELECT agent_id, id, data FROM sources"
+    ):
+        registration = _expect(_loads(data), SourceRegistration)
+        if registration.agent_id != agent_id or registration.id != source_id:
+            raise ValueError("stored source ownership is invalid")
+        if registration.adapter_id == "postgresql" and not isinstance(
+            registration.configuration.get("write_access"), bool
+        ):
+            raise ValueError("stored PostgreSQL write_access is invalid")
+
+
+_STATE_MIGRATIONS = {
+    1: _StateMigration(
+        target_format=2,
+        source_schema=_INITIAL_STATE_TABLE_DEFINITIONS,
+        target_schema=_RECEIPT_STATE_TABLE_DEFINITIONS,
+        apply=_migrate_v1_to_v2,
+    ),
+    2: _StateMigration(
+        target_format=3,
+        source_schema=_RECEIPT_STATE_TABLE_DEFINITIONS,
+        target_schema=_CURRENT_STATE_TABLE_DEFINITIONS,
+        apply=_migrate_v2_to_v3,
+        validate_target=_require_current_source_records,
+    ),
+}
+_UNVERSIONED_STATE_SCHEMAS = (
+    (1, _INITIAL_STATE_TABLE_DEFINITIONS),
+    (2, _RECEIPT_STATE_TABLE_DEFINITIONS),
+)
+
+
+def _read_state_format(connection: sqlite3.Connection) -> int:
+    row = connection.execute("PRAGMA user_version").fetchone()
+    if row is None or len(row) != 1 or not isinstance(row[0], int) or row[0] < 0:
+        raise sqlite3.DatabaseError("state format marker is invalid")
+    return int(row[0])
+
+
+def _table_names(connection: sqlite3.Connection) -> frozenset[str]:
+    return frozenset(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    )
+
+
+def _schema_matches(
+    connection: sqlite3.Connection,
+    definitions: Mapping[str, tuple[tuple[object, ...], ...]],
+) -> bool:
+    try:
+        _require_schema(connection, definitions)
+    except (sqlite3.Error, ValueError):
+        return False
+    return True
+
+
+def _require_schema(
+    connection: sqlite3.Connection,
+    definitions: Mapping[str, tuple[tuple[object, ...], ...]],
+) -> None:
+    if _table_names(connection) != set(definitions):
+        raise ValueError("state tables do not match the declared format")
+    for table, expected in definitions.items():
+        actual = tuple(
+            (row[1], str(row[2]).upper(), row[3], row[4], row[5])
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        )
+        if actual != expected:
+            raise ValueError(f"state table does not match its format: {table}")
+
+    messages_foreign_keys = tuple(
+        (row[2], row[3], row[4], row[5], row[6], row[7])
+        for row in connection.execute("PRAGMA foreign_key_list(messages)")
+    )
+    if messages_foreign_keys != _MESSAGES_FOREIGN_KEYS:
+        raise ValueError("state message ownership constraint is invalid")
+    for table in set(definitions) - {"messages"}:
+        if tuple(connection.execute(f"PRAGMA foreign_key_list({table})")):
+            raise ValueError(f"state table has unexpected foreign keys: {table}")
+
+    named_indexes = {
+        row[0]: row[1]
+        for row in connection.execute(
+            "SELECT name, tbl_name FROM sqlite_master "
+            "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    if named_indexes != {
+        name: definition[0] for name, definition in _NAMED_INDEXES.items()
+    }:
+        raise ValueError("state named indexes do not match the declared format")
+    for name, (table, expected_unique, expected_columns) in _NAMED_INDEXES.items():
+        indexes = {
+            row[1]: bool(row[2])
+            for row in connection.execute(f"PRAGMA index_list({table})")
+            if not str(row[1]).startswith("sqlite_autoindex")
+        }
+        if indexes != {name: expected_unique}:
+            raise ValueError(f"state index is invalid: {name}")
+        columns = tuple(
+            row[2] for row in connection.execute(f"PRAGMA index_info({name})")
+        )
+        if columns != expected_columns:
+            raise ValueError(f"state index columns are invalid: {name}")
+
+    extra_objects = tuple(
+        connection.execute(
+            "SELECT type, name FROM sqlite_master "
+            "WHERE type IN ('trigger', 'view') AND name NOT LIKE 'sqlite_%'"
+        )
+    )
+    if extra_objects:
+        raise ValueError("state database has unexpected triggers or views")
+
+
+def _require_healthy_database(connection: sqlite3.Connection) -> None:
+    quick_check = connection.execute("PRAGMA quick_check(1)").fetchone()
+    if quick_check != ("ok",):
+        raise ValueError("state database integrity check failed")
+    if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise ValueError("state database foreign-key check failed")
+
+
+def _damaged_state_error(
+    path: Path,
+    found_format: int | None,
+) -> StateCompatibilityError:
+    return StateCompatibilityError(
+        StateCompatibilityCode.DAMAGED,
+        path,
+        (
+            "This agent state database is damaged or does not match its declared "
+            "Daita format. No state was changed. Run the matching Daita release's "
+            "diagnostics or restore the database through your normal recovery process."
+        ),
+        current_format=STATE_FORMAT_VERSION,
+        found_format=found_format,
+    )
 
 
 def _recover_started_database_write_receipts(
@@ -2813,7 +3185,7 @@ def _recover_started_database_write_receipts(
     except RuntimeError:
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError):
-        raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE) from None
+        raise _damaged_state_error(path, STATE_FORMAT_VERSION) from None
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -2966,4 +3338,9 @@ def _expect(value: object, expected: type[Any]) -> Any:
     return value
 
 
-__all__ = ["SQLiteStateStore"]
+__all__ = [
+    "STATE_FORMAT_VERSION",
+    "SQLiteStateStore",
+    "StateCompatibilityCode",
+    "StateCompatibilityError",
+]

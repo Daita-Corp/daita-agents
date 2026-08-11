@@ -1,8 +1,11 @@
 """Managed-installer lifecycle smoke against one already-built candidate wheel.
 
 The smoke renders deterministic immutable download fixtures into the canonical
-``scripts/install.sh`` source. It does not claim public artifact, clean-machine,
-or real-terminal evidence and it never contacts the public installer endpoint.
+``scripts/install.sh`` source. With a baseline wheel, it creates agent state
+under that package, installs the distinct candidate artifact (including during
+same-package-version release development), and opens the state to certify its
+format migration. It does not claim public artifact, clean-machine, or
+real-terminal evidence and it never contacts the public installer endpoint.
 
 By default, uv and Python are deterministic local fixtures. Supplying the five
 ``--real-*`` arguments instead consumes an already-downloaded official uv
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import subprocess
 import tempfile
 from pathlib import Path
@@ -51,10 +55,7 @@ def _arguments() -> argparse.Namespace:
         parser.error("all five --real-* bootstrap arguments are required together")
     candidate = arguments.candidate_wheel.resolve(strict=True)
     _, candidate_version, _ = wheel_metadata(candidate)
-    if candidate_version == "1.0.0":
-        if arguments.baseline_wheel is not None:
-            parser.error("Daita 1.0.0 is candidate-only; 0.x is not a valid baseline")
-    elif arguments.baseline_wheel is None:
+    if candidate_version != "1.0.0" and arguments.baseline_wheel is None:
         parser.error("later 1.x candidates require --baseline-wheel")
     return arguments
 
@@ -118,6 +119,29 @@ def _tree_hashes(root: Path) -> dict[str, str]:
         for path in sorted(root.rglob("*"), key=lambda item: item.as_posix())
         if path.is_file() and not path.is_symlink()
     }
+
+
+def _without_state_databases(values: dict[str, str]) -> dict[str, str]:
+    return {
+        name: digest
+        for name, digest in values.items()
+        if not name.endswith("/state.db") and "/run/" not in f"/{name}"
+    }
+
+
+def _database_rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
+    with sqlite3.connect(path) as connection:
+        tables = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        )
+        return {
+            table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
+            for table in tables
+        }
 
 
 def _current_generation(root: Path) -> Path:
@@ -194,12 +218,9 @@ def main() -> int:
             baseline_name, baseline_version, _ = wheel_metadata(baseline)
             if baseline_name != "daita-agents":
                 raise AssertionError("baseline is not a daita-agents wheel")
-            if (
-                baseline_version.startswith("0.")
-                or baseline_version == candidate_version
-            ):
+            if baseline_version.startswith("0.") or baseline == candidate:
                 raise AssertionError(
-                    "cross-version smoke requires a distinct supported 1.x baseline"
+                    "upgrade smoke requires a distinct supported 1.x baseline wheel"
                 )
             baseline_fixture = _create_fixture(
                 workspace / "baseline-fixture",
@@ -241,6 +262,8 @@ def main() -> int:
         artifact = agent_root / "preserved-artifact.csv"
         artifact.write_text("id,value\n1,preserved\n", encoding="utf-8")
         expected_agent_hashes = _tree_hashes(agent_root)
+        state_path = agent_root / "agents" / "preservation-agent" / "state.db"
+        expected_database_rows = _database_rows(state_path)
 
         if arguments.baseline_wheel is not None:
             _run(
@@ -260,6 +283,50 @@ def main() -> int:
         help_result = _run([str(launcher), "--help"], env=environment)
         if "usage: daita" not in help_result.stdout:
             raise AssertionError("managed launcher help is unavailable")
+
+        _run(
+            [
+                str(launcher),
+                "--root",
+                str(agent_root),
+                "sources",
+                "preservation-agent",
+            ],
+            env=environment,
+        )
+        opened_agent_hashes = _tree_hashes(agent_root)
+        if arguments.baseline_wheel is None:
+            if opened_agent_hashes != expected_agent_hashes:
+                raise AssertionError("current-format managed open changed agent state")
+        else:
+            if _without_state_databases(
+                opened_agent_hashes
+            ) != _without_state_databases(expected_agent_hashes):
+                before_files = _without_state_databases(expected_agent_hashes)
+                after_files = _without_state_databases(opened_agent_hashes)
+                changed = sorted(
+                    name
+                    for name in set(before_files) | set(after_files)
+                    if before_files.get(name) != after_files.get(name)
+                )
+                raise AssertionError(
+                    "managed candidate open changed state outside the migrated database: "
+                    + ", ".join(changed)
+                )
+            migrated_rows = _database_rows(state_path)
+            if any(
+                migrated_rows.get(table) != rows
+                for table, rows in expected_database_rows.items()
+            ):
+                raise AssertionError(
+                    "managed candidate migration changed baseline-owned rows"
+                )
+            with sqlite3.connect(state_path) as connection:
+                if connection.execute("PRAGMA user_version").fetchone() != (2,):
+                    raise AssertionError(
+                        "managed candidate did not admit the current state format"
+                    )
+            expected_agent_hashes = opened_agent_hashes
 
         generation = _current_generation(managed_root)
         manifest = _manifest(generation / "manifest")

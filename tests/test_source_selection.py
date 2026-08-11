@@ -4,6 +4,8 @@ import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 
+import pytest
+
 from daita import Agent, LocalDirectorySource, SQLiteSource
 from daita.llm.models import (
     FinishReason,
@@ -72,6 +74,29 @@ async def test_selected_source_persists_and_detach_falls_back_to_the_only_source
         assert await reopened.active_source() == first
     finally:
         await reopened.close()
+
+
+async def test_detached_source_can_be_attached_again(tmp_path: Path):
+    database = tmp_path / "reattach.sqlite"
+    _database(database, "records")
+    agent = await Agent.create("source-reattach", root=tmp_path)
+    try:
+        original = await agent.attach(SQLiteSource(database, name="Original"))
+        detached = await agent.detach(original.id)
+
+        reattached = await agent.attach(SQLiteSource(database, name="Reattached"))
+
+        assert reattached.id == original.id
+        assert reattached.active
+        assert reattached.display_name == "Reattached"
+        assert detached.detached_at is not None
+        assert await agent.active_source() == reattached
+        assert await agent.list_sources() == (reattached,)
+        assert len(await agent.list_catalog_resources(source_id=reattached.id)) == 1
+        with pytest.raises(ValueError, match="source registration already exists"):
+            await agent.attach(SQLiteSource(database, name="Duplicate"))
+    finally:
+        await agent.close()
 
 
 async def test_one_run_override_keeps_conversation_source_and_history_isolated(

@@ -44,6 +44,11 @@ _SLASH_COMMAND_COMPLETIONS = (
         "/source detach <source>",
         "Detach a source and delete its Daita-owned credential",
     ),
+    (
+        "/source config",
+        "/source config",
+        "Configure PostgreSQL write admission through a guided safety check",
+    ),
     ("/catalog", "/catalog", "Show the current catalog summary"),
     ("/settings", "/settings", "Show agent and model settings"),
     ("/new", "/new", "Start a new conversation"),

@@ -1,4 +1,5 @@
 import ast
+import inspect
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -105,6 +106,7 @@ def test_public_surface_is_focused():
         "ModelRoute",
         "ModelRouteCandidate",
         "PostgreSQLSource",
+        "PostgreSQLUpdateReadiness",
         "RetryPolicy",
         "ResourceRevisionBinding",
         "SQLiteSource",
@@ -557,6 +559,66 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         ).read_text(encoding="utf-8")
     finally:
         await agent.close()
+
+
+def test_database_write_phase_four_control_plane_keeps_current_owners():
+    agent_methods = _class_methods(PACKAGE / "agent.py", "Agent")
+    embedded_methods = _class_methods(
+        PACKAGE / "hosting" / "embedded.py",
+        "EmbeddedAgent",
+    )
+    backend_methods = _class_methods(
+        PACKAGE / "adapters" / "postgresql_write.py",
+        "PostgreSQLUpdatePreviewBackend",
+    )
+    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+        encoding="utf-8"
+    )
+    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    cli = (PACKAGE / "cli.py").read_text(encoding="utf-8")
+    terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
+    terminal_shell = (PACKAGE / "tui" / "shell.py").read_text(encoding="utf-8")
+
+    assert "postgresql_update_readiness" in agent_methods
+    assert "postgresql_update_readiness" in embedded_methods
+    assert "postgresql_update_readiness" in backend_methods
+    assert _class_owners("PostgreSQLUpdateReadiness") == {
+        "adapters/postgresql_write.py"
+    }
+    assert "postgresql_update_readiness" not in controller
+    assert "postgresql_update_readiness" not in context
+    assert ".postgresql_update_readiness(" in cli
+    assert ".postgresql_update_readiness(" in terminal
+    assert "set_source_write_access" in cli
+    assert "set_source_write_access" in terminal
+    assert '"/source config"' in terminal
+    assert '"/source config"' in terminal_shell
+    for obsolete_terminal_command in (
+        "/source write inspect",
+        "/source write enable",
+        "/source write disable",
+        "/source write readiness",
+    ):
+        assert obsolete_terminal_command not in terminal
+        assert obsolete_terminal_command not in terminal_shell
+    assert (
+        "write_access"
+        not in inspect.signature(daita.Agent.attach_postgresql).parameters
+    )
+    production = _python_text(PACKAGE)
+    for administration in (
+        "CREATE ROLE daita_writer",
+        "GRANT CONNECT ON DATABASE",
+        "administrator_password",
+    ):
+        assert administration not in production
+    for later_phase in (
+        "data_insert_postgresql",
+        "data_delete_postgresql",
+        "execute_postgresql_sql",
+        "reconcile_database_write",
+    ):
+        assert later_phase not in production
 
 
 def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
@@ -1237,8 +1299,17 @@ def test_pricing_semantics_have_one_provider_neutral_owner():
         assert provider not in pricing
 
 
-def test_new_mvp_owners_have_no_version_or_compatibility_framework():
-    candidates = [PACKAGE / "loop", PACKAGE / "hosting", PACKAGE / "storage"]
+def test_state_format_migration_has_one_existing_owner():
+    storage_text = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    migration_owners = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if "PRAGMA user_version" in path.read_text(encoding="utf-8")
+        or "_STATE_MIGRATIONS" in path.read_text(encoding="utf-8")
+    }
+    assert migration_owners == {"storage/sqlite.py"}
+
+    candidates = [PACKAGE / "loop", PACKAGE / "hosting"]
     candidates.extend(
         path
         for path in (PACKAGE / "memory", PACKAGE / "skills", PACKAGE / "observation.py")
@@ -1254,8 +1325,20 @@ def test_new_mvp_owners_have_no_version_or_compatibility_framework():
         "migration framework",
         "schema_version",
         "schema-version",
+        "user_version",
     ):
         assert term not in text
+
+    assert not (PACKAGE / "storage" / "migrations").exists()
+    assert not (PACKAGE / "migrations").exists()
+    assert "_STATE_MIGRATIONS" in storage_text
+    assert "_state_migration_path" in storage_text
+    for release_history_branch in (
+        "_PREVIOUS_STATE_FORMAT_VERSION",
+        "_FIRST_STATE_FORMAT_VERSION",
+        "_V3_TABLE_DEFINITIONS",
+    ):
+        assert release_history_branch not in storage_text
 
 
 async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):

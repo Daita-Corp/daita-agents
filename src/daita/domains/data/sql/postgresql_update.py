@@ -284,6 +284,66 @@ class PostgreSQLUpdateValidationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidatedPostgreSQLUpdateScope:
+    """Catalog-bound resource and assignment columns for readiness checks."""
+
+    source_id: str
+    resource_id: str
+    resource_name: str
+    schema_name: str
+    relation_name: str
+    source_revision: str
+    resource_revision: str
+    primary_key_column: str
+    assignment_columns: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.source_id, "readiness source_id"),
+            (self.resource_id, "readiness resource_id"),
+            (self.resource_name, "readiness resource_name"),
+            (self.schema_name, "readiness schema_name"),
+            (self.relation_name, "readiness relation_name"),
+            (self.source_revision, "readiness source_revision"),
+            (self.resource_revision, "readiness resource_revision"),
+            (self.primary_key_column, "readiness primary_key_column"),
+        ):
+            if not isinstance(value, str) or not value or "\x00" in value:
+                raise ValueError(f"{name} must be bounded non-empty text")
+        assignment_columns = tuple(self.assignment_columns)
+        if (
+            not 1 <= len(assignment_columns) <= POSTGRESQL_UPDATE_MAX_ASSIGNMENTS
+            or len(assignment_columns) != len(set(assignment_columns))
+            or any(
+                not isinstance(column, str)
+                or not column
+                or len(column) > 256
+                or "\x00" in column
+                for column in assignment_columns
+            )
+        ):
+            raise ValueError("readiness assignment columns are invalid")
+        object.__setattr__(self, "assignment_columns", assignment_columns)
+
+
+@dataclass(frozen=True, slots=True)
+class PostgreSQLUpdateScopeValidationResult:
+    valid: bool
+    validated: ValidatedPostgreSQLUpdateScope | None
+    issues: tuple[SqlValidationIssue, ...]
+
+    def __post_init__(self) -> None:
+        issues = tuple(self.issues)
+        if self.valid != (self.validated is not None and not issues):
+            raise ValueError("update readiness validation state is inconsistent")
+        object.__setattr__(self, "issues", issues)
+
+    @property
+    def issue_codes(self) -> tuple[str, ...]:
+        return tuple(issue.code for issue in self.issues)
+
+
+@dataclass(frozen=True, slots=True)
 class PostgreSQLUpdateStatement:
     sql: str
     parameters: tuple[object, ...]
@@ -294,6 +354,140 @@ class PostgreSQLUpdateStatement:
             raise ValueError("generated update SQL must be non-empty text")
         _require_sha256(self.statement_sha256, "statement_sha256")
         object.__setattr__(self, "parameters", tuple(self.parameters))
+
+
+def validate_postgresql_update_scope(
+    source_id: str,
+    resource_id: str,
+    assignment_columns: tuple[str, ...],
+    *,
+    resources: Iterable[ResourceSchema],
+) -> PostgreSQLUpdateScopeValidationResult:
+    """Resolve a value-free update-readiness scope from current catalog truth."""
+
+    if not isinstance(source_id, str) or not isinstance(resource_id, str):
+        raise TypeError("readiness source and resource identities must be text")
+    if not isinstance(assignment_columns, tuple):
+        raise TypeError("assignment_columns must be a tuple")
+    current = tuple(resources)
+    if any(not isinstance(item, ResourceSchema) for item in current):
+        raise TypeError("resources must contain ResourceSchema records")
+    if (
+        _CANONICAL_SOURCE_ID.fullmatch(source_id) is None
+        or _CANONICAL_RESOURCE_ID.fullmatch(resource_id) is None
+    ):
+        return _invalid_postgresql_update_scope(
+            "write_resource_not_writable",
+            "Readiness requires exact canonical source and resource identifiers.",
+        )
+    if (
+        not 1 <= len(assignment_columns) <= POSTGRESQL_UPDATE_MAX_ASSIGNMENTS
+        or len(assignment_columns) != len(set(assignment_columns))
+        or any(
+            not isinstance(column, str)
+            or not column
+            or len(column) > 256
+            or "\x00" in column
+            for column in assignment_columns
+        )
+    ):
+        return _invalid_postgresql_update_scope(
+            "write_assignment_invalid",
+            "Readiness assignment columns must be one through 32 distinct names.",
+        )
+    resource = next(
+        (
+            item
+            for item in current
+            if item.source_id == source_id and item.resource_id == resource_id
+        ),
+        None,
+    )
+    if (
+        resource is None
+        or resource.resource_kind != "table"
+        or not resource.writable
+        or resource.revision is None
+        or resource.source_revision is None
+    ):
+        return _invalid_postgresql_update_scope(
+            "write_resource_not_writable",
+            "The selected resource is not a current cataloged base table.",
+        )
+    qualified = next(
+        (
+            alias.partition(".")
+            for alias in resource.aliases
+            if "." in alias and "\x00" not in alias
+        ),
+        None,
+    )
+    if (
+        qualified is None
+        or not qualified[0]
+        or not qualified[1]
+        or not qualified[2]
+        or qualified[2] != resource.name
+        or len(qualified[0]) > 256
+        or len(qualified[2]) > 256
+    ):
+        return _invalid_postgresql_update_scope(
+            "write_resource_not_writable",
+            "The selected resource lacks exact PostgreSQL relation identity.",
+        )
+    if len(resource.primary_key_columns) != 1:
+        return _invalid_postgresql_update_scope(
+            "write_primary_key_required",
+            "PostgreSQL update readiness requires one single-column primary key.",
+        )
+    primary_key = resource.primary_key_columns[0]
+    columns = set(resource.columns)
+    forbidden = set(resource.identity_columns) | set(resource.generated_columns)
+    updatable = set(resource.updatable_columns)
+    if any(
+        column not in columns
+        or column == primary_key
+        or column in forbidden
+        or column not in updatable
+        for column in assignment_columns
+    ):
+        return _invalid_postgresql_update_scope(
+            "write_assignment_invalid",
+            "Readiness references an unknown or non-updatable catalog column.",
+        )
+    type_by_column = {
+        column: (namespace, name)
+        for column, namespace, name in resource.column_type_provenance
+    }
+    nullable_by_column = dict(resource.column_nullability)
+    required_columns = (primary_key, *assignment_columns)
+    if nullable_by_column.get(primary_key) is not False or any(
+        nullable_by_column.get(column) is None
+        or type_by_column.get(column, (None, None))[0] != "pg_catalog"
+        or type_by_column.get(column, (None, None))[1] not in _POSTGRESQL_UPDATE_TYPES
+        for column in required_columns
+    ):
+        return _invalid_postgresql_update_scope(
+            "write_assignment_invalid",
+            "The catalog lacks admitted update type or nullability provenance.",
+        )
+    order = {column: index for index, column in enumerate(resource.columns)}
+    ordered_assignments = tuple(sorted(assignment_columns, key=order.__getitem__))
+    return PostgreSQLUpdateScopeValidationResult(
+        True,
+        ValidatedPostgreSQLUpdateScope(
+            source_id=source_id,
+            resource_id=resource_id,
+            resource_name=f"{qualified[0]}.{qualified[2]}",
+            schema_name=qualified[0],
+            relation_name=qualified[2],
+            source_revision=resource.source_revision,
+            resource_revision=resource.revision,
+            primary_key_column=primary_key,
+            assignment_columns=ordered_assignments,
+        ),
+        (),
+    )
 
 
 def validate_postgresql_update_intent(
@@ -617,6 +811,17 @@ def _invalid_postgresql_update(
     message: str,
 ) -> PostgreSQLUpdateValidationResult:
     return PostgreSQLUpdateValidationResult(
+        False,
+        None,
+        (SqlValidationIssue(code, message),),
+    )
+
+
+def _invalid_postgresql_update_scope(
+    code: str,
+    message: str,
+) -> PostgreSQLUpdateScopeValidationResult:
+    return PostgreSQLUpdateScopeValidationResult(
         False,
         None,
         (SqlValidationIssue(code, message),),

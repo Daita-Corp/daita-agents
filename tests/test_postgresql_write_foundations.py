@@ -8,10 +8,14 @@ import pytest
 
 from daita import Agent, PostgreSQLSource
 from daita.adapters import postgresql as postgresql_module
-from daita.adapters.models import DiscoveryRequest, SourceRegistration
+from daita.adapters.models import DiscoveryRequest, DiscoveryResult, SourceRegistration
+from daita.capabilities import ExtensionDeclarations
 from daita.catalog.models import (
     CatalogFacet,
+    CatalogSync,
+    CatalogSyncStatus,
     ResourceKind,
+    SourceCatalogSnapshot,
     TabularColumn,
     TabularFacet,
 )
@@ -178,6 +182,93 @@ async def test_enabled_source_write_access_round_trips_through_agent_reopen(tmp_
         assert reconstructed.write_access is True
     finally:
         await reopened.close()
+
+
+@pytest.mark.parametrize("write_access", (None, True))
+async def test_postgresql_refresh_preserves_the_exact_persisted_registration(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_access: bool | None,
+):
+    agent = await Agent.create(
+        f"postgresql-refresh-{write_access}",
+        root=tmp_path,
+        clock=lambda: NOW,
+    )
+    registration = _registration(agent.id, write_access=write_access)
+    await agent._embedded._store.register_source(registration)
+    canonical = replace(
+        registration,
+        configuration={
+            **dict(registration.configuration),
+            "write_access": False if write_access is None else write_access,
+        },
+    )
+    closed = False
+
+    class _Adapter:
+        @property
+        def registration(self) -> SourceRegistration:
+            return canonical
+
+        def declarations(self) -> ExtensionDeclarations:
+            return ExtensionDeclarations()
+
+        async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
+            sync = CatalogSync(
+                id=request.sync_id,
+                agent_id=request.agent_id,
+                source_id=request.source_id,
+                adapter_id="postgresql",
+                status=CatalogSyncStatus.SUCCEEDED,
+                started_at=request.requested_at,
+                completed_at=NOW,
+                source_revision="catalog:sha256:" + "a" * 64,
+            )
+            return DiscoveryResult(
+                request=request,
+                snapshot=SourceCatalogSnapshot(
+                    sync=sync,
+                    resources=(),
+                    revisions=(),
+                ),
+                completed_at=NOW,
+            )
+
+        async def inspect(self, resource):
+            raise AssertionError("refresh must not inspect individual resources")
+
+        async def health(self):
+            raise AssertionError("refresh must not run a separate health check")
+
+        async def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    async def open_source(
+        source: PostgreSQLSource,
+        *,
+        agent_id: str,
+        attached_at: datetime,
+        clock,
+    ) -> _Adapter:
+        del clock
+        assert source.write_access is (False if write_access is None else write_access)
+        assert agent_id == agent.id
+        assert attached_at == registration.attached_at
+        return _Adapter()
+
+    monkeypatch.setattr(PostgreSQLSource, "open", open_source)
+    try:
+        refreshed = await agent.refresh_source(registration.id)
+        assert refreshed == registration
+        assert (
+            await agent._embedded._store.load_source(agent.id, registration.id)
+            == registration
+        )
+        assert closed is True
+    finally:
+        await agent.close()
 
 
 def test_postgresql_discovery_projects_write_relevant_column_facts():
@@ -372,9 +463,15 @@ async def test_write_access_projects_only_the_postgresql_preview_and_update_tool
             definition.name
             for definition in await agent._embedded._data_tool_runtime.definitions(run)
         }
+        await agent.set_source_write_access(registration.id, False)
+        disabled = {
+            definition.name
+            for definition in await agent._embedded._data_tool_runtime.definitions(run)
+        }
         assert {preview, update}.isdisjoint(before)
         assert forbidden.isdisjoint(after)
         assert {preview, update}.issubset(after)
         assert after == before | {preview, update}
+        assert disabled == before
     finally:
         await agent.close()

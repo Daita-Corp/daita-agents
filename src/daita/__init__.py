@@ -2,6 +2,7 @@
 
 from .adapters import LocalDirectorySource, PostgreSQLSource, SQLiteSource
 from .agent import Agent
+from .adapters.postgresql_write import PostgreSQLUpdateReadiness
 from .artifacts import (
     ArtifactDeliveryReceipt,
     ArtifactDestination,
@@ -84,6 +85,7 @@ __all__ = [
     "ModelRoute",
     "ModelRouteCandidate",
     "PostgreSQLSource",
+    "PostgreSQLUpdateReadiness",
     "RetryPolicy",
     "ResourceRevisionBinding",
     "SQLiteSource",

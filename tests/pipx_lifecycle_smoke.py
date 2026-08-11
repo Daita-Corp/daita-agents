@@ -4,9 +4,9 @@ Run from the repository root:
 
     .venv/bin/python tests/pipx_lifecycle_smoke.py
 
-Version 1.0.0 has no predecessor, so pass its once-built candidate wheel and
-exercise install, reinstall, and uninstall through ``pipx install``,
-``pipx reinstall``, and ``pipx uninstall``:
+To exercise install, reinstall, and uninstall for one wheel, pass its
+once-built artifact through ``pipx install``, ``pipx reinstall``, and
+``pipx uninstall``:
 
     .venv/bin/python tests/pipx_lifecycle_smoke.py \
         --candidate-wheel /path/to/candidate.whl
@@ -19,11 +19,13 @@ pass the immediately preceding wheel and the candidate wheel:
         --baseline-wheel /path/to/previous.whl \
         --candidate-wheel /path/to/candidate.whl
 
-The two-wheel procedure installs the baseline, creates real agent state, then
-force-installs the candidate into the same isolated pipx environment and opens
-the baseline-created state with it. Pip may read a configured package index to
-resolve declared dependencies; the procedure never changes an index or uploads
-an artifact.
+The two-wheel procedure installs an actual prior build, creates real agent
+state, then force-installs the candidate into the same isolated pipx
+environment and opens the prior-build state with it. The wheels may have the
+same package version when certifying a state-format change made during release
+development; they must still be distinct artifacts. Pip may read a configured
+package index to resolve declared dependencies; the procedure never changes an
+index or uploads an artifact.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ import hashlib
 import importlib.util
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -104,6 +107,25 @@ def _home_hashes(home: Path) -> dict[str, str]:
         )
     )
     return {path.relative_to(home).as_posix(): _sha256(path) for path in paths}
+
+
+def _without_state_database(values: dict[str, str]) -> dict[str, str]:
+    return {name: digest for name, digest in values.items() if name != "state.db"}
+
+
+def _database_rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
+    with sqlite3.connect(path) as connection:
+        tables = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        )
+        return {
+            table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
+            for table in tables
+        }
 
 
 def _wheel_version(path: Path) -> str:
@@ -304,6 +326,8 @@ from daita.llm.providers.mock import MockModelProvider
 
 async def main():
     root = Path(sys.argv[1])
+    export_directory = root / "upgrade-exports"
+    export_directory.mkdir()
     source_path = root / "upgrade-source.sqlite"
     with sqlite3.connect(source_path) as connection:
         connection.execute(
@@ -314,7 +338,23 @@ async def main():
         )
 
     provider = MockModelProvider(
-        (ModelResponse(finish_reason=FinishReason.STOP, text="Baseline answer."),),
+        (
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="upgrade-artifact-create",
+                        name="artifact_create_document",
+                        arguments={
+                            "format": "txt",
+                            "filename": "upgrade-notes.txt",
+                            "content": "Artifact created by the baseline package.\\n",
+                        },
+                    ),
+                ),
+            ),
+            ModelResponse(finish_reason=FinishReason.STOP, text="Baseline answer."),
+        ),
         provider_id="mock:upgrade-baseline",
     )
     profile = ModelProfile(
@@ -333,6 +373,7 @@ async def main():
         SQLiteSource(source_path, name="Upgrade source")
     )
     run = await agent.run("Remember the baseline upgrade run.")
+    export_destination = await agent.set_export_destination(export_directory)
     await agent.set_memory("Fiscal year begins in February.\\n")
     await agent.set_user_profile("Prefer concise upgrade reports.\\n")
     await agent.save_skill(
@@ -398,7 +439,9 @@ async def main():
     )
     expectations = {
         "agent_id": agent.id,
+        "artifact_id": run.artifacts[0].artifact_id,
         "conversation_id": run.conversation_id,
+        "export_destination_id": export_destination.destination_id,
         "resource_id": resource.id,
         "run_id": run.run_id,
         "source_id": registration.id,
@@ -459,11 +502,13 @@ asyncio.run(main())
             preserved_home / "config.json",
             preserved_home / "MEMORY.md",
             preserved_home / "USER.md",
+            preserved_home / "artifacts" / "delivery-config.json",
             preserved_home / "skills" / "upgrade-check" / "SKILL.md",
         )
         if not all(path.is_file() for path in preserved_paths):
             raise AssertionError("installed daita did not create a real agent home")
         preserved_hashes = _home_hashes(preserved_home)
+        preserved_database_rows = _database_rows(preserved_home / "state.db")
         inspect_state = """
 import asyncio
 import json
@@ -487,13 +532,18 @@ async def main():
     semantics = await agent.list_semantic_annotations()
     candidates = await agent.list_learning_candidates()
     active = await agent.active_source()
+    artifact = await agent.read_artifact(expected["artifact_id"])
+    export_destination = await agent.export_destination()
     projection = {
         "active_source_id": None if active is None else active.id,
         "agent_id": agent.id,
+        "artifact_content": artifact.content.decode("utf-8"),
+        "artifact_id": artifact.ref.artifact_id,
         "candidate_ids": [item.candidate.id for item in candidates],
         "catalog_relationship_count": summary.relationship_count,
         "catalog_resource_count": summary.resource_count,
         "conversation_run_ids": [item.transcript.run.id for item in runs],
+        "export_destination_id": export_destination.destination_id,
         "memory": await agent.read_memory(),
         "model_provider_id": agent.model_route.candidates[0].provider_id,
         "run_answer": transcript.run.message,
@@ -610,6 +660,10 @@ assert any(item.startswith("XlsxWriter") for item in requirements)
             cwd=outside_checkout,
             env=environment,
         )
+        if _home_hashes(preserved_home) != preserved_hashes:
+            raise AssertionError(
+                "package replacement mutated agent state before candidate open"
+            )
         _run(
             [
                 str(command),
@@ -647,10 +701,45 @@ assert any(item.startswith("XlsxWriter") for item in requirements)
             raise AssertionError(
                 "candidate did not preserve the baseline agent's logical state"
             )
-        if _home_hashes(preserved_home) != preserved_hashes:
+        migrated_hashes = _home_hashes(preserved_home)
+        if _without_state_database(migrated_hashes) != _without_state_database(
+            preserved_hashes
+        ):
             raise AssertionError(
-                "package replacement changed Daita-created agent state"
+                "candidate open changed agent state outside the migrated database"
             )
+        migrated_database_rows = _database_rows(preserved_home / "state.db")
+        if any(
+            migrated_database_rows.get(table) != rows
+            for table, rows in preserved_database_rows.items()
+        ):
+            raise AssertionError(
+                "candidate migration changed rows owned by the baseline format"
+            )
+        state_format_check = """
+import sqlite3
+import sys
+from pathlib import Path
+
+from daita.storage.sqlite import STATE_FORMAT_VERSION
+
+
+path = Path(sys.argv[1]) / "agents" / "preservation-agent" / "state.db"
+with sqlite3.connect(path) as connection:
+    state_format = connection.execute("PRAGMA user_version").fetchone()[0]
+assert state_format == STATE_FORMAT_VERSION
+"""
+        _run(
+            [
+                str(installed_python),
+                "-I",
+                "-c",
+                state_format_check,
+                str(separate_agent_home),
+            ],
+            cwd=outside_checkout,
+            env=environment,
+        )
         append_state = """
 import asyncio
 import json

@@ -40,6 +40,7 @@ from .artifacts.models import (
     artifact_destination_to_mapping,
     artifact_ref_to_mapping,
 )
+from .errors import StateCompatibilityError
 from .learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
     learning_candidate_content_to_mapping,
@@ -184,6 +185,43 @@ def build_parser() -> argparse.ArgumentParser:
 
     sources = commands.add_parser("sources", help="list attached sources")
     sources.add_argument("name")
+
+    write_access = commands.add_parser(
+        "source-write-access",
+        help="inspect or change one PostgreSQL source write-admission flag",
+    )
+    write_access_commands = write_access.add_subparsers(
+        dest="source_write_access_command",
+        required=True,
+    )
+    for command in ("inspect", "enable", "disable"):
+        action = write_access_commands.add_parser(command)
+        action.add_argument("name")
+        action.add_argument("source_id")
+        if command == "enable":
+            action.add_argument(
+                "--yes",
+                action="store_true",
+                help=(
+                    "confirm exact-source Daita admission; PostgreSQL privileges "
+                    "are unchanged"
+                ),
+            )
+
+    readiness = commands.add_parser(
+        "postgresql-update-readiness",
+        help="inspect one resource and assignment-column update scope",
+    )
+    readiness.add_argument("name")
+    readiness.add_argument("source_id")
+    readiness.add_argument("resource_id")
+    readiness.add_argument(
+        "--assignment-column",
+        action="append",
+        dest="assignment_columns",
+        required=True,
+        help="exact catalog column proposed for assignment; repeat as needed",
+    )
 
     detach = commands.add_parser("detach", help="detach a source")
     detach.add_argument("name")
@@ -1364,6 +1402,55 @@ async def _execute(args: argparse.Namespace) -> object:
                 "source_id": registration.id,
                 "adapter": registration.adapter_id,
                 "name": registration.display_name,
+                "write_access": registration.configuration.get("write_access", False),
+            }
+        if args.command == "source-write-access":
+            sources = await agent.list_sources()
+            selected = next(
+                (source for source in sources if source.id == args.source_id),
+                None,
+            )
+            if selected is None or selected.adapter_id != "postgresql":
+                raise ValueError(
+                    "write admission requires one exact PostgreSQL source for this agent"
+                )
+            if args.source_write_access_command == "enable" and not args.yes:
+                raise ValueError(
+                    "enable requires --yes for exact source "
+                    f"{args.source_id}; PostgreSQL privileges are unchanged"
+                )
+            if args.source_write_access_command == "inspect":
+                registration = selected
+            else:
+                registration = await agent.set_source_write_access(
+                    args.source_id,
+                    args.source_write_access_command == "enable",
+                )
+            return {
+                "source_id": registration.id,
+                "adapter": registration.adapter_id,
+                "active": registration.active,
+                "write_access": registration.configuration.get(
+                    "write_access",
+                    False,
+                ),
+                "warning": (
+                    "Daita write admission does not grant or broaden PostgreSQL "
+                    "privileges; role and grant administration stays external."
+                ),
+            }
+        if args.command == "postgresql-update-readiness":
+            readiness_result = await agent.postgresql_update_readiness(
+                args.source_id,
+                args.resource_id,
+                tuple(args.assignment_columns),
+            )
+            return {
+                "readiness": readiness_result.to_mapping(),
+                "guidance": (
+                    "Apply any role or grant remediation externally; Daita does "
+                    "not accept administrator credentials."
+                ),
             }
         if args.command == "memory":
             if args.memory_command == "read":
@@ -1551,6 +1638,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             file=sys.stderr,
         )
+        return 1
+    except StateCompatibilityError as error:
+        if args.command is None:
+            print("Daita could not open this local agent state.", file=sys.stderr)
+            print(file=sys.stderr)
+            print(str(error), file=sys.stderr)
+            print(file=sys.stderr)
+            print(f"State: {error.path}", file=sys.stderr)
+            print(
+                f"Format: {error.found_format if error.found_format is not None else 'unknown'} "
+                f"(this release: {error.current_format})",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                json.dumps({"error": error.to_mapping()}, sort_keys=True),
+                file=sys.stderr,
+            )
         return 1
     except (ValueError, RuntimeError, OSError, ImportError) as error:
         print(json.dumps({"error": str(error)}), file=sys.stderr)

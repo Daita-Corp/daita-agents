@@ -90,6 +90,7 @@ from .sql import (
     PostgreSQLUpdateCell,
     PostgreSQLUpdateCommand,
     PostgreSQLUpdateIntent,
+    PostgreSQLUpdateScopeValidationResult,
     PostgreSQLUpdateStatement,
     PostgreSQLUpdateValidationResult,
     ResourceSchema,
@@ -100,6 +101,7 @@ from .sql import (
     SqlValidationIssue,
     SqlValidationResult,
     ValidatedPostgreSQLUpdate,
+    ValidatedPostgreSQLUpdateScope,
     analyze_postgresql_sql,
     analyze_sqlite_sql,
     normalize_sql,
@@ -108,6 +110,7 @@ from .sql import (
     sqlite_identifier_key,
     validate_postgresql_read,
     validate_postgresql_update_intent,
+    validate_postgresql_update_scope,
     validate_sqlite_read,
 )
 
@@ -173,6 +176,7 @@ __all__ = [
     "PostgreSQLUpdateResult",
     "PostgreSQLUpdateCell",
     "PostgreSQLUpdateIntent",
+    "PostgreSQLUpdateScopeValidationResult",
     "PostgreSQLUpdateStatement",
     "PostgreSQLUpdateValidationResult",
     "ResourceSchema",
@@ -192,6 +196,7 @@ __all__ = [
     "SqlValidationIssue",
     "SqlValidationResult",
     "ValidatedPostgreSQLUpdate",
+    "ValidatedPostgreSQLUpdateScope",
     "analyze_postgresql_sql",
     "analyze_sqlite_sql",
     "artifact_capability_declarations",
@@ -213,5 +218,6 @@ __all__ = [
     "sqlite_query_extension_declarations",
     "validate_postgresql_read",
     "validate_postgresql_update_intent",
+    "validate_postgresql_update_scope",
     "validate_sqlite_read",
 ]

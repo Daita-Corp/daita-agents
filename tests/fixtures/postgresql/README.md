@@ -25,6 +25,20 @@ The schema contains eight related tables:
 - `shipments`
 - `support_tickets`
 
+The same disposable container also provisions a separate Phase 4 certification
+schema, `write_canary`, and a dedicated `daita_writer` role. The role is
+`NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOREPLICATION`, and
+`NOBYPASSRLS`; it receives `CONNECT`, schema `USAGE`, the bounded `SELECT`
+needed by preview/revalidation, and column-scoped `UPDATE` only for the intended
+canary table. PostgreSQL startup SQL owns those fixture roles and grants. Daita
+never receives the fixture administrator credential and never creates roles or
+applies grants.
+
+`write_canary` includes two resettable canary rows plus isolated permission,
+no-primary-key, composite-primary-key, RLS, and trigger targets for real
+guardrail certification. It is not production-like customer data and must be
+discarded with the tmpfs-backed container.
+
 It creates 1,000 customers, 250 products, 6,000 orders, one to four randomized
 items per order, payments and shipments for completed/refunded orders, and 800
 support tickets.
@@ -99,11 +113,51 @@ DAITA_FIXTURE_POSTGRES_PASSWORD=daita_fixture_password \
 .venv/bin/python -m pytest tests/test_postgresql_fixture.py -v
 ```
 
-The acceptance test drives the zero-argument terminal controller from agent
-creation through model configuration, PostgreSQL probing, `analytics` schema
-selection, catalog summary, and one grounded read-only query. Its model
-provider and OS keychain boundaries are fakes: it makes no live provider call
-and writes no real keychain entry. Only PostgreSQL I/O goes to the fixture.
+## Phase 4 database-write certification
+
+Read [the complete rollout and recovery guide](../../../docs/POSTGRESQL_ONE_ROW_UPDATE.md)
+before enabling the fixture writer. The guide covers external role setup,
+credential handling, backup/PITR, API/CLI/TUI controls, canary procedure,
+disablement, and unknown outcomes.
+
+After deterministic gates pass and the running disposable fixture is separately
+authorized, run the DB-only suite first:
+
+```bash
+export DAITA_FIXTURE_POSTGRES_WRITER_PASSWORD=daita_writer_fixture_password
+export DAITA_FIXTURE_POSTGRES_ADMIN_PASSWORD=fixture_admin_password
+export DAITA_RUN_POSTGRESQL_UPDATE_CERTIFICATION=1
+
+.venv/bin/python -m pytest \
+  tests/test_postgresql_update_certification_live.py \
+  -m "requires_db and integration" -v -s
+```
+
+The administrator credential is consumed only by test-fixture setup and
+verification code. It is never passed to `Agent`, `PostgreSQLSource`, readiness,
+or a model tool. The Daita attachment uses only `daita_writer` and begins with
+`write_access=False`.
+
+Only after DB-only certification passes, separately authorize the one paid
+model/database acceptance:
+
+```bash
+export OPENAI_API_KEY='<loaded through the approved secret mechanism>'
+export DAITA_RUN_LIVE_POSTGRESQL_UPDATE_ACCEPTANCE=1
+export DAITA_POSTGRESQL_UPDATE_ACCEPTANCE_MAX_COST_USD=0.20
+
+.venv/bin/python -m pytest \
+  tests/live/test_postgresql_update_acceptance_live.py \
+  -m "requires_llm and requires_db and acceptance" -v -s
+```
+
+The acceptance test uses the public `Agent` API and one release-reviewed paid
+model against the real disposable `write_canary.accounts` table. It proves
+read-only attachment, targeted readiness, separate enablement, preview, exact
+approval, one committed update, tool result/receipt agreement, independent row
+verification, and disablement. The administrator credential remains confined
+to external fixture reset and verification; Daita receives only the dedicated
+writer credential.
 
 ## Optional live database-write unavailability gate
 

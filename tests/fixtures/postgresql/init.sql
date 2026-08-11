@@ -344,8 +344,128 @@ ANALYZE analytics.payments;
 ANALYZE analytics.shipments;
 ANALYZE analytics.support_tickets;
 
+-- Make database admission explicit for fixture roles instead of inheriting the
+-- PostgreSQL default CONNECT/TEMP privileges from PUBLIC. The owner/superuser
+-- remains available for external fixture setup and verification.
+REVOKE ALL PRIVILEGES ON DATABASE daita_fixture FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON DATABASE postgres FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON DATABASE template1 FROM PUBLIC;
+
 GRANT CONNECT ON DATABASE daita_fixture TO daita_reader;
 GRANT USAGE ON SCHEMA analytics TO daita_reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO daita_reader;
 ALTER DEFAULT PRIVILEGES IN SCHEMA analytics
     GRANT SELECT ON TABLES TO daita_reader;
+
+-- Phase 4 write certification is isolated from the read fixture. This role and
+-- schema are disposable test infrastructure provisioned by PostgreSQL startup,
+-- never by Daita.
+CREATE ROLE daita_writer
+    LOGIN
+    PASSWORD 'daita_writer_fixture_password'
+    NOSUPERUSER
+    NOCREATEDB
+    NOCREATEROLE
+    NOINHERIT
+    NOREPLICATION
+    NOBYPASSRLS;
+
+CREATE SCHEMA write_canary;
+
+CREATE TABLE write_canary.regions (
+    region_code text PRIMARY KEY,
+    name text NOT NULL UNIQUE
+);
+
+CREATE TABLE write_canary.accounts (
+    account_id bigint PRIMARY KEY,
+    status text NOT NULL CHECK (status IN ('active', 'inactive', 'locked')),
+    external_key text NOT NULL UNIQUE,
+    region_code text NOT NULL REFERENCES write_canary.regions(region_code),
+    note text,
+    counter integer NOT NULL CHECK (counter >= 0),
+    updated_at timestamptz NOT NULL
+);
+
+CREATE TABLE write_canary.permission_denied (
+    account_id bigint PRIMARY KEY,
+    status text NOT NULL
+);
+
+CREATE TABLE write_canary.no_primary_key (
+    account_id bigint NOT NULL,
+    status text NOT NULL
+);
+
+CREATE TABLE write_canary.composite_primary_key (
+    tenant_id bigint NOT NULL,
+    account_id bigint NOT NULL,
+    status text NOT NULL,
+    PRIMARY KEY (tenant_id, account_id)
+);
+
+CREATE TABLE write_canary.rls_accounts (
+    account_id bigint PRIMARY KEY,
+    status text NOT NULL
+);
+ALTER TABLE write_canary.rls_accounts ENABLE ROW LEVEL SECURITY;
+
+CREATE TABLE write_canary.trigger_accounts (
+    account_id bigint PRIMARY KEY,
+    status text NOT NULL
+);
+
+CREATE FUNCTION write_canary.reject_trigger_update()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'fixture trigger must never execute';
+END;
+$$;
+
+CREATE TRIGGER reject_trigger_update
+BEFORE UPDATE ON write_canary.trigger_accounts
+FOR EACH ROW EXECUTE FUNCTION write_canary.reject_trigger_update();
+
+INSERT INTO write_canary.regions (region_code, name) VALUES
+    ('NA', 'North America'),
+    ('EU', 'Europe');
+
+INSERT INTO write_canary.accounts (
+    account_id,
+    status,
+    external_key,
+    region_code,
+    note,
+    counter,
+    updated_at
+) VALUES
+    (42, 'active', 'canary-42', 'NA', 'phase-4 canary', 0,
+        timestamptz '2026-08-10 00:00:00+00'),
+    (43, 'inactive', 'canary-43', 'EU', 'constraint peer', 1,
+        timestamptz '2026-08-10 00:00:00+00');
+
+INSERT INTO write_canary.permission_denied VALUES (42, 'active');
+INSERT INTO write_canary.no_primary_key VALUES (42, 'active');
+INSERT INTO write_canary.composite_primary_key VALUES (1, 42, 'active');
+INSERT INTO write_canary.rls_accounts VALUES (42, 'active');
+INSERT INTO write_canary.trigger_accounts VALUES (42, 'active');
+
+GRANT CONNECT ON DATABASE daita_fixture TO daita_writer;
+GRANT USAGE ON SCHEMA write_canary TO daita_writer;
+GRANT SELECT ON write_canary.regions TO daita_writer;
+GRANT SELECT ON write_canary.accounts TO daita_writer;
+GRANT UPDATE (
+    status,
+    external_key,
+    region_code,
+    note,
+    counter,
+    updated_at
+) ON write_canary.accounts TO daita_writer;
+GRANT SELECT ON write_canary.permission_denied TO daita_writer;
+GRANT SELECT, UPDATE (status) ON write_canary.no_primary_key TO daita_writer;
+GRANT SELECT, UPDATE (status) ON write_canary.composite_primary_key TO daita_writer;
+GRANT SELECT, UPDATE (status) ON write_canary.rls_accounts TO daita_writer;
+GRANT SELECT, UPDATE (status) ON write_canary.trigger_accounts TO daita_writer;

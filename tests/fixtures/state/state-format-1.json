@@ -1,0 +1,60 @@
+{
+  "user_version": 0,
+  "package_version": "1.0.0",
+  "objects": [
+    {
+      "type": "index",
+      "name": "runs_conversation_turn",
+      "table": "runs",
+      "sql": "CREATE UNIQUE INDEX runs_conversation_turn\n               ON runs(agent_id, conversation_id, turn_index)"
+    },
+    {
+      "type": "table",
+      "name": "learning_candidates",
+      "table": "learning_candidates",
+      "sql": "CREATE TABLE learning_candidates (\n                agent_id TEXT NOT NULL,\n                id TEXT NOT NULL,\n                data TEXT NOT NULL,\n                PRIMARY KEY(agent_id, id)\n            )"
+    },
+    {
+      "type": "table",
+      "name": "messages",
+      "table": "messages",
+      "sql": "CREATE TABLE messages (\n                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,\n                position INTEGER NOT NULL,\n                data TEXT NOT NULL,\n                PRIMARY KEY(run_id, position)\n            )"
+    },
+    {
+      "type": "table",
+      "name": "metadata",
+      "table": "metadata",
+      "sql": "CREATE TABLE metadata (\n                key TEXT PRIMARY KEY,\n                data TEXT NOT NULL\n            )"
+    },
+    {
+      "type": "table",
+      "name": "runs",
+      "table": "runs",
+      "sql": "CREATE TABLE runs (\n                id TEXT PRIMARY KEY,\n                agent_id TEXT NOT NULL,\n                conversation_id TEXT NOT NULL,\n                turn_index INTEGER NOT NULL,\n                input TEXT NOT NULL,\n                result TEXT\n            )"
+    },
+    {
+      "type": "table",
+      "name": "semantic_annotations",
+      "table": "semantic_annotations",
+      "sql": "CREATE TABLE semantic_annotations (\n                agent_id TEXT NOT NULL,\n                id TEXT NOT NULL,\n                data TEXT NOT NULL,\n                PRIMARY KEY(agent_id, id)\n            )"
+    },
+    {
+      "type": "table",
+      "name": "snapshots",
+      "table": "snapshots",
+      "sql": "CREATE TABLE snapshots (\n                agent_id TEXT NOT NULL,\n                source_id TEXT NOT NULL,\n                sync_id TEXT NOT NULL,\n                data TEXT NOT NULL,\n                PRIMARY KEY(agent_id, source_id)\n            )"
+    },
+    {
+      "type": "table",
+      "name": "sources",
+      "table": "sources",
+      "sql": "CREATE TABLE sources (\n                agent_id TEXT NOT NULL,\n                id TEXT NOT NULL,\n                data TEXT NOT NULL,\n                PRIMARY KEY(agent_id, id)\n            )"
+    },
+    {
+      "type": "table",
+      "name": "syncs",
+      "table": "syncs",
+      "sql": "CREATE TABLE syncs (\n                agent_id TEXT NOT NULL,\n                id TEXT NOT NULL,\n                source_id TEXT NOT NULL,\n                data TEXT NOT NULL,\n                PRIMARY KEY(agent_id, id)\n            )"
+    }
+  ]
+}

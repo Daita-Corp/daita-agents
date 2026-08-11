@@ -955,6 +955,7 @@ class _RuntimeBackend:
         self.previews = 0
         self.executions: list[ToolExecution] = []
         self.change_after_first = False
+        self.preflight_error: BaseException | None = None
         self.execute_started = asyncio.Event()
         self.execute_gate: asyncio.Event | None = None
         self.execute_error: BaseException | None = None
@@ -963,6 +964,8 @@ class _RuntimeBackend:
     async def preview_update(self, *, agent_id: str, intent):
         assert agent_id == "agent-update"
         assert intent == _intent()
+        if self.preflight_error is not None:
+            raise self.preflight_error
         self.previews += 1
         self.log.append("preview")
         fingerprint = "sha256:" + (
@@ -1126,6 +1129,32 @@ async def test_runtime_second_preflight_rejects_state_change_before_execution() 
     )[0]
 
     assert _runtime_error(result) == "state_changed"
+    assert backend.executions == []
+
+
+async def test_disablement_while_approval_is_pending_fails_closed_before_execution() -> (
+    None
+):
+    lock = asyncio.Lock()
+    backend = _RuntimeBackend(lock)
+
+    async def disable_then_approve(request: ApprovalRequest):
+        del request
+        backend.preflight_error = write_module.PostgreSQLUpdatePreviewError(
+            "write_access_not_enabled",
+            "PostgreSQL update preview requires user-owned write_access enablement.",
+        )
+        return ApprovalDecision.APPROVE
+
+    result = (
+        await _runtime_with_backend(backend, lock, disable_then_approve).execute_all(
+            _runtime_run(),
+            (_runtime_call(),),
+        )
+    )[0]
+
+    assert _runtime_error(result) == "write_access_not_enabled"
+    assert backend.previews == 1
     assert backend.executions == []
 
 

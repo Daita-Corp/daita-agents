@@ -15,6 +15,8 @@ from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
 )
+from .adapters.postgresql_write import PostgreSQLUpdateReadiness
+from .adapters.protocols import ResourceAdapterError as SourceRefreshError
 from .adapters.protocols import ResourceSource
 from .artifacts.models import (
     ArtifactDeliveryReceipt,
@@ -540,9 +542,10 @@ class Agent:
         schemas: tuple[str, ...],
         port: int = 5432,
         ssl_mode: str = "require",
-        write_access: bool = False,
         name: str | None = None,
     ) -> SourceRegistration:
+        """Attach PostgreSQL read-only; write admission is a separate user action."""
+
         return await self._embedded.attach_postgresql(
             host=host,
             database=database,
@@ -551,7 +554,6 @@ class Agent:
             schemas=schemas,
             port=port,
             ssl_mode=ssl_mode,
-            write_access=write_access,
             name=name,
         )
 
@@ -560,13 +562,33 @@ class Agent:
         source_id: str,
         enabled: bool,
     ) -> SourceRegistration:
-        """Set one exact user-owned PostgreSQL write-admission flag."""
+        """Set Daita admission for one source; this grants no database privilege."""
 
         if not isinstance(source_id, str) or not source_id:
             raise ValueError("source_id must be a non-empty string")
         if not isinstance(enabled, bool):
             raise TypeError("enabled must be a boolean")
         return await self._embedded.set_source_write_access(source_id, enabled)
+
+    async def postgresql_update_readiness(
+        self,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> PostgreSQLUpdateReadiness:
+        """Return bounded non-mutating readiness for one exact update scope."""
+
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        if not isinstance(resource_id, str) or not resource_id:
+            raise ValueError("resource_id must be a non-empty string")
+        if not isinstance(assignment_columns, tuple):
+            raise TypeError("assignment_columns must be a tuple")
+        return await self._embedded.postgresql_update_readiness(
+            source_id,
+            resource_id,
+            assignment_columns,
+        )
 
     async def detach(self, source_id: str) -> SourceRegistration:
         return await self._embedded.detach(source_id)
@@ -641,6 +663,7 @@ __all__ = [
     "HostActiveError",
     "PostgreSQLProbeResult",
     "PostgreSQLSourceError",
+    "SourceRefreshError",
     "SourceSelectionError",
     "CatalogSummary",
 ]

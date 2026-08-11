@@ -5,6 +5,7 @@ import io
 import json
 import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO, cast
 
@@ -17,12 +18,15 @@ from daita import (
     Agent,
     ApprovalDecision,
     ApprovalRequest,
+    PostgreSQLUpdateReadiness,
     Skill,
     SQLiteSource,
+    cli,
     terminal,
     terminal_tui,
 )
 from daita._json import FrozenJsonObject
+from daita.adapters.models import SourceRegistration
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
@@ -51,6 +55,56 @@ class _Keychain:
 
     async def delete(self, reference: SecretReference) -> None:
         self.values.pop(reference.name, None)
+
+
+def _ready_postgresql_result(
+    source_id: str,
+    resource_id: str,
+    *,
+    write_access: bool = True,
+    requested_columns_update: bool = True,
+    rejection_codes: tuple[str, ...] = (),
+    remediation_categories: tuple[str, ...] = (),
+) -> PostgreSQLUpdateReadiness:
+    return PostgreSQLUpdateReadiness(
+        source_id=source_id,
+        resource_id=resource_id,
+        assignment_columns=("status",),
+        write_access=write_access,
+        ready_for_preview=not rejection_codes,
+        proves_execution=False,
+        role_attributes=FrozenJsonObject.from_mapping(
+            {
+                "superuser": False,
+                "bypass_rls": False,
+                "create_database": False,
+                "create_role": False,
+                "replication": False,
+            }
+        ),
+        privileges=FrozenJsonObject.from_mapping(
+            {
+                "database_connect": True,
+                "schema_usage": True,
+                "table_select": True,
+                "requested_columns_update": requested_columns_update,
+            }
+        ),
+        relation=FrozenJsonObject.from_mapping(
+            {
+                "catalog_admitted": True,
+                "base_table": True,
+                "partition": False,
+                "inheritance": False,
+                "row_level_security": False,
+                "force_row_level_security": False,
+                "user_triggers": False,
+                "rewrite_rules": False,
+            }
+        ),
+        rejection_codes=rejection_codes,
+        remediation_categories=remediation_categories,
+    )
 
 
 def _stop(text: str, *, provider_id: str = "openai:test-model") -> ModelResponse:
@@ -352,6 +406,461 @@ async def test_unreviewable_approval_is_denied_before_prompting(
     assert "Approve this exact change once?" not in output.getvalue()
 
 
+async def test_tui_source_config_guides_readiness_enablement_and_preview_without_ids(
+    tmp_path: Path,
+) -> None:
+    registration = SourceRegistration.build(
+        agent_id="agent-tui-write",
+        adapter_id="postgresql",
+        native_identity="postgresql:tui-write",
+        display_name="TUI PostgreSQL",
+        configuration={
+            "database": "fixture",
+            "host": "fixture.invalid",
+            "port": 5432,
+            "schemas": ("canary",),
+            "ssl_mode": "require",
+            "username": "writer",
+            "write_access": False,
+        },
+        attached_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+    )
+    resource_id = "catalog-resource:sha256:" + "b" * 64
+
+    class Kind:
+        value = "table"
+
+    class Resource:
+        id = resource_id
+        kind = Kind()
+        name = "accounts"
+        native_identity = "write_canary.accounts"
+
+    inspection = FrozenJsonObject.from_mapping(
+        {
+            "facets": [
+                {
+                    "kind": "tabular",
+                    "payload": {
+                        "columns": [
+                            {
+                                "name": "account_id",
+                                "native_type": "bigint",
+                                "ordinal": 0,
+                                "primary_key_ordinal": 1,
+                                "identity": False,
+                                "generated": False,
+                                "updatable": False,
+                            },
+                            {
+                                "name": "status",
+                                "native_type": "text",
+                                "ordinal": 1,
+                                "primary_key_ordinal": None,
+                                "identity": False,
+                                "generated": False,
+                                "updatable": True,
+                            },
+                        ]
+                    },
+                }
+            ]
+        }
+    )
+
+    class PublicAgentOnly:
+        def __init__(self) -> None:
+            self.current = registration
+            self.calls: list[tuple[object, ...]] = []
+
+        async def list_sources(self):
+            self.calls.append(("list_sources",))
+            return (self.current,)
+
+        async def list_catalog_resources(self, *, source_id: str | None = None):
+            self.calls.append(("list_catalog_resources", source_id))
+            return (Resource(),)
+
+        async def inspect_catalog_resource(self, selected_resource_id: str):
+            self.calls.append(("inspect_catalog_resource", selected_resource_id))
+            return inspection
+
+        async def set_source_write_access(self, source_id: str, enabled: bool):
+            self.calls.append(("set_source_write_access", source_id, enabled))
+            self.current = SourceRegistration(
+                id=self.current.id,
+                agent_id=self.current.agent_id,
+                adapter_id=self.current.adapter_id,
+                native_identity=self.current.native_identity,
+                display_name=self.current.display_name,
+                configuration={
+                    **dict(self.current.configuration),
+                    "write_access": enabled,
+                },
+                attached_at=self.current.attached_at,
+                detached_at=self.current.detached_at,
+            )
+            return self.current
+
+        async def postgresql_update_readiness(
+            self,
+            source_id: str,
+            selected_resource_id: str,
+            assignment_columns: tuple[str, ...],
+        ):
+            self.calls.append(
+                (
+                    "postgresql_update_readiness",
+                    source_id,
+                    selected_resource_id,
+                    assignment_columns,
+                )
+            )
+            write_access = self.current.configuration.get("write_access") is True
+            return _ready_postgresql_result(
+                source_id,
+                selected_resource_id,
+                write_access=write_access,
+                rejection_codes=(() if write_access else ("write_access_not_enabled",)),
+                remediation_categories=(
+                    () if write_access else ("enable_write_access_in_daita",)
+                ),
+            )
+
+    fake = cast(Agent, PublicAgentOnly())
+
+    output = io.StringIO()
+    returned, conversation_id, action = await terminal._handle_local_command(
+        "/source config",
+        agent=fake,
+        root=tmp_path,
+        input_stream=io.StringIO("1\n1\n1\n1\ny\n1\n"),
+        output_stream=output,
+        hidden_input=lambda _prompt: "",
+        keychain=None,
+        model_validator=None,
+        approval_handler=None,
+        conversation_id=None,
+        validated=True,
+    )
+
+    assert returned is fake
+    assert conversation_id is None
+    assert action is None
+    rendered = output.getvalue()
+    assert "Configure PostgreSQL writes" in rendered
+    assert "TUI PostgreSQL" in rendered
+    assert "write_canary.accounts" in rendered
+    assert "Current catalog scope and single-column primary key" in rendered
+    assert "Daita admission\n  ○ Disabled for this source" in rendered
+    assert "Enabling admission is source-scoped" in rendered
+    assert "Every update still requires a fresh preview" in rendered
+    assert "Daita admission\n  ✓ Enabled for this source" in rendered
+    assert "Ready for preview" in rendered
+    assert "Preview-only canary prompt" in rendered
+    assert "where account_id=<canary value>" in rendered
+    assert registration.id not in rendered
+    assert resource_id not in rendered
+    assert (
+        "postgresql_update_readiness",
+        registration.id,
+        resource_id,
+        ("status",),
+    ) in cast(Any, fake).calls
+    assert (
+        cast(Any, fake).calls.count(
+            (
+                "postgresql_update_readiness",
+                registration.id,
+                resource_id,
+                ("status",),
+            )
+        )
+        == 2
+    )
+    assert (
+        "set_source_write_access",
+        registration.id,
+        True,
+    ) in cast(Any, fake).calls
+
+
+async def test_tui_source_config_disables_immediately_without_confirmation(
+    tmp_path: Path,
+) -> None:
+    registration = SourceRegistration.build(
+        agent_id="agent-tui-disable",
+        adapter_id="postgresql",
+        native_identity="postgresql:tui-disable",
+        display_name="Disposable writer",
+        configuration={
+            "database": "fixture",
+            "host": "fixture.invalid",
+            "port": 5432,
+            "schemas": ("canary",),
+            "ssl_mode": "require",
+            "username": "writer",
+            "write_access": True,
+        },
+        attached_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+    )
+
+    class PublicAgentOnly:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        async def list_sources(self):
+            return (registration,)
+
+        async def set_source_write_access(self, source_id: str, enabled: bool):
+            self.calls.append((source_id, enabled))
+            return SourceRegistration(
+                id=registration.id,
+                agent_id=registration.agent_id,
+                adapter_id=registration.adapter_id,
+                native_identity=registration.native_identity,
+                display_name=registration.display_name,
+                configuration={
+                    **dict(registration.configuration),
+                    "write_access": enabled,
+                },
+                attached_at=registration.attached_at,
+                detached_at=registration.detached_at,
+            )
+
+    fake = cast(Agent, PublicAgentOnly())
+    output = io.StringIO()
+    await terminal._handle_local_command(
+        "/source config",
+        agent=fake,
+        root=tmp_path,
+        input_stream=io.StringIO("1\n2\n"),
+        output_stream=output,
+        hidden_input=lambda _prompt: "",
+        keychain=None,
+        model_validator=None,
+        approval_handler=None,
+        conversation_id=None,
+        validated=True,
+    )
+
+    assert cast(Any, fake).calls == [(registration.id, False)]
+    assert "Write admission disabled for Disposable writer." in output.getvalue()
+    assert "[y/N]" not in output.getvalue()
+    assert registration.id not in output.getvalue()
+
+
+async def test_tui_source_config_cancellation_returns_to_chat_without_mutation(
+    tmp_path: Path,
+) -> None:
+    registration = SourceRegistration.build(
+        agent_id="agent-tui-cancel",
+        adapter_id="postgresql",
+        native_identity="postgresql:tui-cancel",
+        display_name="Cancel canary",
+        configuration={
+            "database": "fixture",
+            "host": "fixture.invalid",
+            "port": 5432,
+            "schemas": ("canary",),
+            "ssl_mode": "require",
+            "username": "writer",
+            "write_access": False,
+        },
+        attached_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+    )
+
+    class PublicAgentOnly:
+        async def list_sources(self):
+            return (registration,)
+
+        async def set_source_write_access(self, source_id: str, enabled: bool):
+            raise AssertionError((source_id, enabled))
+
+    fake = cast(Agent, PublicAgentOnly())
+    output = io.StringIO()
+    returned, conversation_id, action = await terminal._handle_local_command(
+        "/source config",
+        agent=fake,
+        root=tmp_path,
+        input_stream=io.StringIO(""),
+        output_stream=output,
+        hidden_input=lambda _prompt: "",
+        keychain=None,
+        model_validator=None,
+        approval_handler=None,
+        conversation_id="conversation-keep",
+        validated=True,
+    )
+
+    assert returned is fake
+    assert conversation_id == "conversation-keep"
+    assert action is None
+    assert "Source configuration cancelled; returning to chat." in output.getvalue()
+    assert registration.id not in output.getvalue()
+
+
+async def test_tui_source_config_keeps_admission_disabled_for_database_blockers(
+    tmp_path: Path,
+) -> None:
+    registration = SourceRegistration.build(
+        agent_id="agent-tui-blocked",
+        adapter_id="postgresql",
+        native_identity="postgresql:tui-blocked",
+        display_name="Blocked canary",
+        configuration={
+            "database": "fixture",
+            "host": "fixture.invalid",
+            "port": 5432,
+            "schemas": ("canary",),
+            "ssl_mode": "require",
+            "username": "writer",
+            "write_access": False,
+        },
+        attached_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
+    )
+    resource_id = "catalog-resource:sha256:" + "c" * 64
+
+    class Kind:
+        value = "table"
+
+    class Resource:
+        id = resource_id
+        kind = Kind()
+        name = "accounts"
+        native_identity = "write_canary.accounts"
+
+    inspection = FrozenJsonObject.from_mapping(
+        {
+            "facets": [
+                {
+                    "kind": "tabular",
+                    "payload": {
+                        "columns": [
+                            {
+                                "name": "status",
+                                "native_type": "text",
+                                "ordinal": 1,
+                                "primary_key_ordinal": None,
+                                "identity": False,
+                                "generated": False,
+                                "updatable": True,
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    )
+
+    class PublicAgentOnly:
+        def __init__(self) -> None:
+            self.enable_calls: list[tuple[str, bool]] = []
+
+        async def list_sources(self):
+            return (registration,)
+
+        async def list_catalog_resources(self, *, source_id: str | None = None):
+            assert source_id == registration.id
+            return (Resource(),)
+
+        async def inspect_catalog_resource(self, selected_resource_id: str):
+            assert selected_resource_id == resource_id
+            return inspection
+
+        async def postgresql_update_readiness(
+            self,
+            source_id: str,
+            selected_resource_id: str,
+            assignment_columns: tuple[str, ...],
+        ):
+            assert (source_id, selected_resource_id, assignment_columns) == (
+                registration.id,
+                resource_id,
+                ("status",),
+            )
+            return _ready_postgresql_result(
+                source_id,
+                selected_resource_id,
+                write_access=False,
+                requested_columns_update=False,
+                rejection_codes=(
+                    "write_permission_denied",
+                    "write_access_not_enabled",
+                ),
+                remediation_categories=(
+                    "grant_requested_columns_update",
+                    "enable_write_access_in_daita",
+                ),
+            )
+
+        async def set_source_write_access(self, source_id: str, enabled: bool):
+            self.enable_calls.append((source_id, enabled))
+            raise AssertionError("database blockers must prevent enablement")
+
+    fake = cast(Agent, PublicAgentOnly())
+    output = io.StringIO()
+    await terminal._handle_local_command(
+        "/source config",
+        agent=fake,
+        root=tmp_path,
+        input_stream=io.StringIO("1\n1\n1\n"),
+        output_stream=output,
+        hidden_input=lambda _prompt: "",
+        keychain=None,
+        model_validator=None,
+        approval_handler=None,
+        conversation_id=None,
+        validated=True,
+    )
+
+    rendered = output.getvalue()
+    assert "PostgreSQL blockers" in rendered
+    assert "write permission denied" in rendered
+    assert "grant requested columns update" in rendered
+    assert "enable write access in daita" not in rendered
+    assert "Write admission remains disabled" in rendered
+    assert "Enable source write admission" not in rendered
+    assert cast(Any, fake).enable_calls == []
+
+
+async def test_cli_and_tui_render_identical_frozen_postgresql_update_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    arguments = FrozenJsonObject.from_mapping(
+        {
+            "source_id": "source:sha256:" + "a" * 64,
+            "resource_id": "catalog-resource:sha256:" + "b" * 64,
+            "match": [{"column": "account_id", "value": 42}],
+            "assignments": [{"column": "status", "value": "inactive"}],
+            "preview_fingerprint": "sha256:" + "c" * 64,
+            "max_affected_rows": 1,
+        }
+    )
+    request = ApprovalRequest(
+        run_id="run-update",
+        call_id="call-update",
+        tool_name="data_update_postgresql",
+        capability_id="data.postgresql.update",
+        arguments=arguments,
+        reason="write",
+    )
+    frozen_arguments = request.arguments
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+
+    decision = await cli._prompt_for_exact_approval(request)
+    panel = terminal_tui._approval_panel_for_request(request)
+
+    assert decision is ApprovalDecision.DENY
+    assert panel is not None
+    cli_output = capsys.readouterr().out
+    cli_arguments = cli_output.split("Arguments:\n", 1)[1]
+    assert json.loads(cli_arguments) == json.loads(panel.arguments_text)
+    assert json.loads(panel.arguments_text) == arguments.to_dict()
+    assert request.arguments is frozen_arguments
+
+
 @pytest.mark.parametrize(
     ("command", "confirmation", "setup_name"),
     (
@@ -579,6 +1088,8 @@ async def test_local_status_commands_are_bounded_secret_free_and_never_modeled(
     assert "Sources" in text
     assert "Settings" in text
     assert "Commands" in text
+    assert "/source config" in text
+    assert "/source write" not in text
     assert "Wheel or Page Up/Page Down review" in text
     assert "Esc Esc clear input" in text
     assert "Animated status shows the active tool" in text
@@ -760,7 +1271,8 @@ async def test_failed_source_refresh_preserves_previous_committed_catalog(
     )
 
     assert code == 0
-    assert "without replacing committed catalog truth" in output.getvalue()
+    assert "existing catalog is still available" in output.getvalue()
+    assert "Check that the source is available" in output.getvalue()
     assert "records" in output.getvalue()
     reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
     try:

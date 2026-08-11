@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
@@ -39,6 +40,7 @@ from ..domains.data.sql import (
     ValidatedPostgreSQLUpdate,
     render_postgresql_update_statement,
     validate_postgresql_update_intent,
+    validate_postgresql_update_scope,
 )
 from ..errors import PluginError
 from ..security import SecretProvider, default_secret_provider
@@ -62,6 +64,30 @@ from .postgresql import (
 from .protocols import SourceStore
 
 _PREVIEW_VALUE_BYTES = 64 * 1_024
+
+_READINESS_ROLE_KEYS = (
+    "superuser",
+    "bypass_rls",
+    "create_database",
+    "create_role",
+    "replication",
+)
+_READINESS_PRIVILEGE_KEYS = (
+    "database_connect",
+    "schema_usage",
+    "table_select",
+    "requested_columns_update",
+)
+_READINESS_RELATION_KEYS = (
+    "catalog_admitted",
+    "base_table",
+    "partition",
+    "inheritance",
+    "row_level_security",
+    "force_row_level_security",
+    "user_triggers",
+    "rewrite_rules",
+)
 
 _WRITE_GUARDRAILS_SQL = """
 /* daita:postgresql.update_preview_guardrails */
@@ -125,7 +151,7 @@ FROM pg_catalog.pg_class AS relation
 JOIN pg_catalog.pg_namespace AS namespace
   ON namespace.oid = relation.relnamespace
 JOIN pg_catalog.pg_roles AS role
-  ON role.rolname = pg_catalog.current_user
+  ON role.rolname = current_user
 WHERE namespace.nspname = $1
   AND relation.relname = $2
 LIMIT 1
@@ -155,6 +181,98 @@ class PostgreSQLUpdateExecutionError(PluginError):
     ) -> None:
         self.details = FrozenJsonObject.from_mapping(details or {})
         super().__init__(message, plugin_id="postgresql", error_code=code)
+
+
+@dataclass(frozen=True, slots=True)
+class PostgreSQLUpdateReadiness:
+    """Bounded, secret-free readiness facts for one exact update scope."""
+
+    source_id: str
+    resource_id: str
+    assignment_columns: tuple[str, ...]
+    write_access: bool
+    ready_for_preview: bool
+    proves_execution: bool
+    role_attributes: FrozenJsonObject
+    privileges: FrozenJsonObject
+    relation: FrozenJsonObject
+    rejection_codes: tuple[str, ...]
+    remediation_categories: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.source_id, "readiness source_id"),
+            (self.resource_id, "readiness resource_id"),
+        ):
+            if not isinstance(value, str) or not value or len(value) > 1_024:
+                raise ValueError(f"{name} must be bounded non-empty text")
+        assignment_columns = tuple(self.assignment_columns)
+        if (
+            not 1 <= len(assignment_columns) <= 32
+            or len(assignment_columns) != len(set(assignment_columns))
+            or any(
+                not isinstance(column, str) or not column or len(column) > 256
+                for column in assignment_columns
+            )
+        ):
+            raise ValueError("readiness assignment columns are invalid")
+        for boolean_value, name in (
+            (self.write_access, "write_access"),
+            (self.ready_for_preview, "ready_for_preview"),
+            (self.proves_execution, "proves_execution"),
+        ):
+            if not isinstance(boolean_value, bool):
+                raise TypeError(f"readiness {name} must be a boolean")
+        if self.proves_execution:
+            raise ValueError("readiness can never prove a future execution")
+        for facts_value, keys, name in (
+            (self.role_attributes, _READINESS_ROLE_KEYS, "role_attributes"),
+            (self.privileges, _READINESS_PRIVILEGE_KEYS, "privileges"),
+            (self.relation, _READINESS_RELATION_KEYS, "relation"),
+        ):
+            if not isinstance(facts_value, FrozenJsonObject) or set(facts_value) != set(
+                keys
+            ):
+                raise ValueError(f"readiness {name} has invalid bounded facts")
+            if any(
+                facts_value[key] is not None and not isinstance(facts_value[key], bool)
+                for key in keys
+            ):
+                raise TypeError(f"readiness {name} facts must be booleans or null")
+        rejection_codes = _bounded_readiness_labels(
+            self.rejection_codes,
+            "rejection_codes",
+        )
+        remediation_categories = _bounded_readiness_labels(
+            self.remediation_categories,
+            "remediation_categories",
+        )
+        if self.ready_for_preview != (not rejection_codes):
+            raise ValueError("readiness status must agree with rejection codes")
+        object.__setattr__(self, "assignment_columns", assignment_columns)
+        object.__setattr__(self, "rejection_codes", rejection_codes)
+        object.__setattr__(
+            self,
+            "remediation_categories",
+            remediation_categories,
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        """Return the one safe representation shared by API, CLI, and TUI."""
+
+        return {
+            "source_id": self.source_id,
+            "resource_id": self.resource_id,
+            "assignment_columns": self.assignment_columns,
+            "write_access": self.write_access,
+            "ready_for_preview": self.ready_for_preview,
+            "proves_execution": self.proves_execution,
+            "role_attributes": self.role_attributes.to_dict(),
+            "privileges": self.privileges.to_dict(),
+            "relation": self.relation.to_dict(),
+            "rejection_codes": self.rejection_codes,
+            "remediation_categories": self.remediation_categories,
+        }
 
 
 class DatabaseWriteReceiptStore(Protocol):
@@ -221,6 +339,170 @@ class PostgreSQLUpdatePreviewBackend:
         self._statement_timeout_seconds = float(statement_timeout_seconds)
         self._lock_timeout_seconds = float(lock_timeout_seconds)
         self._cleanup_timeout_seconds = float(cleanup_timeout_seconds)
+
+    async def postgresql_update_readiness(
+        self,
+        *,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> PostgreSQLUpdateReadiness:
+        """Inspect one exact resource/column scope without granting or mutating."""
+
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("readiness agent_id must be non-empty text")
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be non-empty text")
+        if not isinstance(resource_id, str) or not resource_id:
+            raise ValueError("resource_id must be non-empty text")
+        if not isinstance(assignment_columns, tuple):
+            raise TypeError("assignment_columns must be a tuple")
+        if (
+            not 1 <= len(assignment_columns) <= 32
+            or len(assignment_columns) != len(set(assignment_columns))
+            or any(
+                not isinstance(column, str)
+                or not column
+                or len(column) > 256
+                or "\x00" in column
+                for column in assignment_columns
+            )
+        ):
+            raise ValueError(
+                "assignment_columns must contain one through 32 distinct bounded names"
+            )
+
+        registration = await self._sources.load_source(agent_id, source_id)
+        if (
+            registration is None
+            or registration.agent_id != agent_id
+            or registration.id != source_id
+            or not registration.active
+            or registration.adapter_id != "postgresql"
+        ):
+            return _readiness_result(
+                source_id=source_id,
+                resource_id=resource_id,
+                assignment_columns=assignment_columns,
+                write_access=False,
+                relation={"catalog_admitted": False},
+                rejection_codes=("write_source_not_available",),
+                remediation_categories=("attach_active_postgresql_source",),
+            )
+        write_access = registration.configuration.get("write_access") is True
+        validation = validate_postgresql_update_scope(
+            source_id,
+            resource_id,
+            assignment_columns,
+            resources=await self._catalog.resource_schemas(agent_id, source_id),
+        )
+        if not validation.valid or validation.validated is None:
+            return _readiness_result(
+                source_id=source_id,
+                resource_id=resource_id,
+                assignment_columns=assignment_columns,
+                write_access=write_access,
+                relation={"catalog_admitted": False},
+                rejection_codes=validation.issue_codes,
+                remediation_categories=("refresh_or_select_supported_resource",),
+            )
+        validated = validation.validated
+
+        connection = None
+        transaction = None
+        transaction_finished = False
+        facts: dict[str, object] | None = None
+        rejection_codes: tuple[str, ...] = ()
+        remediation_categories: tuple[str, ...] = ()
+        try:
+            connection = await _connect(registration, self._secret_provider)
+            transaction = connection.transaction(
+                isolation="repeatable_read",
+                readonly=True,
+            )
+            await transaction.start()
+            await _configure_readiness_transaction(
+                connection,
+                statement_timeout_seconds=self._statement_timeout_seconds,
+                lock_timeout_seconds=self._lock_timeout_seconds,
+            )
+            structure = await _load_structure(
+                connection,
+                registration,
+                max_resources=_DEFAULT_MAX_RESOURCES,
+                max_columns=_DEFAULT_MAX_COLUMNS,
+                max_indexes=_DEFAULT_MAX_INDEXES,
+                max_relationships=_DEFAULT_MAX_RELATIONSHIPS,
+            )
+            if structure.source_revision != validated.source_revision:
+                rejection_codes = ("write_resource_not_writable",)
+                remediation_categories = ("refresh_catalog",)
+            else:
+                table = next(
+                    (
+                        item
+                        for item in structure.tables
+                        if item.schema == validated.schema_name
+                        and item.name == validated.relation_name
+                    ),
+                    None,
+                )
+                if table is None:
+                    rejection_codes = ("write_resource_not_writable",)
+                    remediation_categories = ("refresh_catalog",)
+                else:
+                    raw = await connection.fetchrow(
+                        _WRITE_GUARDRAILS_SQL,
+                        validated.schema_name,
+                        validated.relation_name,
+                        list(validated.assignment_columns),
+                        timeout=self._statement_timeout_seconds,
+                    )
+                    facts = _guardrail_facts(raw)
+                    (
+                        rejection_codes,
+                        remediation_categories,
+                    ) = _readiness_rejections(facts)
+            await transaction.commit()
+            transaction_finished = True
+        except asyncio.CancelledError:
+            raise
+        except ImportError:
+            raise
+        except Exception:
+            rejection_codes = ("write_readiness_unavailable",)
+            remediation_categories = ("check_connection_and_credentials",)
+        finally:
+            try:
+                if transaction is not None and not transaction_finished:
+                    await _rollback_postgresql_transaction(
+                        transaction,
+                        connection,
+                        timeout_seconds=self._cleanup_timeout_seconds,
+                    )
+            finally:
+                if connection is not None:
+                    await _close_postgresql_connection(
+                        connection,
+                        timeout_seconds=self._cleanup_timeout_seconds,
+                    )
+
+        if not write_access:
+            rejection_codes = (*rejection_codes, "write_access_not_enabled")
+            remediation_categories = (
+                *remediation_categories,
+                "enable_write_access_in_daita",
+            )
+        return _readiness_result(
+            source_id=source_id,
+            resource_id=resource_id,
+            assignment_columns=validated.assignment_columns,
+            write_access=write_access,
+            facts=facts,
+            rejection_codes=_distinct_labels(rejection_codes),
+            remediation_categories=_distinct_labels(remediation_categories),
+        )
 
     async def preview_update(
         self,
@@ -865,6 +1147,17 @@ def _exact_live_table(
 
 
 def _admitted_guardrails(value: object) -> dict[str, object]:
+    facts = _guardrail_facts(value)
+    rejection_codes, _remediation = _readiness_rejections(facts)
+    if rejection_codes:
+        raise PostgreSQLUpdatePreviewError(
+            "write_guardrail_rejected",
+            "The PostgreSQL relation, role, or privileges do not satisfy preview guardrails.",
+        )
+    return facts
+
+
+def _guardrail_facts(value: object) -> dict[str, object]:
     if value is None:
         raise PostgreSQLUpdatePreviewError(
             "write_resource_not_writable",
@@ -906,30 +1199,211 @@ def _admitted_guardrails(value: object) -> dict[str, object]:
             "write_guardrail_rejected",
             "PostgreSQL returned invalid bounded write-readiness facts.",
         )
-    rejected = (
-        relation_kind != "r"
-        or facts["is_partition"] is True
-        or facts["row_level_security"] is True
-        or facts["force_row_level_security"] is True
-        or facts["has_inheritance"] is True
-        or facts["has_user_triggers"] is True
-        or facts["has_rewrite_rules"] is True
-        or facts["role_superuser"] is True
-        or facts["role_bypass_rls"] is True
-        or facts["role_create_database"] is True
-        or facts["role_create_role"] is True
-        or facts["role_replication"] is True
-        or facts["can_connect"] is not True
-        or facts["can_use_schema"] is not True
-        or facts["can_select_table"] is not True
-        or facts["can_update_columns"] is not True
-    )
-    if rejected:
-        raise PostgreSQLUpdatePreviewError(
-            "write_guardrail_rejected",
-            "The PostgreSQL relation, role, or privileges do not satisfy preview guardrails.",
-        )
     return facts
+
+
+def _readiness_rejections(
+    facts: Mapping[str, object],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    checks = (
+        (
+            facts["relation_kind"] != "r",
+            "write_relation_not_base_table",
+            "select_supported_base_table",
+        ),
+        (
+            facts["is_partition"] is True,
+            "write_relation_partitioned",
+            "select_supported_base_table",
+        ),
+        (
+            facts["has_inheritance"] is True,
+            "write_relation_inherited",
+            "select_supported_base_table",
+        ),
+        (
+            facts["row_level_security"] is True,
+            "write_relation_rls_enabled",
+            "select_relation_without_rls",
+        ),
+        (
+            facts["force_row_level_security"] is True,
+            "write_relation_force_rls",
+            "select_relation_without_rls",
+        ),
+        (
+            facts["has_user_triggers"] is True,
+            "write_relation_user_triggers",
+            "select_relation_without_user_triggers",
+        ),
+        (
+            facts["has_rewrite_rules"] is True,
+            "write_relation_rewrite_rules",
+            "select_relation_without_rewrite_rules",
+        ),
+        (
+            facts["role_superuser"] is True,
+            "write_role_superuser",
+            "use_least_privileged_role",
+        ),
+        (
+            facts["role_bypass_rls"] is True,
+            "write_role_bypass_rls",
+            "use_least_privileged_role",
+        ),
+        (
+            facts["role_create_database"] is True,
+            "write_role_create_database",
+            "use_least_privileged_role",
+        ),
+        (
+            facts["role_create_role"] is True,
+            "write_role_create_role",
+            "use_least_privileged_role",
+        ),
+        (
+            facts["role_replication"] is True,
+            "write_role_replication",
+            "use_least_privileged_role",
+        ),
+        (
+            facts["can_connect"] is not True,
+            "write_privilege_connect_missing",
+            "grant_connect_externally",
+        ),
+        (
+            facts["can_use_schema"] is not True,
+            "write_privilege_schema_usage_missing",
+            "grant_schema_usage_externally",
+        ),
+        (
+            facts["can_select_table"] is not True,
+            "write_privilege_table_select_missing",
+            "grant_table_select_externally",
+        ),
+        (
+            facts["can_update_columns"] is not True,
+            "write_privilege_column_update_missing",
+            "grant_column_update_externally",
+        ),
+    )
+    return (
+        tuple(code for rejected, code, _category in checks if rejected),
+        _distinct_labels(
+            tuple(category for rejected, _code, category in checks if rejected)
+        ),
+    )
+
+
+async def _configure_readiness_transaction(
+    connection: object,
+    *,
+    statement_timeout_seconds: float,
+    lock_timeout_seconds: float,
+) -> None:
+    execute = getattr(connection, "execute")
+    statement_milliseconds = max(1, int(statement_timeout_seconds * 1_000))
+    lock_milliseconds = max(1, int(lock_timeout_seconds * 1_000))
+    await execute(
+        "SELECT set_config('statement_timeout', $1, true)",
+        f"{statement_milliseconds}ms",
+    )
+    await execute(
+        "SELECT set_config('lock_timeout', $1, true)",
+        f"{lock_milliseconds}ms",
+    )
+    await execute(
+        "SELECT set_config('search_path', $1, true)",
+        "pg_catalog",
+    )
+
+
+def _readiness_result(
+    *,
+    source_id: str,
+    resource_id: str,
+    assignment_columns: tuple[str, ...],
+    write_access: bool,
+    facts: Mapping[str, object] | None = None,
+    relation: Mapping[str, object] | None = None,
+    rejection_codes: tuple[str, ...],
+    remediation_categories: tuple[str, ...],
+) -> PostgreSQLUpdateReadiness:
+    role_attributes: dict[str, object] = dict.fromkeys(_READINESS_ROLE_KEYS)
+    privileges: dict[str, object] = dict.fromkeys(_READINESS_PRIVILEGE_KEYS)
+    relation_facts: dict[str, object] = dict.fromkeys(_READINESS_RELATION_KEYS)
+    relation_facts["catalog_admitted"] = True
+    if facts is not None:
+        role_attributes.update(
+            {
+                "superuser": facts["role_superuser"],
+                "bypass_rls": facts["role_bypass_rls"],
+                "create_database": facts["role_create_database"],
+                "create_role": facts["role_create_role"],
+                "replication": facts["role_replication"],
+            }
+        )
+        privileges.update(
+            {
+                "database_connect": facts["can_connect"],
+                "schema_usage": facts["can_use_schema"],
+                "table_select": facts["can_select_table"],
+                "requested_columns_update": facts["can_update_columns"],
+            }
+        )
+        relation_facts.update(
+            {
+                "base_table": facts["relation_kind"] == "r",
+                "partition": facts["is_partition"],
+                "inheritance": facts["has_inheritance"],
+                "row_level_security": facts["row_level_security"],
+                "force_row_level_security": facts["force_row_level_security"],
+                "user_triggers": facts["has_user_triggers"],
+                "rewrite_rules": facts["has_rewrite_rules"],
+            }
+        )
+    if relation is not None:
+        unknown = set(relation) - set(_READINESS_RELATION_KEYS)
+        if unknown:
+            raise ValueError("readiness relation override is invalid")
+        relation_facts.update(relation)
+    return PostgreSQLUpdateReadiness(
+        source_id=source_id,
+        resource_id=resource_id,
+        assignment_columns=assignment_columns,
+        write_access=write_access,
+        ready_for_preview=not rejection_codes,
+        proves_execution=False,
+        role_attributes=FrozenJsonObject.from_mapping(role_attributes),
+        privileges=FrozenJsonObject.from_mapping(privileges),
+        relation=FrozenJsonObject.from_mapping(relation_facts),
+        rejection_codes=rejection_codes,
+        remediation_categories=remediation_categories,
+    )
+
+
+def _bounded_readiness_labels(
+    values: tuple[str, ...],
+    name: str,
+) -> tuple[str, ...]:
+    normalized = tuple(values)
+    if (
+        len(normalized) > 32
+        or len(normalized) != len(set(normalized))
+        or any(
+            not isinstance(value, str)
+            or not value
+            or len(value) > 128
+            or "\x00" in value
+            for value in normalized
+        )
+    ):
+        raise ValueError(f"readiness {name} must contain bounded distinct labels")
+    return normalized
+
+
+def _distinct_labels(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(values))
 
 
 def _preview_select_sql(validated: ValidatedPostgreSQLUpdate) -> str:
@@ -1234,4 +1708,5 @@ __all__ = [
     "PostgreSQLUpdateExecutionError",
     "PostgreSQLUpdatePreviewBackend",
     "PostgreSQLUpdatePreviewError",
+    "PostgreSQLUpdateReadiness",
 ]

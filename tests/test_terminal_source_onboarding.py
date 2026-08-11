@@ -177,6 +177,7 @@ async def test_terminal_postgresql_probe_selects_only_requested_schemas(
     assert result == 0
     assert len(attached) == 1
     assert attached[0]["schemas"] == ("analytics", "reporting")
+    assert "write_access" not in attached[0]
     reference = attached[0]["credential"]
     assert isinstance(reference, SecretReference)
     assert keychain.values[reference.name] == "database-secret"

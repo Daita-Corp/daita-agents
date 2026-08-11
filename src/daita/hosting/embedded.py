@@ -24,7 +24,10 @@ from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySour
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
 from ..adapters.postgresql_query import PostgreSQLQueryBackend
-from ..adapters.postgresql_write import PostgreSQLUpdatePreviewBackend
+from ..adapters.postgresql_write import (
+    PostgreSQLUpdatePreviewBackend,
+    PostgreSQLUpdateReadiness,
+)
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.sqlite import SQLiteSource
 from ..adapters.sqlite_query import SQLiteQueryBackend
@@ -59,7 +62,7 @@ from ..domains.data import (
     sqlite_query_declarations,
 )
 from ..domains.data.context import _project_completed_history
-from ..errors import AgentError
+from ..errors import AgentError, StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity
 from ..learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
@@ -119,12 +122,21 @@ from ..semantics import (
 )
 from ..skills import Skill, SkillStore, SkillSummary
 from ..skills.capabilities import skill_declarations
-from ..storage.sqlite import SQLiteStateStore
+from ..storage.sqlite import (
+    STATE_FORMAT_VERSION,
+    SQLiteStateStore,
+)
 
 _AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_AGENT_HOME_CANDIDATES = 256
 _MAX_DISCOVERED_AGENTS = 100
+_LEGACY_STATE_ROOT_MARKERS = (
+    "catalog.json",
+    "graph",
+    "memory",
+    "sessions",
+)
 _MODEL_CONFIG_NAME = "config.json"
 _MAX_MODEL_CONFIG_BYTES = 64 * 1_024
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
@@ -295,6 +307,7 @@ class EmbeddedAgent:
         catalog_service: CatalogService,
         data_view: CatalogDataView,
         data_tool_runtime: DataToolRuntime,
+        postgresql_update_backend: PostgreSQLUpdatePreviewBackend,
         memory_store: MemoryStore,
         skill_store: SkillStore,
         candidate_reviewer: OneShotCandidateReviewer,
@@ -328,6 +341,7 @@ class EmbeddedAgent:
         self._catalog_service = catalog_service
         self._data_view = data_view
         self._data_tool_runtime = data_tool_runtime
+        self._postgresql_update_backend = postgresql_update_backend
         self._memory_store = memory_store
         self._skill_store = skill_store
         self._candidate_reviewer = candidate_reviewer
@@ -888,6 +902,7 @@ class EmbeddedAgent:
             catalog_service=catalog_service,
             data_view=data_view,
             data_tool_runtime=data_tool_runtime,
+            postgresql_update_backend=postgresql_preview_backend,
             memory_store=memory_store,
             skill_store=skill_store,
             candidate_reviewer=candidate_reviewer,
@@ -1667,6 +1682,11 @@ class EmbeddedAgent:
         return await self._skill_store.delete_skill(name)
 
     async def attach(self, source: ResourceSource) -> SourceRegistration:
+        if isinstance(source, PostgreSQLSource) and source.write_access:
+            raise ValueError(
+                "PostgreSQL attachment is read-only; enable write_access "
+                "separately after attachment and readiness inspection"
+            )
         return await self._attach_source(source, attached_at=self._clock())
 
     async def _attach_source(
@@ -1687,6 +1707,7 @@ class EmbeddedAgent:
         source: ResourceSource,
         *,
         attached_at: datetime,
+        persisted_registration: SourceRegistration | None = None,
     ) -> SourceRegistration:
         adapter = await source.open(
             agent_id=self.identity.id,
@@ -1695,9 +1716,29 @@ class EmbeddedAgent:
         )
         if not isinstance(adapter, ResourceAdapter):
             raise TypeError("source open() must return ResourceAdapter")
-        registration = adapter.registration
+        opened_registration = adapter.registration
+        registration = opened_registration
         sync: CatalogSync | None = None
         try:
+            if persisted_registration is not None:
+                comparable_configuration = dict(persisted_registration.configuration)
+                if (
+                    persisted_registration.adapter_id == "postgresql"
+                    and "write_access" not in comparable_configuration
+                    and opened_registration.configuration.get("write_access") is False
+                ):
+                    comparable_configuration["write_access"] = False
+                if (
+                    replace(
+                        persisted_registration,
+                        configuration=comparable_configuration,
+                    )
+                    != opened_registration
+                ):
+                    raise ValueError(
+                        "refreshed source registration disagrees with persisted identity"
+                    )
+                registration = persisted_registration
             self._capabilities.validate_declarations(adapter.declarations())
             sync = CatalogSync(
                 id=self._id_factory("catalog-sync"),
@@ -1853,7 +1894,6 @@ class EmbeddedAgent:
         schemas: tuple[str, ...],
         port: int = 5432,
         ssl_mode: str = "require",
-        write_access: bool = False,
         name: str | None = None,
     ) -> SourceRegistration:
         """Construct and attach one ordinary selected-schema PostgreSQL source."""
@@ -1867,7 +1907,7 @@ class EmbeddedAgent:
                 credential=credential,
                 schemas=schemas,
                 ssl_mode=ssl_mode,
-                write_access=write_access,
+                write_access=False,
                 name=name,
                 secret_provider=self._secret_provider or self._keychain,
             )
@@ -1891,6 +1931,22 @@ class EmbeddedAgent:
                 source_id,
                 enabled,
             )
+
+    async def postgresql_update_readiness(
+        self,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> PostgreSQLUpdateReadiness:
+        """Inspect one exact PostgreSQL update scope without mutating state."""
+
+        self._require_open()
+        return await self._postgresql_update_backend.postgresql_update_readiness(
+            agent_id=self.identity.id,
+            source_id=source_id,
+            resource_id=resource_id,
+            assignment_columns=assignment_columns,
+        )
 
     async def detach(self, source_id: str) -> SourceRegistration:
         async with self._mutation_lock:
@@ -1931,6 +1987,7 @@ class EmbeddedAgent:
             return await self._attach_source_locked(
                 source,
                 attached_at=registration.attached_at,
+                persisted_registration=registration,
             )
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
@@ -2985,6 +3042,7 @@ def _admit_agent_home(
             "agent name must contain 1-64 ASCII letters, digits, '_' or '-'"
         )
     state_root = _resolve_state_root(root)
+    _reject_legacy_state_root(state_root)
     state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     agents_root = state_root / "agents"
     agents_root.mkdir(mode=0o700, exist_ok=True)
@@ -3011,6 +3069,7 @@ def _candidate_agent_homes(root: str | Path | None) -> tuple[Path, ...]:
         return ()
     if not state_root.is_dir():
         raise AgentHomeError("agent state root must be a directory")
+    _reject_legacy_state_root(state_root)
     agents_root = state_root / "agents"
     if not agents_root.exists():
         return ()
@@ -3037,6 +3096,24 @@ def _candidate_agent_homes(root: str | Path | None) -> tuple[Path, ...]:
             continue
         candidates.append(home)
     return tuple(candidates)
+
+
+def _reject_legacy_state_root(state_root: Path) -> None:
+    if (state_root / "agents").exists() or not state_root.exists():
+        return
+    if not any((state_root / marker).exists() for marker in _LEGACY_STATE_ROOT_MARKERS):
+        return
+    raise StateCompatibilityError(
+        StateCompatibilityCode.LEGACY_FORMAT,
+        state_root,
+        (
+            "This local data directory belongs to the unsupported pre-1.0 Daita "
+            "framework. It was left unchanged. Use a separate current-format root "
+            "and keep this directory intact for a deliberate legacy export/import."
+        ),
+        current_format=STATE_FORMAT_VERSION,
+        found_format=0,
+    )
 
 
 def _resolve_state_root(root: str | Path | None) -> Path:

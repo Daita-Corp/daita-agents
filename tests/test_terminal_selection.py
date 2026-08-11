@@ -394,7 +394,7 @@ async def test_multi_select_space_toggles_and_untoggles_without_committing_empty
             )
         )
         pipe.send_text("  \r")
-        await asyncio.sleep(0.02)
+        await _wait_for_output(output, "Select at least one option.")
         assert not task.done()
         assert "Select at least one option." in output.text
         pipe.send_text("\x1b[B \r")

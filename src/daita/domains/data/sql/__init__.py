@@ -26,11 +26,14 @@ from .postgresql_update import (
     PostgreSQLUpdateCell,
     PostgreSQLUpdateCommand,
     PostgreSQLUpdateIntent,
+    PostgreSQLUpdateScopeValidationResult,
     PostgreSQLUpdateStatement,
     PostgreSQLUpdateValidationResult,
     ValidatedPostgreSQLUpdate,
+    ValidatedPostgreSQLUpdateScope,
     render_postgresql_update_statement,
     validate_postgresql_update_intent,
+    validate_postgresql_update_scope,
 )
 from .read_validation import validate_postgresql_read, validate_sqlite_read
 
@@ -42,6 +45,7 @@ __all__ = [
     "PostgreSQLUpdateCell",
     "PostgreSQLUpdateCommand",
     "PostgreSQLUpdateIntent",
+    "PostgreSQLUpdateScopeValidationResult",
     "PostgreSQLUpdateStatement",
     "PostgreSQLUpdateValidationResult",
     "ResourceSchema",
@@ -52,6 +56,7 @@ __all__ = [
     "SqlValidationIssue",
     "SqlValidationResult",
     "ValidatedPostgreSQLUpdate",
+    "ValidatedPostgreSQLUpdateScope",
     "analyze_postgresql_sql",
     "analyze_sqlite_sql",
     "normalize_sql",
@@ -60,5 +65,6 @@ __all__ = [
     "sqlite_identifier_key",
     "validate_postgresql_read",
     "validate_postgresql_update_intent",
+    "validate_postgresql_update_scope",
     "validate_sqlite_read",
 ]
