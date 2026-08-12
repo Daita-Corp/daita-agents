@@ -98,6 +98,7 @@ from ...skills.store import (
     SkillValidationError,
     validate_skill_name,
 )
+from ...storage.sqlite_records import SourcePermissionStateError
 from .export_capabilities import (
     ARTIFACT_CONVERT_CAPABILITY_ID,
     ARTIFACT_LIST_CAPABILITY_ID,
@@ -200,6 +201,24 @@ class CatalogSchemaReader(Protocol):
     ) -> tuple[ResourceSchema, ...]: ...
 
 
+class ReadScopedCatalogReader(CatalogSchemaReader, Protocol):
+    async def readable_resource_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> frozenset[str]: ...
+
+
+class PostgreSQLUpdateCatalogReader(CatalogSchemaReader, Protocol):
+    async def postgresql_update_scope_issue(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> tuple[str, str] | None: ...
+
+
 class CatalogDataReader(CatalogSchemaReader, Protocol):
     async def catalog_context(
         self,
@@ -214,9 +233,28 @@ class CatalogDataReader(CatalogSchemaReader, Protocol):
     async def source_routing_facts(
         self,
         agent_id: str,
-        configuration_flags: tuple[str, ...],
         source_ids: tuple[str, ...] = (),
     ) -> tuple[Mapping[str, object], ...]: ...
+
+    async def readable_resource_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> frozenset[str]: ...
+
+    async def postgresql_update_scope_issue(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> tuple[str, str] | None: ...
+
+    async def postgresql_update_applicable_source_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> frozenset[str]: ...
 
     async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None: ...
 
@@ -866,6 +904,22 @@ class DataToolRuntime:
                 },
             )
         resources = await self._catalog.resource_schemas(run.agent_id, source_id)
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError:
+            raise ArtifactError(
+                "artifact_incomplete_export",
+                "Current source permission state no longer proves the exact export.",
+                {
+                    "reason": "permission_state_invalid",
+                    "completed_rows": draft.provenance.row_count or 0,
+                    "completed_columns": len(draft.provenance.columns),
+                    "completed_bytes": len(draft.content),
+                },
+            )
         validator = (
             validate_postgresql_read
             if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
@@ -876,6 +930,7 @@ class DataToolRuntime:
             source_id=source_id,
             resources=resources,
             parameters=parameters,
+            allowed_resource_ids=readable,
         )
         if (
             not validation.valid
@@ -1570,7 +1625,13 @@ class DataToolRuntime:
             )
         )
         facts = await self._catalog.semantic_resource_facts(agent_id, resource_ids)
-        return inspect_semantic_annotations(annotations, facts)
+        readable_fact_ids = {fact.resource_id for fact in facts}
+        readable_annotations = tuple(
+            annotation
+            for annotation in annotations
+            if set(annotation.subject.resource_ids) <= readable_fact_ids
+        )
+        return inspect_semantic_annotations(readable_annotations, facts)
 
     async def _semantic_annotation_issue(
         self,
@@ -1851,6 +1912,13 @@ class DataToolRuntime:
         )
         if source_scope_error is not None:
             return source_scope_error
+        read_scope_error = await self._validate_resource_read_scope(
+            run,
+            capability,
+            arguments,
+        )
+        if read_scope_error is not None:
+            return read_scope_error
         if capability.access_mode is AccessMode.WRITE:
             if (
                 capability.id
@@ -2020,24 +2088,6 @@ class DataToolRuntime:
                 "The selected source is not an active PostgreSQL source owned by this agent.",
                 {"source_id": source_id},
             )
-        facts = await self._catalog.source_routing_facts(
-            run.agent_id,
-            ("write_access",),
-            (source_id,),
-        )
-        eligible = any(
-            fact.get("source_id") == source_id
-            and fact.get("adapter_id") == "postgresql"
-            and isinstance((flags := fact.get("configuration_flags")), Mapping)
-            and flags.get("write_access") is True
-            for fact in facts
-        )
-        if not eligible:
-            return (
-                "write_access_not_enabled",
-                "PostgreSQL update requires user-owned write_access enablement.",
-                {"source_id": source_id},
-            )
         try:
             intent = (
                 PostgreSQLUpdateCommand.from_mapping(arguments).intent
@@ -2050,6 +2100,21 @@ class DataToolRuntime:
                 "The PostgreSQL update intent is malformed.",
                 {},
             )
+        try:
+            scope_issue = await self._catalog.postgresql_update_scope_issue(
+                run.agent_id,
+                source_id,
+                intent.resource_id,
+                tuple(item.column for item in intent.assignments),
+            )
+        except SourcePermissionStateError:
+            return (
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+                {},
+            )
+        if scope_issue is not None:
+            return scope_issue[0], scope_issue[1], {}
         validation = validate_postgresql_update_intent(
             intent,
             resources=await self._catalog.resource_schemas(
@@ -2065,6 +2130,64 @@ class DataToolRuntime:
             issue.message,
             {"source_id": source_id, "resource_id": intent.resource_id},
         )
+
+    async def _validate_resource_read_scope(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> tuple[str, str, Mapping[str, object]] | None:
+        resource_ids: tuple[object, ...] = ()
+        if capability.id in {
+            CATALOG_INSPECT_CAPABILITY_ID,
+            LOCAL_FILE_READ_CAPABILITY_ID,
+            LOCAL_FILE_COPY_CAPABILITY_ID,
+            POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+            POSTGRESQL_UPDATE_CAPABILITY_ID,
+        }:
+            resource_ids = (arguments.get("resource_id"),)
+        elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
+            raw = arguments.get("resource_ids", ())
+            resource_ids = raw if isinstance(raw, tuple) else ()
+        elif capability.id == CATALOG_TRAVERSE_CAPABILITY_ID:
+            raw_from = arguments.get("from_resource_ids", ())
+            raw_to = arguments.get("to_resource_ids", ())
+            resource_ids = (
+                *(raw_from if isinstance(raw_from, tuple) else ()),
+                *(raw_to if isinstance(raw_to, tuple) else ()),
+            )
+        elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:
+            resource_ids = (arguments.get("resource_id"),)
+        elif capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
+            subject = arguments.get("subject")
+            raw = subject.get("resource_ids") if isinstance(subject, Mapping) else ()
+            resource_ids = raw if isinstance(raw, tuple) else ()
+
+        requested = tuple(
+            resource_id for resource_id in resource_ids if isinstance(resource_id, str)
+        )
+        if not requested:
+            return None
+        source_id = arguments.get("source_id")
+        source_ids = (source_id,) if isinstance(source_id, str) else ()
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                source_ids,
+            )
+        except SourcePermissionStateError:
+            return (
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+                {},
+            )
+        if any(resource_id not in readable for resource_id in requested):
+            return (
+                "resource_read_not_allowed",
+                "The requested resource is not available for reading.",
+                {},
+            )
+        return None
 
     async def _current_conversation_artifact_ref(
         self,
@@ -2269,6 +2392,17 @@ class DataToolRuntime:
                 },
             )
         resources = await self._catalog.resource_schemas(run.agent_id, source_id)
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError:
+            return (
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+                {},
+            )
         validator = (
             validate_postgresql_read
             if expected_adapter == "postgresql"
@@ -2279,9 +2413,17 @@ class DataToolRuntime:
             source_id=source_id,
             resources=resources,
             parameters=parameters,
+            allowed_resource_ids=readable,
         )
         if result.valid:
             return None
+        issue_codes = {issue.code for issue in result.issues}
+        if issue_codes & {"resource_out_of_scope", "unknown_resource"}:
+            return (
+                "resource_read_not_allowed",
+                "One or more requested resources are not available for reading.",
+                {},
+            )
         return (
             "sql_validation_failed",
             "The SQL read is invalid. Correct all reported issues before retrying.",
@@ -2299,8 +2441,7 @@ class DataToolRuntime:
         )
 
     async def _projected_tool_names(self, run: RunInput) -> tuple[str, ...]:
-        candidates: list[tuple[str, ToolApplicability]] = []
-        required_flags: set[str] = set()
+        candidates: list[tuple[str, str, ToolApplicability]] = []
         selected_candidate = self._selected_learning_candidates.get(run.id)
         candidate_mutation_tool = (
             None
@@ -2351,25 +2492,45 @@ class DataToolRuntime:
                 has_current_run_artifacts or has_prior_conversation_artifacts
             ):
                 continue
-            candidates.append((name, view.applicability))
-            required_flags.update(view.applicability.required_configuration_flags)
-        required = tuple(sorted(required_flags))
+            candidates.append((name, capability.id, view.applicability))
         facts = (
             await self._catalog.source_routing_facts(
                 run.agent_id,
-                required,
                 (run.source_id,),
             )
             if run.source_id is not None
             else await self._catalog.source_routing_facts(
                 run.agent_id,
-                required,
             )
+        )
+        has_update_candidates = any(
+            capability_id
+            in {
+                POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+                POSTGRESQL_UPDATE_CAPABILITY_ID,
+            }
+            for _, capability_id, _ in candidates
+        )
+        update_source_ids = (
+            await self._catalog.postgresql_update_applicable_source_ids(
+                run.agent_id,
+                (() if run.source_id is None else (run.source_id,)),
+            )
+            if has_update_candidates
+            else frozenset()
         )
         return tuple(
             name
-            for name, applicability in candidates
+            for name, capability_id, applicability in candidates
             if _applicable(applicability, facts)
+            and (
+                capability_id
+                not in {
+                    POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+                    POSTGRESQL_UPDATE_CAPABILITY_ID,
+                }
+                or bool(update_source_ids)
+            )
         )
 
     async def _semantic_maintenance_requested(self, run: RunInput) -> bool:
@@ -2521,12 +2682,6 @@ def _applicable(
             applicability.source_adapter_ids
         ):
             continue
-        flags = fact.get("configuration_flags", {})
-        if not isinstance(flags, Mapping) or any(
-            flags.get(flag) is not True
-            for flag in applicability.required_configuration_flags
-        ):
-            continue
         matching.append(fact)
     return len(matching) >= applicability.minimum_active_sources
 
@@ -2591,6 +2746,8 @@ __all__ = [
     "POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND",
     "POSTGRESQL_UPDATE_CAPABILITY_ID",
     "POSTGRESQL_UPDATE_EVIDENCE_KIND",
+    "PostgreSQLUpdateCatalogReader",
+    "ReadScopedCatalogReader",
     "SQLITE_QUERY_CAPABILITY_ID",
     "SQLITE_QUERY_EVIDENCE_KIND",
 ]

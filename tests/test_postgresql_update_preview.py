@@ -88,8 +88,14 @@ class _SourceStore:
 
 
 class _Catalog:
-    def __init__(self, resource: ResourceSchema) -> None:
+    def __init__(
+        self,
+        resource: ResourceSchema,
+        *,
+        scope_issue: tuple[str, str] | None = None,
+    ) -> None:
         self.resource = resource
+        self.scope_issue = scope_issue
 
     async def resource_schemas(
         self,
@@ -98,6 +104,10 @@ class _Catalog:
     ) -> tuple[ResourceSchema, ...]:
         del agent_id
         return (self.resource,) if source_id == self.resource.source_id else ()
+
+    async def postgresql_update_scope_issue(self, *args: object):
+        del args
+        return self.scope_issue
 
 
 class _Transaction:
@@ -333,10 +343,11 @@ def _backend(
     *,
     registration: SourceRegistration | None = None,
     resource: ResourceSchema | None = None,
+    scope_issue: tuple[str, str] | None = None,
 ) -> write_module.PostgreSQLUpdatePreviewBackend:
     return write_module.PostgreSQLUpdatePreviewBackend(
         _SourceStore(registration or _registration()),
-        _Catalog(resource or _resource()),
+        _Catalog(resource or _resource(), scope_issue=scope_issue),
         EmptySecretProvider(),
     )
 
@@ -586,7 +597,7 @@ async def test_stale_live_structure_and_catalog_revision_fail_before_preview(
     assert connected is False
 
 
-async def test_write_access_and_source_ownership_are_rechecked_before_connection(
+async def test_update_scope_and_source_ownership_are_rechecked_before_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connected = False
@@ -602,6 +613,10 @@ async def test_write_access_and_source_ownership_are_rechecked_before_connection
         await _backend(
             _Connection(),
             registration=_registration(write_access=False),
+            scope_issue=(
+                "resource_update_not_allowed",
+                "The requested resource is not authorized for PostgreSQL updates.",
+            ),
         ).preview_update(agent_id="agent-preview", intent=_intent())
     with pytest.raises(write_module.PostgreSQLUpdatePreviewError) as foreign:
         await _backend(
@@ -609,7 +624,7 @@ async def test_write_access_and_source_ownership_are_rechecked_before_connection
             registration=_registration(agent_id="another-agent"),
         ).preview_update(agent_id="agent-preview", intent=_intent())
 
-    assert disabled.value.code == "write_access_not_enabled"
+    assert disabled.value.code == "resource_update_not_allowed"
     assert foreign.value.code == "write_source_not_available"
     assert connected is False
 

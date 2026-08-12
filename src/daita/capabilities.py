@@ -177,16 +177,14 @@ class Capability:
 class ToolApplicability:
     source_adapter_ids: tuple[str, ...] = ()
     minimum_active_sources: int = 0
-    required_configuration_flags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("source_adapter_ids", "required_configuration_flags"):
-            values = tuple(getattr(self, name))
-            if any(not isinstance(value, str) or not value for value in values):
-                raise ValueError(f"{name} must contain non-empty strings")
-            if len(values) != len(set(values)):
-                raise ValueError(f"{name} cannot contain duplicates")
-            object.__setattr__(self, name, values)
+        source_adapter_ids = tuple(self.source_adapter_ids)
+        if any(not isinstance(value, str) or not value for value in source_adapter_ids):
+            raise ValueError("source_adapter_ids must contain non-empty strings")
+        if len(source_adapter_ids) != len(set(source_adapter_ids)):
+            raise ValueError("source_adapter_ids cannot contain duplicates")
+        object.__setattr__(self, "source_adapter_ids", source_adapter_ids)
         if (
             not isinstance(self.minimum_active_sources, int)
             or isinstance(self.minimum_active_sources, bool)

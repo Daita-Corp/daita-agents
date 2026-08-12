@@ -362,7 +362,12 @@ class CatalogService:
                 break
         raise CatalogStoreError("catalog snapshot generation changed repeatedly")
 
-    async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
+    async def search(
+        self,
+        request: CatalogSearchRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
+    ) -> CatalogSearchResult:
         if not isinstance(request, CatalogSearchRequest):
             raise TypeError("request must be a CatalogSearchRequest record")
         for attempt in range(2):
@@ -404,7 +409,11 @@ class CatalogService:
                 if attempt == 0:
                     continue
                 break
-            result = self._search_indexes(request, tuple(indexes))
+            result = self._search_indexes(
+                request,
+                tuple(indexes),
+                readable_resource_ids=readable_resource_ids,
+            )
             current_active_source_ids = await self._active_source_ids(request.agent_id)
             current_refs = (
                 ()
@@ -491,6 +500,8 @@ class CatalogService:
         self,
         request: CatalogSearchRequest,
         indexes: tuple[_SourceCatalogIndex, ...],
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> CatalogSearchResult:
         for index in indexes:
             if index.agent_id != request.agent_id or (
@@ -512,6 +523,7 @@ class CatalogService:
                 resource.id: resource
                 for index in indexes
                 for resource in index.resources_by_id.values()
+                if readable_resource_ids is None or resource.id in readable_resource_ids
                 if not resource_kinds or resource.kind in resource_kinds
             }
             candidates = tuple(
@@ -531,7 +543,10 @@ class CatalogService:
                 )
                 for resource_id in exact_ids:
                     resource = index.resources_by_id[resource_id]
-                    if resource_kinds and resource.kind not in resource_kinds:
+                    if (
+                        readable_resource_ids is not None
+                        and resource.id not in readable_resource_ids
+                    ) or (resource_kinds and resource.kind not in resource_kinds):
                         continue
                     candidate_resources[resource_id] = resource
                     matching = tuple(
@@ -554,7 +569,12 @@ class CatalogService:
                         postings = index.token_postings[indexed_token]
                         for posting in postings:
                             resource = index.resources_by_id[posting.resource_id]
-                            if resource_kinds and resource.kind not in resource_kinds:
+                            if (
+                                readable_resource_ids is not None
+                                and resource.id not in readable_resource_ids
+                            ) or (
+                                resource_kinds and resource.kind not in resource_kinds
+                            ):
                                 continue
                             candidate_resources[posting.resource_id] = resource
                             postings_by_candidate.setdefault(
@@ -587,6 +607,10 @@ class CatalogService:
                 neighbor = index.resources_by_id.get(edge.neighbor_resource_id)
                 if (
                     neighbor is None
+                    or (
+                        readable_resource_ids is not None
+                        and neighbor.id not in readable_resource_ids
+                    )
                     or neighbor.id in direct_ids
                     or (resource_kinds and neighbor.kind not in resource_kinds)
                 ):
@@ -628,6 +652,8 @@ class CatalogService:
     async def schema_slice(
         self,
         request: CatalogSchemaRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
         """Project bounded current structural truth without source connector I/O."""
 
@@ -673,6 +699,7 @@ class CatalogService:
                     request,
                     active_source_ids,
                     tuple(indexes),
+                    readable_resource_ids=readable_resource_ids,
                 )
             except _CatalogGenerationChanged:
                 if attempt == 0:
@@ -698,6 +725,8 @@ class CatalogService:
         request: CatalogSchemaRequest,
         active_source_ids: tuple[str, ...],
         indexes: tuple[_SourceCatalogIndex, ...],
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
         resources_by_id: dict[str, CatalogResource] = {}
         revisions_by_resource_id: dict[str, CatalogResourceRevision] = {}
@@ -720,17 +749,30 @@ class CatalogService:
             all_syncs_by_id[sync.id] = sync
             index_by_source_id[index.source_id] = index
             for resource in index.resources_by_id.values():
+                if (
+                    readable_resource_ids is not None
+                    and resource.id not in readable_resource_ids
+                ):
+                    continue
                 if resource.id in resources_by_id:
                     raise CatalogStoreError("catalog index set repeats a resource")
                 resources_by_id[resource.id] = resource
                 index_by_resource_id[resource.id] = index
             for revision in index.revisions_by_resource_id.values():
+                if revision.resource_id not in resources_by_id:
+                    continue
                 if revision.resource_id in revisions_by_resource_id:
                     raise CatalogStoreError("catalog index set repeats a revision")
                 revisions_by_resource_id[revision.resource_id] = revision
             for resource_id, facets in index.facets_by_resource_id.items():
-                facets_by_resource_id[resource_id] = facets
+                if resource_id in resources_by_id:
+                    facets_by_resource_id[resource_id] = facets
             for relationship in index.relationships_by_id.values():
+                if (
+                    relationship.from_resource_id not in resources_by_id
+                    or relationship.to_resource_id not in resources_by_id
+                ):
+                    continue
                 if relationship.id in relationships_by_id:
                     raise CatalogStoreError("catalog index set repeats a relationship")
                 relationships_by_id[relationship.id] = relationship
@@ -761,6 +803,7 @@ class CatalogService:
                     for index in indexes
                     if request.source_id is None or index.source_id == request.source_id
                 ),
+                readable_resource_ids=readable_resource_ids,
             )
             match_by_resource_id = {hit.resource_id: hit for hit in search.hits}
         else:
@@ -854,6 +897,7 @@ class CatalogService:
                 request,
                 seeds,
                 index_by_source_id,
+                readable_resource_ids=readable_resource_ids,
             )
 
         included_ids = set(seed_ids)
@@ -862,11 +906,18 @@ class CatalogService:
         if request.include_relationships and len(seeds) == 1:
             seed = seeds[0]
             index = index_by_resource_id[seed.id]
-            eligible_ids = self._sql_join_relationship_ids(index)
+            eligible_ids = self._sql_join_relationship_ids(
+                index,
+                readable_resource_ids=readable_resource_ids,
+            )
             neighbor_candidates = tuple(
                 edge.neighbor_resource_id
                 for edge in index.adjacency_by_resource_id.get(seed.id, ())
                 if edge.relationship_id in eligible_ids
+                and (
+                    readable_resource_ids is None
+                    or edge.neighbor_resource_id in readable_resource_ids
+                )
             )
             for neighbor_id in neighbor_candidates:
                 if neighbor_id in included_ids:
@@ -967,8 +1018,11 @@ class CatalogService:
                 selected_relationship_ids.update(
                     edge.relationship_id
                     for edge in index.adjacency_by_resource_id.get(resource.id, ())
-                    if len(seeds) == 1
-                    or edge.neighbor_resource_id in selected_resources
+                    if edge.relationship_id in relationships_by_id
+                    and (
+                        len(seeds) == 1
+                        or edge.neighbor_resource_id in selected_resources
+                    )
                 )
             relationships = tuple(
                 sorted(
@@ -1162,6 +1216,8 @@ class CatalogService:
     def _sql_join_relationship_ids(
         self,
         index: _SourceCatalogIndex,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> frozenset[str]:
         eligible: set[str] = set()
         for relationship in index.relationships_by_id.values():
@@ -1171,6 +1227,13 @@ class CatalogService:
                 or not relationship.field_pairs
                 or relationship.source_id != index.source_id
                 or relationship.sync_id != index.sync_id
+                or (
+                    readable_resource_ids is not None
+                    and (
+                        relationship.from_resource_id not in readable_resource_ids
+                        or relationship.to_resource_id not in readable_resource_ids
+                    )
+                )
                 or not self._is_tabular_resource(
                     index,
                     relationship.from_resource_id,
@@ -1199,6 +1262,8 @@ class CatalogService:
         request: CatalogSchemaRequest,
         seeds: tuple[CatalogResource, ...],
         index_by_source_id: Mapping[str, _SourceCatalogIndex],
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> _SchemaJoinSelection:
         groups: dict[str, list[CatalogResource]] = {}
         for seed in seeds:
@@ -1229,7 +1294,10 @@ class CatalogService:
             if len(joinable_seeds) < 2:
                 continue
 
-            eligible_relationship_ids = self._sql_join_relationship_ids(index)
+            eligible_relationship_ids = self._sql_join_relationship_ids(
+                index,
+                readable_resource_ids=readable_resource_ids,
+            )
             tree_resource_ids = {joinable_seeds[0].id}
             remaining = list(joinable_seeds[1:])
             while remaining:
@@ -1278,6 +1346,7 @@ class CatalogService:
                             (index,),
                             eligible_relationship_ids=eligible_relationship_ids,
                             stop_at_shortest_target=True,
+                            readable_resource_ids=readable_resource_ids,
                         )
                         visited_nodes += result.visited_nodes
                         visited_edges += result.visited_edges
@@ -1402,7 +1471,14 @@ class CatalogService:
         self,
         agent_id: str,
         resource_id: str,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
+        if (
+            readable_resource_ids is not None
+            and resource_id not in readable_resource_ids
+        ):
+            raise CatalogResourceNotFoundError(agent_id, resource_id)
         resource = await self._active_resource(agent_id, resource_id)
         facets = await self._store.load_facets(
             agent_id,
@@ -1412,8 +1488,15 @@ class CatalogService:
         incident = await self._store.load_incident_relationships(
             agent_id,
             resource.id,
-            limit=_INSPECT_INCIDENT_RELATIONSHIP_LIMIT + 1,
+            limit=CATALOG_TRAVERSAL_MAX_EDGES + 1,
         )
+        if readable_resource_ids is not None:
+            incident = tuple(
+                relationship
+                for relationship in incident
+                if relationship.from_resource_id in readable_resource_ids
+                and relationship.to_resource_id in readable_resource_ids
+            )
         incident_truncated = len(incident) > _INSPECT_INCIDENT_RELATIONSHIP_LIMIT
         incident = incident[:_INSPECT_INCIDENT_RELATIONSHIP_LIMIT]
         resources = {resource.id: resource}
@@ -1489,6 +1572,8 @@ class CatalogService:
     async def traverse(
         self,
         request: CatalogTraversalRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
         if not isinstance(request, CatalogTraversalRequest):
             raise TypeError("request must be a CatalogTraversalRequest record")
@@ -1520,7 +1605,11 @@ class CatalogService:
                     continue
                 break
             resolved_indexes = tuple(indexes)
-            result = self._traverse_indexes(request, resolved_indexes)
+            result = self._traverse_indexes(
+                request,
+                resolved_indexes,
+                readable_resource_ids=readable_resource_ids,
+            )
             projection = self._traversal_projection(result, resolved_indexes)
             current_active_source_ids = await self._active_source_ids(request.agent_id)
             current_refs = (
@@ -1544,6 +1633,7 @@ class CatalogService:
         *,
         eligible_relationship_ids: frozenset[str] | None = None,
         stop_at_shortest_target: bool = False,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> CatalogTraversalResult:
         resources_by_id: dict[str, CatalogResource] = {}
         relationships_by_id: dict[str, CatalogRelationship] = {}
@@ -1551,16 +1641,32 @@ class CatalogService:
         for index in indexes:
             if index.agent_id != request.agent_id:
                 raise CatalogStoreError("catalog traversal index escaped agent scope")
-            duplicate_resources = resources_by_id.keys() & index.resources_by_id.keys()
+            admitted_resources = {
+                resource_id: resource
+                for resource_id, resource in index.resources_by_id.items()
+                if readable_resource_ids is None or resource_id in readable_resource_ids
+            }
+            admitted_relationships = {
+                relationship_id: relationship
+                for relationship_id, relationship in index.relationships_by_id.items()
+                if (
+                    readable_resource_ids is None
+                    or (
+                        relationship.from_resource_id in readable_resource_ids
+                        and relationship.to_resource_id in readable_resource_ids
+                    )
+                )
+            }
+            duplicate_resources = resources_by_id.keys() & admitted_resources.keys()
             duplicate_relationships = (
-                relationships_by_id.keys() & index.relationships_by_id.keys()
+                relationships_by_id.keys() & admitted_relationships.keys()
             )
             if duplicate_resources or duplicate_relationships:
                 raise CatalogStoreError("catalog traversal index identities overlap")
-            resources_by_id.update(index.resources_by_id)
-            relationships_by_id.update(index.relationships_by_id)
+            resources_by_id.update(admitted_resources)
+            relationships_by_id.update(admitted_relationships)
             index_by_resource_id.update(
-                (resource_id, index) for resource_id in index.resources_by_id
+                (resource_id, index) for resource_id in admitted_resources
             )
 
         for resource_id in (*request.from_resource_ids, *request.to_resource_ids):
@@ -1605,6 +1711,8 @@ class CatalogService:
                 continue
             index = index_by_resource_id[current_resource_id]
             for edge in index.adjacency_by_resource_id.get(current_resource_id, ()):
+                if edge.relationship_id not in relationships_by_id:
+                    continue
                 relationship = relationships_by_id[edge.relationship_id]
                 if allowed_kinds and relationship.kind not in allowed_kinds:
                     continue
@@ -2050,6 +2158,7 @@ class CatalogService:
         limit: int,
         source_ids: tuple[str, ...] = (),
         resource_ids: tuple[str, ...] = (),
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
         result = await self.search(
             CatalogSearchRequest(
@@ -2059,7 +2168,8 @@ class CatalogService:
                 limit=(
                     CATALOG_MAX_LIMIT if resource_ids else min(limit, CATALOG_MAX_LIMIT)
                 ),
-            )
+            ),
+            readable_resource_ids=readable_resource_ids,
         )
         hits = tuple(
             hit

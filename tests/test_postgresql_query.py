@@ -62,6 +62,14 @@ class _CatalogSchemas:
         del agent_id
         return tuple(item for item in self.resources if item.source_id == source_id)
 
+    async def readable_resource_ids(self, agent_id: str, source_ids=()):
+        del agent_id
+        return frozenset(
+            item.resource_id
+            for item in self.resources
+            if not source_ids or item.source_id in source_ids
+        )
+
 
 def _backend() -> tuple[
     postgresql_query_module.PostgreSQLQueryBackend,

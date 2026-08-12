@@ -725,7 +725,7 @@ class EmbeddedAgent:
     ) -> Self:
         catalog_service = CatalogService(store, store)
         data_view = CatalogDataView(store, catalog_service, store)
-        catalog = catalog_declarations(identity.id, catalog_service)
+        catalog = catalog_declarations(identity.id, data_view)
         sqlite_backend = SQLiteQueryBackend(store, data_view)
         postgresql_backend = PostgreSQLQueryBackend(
             store, data_view, secret_provider or keychain
@@ -750,7 +750,7 @@ class EmbeddedAgent:
             identity.id,
             postgresql_preview_backend,
         )
-        local_file_backend = LocalDirectoryReadBackend(store, store)
+        local_file_backend = LocalDirectoryReadBackend(store, store, data_view)
         local_files = local_file_read_declarations(identity.id, local_file_backend)
         mutation_lock = asyncio.Lock()
         memory_store = MemoryStore(home, mutation_lock)

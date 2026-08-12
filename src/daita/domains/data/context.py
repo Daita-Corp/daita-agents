@@ -320,7 +320,16 @@ class DataContextBuilder:
                 run.agent_id,
                 resource_ids,
             )
-            semantic_views = inspect_semantic_annotations(annotations, facts)
+            readable_fact_ids = {fact.resource_id for fact in facts}
+            readable_annotations = tuple(
+                annotation
+                for annotation in annotations
+                if set(annotation.subject.resource_ids) <= readable_fact_ids
+            )
+            semantic_views = inspect_semantic_annotations(
+                readable_annotations,
+                facts,
+            )
         candidate_text = ""
         selected_candidate = self._selected_learning_candidates.get(run.id)
         if selected_candidate is not None:

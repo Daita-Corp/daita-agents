@@ -31,7 +31,7 @@ from ..domains.data.capabilities import (
 from ..domains.data.controller import (
     POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
     POSTGRESQL_UPDATE_CAPABILITY_ID,
-    CatalogSchemaReader,
+    PostgreSQLUpdateCatalogReader,
 )
 from ..domains.data.sql import (
     PostgreSQLUpdateCell,
@@ -49,6 +49,7 @@ from ..storage.sqlite import (
     DatabaseWriteReceipt,
     DatabaseWriteReceiptConflictError,
 )
+from ..storage.sqlite_records import SourcePermissionStateError
 from .postgresql import (
     _DEFAULT_MAX_COLUMNS,
     _DEFAULT_MAX_INDEXES,
@@ -295,7 +296,7 @@ class PostgreSQLUpdatePreviewBackend:
     def __init__(
         self,
         sources: SourceStore,
-        catalog: CatalogSchemaReader,
+        catalog: PostgreSQLUpdateCatalogReader,
         secret_provider: SecretProvider | None = None,
         *,
         receipt_store: DatabaseWriteReceiptStore | None = None,
@@ -306,8 +307,12 @@ class PostgreSQLUpdatePreviewBackend:
     ) -> None:
         if not isinstance(sources, SourceStore):
             raise TypeError("sources must implement SourceStore")
-        if not callable(getattr(catalog, "resource_schemas", None)):
-            raise TypeError("catalog must provide resource_schemas")
+        for method_name in (
+            "resource_schemas",
+            "postgresql_update_scope_issue",
+        ):
+            if not callable(getattr(catalog, method_name, None)):
+                raise TypeError(f"catalog must provide {method_name}")
         provider = default_secret_provider(secret_provider)
         if not isinstance(provider, SecretProvider):
             raise TypeError("secret_provider must implement SecretProvider")
@@ -339,6 +344,33 @@ class PostgreSQLUpdatePreviewBackend:
         self._statement_timeout_seconds = float(statement_timeout_seconds)
         self._lock_timeout_seconds = float(lock_timeout_seconds)
         self._cleanup_timeout_seconds = float(cleanup_timeout_seconds)
+
+    async def _require_update_scope(
+        self,
+        *,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+        execution: bool,
+    ) -> None:
+        try:
+            issue = await self._catalog.postgresql_update_scope_issue(
+                agent_id,
+                source_id,
+                resource_id,
+                assignment_columns,
+            )
+        except SourcePermissionStateError:
+            issue = (
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            )
+        if issue is None:
+            return
+        if execution:
+            raise PostgreSQLUpdateExecutionError(issue[0], issue[1])
+        raise PostgreSQLUpdatePreviewError(issue[0], issue[1])
 
     async def postgresql_update_readiness(
         self,
@@ -390,7 +422,35 @@ class PostgreSQLUpdatePreviewBackend:
                 rejection_codes=("write_source_not_available",),
                 remediation_categories=("attach_active_postgresql_source",),
             )
-        write_access = registration.configuration.get("write_access") is True
+        try:
+            scope_issue = await self._catalog.postgresql_update_scope_issue(
+                agent_id,
+                source_id,
+                resource_id,
+                assignment_columns,
+            )
+        except SourcePermissionStateError:
+            scope_issue = (
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            )
+        write_access = scope_issue is None
+        if scope_issue is not None:
+            return _readiness_result(
+                source_id=source_id,
+                resource_id=resource_id,
+                assignment_columns=assignment_columns,
+                write_access=False,
+                relation={"catalog_admitted": False},
+                rejection_codes=(scope_issue[0],),
+                remediation_categories=(
+                    (
+                        "configure_source_permissions_again"
+                        if scope_issue[0] == "resource_update_scope_stale"
+                        else "configure_source_permissions"
+                    ),
+                ),
+            )
         validation = validate_postgresql_update_scope(
             source_id,
             resource_id,
@@ -488,12 +548,6 @@ class PostgreSQLUpdatePreviewBackend:
                         timeout_seconds=self._cleanup_timeout_seconds,
                     )
 
-        if not write_access:
-            rejection_codes = (*rejection_codes, "write_access_not_enabled")
-            remediation_categories = (
-                *remediation_categories,
-                "enable_write_access_in_daita",
-            )
         return _readiness_result(
             source_id=source_id,
             resource_id=resource_id,
@@ -526,11 +580,13 @@ class PostgreSQLUpdatePreviewBackend:
                 "write_source_not_available",
                 "The selected source is not an active PostgreSQL source owned by this agent.",
             )
-        if registration.configuration.get("write_access") is not True:
-            raise PostgreSQLUpdatePreviewError(
-                "write_access_not_enabled",
-                "PostgreSQL update preview requires user-owned write_access enablement.",
-            )
+        await self._require_update_scope(
+            agent_id=agent_id,
+            source_id=intent.source_id,
+            resource_id=intent.resource_id,
+            assignment_columns=tuple(item.column for item in intent.assignments),
+            execution=False,
+        )
         validation = validate_postgresql_update_intent(
             intent,
             resources=await self._catalog.resource_schemas(
@@ -708,11 +764,13 @@ class PostgreSQLUpdatePreviewBackend:
                 "write_source_not_available",
                 "The selected source is not an active PostgreSQL source owned by this agent.",
             )
-        if registration.configuration.get("write_access") is not True:
-            raise PostgreSQLUpdateExecutionError(
-                "write_access_not_enabled",
-                "PostgreSQL update requires user-owned write_access enablement.",
-            )
+        await self._require_update_scope(
+            agent_id=agent_id,
+            source_id=intent.source_id,
+            resource_id=intent.resource_id,
+            assignment_columns=tuple(item.column for item in intent.assignments),
+            execution=True,
+        )
         validation = validate_postgresql_update_intent(
             intent,
             resources=await self._catalog.resource_schemas(agent_id, intent.source_id),
@@ -779,6 +837,13 @@ class PostgreSQLUpdatePreviewBackend:
         terminal_code: str | None = "write_not_committed"
         cancelled: asyncio.CancelledError | None = None
         try:
+            await self._require_update_scope(
+                agent_id=agent_id,
+                source_id=intent.source_id,
+                resource_id=intent.resource_id,
+                assignment_columns=tuple(item.column for item in intent.assignments),
+                execution=True,
+            )
             connection = await _connect(registration, self._secret_provider)
             transaction = connection.transaction(isolation="repeatable_read")
             await transaction.start()

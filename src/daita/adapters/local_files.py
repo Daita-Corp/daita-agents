@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
+from typing import Protocol
 from urllib.parse import quote
 
 from .._json import canonical_json
@@ -44,6 +45,7 @@ from ..domains.data.export_capabilities import (
 )
 from ..domains.data.file_capabilities import LocalFileReadResult
 from ..domains.data.results import project_result_rows
+from ..storage.sqlite_records import SourcePermissionStateError
 from .models import (
     DiscoveryRequest,
     DiscoveryResult,
@@ -64,6 +66,14 @@ from .protocols import (
 _ADAPTER_ID = "local-directory"
 _SUPPORTED_SUFFIXES = frozenset({".csv", ".json"})
 _READ_CHUNK_BYTES = 64 * 1024
+
+
+class _ReadableResourceIds(Protocol):
+    async def readable_resource_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> frozenset[str]: ...
 
 
 class LocalDirectorySourceError(ResourceAdapterError):
@@ -384,13 +394,21 @@ class LocalDirectoryResourceAdapter:
 class LocalDirectoryReadBackend:
     """Revalidate persisted file scope, then perform one bounded safe read."""
 
-    def __init__(self, sources: SourceStore, catalog: CatalogStore) -> None:
+    def __init__(
+        self,
+        sources: SourceStore,
+        catalog: CatalogStore,
+        permissions: _ReadableResourceIds,
+    ) -> None:
         if not isinstance(sources, SourceStore):
             raise TypeError("sources must implement SourceStore")
         if not isinstance(catalog, CatalogStore):
             raise TypeError("catalog must implement CatalogStore")
+        if not callable(getattr(permissions, "readable_resource_ids", None)):
+            raise TypeError("permissions must provide readable_resource_ids")
         self._sources = sources
         self._catalog = catalog
+        self._permissions = permissions
 
     async def execute_read(
         self,
@@ -425,6 +443,7 @@ class LocalDirectoryReadBackend:
                 "The selected source is not a local-directory source.",
                 source_id=source_id,
             )
+        await self._require_read_access(agent_id, source_id, resource_id)
         resource = await self._catalog.load_resource(agent_id, resource_id)
         if resource is None:
             raise LocalDirectorySourceError(
@@ -618,6 +637,7 @@ class LocalDirectoryReadBackend:
                 "The selected source is not a local-directory source.",
                 source_id=source_id,
             )
+        await self._require_read_access(agent_id, source_id, resource_id)
         resource = await self._catalog.load_resource(agent_id, resource_id)
         if resource is None or resource.id != resource_id:
             raise LocalDirectorySourceError(
@@ -757,6 +777,30 @@ class LocalDirectoryReadBackend:
             content=content,
             sensitivity=resource.sensitivity,
         )
+
+    async def _require_read_access(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+    ) -> None:
+        try:
+            readable = await self._permissions.readable_resource_ids(
+                agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError:
+            raise LocalDirectorySourceError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+                source_id=source_id,
+            ) from None
+        if resource_id not in readable:
+            raise LocalDirectorySourceError(
+                "resource_read_not_allowed",
+                "The requested resource is not available for reading.",
+                source_id=source_id,
+            )
 
 
 @dataclass(frozen=True, slots=True)

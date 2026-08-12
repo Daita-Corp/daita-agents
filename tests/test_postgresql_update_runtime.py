@@ -100,10 +100,17 @@ class _SourceStore:
 class _Catalog:
     def __init__(self, resource) -> None:
         self.resource = resource
+        self.scope_issue: tuple[str, str] | None = None
+        self.scope_checks = 0
 
     async def resource_schemas(self, agent_id: str, source_id: str):
         del agent_id
         return (self.resource,) if source_id == self.resource.source_id else ()
+
+    async def postgresql_update_scope_issue(self, *args: object):
+        del args
+        self.scope_checks += 1
+        return self.scope_issue
 
 
 class _ReceiptStore:
@@ -474,6 +481,39 @@ async def test_transaction_is_receipt_first_locked_parameterized_bounded_and_com
     assert ("transaction.commit",) in log
     assert ("receipt.finish", "committed") in log
     assert "secret-host" not in canonical_json(result.tool_data())
+
+
+async def test_backend_rechecks_scope_immediately_before_source_io(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log: list[tuple[object, ...]] = []
+    receipts = _ReceiptStore(log)
+    catalog = _Catalog(_resource())
+    backend = write_module.PostgreSQLUpdatePreviewBackend(
+        _SourceStore(_registration()),
+        catalog,
+        EmptySecretProvider(),
+        receipt_store=receipts,
+        clock=lambda: NOW,
+    )
+    preview_connection = _Connection(log, preview_rows=(_row(),))
+    _patch_io(monkeypatch, [preview_connection], log)
+    command = await _preview_and_command(backend, _intent())
+    catalog.scope_issue = (
+        "resource_update_not_allowed",
+        "The requested resource is not authorized for PostgreSQL updates.",
+    )
+
+    with pytest.raises(write_module.PostgreSQLUpdateExecutionError) as raised:
+        await backend.execute_update(
+            agent_id="agent-update",
+            execution=_execution(call_id="scope-revoked"),
+            command=command,
+        )
+
+    assert raised.value.error_code == "resource_update_not_allowed"
+    assert log.count(("connect",)) == 1
+    assert all(item[0] != "receipt.start" for item in log)
 
 
 async def test_started_receipt_failure_prevents_connection_and_mutation(
@@ -872,7 +912,7 @@ def test_update_tool_identity_schema_and_side_effect_contract() -> None:
     assert isinstance(maximum, Mapping)
     assert maximum["minimum"] == maximum["maximum"] == 1
     assert "sql" not in properties
-    assert view.applicability.required_configuration_flags == ("write_access",)
+    assert view.applicability.source_adapter_ids == ("postgresql",)
 
 
 def test_historical_update_side_effect_is_compacted_without_row_or_receipt_reuse() -> (
@@ -908,16 +948,22 @@ def test_historical_update_side_effect_is_compacted_without_row_or_receipt_reuse
 
 
 class _RuntimeCatalog:
-    def __init__(self, *, write_access: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        write_access: bool = True,
+        scope_issues: tuple[tuple[str, str] | None, ...] = (),
+    ) -> None:
         self.write_access = write_access
+        self.scope_issues = list(scope_issues)
+        self.scope_checks = 0
 
     async def source_routing_facts(
         self,
         agent_id: str,
-        configuration_flags: tuple[str, ...],
         source_ids: tuple[str, ...] = (),
     ):
-        del agent_id, configuration_flags
+        del agent_id
         if source_ids and SOURCE_ID not in source_ids:
             return ()
         return (
@@ -925,9 +971,44 @@ class _RuntimeCatalog:
                 "source_id": SOURCE_ID,
                 "adapter_id": "postgresql",
                 "active": True,
-                "configuration_flags": {"write_access": self.write_access},
             },
         )
+
+    async def readable_resource_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ):
+        del agent_id
+        return (
+            frozenset({RESOURCE_ID})
+            if (not source_ids or SOURCE_ID in source_ids)
+            else frozenset()
+        )
+
+    async def postgresql_update_scope_issue(self, *args: object):
+        del args
+        self.scope_checks += 1
+        if self.scope_issues:
+            return self.scope_issues.pop(0)
+        return (
+            None
+            if self.write_access
+            else (
+                "resource_update_not_allowed",
+                "The requested resource is not authorized for PostgreSQL updates.",
+            )
+        )
+
+    async def postgresql_update_applicable_source_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ):
+        del agent_id
+        if not self.write_access or (source_ids and SOURCE_ID not in source_ids):
+            return frozenset()
+        return frozenset({SOURCE_ID})
 
     async def source_adapter_id(self, agent_id: str, source_id: str):
         del agent_id
@@ -1137,28 +1218,26 @@ async def test_runtime_second_preflight_rejects_state_change_before_execution() 
     assert backend.executions == []
 
 
-async def test_disablement_while_approval_is_pending_fails_closed_before_execution() -> (
-    None
-):
+async def test_scope_revocation_while_approval_is_pending_fails_closed() -> None:
     lock = asyncio.Lock()
     backend = _RuntimeBackend(lock)
 
-    async def disable_then_approve(request: ApprovalRequest):
+    async def revoke_then_approve(request: ApprovalRequest):
         del request
         backend.preflight_error = write_module.PostgreSQLUpdatePreviewError(
-            "write_access_not_enabled",
-            "PostgreSQL update preview requires user-owned write_access enablement.",
+            "resource_update_not_allowed",
+            "The requested resource is not authorized for PostgreSQL updates.",
         )
         return ApprovalDecision.APPROVE
 
     result = (
-        await _runtime_with_backend(backend, lock, disable_then_approve).execute_all(
+        await _runtime_with_backend(backend, lock, revoke_then_approve).execute_all(
             _runtime_run(),
             (_runtime_call(),),
         )
     )[0]
 
-    assert _runtime_error(result) == "write_access_not_enabled"
+    assert _runtime_error(result) == "resource_update_not_allowed"
     assert backend.previews == 1
     assert backend.executions == []
 
@@ -1184,6 +1263,56 @@ async def test_runtime_rejects_wrong_preview_before_approval() -> None:
 
     assert _runtime_error(result) == "write_preview_stale"
     assert approvals == []
+
+
+@pytest.mark.parametrize(
+    ("scope_issue", "expected_code"),
+    (
+        (
+            (
+                "resource_update_not_allowed",
+                "The requested resource is not authorized for PostgreSQL updates.",
+            ),
+            "resource_update_not_allowed",
+        ),
+        (
+            (
+                "update_column_not_allowed",
+                "One or more assignment columns are not authorized for this table.",
+            ),
+            "update_column_not_allowed",
+        ),
+        (
+            (
+                "resource_update_scope_stale",
+                "The PostgreSQL update scope is stale; configure source permissions again.",
+            ),
+            "resource_update_scope_stale",
+        ),
+    ),
+)
+async def test_runtime_requires_exact_table_column_and_current_scope(
+    scope_issue: tuple[str, str],
+    expected_code: str,
+) -> None:
+    lock = asyncio.Lock()
+    backend = _RuntimeBackend(lock)
+
+    async def approve_scope(request: ApprovalRequest):
+        del request
+        return ApprovalDecision.APPROVE
+
+    runtime = _runtime_with_backend(
+        backend,
+        lock,
+        approve_scope,
+        catalog=_RuntimeCatalog(scope_issues=(scope_issue,)),
+    )
+
+    result = (await runtime.execute_all(_runtime_run(), (_runtime_call(),)))[0]
+
+    assert _runtime_error(result) == expected_code
+    assert backend.previews == 0
     assert backend.executions == []
 
 

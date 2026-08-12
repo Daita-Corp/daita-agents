@@ -2,18 +2,44 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from ..._json import FrozenJsonObject
-from ...capabilities import ToolApplicability
-from ...catalog.models import FacetKind, ResourceKind
-from ...catalog.protocols import CatalogStore
+from ...catalog.models import (
+    CatalogSchemaRequest,
+    CatalogSearchRequest,
+    CatalogSearchResult,
+    CatalogTraversalRequest,
+    FacetKind,
+    ResourceKind,
+)
+from ...catalog.protocols import CatalogResourceNotFoundError, CatalogStore
 from ...catalog.service import CatalogService
 from ...semantics import SemanticResourceFact
+from ...storage.sqlite_records import (
+    PostgreSQLUpdateScope,
+    SourcePermissionStateError,
+    SourceReadMode,
+    SourceReadScope,
+    postgresql_update_authorization_fingerprint,
+)
 from .sql import ResourceSchema
 
 if TYPE_CHECKING:
     from ...adapters.protocols import SourceStore
+
+    class CatalogPermissionStore(SourceStore, Protocol):
+        async def load_source_read_scope(
+            self,
+            agent_id: str,
+            source_id: str,
+        ) -> SourceReadScope | None: ...
+
+        async def list_postgresql_update_scopes(
+            self,
+            agent_id: str,
+            source_id: str,
+        ) -> tuple[PostgreSQLUpdateScope, ...]: ...
 
 
 class CatalogDataView:
@@ -23,7 +49,7 @@ class CatalogDataView:
         self,
         store: CatalogStore,
         service: CatalogService,
-        sources: SourceStore,
+        sources: CatalogPermissionStore,
     ) -> None:
         if not isinstance(store, CatalogStore):
             raise TypeError("store must implement CatalogStore")
@@ -33,6 +59,12 @@ class CatalogDataView:
             getattr(sources, "list_sources", None)
         ):
             raise TypeError("sources must provide source registration reads")
+        for method_name in (
+            "load_source_read_scope",
+            "list_postgresql_update_scopes",
+        ):
+            if not callable(getattr(sources, method_name, None)):
+                raise TypeError(f"sources must provide {method_name}")
         self._store = store
         self._service = service
         self._sources = sources
@@ -40,14 +72,10 @@ class CatalogDataView:
     async def source_routing_facts(
         self,
         agent_id: str,
-        configuration_flags: tuple[str, ...],
         source_ids: tuple[str, ...] = (),
     ) -> tuple[FrozenJsonObject, ...]:
         """Project only active, declared source-routing control facts."""
 
-        requested_flags = ToolApplicability(
-            required_configuration_flags=configuration_flags
-        ).required_configuration_flags
         selected_source_ids = frozenset(source_ids)
         registrations = await self._sources.list_sources(agent_id)
         return tuple(
@@ -55,10 +83,6 @@ class CatalogDataView:
                 {
                     "source_id": registration.id,
                     "adapter_id": registration.adapter_id,
-                    "configuration_flags": {
-                        flag: registration.configuration.get(flag) is True
-                        for flag in requested_flags
-                    },
                 }
             )
             for registration in sorted(
@@ -68,6 +92,107 @@ class CatalogDataView:
             if registration.agent_id == agent_id
             and registration.active
             and (not selected_source_ids or registration.id in selected_source_ids)
+        )
+
+    async def readable_resource_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> frozenset[str]:
+        """Resolve current readable IDs without changing complete catalog truth."""
+
+        selected_source_ids = frozenset(source_ids)
+        registrations = tuple(
+            registration
+            for registration in await self._sources.list_sources(agent_id)
+            if registration.agent_id == agent_id
+            and registration.active
+            and (not selected_source_ids or registration.id in selected_source_ids)
+        )
+        readable: set[str] = set()
+        for registration in registrations:
+            scope = await self._sources.load_source_read_scope(
+                agent_id,
+                registration.id,
+            )
+            if scope is None:
+                raise SourcePermissionStateError(
+                    "active source is missing its read scope"
+                )
+            self._require_owned_read_scope(registration.id, agent_id, scope)
+            if scope.mode is SourceReadMode.NONE:
+                continue
+            current = tuple(
+                resource
+                for resource in await self._store.list_resources(
+                    agent_id,
+                    registration.id,
+                )
+                if resource.agent_id == agent_id
+                and resource.source_id == registration.id
+            )
+            current_ids = {resource.id for resource in current}
+            if scope.mode is SourceReadMode.ALL:
+                readable.update(current_ids)
+            else:
+                readable.update(current_ids & set(scope.resource_ids))
+        return frozenset(readable)
+
+    @staticmethod
+    def _require_owned_read_scope(
+        source_id: str,
+        agent_id: str,
+        scope: SourceReadScope,
+    ) -> None:
+        if (
+            not isinstance(scope, SourceReadScope)
+            or scope.agent_id != agent_id
+            or scope.source_id != source_id
+        ):
+            raise SourcePermissionStateError(
+                "active source read scope ownership is invalid"
+            )
+
+    async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
+        readable = await self.readable_resource_ids(
+            request.agent_id,
+            request.source_ids,
+        )
+        return await self._service.search(
+            request,
+            readable_resource_ids=readable,
+        )
+
+    async def schema_slice(self, request: CatalogSchemaRequest) -> FrozenJsonObject:
+        readable = await self.readable_resource_ids(
+            request.agent_id,
+            (() if request.source_id is None else (request.source_id,)),
+        )
+        return await self._service.schema_slice(
+            request,
+            readable_resource_ids=readable,
+        )
+
+    async def inspect_resource(
+        self,
+        agent_id: str,
+        resource_id: str,
+    ) -> FrozenJsonObject:
+        readable = await self.readable_resource_ids(agent_id)
+        return await self._service.inspect_resource(
+            agent_id,
+            resource_id,
+            readable_resource_ids=readable,
+        )
+
+    async def traverse(
+        self,
+        request: CatalogTraversalRequest,
+    ) -> FrozenJsonObject:
+        readable = await self.readable_resource_ids(request.agent_id)
+        return await self._service.traverse(
+            request,
+            readable_resource_ids=readable,
         )
 
     async def resource_schemas(
@@ -247,6 +372,7 @@ class CatalogDataView:
             not isinstance(item, str) or not item for item in requested
         ):
             raise ValueError("semantic resource IDs must be bounded non-empty strings")
+        readable = await self.readable_resource_ids(agent_id)
         registrations = {
             item.id: item
             for item in await self._sources.list_sources(agent_id)
@@ -255,7 +381,9 @@ class CatalogDataView:
         resources = {
             item.id: item
             for item in await self._store.list_resources(agent_id)
-            if item.id in requested and item.source_id in registrations
+            if item.id in requested
+            and item.id in readable
+            and item.source_id in registrations
         }
         fields_by_id: dict[str, tuple[str, ...]] = {}
         for source_id in sorted({item.source_id for item in resources.values()}):
@@ -294,6 +422,11 @@ class CatalogDataView:
         source_id: str,
         resource_id: str,
     ) -> bool:
+        if resource_id not in await self.readable_resource_ids(
+            agent_id,
+            (source_id,),
+        ):
+            return False
         resource = await self._store.load_resource(agent_id, resource_id)
         if (
             resource is None
@@ -318,13 +451,133 @@ class CatalogDataView:
         source_ids: tuple[str, ...] = (),
         resource_ids: tuple[str, ...] = (),
     ) -> FrozenJsonObject:
+        readable = await self.readable_resource_ids(agent_id, source_ids)
+        if resource_ids and any(
+            resource_id not in readable for resource_id in resource_ids
+        ):
+            raise CatalogResourceNotFoundError(agent_id, resource_ids[0])
         return await self._service.catalog_context(
             agent_id,
             query,
             limit=limit,
             source_ids=source_ids,
             resource_ids=resource_ids,
+            readable_resource_ids=readable,
         )
+
+    async def postgresql_update_scope_issue(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> tuple[str, str] | None:
+        """Validate one exact current update authorization without source I/O."""
+
+        readable = await self.readable_resource_ids(agent_id, (source_id,))
+        if resource_id not in readable:
+            return (
+                "resource_read_not_allowed",
+                "The requested resource is not available for reading.",
+            )
+        registration = await self._sources.load_source(agent_id, source_id)
+        if (
+            registration is None
+            or registration.agent_id != agent_id
+            or registration.id != source_id
+            or not registration.active
+            or registration.adapter_id != "postgresql"
+        ):
+            return (
+                "resource_update_not_allowed",
+                "The requested resource is not authorized for PostgreSQL updates.",
+            )
+        current = next(
+            (
+                item
+                for item in await self._service.tabular_resources(agent_id, source_id)
+                if item.resource.id == resource_id
+                and item.resource.kind is ResourceKind.TABLE
+            ),
+            None,
+        )
+        if current is None:
+            return (
+                "resource_update_not_allowed",
+                "The requested resource is not authorized for PostgreSQL updates.",
+            )
+        scopes = await self._sources.list_postgresql_update_scopes(
+            agent_id,
+            source_id,
+        )
+        scope = next(
+            (item for item in scopes if item.resource_id == resource_id),
+            None,
+        )
+        if scope is None:
+            return (
+                "resource_update_not_allowed",
+                "The requested resource is not authorized for PostgreSQL updates.",
+            )
+        if (
+            not isinstance(scope, PostgreSQLUpdateScope)
+            or scope.agent_id != agent_id
+            or scope.source_id != source_id
+        ):
+            raise SourcePermissionStateError(
+                "stored PostgreSQL update scope ownership is invalid"
+            )
+        requested_columns = frozenset(assignment_columns)
+        if not requested_columns <= frozenset(scope.allowed_assignment_columns):
+            return (
+                "update_column_not_allowed",
+                "One or more assignment columns are not authorized for this table.",
+            )
+        try:
+            expected = postgresql_update_authorization_fingerprint(
+                source=registration,
+                resource=current.resource,
+                facet=current.facet,
+                allowed_assignment_columns=scope.allowed_assignment_columns,
+            )
+        except (TypeError, ValueError):
+            expected = None
+        if scope.authorization_fingerprint != expected:
+            return (
+                "resource_update_scope_stale",
+                "The PostgreSQL update scope is stale; configure source permissions again.",
+            )
+        return None
+
+    async def postgresql_update_applicable_source_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> frozenset[str]:
+        selected = frozenset(source_ids)
+        applicable: set[str] = set()
+        for registration in await self._sources.list_sources(agent_id):
+            if (
+                registration.agent_id != agent_id
+                or not registration.active
+                or registration.adapter_id != "postgresql"
+                or (selected and registration.id not in selected)
+            ):
+                continue
+            for scope in await self._sources.list_postgresql_update_scopes(
+                agent_id,
+                registration.id,
+            ):
+                issue = await self.postgresql_update_scope_issue(
+                    agent_id,
+                    registration.id,
+                    scope.resource_id,
+                    scope.allowed_assignment_columns,
+                )
+                if issue is None:
+                    applicable.add(registration.id)
+                    break
+        return frozenset(applicable)
 
 
 __all__ = ["CatalogDataView"]

@@ -129,12 +129,22 @@ class _Sources:
 
 
 class _Catalog:
-    def __init__(self, resource: ResourceSchema | None = None) -> None:
+    def __init__(
+        self,
+        resource: ResourceSchema | None = None,
+        *,
+        scope_issue: tuple[str, str] | None = None,
+    ) -> None:
         self.resource = resource or _resource()
+        self.scope_issue = scope_issue
 
     async def resource_schemas(self, agent_id: str, source_id: str):
         assert agent_id == "agent-readiness"
         return (self.resource,) if source_id == SOURCE_ID else ()
+
+    async def postgresql_update_scope_issue(self, *args: object):
+        del args
+        return self.scope_issue
 
 
 class _Transaction:
@@ -232,7 +242,17 @@ async def _readiness(
     monkeypatch.setattr(write_module, "_load_structure", load_structure)
     backend = write_module.PostgreSQLUpdatePreviewBackend(
         _Sources(_registration(write_access=write_access)),
-        _Catalog(resource),
+        _Catalog(
+            resource,
+            scope_issue=(
+                None
+                if write_access
+                else (
+                    "resource_update_not_allowed",
+                    "The requested resource is not authorized for PostgreSQL updates.",
+                )
+            ),
+        ),
     )
     result = await backend.postgresql_update_readiness(
         agent_id="agent-readiness",
@@ -243,7 +263,7 @@ async def _readiness(
     return result, connection
 
 
-async def test_resource_scoped_readiness_is_read_only_bounded_and_secret_free(
+async def test_missing_exact_scope_fails_before_native_readiness_io(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     result, connection = await _readiness(
@@ -255,9 +275,9 @@ async def test_resource_scoped_readiness_is_read_only_bounded_and_secret_free(
     assert result.ready_for_preview is False
     assert result.write_access is False
     assert result.proves_execution is False
-    assert result.rejection_codes == ("write_access_not_enabled",)
-    assert result.remediation_categories == ("enable_write_access_in_daita",)
-    assert result.privileges["requested_columns_update"] is True
+    assert result.rejection_codes == ("resource_update_not_allowed",)
+    assert result.remediation_categories == ("configure_source_permissions",)
+    assert result.privileges["requested_columns_update"] is None
     assert tuple(field.name for field in fields(result)) == (
         "source_id",
         "resource_id",
@@ -276,7 +296,7 @@ async def test_resource_scoped_readiness_is_read_only_bounded_and_secret_free(
     assert "secret-role" not in rendered
     assert "SELECT" not in rendered
     assert "status value" not in rendered
-    assert connection.log[-2:] == ["commit", "close"]
+    assert connection.log == []
 
 
 async def test_readiness_rejects_powerful_roles_and_missing_column_grant(

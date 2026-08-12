@@ -48,6 +48,8 @@ from .controller import (
     CatalogDataReader,
     CatalogSchemaReader,
     DataToolRuntime,
+    PostgreSQLUpdateCatalogReader,
+    ReadScopedCatalogReader,
 )
 from .export_capabilities import (
     ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
@@ -170,6 +172,8 @@ __all__ = [
     "PostgreSQLUpdatePreviewDeclarations",
     "PostgreSQLUpdatePreviewExecutor",
     "PostgreSQLUpdateBackend",
+    "PostgreSQLUpdateCatalogReader",
+    "ReadScopedCatalogReader",
     "PostgreSQLUpdateCommand",
     "PostgreSQLUpdateDeclarations",
     "PostgreSQLUpdateExecutor",

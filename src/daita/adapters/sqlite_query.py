@@ -20,7 +20,7 @@ from ..artifacts.renderers import (
     ExactXlsxRenderer,
 )
 from ..domains.data.capabilities import SQLiteReadResult
-from ..domains.data.controller import CatalogSchemaReader
+from ..domains.data.controller import ReadScopedCatalogReader
 from ..domains.data.export_capabilities import (
     ExactTabularExportResult,
     ExactTabularProgress,
@@ -28,6 +28,8 @@ from ..domains.data.export_capabilities import (
 )
 from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_sqlite_read
+from ..errors import PluginError
+from ..storage.sqlite_records import SourcePermissionStateError
 from .protocols import SourceStore
 
 
@@ -39,14 +41,22 @@ class SQLiteQueryError(RuntimeError):
         super().__init__(message)
 
 
+class _SQLiteReadPermissionError(PluginError):
+    """Stable model-visible failure for a permission recheck at source I/O."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message, plugin_id="sqlite", error_code=code)
+
+
 class SQLiteQueryBackend:
     """Revalidate catalog scope, then perform one bounded read-only query."""
 
-    def __init__(self, sources: SourceStore, catalog: CatalogSchemaReader) -> None:
+    def __init__(self, sources: SourceStore, catalog: ReadScopedCatalogReader) -> None:
         if not isinstance(sources, SourceStore):
             raise TypeError("sources must implement SourceStore")
-        if not callable(getattr(catalog, "resource_schemas", None)):
-            raise TypeError("catalog must provide resource_schemas")
+        for method_name in ("resource_schemas", "readable_resource_ids"):
+            if not callable(getattr(catalog, method_name, None)):
+                raise TypeError(f"catalog must provide {method_name}")
         self._sources = sources
         self._catalog = catalog
 
@@ -72,13 +82,29 @@ class SQLiteQueryBackend:
                 "The selected source is not a SQLite source.",
             )
         resources = await self._catalog.resource_schemas(agent_id, source_id)
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError:
+            raise _SQLiteReadPermissionError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from None
         validation = validate_sqlite_read(
             sql,
             source_id=source_id,
             resources=resources,
             parameters=parameters,
+            allowed_resource_ids=readable,
         )
         if not validation.valid or validation.analysis is None:
+            if "resource_out_of_scope" in validation.issue_codes:
+                raise _SQLiteReadPermissionError(
+                    "resource_read_not_allowed",
+                    "One or more requested resources are not available for reading.",
+                )
             codes = ",".join(validation.issue_codes[:8]) or "invalid_sql"
             raise SQLiteQueryError(
                 "query_revalidation_failed",
@@ -163,13 +189,29 @@ class SQLiteQueryBackend:
                 "The selected source is not a SQLite source.",
             )
         resources = await self._catalog.resource_schemas(agent_id, source_id)
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError:
+            raise _SQLiteReadPermissionError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from None
         validation = validate_sqlite_read(
             sql,
             source_id=source_id,
             resources=resources,
             parameters=parameters,
+            allowed_resource_ids=readable,
         )
         if not validation.valid or validation.analysis is None:
+            if "resource_out_of_scope" in validation.issue_codes:
+                raise _SQLiteReadPermissionError(
+                    "resource_read_not_allowed",
+                    "One or more requested resources are not available for reading.",
+                )
             codes = ",".join(validation.issue_codes[:8]) or "invalid_sql"
             raise SQLiteQueryError(
                 "query_revalidation_failed",

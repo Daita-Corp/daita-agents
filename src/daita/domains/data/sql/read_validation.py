@@ -692,9 +692,24 @@ def _validate_sql_read(
                     {
                         "resource": table.qualified_name,
                         "candidates": _resource_name_candidates(
-                            table.qualified_name, source_resources
+                            table.qualified_name,
+                            tuple(
+                                resource
+                                for resource in source_resources
+                                if allowed is None or resource.resource_id in allowed
+                            ),
                         ),
                     },
+                )
+            )
+            continue
+        if allowed is not None and any(
+            candidate.resource_id not in allowed for candidate in candidates
+        ):
+            issues.append(
+                SqlValidationIssue(
+                    "resource_out_of_scope",
+                    "SQL references a resource outside the allowed operation scope.",
                 )
             )
             continue
@@ -713,15 +728,6 @@ def _validate_sql_read(
             )
             continue
         resource = next(iter(candidates))
-        if allowed is not None and resource.resource_id not in allowed:
-            issues.append(
-                SqlValidationIssue(
-                    "resource_out_of_scope",
-                    "SQL references a resource outside the allowed operation scope.",
-                    {"resource_id": resource.resource_id},
-                )
-            )
-            continue
         if dialect == "postgresql" and resource.resource_kind != "table":
             issues.append(
                 SqlValidationIssue(

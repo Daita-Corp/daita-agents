@@ -357,7 +357,7 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
         ):
             await agent.run(prompt)
         assert tuple(_error_code(item) for item in _tool_results(provider)) == (
-            "semantic_unknown_resource",
+            "resource_read_not_allowed",
             "source_scope_violation",
             "semantic_stale_revision",
             "semantic_unknown_field",

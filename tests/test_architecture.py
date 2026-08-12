@@ -1154,7 +1154,8 @@ def test_catalog_schema_slice_extends_existing_catalog_and_capability_owners():
     loop = _python_text(PACKAGE / "loop")
     assert 'name="catalog_schema"' in capabilities
     assert 'CATALOG_SCHEMA_EVIDENCE_KIND = "catalog.schema_slice"' in capabilities
-    assert "catalog_declarations(identity.id, catalog_service)" in embedded
+    assert "catalog_declarations(identity.id, data_view)" in embedded
+    assert "catalog_service = CatalogService(store, store)" in embedded
     assert "catalog_schema" not in loop
     for prohibited in (
         "CatalogSchemaCache",

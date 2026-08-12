@@ -650,7 +650,6 @@ def postgresql_update_preview_extension_declarations() -> ExtensionDeclarations:
         applicability=ToolApplicability(
             source_adapter_ids=("postgresql",),
             minimum_active_sources=1,
-            required_configuration_flags=("write_access",),
         ),
     )
     return ExtensionDeclarations(
@@ -732,7 +731,6 @@ def postgresql_update_extension_declarations() -> ExtensionDeclarations:
         applicability=ToolApplicability(
             source_adapter_ids=("postgresql",),
             minimum_active_sources=1,
-            required_configuration_flags=("write_access",),
         ),
     )
     return ExtensionDeclarations((capability,), (capability.executor_id,), (view,))
