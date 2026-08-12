@@ -33,6 +33,7 @@ from ..catalog.models import (
     CatalogSnapshotRef,
     CatalogSummary,
     CatalogSync,
+    FacetKind,
     RelationshipKind,
     SourceCatalogSnapshot,
 )
@@ -73,11 +74,13 @@ from .sqlite_codecs import (
     decode_learning_candidate,
     decode_loop_exit,
     decode_message,
+    decode_postgresql_update_scope,
     decode_receipt,
     decode_review_stamps,
     decode_run_input,
     decode_semantic_annotation,
     decode_source,
+    decode_source_read_scope,
     encode_catalog_snapshot,
     encode_catalog_sync,
     encode_identifier,
@@ -85,11 +88,13 @@ from .sqlite_codecs import (
     encode_learning_candidate,
     encode_loop_exit,
     encode_message,
+    encode_postgresql_update_scope,
     encode_receipt,
     encode_review_stamps,
     encode_run_input,
     encode_semantic_annotation,
     encode_source,
+    encode_source_read_scope,
     persisted_source,
     project_source_admission,
 )
@@ -111,12 +116,22 @@ from .sqlite_records import (
     DatabaseWriteOutcome,
     DatabaseWriteReceipt,
     DatabaseWriteReceiptConflictError,
+    PostgreSQLUpdateScope,
+    SourcePermissionStateError,
+    SourceReadMode,
+    SourceReadScope,
     database_write_aware as _database_write_aware,
     database_write_receipt_id,
+    postgresql_update_authorization_fingerprint,
     database_write_text as _database_write_text,
     validate_database_write_receipt_id,
 )
-from .sqlite_schema import CURRENT_TABLES, require_healthy, require_schema, table_names
+from .sqlite_schema import (
+    SCOPED_PERMISSION_TABLES,
+    require_healthy,
+    require_schema,
+    table_names,
+)
 
 _CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH = 64
 _ACTIVE_SOURCE_KEY_PREFIX = "active_source:"
@@ -132,13 +147,104 @@ def _learning_review_stamps_key(agent_id: str) -> str:
     return f"{_LEARNING_REVIEW_STAMPS_KEY_PREFIX}{agent_id}"
 
 
-def _decode_source_projection(
-    data: str,
-    admitted: object,
+def _decode_owned_read_scope(
+    connection: sqlite3.Connection,
+    registration: SourceRegistration,
+    data: object,
+) -> SourceReadScope | None:
+    if not registration.active:
+        if data is not None:
+            raise SourcePermissionStateError(
+                "detached source unexpectedly retains a read scope"
+            )
+        return None
+    if not isinstance(data, str):
+        raise SourcePermissionStateError("active source is missing its read scope")
+    try:
+        scope = decode_source_read_scope(
+            data,
+            agent_id=registration.agent_id,
+            source_id=registration.id,
+        )
+        if scope.mode is SourceReadMode.SELECTED:
+            _require_nonforeign_read_resources(connection, scope)
+        return scope
+    except SourcePermissionStateError:
+        raise
+    except (TypeError, ValueError):
+        raise SourcePermissionStateError(
+            "active source read scope is undecodable"
+        ) from None
+
+
+def _require_nonforeign_read_resources(
+    connection: sqlite3.Connection,
+    scope: SourceReadScope,
+) -> None:
+    requested = set(scope.resource_ids)
+    if not requested:
+        return
+    for (data,) in connection.execute(
+        "SELECT data FROM snapshots WHERE agent_id = ?",
+        (scope.agent_id,),
+    ):
+        snapshot = decode_catalog_snapshot(data)
+        for resource in snapshot.resources:
+            if resource.id in requested and resource.source_id != scope.source_id:
+                raise SourcePermissionStateError(
+                    "active source read scope contains a foreign resource"
+                )
+
+
+def _decode_source_state(
+    connection: sqlite3.Connection,
+    *,
+    row_agent_id: object,
+    row_source_id: object,
+    source_data: object,
+    read_scope_data: object,
+    update_scope_count: object,
 ) -> SourceRegistration:
-    if admitted not in (0, 1):
-        raise ValueError("stored PostgreSQL write admission projection is invalid")
-    return project_source_admission(decode_source(data), bool(admitted))
+    if (
+        not isinstance(row_agent_id, str)
+        or not isinstance(row_source_id, str)
+        or not isinstance(source_data, str)
+        or not isinstance(update_scope_count, int)
+        or isinstance(update_scope_count, bool)
+        or update_scope_count < 0
+    ):
+        raise SourcePermissionStateError("stored source permission state is invalid")
+    try:
+        registration = decode_source(source_data)
+    except (TypeError, ValueError):
+        raise SourcePermissionStateError(
+            "stored source registration is invalid"
+        ) from None
+    if registration.agent_id != row_agent_id or registration.id != row_source_id:
+        raise SourcePermissionStateError("stored source ownership is invalid")
+    _decode_owned_read_scope(connection, registration, read_scope_data)
+    if update_scope_count and (
+        not registration.active or registration.adapter_id != "postgresql"
+    ):
+        raise SourcePermissionStateError("stored PostgreSQL update scope is foreign")
+    return project_source_admission(registration, bool(update_scope_count))
+
+
+def _source_state_row(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    source_id: str,
+) -> tuple[object, ...] | None:
+    return connection.execute(
+        """SELECT s.agent_id, s.id, s.data, r.data,
+                  (SELECT COUNT(*) FROM postgresql_update_scopes AS u
+                   WHERE u.agent_id = s.agent_id AND u.source_id = s.id)
+           FROM sources AS s
+           LEFT JOIN source_read_scopes AS r
+             ON r.agent_id = s.agent_id AND r.source_id = s.id
+           WHERE s.agent_id = ? AND s.id = ?""",
+        (agent_id, source_id),
+    ).fetchone()
 
 
 class _CatalogCommitGate:
@@ -169,6 +275,42 @@ class _CatalogCommitGate:
             return True
 
 
+class _UpgradeCommitGate:
+    """Let task cancellation veto a not-yet-committed state migration."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._committed = False
+
+    def start(self, connection: sqlite3.Connection) -> bool:
+        with self._lock:
+            if self._cancelled:
+                return False
+        connection.execute("BEGIN IMMEDIATE")
+        with self._lock:
+            if self._cancelled:
+                connection.rollback()
+                return False
+            return True
+
+    def commit(self, connection: sqlite3.Connection) -> bool:
+        with self._lock:
+            if self._cancelled:
+                connection.rollback()
+                return False
+            connection.commit()
+            self._committed = True
+            return True
+
+    def cancel_before_commit(self) -> bool:
+        with self._lock:
+            if self._committed:
+                return False
+            self._cancelled = True
+            return True
+
+
 class SQLiteStateStore:
     """Sole persistence and upgrade boundary for one admitted agent home."""
 
@@ -192,8 +334,10 @@ class SQLiteStateStore:
         resolved = Path(path).resolve()
         resolved_clock = clock or (lambda: datetime.now(timezone.utc))
 
+        upgrade_gate = _UpgradeCommitGate()
+
         def admit() -> None:
-            _initialize(resolved)
+            _initialize(resolved, upgrade_gate=upgrade_gate)
             _recover_started_database_write_receipts(resolved, resolved_clock)
 
         worker = asyncio.create_task(asyncio.to_thread(admit))
@@ -203,6 +347,7 @@ class SQLiteStateStore:
                 await asyncio.shield(worker)
             except asyncio.CancelledError:
                 cancelled = True
+                upgrade_gate.cancel_before_commit()
         worker.result()
         if cancelled:
             raise asyncio.CancelledError
@@ -249,16 +394,21 @@ class SQLiteStateStore:
         def write() -> SourceRegistration:
             stored = persisted_source(registration)
             with _connect(self.path) as connection:
-                row = connection.execute(
-                    """SELECT s.data, a.source_id IS NOT NULL
-                       FROM sources AS s
-                       LEFT JOIN postgresql_write_admissions AS a
-                         ON a.agent_id = s.agent_id AND a.source_id = s.id
-                       WHERE s.agent_id = ? AND s.id = ?""",
-                    (registration.agent_id, registration.id),
-                ).fetchone()
+                connection.execute("BEGIN IMMEDIATE")
+                row = _source_state_row(
+                    connection,
+                    registration.agent_id,
+                    registration.id,
+                )
                 if row is not None:
-                    current = _decode_source_projection(row[0], row[1])
+                    current = _decode_source_state(
+                        connection,
+                        row_agent_id=row[0],
+                        row_source_id=row[1],
+                        source_data=row[2],
+                        read_scope_data=row[3],
+                        update_scope_count=row[4],
+                    )
                     if persisted_source(current) != stored:
                         raise ValueError(
                             f"source registration already exists: {registration.id}"
@@ -268,6 +418,16 @@ class SQLiteStateStore:
                     "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
                     (stored.agent_id, stored.id, encode_source(stored)),
                 )
+                if stored.active:
+                    scope = SourceReadScope.allow_all(
+                        agent_id=stored.agent_id,
+                        source_id=stored.id,
+                    )
+                    connection.execute(
+                        """INSERT INTO source_read_scopes(agent_id, source_id, data)
+                           VALUES (?, ?, ?)""",
+                        (stored.agent_id, stored.id, encode_source_read_scope(scope)),
+                    )
                 return project_source_admission(stored, False)
 
         return await asyncio.to_thread(write)
@@ -277,15 +437,19 @@ class SQLiteStateStore:
     ) -> SourceRegistration | None:
         def read() -> SourceRegistration | None:
             with _connect(self.path) as connection:
-                row = connection.execute(
-                    """SELECT s.data, a.source_id IS NOT NULL
-                       FROM sources AS s
-                       LEFT JOIN postgresql_write_admissions AS a
-                         ON a.agent_id = s.agent_id AND a.source_id = s.id
-                       WHERE s.agent_id = ? AND s.id = ?""",
-                    (agent_id, source_id),
-                ).fetchone()
-            return None if row is None else _decode_source_projection(row[0], row[1])
+                row = _source_state_row(connection, agent_id, source_id)
+                return (
+                    None
+                    if row is None
+                    else _decode_source_state(
+                        connection,
+                        row_agent_id=row[0],
+                        row_source_id=row[1],
+                        source_data=row[2],
+                        read_scope_data=row[3],
+                        update_scope_count=row[4],
+                    )
+                )
 
         return await asyncio.to_thread(read)
 
@@ -293,18 +457,277 @@ class SQLiteStateStore:
         def read() -> tuple[SourceRegistration, ...]:
             with _connect(self.path) as connection:
                 rows = connection.execute(
-                    """SELECT s.data, a.source_id IS NOT NULL
+                    """SELECT s.agent_id, s.id, s.data, r.data,
+                              (SELECT COUNT(*)
+                               FROM postgresql_update_scopes AS u
+                               WHERE u.agent_id = s.agent_id
+                                 AND u.source_id = s.id)
                        FROM sources AS s
-                       LEFT JOIN postgresql_write_admissions AS a
-                         ON a.agent_id = s.agent_id AND a.source_id = s.id
+                       LEFT JOIN source_read_scopes AS r
+                         ON r.agent_id = s.agent_id AND r.source_id = s.id
                        WHERE s.agent_id = ? ORDER BY s.id""",
                     (agent_id,),
                 ).fetchall()
-            return tuple(
-                _decode_source_projection(data, admitted) for data, admitted in rows
-            )
+                return tuple(
+                    _decode_source_state(
+                        connection,
+                        row_agent_id=row_agent_id,
+                        row_source_id=row_source_id,
+                        source_data=data,
+                        read_scope_data=read_scope_data,
+                        update_scope_count=update_scope_count,
+                    )
+                    for (
+                        row_agent_id,
+                        row_source_id,
+                        data,
+                        read_scope_data,
+                        update_scope_count,
+                    ) in rows
+                )
 
         return await asyncio.to_thread(read)
+
+    async def load_source_read_scope(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> SourceReadScope | None:
+        """Load one exact active-source scope; invalid state never becomes all."""
+
+        def read() -> SourceReadScope | None:
+            with _connect(self.path) as connection:
+                row = _source_state_row(connection, agent_id, source_id)
+                if row is None:
+                    return None
+                registration = _decode_source_state(
+                    connection,
+                    row_agent_id=row[0],
+                    row_source_id=row[1],
+                    source_data=row[2],
+                    read_scope_data=row[3],
+                    update_scope_count=row[4],
+                )
+                return _decode_owned_read_scope(connection, registration, row[3])
+
+        return await asyncio.to_thread(read)
+
+    async def list_postgresql_update_scopes(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> tuple[PostgreSQLUpdateScope, ...]:
+        def read() -> tuple[PostgreSQLUpdateScope, ...]:
+            with _connect(self.path) as connection:
+                source_row = _source_state_row(connection, agent_id, source_id)
+                if source_row is None:
+                    return ()
+                registration = _decode_source_state(
+                    connection,
+                    row_agent_id=source_row[0],
+                    row_source_id=source_row[1],
+                    source_data=source_row[2],
+                    read_scope_data=source_row[3],
+                    update_scope_count=source_row[4],
+                )
+                if not registration.active:
+                    return ()
+                if registration.adapter_id != "postgresql":
+                    if source_row[4]:
+                        raise SourcePermissionStateError(
+                            "non-PostgreSQL source retains update scopes"
+                        )
+                    return ()
+                rows = connection.execute(
+                    """SELECT resource_id, authorization_fingerprint, data
+                       FROM postgresql_update_scopes
+                       WHERE agent_id = ? AND source_id = ?
+                       ORDER BY resource_id""",
+                    (agent_id, source_id),
+                ).fetchall()
+                try:
+                    return tuple(
+                        decode_postgresql_update_scope(
+                            data,
+                            agent_id=agent_id,
+                            source_id=source_id,
+                            resource_id=resource_id,
+                            authorization_fingerprint=fingerprint,
+                        )
+                        for resource_id, fingerprint, data in rows
+                    )
+                except (TypeError, ValueError):
+                    raise SourcePermissionStateError(
+                        "stored PostgreSQL update scope is undecodable"
+                    ) from None
+
+        return await asyncio.to_thread(read)
+
+    async def replace_source_permission_scopes(
+        self,
+        read_scope: SourceReadScope,
+        update_scopes: tuple[PostgreSQLUpdateScope, ...],
+    ) -> SourceRegistration:
+        """Atomically replace only the two narrow scope families for one source."""
+
+        if not isinstance(read_scope, SourceReadScope):
+            raise TypeError("read_scope must be a SourceReadScope")
+        if not isinstance(update_scopes, tuple) or any(
+            not isinstance(scope, PostgreSQLUpdateScope) for scope in update_scopes
+        ):
+            raise TypeError("update_scopes must be a tuple of PostgreSQLUpdateScope")
+        if len({scope.resource_id for scope in update_scopes}) != len(update_scopes):
+            raise ValueError("update_scopes cannot contain duplicate resources")
+        gate = _CatalogCommitGate()
+
+        def write() -> SourceRegistration | None:
+            connection = _connect(self.path)
+            try:
+                if not gate.start(connection):
+                    return None
+                row = _source_state_row(
+                    connection,
+                    read_scope.agent_id,
+                    read_scope.source_id,
+                )
+                if row is None:
+                    raise ValueError("permission scopes require an active owned source")
+                registration = _decode_source_state(
+                    connection,
+                    row_agent_id=row[0],
+                    row_source_id=row[1],
+                    source_data=row[2],
+                    read_scope_data=row[3],
+                    update_scope_count=row[4],
+                )
+                if not registration.active:
+                    raise ValueError("permission scopes require an active owned source")
+                _require_nonforeign_read_resources(connection, read_scope)
+                if any(
+                    scope.agent_id != read_scope.agent_id
+                    or scope.source_id != read_scope.source_id
+                    for scope in update_scopes
+                ):
+                    raise ValueError("update scope belongs to another source")
+                update_resource_ids = {scope.resource_id for scope in update_scopes}
+                if read_scope.mode is SourceReadMode.NONE and update_resource_ids:
+                    raise ValueError("PostgreSQL update scope requires read access")
+                if (
+                    read_scope.mode is SourceReadMode.SELECTED
+                    and not update_resource_ids <= set(read_scope.resource_ids)
+                ):
+                    raise ValueError("PostgreSQL update scope must be a read subset")
+                if update_scopes and registration.adapter_id != "postgresql":
+                    raise ValueError(
+                        "PostgreSQL update scopes require a PostgreSQL source"
+                    )
+
+                snapshot = _current_source_snapshot(
+                    connection,
+                    read_scope.agent_id,
+                    read_scope.source_id,
+                )
+                resources = (
+                    {}
+                    if snapshot is None
+                    else {item.id: item for item in snapshot.resources}
+                )
+                facets = (
+                    {}
+                    if snapshot is None
+                    else {
+                        item.resource_id: item
+                        for item in snapshot.facets
+                        if item.kind is FacetKind.TABULAR
+                    }
+                )
+                for scope in update_scopes:
+                    resource = resources.get(scope.resource_id)
+                    facet = facets.get(scope.resource_id)
+                    if resource is None or facet is None:
+                        raise ValueError(
+                            "PostgreSQL update scope requires a current table resource"
+                        )
+                    expected = postgresql_update_authorization_fingerprint(
+                        source=persisted_source(registration),
+                        resource=resource,
+                        facet=facet,
+                        allowed_assignment_columns=scope.allowed_assignment_columns,
+                    )
+                    if scope.authorization_fingerprint != expected:
+                        raise ValueError(
+                            "PostgreSQL update authorization fingerprint is stale"
+                        )
+
+                connection.execute(
+                    """INSERT INTO source_read_scopes(agent_id, source_id, data)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(agent_id, source_id)
+                       DO UPDATE SET data = excluded.data""",
+                    (
+                        read_scope.agent_id,
+                        read_scope.source_id,
+                        encode_source_read_scope(read_scope),
+                    ),
+                )
+                connection.execute(
+                    """DELETE FROM postgresql_update_scopes
+                       WHERE agent_id = ? AND source_id = ?""",
+                    (read_scope.agent_id, read_scope.source_id),
+                )
+                for scope in sorted(update_scopes, key=lambda item: item.resource_id):
+                    connection.execute(
+                        """INSERT INTO postgresql_update_scopes(
+                               agent_id, source_id, resource_id,
+                               authorization_fingerprint, data
+                           ) VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            scope.agent_id,
+                            scope.source_id,
+                            scope.resource_id,
+                            scope.authorization_fingerprint,
+                            encode_postgresql_update_scope(scope),
+                        ),
+                    )
+                connection.commit()
+                return project_source_admission(registration, bool(update_scopes))
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled_before_start = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled_before_start = (
+                    gate.cancel_before_start() or cancelled_before_start
+                )
+        updated = worker.result()
+        if cancelled_before_start:
+            if updated is not None:
+                raise AssertionError(
+                    "cancelled source permission transaction committed"
+                )
+            raise asyncio.CancelledError
+        if updated is None:
+            raise AssertionError(
+                "source permission transaction stopped without cancellation"
+            )
+        return updated
+
+    async def clear_postgresql_update_scopes(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> SourceRegistration:
+        read_scope = await self.load_source_read_scope(agent_id, source_id)
+        if read_scope is None:
+            raise ValueError("unknown active source for this agent")
+        return await self.replace_source_permission_scopes(read_scope, ())
 
     async def load_database_write_receipt(
         self,
@@ -489,17 +912,17 @@ class SQLiteStateStore:
         def write() -> SourceRegistration:
             with _connect(self.path) as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                row = connection.execute(
-                    """SELECT s.data, a.source_id IS NOT NULL
-                       FROM sources AS s
-                       LEFT JOIN postgresql_write_admissions AS a
-                         ON a.agent_id = s.agent_id AND a.source_id = s.id
-                       WHERE s.agent_id = ? AND s.id = ?""",
-                    (agent_id, source_id),
-                ).fetchone()
+                row = _source_state_row(connection, agent_id, source_id)
                 if row is None:
                     raise ValueError("unknown active source for this agent")
-                registration = _decode_source_projection(row[0], row[1])
+                registration = _decode_source_state(
+                    connection,
+                    row_agent_id=row[0],
+                    row_source_id=row[1],
+                    source_data=row[2],
+                    read_scope_data=row[3],
+                    update_scope_count=row[4],
+                )
                 if not registration.active:
                     raise ValueError("unknown active source for this agent")
                 connection.execute(
@@ -527,7 +950,7 @@ class SQLiteStateStore:
         source_id: str,
         enabled: bool,
     ) -> SourceRegistration:
-        """Atomically change only one owned PostgreSQL admission row."""
+        """Phase-C compatibility: source-wide enable is no longer representable."""
 
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("agent_id must be a non-empty string")
@@ -535,74 +958,11 @@ class SQLiteStateStore:
             raise ValueError("source_id must be a non-empty string")
         if not isinstance(enabled, bool):
             raise TypeError("enabled must be a boolean")
-        gate = _CatalogCommitGate()
-
-        def write() -> SourceRegistration | None:
-            connection = _connect(self.path)
-            try:
-                if not gate.start(connection):
-                    return None
-                row = connection.execute(
-                    "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
-                    (agent_id, source_id),
-                ).fetchone()
-                if row is None:
-                    raise ValueError(
-                        "source must be an active PostgreSQL source owned by this agent"
-                    )
-                current = decode_source(row[0])
-                if (
-                    current.agent_id != agent_id
-                    or current.id != source_id
-                    or current.adapter_id != "postgresql"
-                    or not current.active
-                ):
-                    raise ValueError(
-                        "source must be an active PostgreSQL source owned by this agent"
-                    )
-                if enabled:
-                    connection.execute(
-                        """INSERT INTO postgresql_write_admissions(agent_id, source_id)
-                           VALUES (?, ?) ON CONFLICT(agent_id, source_id) DO NOTHING""",
-                        (agent_id, source_id),
-                    )
-                else:
-                    connection.execute(
-                        """DELETE FROM postgresql_write_admissions
-                           WHERE agent_id = ? AND source_id = ?""",
-                        (agent_id, source_id),
-                    )
-                connection.commit()
-                return project_source_admission(current, enabled)
-            except BaseException:
-                connection.rollback()
-                raise
-            finally:
-                connection.close()
-
-        worker = asyncio.create_task(asyncio.to_thread(write))
-        cancelled = False
-        cancelled_before_start = False
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                cancelled = True
-                cancelled_before_start = (
-                    gate.cancel_before_start() or cancelled_before_start
-                )
-        updated = worker.result()
-        if cancelled_before_start:
-            if updated is not None:
-                raise AssertionError("cancelled source admission transaction committed")
-            raise asyncio.CancelledError
-        if updated is None:
-            raise AssertionError(
-                "source admission transaction stopped without cancellation"
+        if enabled:
+            raise ValueError(
+                "source-wide PostgreSQL write access was replaced by exact table scopes"
             )
-        if cancelled:
-            raise asyncio.CancelledError
-        return updated
+        return await self.clear_postgresql_update_scopes(agent_id, source_id)
 
     async def detach_source(
         self, agent_id: str, source_id: str, detached_at: datetime
@@ -629,7 +989,12 @@ class SQLiteStateStore:
                     (encode_source(detached), agent_id, source_id),
                 )
                 connection.execute(
-                    """DELETE FROM postgresql_write_admissions
+                    """DELETE FROM source_read_scopes
+                       WHERE agent_id = ? AND source_id = ?""",
+                    (agent_id, source_id),
+                )
+                connection.execute(
+                    """DELETE FROM postgresql_update_scopes
                        WHERE agent_id = ? AND source_id = ?""",
                     (agent_id, source_id),
                 )
@@ -729,10 +1094,11 @@ class SQLiteStateStore:
                     return None
                 if registration is not None:
                     stored_registration = persisted_source(registration)
-                    row = connection.execute(
-                        "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
-                        (stored_registration.agent_id, stored_registration.id),
-                    ).fetchone()
+                    row = _source_state_row(
+                        connection,
+                        stored_registration.agent_id,
+                        stored_registration.id,
+                    )
                     if row is None:
                         connection.execute(
                             "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
@@ -742,8 +1108,31 @@ class SQLiteStateStore:
                                 encode_source(stored_registration),
                             ),
                         )
+                        if stored_registration.active:
+                            attach_scope = SourceReadScope.allow_all(
+                                agent_id=stored_registration.agent_id,
+                                source_id=stored_registration.id,
+                            )
+                            connection.execute(
+                                """INSERT INTO source_read_scopes(
+                                       agent_id, source_id, data
+                                   ) VALUES (?, ?, ?)""",
+                                (
+                                    stored_registration.agent_id,
+                                    stored_registration.id,
+                                    encode_source_read_scope(attach_scope),
+                                ),
+                            )
                     else:
-                        current = decode_source(row[0])
+                        current = _decode_source_state(
+                            connection,
+                            row_agent_id=row[0],
+                            row_source_id=row[1],
+                            source_data=row[2],
+                            read_scope_data=row[3],
+                            update_scope_count=row[4],
+                        )
+                        current = persisted_source(current)
                         if current != stored_registration:
                             if (
                                 current.active
@@ -763,6 +1152,20 @@ class SQLiteStateStore:
                                     encode_source(stored_registration),
                                     stored_registration.agent_id,
                                     stored_registration.id,
+                                ),
+                            )
+                            attach_scope = SourceReadScope.allow_all(
+                                agent_id=stored_registration.agent_id,
+                                source_id=stored_registration.id,
+                            )
+                            connection.execute(
+                                """INSERT INTO source_read_scopes(
+                                       agent_id, source_id, data
+                                   ) VALUES (?, ?, ?)""",
+                                (
+                                    stored_registration.agent_id,
+                                    stored_registration.id,
+                                    encode_source_read_scope(attach_scope),
                                 ),
                             )
                     selection = connection.execute(
@@ -2102,6 +2505,23 @@ def _current_snapshot_row(
     return str(row[0]), str(row[1])
 
 
+def _current_source_snapshot(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    source_id: str,
+) -> SourceCatalogSnapshot | None:
+    row = connection.execute(
+        "SELECT data FROM snapshots WHERE agent_id = ? AND source_id = ?",
+        (agent_id, source_id),
+    ).fetchone()
+    if row is None:
+        return None
+    snapshot = decode_catalog_snapshot(row[0])
+    if snapshot.sync.agent_id != agent_id or snapshot.sync.source_id != source_id:
+        raise SourcePermissionStateError("stored catalog snapshot ownership is invalid")
+    return snapshot
+
+
 def _decode_catalog_snapshot(value: str) -> SourceCatalogSnapshot:
     return decode_catalog_snapshot(value)
 
@@ -2391,18 +2811,22 @@ async def _run_candidate_transaction(
     return result
 
 
-def _initialize(path: Path) -> None:
+def _initialize(path: Path, *, upgrade_gate: _UpgradeCommitGate | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         os.chmod(path, 0o600)
-        _admit_existing_state(path)
+        _admit_existing_state(path, upgrade_gate=upgrade_gate)
         return
     with _connect(path) as connection:
         create_current(connection)
     os.chmod(path, 0o600)
 
 
-def _admit_existing_state(path: Path) -> None:
+def _admit_existing_state(
+    path: Path,
+    *,
+    upgrade_gate: _UpgradeCommitGate | None = None,
+) -> None:
     try:
         with _connect_read_only(path) as read_connection:
             if "state_migrations" in table_names(read_connection):
@@ -2465,7 +2889,10 @@ def _admit_existing_state(path: Path) -> None:
     connection: sqlite3.Connection | None = None
     try:
         connection = _connect(path)
-        connection.execute("BEGIN IMMEDIATE")
+        if upgrade_gate is None:
+            connection.execute("BEGIN IMMEDIATE")
+        elif not upgrade_gate.start(connection):
+            return
         if applied is None:
             assert expected_preledger is not None
             bridge_preledger(connection, expected_preledger)
@@ -2473,9 +2900,12 @@ def _admit_existing_state(path: Path) -> None:
             if inspect_journal(connection) != applied:
                 raise RuntimeError("migration journal changed during admission")
             upgrade_journaled(connection, applied)
-        require_schema(connection, CURRENT_TABLES)
+        require_schema(connection, SCOPED_PERMISSION_TABLES)
         require_healthy(connection)
-        connection.commit()
+        if upgrade_gate is None:
+            connection.commit()
+        elif not upgrade_gate.commit(connection):
+            return
     except BaseException as error:
         if connection is not None:
             connection.rollback()
@@ -2591,8 +3021,13 @@ __all__ = [
     "DatabaseWriteOutcome",
     "DatabaseWriteReceipt",
     "DatabaseWriteReceiptConflictError",
+    "PostgreSQLUpdateScope",
     "SQLiteStateStore",
+    "SourcePermissionStateError",
+    "SourceReadMode",
+    "SourceReadScope",
     "StateCompatibilityCode",
     "StateCompatibilityError",
     "database_write_receipt_id",
+    "postgresql_update_authorization_fingerprint",
 ]

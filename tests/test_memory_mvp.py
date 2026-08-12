@@ -363,10 +363,11 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
             "learning_candidates",
             "messages",
             "metadata",
-            "postgresql_write_admissions",
+            "postgresql_update_scopes",
             "runs",
             "semantic_annotations",
             "snapshots",
+            "source_read_scopes",
             "sources",
             "state_migrations",
             "syncs",
@@ -374,7 +375,7 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
         for table in tables:
             expected_rows = 1 if table == "metadata" else 0
             if table == "state_migrations":
-                expected_rows = 2
+                expected_rows = 3
             assert (
                 connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 == expected_rows

@@ -34,6 +34,11 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import EmptySecretProvider
+from daita.storage.sqlite_records import (
+    PostgreSQLUpdateScope,
+    SourceReadScope,
+    postgresql_update_authorization_fingerprint,
+)
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
 _NATIVE_IDENTITY = "postgresql:preview-contract"
@@ -801,7 +806,27 @@ async def test_public_agent_preview_vertical_slice_creates_no_write_receipt(
     )
     await agent._embedded._store.register_source(registration)
     await agent._embedded._store.commit_snapshot(snapshot)
-    enabled = await agent.set_source_write_access(registration.id, True)
+    resource = next(
+        item for item in snapshot.resources if item.id == public_resource_id
+    )
+    facet = next(item for item in snapshot.facets if item.resource_id == resource.id)
+    enabled = await agent._embedded._store.replace_source_permission_scopes(
+        SourceReadScope.allow_all(agent_id=agent.id, source_id=registration.id),
+        (
+            PostgreSQLUpdateScope(
+                agent_id=agent.id,
+                source_id=registration.id,
+                resource_id=resource.id,
+                allowed_assignment_columns=("status",),
+                authorization_fingerprint=postgresql_update_authorization_fingerprint(
+                    source=registration,
+                    resource=resource,
+                    facet=facet,
+                    allowed_assignment_columns=("status",),
+                ),
+            ),
+        ),
+    )
     assert enabled.configuration["write_access"] is True
     connection = _Connection()
     _patch_io(monkeypatch, connection)

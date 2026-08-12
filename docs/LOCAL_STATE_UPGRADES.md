@@ -1,6 +1,6 @@
 # Local state upgrades
 
-Daita package replacement and local-state evolution are separate concerns. Pipx
+Daita package replacement and local state evolution are separate concerns. Pipx
 and the managed installer replace application code without touching agent data.
 The first command that subsequently opens an agent validates its SQLite state
 and applies any supported durable revisions automatically.
@@ -34,31 +34,10 @@ copy them into SQLite.
 - Each published durable change has one immutable migration file. The current
   ledger therefore has separate receipt-table and PostgreSQL-admission entries.
 
-## Admission outcomes and diagnostics
-
-| Existing state | Behavior |
-| --- | --- |
-| Exact current journal | Validate the journal, schema, integrity, foreign keys, and open without a database write. |
-| Known journal prefix | Apply each missing migration in order in one transaction, validate each target, stamp its checksum, and open. |
-| Supported preledger shape | Identify the exact historical schema in the isolated bridge, create the journal, apply the remaining migrations, and open. |
-| Unknown, reordered, gapped, or checksum-mismatched journal | Refuse without changing state. |
-| State created by a newer release | Refuse the downgrade without changing state; install the same or a newer Daita package. |
-| Recognizable pre-1.0 framework | Refuse without creating mixed current state in that root. |
-| Damaged or unexpected schema | Refuse without changing database contents. |
-| Upgrade failure | Roll back the SQLite transaction; no partial revision is admitted. |
-| Caller cancellation | Wait for the transaction to settle, then surface cancellation; state is wholly old or wholly current. |
-
-Headless CLI diagnostics expose `code`, `state_path`, `found_revision`,
-`current_revision`, and `state_changed`. Interactive startup renders the same
-classification in descriptive language and does not expose historical numeric
-markers. Stable error codes are `state_revision_newer`, `state_legacy`,
-`state_database_damaged`, `state_revision_unsupported`, and
-`state_upgrade_failed`.
-
 ## Ownership and ledger rules
 
-`SQLiteStateStore` is the only owner of local-state admission and migration.
-Admission starts only after `EmbeddedAgent` acquires the existing per-agent
+`SQLiteStateStore` is the only owner of local state admission and migration.
+Admission starts only after `EmbeddedAgent` acquires the existing per agent
 process writer lock. The store uses `BEGIN IMMEDIATE`; validates the exact
 source schema, database integrity, and foreign keys; applies the known suffix;
 validates every target; and commits once. DDL, data changes, and journal rows
@@ -81,7 +60,7 @@ layers do not implement alternate compatibility paths.
 
 ## Persisted-record codecs
 
-Record-shape evolution is separate from database migration. SQLite persistence
+Record shape evolution is separate from database migration. SQLite persistence
 uses explicit codecs for identity/identifiers, sources, receipts, catalog
 syncs/snapshots, artifact references, transcript/run records, semantic
 annotations, and learning candidates/review stamps. Each codec declares its
@@ -90,23 +69,9 @@ and unknown-field policy. Stored class-name text never selects a Python type.
 
 An additive payload default that leaves the physical schema and invariants
 unchanged is a codec change, not a ledger entry. A physical table, index,
-foreign-key, ownership, or cross-record invariant change is a migration. This
+foreign key, ownership, or cross record invariant change is a migration. This
 keeps package releases from rewriting an entire database merely because one
 serialized record gained an optional field.
-
-## Bounded preledger bridge
-
-The historical marker reader exists only in
-`daita.storage.sqlite_migrations.preledger`. It admits these exact combinations:
-
-- the pre-receipt table shape with marker 0 or 1; and
-- the receipt-era table shape with marker 0, 2, or 3.
-
-The bridge never guesses from a partial schema. It rejects newer markers,
-recognizable pre-1.0 framework tables, and all other shapes. Remove this unit
-only after the minimum supported Daita release is guaranteed to have created
-`state_migrations` and product support for every preledger home has been
-deliberately ended. Normal journaled opens never read the historical marker.
 
 ## PostgreSQL write-admission cutover
 

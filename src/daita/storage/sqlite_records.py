@@ -7,14 +7,253 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
+from collections.abc import Iterable, Mapping
 
 from .._json import canonical_json
+from ..adapters.models import SourceRegistration
+from ..catalog.models import CatalogFacet, CatalogResource, FacetKind, ResourceKind
 
 _DATABASE_WRITE_RECEIPT_ID = re.compile(r"database-write-receipt:sha256:[0-9a-f]{64}\Z")
 _DATABASE_WRITE_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _DATABASE_WRITE_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
 _DATABASE_WRITE_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
 _DATABASE_WRITE_ERROR_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z")
+_SOURCE_PERMISSION_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_SOURCE_PERMISSION_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
+_SOURCE_PERMISSION_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
+_SOURCE_PERMISSION_MAX_RESOURCE_IDS = 10_000
+_SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS = 32
+
+
+class SourceReadMode(str, Enum):
+    ALL = "all"
+    SELECTED = "selected"
+    NONE = "none"
+
+
+class SourcePermissionStateError(RuntimeError):
+    """A durable source permission record is missing, foreign, or invalid."""
+
+
+def _permission_text(value: str, name: str, *, maximum: int = 512) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{name} must be non-empty text without surrounding space")
+    if len(value) > maximum:
+        raise ValueError(f"{name} exceeds {maximum} characters")
+    return value
+
+
+def _canonical_permission_texts(
+    values: Iterable[str],
+    name: str,
+    *,
+    maximum_items: int,
+    maximum_characters: int,
+) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{name} must be a sequence of strings")
+    items = tuple(values)
+    if len(items) > maximum_items:
+        raise ValueError(f"{name} exceeds {maximum_items} items")
+    for item in items:
+        _permission_text(item, name, maximum=maximum_characters)
+    if len(items) != len(set(items)):
+        raise ValueError(f"{name} cannot contain duplicates")
+    return tuple(sorted(items))
+
+
+@dataclass(frozen=True, slots=True)
+class SourceReadScope:
+    """One exact fail-closed read scope for an active source."""
+
+    agent_id: str
+    source_id: str
+    mode: SourceReadMode
+    resource_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _permission_text(self.agent_id, "read scope agent_id")
+        if (
+            not isinstance(self.source_id, str)
+            or _SOURCE_PERMISSION_SOURCE_ID.fullmatch(self.source_id) is None
+        ):
+            raise ValueError("read scope source_id must be a canonical source id")
+        if not isinstance(self.mode, SourceReadMode):
+            raise TypeError("read scope mode must be a SourceReadMode")
+        resource_ids = _canonical_permission_texts(
+            self.resource_ids,
+            "read scope resource_ids",
+            maximum_items=_SOURCE_PERMISSION_MAX_RESOURCE_IDS,
+            maximum_characters=256,
+        )
+        if any(
+            _SOURCE_PERMISSION_RESOURCE_ID.fullmatch(resource_id) is None
+            for resource_id in resource_ids
+        ):
+            raise ValueError(
+                "read scope resource_ids must be canonical catalog resource ids"
+            )
+        if self.mode is SourceReadMode.SELECTED and not resource_ids:
+            raise ValueError("selected read scope requires resource_ids")
+        if self.mode is not SourceReadMode.SELECTED and resource_ids:
+            raise ValueError("only selected read scope can contain resource_ids")
+        object.__setattr__(self, "resource_ids", resource_ids)
+
+    @classmethod
+    def allow_all(cls, *, agent_id: str, source_id: str) -> SourceReadScope:
+        return cls(agent_id=agent_id, source_id=source_id, mode=SourceReadMode.ALL)
+
+
+@dataclass(frozen=True, slots=True)
+class PostgreSQLUpdateScope:
+    """One exact table and assignment-column PostgreSQL authorization."""
+
+    agent_id: str
+    source_id: str
+    resource_id: str
+    allowed_assignment_columns: tuple[str, ...]
+    authorization_fingerprint: str
+
+    def __post_init__(self) -> None:
+        _permission_text(self.agent_id, "update scope agent_id")
+        if (
+            not isinstance(self.source_id, str)
+            or _SOURCE_PERMISSION_SOURCE_ID.fullmatch(self.source_id) is None
+        ):
+            raise ValueError("update scope source_id must be a canonical source id")
+        if (
+            not isinstance(self.resource_id, str)
+            or _SOURCE_PERMISSION_RESOURCE_ID.fullmatch(self.resource_id) is None
+        ):
+            raise ValueError(
+                "update scope resource_id must be a canonical catalog resource id"
+            )
+        columns = _canonical_permission_texts(
+            self.allowed_assignment_columns,
+            "update scope allowed_assignment_columns",
+            maximum_items=_SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS,
+            maximum_characters=256,
+        )
+        if not columns:
+            raise ValueError("update scope allowed_assignment_columns cannot be empty")
+        if (
+            not isinstance(self.authorization_fingerprint, str)
+            or _SOURCE_PERMISSION_HASH.fullmatch(self.authorization_fingerprint) is None
+        ):
+            raise ValueError(
+                "update scope authorization_fingerprint must be a sha256 hash"
+            )
+        object.__setattr__(self, "allowed_assignment_columns", columns)
+
+
+def postgresql_update_authorization_fingerprint(
+    *,
+    source: SourceRegistration,
+    resource: CatalogResource,
+    facet: CatalogFacet,
+    allowed_assignment_columns: Iterable[str],
+) -> str:
+    """Bind only durable facts that determine one update authorization's meaning."""
+
+    if not isinstance(source, SourceRegistration):
+        raise TypeError("authorization source must be a SourceRegistration")
+    if not isinstance(resource, CatalogResource):
+        raise TypeError("authorization resource must be a CatalogResource")
+    if not isinstance(facet, CatalogFacet):
+        raise TypeError("authorization facet must be a CatalogFacet")
+    if (
+        source.adapter_id != "postgresql"
+        or not source.active
+        or resource.agent_id != source.agent_id
+        or resource.source_id != source.id
+        or resource.kind is not ResourceKind.TABLE
+        or facet.resource_id != resource.id
+        or facet.kind is not FacetKind.TABULAR
+    ):
+        raise ValueError(
+            "authorization requires one current table from an active PostgreSQL source"
+        )
+    allowed = _canonical_permission_texts(
+        allowed_assignment_columns,
+        "authorization allowed_assignment_columns",
+        maximum_items=_SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS,
+        maximum_characters=256,
+    )
+    if not allowed:
+        raise ValueError("authorization allowed_assignment_columns cannot be empty")
+    raw_columns = facet.payload.get("columns")
+    if not isinstance(raw_columns, tuple):
+        raise ValueError("authorization requires exact tabular column facts")
+    columns: dict[str, Mapping[str, object]] = {}
+    for raw_column in raw_columns:
+        if not isinstance(raw_column, Mapping):
+            raise ValueError("authorization tabular column facts are invalid")
+        name = raw_column.get("name")
+        if not isinstance(name, str) or name in columns:
+            raise ValueError("authorization tabular column identity is invalid")
+        columns[name] = raw_column
+
+    primary_key_columns: list[tuple[int, str]] = []
+    for name, column in columns.items():
+        ordinal = column.get("primary_key_ordinal")
+        if ordinal is None:
+            continue
+        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 1:
+            raise ValueError("authorization primary-key structure is invalid")
+        primary_key_columns.append((ordinal, name))
+    primary_key_columns.sort()
+    if [ordinal for ordinal, _ in primary_key_columns] != list(
+        range(1, len(primary_key_columns) + 1)
+    ):
+        raise ValueError("authorization primary-key structure is invalid")
+
+    allowed_facts: list[dict[str, object]] = []
+    primary_names = {name for _, name in primary_key_columns}
+    for name in allowed:
+        selected_column = columns.get(name)
+        if selected_column is None:
+            raise ValueError("authorization references an unknown assignment column")
+        native_type = selected_column.get("native_type")
+        namespace = selected_column.get("native_type_namespace")
+        native_name = selected_column.get("native_type_name")
+        updatable = selected_column.get("updatable")
+        identity = selected_column.get("identity")
+        generated = selected_column.get("generated")
+        if (
+            not isinstance(native_type, str)
+            or not isinstance(updatable, bool)
+            or not isinstance(identity, bool)
+            or not isinstance(generated, bool)
+            or (namespace is None) is not (native_name is None)
+            or (namespace is not None and not isinstance(namespace, str))
+            or (native_name is not None and not isinstance(native_name, str))
+        ):
+            raise ValueError("authorization assignment-column facts are invalid")
+        if name in primary_names or not updatable or identity or generated:
+            raise ValueError("authorization assignment column is not eligible")
+        allowed_facts.append(
+            {
+                "generated": generated,
+                "identity": identity,
+                "name": name,
+                "native_type": native_type,
+                "native_type_name": native_name,
+                "native_type_namespace": namespace,
+                "updatable": updatable,
+            }
+        )
+
+    material = {
+        "adapter_id": source.adapter_id,
+        "allowed_assignment_columns": allowed_facts,
+        "primary_key": tuple(
+            {"name": name, "ordinal": ordinal} for ordinal, name in primary_key_columns
+        ),
+        "resource_id": resource.id,
+        "resource_kind": resource.kind.value,
+        "source_id": source.id,
+    }
+    return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
 class DatabaseWriteOutcome(str, Enum):
@@ -257,8 +496,13 @@ __all__ = [
     "DatabaseWriteOutcome",
     "DatabaseWriteReceipt",
     "DatabaseWriteReceiptConflictError",
+    "PostgreSQLUpdateScope",
+    "SourcePermissionStateError",
+    "SourceReadMode",
+    "SourceReadScope",
     "database_write_aware",
     "database_write_receipt_id",
     "database_write_text",
+    "postgresql_update_authorization_fingerprint",
     "validate_database_write_receipt_id",
 ]

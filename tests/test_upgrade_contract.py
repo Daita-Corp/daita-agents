@@ -28,7 +28,15 @@ from daita.storage.sqlite_migrations import migration_rows, runner as migration_
 from daita.storage.sqlite_migrations.postgresql_write_admission import (
     MIGRATION as ADMISSION_MIGRATION,
 )
-from daita.storage.sqlite_schema import INITIAL_TABLES, RECEIPT_TABLES, require_schema
+from daita.storage.sqlite_migrations.scoped_source_permissions import (
+    MIGRATION as SCOPED_PERMISSION_MIGRATION,
+)
+from daita.storage.sqlite_schema import (
+    ADMISSION_TABLE_SQL,
+    INITIAL_TABLES,
+    RECEIPT_TABLES,
+    require_schema,
+)
 
 FIXTURE = (
     Path(__file__).parent / "fixtures" / "state" / "preledger-supported-shapes.json"
@@ -116,7 +124,8 @@ def _make_preledger(
     with sqlite3.connect(path) as connection:
         for source_id, value in (embedded_admissions or {}).items():
             _embedded_admission(connection, source_id, value)
-        connection.execute("DROP TABLE postgresql_write_admissions")
+        connection.execute("DROP TABLE postgresql_update_scopes")
+        connection.execute("DROP TABLE source_read_scopes")
         connection.execute("DROP TABLE state_migrations")
         if not receipt_era:
             connection.execute("DROP TABLE database_write_receipts")
@@ -126,8 +135,31 @@ def _make_preledger(
 def _make_journal_prefix(path: Path, source_id: str, *, admission: object) -> None:
     with sqlite3.connect(path) as connection:
         _embedded_admission(connection, source_id, admission)
-        connection.execute("DROP TABLE postgresql_write_admissions")
-        connection.execute("DELETE FROM state_migrations WHERE ordinal = 2")
+        connection.execute("DROP TABLE postgresql_update_scopes")
+        connection.execute("DROP TABLE source_read_scopes")
+        connection.execute("DELETE FROM state_migrations WHERE ordinal >= 2")
+
+
+def _make_admission_prefix(
+    path: Path,
+    source_id: str,
+    *,
+    admitted: bool,
+) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE postgresql_update_scopes")
+        connection.execute("DROP TABLE source_read_scopes")
+        connection.execute(ADMISSION_TABLE_SQL)
+        if admitted:
+            agent_id = connection.execute(
+                "SELECT agent_id FROM sources WHERE id = ?", (source_id,)
+            ).fetchone()[0]
+            connection.execute(
+                "INSERT INTO postgresql_write_admissions(agent_id, source_id) "
+                "VALUES (?, ?)",
+                (agent_id, source_id),
+            )
+        connection.execute("DELETE FROM state_migrations WHERE ordinal = 3")
 
 
 def _registration(agent_id: str) -> SourceRegistration:
@@ -163,9 +195,11 @@ async def test_fresh_state_has_exact_journal_and_reopens_without_writing(
     assert _journal(path) == migration_rows()
     assert {
         "state_migrations",
-        "postgresql_write_admissions",
+        "source_read_scopes",
+        "postgresql_update_scopes",
         "database_write_receipts",
     } <= set(_tables(path))
+    assert "postgresql_write_admissions" not in _tables(path)
     before = _sha256(path)
 
     reopened = await SQLiteStateStore.open(path)
@@ -261,15 +295,7 @@ async def test_every_supported_preledger_shape_upgrades_and_preserves_rows(
     try:
         assert reopened.id == agent_id
         sources = await reopened.list_sources()
-        assert sources == (
-            replace(
-                registered,
-                configuration={
-                    **dict(registered.configuration),
-                    "write_access": True,
-                },
-            ),
-        )
+        assert sources == (registered,)
         assert await reopened.active_source() == sources[0]
         assert (
             sources[0].configuration["credential_ref"]
@@ -289,18 +315,17 @@ async def test_every_supported_preledger_shape_upgrades_and_preserves_rows(
         source_data = connection.execute("SELECT data FROM sources").fetchone()[0]
         assert "write_access" not in json.loads(source_data)["fields"]["configuration"]
         assert connection.execute(
-            "SELECT agent_id, source_id FROM postgresql_write_admissions"
+            "SELECT agent_id, source_id FROM source_read_scopes"
         ).fetchone() == (agent_id, registration.id)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM postgresql_update_scopes"
+        ).fetchone() == (0,)
 
 
-@pytest.mark.parametrize(
-    ("legacy_value", "enabled"),
-    ((_MISSING, False), (False, False), (True, True)),
-)
+@pytest.mark.parametrize("legacy_value", (_MISSING, False, True))
 async def test_preledger_admission_cutover_is_fail_closed(
     tmp_path: Path,
     legacy_value: object,
-    enabled: bool,
 ) -> None:
     agent = await Agent.create("admission-cutover", root=tmp_path, clock=lambda: NOW)
     path = agent.home / "state.db"
@@ -316,9 +341,14 @@ async def test_preledger_admission_cutover_is_fail_closed(
 
     reopened = await Agent.open("admission-cutover", root=tmp_path, clock=lambda: NOW)
     try:
-        assert (await reopened.list_sources())[0].configuration[
-            "write_access"
-        ] is enabled
+        assert (await reopened.list_sources())[0].configuration["write_access"] is False
+        assert (
+            await reopened._embedded._store.list_postgresql_update_scopes(
+                reopened.id,
+                registration.id,
+            )
+            == ()
+        )
     finally:
         await reopened.close()
 
@@ -372,19 +402,11 @@ async def test_detached_preledger_source_never_inherits_embedded_admission(
     reopened = await Agent.open("detached-cutover", root=tmp_path, clock=lambda: NOW)
     try:
         sources = await reopened.list_sources()
-        assert sources == (
-            replace(
-                detached,
-                configuration={
-                    **dict(detached.configuration),
-                    "write_access": False,
-                },
-            ),
-        )
+        assert sources == (detached,)
         assert await reopened.active_source() is None
         with sqlite3.connect(path) as connection:
             assert connection.execute(
-                "SELECT COUNT(*) FROM postgresql_write_admissions"
+                "SELECT COUNT(*) FROM source_read_scopes"
             ).fetchone() == (0,)
     finally:
         await reopened.close()
@@ -402,8 +424,8 @@ async def test_detached_preledger_source_never_inherits_embedded_admission(
             "20990101_unknown",
         ),
         (
-            "UPDATE state_migrations SET ordinal = 3 WHERE ordinal = 2",
-            "20260811_postgresql_write_admission",
+            "UPDATE state_migrations SET ordinal = 4 WHERE ordinal = 2",
+            "20260812_scoped_source_permissions",
         ),
     ),
 )
@@ -439,7 +461,14 @@ async def test_skipped_release_journal_prefix_applies_pending_migration(
 
     reopened = await Agent.open("journal-prefix", root=tmp_path, clock=lambda: NOW)
     try:
-        assert (await reopened.list_sources())[0].configuration["write_access"] is True
+        assert (await reopened.list_sources())[0].configuration["write_access"] is False
+        assert (
+            await reopened._embedded._store.list_postgresql_update_scopes(
+                reopened.id,
+                registration.id,
+            )
+            == ()
+        )
     finally:
         await reopened.close()
     assert _journal(path) == migration_rows()
@@ -454,20 +483,20 @@ async def test_cancellation_waits_for_atomic_journal_upgrade_to_settle(
     registration = _registration(agent.id)
     await agent._embedded._store.register_source(registration)
     await agent.close()
-    _make_journal_prefix(path, registration.id, admission=True)
+    _make_admission_prefix(path, registration.id, admitted=True)
     entered = threading.Event()
     release = threading.Event()
 
     def controlled_apply(connection: sqlite3.Connection) -> None:
-        ADMISSION_MIGRATION.apply(connection)
+        SCOPED_PERMISSION_MIGRATION.apply(connection)
         entered.set()
         assert release.wait(timeout=5)
 
-    controlled = replace(ADMISSION_MIGRATION, apply=controlled_apply)
+    controlled = replace(SCOPED_PERMISSION_MIGRATION, apply=controlled_apply)
     monkeypatch.setattr(
         migration_runner,
         "MIGRATIONS",
-        (migration_runner.MIGRATIONS[0], controlled),
+        (*migration_runner.MIGRATIONS[:2], controlled),
     )
     opening = asyncio.create_task(SQLiteStateStore.open(path))
     assert await asyncio.to_thread(entered.wait, 5)
@@ -477,11 +506,48 @@ async def test_cancellation_waits_for_atomic_journal_upgrade_to_settle(
     with pytest.raises(asyncio.CancelledError):
         await opening
 
-    assert _journal(path) == migration_rows()
+    assert _journal(path) == migration_rows()[:2]
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT source_id FROM postgresql_write_admissions"
         ).fetchone() == (registration.id,)
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'source_read_scopes'"
+            ).fetchone()
+            is None
+        )
+
+
+async def test_scoped_permission_migration_failure_rolls_back_every_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = await Agent.create("failed-scope-upgrade", root=tmp_path, clock=lambda: NOW)
+    path = agent.home / "state.db"
+    registration = _registration(agent.id)
+    await agent._embedded._store.register_source(registration)
+    await agent.close()
+    _make_admission_prefix(path, registration.id, admitted=True)
+    rows_before = _rows(path, _tables(path))
+
+    def failing_apply(connection: sqlite3.Connection) -> None:
+        SCOPED_PERMISSION_MIGRATION.apply(connection)
+        raise RuntimeError("controlled migration failure")
+
+    controlled = replace(SCOPED_PERMISSION_MIGRATION, apply=failing_apply)
+    monkeypatch.setattr(
+        migration_runner,
+        "MIGRATIONS",
+        (*migration_runner.MIGRATIONS[:2], controlled),
+    )
+    with pytest.raises(StateCompatibilityError) as raised:
+        await SQLiteStateStore.open(path)
+
+    assert raised.value.code is StateCompatibilityCode.UPGRADE_FAILED
+    assert _journal(path) == migration_rows()[:2]
+    assert _rows(path, _tables(path)) == rows_before
 
 
 async def test_newer_preledger_state_is_refused_without_write(tmp_path: Path) -> None:
@@ -509,7 +575,7 @@ async def test_newer_journal_extension_is_a_downgrade_refusal_without_write(
     with sqlite3.connect(path) as connection:
         connection.execute(
             "INSERT INTO state_migrations(ordinal, migration_id, checksum) "
-            "VALUES (3, ?, ?)",
+            "VALUES (4, ?, ?)",
             (future_revision, "f" * 64),
         )
     before = _sha256(path)
@@ -532,7 +598,7 @@ async def test_invalid_later_journal_entry_is_unsupported_without_write(
     with sqlite3.connect(path) as connection:
         connection.execute(
             "INSERT INTO state_migrations(ordinal, migration_id, checksum) "
-            "VALUES (4, 'gapped-future', ?)",
+            "VALUES (5, 'gapped-future', ?)",
             ("f" * 64,),
         )
     before = _sha256(path)
@@ -756,6 +822,11 @@ def test_migration_checksums_are_stable_sha256_values() -> None:
             2,
             "20260811_postgresql_write_admission",
             "451840240521fe5ad424d43e0bc5b7df2d124b3261b35be64b53bd36e08431d0",
+        ),
+        (
+            3,
+            "20260812_scoped_source_permissions",
+            "2ed3f7017f9d4c683ee17a0ba43c88ad4452c5af1b06223343cd43248f699d95",
         ),
     )
 

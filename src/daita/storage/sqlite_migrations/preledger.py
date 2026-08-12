@@ -12,11 +12,11 @@ import sqlite3
 from enum import Enum
 
 from ..sqlite_schema import (
-    CURRENT_TABLES,
     INITIAL_TABLES,
     JOURNAL_RECEIPT_TABLES,
     JOURNAL_TABLE_SQL,
     RECEIPT_TABLES,
+    SCOPED_PERMISSION_TABLES,
     require_healthy,
     require_schema,
     schema_matches,
@@ -25,6 +25,7 @@ from ..sqlite_schema import (
 from .database_write_receipts import MIGRATION as RECEIPT_MIGRATION
 from .postgresql_write_admission import MIGRATION as ADMISSION_MIGRATION
 from .runner import insert_journal_row
+from .scoped_source_permissions import MIGRATION as SCOPED_PERMISSION_MIGRATION
 
 LEGACY_TABLE_MARKERS = frozenset({"evidence", "events", "operations", "tasks"})
 
@@ -83,9 +84,13 @@ def bridge(connection: sqlite3.Connection, expected: PreledgerShape) -> None:
     require_schema(connection, JOURNAL_RECEIPT_TABLES)
     ADMISSION_MIGRATION.apply(connection)
     insert_journal_row(connection, ADMISSION_MIGRATION)
-    require_schema(connection, CURRENT_TABLES)
     if ADMISSION_MIGRATION.validate_target is not None:
         ADMISSION_MIGRATION.validate_target(connection)
+    SCOPED_PERMISSION_MIGRATION.apply(connection)
+    insert_journal_row(connection, SCOPED_PERMISSION_MIGRATION)
+    require_schema(connection, SCOPED_PERMISSION_TABLES)
+    if SCOPED_PERMISSION_MIGRATION.validate_target is not None:
+        SCOPED_PERMISSION_MIGRATION.validate_target(connection)
     require_healthy(connection)
 
 

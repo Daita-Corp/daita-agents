@@ -44,6 +44,11 @@ from daita.semantics import (
     SemanticSubject,
 )
 from daita.storage.sqlite import DatabaseWriteOutcome, DatabaseWriteReceipt
+from daita.storage.sqlite_records import (
+    PostgreSQLUpdateScope,
+    SourceReadMode,
+    SourceReadScope,
+)
 from daita.storage.sqlite_codecs import (
     decode_catalog_snapshot,
     decode_catalog_sync,
@@ -52,11 +57,13 @@ from daita.storage.sqlite_codecs import (
     decode_learning_candidate,
     decode_loop_exit,
     decode_message,
+    decode_postgresql_update_scope,
     decode_receipt,
     decode_review_stamps,
     decode_run_input,
     decode_semantic_annotation,
     decode_source,
+    decode_source_read_scope,
     encode_catalog_snapshot,
     encode_catalog_sync,
     encode_identifier,
@@ -64,11 +71,13 @@ from daita.storage.sqlite_codecs import (
     encode_learning_candidate,
     encode_loop_exit,
     encode_message,
+    encode_postgresql_update_scope,
     encode_receipt,
     encode_review_stamps,
     encode_run_input,
     encode_semantic_annotation,
     encode_source,
+    encode_source_read_scope,
 )
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -288,6 +297,74 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
     assert encode_source(stored_source) == encoded_source
     assert decode_identifier(encode_identifier("source-codec")) == "source-codec"
     assert decode_review_stamps(encode_review_stamps((stamp,))) == (stamp,)
+
+    read_scope = SourceReadScope(
+        agent_id="agent-codec",
+        source_id="source:sha256:" + "1" * 64,
+        mode=SourceReadMode.SELECTED,
+        resource_ids=(
+            "catalog-resource:sha256:" + "3" * 64,
+            "catalog-resource:sha256:" + "2" * 64,
+        ),
+    )
+    encoded_read_scope = encode_source_read_scope(read_scope)
+    assert (
+        decode_source_read_scope(
+            encoded_read_scope,
+            agent_id=read_scope.agent_id,
+            source_id=read_scope.source_id,
+        )
+        == read_scope
+    )
+    assert encode_source_read_scope(read_scope) == encoded_read_scope
+
+    update_scope = PostgreSQLUpdateScope(
+        agent_id=read_scope.agent_id,
+        source_id=read_scope.source_id,
+        resource_id="catalog-resource:sha256:" + "2" * 64,
+        allowed_assignment_columns=("status", "amount"),
+        authorization_fingerprint="sha256:" + "4" * 64,
+    )
+    encoded_update_scope = encode_postgresql_update_scope(update_scope)
+    assert (
+        decode_postgresql_update_scope(
+            encoded_update_scope,
+            agent_id=update_scope.agent_id,
+            source_id=update_scope.source_id,
+            resource_id=update_scope.resource_id,
+            authorization_fingerprint=update_scope.authorization_fingerprint,
+        )
+        == update_scope
+    )
+    assert encode_postgresql_update_scope(update_scope) == encoded_update_scope
+
+
+def test_source_permission_codecs_reject_unknown_versions_and_noncanonical_sets() -> (
+    None
+):
+    read_scope = SourceReadScope.allow_all(
+        agent_id="agent-codec",
+        source_id="source:sha256:" + "1" * 64,
+    )
+    payload = json.loads(encode_source_read_scope(read_scope))
+    payload["fields"]["version"] = 2
+    with pytest.raises(ValueError, match="version is unsupported"):
+        decode_source_read_scope(
+            json.dumps(payload),
+            agent_id=read_scope.agent_id,
+            source_id=read_scope.source_id,
+        )
+
+    with pytest.raises(ValueError, match="cannot contain duplicates"):
+        SourceReadScope(
+            agent_id=read_scope.agent_id,
+            source_id=read_scope.source_id,
+            mode=SourceReadMode.SELECTED,
+            resource_ids=(
+                "catalog-resource:sha256:" + "2" * 64,
+                "catalog-resource:sha256:" + "2" * 64,
+            ),
+        )
 
 
 def test_additive_defaults_decode_without_a_database_migration() -> None:

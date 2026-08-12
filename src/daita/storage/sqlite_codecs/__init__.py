@@ -20,6 +20,12 @@ from .learning import (
 )
 from .receipts import decode_receipt, encode_receipt
 from .semantics import decode_semantic_annotation, encode_semantic_annotation
+from .source_permissions import (
+    decode_postgresql_update_scope,
+    decode_source_read_scope,
+    encode_postgresql_update_scope,
+    encode_source_read_scope,
+)
 from .sources import (
     decode_preledger_source,
     decode_source,
@@ -45,11 +51,13 @@ __all__ = [
     "decode_loop_exit",
     "decode_message",
     "decode_preledger_source",
+    "decode_postgresql_update_scope",
     "decode_receipt",
     "decode_review_stamps",
     "decode_run_input",
     "decode_semantic_annotation",
     "decode_source",
+    "decode_source_read_scope",
     "encode_catalog_snapshot",
     "encode_catalog_sync",
     "encode_identifier",
@@ -57,11 +65,13 @@ __all__ = [
     "encode_learning_candidate",
     "encode_loop_exit",
     "encode_message",
+    "encode_postgresql_update_scope",
     "encode_receipt",
     "encode_review_stamps",
     "encode_run_input",
     "encode_semantic_annotation",
     "encode_source",
+    "encode_source_read_scope",
     "persisted_source",
     "project_source_admission",
 ]

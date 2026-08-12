@@ -70,6 +70,18 @@ ADMISSION_TABLE = (
     ("agent_id", "TEXT", 1, None, 1),
     ("source_id", "TEXT", 1, None, 2),
 )
+READ_SCOPE_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("source_id", "TEXT", 1, None, 2),
+    ("data", "TEXT", 1, None, 0),
+)
+UPDATE_SCOPE_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("source_id", "TEXT", 1, None, 2),
+    ("resource_id", "TEXT", 1, None, 3),
+    ("authorization_fingerprint", "TEXT", 1, None, 0),
+    ("data", "TEXT", 1, None, 0),
+)
 
 RECEIPT_TABLES = {**INITIAL_TABLES, "database_write_receipts": RECEIPT_TABLE}
 JOURNAL_INITIAL_TABLES = {**INITIAL_TABLES, "state_migrations": JOURNAL_TABLE}
@@ -78,12 +90,19 @@ CURRENT_TABLES = {
     **JOURNAL_RECEIPT_TABLES,
     "postgresql_write_admissions": ADMISSION_TABLE,
 }
+WRITE_ADMISSION_TABLES = CURRENT_TABLES
+SCOPED_PERMISSION_TABLES = {
+    **JOURNAL_RECEIPT_TABLES,
+    "source_read_scopes": READ_SCOPE_TABLE,
+    "postgresql_update_scopes": UPDATE_SCOPE_TABLE,
+}
 
 MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
 ADMISSION_FOREIGN_KEYS = (
     ("sources", "agent_id", "agent_id", "NO ACTION", "CASCADE", "NONE"),
     ("sources", "source_id", "id", "NO ACTION", "CASCADE", "NONE"),
 )
+SOURCE_SCOPE_FOREIGN_KEYS = ADMISSION_FOREIGN_KEYS
 NAMED_INDEXES = {
     "runs_conversation_turn": (
         "runs",
@@ -182,6 +201,32 @@ CREATE TABLE postgresql_write_admissions (
 )
 """
 
+SOURCE_READ_SCOPE_TABLE_SQL = """
+CREATE TABLE source_read_scopes (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, source_id),
+    FOREIGN KEY (agent_id, source_id)
+        REFERENCES sources(agent_id, id)
+        ON DELETE CASCADE
+)
+"""
+
+POSTGRESQL_UPDATE_SCOPE_TABLE_SQL = """
+CREATE TABLE postgresql_update_scopes (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    authorization_fingerprint TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, source_id, resource_id),
+    FOREIGN KEY (agent_id, source_id)
+        REFERENCES sources(agent_id, id)
+        ON DELETE CASCADE
+)
+"""
+
 
 def table_names(connection: sqlite3.Connection) -> frozenset[str]:
     return frozenset(
@@ -224,6 +269,16 @@ def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> 
         **(
             {"postgresql_write_admissions": ADMISSION_FOREIGN_KEYS}
             if "postgresql_write_admissions" in definitions
+            else {}
+        ),
+        **(
+            {"source_read_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
+            if "source_read_scopes" in definitions
+            else {}
+        ),
+        **(
+            {"postgresql_update_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
+            if "postgresql_update_scopes" in definitions
             else {}
         ),
     }
