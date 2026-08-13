@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -41,7 +41,7 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.loop import AgentLoop, InMemoryTranscriptStore
 from daita.loop.models import LoopExitKind, RunInput
 
-NOW = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 1, 12, tzinfo=UTC)
 RUN_ID = "run-00000000000000000000000000000001"
 CONVERSATION_ID = "conversation-00000000000000000000000000000001"
 

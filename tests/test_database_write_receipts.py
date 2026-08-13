@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -13,7 +13,7 @@ from daita.storage.sqlite import (
     SQLiteStateStore,
 )
 
-STARTED_AT = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+STARTED_AT = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 COMPLETED_AT = STARTED_AT + timedelta(seconds=1)
 
 

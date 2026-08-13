@@ -4,7 +4,7 @@ import asyncio
 import sqlite3
 import threading
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -59,7 +59,7 @@ def _snapshot_decode_counter(
 async def test_catalog_summary_aggregates_current_active_snapshots_and_latest_sync(
     tmp_path: Path,
 ):
-    first_time = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+    first_time = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
     current_time = first_time
 
     def clock() -> datetime:
@@ -121,7 +121,7 @@ async def test_catalog_summary_aggregates_current_active_snapshots_and_latest_sy
 async def test_empty_successful_snapshot_is_not_ready_but_retains_sync_time(
     tmp_path: Path,
 ):
-    completed_at = datetime(2026, 7, 22, 13, 0, tzinfo=timezone.utc)
+    completed_at = datetime(2026, 7, 22, 13, 0, tzinfo=UTC)
     database = tmp_path / "empty.sqlite"
     _database(database, with_tables=False)
     agent = await Agent.create("empty", root=tmp_path, clock=lambda: completed_at)
@@ -795,7 +795,7 @@ async def test_failed_snapshot_commit_does_not_publish_candidate_cache(
 async def test_running_partial_and_failed_syncs_never_contribute_or_replace_truth(
     tmp_path: Path,
 ):
-    started_at = datetime(2026, 7, 22, 14, 0, tzinfo=timezone.utc)
+    started_at = datetime(2026, 7, 22, 14, 0, tzinfo=UTC)
     agent = await Agent.create("sync-state", root=tmp_path, clock=lambda: started_at)
     store = SQLiteStateStore(agent.home / "state.db")
     try:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -23,7 +23,7 @@ from daita.hosting import embedded as embedded_module
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
 
-NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 
 
 def _configuration() -> dict[str, object]:

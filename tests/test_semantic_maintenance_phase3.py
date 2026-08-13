@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
-from typing import Mapping
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -41,7 +41,7 @@ from daita.semantics import (
 from daita.skills import SKILL_MAX_COUNT
 from daita.storage.sqlite import SQLiteStateStore
 
-NOW = datetime(2026, 7, 28, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 28, 12, tzinfo=UTC)
 
 
 def _annotation(

@@ -6,7 +6,7 @@ import re
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
@@ -448,7 +448,7 @@ def canonical_artifact_filename(
 
 def _datetime_text(value: datetime) -> str:
     _utc(value, "serialized datetime")
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _datetime_value(value: object, name: str) -> datetime:

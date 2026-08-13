@@ -4,7 +4,7 @@ import json
 import sqlite3
 from collections import defaultdict
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -52,7 +52,7 @@ from daita.semantics import (
 )
 from daita.storage.sqlite import SQLiteStateStore
 
-_NOW = datetime(2026, 7, 29, tzinfo=timezone.utc)
+_NOW = datetime(2026, 7, 29, tzinfo=UTC)
 
 
 def _ids():

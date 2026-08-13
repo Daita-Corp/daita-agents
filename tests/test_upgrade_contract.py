@@ -9,7 +9,7 @@ import sys
 import threading
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,7 +41,7 @@ from daita.storage.sqlite_schema import (
 FIXTURE = (
     Path(__file__).parent / "fixtures" / "state" / "preledger-supported-shapes.json"
 )
-NOW = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
 
 
 class _TTYBuffer(io.StringIO):

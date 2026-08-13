@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from daita import terminal
 from daita.adapters.models import SourceRegistration
@@ -18,7 +18,7 @@ from daita.storage.sqlite_records import (
     SourceReadScope,
 )
 
-NOW = datetime(2026, 8, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 12, tzinfo=UTC)
 AGENT_ID = "agent-terminal-permissions"
 
 

@@ -10,10 +10,11 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Protocol
 
 from . import (
     Agent,

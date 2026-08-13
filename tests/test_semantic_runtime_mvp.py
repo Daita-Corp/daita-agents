@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -35,7 +35,7 @@ from daita.semantics import (
 )
 from daita.terminal import _learning_invocation_message
 
-NOW = datetime(2026, 7, 28, 14, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 28, 14, tzinfo=UTC)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:

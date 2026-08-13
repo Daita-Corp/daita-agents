@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from collections import defaultdict
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -82,7 +82,7 @@ async def _result(agent: Agent, run_id: str, call_id: str) -> ToolResultBlock:
 
 
 async def test_artifact_list_is_bounded_newest_first_and_metadata_only() -> None:
-    created = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    created = datetime(2026, 8, 3, tzinfo=UTC)
     refs = tuple(
         ArtifactRef(
             artifact_id=f"artifact-{index:032x}",

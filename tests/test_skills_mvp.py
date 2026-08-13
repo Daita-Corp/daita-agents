@@ -3,7 +3,7 @@ import os
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import fields
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
@@ -45,7 +45,7 @@ from daita.skills.capabilities import (
     SKILL_VIEW_TOOL_NAME,
 )
 
-NOW = datetime(2026, 7, 22, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 22, tzinfo=UTC)
 
 
 def _profile(provider: MockModelProvider, *, context: int = 20_000) -> ModelProfile:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import TypeVar
@@ -100,7 +100,7 @@ def datetime_encode(value: datetime) -> dict[str, JsonValue]:
     timestamp = value.isoformat()
     offset = value.utcoffset()
     if offset is not None and offset.total_seconds() == 0:
-        timestamp = value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        timestamp = value.astimezone(UTC).isoformat().replace("+00:00", "Z")
     return {"__datetime__": timestamp}
 
 

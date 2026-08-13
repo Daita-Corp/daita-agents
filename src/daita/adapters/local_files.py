@@ -12,7 +12,7 @@ import stat
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Protocol
@@ -1472,7 +1472,7 @@ def _build_snapshot(
         parsed = _parse_tabular(content, file_format, limits)
         modified_at = datetime.fromtimestamp(
             descriptor_stat.st_mtime,
-            tz=timezone.utc,
+            tz=UTC,
         )
         file_facet = CatalogFacet.from_file(
             resource_id=resource_id,

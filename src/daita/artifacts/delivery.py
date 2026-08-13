@@ -12,7 +12,7 @@ import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import NoReturn, Protocol
@@ -44,7 +44,7 @@ _DELIVERY_TIMEOUT_SECONDS = 60.0
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _new_id(prefix: str) -> str:

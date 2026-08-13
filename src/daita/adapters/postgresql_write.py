@@ -6,12 +6,12 @@ import asyncio
 import inspect
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from hashlib import sha256
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 from .._json import (
@@ -340,7 +340,7 @@ class PostgreSQLUpdatePreviewBackend:
         ):
             raise TypeError("receipt_store must provide the database receipt contract")
         self._receipt_store = receipt_store
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._statement_timeout_seconds = float(statement_timeout_seconds)
         self._lock_timeout_seconds = float(lock_timeout_seconds)
         self._cleanup_timeout_seconds = float(cleanup_timeout_seconds)
@@ -1094,7 +1094,13 @@ async def _fetch_update_rows(
             "write_affected_rows_mismatch",
             "PostgreSQL did not provide a bounded RETURNING cursor.",
         )
-    return tuple(await fetch(2))
+    fetched_rows = fetch(2)
+    if not inspect.isawaitable(fetched_rows):
+        raise PostgreSQLUpdateExecutionError(
+            "write_affected_rows_mismatch",
+            "PostgreSQL did not provide an asynchronous bounded RETURNING cursor.",
+        )
+    return tuple(await fetched_rows)
 
 
 def _verified_returned_cells(
@@ -1394,9 +1400,15 @@ def _readiness_result(
     rejection_codes: tuple[str, ...],
     remediation_categories: tuple[str, ...],
 ) -> PostgreSQLUpdateReadiness:
-    role_attributes: dict[str, object] = dict.fromkeys(_READINESS_ROLE_KEYS)
-    privileges: dict[str, object] = dict.fromkeys(_READINESS_PRIVILEGE_KEYS)
-    relation_facts: dict[str, object] = dict.fromkeys(_READINESS_RELATION_KEYS)
+    role_attributes: dict[str, object] = {}
+    privileges: dict[str, object] = {}
+    relation_facts: dict[str, object] = {}
+    for key in _READINESS_ROLE_KEYS:
+        role_attributes[key] = None
+    for key in _READINESS_PRIVILEGE_KEYS:
+        privileges[key] = None
+    for key in _READINESS_RELATION_KEYS:
+        relation_facts[key] = None
     relation_facts["catalog_admitted"] = True
     if facts is not None:
         role_attributes.update(

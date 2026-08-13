@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
@@ -60,7 +60,7 @@ _MODEL_ID = "DAITA_POSTGRESQL_UPDATE_MODEL_ID"
 _MODEL_KEY = "OPENAI_API_KEY"
 _MAX_COST = "DAITA_POSTGRESQL_UPDATE_MAX_COST_USD"
 _DEFAULT_MODEL_ID = "openai:gpt-5.6-terra"
-_NOW = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+_NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
 _AGENT_ID = "agent-live-postgresql-update"
 _NATIVE_IDENTITY = "postgresql:live-model-update"
 _ALLOWED_MODEL_CALLS = frozenset(

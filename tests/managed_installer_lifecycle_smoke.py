@@ -279,7 +279,7 @@ def main() -> int:
         seed_python = seed_generation / seed_manifest["generation_python"]
         seed_write_admission = """
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 import sys
 
@@ -304,7 +304,7 @@ async def main():
             "ssl_mode": "require",
             "username": "reader",
         },
-        attached_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+        attached_at=datetime(2026, 7, 30, tzinfo=UTC),
     )
     await agent._embedded._store.register_source(source)
     await agent.close()

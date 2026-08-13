@@ -1,7 +1,7 @@
 import asyncio
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -41,7 +41,7 @@ from daita.loop import (
 )
 from daita.observation import AgentEvent, AgentEventKind
 
-NOW = datetime(2026, 7, 21, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 class TranscriptContext:

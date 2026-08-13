@@ -1,8 +1,8 @@
-import sqlite3
 import inspect
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import fields
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -43,7 +43,7 @@ from daita.loop import (
 )
 from daita.storage.sqlite import SQLiteStateStore
 
-NOW = datetime(2026, 7, 21, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 def test_context_builder_exposes_only_fixed_absolute_history_bounds():

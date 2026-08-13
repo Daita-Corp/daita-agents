@@ -251,27 +251,21 @@ class CatalogDataView:
                 and isinstance((namespace := column.get("native_type_namespace")), str)
                 and isinstance((native_name := column.get("native_type_name")), str)
             )
-            identity_columns = tuple(
-                name
-                for column in raw_columns
-                if isinstance(column, FrozenJsonObject)
-                and isinstance((name := column.get("name")), str)
-                and column.get("identity") is True
-            )
-            generated_columns = tuple(
-                name
-                for column in raw_columns
-                if isinstance(column, FrozenJsonObject)
-                and isinstance((name := column.get("name")), str)
-                and column.get("generated") is True
-            )
-            updatable_columns = tuple(
-                name
-                for column in raw_columns
-                if isinstance(column, FrozenJsonObject)
-                and isinstance((name := column.get("name")), str)
-                and column.get("updatable") is True
-            )
+            identity_column_names: list[str] = []
+            generated_column_names: list[str] = []
+            updatable_column_names: list[str] = []
+            for column in raw_columns:
+                if not isinstance(column, FrozenJsonObject):
+                    continue
+                name = column.get("name")
+                if not isinstance(name, str):
+                    continue
+                if column.get("identity") is True:
+                    identity_column_names.append(name)
+                if column.get("generated") is True:
+                    generated_column_names.append(name)
+                if column.get("updatable") is True:
+                    updatable_column_names.append(name)
             unique_key_columns: list[str] = []
             if len(primary_key_columns) == 1 and primary_key_columns[0][0] == 1:
                 unique_key_columns.append(primary_key_columns[0][1])
@@ -315,9 +309,9 @@ class CatalogDataView:
                     column_declared_types=column_declared_types,
                     column_nullability=column_nullability,
                     column_type_provenance=column_type_provenance,
-                    identity_columns=identity_columns,
-                    generated_columns=generated_columns,
-                    updatable_columns=updatable_columns,
+                    identity_columns=tuple(identity_column_names),
+                    generated_columns=tuple(generated_column_names),
+                    updatable_columns=tuple(updatable_column_names),
                 )
             )
         return tuple(sorted(schemas, key=lambda item: (item.name, item.resource_id)))

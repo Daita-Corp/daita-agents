@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
@@ -21,7 +21,7 @@ from daita.domains.data.sql import (
 )
 from daita.security import SecretReference
 
-NOW = datetime(2026, 8, 10, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 10, tzinfo=UTC)
 SOURCE_ID = "source:sha256:" + "a" * 64
 RESOURCE_ID = "catalog-resource:sha256:" + "b" * 64
 RESOURCE_REVISION = "sha256:" + "c" * 64
@@ -113,20 +113,32 @@ class _Sources:
     def __init__(self, registration: SourceRegistration) -> None:
         self.registration = registration
 
-    async def register_source(self, registration: SourceRegistration):
+    async def register_source(
+        self,
+        registration: SourceRegistration,
+    ) -> SourceRegistration:
         self.registration = registration
         return registration
 
-    async def load_source(self, agent_id: str, source_id: str):
+    async def load_source(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> SourceRegistration | None:
         if agent_id == self.registration.agent_id and source_id == SOURCE_ID:
             return self.registration
         return None
 
-    async def list_sources(self, agent_id: str):
+    async def list_sources(self, agent_id: str) -> tuple[SourceRegistration, ...]:
         return (self.registration,) if agent_id == self.registration.agent_id else ()
 
-    async def detach_source(self, *args: object):
-        raise AssertionError(args)
+    async def detach_source(
+        self,
+        agent_id: str,
+        source_id: str,
+        detached_at: datetime,
+    ) -> SourceRegistration:
+        raise AssertionError((agent_id, source_id, detached_at))
 
 
 class _Catalog:
@@ -139,12 +151,22 @@ class _Catalog:
         self.resource = resource or _resource()
         self.scope_issue = scope_issue
 
-    async def resource_schemas(self, agent_id: str, source_id: str):
+    async def resource_schemas(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> tuple[ResourceSchema, ...]:
         assert agent_id == "agent-readiness"
         return (self.resource,) if source_id == SOURCE_ID else ()
 
-    async def postgresql_update_scope_issue(self, *args: object):
-        del args
+    async def postgresql_update_scope_issue(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> tuple[str, str] | None:
+        del agent_id, source_id, resource_id, assignment_columns
         return self.scope_issue
 
 
@@ -577,7 +599,7 @@ def test_first_party_postgresql_attachment_has_no_permission_field() -> None:
             database="warehouse",
             username="writer",
             credential=SecretReference.environment("FIXTURE_PASSWORD"),
-            daita_scope_ready=True,
+            daita_scope_ready=True,  # pyright: ignore[reportCallIssue]
         )
         del source
 

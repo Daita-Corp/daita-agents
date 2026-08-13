@@ -12,7 +12,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
@@ -1053,9 +1053,7 @@ def _parse_timestamp(value: object, field_name: str) -> datetime:
     if not text.endswith("Z"):
         raise ValueError(f"pricing {field_name} must be UTC with a Z suffix")
     try:
-        parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
+        parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
     except ValueError as error:
         raise ValueError(f"pricing {field_name} is malformed") from error
     return parsed
@@ -1228,8 +1226,8 @@ def _effective_periods_overlap(
     left: PricingSchedule,
     right: PricingSchedule,
 ) -> bool:
-    left_until = left.effective_until or datetime.max.replace(tzinfo=timezone.utc)
-    right_until = right.effective_until or datetime.max.replace(tzinfo=timezone.utc)
+    left_until = left.effective_until or datetime.max.replace(tzinfo=UTC)
+    right_until = right.effective_until or datetime.max.replace(tzinfo=UTC)
     return left.effective_from < right_until and right.effective_from < left_until
 
 

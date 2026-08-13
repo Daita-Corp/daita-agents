@@ -291,7 +291,7 @@ assert len(content) > 0
         seed_state = """
 import asyncio
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import sqlite3
@@ -417,7 +417,7 @@ async def main():
             "ssl_mode": "require",
             "username": "reader",
         },
-        attached_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+        attached_at=datetime(2026, 7, 30, tzinfo=UTC),
     )
     await agent._embedded._store.register_source(postgresql_registration)
     export_destination = await agent.set_export_destination(export_directory)
@@ -490,8 +490,8 @@ async def main():
         catalog_revisions=(),
         candidate_fingerprint="4" * 64,
         status=LearningCandidateStatus.AWAITING_REVIEW,
-        created_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
-        updated_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+        created_at=datetime(2026, 7, 30, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 30, tzinfo=UTC),
     )
     stamp = LearningCandidateReviewStamp(
         run_id=run.run_id,

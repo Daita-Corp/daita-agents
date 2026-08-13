@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -70,7 +70,7 @@ from daita.llm.models import (
 )
 from daita.loop.models import RunInput
 
-_OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+_OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
 
 
 @dataclass(frozen=True, slots=True)

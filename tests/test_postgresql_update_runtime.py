@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
 
 from daita import Agent
-from daita._json import canonical_json
+from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters import (
     postgresql as postgresql_module,
     postgresql_write as write_module,
@@ -40,7 +40,11 @@ from daita.domains.data.controller import (
     POSTGRESQL_UPDATE_CAPABILITY_ID,
     DataToolRuntime,
 )
-from daita.domains.data.sql import PostgreSQLUpdateCommand, PostgreSQLUpdateIntent
+from daita.domains.data.sql import (
+    PostgreSQLUpdateCommand,
+    PostgreSQLUpdateIntent,
+    ResourceSchema,
+)
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -55,6 +59,7 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.loop import AgentLoop, InMemoryTranscriptStore, LoopExitKind
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
+from daita.semantics import SemanticResourceFact
 from daita.storage.sqlite import DatabaseWriteOutcome, DatabaseWriteReceipt
 from daita.storage.sqlite_records import (
     PostgreSQLUpdateScope,
@@ -62,7 +67,7 @@ from daita.storage.sqlite_records import (
     postgresql_update_authorization_fingerprint,
 )
 
-NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 SOURCE_ID = source_registration_id(
     "agent-update",
     "postgresql",
@@ -108,12 +113,22 @@ class _Catalog:
         self.scope_issue: tuple[str, str] | None = None
         self.scope_checks = 0
 
-    async def resource_schemas(self, agent_id: str, source_id: str):
+    async def resource_schemas(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> tuple[ResourceSchema, ...]:
         del agent_id
         return (self.resource,) if source_id == self.resource.source_id else ()
 
-    async def postgresql_update_scope_issue(self, *args: object):
-        del args
+    async def postgresql_update_scope_issue(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> tuple[str, str] | None:
+        del agent_id, source_id, resource_id, assignment_columns
         self.scope_checks += 1
         return self.scope_issue
 
@@ -966,7 +981,7 @@ class _RuntimeCatalog:
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
-    ):
+    ) -> tuple[Mapping[str, object], ...]:
         del agent_id
         if source_ids and SOURCE_ID not in source_ids:
             return ()
@@ -982,7 +997,7 @@ class _RuntimeCatalog:
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
-    ):
+    ) -> frozenset[str]:
         del agent_id
         return (
             frozenset({RESOURCE_ID})
@@ -990,8 +1005,14 @@ class _RuntimeCatalog:
             else frozenset()
         )
 
-    async def postgresql_update_scope_issue(self, *args: object):
-        del args
+    async def postgresql_update_scope_issue(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> tuple[str, str] | None:
+        del agent_id, source_id, resource_id, assignment_columns
         self.scope_checks += 1
         if self.scope_issues:
             return self.scope_issues.pop(0)
@@ -1008,35 +1029,64 @@ class _RuntimeCatalog:
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
-    ):
+    ) -> frozenset[str]:
         del agent_id
         if not self.scope_ready or (source_ids and SOURCE_ID not in source_ids):
             return frozenset()
         return frozenset({SOURCE_ID})
 
-    async def source_adapter_id(self, agent_id: str, source_id: str):
+    async def source_adapter_id(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> str | None:
         del agent_id
         return "postgresql" if source_id == SOURCE_ID else None
 
-    async def resource_schemas(self, agent_id: str, source_id: str):
+    async def resource_schemas(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> tuple[ResourceSchema, ...]:
         del agent_id
         return (_resource(),) if source_id == SOURCE_ID else ()
 
-    async def resource_identity(self, agent_id: str, resource_id: str):
+    async def resource_identity(
+        self,
+        agent_id: str,
+        resource_id: str,
+    ) -> tuple[str, str, str] | None:
         del agent_id
         return (SOURCE_ID, "table", "accounts") if resource_id == RESOURCE_ID else None
 
-    async def is_current_tabular_file(self, *args: object) -> bool:
-        del args
+    async def is_current_tabular_file(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+    ) -> bool:
+        del agent_id, source_id, resource_id
         return False
 
-    async def semantic_resource_facts(self, *args: object):
-        del args
+    async def semantic_resource_facts(
+        self,
+        agent_id: str,
+        resource_ids: tuple[str, ...],
+    ) -> tuple[SemanticResourceFact, ...]:
+        del agent_id, resource_ids
         return ()
 
-    async def catalog_context(self, *args: object, **kwargs: object):
-        del args, kwargs
-        return {}
+    async def catalog_context(
+        self,
+        agent_id: str,
+        query: str,
+        *,
+        limit: int,
+        source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] = (),
+    ) -> FrozenJsonObject:
+        del agent_id, query, limit, source_ids, resource_ids
+        return FrozenJsonObject.from_mapping({})
 
 
 class _RuntimeBackend:

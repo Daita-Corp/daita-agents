@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -22,7 +22,7 @@ from daita.catalog.models import (
 )
 from daita.storage.sqlite_records import SourceReadMode
 
-NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
 
 
 def _registration(agent_id: str) -> SourceRegistration:

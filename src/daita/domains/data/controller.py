@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Protocol, cast
 
@@ -303,7 +303,7 @@ class DataToolRuntime:
         self._approval_handler = approval_handler
         self._mutation_lock = mutation_lock or asyncio.Lock()
         self._observer = observer
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._transcripts = transcripts
         self._artifacts = artifacts
         self._artifact_delivery = artifact_delivery

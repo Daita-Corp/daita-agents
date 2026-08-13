@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 PIPX_REPAIR_GUIDANCE = "Repair it with: pipx reinstall daita-agents"
 MANAGED_REPAIR_GUIDANCE = (

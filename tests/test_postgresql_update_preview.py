@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -42,7 +42,7 @@ from daita.storage.sqlite_records import (
     postgresql_update_authorization_fingerprint,
 )
 
-NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 _NATIVE_IDENTITY = "postgresql:preview-contract"
 SOURCE_ID = source_registration_id(
     "agent-preview",
@@ -107,8 +107,14 @@ class _Catalog:
         del agent_id
         return (self.resource,) if source_id == self.resource.source_id else ()
 
-    async def postgresql_update_scope_issue(self, *args: object):
-        del args
+    async def postgresql_update_scope_issue(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> tuple[str, str] | None:
+        del agent_id, source_id, resource_id, assignment_columns
         return self.scope_issue
 
 

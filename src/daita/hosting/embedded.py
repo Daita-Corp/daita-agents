@@ -15,7 +15,7 @@ import stat
 import tomllib
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Self, TypeVar, cast
@@ -170,7 +170,7 @@ _T = TypeVar("_T")
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _new_id(prefix: str) -> str:

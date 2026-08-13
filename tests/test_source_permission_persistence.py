@@ -5,7 +5,7 @@ import json
 import sqlite3
 import threading
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -35,7 +35,7 @@ from daita.storage.sqlite_records import (
     postgresql_update_authorization_fingerprint,
 )
 
-NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
 
 
 def _registration(

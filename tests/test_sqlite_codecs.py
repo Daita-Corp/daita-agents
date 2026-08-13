@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TypeVar
 
@@ -80,7 +80,7 @@ from daita.storage.sqlite_records import (
     SourceReadScope,
 )
 
-NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 _RecordT = TypeVar("_RecordT")
 
 

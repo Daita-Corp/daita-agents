@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Mapping
 
 import pytest
 
@@ -34,7 +33,7 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.observation import AgentEvent, AgentEventKind
 
-NOW = datetime(2026, 7, 28, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 28, 12, tzinfo=UTC)
 
 
 @dataclass(frozen=True, slots=True)

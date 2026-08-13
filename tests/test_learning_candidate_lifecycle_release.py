@@ -6,7 +6,7 @@ import sqlite3
 import threading
 from collections import defaultdict
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -256,7 +256,7 @@ async def test_semantic_acceptance_projects_only_its_exact_write_tool(tmp_path):
             resource_id=resource.id,
             revision=resource.current_revision,
         )
-        now = datetime(2026, 7, 29, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 29, tzinfo=UTC)
         candidate = LearningCandidate(
             id="candidate-semantic",
             agent_id=agent.id,

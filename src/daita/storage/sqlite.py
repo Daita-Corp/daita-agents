@@ -14,7 +14,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import TypeVar
@@ -330,7 +330,7 @@ class SQLiteStateStore:
         **_: object,
     ) -> SQLiteStateStore:
         resolved = Path(path).resolve()
-        resolved_clock = clock or (lambda: datetime.now(timezone.utc))
+        resolved_clock = clock or (lambda: datetime.now(UTC))
 
         upgrade_gate = _UpgradeCommitGate()
 

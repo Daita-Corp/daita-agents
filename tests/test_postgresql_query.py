@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import traceback
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -82,7 +82,7 @@ def _backend() -> tuple[
         native_identity="offline-query-contract",
         display_name="Offline PostgreSQL",
         configuration={},
-        attached_at=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        attached_at=datetime(2026, 8, 5, tzinfo=UTC),
     )
     source_revision = "sha256:" + "3" * 64
     resource = ResourceSchema(
@@ -143,7 +143,7 @@ async def test_postgresql_backend_preserves_safe_connection_failure(
                 parameters=(),
                 format_name="csv",
                 parameters_sha256="sha256:" + "0" * 64,
-                created_at=datetime(2026, 8, 5, tzinfo=timezone.utc),
+                created_at=datetime(2026, 8, 5, tzinfo=UTC),
                 max_rows=100_000,
                 max_columns=256,
                 max_bytes=64 * 1024 * 1024,

@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -28,7 +28,7 @@ from daita.loop import (
 )
 from daita.observation import AgentEvent, AgentEventKind
 
-NOW = datetime(2026, 7, 21, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 class TranscriptContext:
@@ -248,14 +248,15 @@ async def test_terminalization_failure_never_masks_pending_cancellation():
     class HangingProvider:
         provider_id = "mock:hanging-cancel"
 
-        def supports_request_policy(self, request):
+        def supports_request_policy(self, request: ModelRequest) -> bool:
             del request
             return True
 
-        async def generate(self, request):
+        async def generate(self, request: ModelRequest) -> ModelResponse:
             del request
             model_started.set()
             await asyncio.Event().wait()
+            raise AssertionError("unreachable")
 
     store = FinishFailsStore()
     loop = AgentLoop(

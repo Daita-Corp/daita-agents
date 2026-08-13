@@ -4,7 +4,7 @@ import io
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from daita import (
     Agent,
@@ -37,7 +37,7 @@ from daita.terminal import (
     _learning_invocation_message,
 )
 
-NOW = datetime(2026, 7, 28, 16, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 28, 16, tzinfo=UTC)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:

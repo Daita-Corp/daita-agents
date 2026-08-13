@@ -7,7 +7,7 @@ import time as time_module
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from io import BytesIO
@@ -59,7 +59,7 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import LoopExitKind
 
-_CREATED_AT = datetime(2026, 8, 1, 12, 30, 45, tzinfo=timezone.utc)
+_CREATED_AT = datetime(2026, 8, 1, 12, 30, 45, tzinfo=UTC)
 
 
 def _ids():
@@ -138,8 +138,8 @@ def test_exact_xlsx_frozen_scalars_precision_and_fixed_provenance() -> None:
                 -0.0,
                 Decimal("12.3400"),
                 date(2026, 8, 1),
-                time(1, 2, 3, 4, tzinfo=timezone.utc),
-                datetime(2026, 8, 1, 1, 2, 3, 4, tzinfo=timezone.utc),
+                time(1, 2, 3, 4, tzinfo=UTC),
+                datetime(2026, 8, 1, 1, 2, 3, 4, tzinfo=UTC),
                 b"\x00\xff",
                 UUID("ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB"),
             ),
@@ -685,7 +685,7 @@ async def test_postgresql_xlsx_adapter_streams_typed_values_without_json_or_csv(
         (
             (
                 Decimal("1.2300"),
-                datetime(2026, 8, 1, tzinfo=timezone.utc),
+                datetime(2026, 8, 1, tzinfo=UTC),
                 b"abc",
                 True,
             ),

@@ -4,7 +4,7 @@ import json
 import os
 import re
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from html import unescape
 from pathlib import Path
@@ -214,7 +214,7 @@ def _paid_margin_judgment(
 def _write_report(report, output_directory: Path, model_id: str) -> tuple[Path, Path]:
     output_directory.mkdir(parents=True, exist_ok=True)
     safe_model = re.sub(r"[^a-z0-9._-]+", "-", model_id.casefold()).strip("-")
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     stem = f"learning-effectiveness-{safe_model}-{stamp}"
     json_path = output_directory / f"{stem}.json"
     markdown_path = output_directory / f"{stem}.md"

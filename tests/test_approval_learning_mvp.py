@@ -2,7 +2,7 @@ import asyncio
 import threading
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import cast
 
 import pytest
@@ -49,7 +49,7 @@ from daita.skills.capabilities import (
     SKILL_SAVE_TOOL_NAME,
 )
 
-NOW = datetime(2026, 7, 22, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 22, tzinfo=UTC)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:

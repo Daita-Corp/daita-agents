@@ -2,7 +2,7 @@ import asyncio
 import os
 import sqlite3
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -28,7 +28,7 @@ from daita.memory import (
     MemoryValidationError,
 )
 
-NOW = datetime(2026, 7, 22, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 22, tzinfo=UTC)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:

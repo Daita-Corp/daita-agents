@@ -5,7 +5,11 @@ surface while keeping analysis, read validation, and typed update validation
 in cohesive internal modules.
 """
 
-from .analysis import _load_sqlglot, analyze_postgresql_sql, analyze_sqlite_sql
+from .analysis import (
+    _load_sqlglot as _load_sqlglot,
+    analyze_postgresql_sql,
+    analyze_sqlite_sql,
+)
 from .contracts import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
