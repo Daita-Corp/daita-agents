@@ -20,16 +20,14 @@ from daita.catalog.models import (
     TabularFacet,
 )
 from daita.hosting import embedded as embedded_module
-from daita.hosting.embedded import AgentHomeError
-from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
 
 
-def _configuration(*, write_access: bool | None = False) -> dict[str, object]:
-    configuration: dict[str, object] = {
+def _configuration() -> dict[str, object]:
+    return {
         "database": "warehouse",
         "host": "db.example.test",
         "port": 5432,
@@ -37,9 +35,6 @@ def _configuration(*, write_access: bool | None = False) -> dict[str, object]:
         "ssl_mode": "require",
         "username": "reader",
     }
-    if write_access is not None:
-        configuration["write_access"] = write_access
-    return configuration
 
 
 def _registration(
@@ -47,7 +42,6 @@ def _registration(
     *,
     adapter_id: str = "postgresql",
     native_identity: str = "postgresql:test",
-    write_access: bool | None = False,
 ) -> SourceRegistration:
     return SourceRegistration.build(
         agent_id=agent_id,
@@ -55,7 +49,7 @@ def _registration(
         native_identity=native_identity,
         display_name="Warehouse",
         configuration=(
-            _configuration(write_access=write_access)
+            _configuration()
             if adapter_id == "postgresql"
             else {"path": "/tmp/read-only.sqlite"}
         ),
@@ -63,121 +57,16 @@ def _registration(
     )
 
 
-def test_postgresql_write_access_projection_never_changes_connection_identity():
-    source = PostgreSQLSource(
-        host="db.example.test",
-        database="warehouse",
-        username="reader",
-        secret_provider=EmptySecretProvider(),
-    )
-    assert source.write_access is False
-    assert postgresql_module._source_configuration(source)["write_access"] is False
-
-    missing = _registration("agent-source", write_access=None)
-    reconstructed = embedded_module._source_from_registration(
-        missing,
-        secret_provider=EmptySecretProvider(),
-    )
-    assert isinstance(reconstructed, PostgreSQLSource)
-    assert reconstructed.write_access is False
-
-    enabled_projection = _registration("agent-enabled", write_access=True)
-    enabled_connection = embedded_module._source_from_registration(
-        enabled_projection,
-        secret_provider=EmptySecretProvider(),
-    )
-    assert isinstance(enabled_connection, PostgreSQLSource)
-    assert enabled_connection.write_access is False
-
-    invalid = replace(
-        missing,
-        configuration={**dict(missing.configuration), "write_access": "yes"},
-    )
-    with pytest.raises(AgentHomeError, match="configuration is invalid"):
-        embedded_module._source_from_registration(
-            invalid,
-            secret_provider=EmptySecretProvider(),
-        )
-
-    with pytest.raises(TypeError, match="write_access must be a boolean"):
-        PostgreSQLSource(
-            host="db.example.test",
-            database="warehouse",
-            username="reader",
-            write_access=1,  # type: ignore[arg-type]
-            secret_provider=EmptySecretProvider(),
-        )
-
-
-async def test_source_wide_write_enable_is_no_longer_persistable(tmp_path):
-    agent = await Agent.create("source-write-access", root=tmp_path, clock=lambda: NOW)
-    registration = _registration(agent.id)
-    other = _registration(agent.id, native_identity="postgresql:other")
-    await agent._embedded._store.register_source(registration)
-    await agent._embedded._store.register_source(other)
-
-    try:
-        with pytest.raises(ValueError, match="exact table scopes"):
-            await agent.set_source_write_access(registration.id, True)
-        assert (await agent._embedded._store.load_source(agent.id, other.id)) == other
-        with sqlite3.connect(agent.home / "state.db") as connection:
-            source_data = connection.execute(
-                "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
-                (agent.id, registration.id),
-            ).fetchone()[0]
-            assert "write_access" not in source_data
-            assert connection.execute(
-                "SELECT COUNT(*) FROM postgresql_update_scopes"
-            ).fetchone() == (0,)
-
-        disabled = await agent.set_source_write_access(registration.id, False)
-        assert disabled == registration
-        assert await agent.list_sources() == tuple(
-            sorted((registration, other), key=lambda item: item.id)
-        )
-        with sqlite3.connect(agent.home / "state.db") as connection:
-            assert connection.execute(
-                "SELECT COUNT(*) FROM postgresql_update_scopes"
-            ).fetchone() == (0,)
-    finally:
-        await agent.close()
-
-
-async def test_source_write_access_toggle_rejects_non_exact_or_unowned_targets(
-    tmp_path,
-):
-    agent = await Agent.create(
-        "source-write-access-reject", root=tmp_path, clock=lambda: NOW
-    )
-    postgres = _registration(agent.id)
-    sqlite = _registration(agent.id, adapter_id="sqlite", native_identity="sqlite:test")
-    foreign = _registration("another-agent")
-    detached = _registration(agent.id, native_identity="postgresql:detached")
-    for registration in (postgres, sqlite, foreign, detached):
-        await agent._embedded._store.register_source(registration)
-    await agent._embedded._store.detach_source(agent.id, detached.id, NOW)
-    try:
-        with pytest.raises(TypeError, match="enabled must be a boolean"):
-            await agent.set_source_write_access(postgres.id, 1)  # type: ignore[arg-type]
-        with pytest.raises(ValueError, match="exact table scopes"):
-            await agent.set_source_write_access(postgres.id, True)
-        assert (
-            await agent._embedded._store.load_source(agent.id, postgres.id) == postgres
-        )
-    finally:
-        await agent.close()
-
-
 async def test_default_read_scope_round_trips_through_agent_reopen(tmp_path):
     agent = await Agent.create(
-        "source-write-access-reopen", root=tmp_path, clock=lambda: NOW
+        "source-permissions-reopen", root=tmp_path, clock=lambda: NOW
     )
     registration = _registration(agent.id)
     await agent._embedded._store.register_source(registration)
     await agent.close()
 
     reopened = await Agent.open(
-        "source-write-access-reopen", root=tmp_path, clock=lambda: NOW
+        "source-permissions-reopen", root=tmp_path, clock=lambda: NOW
     )
     try:
         assert await reopened.list_sources() == (registration,)
@@ -186,10 +75,7 @@ async def test_default_read_scope_round_trips_through_agent_reopen(tmp_path):
             secret_provider=EmptySecretProvider(),
         )
         assert isinstance(reconstructed, PostgreSQLSource)
-        assert reconstructed.write_access is False
         with sqlite3.connect(reopened.home / "state.db") as connection:
-            source_data = connection.execute("SELECT data FROM sources").fetchone()[0]
-            assert "write_access" not in source_data
             assert connection.execute(
                 "SELECT source_id FROM source_read_scopes"
             ).fetchone() == (registration.id,)
@@ -208,7 +94,6 @@ async def test_detach_revokes_scopes_and_storage_reattachment_starts_read_only(
     registered = await agent._embedded._store.register_source(registration)
     detached = await agent.detach(registration.id)
     assert detached.active is False
-    assert detached.configuration["write_access"] is False
     with sqlite3.connect(agent.home / "state.db") as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM source_read_scopes"
@@ -235,7 +120,6 @@ async def test_detach_revokes_scopes_and_storage_reattachment_starts_read_only(
     try:
         assert reattached is not None
         assert reattached.active is True
-        assert reattached.configuration["write_access"] is False
         with sqlite3.connect(agent.home / "state.db") as connection:
             assert connection.execute(
                 "SELECT COUNT(*) FROM source_read_scopes"
@@ -267,10 +151,7 @@ async def test_postgresql_refresh_preserves_read_scope_outside_connection_identi
     )
     await agent._embedded._store.replace_source_permission_scopes(scope, ())
     expected = registered
-    connection_registration = replace(
-        registered,
-        configuration={**dict(registered.configuration), "write_access": False},
-    )
+    connection_registration = registered
     closed = False
 
     class _Adapter:
@@ -320,7 +201,6 @@ async def test_postgresql_refresh_preserves_read_scope_outside_connection_identi
         clock,
     ) -> _Adapter:
         del clock
-        assert source.write_access is False
         assert agent_id == agent.id
         assert attached_at == registration.attached_at
         return _Adapter()
@@ -337,10 +217,6 @@ async def test_postgresql_refresh_preserves_read_scope_outside_connection_identi
             assert connection.execute(
                 "SELECT COUNT(*) FROM postgresql_update_scopes"
             ).fetchone() == (0,)
-            assert (
-                "write_access"
-                not in connection.execute("SELECT data FROM sources").fetchone()[0]
-            )
         assert (
             await agent._embedded._store.load_source_read_scope(
                 agent.id,
@@ -515,45 +391,3 @@ async def test_catalog_projection_round_trips_ordered_keys_and_column_write_fact
         )[0] == schema
     finally:
         await reopened.close()
-
-
-async def test_source_wide_write_enable_does_not_change_projected_tools(
-    tmp_path,
-):
-    agent = await Agent.create("write-access-no-tool", root=tmp_path, clock=lambda: NOW)
-    registration = _registration(agent.id)
-    await agent._embedded._store.register_source(registration)
-    run = RunInput(
-        id="run-no-write-tool",
-        agent_id=agent.id,
-        message="test projection",
-        created_at=NOW,
-    )
-    preview = "data_preview_postgresql_update"
-    update = "data_update_postgresql"
-    forbidden = {
-        "data_preview_sqlite_update",
-        "data_update_sqlite",
-    }
-    try:
-        before = {
-            definition.name
-            for definition in await agent._embedded._data_tool_runtime.definitions(run)
-        }
-        with pytest.raises(ValueError, match="exact table scopes"):
-            await agent.set_source_write_access(registration.id, True)
-        after = {
-            definition.name
-            for definition in await agent._embedded._data_tool_runtime.definitions(run)
-        }
-        await agent.set_source_write_access(registration.id, False)
-        disabled = {
-            definition.name
-            for definition in await agent._embedded._data_tool_runtime.definitions(run)
-        }
-        assert {preview, update}.isdisjoint(before)
-        assert forbidden.isdisjoint(after)
-        assert after == before
-        assert disabled == before
-    finally:
-        await agent.close()

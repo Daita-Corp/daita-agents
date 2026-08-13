@@ -191,7 +191,7 @@ class PostgreSQLUpdateReadiness:
     source_id: str
     resource_id: str
     assignment_columns: tuple[str, ...]
-    write_access: bool
+    daita_scope_ready: bool
     ready_for_preview: bool
     proves_execution: bool
     role_attributes: FrozenJsonObject
@@ -218,7 +218,7 @@ class PostgreSQLUpdateReadiness:
         ):
             raise ValueError("readiness assignment columns are invalid")
         for boolean_value, name in (
-            (self.write_access, "write_access"),
+            (self.daita_scope_ready, "daita_scope_ready"),
             (self.ready_for_preview, "ready_for_preview"),
             (self.proves_execution, "proves_execution"),
         ):
@@ -265,7 +265,7 @@ class PostgreSQLUpdateReadiness:
             "source_id": self.source_id,
             "resource_id": self.resource_id,
             "assignment_columns": self.assignment_columns,
-            "write_access": self.write_access,
+            "daita_scope_ready": self.daita_scope_ready,
             "ready_for_preview": self.ready_for_preview,
             "proves_execution": self.proves_execution,
             "role_attributes": self.role_attributes.to_dict(),
@@ -417,7 +417,7 @@ class PostgreSQLUpdatePreviewBackend:
                 source_id=source_id,
                 resource_id=resource_id,
                 assignment_columns=assignment_columns,
-                write_access=False,
+                daita_scope_ready=False,
                 relation={"catalog_admitted": False},
                 rejection_codes=("write_source_not_available",),
                 remediation_categories=("attach_active_postgresql_source",),
@@ -434,13 +434,13 @@ class PostgreSQLUpdatePreviewBackend:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             )
-        write_access = scope_issue is None
+        daita_scope_ready = scope_issue is None
         if scope_issue is not None:
             return _readiness_result(
                 source_id=source_id,
                 resource_id=resource_id,
                 assignment_columns=assignment_columns,
-                write_access=False,
+                daita_scope_ready=False,
                 relation={"catalog_admitted": False},
                 rejection_codes=(scope_issue[0],),
                 remediation_categories=(
@@ -462,7 +462,7 @@ class PostgreSQLUpdatePreviewBackend:
                 source_id=source_id,
                 resource_id=resource_id,
                 assignment_columns=assignment_columns,
-                write_access=write_access,
+                daita_scope_ready=daita_scope_ready,
                 relation={"catalog_admitted": False},
                 rejection_codes=validation.issue_codes,
                 remediation_categories=("refresh_or_select_supported_resource",),
@@ -552,7 +552,7 @@ class PostgreSQLUpdatePreviewBackend:
             source_id=source_id,
             resource_id=resource_id,
             assignment_columns=validated.assignment_columns,
-            write_access=write_access,
+            daita_scope_ready=daita_scope_ready,
             facts=facts,
             rejection_codes=_distinct_labels(rejection_codes),
             remediation_categories=_distinct_labels(remediation_categories),
@@ -1388,7 +1388,7 @@ def _readiness_result(
     source_id: str,
     resource_id: str,
     assignment_columns: tuple[str, ...],
-    write_access: bool,
+    daita_scope_ready: bool,
     facts: Mapping[str, object] | None = None,
     relation: Mapping[str, object] | None = None,
     rejection_codes: tuple[str, ...],
@@ -1436,7 +1436,7 @@ def _readiness_result(
         source_id=source_id,
         resource_id=resource_id,
         assignment_columns=assignment_columns,
-        write_access=write_access,
+        daita_scope_ready=daita_scope_ready,
         ready_for_preview=not rejection_codes,
         proves_execution=False,
         role_attributes=FrozenJsonObject.from_mapping(role_attributes),

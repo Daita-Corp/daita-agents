@@ -438,5 +438,5 @@ def test_current_source_codec_rejects_embedded_postgresql_admission() -> None:
         source,
         configuration={**dict(source.configuration), "write_access": "yes"},
     )
-    with pytest.raises(ValueError, match="projection must be boolean"):
+    with pytest.raises(ValueError, match="admission must be boolean"):
         encode_source(invalid_projection)

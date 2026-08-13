@@ -95,8 +95,6 @@ from .sqlite_codecs import (
     encode_semantic_annotation,
     encode_source,
     encode_source_read_scope,
-    persisted_source,
-    project_source_admission,
 )
 from .sqlite_migrations import (
     CURRENT_REVISION,
@@ -227,7 +225,7 @@ def _decode_source_state(
         not registration.active or registration.adapter_id != "postgresql"
     ):
         raise SourcePermissionStateError("stored PostgreSQL update scope is foreign")
-    return project_source_admission(registration, bool(update_scope_count))
+    return registration
 
 
 def _source_state_row(
@@ -392,7 +390,7 @@ class SQLiteStateStore:
         self, registration: SourceRegistration
     ) -> SourceRegistration:
         def write() -> SourceRegistration:
-            stored = persisted_source(registration)
+            stored = registration
             with _connect(self.path) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 row = _source_state_row(
@@ -409,7 +407,7 @@ class SQLiteStateStore:
                         read_scope_data=row[3],
                         update_scope_count=row[4],
                     )
-                    if persisted_source(current) != stored:
+                    if current != stored:
                         raise ValueError(
                             f"source registration already exists: {registration.id}"
                         )
@@ -428,7 +426,7 @@ class SQLiteStateStore:
                            VALUES (?, ?, ?)""",
                         (stored.agent_id, stored.id, encode_source_read_scope(scope)),
                     )
-                return project_source_admission(stored, False)
+                return stored
 
         return await asyncio.to_thread(write)
 
@@ -649,7 +647,7 @@ class SQLiteStateStore:
                             "PostgreSQL update scope requires a current table resource"
                         )
                     expected = postgresql_update_authorization_fingerprint(
-                        source=persisted_source(registration),
+                        source=registration,
                         resource=resource,
                         facet=facet,
                         allowed_assignment_columns=scope.allowed_assignment_columns,
@@ -690,7 +688,7 @@ class SQLiteStateStore:
                         ),
                     )
                 connection.commit()
-                return project_source_admission(registration, bool(update_scopes))
+                return registration
             except BaseException:
                 connection.rollback()
                 raise
@@ -718,16 +716,6 @@ class SQLiteStateStore:
                 "source permission transaction stopped without cancellation"
             )
         return updated
-
-    async def clear_postgresql_update_scopes(
-        self,
-        agent_id: str,
-        source_id: str,
-    ) -> SourceRegistration:
-        read_scope = await self.load_source_read_scope(agent_id, source_id)
-        if read_scope is None:
-            raise ValueError("unknown active source for this agent")
-        return await self.replace_source_permission_scopes(read_scope, ())
 
     async def load_database_write_receipt(
         self,
@@ -944,26 +932,6 @@ class SQLiteStateStore:
             raise asyncio.CancelledError
         return registration
 
-    async def set_source_write_access(
-        self,
-        agent_id: str,
-        source_id: str,
-        enabled: bool,
-    ) -> SourceRegistration:
-        """Phase-C compatibility: source-wide enable is no longer representable."""
-
-        if not isinstance(agent_id, str) or not agent_id:
-            raise ValueError("agent_id must be a non-empty string")
-        if not isinstance(source_id, str) or not source_id:
-            raise ValueError("source_id must be a non-empty string")
-        if not isinstance(enabled, bool):
-            raise TypeError("enabled must be a boolean")
-        if enabled:
-            raise ValueError(
-                "source-wide PostgreSQL write access was replaced by exact table scopes"
-            )
-        return await self.clear_postgresql_update_scopes(agent_id, source_id)
-
     async def detach_source(
         self, agent_id: str, source_id: str, detached_at: datetime
     ) -> SourceRegistration:
@@ -1027,7 +995,7 @@ class SQLiteStateStore:
                             ),
                         )
                 connection.commit()
-                return project_source_admission(detached, False)
+                return detached
             except BaseException:
                 connection.rollback()
                 raise
@@ -1093,7 +1061,7 @@ class SQLiteStateStore:
                 if not gate.start(connection):
                     return None
                 if registration is not None:
-                    stored_registration = persisted_source(registration)
+                    stored_registration = registration
                     row = _source_state_row(
                         connection,
                         stored_registration.agent_id,
@@ -1132,7 +1100,6 @@ class SQLiteStateStore:
                             read_scope_data=row[3],
                             update_scope_count=row[4],
                         )
-                        current = persisted_source(current)
                         if current != stored_registration:
                             if (
                                 current.active

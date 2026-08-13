@@ -399,23 +399,6 @@ class CatalogDataView:
             for resource in sorted(resources.values(), key=lambda item: item.id)
         )
 
-    async def is_writable_sqlite_source(
-        self,
-        agent_id: str,
-        source_id: str,
-    ) -> bool:
-        """Project explicit write admission from the durable source registration."""
-
-        registration = await self._sources.load_source(agent_id, source_id)
-        return bool(
-            registration is not None
-            and registration.agent_id == agent_id
-            and registration.id == source_id
-            and registration.active
-            and registration.adapter_id == "sqlite"
-            and registration.configuration.get("write_access") is True
-        )
-
     async def is_current_tabular_file(
         self,
         agent_id: str,

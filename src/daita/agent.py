@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -65,6 +65,11 @@ from .semantics import (
     SemanticKind,
 )
 from .skills import Skill, SkillSummary
+from .storage.sqlite_records import (
+    SourcePermissionsInspection,
+    SourcePermissionsPreview,
+    SourceReadMode,
+)
 
 
 class Agent:
@@ -544,7 +549,7 @@ class Agent:
         ssl_mode: str = "require",
         name: str | None = None,
     ) -> SourceRegistration:
-        """Attach PostgreSQL read-only; write admission is a separate user action."""
+        """Attach PostgreSQL with all reads and zero exact update scopes."""
 
         return await self._embedded.attach_postgresql(
             host=host,
@@ -557,18 +562,81 @@ class Agent:
             name=name,
         )
 
-    async def set_source_write_access(
+    async def inspect_source_permissions(
         self,
         source_id: str,
-        enabled: bool,
-    ) -> SourceRegistration:
-        """Set Daita admission for one source; this grants no database privilege."""
+    ) -> SourcePermissionsInspection:
+        """Return exact scopes and safe complete-catalog permission choices."""
 
         if not isinstance(source_id, str) or not source_id:
             raise ValueError("source_id must be a non-empty string")
-        if not isinstance(enabled, bool):
-            raise TypeError("enabled must be a boolean")
-        return await self._embedded.set_source_write_access(source_id, enabled)
+        return await self._embedded.inspect_source_permissions(source_id)
+
+    async def preview_source_permissions(
+        self,
+        *,
+        source_id: str,
+        read_mode: SourceReadMode | str,
+        read_resource_ids: tuple[str, ...],
+        postgresql_update_scopes: Mapping[str, Sequence[str]],
+    ) -> SourcePermissionsPreview:
+        """Preview one exact final scope state without changing durable state."""
+
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        if isinstance(read_mode, str):
+            try:
+                read_mode = SourceReadMode(read_mode)
+            except ValueError:
+                raise ValueError("read_mode must be all, selected, or none") from None
+        if not isinstance(read_mode, SourceReadMode):
+            raise TypeError("read_mode must be SourceReadMode or string")
+        if not isinstance(read_resource_ids, tuple) or any(
+            not isinstance(resource_id, str) or not resource_id
+            for resource_id in read_resource_ids
+        ):
+            raise TypeError("read_resource_ids must be a tuple of non-empty strings")
+        if not isinstance(postgresql_update_scopes, Mapping):
+            raise TypeError("postgresql_update_scopes must be a mapping")
+        normalized_updates: dict[str, tuple[str, ...]] = {}
+        for resource_id, columns in postgresql_update_scopes.items():
+            if not isinstance(resource_id, str) or not resource_id:
+                raise ValueError("update scope resource ids must be non-empty strings")
+            if isinstance(columns, (str, bytes)) or not isinstance(
+                columns,
+                (list, tuple),
+            ):
+                raise TypeError("update scope columns must be lists or tuples")
+            normalized = tuple(columns)
+            if any(not isinstance(column, str) or not column for column in normalized):
+                raise TypeError("update scope columns must be non-empty strings")
+            normalized_updates[resource_id] = normalized
+        return await self._embedded.preview_source_permissions(
+            source_id=source_id,
+            read_mode=read_mode,
+            read_resource_ids=read_resource_ids,
+            postgresql_update_scopes=normalized_updates,
+        )
+
+    async def apply_source_permissions(
+        self,
+        *,
+        source_id: str,
+        confirmation_fingerprint: str,
+    ) -> SourcePermissionsInspection:
+        """Apply one exact confirmed preview after locked current-state checks."""
+
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        if not isinstance(confirmation_fingerprint, str) or not (
+            confirmation_fingerprint.startswith("sha256:")
+            and len(confirmation_fingerprint) == 71
+        ):
+            raise ValueError("confirmation_fingerprint must be a sha256 fingerprint")
+        return await self._embedded.apply_source_permissions(
+            source_id=source_id,
+            confirmation_fingerprint=confirmation_fingerprint,
+        )
 
     async def postgresql_update_readiness(
         self,

@@ -122,7 +122,8 @@ class _GuardedProvider:
         projected = {definition.name for definition in request.tools}
         assert POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME in projected
         assert POSTGRESQL_UPDATE_TOOL_NAME in projected
-        assert "set_source_write_access" not in projected
+        assert "preview_source_permissions" not in projected
+        assert "apply_source_permissions" not in projected
         self.requests.append(request)
         response = await self._delegate.generate(request)
         unexpected = {call.name for call in response.tool_calls} - _ALLOWED_TOOLS
@@ -196,7 +197,6 @@ async def test_public_agent_model_and_real_postgresql_update_vertical_slice(
             ssl_mode="disable",
             name="Disposable Phase 4 PostgreSQL",
         )
-        assert source.configuration["write_access"] is False
         resources = await agent.list_catalog_resources(source_id=source.id)
         resource = next(
             item
@@ -205,13 +205,16 @@ async def test_public_agent_model_and_real_postgresql_update_vertical_slice(
         )
         expected_source_id = source.id
         expected_resource_id = resource.id
-        readiness = await agent.postgresql_update_readiness(
-            source.id,
-            resource.id,
-            ("status",),
+        permission_preview = await agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode="all",
+            read_resource_ids=(),
+            postgresql_update_scopes={resource.id: ["status"]},
         )
-        assert readiness.rejection_codes == ("write_access_not_enabled",)
-        await agent.set_source_write_access(source.id, True)
+        await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=permission_preview.confirmation_fingerprint,
+        )
         exit = await agent.run(
             "Update exactly write_canary.accounts account_id 42 so status is the "
             "literal text inactive. First use the PostgreSQL update preview. Then "
@@ -242,9 +245,15 @@ async def test_public_agent_model_and_real_postgresql_update_vertical_slice(
             if len(update_calls) == 1
             else None
         )
-        await agent.set_source_write_access(source.id, False)
-        disabled = next(
-            item for item in await agent.list_sources() if item.id == source.id
+        permission_preview = await agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode="all",
+            read_resource_ids=(),
+            postgresql_update_scopes={},
+        )
+        await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=permission_preview.confirmation_fingerprint,
         )
     finally:
         await agent.close()
@@ -273,4 +282,3 @@ async def test_public_agent_model_and_real_postgresql_update_vertical_slice(
     assert receipt.outcome is DatabaseWriteOutcome.COMMITTED
     assert receipt.preview_fingerprint == update_data["preview_fingerprint"]
     assert status == "inactive"
-    assert disabled.configuration["write_access"] is False

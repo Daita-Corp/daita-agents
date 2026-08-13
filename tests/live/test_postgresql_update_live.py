@@ -75,7 +75,8 @@ _FORBIDDEN_MODEL_TOOLS = frozenset(
     {
         "data_preview_sqlite_update",
         "data_update_sqlite",
-        "set_source_write_access",
+        "preview_source_permissions",
+        "apply_source_permissions",
     }
 )
 
@@ -259,7 +260,6 @@ def _registration() -> SourceRegistration:
             "schemas": ("public",),
             "ssl_mode": "require",
             "username": "synthetic_update_role",
-            "write_access": False,
         },
         attached_at=_NOW,
     )
@@ -429,9 +429,20 @@ async def test_live_model_previews_approves_and_commits_exact_postgresql_update(
     )
     await agent._embedded._store.register_source(registration)
     await agent._embedded._store.commit_snapshot(snapshot)
+    resource = next(
+        item for item in snapshot.resources if item.native_identity == "public.accounts"
+    )
     try:
-        enabled = await agent.set_source_write_access(registration.id, True)
-        assert enabled.configuration["write_access"] is True
+        permission_preview = await agent.preview_source_permissions(
+            source_id=registration.id,
+            read_mode="all",
+            read_resource_ids=(),
+            postgresql_update_scopes={resource.id: ["is_active"]},
+        )
+        await agent.apply_source_permissions(
+            source_id=registration.id,
+            confirmation_fingerprint=permission_preview.confirmation_fingerprint,
+        )
         exit = await agent.run(
             "Perform exactly one PostgreSQL update to public.accounts. Match the "
             "single primary-key row account_id 42 and assign is_active to the "

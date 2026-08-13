@@ -60,7 +60,8 @@ _FORBIDDEN_MODEL_TOOLS = frozenset(
     {
         "data_preview_sqlite_update",
         "data_update_sqlite",
-        "set_source_write_access",
+        "preview_source_permissions",
+        "apply_source_permissions",
     }
 )
 _ALLOWED_CATALOG_TOOLS = frozenset(
@@ -245,7 +246,6 @@ def _registration() -> SourceRegistration:
             "schemas": ("public",),
             "ssl_mode": "require",
             "username": "synthetic_preview_role",
-            "write_access": False,
         },
         attached_at=_NOW,
     )
@@ -390,6 +390,9 @@ async def test_live_model_uses_only_enabled_read_only_postgresql_preview(
     )
     await agent._embedded._store.register_source(registration)
     await agent._embedded._store.commit_snapshot(snapshot)
+    resource = next(
+        item for item in snapshot.resources if item.native_identity == "public.accounts"
+    )
     try:
         disabled_exit = await agent.run(
             "Can you preview changing public.accounts account_id 42 is_active to "
@@ -400,8 +403,16 @@ async def test_live_model_uses_only_enabled_read_only_postgresql_preview(
         disabled_request_count = len(provider.requests)
         disabled_transcript = await agent.transcript(disabled_exit.run_id)
 
-        enabled = await agent.set_source_write_access(registration.id, True)
-        assert enabled.configuration["write_access"] is True
+        permission_preview = await agent.preview_source_permissions(
+            source_id=registration.id,
+            read_mode="all",
+            read_resource_ids=(),
+            postgresql_update_scopes={resource.id: ["is_active"]},
+        )
+        await agent.apply_source_permissions(
+            source_id=registration.id,
+            confirmation_fingerprint=permission_preview.confirmation_fingerprint,
+        )
         provider.preview_expected = True
         preview_exit = await agent.run(
             "Use the PostgreSQL update-preview tool now. Preview exactly one "

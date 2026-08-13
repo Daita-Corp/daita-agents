@@ -22,37 +22,26 @@ from .common import (
 )
 
 
-def persisted_source(value: SourceRegistration) -> SourceRegistration:
-    """Return the registration identity stored independently from admission."""
+def _without_historical_postgresql_write_access(
+    value: SourceRegistration,
+) -> SourceRegistration:
+    """Strip only the pre-ledger field used by the immutable upgrade path."""
 
     if not isinstance(value, SourceRegistration):
         raise TypeError("source codec requires SourceRegistration")
     if value.adapter_id != "postgresql" or "write_access" not in value.configuration:
         return value
     if not isinstance(value.configuration["write_access"], bool):
-        raise ValueError("PostgreSQL write admission projection must be boolean")
+        raise ValueError("historical PostgreSQL write admission must be boolean")
     configuration = dict(value.configuration)
     del configuration["write_access"]
     return replace(value, configuration=configuration)
 
 
-def project_source_admission(
-    value: SourceRegistration,
-    enabled: bool,
-) -> SourceRegistration:
-    if not isinstance(value, SourceRegistration):
-        raise TypeError("source codec requires SourceRegistration")
-    if not isinstance(enabled, bool):
-        raise TypeError("source admission projection must be boolean")
-    if value.adapter_id != "postgresql":
-        return value
-    configuration = dict(value.configuration)
-    configuration["write_access"] = enabled
-    return replace(value, configuration=configuration)
-
-
 def encode_source(value: SourceRegistration) -> str:
-    return dump_payload(_encode_source(persisted_source(value)))
+    return dump_payload(
+        _encode_source(_without_historical_postgresql_write_access(value))
+    )
 
 
 def decode_source(value: str) -> SourceRegistration:

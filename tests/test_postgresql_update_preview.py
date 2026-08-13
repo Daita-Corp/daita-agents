@@ -190,7 +190,6 @@ class _SqlStateError(RuntimeError):
 def _registration(
     *,
     agent_id: str = "agent-preview",
-    write_access: bool = True,
     adapter_id: str = "postgresql",
 ) -> SourceRegistration:
     registration = SourceRegistration.build(
@@ -205,7 +204,6 @@ def _registration(
             "schemas": ("public",),
             "ssl_mode": "require",
             "username": "writer",
-            "write_access": write_access,
         },
         attached_at=NOW,
     )
@@ -612,7 +610,7 @@ async def test_update_scope_and_source_ownership_are_rechecked_before_connection
     with pytest.raises(write_module.PostgreSQLUpdatePreviewError) as disabled:
         await _backend(
             _Connection(),
-            registration=_registration(write_access=False),
+            registration=_registration(),
             scope_issue=(
                 "resource_update_not_allowed",
                 "The requested resource is not authorized for PostgreSQL updates.",
@@ -769,7 +767,7 @@ async def test_public_agent_preview_vertical_slice_creates_no_write_receipt(
 ) -> None:
     call_id = "preview-call"
     public_agent_id = "agent-preview-public"
-    registration = _registration(agent_id=public_agent_id, write_access=False)
+    registration = _registration(agent_id=public_agent_id)
     public_resource_id = catalog_resource_id(
         registration.id,
         ResourceKind.TABLE,
@@ -842,7 +840,7 @@ async def test_public_agent_preview_vertical_slice_creates_no_write_receipt(
             ),
         ),
     )
-    assert enabled.configuration["write_access"] is True
+    assert "scope_ready" not in enabled.configuration
     connection = _Connection()
     _patch_io(monkeypatch, connection)
     try:

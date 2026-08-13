@@ -216,6 +216,7 @@ async def test_first_run_keyboard_postgresql_path_reaches_grounded_chat(
                 "warehouse\n"
                 "reader\n"
                 "disable\n"
+                "n\n"
                 "Which region leads paid revenue?\n"
                 "/exit\n"
             ),

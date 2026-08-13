@@ -256,7 +256,7 @@ class _Connection:
         self.log.append(("terminate",))
 
 
-def _registration(*, write_access: bool = True) -> SourceRegistration:
+def _registration() -> SourceRegistration:
     return SourceRegistration.build(
         agent_id="agent-update",
         adapter_id="postgresql",
@@ -269,7 +269,6 @@ def _registration(*, write_access: bool = True) -> SourceRegistration:
             "schemas": ("public",),
             "ssl_mode": "require",
             "username": "writer",
-            "write_access": write_access,
         },
         attached_at=NOW,
     )
@@ -951,10 +950,10 @@ class _RuntimeCatalog:
     def __init__(
         self,
         *,
-        write_access: bool = True,
+        scope_ready: bool = True,
         scope_issues: tuple[tuple[str, str] | None, ...] = (),
     ) -> None:
-        self.write_access = write_access
+        self.scope_ready = scope_ready
         self.scope_issues = list(scope_issues)
         self.scope_checks = 0
 
@@ -993,7 +992,7 @@ class _RuntimeCatalog:
             return self.scope_issues.pop(0)
         return (
             None
-            if self.write_access
+            if self.scope_ready
             else (
                 "resource_update_not_allowed",
                 "The requested resource is not authorized for PostgreSQL updates.",
@@ -1006,7 +1005,7 @@ class _RuntimeCatalog:
         source_ids: tuple[str, ...] = (),
     ):
         del agent_id
-        if not self.write_access or (source_ids and SOURCE_ID not in source_ids):
+        if not self.scope_ready or (source_ids and SOURCE_ID not in source_ids):
             return frozenset()
         return frozenset({SOURCE_ID})
 
@@ -1328,7 +1327,7 @@ async def test_runtime_write_tool_cannot_run_when_not_projected() -> None:
         backend,
         lock,
         approve,
-        catalog=_RuntimeCatalog(write_access=False),
+        catalog=_RuntimeCatalog(scope_ready=False),
     )
     result = (await runtime.execute_all(_runtime_run(), (_runtime_call(),)))[0]
 
@@ -1504,7 +1503,7 @@ async def test_public_agent_preview_approval_update_and_receipt_vertical_slice(
             "agent-update" if prefix == "agent" else f"{prefix}-update-public"
         ),
     )
-    registration = _registration(write_access=False)
+    registration = _registration()
     public_resource_id = catalog_resource_id(
         registration.id,
         ResourceKind.TABLE,

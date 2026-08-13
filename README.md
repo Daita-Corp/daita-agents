@@ -171,17 +171,19 @@ daita skills --help
 The terminal provides confirmed lifecycle commands:
 
 ```text
-/source config
+/source permissions
 /source detach <source>
 /conversation clear
 /agent delete
 ```
 
-`/source config` is the single guided terminal flow for selecting a PostgreSQL
-source, checking one current table and assignment-column scope while writes are
-disabled, and explicitly enabling or immediately disabling source-level Daita
-write admission. It does not ask users to copy source or resource IDs and it
-does not change PostgreSQL roles or grants.
+`/source permissions` is the single guided terminal flow for read access
+(`all`, exact selected current resources, or `none`) and exact PostgreSQL
+one-row update access. Users can select one, many, or all current eligible
+tables, use all eligible assignment columns by default, or choose an exact
+subset through Advanced. One before/after summary and confirmation applies both
+scope families atomically. Future tables are never automatically write-enabled,
+and the flow never changes PostgreSQL roles or grants.
 
 Source detachment disables access and deletes a Daita-owned PostgreSQL
 credential. Its non-secret registration remains as inactive lifecycle history
@@ -235,7 +237,7 @@ upgrade.
 
 The supported upgrade preserves agent identity, model configuration and secret
 references, settings, source registrations and current catalogs, the active
-source, PostgreSQL write admission, complete conversations and results,
+source, exact source permissions, complete conversations and results,
 artifacts, approved memory and user profile, skills, semantics, learning state,
 and database-write receipts. Secret values remain in their existing environment
 or OS keychain location and are never copied into the state database.

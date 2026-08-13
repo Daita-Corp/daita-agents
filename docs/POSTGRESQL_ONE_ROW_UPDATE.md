@@ -28,7 +28,7 @@ infrastructure-as-code process must create one dedicated role with:
 
 Daita does not accept an administrator credential, create or drop roles, or
 execute `GRANT` or `REVOKE`. PostgreSQL privileges remain an independent
-authorization boundary even after Daita write admission is enabled.
+authorization boundary even after an exact Daita update scope is enabled.
 
 The first slice rejects superusers, `BYPASSRLS`, row-level security, user
 triggers, custom rewrite rules, partitions/inheritance, non-base relations,
@@ -44,9 +44,9 @@ automation should name an environment variable with `--password-env`; never
 place a password, connection URL containing a password, or administrator
 credential in command history, model text, source names, logs, or test output.
 
-Attachment always begins with Daita admission disabled and cannot be combined
-with enablement. Admission is stored separately from connection configuration;
-the public registration's `write_access` field is a computed Boolean projection.
+Attachment always begins with read access to all cataloged resources and zero
+PostgreSQL update scopes. Permission scopes are stored separately from connection
+configuration; public source registrations contain no permission projection.
 Rotating the secret changes the value behind the same approved secret reference;
 it does not broaden database grants or Daita admission.
 
@@ -65,48 +65,49 @@ discarded instead of restored.
 ## Readiness and admission controls
 
 Readiness is non-mutating and scoped to one current resource plus a distinct
-tuple of assignment-column names. It can run while source admission is still
-disabled.
+tuple of assignment-column names. It requires the exact configured table and
+column scope.
 
 Python:
 
 ```python
-readiness = await agent.postgresql_update_readiness(
-    source_id,
-    resource_id,
-    ("status",),
+preview = await agent.preview_source_permissions(
+    source_id=source_id,
+    read_mode="all",
+    read_resource_ids=(),
+    postgresql_update_scopes={resource_id: ["status"]},
 )
-if readiness.ready_for_preview:
-    await agent.set_source_write_access(source_id, True)
+await agent.apply_source_permissions(
+    source_id=source_id,
+    confirmation_fingerprint=preview.confirmation_fingerprint,
+)
+readiness = await agent.postgresql_update_readiness(
+    source_id, resource_id, ("status",)
+)
 ```
 
-`set_source_write_access` changes only the dedicated source-level Daita
-admission row. It never rewrites connection identity or changes PostgreSQL
-privileges. Refresh preserves that row; detachment deletes it atomically. Always
-rerun readiness after enablement and before using a canary preview.
+The public inspect/preview/apply control plane changes only exact read and update
+scopes. It never rewrites connection identity or changes PostgreSQL privileges.
+Refresh preserves scopes; detachment deletes them atomically. Always rerun
+readiness after permissioning and before using a canary preview.
 
 CLI:
 
 ```bash
 daita postgresql-update-readiness atlas SOURCE_ID RESOURCE_ID \
   --assignment-column status
-daita source-write-access inspect atlas SOURCE_ID
-daita source-write-access enable atlas SOURCE_ID --yes
-daita source-write-access disable atlas SOURCE_ID
 ```
 
 TUI:
 
 ```text
-/source config
+/source permissions
 ```
 
-Select the PostgreSQL source, cataloged table, and assignment columns by
-display name. The guided screen runs readiness while disabled, explains that
-enablement is source-scoped, and requires a separate user confirmation. The
-model cannot invoke this control plane. Disabling remains immediately
-available, requires no model interaction, and removes write-tool projection
-from subsequent runs.
+Select the source, read mode, cataloged resources, and PostgreSQL tables by
+display name. Normal setup uses all eligible assignment columns; Advanced
+selects a bounded exact subset. The model cannot invoke this control plane.
+One terminal confirmation atomically replaces both scope families.
 
 ## Non-production canary procedure
 
@@ -120,16 +121,16 @@ shared staging data, a persistent customer database, or
 3. Use a new root under `/private/tmp` and attach only `write_canary` with the
    `daita_writer` credential. Confirm the returned registration is read-only.
 4. Run readiness for `write_canary.accounts` and assignment column `status`.
-5. Confirm all database guardrails pass and the only expected blocker is Daita
-   write admission.
-6. Enable the exact source through API, CLI, or `/source config`.
+5. Configure the exact table and assignment-column scope through
+   `/source permissions`.
+6. Confirm current native PostgreSQL privilege readiness.
 7. Rerun readiness and request a preview for canary key `42`. Confirm the exact
    before/after value without approving an unintended assignment.
 8. Approve the exact once-only update card. Confirm one committed row, one
    receipt, and agreement between result and receipt identity.
 9. Read the row independently and verify the intended after-state.
-10. Disable source admission immediately and confirm preview/update tools are
-    no longer projected.
+10. Remove the exact update scope and confirm preview/update tools are no longer
+    projected.
 11. Reset or discard the fixture externally.
 
 After deterministic gates pass and the disposable database is explicitly
@@ -166,12 +167,8 @@ Do not use paid runs to diagnose deterministic failures.
 
 ## Disablement and incident response
 
-Disable Daita admission first when scope, credentials, schema, privileges, or
-expected behavior are uncertain:
-
-```bash
-daita source-write-access disable atlas SOURCE_ID
-```
+Remove the exact update scopes through `/source permissions` first when scope,
+credentials, schema, privileges, or expected behavior are uncertain.
 
 Then revoke or rotate database access through the external DBA/secret process
 when required. Disabling Daita does not revoke PostgreSQL grants, terminate
@@ -186,7 +183,7 @@ were committed.
 
 When this occurs:
 
-1. disable source write admission;
+1. remove the affected update scope;
 2. preserve the immutable receipt ID and exact run/call identity;
 3. do not retry automatically and do not ask the model to repeat the update;
 4. perform a fresh read/preview of the target row;

@@ -87,7 +87,7 @@ def _resource(**changes: object) -> ResourceSchema:
     return ResourceSchema(**values)  # type: ignore[arg-type]
 
 
-def _registration(*, write_access: bool) -> SourceRegistration:
+def _registration() -> SourceRegistration:
     registration = SourceRegistration.build(
         agent_id="agent-readiness",
         adapter_id="postgresql",
@@ -100,7 +100,6 @@ def _registration(*, write_access: bool) -> SourceRegistration:
             "schemas": ("canary",),
             "ssl_mode": "require",
             "username": "secret-role",
-            "write_access": write_access,
         },
         attached_at=NOW,
     )
@@ -219,7 +218,7 @@ def test_guardrail_query_uses_postgresql_current_user_keyword() -> None:
 async def _readiness(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    write_access: bool,
+    daita_scope_ready: bool,
     facts: dict[str, object],
     resource: ResourceSchema | None = None,
     source_revision: str = SOURCE_REVISION,
@@ -241,12 +240,12 @@ async def _readiness(
     monkeypatch.setattr(write_module, "_connect", connect)
     monkeypatch.setattr(write_module, "_load_structure", load_structure)
     backend = write_module.PostgreSQLUpdatePreviewBackend(
-        _Sources(_registration(write_access=write_access)),
+        _Sources(_registration()),
         _Catalog(
             resource,
             scope_issue=(
                 None
-                if write_access
+                if daita_scope_ready
                 else (
                     "resource_update_not_allowed",
                     "The requested resource is not authorized for PostgreSQL updates.",
@@ -268,12 +267,12 @@ async def test_missing_exact_scope_fails_before_native_readiness_io(
 ) -> None:
     result, connection = await _readiness(
         monkeypatch,
-        write_access=False,
+        daita_scope_ready=False,
         facts=_facts(),
     )
 
     assert result.ready_for_preview is False
-    assert result.write_access is False
+    assert result.daita_scope_ready is False
     assert result.proves_execution is False
     assert result.rejection_codes == ("resource_update_not_allowed",)
     assert result.remediation_categories == ("configure_source_permissions",)
@@ -282,7 +281,7 @@ async def test_missing_exact_scope_fails_before_native_readiness_io(
         "source_id",
         "resource_id",
         "assignment_columns",
-        "write_access",
+        "daita_scope_ready",
         "ready_for_preview",
         "proves_execution",
         "role_attributes",
@@ -304,7 +303,7 @@ async def test_readiness_rejects_powerful_roles_and_missing_column_grant(
 ) -> None:
     result, _connection = await _readiness(
         monkeypatch,
-        write_access=True,
+        daita_scope_ready=True,
         facts=_facts(role_superuser=True, can_update_columns=False),
     )
 
@@ -324,7 +323,7 @@ async def test_readiness_passes_only_for_enabled_exact_scope(
 ) -> None:
     result, _connection = await _readiness(
         monkeypatch,
-        write_access=True,
+        daita_scope_ready=True,
         facts=_facts(),
     )
 
@@ -420,7 +419,7 @@ async def test_readiness_normalizes_relation_role_and_privilege_rejections(
 ) -> None:
     result, _connection = await _readiness(
         monkeypatch,
-        write_access=True,
+        daita_scope_ready=True,
         facts=_facts(**changes),
     )
 
@@ -434,7 +433,7 @@ async def test_readiness_stale_live_structure_is_bounded_and_requests_refresh(
 ) -> None:
     result, connection = await _readiness(
         monkeypatch,
-        write_access=True,
+        daita_scope_ready=True,
         facts=_facts(),
         source_revision="catalog:sha256:" + "d" * 64,
     )
@@ -457,7 +456,7 @@ async def test_readiness_connection_failure_omits_raw_diagnostics(
 
     monkeypatch.setattr(write_module, "_connect", failed_connect)
     backend = write_module.PostgreSQLUpdatePreviewBackend(
-        _Sources(_registration(write_access=True)),
+        _Sources(_registration()),
         _Catalog(),
     )
 
@@ -489,7 +488,7 @@ async def test_readiness_rejects_unavailable_source_before_connection(
 
     monkeypatch.setattr(write_module, "_connect", forbidden_connect)
     backend = write_module.PostgreSQLUpdatePreviewBackend(
-        _Sources(_registration(write_access=False)),
+        _Sources(_registration()),
         _Catalog(),
     )
 
@@ -502,7 +501,7 @@ async def test_readiness_rejects_unavailable_source_before_connection(
 
     assert connection_attempted is False
     assert result.ready_for_preview is False
-    assert result.write_access is False
+    assert result.daita_scope_ready is False
     assert result.relation["catalog_admitted"] is False
     assert result.rejection_codes == ("write_source_not_available",)
     assert result.remediation_categories == ("attach_active_postgresql_source",)
@@ -516,7 +515,7 @@ async def test_readiness_rejects_wrong_adapter_or_inactive_source_before_connect
     monkeypatch: pytest.MonkeyPatch,
     variant: str,
 ) -> None:
-    registration = _registration(write_access=False)
+    registration = _registration()
     if variant == "wrong_adapter":
         object.__setattr__(registration, "adapter_id", "sqlite")
     else:
@@ -556,7 +555,7 @@ async def test_readiness_rejects_unbounded_assignment_scope_before_source_io(
     assignment_columns: tuple[str, ...],
 ) -> None:
     backend = write_module.PostgreSQLUpdatePreviewBackend(
-        _Sources(_registration(write_access=False)),
+        _Sources(_registration()),
         _Catalog(),
     )
 
@@ -569,22 +568,16 @@ async def test_readiness_rejects_unbounded_assignment_scope_before_source_io(
         )
 
 
-async def test_first_party_postgresql_attachment_cannot_enable_writes(
-    tmp_path: Path,
-) -> None:
-    agent = await Agent.create("read-only-attachment", root=tmp_path)
-    try:
-        source = PostgreSQLSource(
+def test_first_party_postgresql_attachment_has_no_permission_field() -> None:
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        source = PostgreSQLSource(  # type: ignore[call-arg]
             host="db.example.test",
             database="warehouse",
             username="writer",
             credential=SecretReference.environment("FIXTURE_PASSWORD"),
-            write_access=True,
+            daita_scope_ready=True,
         )
-        with pytest.raises(ValueError, match="attachment is read-only"):
-            await agent.attach(source)
-    finally:
-        await agent.close()
+        del source
 
 
 async def test_public_agent_readiness_delegates_exact_scope_without_mutation(
@@ -593,7 +586,7 @@ async def test_public_agent_readiness_delegates_exact_scope_without_mutation(
 ) -> None:
     expected, _connection = await _readiness(
         monkeypatch,
-        write_access=True,
+        daita_scope_ready=True,
         facts=_facts(),
     )
     calls: list[dict[str, object]] = []

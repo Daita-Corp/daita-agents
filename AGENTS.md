@@ -192,7 +192,8 @@ apply at execution. Do not duplicate either system in a generic policy layer.
 `daita.storage.sqlite.SQLiteStateStore` persists only state used by the MVP:
 identity, sources, current catalog snapshots, run transcripts and terminal
 results, semantic annotations, learning review state, immutable database-write
-receipts, and PostgreSQL write admission. It is the sole owner of the immutable
+receipts, explicit source read scopes, and exact PostgreSQL update scopes. It is
+the sole owner of the immutable
 checksummed `state_migrations` journal, explicit persisted-record codecs, exact
 current/historical schemas, and the bounded preledger bridge. Migrations run
 atomically under the existing agent-home writer boundary and validate their
@@ -202,11 +203,11 @@ hosting, the loop, or a new runtime. The isolated preledger unit is the only
 code allowed to read the historical numeric marker, and only until its
 documented minimum-release removal gate is met.
 
-PostgreSQL write admission is owned only by
-`postgresql_write_admissions`, never by source connection JSON. Public source
-registrations expose `write_access` as a computed compatibility projection;
-connection reconstruction remains fail-closed, refresh preserves admission,
-and detach revokes it atomically.
+Source read access is owned only by `source_read_scopes`, and PostgreSQL update
+access is owned only by `postgresql_update_scopes`, never by source connection
+JSON. Public source registrations expose no permission compatibility
+projection; connection reconstruction remains fail-closed, refresh preserves
+exact scopes, and detach revokes both scope families atomically.
 
 State mutation must remain atomic and cancellation-safe. Preserve the single
 agent-home writer boundary. Do not add event sourcing, replay projections,

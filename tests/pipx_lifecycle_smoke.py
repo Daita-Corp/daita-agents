@@ -416,12 +416,10 @@ async def main():
             "schemas": ("public",),
             "ssl_mode": "require",
             "username": "reader",
-            "write_access": False,
         },
         attached_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
     )
     await agent._embedded._store.register_source(postgresql_registration)
-    await agent.set_source_write_access(postgresql_registration.id, True)
     export_destination = await agent.set_export_destination(export_directory)
     run = await agent.run("Remember the baseline upgrade run.")
     assert len(run.artifact_deliveries) == 1
@@ -675,8 +673,17 @@ async def main():
             }
             for item in sources
         ],
-        "write_access_by_source": {
-            item.id: item.configuration.get("write_access")
+        "source_permissions": {
+            item.id: {
+                "read_mode": (
+                    await agent.inspect_source_permissions(item.id)
+                ).state.read_scope.mode.value,
+                "update_scope_count": len(
+                    (
+                        await agent.inspect_source_permissions(item.id)
+                    ).state.postgresql_update_scopes
+                ),
+            }
             for item in sources
             if item.adapter_id == "postgresql"
         },

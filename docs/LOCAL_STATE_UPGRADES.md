@@ -21,9 +21,8 @@ copy them into SQLite.
 
 ## Resolved design decisions
 
-- `SourceRegistration.configuration["write_access"]` remains available as a
-  computed public projection; it is not durable connection or admission
-  authority.
+- Public source registrations contain connection and lifecycle data only;
+  permissions are exact dedicated scope records.
 - Compatibility diagnostics use `current_revision` and `found_revision` once,
   with no parallel numeric-format payload.
 - The supported preledger floor is the exact pre-receipt and receipt-era wheel
@@ -73,19 +72,14 @@ foreign key, ownership, or cross record invariant change is a migration. This
 keeps package releases from rewriting an entire database merely because one
 serialized record gained an optional field.
 
-## PostgreSQL write-admission cutover
+## Historical PostgreSQL admission and scoped-permission cutover
 
-PostgreSQL write admission is control-plane authority, not connection
-configuration. Its sole durable owner is `postgresql_write_admissions`, keyed
-by `(agent_id, source_id)` with a foreign key to the source registration.
-
-During the preledger cutover, an attached PostgreSQL source with historical
-`write_access: true` receives one admission row. False or missing values receive
-no row, invalid values fail and roll back, and detached sources are not
-admitted. The migration removes `write_access` from persisted source JSON.
-Public source registrations retain a computed Boolean projection for API/CLI/TUI
-compatibility; connection reconstruction always remains fail-closed. Refresh
-cannot change admission, and detach deletes it atomically.
+The immutable historical cutover first moved the legacy Boolean out of source
+connection JSON. The following scoped-permissions migration converts every
+legacy state to zero update scopes, creates one explicit `all` read scope for
+each active source, and removes the legacy table from the current schema.
+Connection reconstruction remains fail-closed. Refresh preserves exact scopes,
+and detach deletes both scope families atomically.
 
 ## Preservation matrix
 
@@ -98,7 +92,8 @@ cannot change admission, and detach deletes it atomically.
 | `semantic_annotations` | Preserve every encoded annotation byte-for-byte. |
 | `learning_candidates` | Preserve candidates and review state byte-for-byte. |
 | `database_write_receipts` | Preserve every existing immutable receipt; create the empty table only when absent. |
-| `postgresql_write_admissions` | Create from valid active historical admissions; preserve existing current rows. |
+| `source_read_scopes` | Create one explicit `all` scope for every active source. |
+| `postgresql_update_scopes` | Create empty; historical broad admission grants no exact table scope. |
 | `state_migrations` | Validate the exact existing prefix and append only the known missing suffix. |
 | `agent.toml` | Preserve bytes; it remains the manifest cross-check for SQLite identity. |
 | `config.json` | Preserve model route, settings, and secret references byte-for-byte. |

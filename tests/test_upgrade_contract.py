@@ -179,7 +179,6 @@ def _registration(agent_id: str) -> SourceRegistration:
             "ssl_mode": "require",
             "username": "daita_writer",
             "custom_key": "preserved",
-            "write_access": False,
         },
         attached_at=NOW,
     )
@@ -341,7 +340,9 @@ async def test_preledger_admission_cutover_is_fail_closed(
 
     reopened = await Agent.open("admission-cutover", root=tmp_path, clock=lambda: NOW)
     try:
-        assert (await reopened.list_sources())[0].configuration["write_access"] is False
+        assert (await reopened.list_sources())[0].configuration.get(
+            "write_access"
+        ) is None
         assert (
             await reopened._embedded._store.list_postgresql_update_scopes(
                 reopened.id,
@@ -461,7 +462,9 @@ async def test_skipped_release_journal_prefix_applies_pending_migration(
 
     reopened = await Agent.open("journal-prefix", root=tmp_path, clock=lambda: NOW)
     try:
-        assert (await reopened.list_sources())[0].configuration["write_access"] is False
+        assert (await reopened.list_sources())[0].configuration.get(
+            "write_access"
+        ) is None
         assert (
             await reopened._embedded._store.list_postgresql_update_scopes(
                 reopened.id,

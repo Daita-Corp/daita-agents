@@ -1,5 +1,4 @@
 import ast
-import inspect
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -353,7 +352,6 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
 
 def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
-    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
     schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
         encoding="utf-8"
@@ -549,16 +547,19 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         assert "database_write_events" not in package_text
         assert "DbRuntime" not in package_text
         assert "RuntimeKernel" not in package_text
-        assert "set_source_write_access" in _class_methods(
-            PACKAGE / "agent.py", "Agent"
-        )
-        assert "set_source_write_access" in _class_methods(
-            PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
-        )
-        assert "set_source_write_access" not in controller
-        assert "set_source_write_access" not in (
-            PACKAGE / "domains" / "data" / "context.py"
-        ).read_text(encoding="utf-8")
+        for method in (
+            "inspect_source_permissions",
+            "preview_source_permissions",
+            "apply_source_permissions",
+        ):
+            assert method in _class_methods(PACKAGE / "agent.py", "Agent")
+            assert method in _class_methods(
+                PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
+            )
+            assert method not in controller
+            assert method not in (
+                PACKAGE / "domains" / "data" / "context.py"
+            ).read_text(encoding="utf-8")
     finally:
         await agent.close()
 
@@ -590,11 +591,12 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
     assert "postgresql_update_readiness" not in controller
     assert "postgresql_update_readiness" not in context
     assert ".postgresql_update_readiness(" in cli
-    assert ".postgresql_update_readiness(" in terminal
-    assert "set_source_write_access" in cli
-    assert "set_source_write_access" in terminal
-    assert '"/source config"' in terminal
-    assert '"/source config"' in terminal_shell
+    assert ".postgresql_update_readiness(" not in terminal
+    assert "inspect_source_permissions" in terminal
+    assert "preview_source_permissions" in terminal
+    assert "apply_source_permissions" in terminal
+    assert '"/source permissions"' in terminal
+    assert '"/source permissions"' in terminal_shell
     for obsolete_terminal_command in (
         "/source write inspect",
         "/source write enable",
@@ -603,10 +605,6 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
     ):
         assert obsolete_terminal_command not in terminal
         assert obsolete_terminal_command not in terminal_shell
-    assert (
-        "write_access"
-        not in inspect.signature(daita.Agent.attach_postgresql).parameters
-    )
     production = _python_text(PACKAGE)
     for administration in (
         "CREATE ROLE daita_writer",
@@ -621,6 +619,42 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
         "reconcile_database_write",
     ):
         assert later_phase not in production
+
+
+def test_phase_c_removes_legacy_permission_surfaces_and_limits_history_owners():
+    repository_text = (
+        "\n".join(
+            path.read_text(encoding="utf-8")
+            for root in (PACKAGE, ROOT / "tests", ROOT / "docs", ROOT / "examples")
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix in {".py", ".md"}
+        )
+        + (ROOT / "README.md").read_text(encoding="utf-8")
+        + (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    )
+    for removed in (
+        "/source " + "config",
+        "set_source_" + "write_access",
+        "_configure_postgresql_" + "source",
+        "source-write-" + "access",
+        "clear_postgresql_" + "update_scopes",
+        "required_configuration_" + "flags",
+    ):
+        assert removed not in repository_text
+
+    historical_terms = ("postgresql_write_" + "admissions", "write_" + "access")
+    allowed = {
+        "storage/sqlite_schema.py",
+        "storage/sqlite_codecs/sources.py",
+        "storage/sqlite_migrations/postgresql_write_admission.py",
+        "storage/sqlite_migrations/scoped_source_permissions.py",
+    }
+    matched = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if any(term in path.read_text(encoding="utf-8") for term in historical_terms)
+    }
+    assert matched == allowed
 
 
 def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
@@ -1139,7 +1173,7 @@ def test_stage_four_summary_is_catalog_owned_and_not_loop_or_storage_state():
         "relationship_count",
     ):
         assert field_name not in loop
-    assert "readiness" not in storage.lower()
+    assert "readiness_state" not in storage.lower()
 
 
 def test_catalog_schema_slice_extends_existing_catalog_and_capability_owners():

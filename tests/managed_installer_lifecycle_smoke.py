@@ -303,12 +303,10 @@ async def main():
             "schemas": ("public",),
             "ssl_mode": "require",
             "username": "reader",
-            "write_access": False,
         },
         attached_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
     )
     await agent._embedded._store.register_source(source)
-    await agent.set_source_write_access(source.id, True)
     await agent.close()
 
 
@@ -433,7 +431,6 @@ async def main():
         source
         for source in sources
         if source.adapter_id == "postgresql"
-        and source.configuration.get("write_access") is True
     ]
     assert len(admitted) == 1
     assert admitted[0].id == source_registration_id(
@@ -453,8 +450,10 @@ async def main():
         "schemas": ("public",),
         "ssl_mode": "require",
         "username": "reader",
-        "write_access": True,
     }
+    permissions = await agent.inspect_source_permissions(admitted[0].id)
+    assert permissions.state.read_scope.mode.value == "all"
+    assert permissions.state.postgresql_update_scopes == ()
     await agent.close()
 
 

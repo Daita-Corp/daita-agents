@@ -9,9 +9,7 @@ import re
 import shlex
 import sys
 import tempfile
-from collections.abc import Mapping
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -22,13 +20,10 @@ import pytest
 from daita import (
     Agent,
     PostgreSQLSource,
-    PostgreSQLUpdateReadiness,
     Skill,
     SkillSummary,
     cli,
 )
-from daita._json import FrozenJsonObject
-from daita.adapters.models import SourceRegistration
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -464,7 +459,6 @@ def test_attach_parser_builds_postgresql_source_with_secret_reference():
     )
     assert source.schemas == ("analytics",)
     assert source.ssl_mode == "disable"
-    assert source.write_access is False
     assert source.name == "Fixture PostgreSQL"
 
 
@@ -1292,7 +1286,6 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "create",
         "attach",
         "sources",
-        "source-write-access",
         "postgresql-update-readiness",
         "detach",
         "conversations",
@@ -1311,11 +1304,6 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         ("name",),
         frozenset({"-h", "--help", "--yes"}),
     )
-    write_access = _subcommands(commands["source-write-access"])
-    assert set(write_access) == {"inspect", "enable", "disable"}
-    assert _surface(write_access["inspect"])[0] == ("name", "source_id")
-    assert "--yes" in _surface(write_access["enable"])[1]
-    assert "--yes" not in _surface(write_access["disable"])[1]
     assert _surface(commands["postgresql-update-readiness"])[0] == (
         "name",
         "source_id",
@@ -1374,167 +1362,6 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         ("name", "skill_name"),
         frozenset({"-h", "--help", "--description", "--instructions-file"}),
     )
-
-
-def test_cli_postgresql_write_controls_use_only_public_agent_methods():
-    registration = SourceRegistration.build(
-        agent_id="agent-cli-write",
-        adapter_id="postgresql",
-        native_identity="postgresql:cli-write",
-        display_name="CLI PostgreSQL",
-        configuration={
-            "database": "fixture",
-            "host": "fixture.invalid",
-            "port": 5432,
-            "schemas": ("canary",),
-            "ssl_mode": "require",
-            "username": "writer",
-            "write_access": False,
-        },
-        attached_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
-    )
-    readiness = PostgreSQLUpdateReadiness(
-        source_id=registration.id,
-        resource_id="catalog-resource:sha256:" + "b" * 64,
-        assignment_columns=("status",),
-        write_access=True,
-        ready_for_preview=True,
-        proves_execution=False,
-        role_attributes=FrozenJsonObject.from_mapping(
-            {
-                "superuser": False,
-                "bypass_rls": False,
-                "create_database": False,
-                "create_role": False,
-                "replication": False,
-            }
-        ),
-        privileges=FrozenJsonObject.from_mapping(
-            {
-                "database_connect": True,
-                "schema_usage": True,
-                "table_select": True,
-                "requested_columns_update": True,
-            }
-        ),
-        relation=FrozenJsonObject.from_mapping(
-            {
-                "catalog_admitted": True,
-                "base_table": True,
-                "partition": False,
-                "inheritance": False,
-                "row_level_security": False,
-                "force_row_level_security": False,
-                "user_triggers": False,
-                "rewrite_rules": False,
-            }
-        ),
-        rejection_codes=(),
-        remediation_categories=(),
-    )
-
-    class PublicAgentOnly:
-        def __init__(self) -> None:
-            self.current = registration
-            self.calls: list[tuple[object, ...]] = []
-
-        async def list_sources(self):
-            self.calls.append(("list_sources",))
-            return (self.current,)
-
-        async def set_source_write_access(self, source_id: str, enabled: bool):
-            self.calls.append(("set_source_write_access", source_id, enabled))
-            self.current = SourceRegistration(
-                id=self.current.id,
-                agent_id=self.current.agent_id,
-                adapter_id=self.current.adapter_id,
-                native_identity=self.current.native_identity,
-                display_name=self.current.display_name,
-                configuration={
-                    **dict(self.current.configuration),
-                    "write_access": enabled,
-                },
-                attached_at=self.current.attached_at,
-                detached_at=self.current.detached_at,
-            )
-            return self.current
-
-        async def postgresql_update_readiness(
-            self,
-            source_id: str,
-            resource_id: str,
-            assignment_columns: tuple[str, ...],
-        ):
-            self.calls.append(
-                (
-                    "postgresql_update_readiness",
-                    source_id,
-                    resource_id,
-                    assignment_columns,
-                )
-            )
-            return readiness
-
-        async def close(self) -> None:
-            self.calls.append(("close",))
-
-    fake = PublicAgentOnly()
-    parser = cli.build_parser()
-    with patch.object(cli.Agent, "open", AsyncMock(return_value=fake)):
-        enable = asyncio.run(
-            cli._execute(
-                parser.parse_args(
-                    [
-                        "source-write-access",
-                        "enable",
-                        "agent",
-                        registration.id,
-                        "--yes",
-                    ]
-                )
-            )
-        )
-        checked = asyncio.run(
-            cli._execute(
-                parser.parse_args(
-                    [
-                        "postgresql-update-readiness",
-                        "agent",
-                        registration.id,
-                        readiness.resource_id,
-                        "--assignment-column",
-                        "status",
-                    ]
-                )
-            )
-        )
-        disabled = asyncio.run(
-            cli._execute(
-                parser.parse_args(
-                    [
-                        "source-write-access",
-                        "disable",
-                        "agent",
-                        registration.id,
-                    ]
-                )
-            )
-        )
-
-    assert isinstance(enable, Mapping)
-    assert isinstance(checked, Mapping)
-    assert isinstance(disabled, Mapping)
-    assert enable["write_access"] is True
-    assert "privileges" in str(enable["warning"])
-    assert checked["readiness"] == readiness.to_mapping()
-    assert "administrator credentials" in str(checked["guidance"])
-    assert disabled["write_access"] is False
-    assert (
-        "postgresql_update_readiness",
-        registration.id,
-        readiness.resource_id,
-        ("status",),
-    ) in fake.calls
 
 
 def test_future_cli_4_direct_knowledge_commands_survive_reopen():

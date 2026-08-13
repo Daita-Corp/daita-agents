@@ -30,7 +30,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.loop.models import LoopExitKind, Transcript
+from daita.loop.models import LoopExitKind
 from daita.security import EnvironmentSecretProvider, SecretReference
 from daita.storage.sqlite import DatabaseWriteOutcome
 
@@ -245,7 +245,6 @@ async def _attached_agent(
         ssl_mode="disable",
         name="Disposable Phase 4 PostgreSQL",
     )
-    assert source.configuration["write_access"] is False
     resources = await agent.list_catalog_resources(source_id=source.id)
     resource = next(
         item for item in resources if item.native_identity == f"write_canary.{table}"
@@ -272,13 +271,17 @@ async def _run_update(
         approval_handler=approval_handler,
     )
     try:
-        readiness_before = await agent.postgresql_update_readiness(
-            source.id,
-            resource.id,
-            tuple(str(item["column"]) for item in assignments),
+        columns = tuple(str(item["column"]) for item in assignments)
+        permission_preview = await agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode="all",
+            read_resource_ids=(),
+            postgresql_update_scopes={resource.id: list(columns)},
         )
-        assert readiness_before.rejection_codes == ("write_access_not_enabled",)
-        await agent.set_source_write_access(source.id, True)
+        await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=permission_preview.confirmation_fingerprint,
+        )
         readiness = await agent.postgresql_update_readiness(
             source.id,
             resource.id,
@@ -489,7 +492,16 @@ async def test_real_permissions_and_relation_guardrails_match_readiness(
             approval_handler=deny,
         )
         try:
-            await agent.set_source_write_access(source.id, True)
+            permission_preview = await agent.preview_source_permissions(
+                source_id=source.id,
+                read_mode="all",
+                read_resource_ids=(),
+                postgresql_update_scopes={resource.id: list(columns)},
+            )
+            await agent.apply_source_permissions(
+                source_id=source.id,
+                confirmation_fingerprint=(permission_preview.confirmation_fingerprint),
+            )
             readiness = await agent.postgresql_update_readiness(
                 source.id,
                 resource.id,
@@ -530,7 +542,16 @@ async def test_real_permission_revocation_after_preview_records_not_committed_re
             assignments=assignments,
             approval_handler=approve,
         )
-        await agent.set_source_write_access(source.id, True)
+        permission_preview = await agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode="all",
+            read_resource_ids=(),
+            postgresql_update_scopes={resource.id: ["status"]},
+        )
+        await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=permission_preview.confirmation_fingerprint,
+        )
         readiness = await agent.postgresql_update_readiness(
             source.id,
             resource.id,
@@ -670,7 +691,16 @@ async def test_real_stale_schema_is_rejected_until_catalog_refresh(
     )
     connection = await _database_connection(admin=True)
     try:
-        await agent.set_source_write_access(source.id, True)
+        permission_preview = await agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode="all",
+            read_resource_ids=(),
+            postgresql_update_scopes={resource.id: ["status"]},
+        )
+        await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=permission_preview.confirmation_fingerprint,
+        )
         await connection.execute(
             "ALTER TABLE write_canary.accounts " "ADD COLUMN phase4_stale_probe text"
         )

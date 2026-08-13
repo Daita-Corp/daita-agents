@@ -23,6 +23,8 @@ _SOURCE_PERMISSION_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_MAX_RESOURCE_IDS = 10_000
 _SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS = 32
+_SOURCE_PERMISSION_MAX_CATALOG_COLUMNS = 512
+_SOURCE_PERMISSION_MAX_SUMMARY_EXAMPLES = 5
 
 
 class SourceReadMode(str, Enum):
@@ -144,6 +146,260 @@ class PostgreSQLUpdateScope:
                 "update scope authorization_fingerprint must be a sha256 hash"
             )
         object.__setattr__(self, "allowed_assignment_columns", columns)
+
+
+@dataclass(frozen=True, slots=True)
+class SourcePermissionResource:
+    """One safe complete-catalog choice for the source-permissions control plane."""
+
+    resource_id: str
+    display_name: str
+    resource_kind: str
+    eligible_assignment_columns: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.resource_id, str)
+            or _SOURCE_PERMISSION_RESOURCE_ID.fullmatch(self.resource_id) is None
+        ):
+            raise ValueError("permission resource_id must be canonical")
+        _permission_text(self.display_name, "permission resource display_name")
+        _permission_text(
+            self.resource_kind,
+            "permission resource kind",
+            maximum=128,
+        )
+        columns = _canonical_permission_texts(
+            self.eligible_assignment_columns,
+            "permission resource eligible_assignment_columns",
+            maximum_items=_SOURCE_PERMISSION_MAX_CATALOG_COLUMNS,
+            maximum_characters=256,
+        )
+        object.__setattr__(self, "eligible_assignment_columns", columns)
+
+    @property
+    def postgresql_update_eligible(self) -> bool:
+        return bool(self.eligible_assignment_columns)
+
+    @property
+    def requires_advanced_column_selection(self) -> bool:
+        return len(self.eligible_assignment_columns) > (
+            _SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SourcePermissionState:
+    """One exact read/update-scope state returned by the control plane."""
+
+    read_scope: SourceReadScope
+    postgresql_update_scopes: tuple[PostgreSQLUpdateScope, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.read_scope, SourceReadScope):
+            raise TypeError("permission state read_scope must be SourceReadScope")
+        scopes = tuple(self.postgresql_update_scopes)
+        if any(not isinstance(scope, PostgreSQLUpdateScope) for scope in scopes):
+            raise TypeError(
+                "permission state update scopes must be PostgreSQLUpdateScope records"
+            )
+        if len({scope.resource_id for scope in scopes}) != len(scopes):
+            raise ValueError("permission state update scopes cannot repeat resources")
+        if any(
+            scope.agent_id != self.read_scope.agent_id
+            or scope.source_id != self.read_scope.source_id
+            for scope in scopes
+        ):
+            raise ValueError("permission state scopes must share one owner")
+        object.__setattr__(
+            self,
+            "postgresql_update_scopes",
+            tuple(sorted(scopes, key=lambda scope: scope.resource_id)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SourcePermissionSummary:
+    """Bounded terminal-safe before/after summary for one proposed transition."""
+
+    source_display_name: str
+    read_mode: SourceReadMode
+    selected_read_resource_count: int
+    postgresql_update_table_count: int
+    postgresql_update_table_examples: tuple[str, ...]
+    automatic_read_addition_examples: tuple[str, ...]
+    dependent_update_revocation_examples: tuple[str, ...]
+    postgresql_privilege_status: str = "unknown"
+    future_tables_write_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        _permission_text(self.source_display_name, "permission summary source name")
+        if not isinstance(self.read_mode, SourceReadMode):
+            raise TypeError("permission summary read_mode must be SourceReadMode")
+        for value, name in (
+            (self.selected_read_resource_count, "selected read resource count"),
+            (self.postgresql_update_table_count, "update table count"),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"permission summary {name} must be non-negative")
+        for values, name in (
+            (self.postgresql_update_table_examples, "update table examples"),
+            (self.automatic_read_addition_examples, "automatic read examples"),
+            (
+                self.dependent_update_revocation_examples,
+                "dependent revocation examples",
+            ),
+        ):
+            normalized = _canonical_permission_texts(
+                values,
+                f"permission summary {name}",
+                maximum_items=_SOURCE_PERMISSION_MAX_SUMMARY_EXAMPLES,
+                maximum_characters=512,
+            )
+            object.__setattr__(
+                self,
+                {
+                    "update table examples": "postgresql_update_table_examples",
+                    "automatic read examples": "automatic_read_addition_examples",
+                    "dependent revocation examples": (
+                        "dependent_update_revocation_examples"
+                    ),
+                }[name],
+                normalized,
+            )
+        if self.postgresql_privilege_status not in {
+            "ready",
+            "blocked",
+            "unknown",
+        }:
+            raise ValueError("PostgreSQL privilege status is invalid")
+        if not isinstance(self.future_tables_write_enabled, bool):
+            raise TypeError("future-tables indicator must be boolean")
+        if self.future_tables_write_enabled:
+            raise ValueError("future PostgreSQL tables cannot be write-enabled")
+
+
+@dataclass(frozen=True, slots=True)
+class SourcePermissionsInspection:
+    """Current exact scopes plus safe complete-catalog selection facts."""
+
+    source_id: str
+    source_display_name: str
+    adapter_id: str
+    catalog_generation: str | None
+    state: SourcePermissionState
+    resources: tuple[SourcePermissionResource, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.source_id, str)
+            or _SOURCE_PERMISSION_SOURCE_ID.fullmatch(self.source_id) is None
+        ):
+            raise ValueError("permission inspection source_id must be canonical")
+        _permission_text(
+            self.source_display_name,
+            "permission inspection source name",
+        )
+        _permission_text(
+            self.adapter_id,
+            "permission inspection adapter_id",
+            maximum=128,
+        )
+        if self.catalog_generation is not None:
+            _permission_text(
+                self.catalog_generation,
+                "permission inspection catalog_generation",
+            )
+        if not isinstance(self.state, SourcePermissionState):
+            raise TypeError("permission inspection state must be SourcePermissionState")
+        if self.state.read_scope.source_id != self.source_id:
+            raise ValueError("permission inspection state belongs to another source")
+        resources = tuple(self.resources)
+        if len(resources) > _SOURCE_PERMISSION_MAX_RESOURCE_IDS or any(
+            not isinstance(resource, SourcePermissionResource) for resource in resources
+        ):
+            raise ValueError("permission inspection resources are invalid or too large")
+        if len({resource.resource_id for resource in resources}) != len(resources):
+            raise ValueError("permission inspection resources cannot repeat")
+        object.__setattr__(
+            self,
+            "resources",
+            tuple(
+                sorted(
+                    resources,
+                    key=lambda resource: (
+                        resource.display_name.casefold(),
+                        resource.resource_id,
+                    ),
+                )
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SourcePermissionsPreview:
+    """One exact in-process confirmed transition; it is never persisted."""
+
+    source_id: str
+    catalog_generation: str | None
+    before: SourcePermissionState
+    after: SourcePermissionState
+    automatic_read_additions: tuple[str, ...]
+    dependent_update_revocations: tuple[str, ...]
+    summary: SourcePermissionSummary
+    confirmation_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.source_id, str)
+            or _SOURCE_PERMISSION_SOURCE_ID.fullmatch(self.source_id) is None
+        ):
+            raise ValueError("permission preview source_id must be canonical")
+        if self.catalog_generation is not None:
+            _permission_text(
+                self.catalog_generation,
+                "permission preview catalog_generation",
+            )
+        for state, name in ((self.before, "before"), (self.after, "after")):
+            if not isinstance(state, SourcePermissionState):
+                raise TypeError(f"permission preview {name} must be state")
+            if state.read_scope.source_id != self.source_id:
+                raise ValueError(f"permission preview {name} belongs elsewhere")
+        for values, name in (
+            (self.automatic_read_additions, "automatic read additions"),
+            (self.dependent_update_revocations, "dependent update revocations"),
+        ):
+            normalized = _canonical_permission_texts(
+                values,
+                f"permission preview {name}",
+                maximum_items=_SOURCE_PERMISSION_MAX_RESOURCE_IDS,
+                maximum_characters=256,
+            )
+            if any(
+                _SOURCE_PERMISSION_RESOURCE_ID.fullmatch(value) is None
+                for value in normalized
+            ):
+                raise ValueError(f"permission preview {name} must contain resource ids")
+            object.__setattr__(
+                self,
+                (
+                    "automatic_read_additions"
+                    if name == "automatic read additions"
+                    else "dependent_update_revocations"
+                ),
+                normalized,
+            )
+        if not isinstance(self.summary, SourcePermissionSummary):
+            raise TypeError(
+                "permission preview summary must be SourcePermissionSummary"
+            )
+        if (
+            not isinstance(self.confirmation_fingerprint, str)
+            or _SOURCE_PERMISSION_HASH.fullmatch(self.confirmation_fingerprint) is None
+        ):
+            raise ValueError(
+                "permission confirmation fingerprint must be a sha256 hash"
+            )
 
 
 def postgresql_update_authorization_fingerprint(
@@ -497,7 +753,12 @@ __all__ = [
     "DatabaseWriteReceipt",
     "DatabaseWriteReceiptConflictError",
     "PostgreSQLUpdateScope",
+    "SourcePermissionResource",
+    "SourcePermissionState",
     "SourcePermissionStateError",
+    "SourcePermissionSummary",
+    "SourcePermissionsInspection",
+    "SourcePermissionsPreview",
     "SourceReadMode",
     "SourceReadScope",
     "database_write_aware",

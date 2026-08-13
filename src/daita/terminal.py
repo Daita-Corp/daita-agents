@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -22,7 +22,6 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 from . import (
     ApprovalDecision,
     ApprovalRequest,
-    PostgreSQLUpdateReadiness,
     SemanticAnnotationState,
     SemanticAnnotationView,
     __version__,
@@ -1290,7 +1289,7 @@ async def _onboard_source(
                     _absolute_user_path(path),
                     name=name,
                 )
-            return await _onboard_postgresql(
+            registration = await _onboard_postgresql(
                 agent,
                 input_stream=input_stream,
                 output_stream=output_stream,
@@ -1298,6 +1297,26 @@ async def _onboard_source(
                 selection_input=selection_input,
                 selection_output=selection_output,
             )
+            print(
+                "Source attached and cataloged with read access.",
+                file=output_stream,
+            )
+            configure_now = _read_line(
+                "Configure one-row update access now? [y/N]: ",
+                input_stream,
+                output_stream,
+            )
+            if configure_now.strip().casefold() == "y":
+                await _configure_source_permissions(
+                    agent,
+                    input_stream=input_stream,
+                    output_stream=output_stream,
+                    selection_input=selection_input,
+                    selection_output=selection_output,
+                    preselected_source_id=registration.id,
+                    preselected_section="write",
+                )
+            return registration
         except EOFError:
             raise
         except PostgreSQLSourceError as error:
@@ -2089,7 +2108,7 @@ def _command_uses_terminal_prompts(command: str) -> bool:
         return True
     if parts[0] == "/source" and len(parts) >= 3 and parts[1] == "detach":
         return True
-    if parts[0] == "/source" and parts[1:] == ["config"]:
+    if parts[0] == "/source" and parts[1:] == ["permissions"]:
         return True
     if parts[0] == "/conversation" and parts[1:] == ["clear"]:
         return True
@@ -2362,571 +2381,386 @@ async def _write_artifact_outcomes(
         print(message, file=output_stream)
 
 
-def _write_access_enabled(source: Any) -> bool:
-    configuration = getattr(source, "configuration", None)
-    return (
-        isinstance(configuration, Mapping) and configuration.get("write_access") is True
-    )
+def _permission_update_mapping(inspection: Any) -> dict[str, tuple[str, ...]]:
+    return {
+        scope.resource_id: scope.allowed_assignment_columns
+        for scope in inspection.state.postgresql_update_scopes
+    }
 
 
-def _readiness_status(
-    facts: Mapping[str, object],
-    expectations: tuple[tuple[str, bool], ...],
-) -> str:
-    values = tuple(facts.get(name) for name, _expected in expectations)
-    if any(not isinstance(value, bool) for value in values):
-        return "?"
-    return (
-        "✓"
-        if all(
-            cast(bool, value) is expected
-            for value, (_name, expected) in zip(values, expectations, strict=True)
-        )
-        else "✗"
-    )
+def _permission_examples(values: tuple[str, ...]) -> str:
+    if not values:
+        return "none"
+    return ", ".join(_safe_display(value, fallback="resource") for value in values)
 
 
-def _postgresql_database_ready(readiness: PostgreSQLUpdateReadiness) -> bool:
-    return not tuple(
-        code for code in readiness.rejection_codes if code != "write_access_not_enabled"
-    )
-
-
-def _write_postgresql_readiness(
-    readiness: PostgreSQLUpdateReadiness,
+async def _advanced_update_columns(
+    selected_resources: tuple[Any, ...],
+    inspection: Any,
     *,
-    source_name: str,
-    resource_name: str,
+    input_stream: TextIO,
     output_stream: TextIO,
-) -> None:
-    safe_source = _safe_display(source_name, fallback="PostgreSQL source")
-    safe_resource = _safe_display(resource_name, fallback="selected table")
-    safe_columns = ", ".join(
-        _safe_display(column, fallback="column")
-        for column in readiness.assignment_columns
-    )
-    checks = (
-        (
-            "Least-privileged role attributes",
-            _readiness_status(
-                readiness.role_attributes,
-                (
-                    ("superuser", False),
-                    ("bypass_rls", False),
-                    ("create_database", False),
-                    ("create_role", False),
-                    ("replication", False),
-                ),
-            ),
-        ),
-        (
-            "CONNECT, schema USAGE, and table SELECT access",
-            _readiness_status(
-                readiness.privileges,
-                (
-                    ("database_connect", True),
-                    ("schema_usage", True),
-                    ("table_select", True),
-                ),
-            ),
-        ),
-        (
-            "UPDATE access for the selected columns",
-            _readiness_status(
-                readiness.privileges,
-                (("requested_columns_update", True),),
-            ),
-        ),
-        (
-            "Current catalog scope and single-column primary key",
-            _readiness_status(
-                readiness.relation,
-                (("catalog_admitted", True),),
-            ),
-        ),
-        (
-            "Supported PostgreSQL base table",
-            _readiness_status(
-                readiness.relation,
-                (("base_table", True),),
-            ),
-        ),
-        (
-            "No partition or inheritance behavior",
-            _readiness_status(
-                readiness.relation,
-                (("partition", False), ("inheritance", False)),
-            ),
-        ),
-        (
-            "No row-level security",
-            _readiness_status(
-                readiness.relation,
-                (
-                    ("row_level_security", False),
-                    ("force_row_level_security", False),
-                ),
-            ),
-        ),
-        (
-            "No user triggers or rewrite rules",
-            _readiness_status(
-                readiness.relation,
-                (("user_triggers", False), ("rewrite_rules", False)),
-            ),
-        ),
-    )
-    database_rejections = tuple(
-        code for code in readiness.rejection_codes if code != "write_access_not_enabled"
-    )
-    database_remediation = tuple(
-        category
-        for category in readiness.remediation_categories
-        if category != "enable_write_access_in_daita"
-    )
-
-    print(file=output_stream)
-    print("Target readiness check", file=output_stream)
-    print(f"  Source   {safe_source}", file=output_stream)
-    print(f"  Table    {safe_resource}", file=output_stream)
-    print(f"  Columns  {safe_columns}", file=output_stream)
-    print(file=output_stream)
-    print("PostgreSQL prerequisites", file=output_stream)
-    for label, status in checks:
-        print(f"  {status} {label}", file=output_stream)
-    if database_rejections:
-        print(file=output_stream)
-        print("PostgreSQL blockers", file=output_stream)
-        for code in database_rejections:
-            print(
-                "  - " + _safe_display(code.replace("_", " "), fallback="blocked"),
-                file=output_stream,
-            )
-    if database_remediation:
-        print("External remediation", file=output_stream)
-        for category in database_remediation:
-            print(
-                "  - "
-                + _safe_display(category.replace("_", " "), fallback="review access"),
-                file=output_stream,
-            )
-    print(file=output_stream)
-    print("Daita admission", file=output_stream)
-    print(
-        "  "
-        + ("✓ Enabled" if readiness.write_access else "○ Disabled")
-        + " for this source",
-        file=output_stream,
-    )
-    print(
-        "  Readiness is a current check for this table and these columns; "
-        "it is not authorization or proof of a future update.",
-        file=output_stream,
-    )
-    print(
-        "  PostgreSQL roles and grants stay external. Daita never accepts "
-        "administrator credentials.",
-        file=output_stream,
-    )
-
-
-def _postgresql_write_columns(
-    inspection: Mapping[str, object],
-) -> tuple[tuple[SelectionOption[str], ...], tuple[str, ...]]:
-    facets = inspection.get("facets")
-    if not isinstance(facets, tuple):
-        return (), ()
-    ordered: list[tuple[int, SelectionOption[str]]] = []
-    primary_keys: list[tuple[int, str]] = []
-    for facet in facets:
-        if not isinstance(facet, Mapping) or facet.get("kind") != "tabular":
-            continue
-        payload = facet.get("payload")
-        if not isinstance(payload, Mapping):
-            continue
-        columns = payload.get("columns")
-        if not isinstance(columns, tuple):
-            continue
-        for fallback_ordinal, column in enumerate(columns):
-            if not isinstance(column, Mapping):
-                continue
-            name = column.get("name")
-            ordinal = column.get("ordinal")
-            if not isinstance(name, str) or not name:
-                continue
-            order = ordinal if isinstance(ordinal, int) else fallback_ordinal
-            primary_key_ordinal = column.get("primary_key_ordinal")
-            if isinstance(primary_key_ordinal, int):
-                primary_keys.append((primary_key_ordinal, name))
-            if (
-                column.get("updatable") is not True
-                or primary_key_ordinal is not None
-                or column.get("identity") is True
-                or column.get("generated") is True
-            ):
-                continue
-            native_type = column.get("native_type")
-            description = (
-                _safe_display(native_type, fallback="cataloged type")
-                if isinstance(native_type, str)
-                else "cataloged type"
-            )
-            ordered.append(
-                (
-                    order,
-                    SelectionOption(
-                        name,
-                        name,
-                        description=description,
-                        search_terms=(name, description),
-                    ),
+    selection_input: Any,
+    selection_output: Any,
+) -> dict[str, tuple[str, ...]]:
+    prior = _permission_update_mapping(inspection)
+    result: dict[str, tuple[str, ...]] = {}
+    for resource in selected_resources:
+        columns = resource.eligible_assignment_columns
+        result[resource.resource_id] = await select_many(
+            "Advanced columns for "
+            + _safe_display(resource.display_name, fallback="selected table"),
+            tuple(
+                SelectionOption(
+                    column,
+                    column,
+                    description="eligible assignment column",
+                    search_terms=(column,),
                 )
-            )
-        break
-    return (
-        tuple(option for _ordinal, option in sorted(ordered, key=lambda item: item[0])),
-        tuple(name for _ordinal, name in sorted(primary_keys)),
-    )
+                for column in columns
+            ),
+            input_stream=input_stream,
+            output_stream=output_stream,
+            enhanced_input=selection_input,
+            enhanced_output=selection_output,
+            maximum=_MAX_POSTGRESQL_WRITE_COLUMNS,
+            initial_values=tuple(
+                column
+                for column in prior.get(resource.resource_id, ())
+                if column in columns
+            ),
+            empty_message="Select at least one assignment column.",
+            maximum_message=(
+                f"Select at most {_MAX_POSTGRESQL_WRITE_COLUMNS} assignment columns."
+            ),
+            fallback_prompt="Columns (numbers, ranges, or all): ",
+        )
+    return result
 
 
-async def _configure_postgresql_source(
+async def _configure_source_permissions(
     agent: Agent,
     *,
     input_stream: TextIO,
     output_stream: TextIO,
     selection_input: Any = None,
     selection_output: Any = None,
+    preselected_source_id: str | None = None,
+    preselected_section: str | None = None,
 ) -> None:
     sources = tuple(
         sorted(
-            (
-                source
-                for source in await agent.list_sources()
-                if source.active and source.adapter_id == "postgresql"
-            ),
+            (source for source in await agent.list_sources() if source.active),
             key=lambda source: (source.display_name.casefold(), source.id),
         )
     )
-    print("Configure PostgreSQL writes", file=output_stream)
+    print("Source permissions", file=output_stream)
     if not sources:
         print(
-            "No active PostgreSQL sources are attached. Use /source add first.",
-            file=output_stream,
+            "No active sources are attached. Use /source add first.", file=output_stream
         )
         return
-    if len(sources) > _MAX_SOURCE_PICKER_OPTIONS:
-        print(
-            f"Showing the first {_MAX_SOURCE_PICKER_OPTIONS} PostgreSQL sources.",
-            file=output_stream,
-        )
-    source_id = await select_one(
-        "Select a PostgreSQL source",
-        tuple(
-            SelectionOption(
-                source.id,
-                source.display_name,
-                description=(
-                    "write admission enabled"
-                    if _write_access_enabled(source)
-                    else "write admission disabled"
-                ),
-                search_terms=(source.display_name, "postgresql"),
-            )
-            for source in sources[:_MAX_SOURCE_PICKER_OPTIONS]
-        ),
-        input_stream=input_stream,
-        output_stream=output_stream,
-        enhanced_input=selection_input,
-        enhanced_output=selection_output,
-    )
-    selected = next(source for source in sources if source.id == source_id)
-    source_name = _safe_display(
-        selected.display_name,
-        fallback="PostgreSQL source",
-    )
-    print(file=output_stream)
-    print(f"Source           {source_name}", file=output_stream)
-    print(
-        "Write admission  "
-        + ("Enabled" if _write_access_enabled(selected) else "Disabled"),
-        file=output_stream,
-    )
-
-    if _write_access_enabled(selected):
-        action = await select_one(
-            "Write admission must be disabled before a target readiness check",
-            (
+    if preselected_source_id is None:
+        source_id = await select_one(
+            "Select a source",
+            tuple(
                 SelectionOption(
-                    "configure",
-                    "Disable and continue configuration",
-                    "Disable now, then select a table and columns",
-                ),
-                SelectionOption(
-                    "disable",
-                    "Disable and return to chat",
-                    "Disable immediately without another confirmation",
-                ),
-                SelectionOption("cancel", "Cancel", "Leave admission enabled"),
+                    source.id,
+                    source.display_name,
+                    description=_SOURCE_TYPE_LABELS.get(
+                        source.adapter_id,
+                        source.adapter_id,
+                    ),
+                    search_terms=(source.display_name, source.adapter_id),
+                )
+                for source in sources
             ),
             input_stream=input_stream,
             output_stream=output_stream,
             enhanced_input=selection_input,
             enhanced_output=selection_output,
         )
-        if action == "cancel":
+    else:
+        source_id = preselected_source_id
+        if not any(source.id == source_id for source in sources):
+            raise ValueError("the preselected permission source is not active")
+    inspection = await agent.inspect_source_permissions(source_id)
+    section = preselected_section
+    if section is None:
+        section_options = [
+            SelectionOption(
+                "read",
+                "Read access",
+                "All resources, selected current resources, or none",
+            )
+        ]
+        if inspection.adapter_id == "postgresql":
+            section_options.append(
+                SelectionOption(
+                    "write",
+                    "PostgreSQL one-row update access",
+                    "None, selected tables, or all current eligible tables",
+                )
+            )
+        section = await select_one(
+            "Choose permission type",
+            tuple(section_options),
+            input_stream=input_stream,
+            output_stream=output_stream,
+            enhanced_input=selection_input,
+            enhanced_output=selection_output,
+        )
+
+    if section == "read":
+        mode_text = await select_one(
+            "Read access",
+            (
+                SelectionOption(
+                    "all",
+                    "All resources",
+                    "Includes future resources visible to the source credential",
+                ),
+                SelectionOption(
+                    "selected",
+                    "Selected current resources",
+                    "Future resources stay excluded",
+                ),
+                SelectionOption("none", "No read access", "No model/runtime reads"),
+            ),
+            input_stream=input_stream,
+            output_stream=output_stream,
+            enhanced_input=selection_input,
+            enhanced_output=selection_output,
+        )
+        read_mode = mode_text
+        if read_mode == "selected":
+            current_ids = (
+                inspection.state.read_scope.resource_ids
+                if inspection.state.read_scope.mode.value == "selected"
+                else ()
+            )
+            read_resource_ids = await select_many(
+                "Select readable resources",
+                tuple(
+                    SelectionOption(
+                        resource.resource_id,
+                        resource.display_name,
+                        description=resource.resource_kind,
+                        search_terms=(
+                            resource.display_name,
+                            resource.resource_kind,
+                        ),
+                    )
+                    for resource in inspection.resources
+                ),
+                input_stream=input_stream,
+                output_stream=output_stream,
+                enhanced_input=selection_input,
+                enhanced_output=selection_output,
+                maximum=len(inspection.resources),
+                initial_values=current_ids,
+                fallback_prompt="Resources (numbers, ranges, or all): ",
+            )
+        else:
+            read_resource_ids = ()
+        effective_read = (
+            {resource.resource_id for resource in inspection.resources}
+            if read_mode == "all"
+            else set(read_resource_ids)
+        )
+        update_mapping = {
+            resource_id: columns
+            for resource_id, columns in _permission_update_mapping(inspection).items()
+            if resource_id in effective_read
+        }
+    elif section == "write" and inspection.adapter_id == "postgresql":
+        write_mode = await select_one(
+            "PostgreSQL one-row update access",
+            (
+                SelectionOption("none", "No update access"),
+                SelectionOption(
+                    "selected",
+                    "Selected current tables",
+                    "Choose one or more eligible tables",
+                ),
+                SelectionOption(
+                    "all",
+                    "All current eligible tables",
+                    "Future tables stay excluded",
+                ),
+            ),
+            input_stream=input_stream,
+            output_stream=output_stream,
+            enhanced_input=selection_input,
+            enhanced_output=selection_output,
+        )
+        eligible = tuple(
+            resource
+            for resource in inspection.resources
+            if resource.postgresql_update_eligible
+        )
+        if write_mode != "none" and not eligible:
             print(
-                "Source configuration cancelled; admission remains enabled.",
+                "No current tables are eligible for one-row update access.",
                 file=output_stream,
             )
             return
-        selected = await agent.set_source_write_access(selected.id, False)
-        print(
-            f"Write admission disabled for {source_name}.",
-            file=output_stream,
-        )
-        if action == "disable":
-            return
-
-    resources = tuple(
-        sorted(
-            (
-                resource
-                for resource in await agent.list_catalog_resources(
-                    source_id=selected.id
-                )
-                if getattr(getattr(resource, "kind", None), "value", None) == "table"
-            ),
-            key=lambda resource: (
-                resource.native_identity.casefold(),
-                resource.id,
-            ),
-        )
-    )
-    if not resources:
-        print(
-            "No current cataloged PostgreSQL base tables are available. "
-            "Refresh the source catalog first.",
-            file=output_stream,
-        )
-        return
-    if len(resources) > _MAX_SOURCE_PICKER_OPTIONS:
-        print(
-            f"Showing the first {_MAX_SOURCE_PICKER_OPTIONS} cataloged tables.",
-            file=output_stream,
-        )
-    resource_id = await select_one(
-        "Select a target table for readiness",
-        tuple(
-            SelectionOption(
-                resource.id,
-                resource.native_identity,
-                description=(
-                    resource.name
-                    if resource.name != resource.native_identity
-                    else "PostgreSQL base table"
+        if write_mode == "selected":
+            selected_ids = await select_many(
+                "Select writable tables",
+                tuple(
+                    SelectionOption(
+                        resource.resource_id,
+                        resource.display_name,
+                        description=(
+                            f"{len(resource.eligible_assignment_columns)} eligible columns"
+                        ),
+                        search_terms=(resource.display_name, "table"),
+                    )
+                    for resource in eligible
                 ),
-                search_terms=(resource.name, resource.native_identity),
+                input_stream=input_stream,
+                output_stream=output_stream,
+                enhanced_input=selection_input,
+                enhanced_output=selection_output,
+                maximum=len(eligible),
+                initial_values=tuple(_permission_update_mapping(inspection)),
+                fallback_prompt="Tables (numbers, ranges, or all): ",
             )
-            for resource in resources[:_MAX_SOURCE_PICKER_OPTIONS]
-        ),
-        input_stream=input_stream,
-        output_stream=output_stream,
-        enhanced_input=selection_input,
-        enhanced_output=selection_output,
-    )
-    resource = next(item for item in resources if item.id == resource_id)
-    inspection = await agent.inspect_catalog_resource(resource.id)
-    column_options, primary_keys = _postgresql_write_columns(inspection)
-    if not column_options:
-        print(
-            "This table has no cataloged assignment columns eligible for "
-            "PostgreSQL update readiness.",
-            file=output_stream,
-        )
-        return
-    if len(column_options) > _MAX_SOURCE_PICKER_OPTIONS:
-        print(
-            f"Showing the first {_MAX_SOURCE_PICKER_OPTIONS} eligible columns.",
-            file=output_stream,
-        )
-    assignment_columns = await select_many(
-        "Select intended assignment columns",
-        column_options[:_MAX_SOURCE_PICKER_OPTIONS],
-        input_stream=input_stream,
-        output_stream=output_stream,
-        enhanced_input=selection_input,
-        enhanced_output=selection_output,
-        maximum=_MAX_POSTGRESQL_WRITE_COLUMNS,
-        empty_message="Select at least one assignment column.",
-        maximum_message=(
-            f"Select at most {_MAX_POSTGRESQL_WRITE_COLUMNS} assignment columns."
-        ),
-    )
-    readiness = await agent.postgresql_update_readiness(
-        selected.id,
-        resource.id,
-        assignment_columns,
-    )
-    _write_postgresql_readiness(
-        readiness,
-        source_name=selected.display_name,
-        resource_name=resource.native_identity,
-        output_stream=output_stream,
-    )
-    if not _postgresql_database_ready(readiness):
-        print(
-            "Write admission remains disabled. Resolve PostgreSQL role, grant, "
-            "connection, or schema remediation outside Daita, then run "
-            "/source config again.",
-            file=output_stream,
-        )
-        return
-    if readiness.rejection_codes != (
-        "write_access_not_enabled",
-    ) or readiness.remediation_categories != ("enable_write_access_in_daita",):
-        print(
-            "Write admission remains disabled because this exact readiness "
-            "result is not eligible for enablement.",
-            file=output_stream,
-        )
-        return
+            selected_resources = tuple(
+                resource
+                for resource in eligible
+                if resource.resource_id in set(selected_ids)
+            )
+        elif write_mode == "all":
+            selected_resources = eligible
+        else:
+            selected_resources = ()
 
+        if not selected_resources:
+            update_mapping = {}
+        else:
+            requires_advanced = any(
+                resource.requires_advanced_column_selection
+                for resource in selected_resources
+            )
+            if requires_advanced:
+                print(
+                    "At least one selected table has more than "
+                    f"{_MAX_POSTGRESQL_WRITE_COLUMNS} eligible columns; "
+                    "Advanced selection is required.",
+                    file=output_stream,
+                )
+                advanced = True
+            else:
+                column_mode = await select_one(
+                    "Assignment columns",
+                    (
+                        SelectionOption(
+                            "all",
+                            "Use all eligible columns",
+                            "Recommended normal setup",
+                        ),
+                        SelectionOption(
+                            "advanced",
+                            "Advanced",
+                            "Choose an exact column subset for each table",
+                        ),
+                    ),
+                    input_stream=input_stream,
+                    output_stream=output_stream,
+                    enhanced_input=selection_input,
+                    enhanced_output=selection_output,
+                )
+                advanced = column_mode == "advanced"
+            update_mapping = (
+                await _advanced_update_columns(
+                    selected_resources,
+                    inspection,
+                    input_stream=input_stream,
+                    output_stream=output_stream,
+                    selection_input=selection_input,
+                    selection_output=selection_output,
+                )
+                if advanced
+                else {
+                    resource.resource_id: resource.eligible_assignment_columns
+                    for resource in selected_resources
+                }
+            )
+        read_mode = inspection.state.read_scope.mode
+        read_resource_ids = inspection.state.read_scope.resource_ids
+    else:
+        raise ValueError("the selected permission type is unavailable for this source")
+
+    preview = await agent.preview_source_permissions(
+        source_id=source_id,
+        read_mode=read_mode,
+        read_resource_ids=read_resource_ids,
+        postgresql_update_scopes=update_mapping,
+    )
+    before = preview.before
+    after = preview.after
+    before_read_count = (
+        len(inspection.resources)
+        if before.read_scope.mode.value == "all"
+        else len(before.read_scope.resource_ids)
+    )
     print(file=output_stream)
+    print("Review source permissions", file=output_stream)
     print(
-        "Enabling admission is source-scoped. It is not limited to "
-        f"{_safe_display(resource.native_identity, fallback='this table')} "
-        f"or {', '.join(_safe_display(column, fallback='column') for column in assignment_columns)}.",
+        "  Source  "
+        + _safe_display(preview.summary.source_display_name, fallback="source"),
         file=output_stream,
     )
     print(
-        "PostgreSQL privileges will not change. Every update still requires a "
-        "fresh preview and separate exact once-only approval.",
-        file=output_stream,
-    )
-    enable_action = await select_one(
-        "Daita write admission",
-        (
-            SelectionOption(
-                "enable",
-                "Enable source write admission",
-                "Enable only Daita's source-level admission flag",
-            ),
-            SelectionOption("cancel", "Cancel", "Keep writes disabled"),
-        ),
-        input_stream=input_stream,
-        output_stream=output_stream,
-        enhanced_input=selection_input,
-        enhanced_output=selection_output,
-    )
-    if enable_action != "enable":
-        print("Write admission remains disabled.", file=output_stream)
-        return
-    print(file=output_stream)
-    print(
-        f"Enable Daita write admission for “{source_name}”?",
+        f"  Read    {before.read_scope.mode.value} ({before_read_count})"
+        f" → {after.read_scope.mode.value} "
+        f"({preview.summary.selected_read_resource_count})",
         file=output_stream,
     )
     print(
-        "This enables source-level admission, not only the selected table. "
-        "PostgreSQL privileges will not change.",
+        f"  Update  {len(before.postgresql_update_scopes)}"
+        f" → {preview.summary.postgresql_update_table_count} tables"
+        f" ({_permission_examples(preview.summary.postgresql_update_table_examples)})",
         file=output_stream,
     )
     print(
-        "Every update still requires a fresh preview and separate exact "
-        "once-only approval.",
+        "  Automatic read additions  "
+        + _permission_examples(preview.summary.automatic_read_addition_examples),
+        file=output_stream,
+    )
+    print(
+        "  Dependent update revocations  "
+        + _permission_examples(preview.summary.dependent_update_revocation_examples),
+        file=output_stream,
+    )
+    print(
+        "  Future PostgreSQL tables are not automatically write-enabled.",
+        file=output_stream,
+    )
+    print(
+        "  PostgreSQL privilege readiness  "
+        + preview.summary.postgresql_privilege_status,
         file=output_stream,
     )
     confirmation = _read_line(
-        "[Y] Enable  [N] Cancel: ",
+        "Apply these source permissions? [y/N]: ",
         input_stream,
         output_stream,
     )
     if confirmation.strip().casefold() != "y":
-        print("Write admission remains disabled.", file=output_stream)
+        print("Source permissions were not changed.", file=output_stream)
         return
-    selected = await agent.set_source_write_access(selected.id, True)
-    final_readiness = await agent.postgresql_update_readiness(
-        selected.id,
-        resource.id,
-        assignment_columns,
+    await agent.apply_source_permissions(
+        source_id=source_id,
+        confirmation_fingerprint=preview.confirmation_fingerprint,
     )
-    _write_postgresql_readiness(
-        final_readiness,
-        source_name=selected.display_name,
-        resource_name=resource.native_identity,
-        output_stream=output_stream,
-    )
-    if not final_readiness.ready_for_preview:
-        print(
-            "Readiness changed after enablement. No preview or update was run.",
-            file=output_stream,
-        )
-        followup = await select_one(
-            "Admission is enabled but this target is not ready",
-            (
-                SelectionOption(
-                    "disable",
-                    "Disable write admission now",
-                    "Disable immediately without another confirmation",
-                ),
-                SelectionOption(
-                    "keep",
-                    "Keep admission enabled",
-                    "Return to chat without running a write",
-                ),
-            ),
-            input_stream=input_stream,
-            output_stream=output_stream,
-            enhanced_input=selection_input,
-            enhanced_output=selection_output,
-        )
-        if followup == "disable":
-            await agent.set_source_write_access(selected.id, False)
-            print(
-                f"Write admission disabled for {source_name}.",
-                file=output_stream,
-            )
-        return
-
-    print(file=output_stream)
-    print("Ready for preview", file=output_stream)
+    print("Source permissions updated atomically.", file=output_stream)
     print(
-        "No row was read or changed by this configuration flow.",
+        "No external database mutation was executed.",
         file=output_stream,
     )
-    next_step = await select_one(
-        "Next step",
-        (
-            SelectionOption(
-                "preview",
-                "Show a safe canary preview prompt",
-                "Copy a preview-only request back into chat",
-            ),
-            SelectionOption("chat", "Return to chat", "Do not prepare a prompt"),
-        ),
-        input_stream=input_stream,
-        output_stream=output_stream,
-        enhanced_input=selection_input,
-        enhanced_output=selection_output,
-    )
-    if next_step == "preview":
-        primary_key = (
-            primary_keys[0] if len(primary_keys) == 1 else "<primary-key column>"
-        )
-        columns = ", ".join(
-            _safe_display(column, fallback="column") for column in assignment_columns
-        )
-        print(file=output_stream)
-        print("Preview-only canary prompt", file=output_stream)
-        print(
-            "  Preview changing "
-            f"{_safe_display(resource.native_identity, fallback='the selected table')} "
-            f"where {_safe_display(primary_key, fallback='primary key')}="
-            "<canary value>, assigning "
-            f"{columns}=<new test value>. Show the exact before/after values "
-            "and do not execute the update yet.",
-            file=output_stream,
-        )
 
 
 async def _handle_local_command(
@@ -3223,9 +3057,9 @@ async def _handle_local_command(
             validated=validated,
         )
         return agent, conversation_id, None
-    if name == "/source" and parts[1:] == ["config"]:
+    if name == "/source" and parts[1:] == ["permissions"]:
         try:
-            await _configure_postgresql_source(
+            await _configure_source_permissions(
                 agent,
                 input_stream=input_stream,
                 output_stream=output_stream,
@@ -3234,19 +3068,19 @@ async def _handle_local_command(
             )
         except (SelectionCancelled, EOFError):
             print(
-                "Source configuration cancelled; returning to chat.", file=output_stream
+                "Source permissions cancelled; returning to chat.", file=output_stream
             )
         except ImportError as error:
             print(
-                "Source configuration dependency is unavailable: "
+                "Source permissions dependency is unavailable: "
                 + _safe_display(str(error), fallback="repair the Daita installation"),
                 file=output_stream,
             )
         except (OSError, RuntimeError, TypeError, ValueError):
             print(
-                "Source configuration could not complete from current catalog and "
-                "source facts. No PostgreSQL role or grant was changed; refresh "
-                "the source and retry.",
+                "Source permissions could not complete from current catalog and "
+                "source facts. No scope or PostgreSQL role or grant was changed; "
+                "refresh the source and retry.",
                 file=output_stream,
             )
         return agent, conversation_id, None
@@ -3311,7 +3145,7 @@ async def _handle_local_command(
         print(
             "Usage: /source | /source use <name> | /source add | "
             "/source refresh <source-id> | /source detach <source> | "
-            "/source config",
+            "/source permissions",
             file=output_stream,
         )
     elif name == "/conversation":
@@ -3563,7 +3397,7 @@ def _write_chat_help(output_stream: TextIO) -> None:
         "/source add",
         "/source refresh <id>",
         "/source detach <source>",
-        "/source config",
+        "/source permissions",
         '@"source name" <question>',
         "/catalog",
         "/settings",

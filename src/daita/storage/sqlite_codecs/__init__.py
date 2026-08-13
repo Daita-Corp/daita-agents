@@ -30,8 +30,6 @@ from .sources import (
     decode_preledger_source,
     decode_source,
     encode_source,
-    persisted_source,
-    project_source_admission,
 )
 from .transcripts import (
     decode_loop_exit,
@@ -72,6 +70,4 @@ __all__ = [
     "encode_semantic_annotation",
     "encode_source",
     "encode_source_read_scope",
-    "persisted_source",
-    "project_source_admission",
 ]

@@ -316,7 +316,6 @@ class PostgreSQLSource:
     port: int = 5432
     schemas: tuple[str, ...] = ("public",)
     ssl_mode: str = "require"
-    write_access: bool = False
     name: str | None = None
     secret_provider: SecretProvider = field(
         default_factory=default_secret_provider,
@@ -348,8 +347,6 @@ class PostgreSQLSource:
         schemas = _schemas(self.schemas)
         if self.ssl_mode not in _SSL_MODES:
             raise ValueError("ssl_mode is not supported")
-        if not isinstance(self.write_access, bool):
-            raise TypeError("write_access must be a boolean")
         if self.credential is not None and not isinstance(
             self.credential, SecretReference
         ):
@@ -1034,7 +1031,6 @@ def _source_configuration(source: PostgreSQLSource) -> dict[str, object]:
         "schemas": source.schemas,
         "ssl_mode": source.ssl_mode,
         "username": source.username,
-        "write_access": source.write_access,
     }
     if source.credential is not None:
         configuration["credential_ref"] = source.credential.to_uri()

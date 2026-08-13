@@ -37,7 +37,8 @@ _FORBIDDEN_MODEL_TOOLS = frozenset(
     {
         "data_preview_sqlite_update",
         "data_update_sqlite",
-        "set_source_write_access",
+        "preview_source_permissions",
+        "apply_source_permissions",
     }
 )
 _ALLOWED_MODEL_CALLS = frozenset(
@@ -240,8 +241,21 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
             ssl_mode="disable",
             name="Fixture PostgreSQL",
         )
-        enabled = await agent.set_source_write_access(source.id, True)
-        assert enabled.configuration["write_access"] is True
+        resource = next(
+            item
+            for item in await agent.list_catalog_resources(source_id=source.id)
+            if item.native_identity == "analytics.customers"
+        )
+        permission_preview = await agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode="all",
+            read_resource_ids=(),
+            postgresql_update_scopes={resource.id: ["is_active"]},
+        )
+        await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=permission_preview.confirmation_fingerprint,
+        )
 
         exit = await agent.run(
             "Set analytics.customers customer_id = 1 is_active to the confirmed "

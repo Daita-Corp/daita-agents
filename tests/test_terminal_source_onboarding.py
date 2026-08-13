@@ -135,6 +135,52 @@ async def test_terminal_onboards_local_sources_and_renders_polished_ready_screen
         await reopened.close()
 
 
+async def test_postgresql_post_attach_yes_reuses_permission_flow_with_source_selected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keychain = _Keychain()
+    agent = await _configured_agent(tmp_path, keychain)
+    calls: list[dict[str, object]] = []
+
+    async def fake_probe(self: Agent, **kwargs: Any) -> PostgreSQLProbeResult:
+        del self, kwargs
+        return PostgreSQLProbeResult.build((("analytics", True),))
+
+    async def fake_attach(self: Agent, **kwargs: Any):
+        del self, kwargs
+        return SimpleNamespace(
+            id="source:sha256:" + "a" * 64,
+            display_name="Warehouse",
+        )
+
+    async def fake_permissions(permission_agent: Agent, **kwargs: Any) -> None:
+        assert permission_agent is agent
+        calls.append(dict(kwargs))
+
+    monkeypatch.setattr(Agent, "probe_postgresql", fake_probe)
+    monkeypatch.setattr(Agent, "attach_postgresql", fake_attach)
+    monkeypatch.setattr(terminal, "_configure_source_permissions", fake_permissions)
+    output = io.StringIO()
+    try:
+        attached = await terminal._onboard_source(
+            agent,
+            input_stream=io.StringIO(
+                "3\n2\nWarehouse\ndb.example.test\n5432\nwarehouse\nreader\n\n1\ny\n"
+            ),
+            output_stream=output,
+            hidden_input=lambda _prompt: "database-secret",
+        )
+    finally:
+        await agent.close()
+
+    assert attached.id == "source:sha256:" + "a" * 64
+    assert len(calls) == 1
+    assert calls[0]["preselected_source_id"] == attached.id
+    assert calls[0]["preselected_section"] == "write"
+    assert "Source attached and cataloged with read access" in output.getvalue()
+
+
 async def test_terminal_postgresql_probe_selects_only_requested_schemas(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -177,7 +223,6 @@ async def test_terminal_postgresql_probe_selects_only_requested_schemas(
     assert result == 0
     assert len(attached) == 1
     assert attached[0]["schemas"] == ("analytics", "reporting")
-    assert "write_access" not in attached[0]
     reference = attached[0]["credential"]
     assert isinstance(reference, SecretReference)
     assert keychain.values[reference.name] == "database-secret"
@@ -186,6 +231,7 @@ async def test_terminal_postgresql_probe_selects_only_requested_schemas(
     assert "analytics, reporting" in text
     assert "Connection validated" in text
     assert "more than 100 schemas exist; showing the first 100" in text
+    assert "Configure one-row update access now? [y/N]" in text
     assert "Schemas selected" in text
     assert "Discovering tables and relationships" in text
     assert "Stage 4 status" not in text
