@@ -10,6 +10,7 @@ import stat
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -46,6 +47,13 @@ class _SQLiteReadPermissionError(PluginError):
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message, plugin_id="sqlite", error_code=code)
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedSQLiteFile:
+    path: Path
+    device: int
+    inode: int
 
 
 class SQLiteQueryBackend:
@@ -305,7 +313,7 @@ def _expected_schema_version(source_revision: str) -> int:
     return version
 
 
-def _regular_unaliased_path(value: str) -> Path:
+def _regular_unaliased_path(value: str) -> _AdmittedSQLiteFile:
     lexical = Path(os.path.abspath(value))
     try:
         resolved = lexical.resolve(strict=True)
@@ -316,18 +324,19 @@ def _regular_unaliased_path(value: str) -> Path:
             "SQLite source path is unavailable or unsafe.",
         ) from error
     try:
-        if lexical != resolved or not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        identity = os.fstat(descriptor)
+        if lexical != resolved or not stat.S_ISREG(identity.st_mode):
             raise SQLiteQueryError(
                 "source_path_invalid",
                 "SQLite source path is unavailable or unsafe.",
             )
     finally:
         os.close(descriptor)
-    return resolved
+    return _AdmittedSQLiteFile(resolved, identity.st_dev, identity.st_ino)
 
 
 async def _run_query(
-    path: Path,
+    path: _AdmittedSQLiteFile,
     sql: str,
     parameters: tuple[object, ...],
     *,
@@ -363,7 +372,7 @@ async def _run_query(
 
 
 async def _run_exact_tabular(
-    path: Path,
+    path: _AdmittedSQLiteFile,
     sql: str,
     parameters: tuple[object, ...],
     *,
@@ -409,7 +418,7 @@ async def _run_exact_tabular(
 
 
 def _run_exact_tabular_sync(
-    path: Path,
+    path: _AdmittedSQLiteFile,
     sql: str,
     parameters: tuple[object, ...],
     format_name: str,
@@ -422,8 +431,8 @@ def _run_exact_tabular_sync(
     cancellation: threading.Event,
     progress: ExactTabularProgress | None = None,
 ) -> tuple[bytes, tuple[str, ...], int, str]:
-    uri = f"{path.as_uri()}?mode=ro"
     connection: sqlite3.Connection | None = None
+    admitted_descriptor: int | None = None
     timed_out = threading.Event()
     deadline = time.monotonic() + timeout_seconds
     renderer: ExactCsvRenderer | ExactXlsxRenderer | None = None
@@ -437,7 +446,7 @@ def _run_exact_tabular_sync(
         return 0
 
     try:
-        connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+        connection, admitted_descriptor = _connect_admitted_read_only(path)
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA trusted_schema = OFF")
         connection.execute("PRAGMA foreign_keys = ON")
@@ -538,10 +547,12 @@ def _run_exact_tabular_sync(
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             connection.close()
+        if admitted_descriptor is not None:
+            os.close(admitted_descriptor)
 
 
 def _run_query_sync(
-    path: Path,
+    path: _AdmittedSQLiteFile,
     sql: str,
     parameters: tuple[object, ...],
     expected_schema_version: int,
@@ -549,10 +560,10 @@ def _run_query_sync(
     max_bytes: int,
     cancellation: threading.Event,
 ) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...], str]:
-    uri = f"{path.as_uri()}?mode=ro"
     connection: sqlite3.Connection | None = None
+    admitted_descriptor: int | None = None
     try:
-        connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+        connection, admitted_descriptor = _connect_admitted_read_only(path)
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA trusted_schema = OFF")
         connection.execute("PRAGMA foreign_keys = ON")
@@ -600,6 +611,122 @@ def _run_query_sync(
             if connection.in_transaction:
                 connection.execute("ROLLBACK")
             connection.close()
+        if admitted_descriptor is not None:
+            os.close(admitted_descriptor)
+
+
+def _connect_admitted_read_only(
+    admitted: _AdmittedSQLiteFile,
+) -> tuple[sqlite3.Connection, int]:
+    descriptor: int | None = None
+    connection: sqlite3.Connection | None = None
+    try:
+        try:
+            current_mode = os.lstat(admitted.path).st_mode
+        except OSError as error:
+            raise SQLiteQueryError(
+                "source_path_changed",
+                "SQLite source path changed after admission.",
+            ) from error
+        if stat.S_ISLNK(current_mode):
+            raise SQLiteQueryError(
+                "source_path_changed",
+                "SQLite source path changed after admission.",
+            )
+        descriptor = os.open(
+            admitted.path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        identity = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(identity.st_mode)
+            or identity.st_dev != admitted.device
+            or identity.st_ino != admitted.inode
+        ):
+            raise SQLiteQueryError(
+                "source_path_changed",
+                "SQLite source path changed after admission.",
+            )
+        _reject_wal_format(descriptor)
+        descriptor_path = next(
+            (
+                candidate
+                for directory in ("/dev/fd", "/proc/self/fd")
+                if (candidate := Path(directory) / str(descriptor)).exists()
+            ),
+            None,
+        )
+        if descriptor_path is None:
+            raise SQLiteQueryError(
+                "source_descriptor_unavailable",
+                "SQLite source identity cannot be bound safely on this platform.",
+            )
+        connection = sqlite3.connect(
+            f"{descriptor_path.as_uri()}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+        _require_admitted_identity(admitted)
+        return connection, descriptor
+    except BaseException:
+        if connection is not None:
+            connection.close()
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+
+
+def _reject_wal_format(descriptor: int) -> None:
+    try:
+        header = os.read(descriptor, 20)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+    except OSError as error:
+        raise SQLiteQueryError(
+            "source_path_invalid",
+            "SQLite source header could not be read safely.",
+        ) from error
+    if (
+        len(header) == 20
+        and header.startswith(b"SQLite format 3\x00")
+        and 2 in header[18:20]
+    ):
+        raise SQLiteQueryError(
+            "source_wal_not_supported",
+            "SQLite WAL-mode sources are not supported by the inode-bound read "
+            "boundary.",
+        )
+
+
+def _require_admitted_identity(admitted: _AdmittedSQLiteFile) -> None:
+    descriptor: int | None = None
+    try:
+        if stat.S_ISLNK(os.lstat(admitted.path).st_mode):
+            raise SQLiteQueryError(
+                "source_path_changed",
+                "SQLite source path changed after admission.",
+            )
+        descriptor = os.open(
+            admitted.path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        identity = os.fstat(descriptor)
+    except OSError as error:
+        raise SQLiteQueryError(
+            "source_path_changed",
+            "SQLite source path changed after admission.",
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        not stat.S_ISREG(identity.st_mode)
+        or identity.st_dev != admitted.device
+        or identity.st_ino != admitted.inode
+    ):
+        raise SQLiteQueryError(
+            "source_path_changed",
+            "SQLite source path changed after admission.",
+        )
 
 
 def _execute_user_query(

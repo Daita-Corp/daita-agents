@@ -51,15 +51,15 @@ from ...skills.capabilities import (
     SKILL_SAVE_TOOL_NAME,
     SKILL_VIEW_OUTPUT_KIND,
 )
-from .controller import (
-    POSTGRESQL_QUERY_EVIDENCE_KIND,
-    POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
-    POSTGRESQL_UPDATE_EVIDENCE_KIND,
-    SQLITE_QUERY_EVIDENCE_KIND,
-)
 from .capabilities import (
     POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
     POSTGRESQL_UPDATE_TOOL_NAME,
+)
+from .controller import (
+    POSTGRESQL_QUERY_EVIDENCE_KIND,
+    POSTGRESQL_UPDATE_EVIDENCE_KIND,
+    POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
+    SQLITE_QUERY_EVIDENCE_KIND,
 )
 from .export_capabilities import (
     ARTIFACT_CONVERT_TOOL_NAME,
@@ -192,7 +192,6 @@ class DataContextBuilder:
         semantics: SemanticContextReader | None = None,
         artifact_destinations: ArtifactDestinationContextReader | None = None,
         catalog_limit: int = CATALOG_CONTEXT_DEFAULT_LIMIT,
-        retain_messages: int = 40,
     ) -> None:
         if not isinstance(profile, ModelProfile):
             raise TypeError("profile must be ModelProfile")
@@ -221,12 +220,12 @@ class DataContextBuilder:
             raise TypeError(
                 "artifact_destinations must provide bounded safe destination views"
             )
-        for value, field_name in (
-            (catalog_limit, "catalog_limit"),
-            (retain_messages, "retain_messages"),
+        if (
+            not isinstance(catalog_limit, int)
+            or isinstance(catalog_limit, bool)
+            or catalog_limit < 1
         ):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise ValueError(f"{field_name} must be a positive integer")
+            raise ValueError("catalog_limit must be a positive integer")
         self._catalog = catalog
         self._memory = memory
         self._skills = skills

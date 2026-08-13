@@ -64,11 +64,11 @@ from ..domains.data import (
     postgresql_update_preview_declarations,
     sqlite_query_declarations,
 )
+from ..domains.data.context import _project_completed_history
 from ..domains.data.sql import (
     POSTGRESQL_UPDATE_MAX_ASSIGNMENTS,
     validate_postgresql_update_scope,
 )
-from ..domains.data.context import _project_completed_history
 from ..errors import AgentError, StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity
 from ..learning_candidates import (
@@ -133,10 +133,10 @@ from ..storage.sqlite import SQLiteStateStore
 from ..storage.sqlite_records import (
     PostgreSQLUpdateScope,
     SourcePermissionResource,
-    SourcePermissionState,
-    SourcePermissionSummary,
     SourcePermissionsInspection,
     SourcePermissionsPreview,
+    SourcePermissionState,
+    SourcePermissionSummary,
     SourceReadMode,
     SourceReadScope,
     postgresql_update_authorization_fingerprint,
@@ -1115,6 +1115,22 @@ class EmbeddedAgent:
             source_id=source_id,
         )
 
+    async def learn(
+        self,
+        message: str,
+        *,
+        conversation_id: str | None = None,
+        source_id: str | None = None,
+    ) -> LoopExit:
+        """Run one explicit user-authorized foreground learning action."""
+
+        return await self._run(
+            message,
+            conversation_id=conversation_id,
+            source_id=source_id,
+            explicit_learning=True,
+        )
+
     async def _run(
         self,
         message: str,
@@ -1124,6 +1140,7 @@ class EmbeddedAgent:
         learning_candidate_id: str | None = None,
         learning_candidate_text: str | None = None,
         learning_candidate: LearningCandidate | None = None,
+        explicit_learning: bool = False,
     ) -> LoopExit:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
@@ -1158,6 +1175,7 @@ class EmbeddedAgent:
                 learning_candidate_id=learning_candidate_id,
                 learning_candidate_text=learning_candidate_text,
                 learning_candidate=learning_candidate,
+                explicit_learning=explicit_learning,
             )
 
     async def _run_locked(
@@ -1170,6 +1188,7 @@ class EmbeddedAgent:
         learning_candidate_id: str | None,
         learning_candidate_text: str | None,
         learning_candidate: LearningCandidate | None,
+        explicit_learning: bool = False,
         run_id: str | None = None,
     ) -> LoopExit:
         """Run once while the caller owns the foreground lifecycle lock."""
@@ -1265,6 +1284,8 @@ class EmbeddedAgent:
                 run_input.id,
                 cast(LearningCandidate, learning_candidate),
             )
+        if explicit_learning:
+            self._data_tool_runtime.select_explicit_learning_run(run_input.id)
         try:
             return await loop.run(
                 run_input,
@@ -1276,6 +1297,8 @@ class EmbeddedAgent:
                 assert self._data_context_builder is not None
                 self._data_context_builder.clear_learning_candidate(run_input.id)
                 self._data_tool_runtime.clear_learning_candidate(run_input.id)
+            if explicit_learning:
+                self._data_tool_runtime.clear_explicit_learning_run(run_input.id)
 
     async def transcript(self, run_id: str) -> Transcript:
         self._require_open()
@@ -1403,18 +1426,19 @@ class EmbeddedAgent:
     async def select_source(self, selector: str) -> SourceRegistration:
         """Persist one active source as the default for subsequent conversations."""
 
-        async with self._mutation_lock:
-            self._require_open()
-            sources = tuple(
-                source
-                for source in await self._store.list_sources(self.identity.id)
-                if source.active
-            )
-            selected = _resolve_source_selector(selector, sources)
-            return await self._store.set_active_source_id(
-                self.identity.id,
-                selected.id,
-            )
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                sources = tuple(
+                    source
+                    for source in await self._store.list_sources(self.identity.id)
+                    if source.active
+                )
+                selected = _resolve_source_selector(selector, sources)
+                return await self._store.set_active_source_id(
+                    self.identity.id,
+                    selected.id,
+                )
 
     async def read_memory(self) -> str:
         self._require_open()
@@ -1439,22 +1463,23 @@ class EmbeddedAgent:
     ) -> LearningReviewResult:
         """Explicitly trigger one bounded auxiliary review request."""
 
-        self._require_open()
-        if max_estimated_cost_usd is None or self._candidate_reviewer.enabled:
-            return await self._candidate_reviewer.review(
+        async with self._run_lock:
+            self._require_open()
+            if max_estimated_cost_usd is None or self._candidate_reviewer.enabled:
+                return await self._candidate_reviewer.review(
+                    max_estimated_cost_usd=max_estimated_cost_usd,
+                )
+            if self.model_route is None:
+                return await self._candidate_reviewer.review()
+            model, profile = _candidate_reviewer_from_route(
+                self.model_route,
+                secret_provider=self._secret_provider or self._keychain,
+            )
+            return await self._candidate_reviewer.review_with_model(
+                model=model,
+                profile=profile,
                 max_estimated_cost_usd=max_estimated_cost_usd,
             )
-        if self.model_route is None:
-            return await self._candidate_reviewer.review()
-        model, profile = _candidate_reviewer_from_route(
-            self.model_route,
-            secret_provider=self._secret_provider or self._keychain,
-        )
-        return await self._candidate_reviewer.review_with_model(
-            model=model,
-            profile=profile,
-            max_estimated_cost_usd=max_estimated_cost_usd,
-        )
 
     async def list_learning_candidates(
         self,
@@ -1707,12 +1732,13 @@ class EmbeddedAgent:
         *,
         attached_at: datetime,
     ) -> SourceRegistration:
-        async with self._mutation_lock:
-            self._require_open()
-            return await self._attach_source_locked(
-                source,
-                attached_at=attached_at,
-            )
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                return await self._attach_source_locked(
+                    source,
+                    attached_at=attached_at,
+                )
 
     async def _attach_source_locked(
         self,
@@ -1931,17 +1957,18 @@ class EmbeddedAgent:
     ) -> SourcePermissionsPreview:
         """Build and retain one bounded in-process exact confirmation preview."""
 
-        async with self._mutation_lock:
-            self._require_open()
-            inspection = await self._inspect_source_permissions_locked(source_id)
-            preview = await self._build_source_permissions_preview(
-                inspection,
-                read_mode=read_mode,
-                read_resource_ids=read_resource_ids,
-                postgresql_update_scopes=postgresql_update_scopes,
-            )
-            self._source_permission_previews[source_id] = preview
-            return preview
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                inspection = await self._inspect_source_permissions_locked(source_id)
+                preview = await self._build_source_permissions_preview(
+                    inspection,
+                    read_mode=read_mode,
+                    read_resource_ids=read_resource_ids,
+                    postgresql_update_scopes=postgresql_update_scopes,
+                )
+                self._source_permission_previews[source_id] = preview
+                return preview
 
     async def apply_source_permissions(
         self,
@@ -1951,45 +1978,48 @@ class EmbeddedAgent:
     ) -> SourcePermissionsInspection:
         """Revalidate and atomically apply one exact in-process preview."""
 
-        async with self._mutation_lock:
-            self._require_open()
-            preview = self._source_permission_previews.get(source_id)
-            if preview is None or not hmac.compare_digest(
-                preview.confirmation_fingerprint,
-                confirmation_fingerprint,
-            ):
-                raise ValueError(
-                    "permission confirmation is unknown or expired; preview again"
-                )
-            current = await self._inspect_source_permissions_locked(source_id)
-            if current.catalog_generation != preview.catalog_generation:
-                raise ValueError("source catalog changed after preview; preview again")
-            if current.state == preview.after:
-                return current
-            if current.state != preview.before:
-                raise ValueError(
-                    "source permissions changed after preview; preview again"
-                )
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                preview = self._source_permission_previews.get(source_id)
+                if preview is None or not hmac.compare_digest(
+                    preview.confirmation_fingerprint,
+                    confirmation_fingerprint,
+                ):
+                    raise ValueError(
+                        "permission confirmation is unknown or expired; preview again"
+                    )
+                current = await self._inspect_source_permissions_locked(source_id)
+                if current.catalog_generation != preview.catalog_generation:
+                    raise ValueError(
+                        "source catalog changed after preview; preview again"
+                    )
+                if current.state == preview.after:
+                    return current
+                if current.state != preview.before:
+                    raise ValueError(
+                        "source permissions changed after preview; preview again"
+                    )
 
-            update_mapping = {
-                scope.resource_id: scope.allowed_assignment_columns
-                for scope in preview.after.postgresql_update_scopes
-            }
-            revalidated = await self._build_source_permissions_preview(
-                current,
-                read_mode=preview.after.read_scope.mode,
-                read_resource_ids=preview.after.read_scope.resource_ids,
-                postgresql_update_scopes=update_mapping,
-            )
-            if revalidated.after != preview.after:
-                raise ValueError(
-                    "source permission facts changed after preview; preview again"
+                update_mapping = {
+                    scope.resource_id: scope.allowed_assignment_columns
+                    for scope in preview.after.postgresql_update_scopes
+                }
+                revalidated = await self._build_source_permissions_preview(
+                    current,
+                    read_mode=preview.after.read_scope.mode,
+                    read_resource_ids=preview.after.read_scope.resource_ids,
+                    postgresql_update_scopes=update_mapping,
                 )
-            await self._store.replace_source_permission_scopes(
-                preview.after.read_scope,
-                preview.after.postgresql_update_scopes,
-            )
-            return await self._inspect_source_permissions_locked(source_id)
+                if revalidated.after != preview.after:
+                    raise ValueError(
+                        "source permission facts changed after preview; preview again"
+                    )
+                await self._store.replace_source_permission_scopes(
+                    preview.after.read_scope,
+                    preview.after.postgresql_update_scopes,
+                )
+                return await self._inspect_source_permissions_locked(source_id)
 
     async def _inspect_source_permissions_locked(
         self,
@@ -2283,46 +2313,50 @@ class EmbeddedAgent:
         )
 
     async def detach(self, source_id: str) -> SourceRegistration:
-        async with self._mutation_lock:
-            self._require_open()
-            detached = await self._store.detach_source(
-                self.identity.id, source_id, self._clock()
-            )
-            reference = _owned_source_credential_reference(
-                detached,
-                agent_id=self.identity.id,
-            )
-            if reference is not None:
-                try:
-                    await self._keychain.delete(reference)
-                except Exception:
-                    raise AgentHomeError(
-                        "source was detached, but its stored credential "
-                        "could not be deleted"
-                    ) from None
-            return detached
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                detached = await self._store.detach_source(
+                    self.identity.id, source_id, self._clock()
+                )
+                reference = _owned_source_credential_reference(
+                    detached,
+                    agent_id=self.identity.id,
+                )
+                if reference is not None:
+                    try:
+                        await self._keychain.delete(reference)
+                    except Exception:
+                        raise AgentHomeError(
+                            "source was detached, but its stored credential "
+                            "could not be deleted"
+                        ) from None
+                return detached
 
     async def refresh_source(self, source_id: str) -> SourceRegistration:
         """Refresh one active source using its exact admitted registration."""
 
         if not isinstance(source_id, str) or not source_id:
             raise ValueError("source_id must be a non-empty string")
-        async with self._mutation_lock:
-            self._require_open()
-            registration = await self._store.load_source(self.identity.id, source_id)
-            if registration is None or not registration.active:
-                raise ValueError("unknown active source for this agent")
-            source = _source_from_registration(
-                registration,
-                secret_provider=default_secret_provider(
-                    self._secret_provider or self._keychain
-                ),
-            )
-            return await self._attach_source_locked(
-                source,
-                attached_at=registration.attached_at,
-                persisted_registration=registration,
-            )
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                registration = await self._store.load_source(
+                    self.identity.id, source_id
+                )
+                if registration is None or not registration.active:
+                    raise ValueError("unknown active source for this agent")
+                source = _source_from_registration(
+                    registration,
+                    secret_provider=default_secret_provider(
+                        self._secret_provider or self._keychain
+                    ),
+                )
+                return await self._attach_source_locked(
+                    source,
+                    attached_at=registration.attached_at,
+                    persisted_registration=registration,
+                )
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         self._require_open()
@@ -2385,6 +2419,9 @@ class EmbeddedAgent:
             raise asyncio.CancelledError
 
     async def _finish_close(self) -> None:
+        async with self._run_lock:
+            async with self._mutation_lock:
+                pass
         first_error: BaseException | None = None
         for store in (
             self._candidate_reviewer,

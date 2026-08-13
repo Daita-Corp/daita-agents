@@ -10,15 +10,15 @@ from typing import Any, Literal
 
 from ...._installation import repair_guidance
 from .contracts import (
+    _ASCII_IDENTIFIER_CASE_TRANSLATION,
     MAX_SQL_CHARACTERS,
     SqlAnalysis,
     SqlAnalysisError,
     SqlColumnReference,
     SqlTableReference,
     SqlValidationIssue,
-    _ASCII_IDENTIFIER_CASE_TRANSLATION,
-    _SqlDialect,
     _dialect_identifier_key,
+    _SqlDialect,
     normalize_sql,
     sqlite_identifier_key,
 )

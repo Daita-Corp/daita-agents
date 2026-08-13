@@ -24,8 +24,8 @@ from daita.catalog.models import (
     TabularFacet,
     catalog_resource_id,
 )
-from daita.storage.sqlite import SQLiteStateStore
 from daita.storage import sqlite as sqlite_module
+from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_migrations import migration_rows
 from daita.storage.sqlite_records import (
     PostgreSQLUpdateScope,

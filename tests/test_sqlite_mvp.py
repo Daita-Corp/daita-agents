@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from daita import Agent, SQLiteSource
+from daita.adapters import sqlite_query as sqlite_query_module
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -14,6 +15,215 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop import LoopExitKind
+
+
+@pytest.mark.parametrize("execution", ("query", "exact_export"))
+async def test_sqlite_execution_fails_closed_when_admitted_path_is_replaced(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    execution: str,
+):
+    database = tmp_path / f"admitted-{execution}.sqlite"
+    replacement = tmp_path / f"replacement-{execution}.sqlite"
+    for path, value in ((database, "admitted"), (replacement, "replacement")):
+        with sqlite3.connect(path) as connection:
+            connection.execute("CREATE TABLE records (value TEXT)")
+            connection.execute("INSERT INTO records VALUES (?)", (value,))
+    with sqlite3.connect(database) as connection:
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+    admitted = sqlite_query_module._regular_unaliased_path(str(database))
+    original_connect = sqlite_query_module.sqlite3.connect
+    replaced = False
+
+    def replace_before_connection(*args, **kwargs):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            replacement.replace(database)
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sqlite_query_module.sqlite3,
+        "connect",
+        replace_before_connection,
+    )
+
+    with pytest.raises(
+        sqlite_query_module.SQLiteQueryError,
+        match="changed after admission",
+    ):
+        if execution == "query":
+            await sqlite_query_module._run_query(
+                admitted,
+                "SELECT value FROM records",
+                (),
+                expected_schema_version=schema_version,
+                max_rows=10,
+                max_bytes=10_000,
+            )
+        else:
+            await sqlite_query_module._run_exact_tabular(
+                admitted,
+                "SELECT value FROM records",
+                (),
+                format_name="csv",
+                xlsx_provenance=None,
+                expected_schema_version=schema_version,
+                max_rows=10,
+                max_columns=10,
+                max_bytes=10_000,
+                timeout_seconds=5,
+            )
+
+
+async def test_sqlite_execution_fails_closed_on_symlink_substitution(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "admitted-symlink.sqlite"
+    replacement = tmp_path / "replacement-symlink.sqlite"
+    for path in (database, replacement):
+        with sqlite3.connect(path) as connection:
+            connection.execute("CREATE TABLE records (value TEXT)")
+    with sqlite3.connect(database) as connection:
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+    admitted = sqlite_query_module._regular_unaliased_path(str(database))
+    original_connect = sqlite_query_module.sqlite3.connect
+    substituted = False
+
+    def substitute_before_connection(*args, **kwargs):
+        nonlocal substituted
+        if not substituted:
+            substituted = True
+            database.unlink()
+            database.symlink_to(replacement)
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sqlite_query_module.sqlite3,
+        "connect",
+        substitute_before_connection,
+    )
+
+    with pytest.raises(
+        sqlite_query_module.SQLiteQueryError,
+        match="changed after admission",
+    ):
+        await sqlite_query_module._run_query(
+            admitted,
+            "SELECT value FROM records",
+            (),
+            expected_schema_version=schema_version,
+            max_rows=10,
+            max_bytes=10_000,
+        )
+
+
+@pytest.mark.parametrize("execution", ("query", "exact_export"))
+async def test_sqlite_execution_fails_closed_for_live_wal_database(
+    tmp_path,
+    execution: str,
+):
+    database = tmp_path / f"live-wal-{execution}.sqlite"
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone() == ("wal",)
+        connection.execute("CREATE TABLE records (value TEXT)")
+        connection.execute("INSERT INTO records VALUES ('visible-in-wal')")
+        connection.commit()
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+        assert Path(f"{database}-wal").exists()
+
+        admitted = sqlite_query_module._regular_unaliased_path(str(database))
+        with pytest.raises(sqlite_query_module.SQLiteQueryError) as failure:
+            if execution == "query":
+                await sqlite_query_module._run_query(
+                    admitted,
+                    "SELECT value FROM records",
+                    (),
+                    expected_schema_version=schema_version,
+                    max_rows=10,
+                    max_bytes=10_000,
+                )
+            else:
+                await sqlite_query_module._run_exact_tabular(
+                    admitted,
+                    "SELECT value FROM records",
+                    (),
+                    format_name="csv",
+                    xlsx_provenance=None,
+                    expected_schema_version=schema_version,
+                    max_rows=10,
+                    max_columns=10,
+                    max_bytes=10_000,
+                    timeout_seconds=5,
+                )
+        assert failure.value.code == "source_wal_not_supported"
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("execution", ("query", "exact_export"))
+async def test_sqlite_execution_remains_bound_during_aba_path_substitution(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    execution: str,
+):
+    database = tmp_path / f"aba-{execution}.sqlite"
+    replacement = tmp_path / f"aba-replacement-{execution}.sqlite"
+    admitted_stash = tmp_path / f"aba-admitted-{execution}.sqlite"
+    for path, value in ((database, "admitted"), (replacement, "replacement")):
+        with sqlite3.connect(path) as connection:
+            connection.execute("CREATE TABLE records (value TEXT)")
+            connection.execute("INSERT INTO records VALUES (?)", (value,))
+    with sqlite3.connect(database) as connection:
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+    admitted = sqlite_query_module._regular_unaliased_path(str(database))
+    original_connect = sqlite_query_module.sqlite3.connect
+
+    def substitute_only_during_connection(*args, **kwargs):
+        database.rename(admitted_stash)
+        replacement.rename(database)
+        try:
+            return original_connect(*args, **kwargs)
+        finally:
+            database.rename(replacement)
+            admitted_stash.rename(database)
+
+    monkeypatch.setattr(
+        sqlite_query_module.sqlite3,
+        "connect",
+        substitute_only_during_connection,
+    )
+
+    if execution == "query":
+        _columns, rows, _revision = await sqlite_query_module._run_query(
+            admitted,
+            "SELECT value FROM records",
+            (),
+            expected_schema_version=schema_version,
+            max_rows=10,
+            max_bytes=10_000,
+        )
+        assert rows == ({"value": "admitted"},)
+    else:
+        content, _columns, row_count, _revision = (
+            await sqlite_query_module._run_exact_tabular(
+                admitted,
+                "SELECT value FROM records",
+                (),
+                format_name="csv",
+                xlsx_provenance=None,
+                expected_schema_version=schema_version,
+                max_rows=10,
+                max_columns=10,
+                max_bytes=10_000,
+                timeout_seconds=5,
+            )
+        )
+        assert row_count == 1
+        assert b"admitted" in content
+        assert b"replacement" not in content
 
 
 async def test_default_agent_root_uses_final_daita_home(

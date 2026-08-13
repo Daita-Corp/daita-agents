@@ -58,7 +58,7 @@ from ...learning_candidates import (
     candidate_matches_mutation_call,
 )
 from ...llm.models import MessageRole, ToolCall, ToolDefinition, ToolResultBlock
-from ...loop.models import RunInput, Transcript
+from ...loop.models import ClassifiedToolResultsCancelled, RunInput, Transcript
 from ...memory.capabilities import MEMORY_SET_CAPABILITY_ID, MEMORY_SET_TOOL_NAME
 from ...observation import (
     AgentEvent,
@@ -171,25 +171,6 @@ _SEMANTIC_CAPABILITIES = frozenset(
 )
 _EXACT_TABULAR_CAPABILITIES = frozenset(
     {SQLITE_TABULAR_EXPORT_CAPABILITY_ID, POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}
-)
-_SEMANTIC_MANAGEMENT_SIGNALS = (
-    "business meaning",
-    "correct the definition",
-    "define ",
-    "definition",
-    "explicit teaching request",
-    "learn ",
-    " means ",
-    "remember ",
-    "replace ",
-    "resource/field-scoped semantic annotation",
-    "semantic",
-    "should mean",
-    "supersede",
-    "teach ",
-    "teaching material:",
-    "we mean",
-    "when we say",
 )
 
 
@@ -328,6 +309,17 @@ class DataToolRuntime:
         self._artifact_delivery = artifact_delivery
         self._selected_learning_candidates: dict[str, LearningCandidate] = {}
         self._successful_learning_candidate_mutations: set[str] = set()
+        self._explicit_learning_runs: set[str] = set()
+
+    def select_explicit_learning_run(self, run_id: str) -> None:
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("explicit learning run_id must be non-empty text")
+        if self._explicit_learning_runs:
+            raise RuntimeError("explicit learning guard exceeds its live bound")
+        self._explicit_learning_runs.add(run_id)
+
+    def clear_explicit_learning_run(self, run_id: str) -> None:
+        self._explicit_learning_runs.discard(run_id)
 
     def select_learning_candidate(
         self,
@@ -402,7 +394,22 @@ class DataToolRuntime:
         for index, call in enumerate(calls):
             if self._is_side_effecting(call, projected):
                 await finish_reads()
-                results[index] = await self._execute_one(run, call, projected)
+                try:
+                    results[index] = await self._execute_one(run, call, projected)
+                except ClassifiedToolResultsCancelled as cancelled:
+                    if len(cancelled.results) != 1:
+                        raise RuntimeError(
+                            "one tool execution returned multiple classified results"
+                        ) from cancelled
+                    results[index] = cancelled.results[0]
+                    completed = results[: index + 1]
+                    if any(result is None for result in completed):
+                        raise RuntimeError(
+                            "classified cancellation left an incomplete result prefix"
+                        ) from cancelled
+                    raise ClassifiedToolResultsCancelled(
+                        cast(tuple[ToolResultBlock, ...], tuple(completed))
+                    ) from None
             else:
                 reads.append((index, call))
         await finish_reads()
@@ -566,7 +573,7 @@ class DataToolRuntime:
             result = _exception_result(call, error)
         self._emit_tool_completed(run, call, result, started)
         if cancelled_after_mutation:
-            raise asyncio.CancelledError
+            raise ClassifiedToolResultsCancelled((result,))
         return result
 
     async def _commit_artifact_output(
@@ -2448,7 +2455,7 @@ class DataToolRuntime:
             if selected_candidate is None
             else _learning_candidate_mutation_tool(selected_candidate)
         )
-        semantic_requested = _semantic_management_requested(run.message)
+        semantic_requested = run.id in self._explicit_learning_runs
         artifact_refs = (
             ()
             if self._artifacts is None
@@ -2589,11 +2596,6 @@ def _learning_candidate_mutation_tool(candidate: LearningCandidate) -> str:
     )
 
 
-def _semantic_management_requested(message: str) -> bool:
-    normalized = " ".join(message.casefold().split())
-    return any(signal in normalized for signal in _SEMANTIC_MANAGEMENT_SIGNALS)
-
-
 def _without_runtime_owned_semantic_evidence(
     arguments: Mapping[str, object],
 ) -> Mapping[str, object]:
@@ -2630,6 +2632,10 @@ async def _execute_definitely(
         except asyncio.CancelledError:
             cancelled = True
             continue
+        except BaseException:
+            if worker.done():
+                break
+            raise
     try:
         return worker.result(), None, cancelled
     except BaseException as error:
@@ -2652,7 +2658,7 @@ def _exception_result(call: ToolCall, error: BaseException) -> ToolResultBlock:
     return _error(
         call,
         "tool_execution_failed",
-        f"{type(error).__name__}: {error}",
+        "The tool could not complete because of an unexpected internal error.",
     )
 
 

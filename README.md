@@ -103,9 +103,10 @@ model like any other result, so it can correct the call on the next step. The
 loop has bounded steps, wall time, tokens, and estimated cost; it does not add
 a verifier pass or a session runtime.
 
-Data access remains read only. SQL and local paths are checked against the
-current catalog before source I/O, and every requested tool call receives one
-ordered result even if another call fails.
+Data access is read first. All current data tools are non-side-effecting reads
+except the explicitly scoped PostgreSQL one-row update. SQL and local paths are
+checked against the current catalog before source I/O, and every requested tool
+call receives one ordered result even if another call fails.
 
 Agent identity, source registrations, catalog snapshots, transcripts, and
 terminal results live in a small SQLite database inside the agent home.

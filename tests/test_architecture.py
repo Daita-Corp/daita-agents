@@ -1,4 +1,5 @@
 import ast
+import inspect
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -9,6 +10,13 @@ from daita.storage.sqlite import SQLiteStateStore
 
 PACKAGE = Path(daita.__file__).parent
 ROOT = PACKAGE.parents[1]
+
+
+def test_public_agent_facade_cannot_replace_composed_context_or_tool_runtime():
+    for method in (daita.Agent.create, daita.Agent.open):
+        parameters = inspect.signature(method).parameters
+        assert "context_builder" not in parameters
+        assert "tools" not in parameters
 
 
 def _python_text(root: Path) -> str:
@@ -172,7 +180,8 @@ def test_survivor_docs_and_examples_describe_only_the_mvp():
 
     for required in (
         "at most 8 runs, 40 messages, and 24,000 UTF-8 bytes",
-        "Data access remains read-only",
+        "Data access is read first",
+        "explicitly scoped PostgreSQL one-row update",
         "foreground",
         "in-process approve-once callback",
         "does not persist events, collect telemetry",
@@ -417,7 +426,9 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
     assert "semantic-maintenance" in semantics
     assert "review material only" in context
     assert "_decorate_semantic_view" in controller
-    assert "_semantic_management_requested" in controller
+    assert "_semantic_management_requested" not in controller
+    assert "_SEMANTIC_MANAGEMENT_SIGNALS" not in controller
+    assert "select_explicit_learning_run" in controller
     assert "_semantic_maintenance_requested" in controller
     assert "capability.id in _SEMANTIC_CAPABILITIES" in controller
     assert "semantic_annotations" in storage

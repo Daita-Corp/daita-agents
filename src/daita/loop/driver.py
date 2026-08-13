@@ -43,7 +43,14 @@ from ..llm.protocols import (
     provider_has_complete_pricing,
 )
 from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
-from .models import LoopExit, LoopExitKind, LoopLimits, RunInput, Transcript
+from .models import (
+    ClassifiedToolResultsCancelled,
+    LoopExit,
+    LoopExitKind,
+    LoopLimits,
+    RunInput,
+    Transcript,
+)
 
 _T = TypeVar("_T")
 
@@ -265,10 +272,46 @@ class AgentLoop:
                         artifact_deliveries=tuple(artifact_deliveries),
                     )
 
-                results = await _before(
-                    deadline,
-                    self._tools.execute_all(run, response.tool_calls),
-                )
+                try:
+                    results = await _before(
+                        deadline,
+                        self._tools.execute_all(run, response.tool_calls),
+                    )
+                except ClassifiedToolResultsCancelled as cancelled:
+                    results = cancelled.results
+                    if len(results) > len(response.tool_calls) or any(
+                        result.call_id != call.id
+                        for call, result in zip(
+                            response.tool_calls, results, strict=False
+                        )
+                    ):
+                        raise ValueError(
+                            "tool runtime returned an invalid classified result prefix"
+                        ) from cancelled
+                    for result in results:
+                        await _complete_before_cancellation(
+                            self._transcripts.append(
+                                run.id,
+                                CanonicalMessage(
+                                    role=MessageRole.TOOL,
+                                    content=(result,),
+                                ),
+                            )
+                        )
+                        messages = (
+                            *messages,
+                            CanonicalMessage(
+                                role=MessageRole.TOOL,
+                                content=(result,),
+                            ),
+                        )
+                        artifact = _artifact_ref(result)
+                        if artifact is not None:
+                            artifacts.append(artifact)
+                        receipt = _artifact_delivery(result)
+                        if receipt is not None:
+                            artifact_deliveries.append(receipt)
+                    raise
                 if len(results) != len(response.tool_calls) or any(
                     result.call_id != call.id
                     for call, result in zip(response.tool_calls, results, strict=True)
@@ -327,7 +370,7 @@ class AgentLoop:
                 artifact_deliveries=tuple(artifact_deliveries),
             )
         except asyncio.CancelledError:
-            await self._finish(
+            await self._finish_best_effort(
                 run,
                 LoopExitKind.INTERRUPTED,
                 "cancelled",
@@ -372,6 +415,18 @@ class AgentLoop:
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
             )
+        except Exception:
+            await self._finish_best_effort(
+                run,
+                LoopExitKind.FAILED,
+                "unexpected_internal_error",
+                _completed_steps(messages[current_start:]),
+                usage,
+                run_started,
+                artifacts=tuple(artifacts),
+                artifact_deliveries=tuple(artifact_deliveries),
+            )
+            raise
 
     async def _wrap_up(
         self,
@@ -446,6 +501,17 @@ class AgentLoop:
             _duration_ms(model_started) if model_started is not None else None
         )
         usage = _add_usage(usage, response.usage)
+        if response.tool_calls:
+            return await self._finish(
+                run,
+                LoopExitKind.FAILED,
+                "tool_free_wrap_up_returned_tool_calls",
+                steps,
+                usage,
+                run_started,
+                artifacts=artifacts,
+                artifact_deliveries=artifact_deliveries,
+            )
         assistant = _assistant_message(response)
         await self._transcripts.append(run.id, assistant)
         if self._observer is not None:
@@ -539,6 +605,34 @@ class AgentLoop:
                 },
             )
         return result
+
+    async def _finish_best_effort(
+        self,
+        run: RunInput,
+        kind: LoopExitKind,
+        reason: str,
+        steps: int,
+        usage: ModelUsage,
+        run_started: float,
+        *,
+        artifacts: tuple[ArtifactRef, ...] = (),
+        artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...] = (),
+    ) -> None:
+        try:
+            await _complete_before_cancellation(
+                self._finish(
+                    run,
+                    kind,
+                    reason,
+                    steps,
+                    usage,
+                    run_started,
+                    artifacts=artifacts,
+                    artifact_deliveries=artifact_deliveries,
+                )
+            )
+        except BaseException:
+            pass
 
     def _emit_model_completed(
         self,
@@ -750,6 +844,19 @@ def _duration_ms(started: float) -> int:
 async def _before(deadline: float, awaitable: Awaitable[_T]) -> _T:
     async with asyncio.timeout_at(deadline):
         return await awaitable
+
+
+async def _complete_before_cancellation(awaitable: Awaitable[_T]) -> _T:
+    async def complete() -> _T:
+        return await awaitable
+
+    worker = asyncio.create_task(complete())
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            continue
+    return worker.result()
 
 
 __all__ = [

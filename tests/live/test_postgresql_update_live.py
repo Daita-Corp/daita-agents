@@ -27,8 +27,10 @@ import pytest
 
 from daita import Agent, LoopLimits, create_llm_provider
 from daita._json import canonical_json
-from daita.adapters import postgresql as postgresql_module
-from daita.adapters import postgresql_write as write_module
+from daita.adapters import (
+    postgresql as postgresql_module,
+    postgresql_write as write_module,
+)
 from daita.adapters.models import DiscoveryRequest, SourceRegistration
 from daita.capabilities import ApprovalDecision, ApprovalRequest
 from daita.catalog.models import ResourceKind, TabularColumn, catalog_resource_id

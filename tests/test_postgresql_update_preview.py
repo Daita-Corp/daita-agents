@@ -8,20 +8,22 @@ import pytest
 
 from daita import Agent
 from daita._json import canonical_json
-from daita.adapters import postgresql as postgresql_module
-from daita.adapters import postgresql_write as write_module
+from daita.adapters import (
+    postgresql as postgresql_module,
+    postgresql_write as write_module,
+)
 from daita.adapters.models import (
     DiscoveryRequest,
     SourceRegistration,
     source_registration_id,
 )
-from daita.catalog.models import ResourceKind, TabularColumn, catalog_resource_id
 from daita.capabilities import CapabilityInputError, CapabilityRegistry
+from daita.catalog.models import ResourceKind, TabularColumn, catalog_resource_id
+from daita.domains.data import context as context_module
 from daita.domains.data.capabilities import (
     POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
     postgresql_update_preview_declarations,
 )
-from daita.domains.data import context as context_module
 from daita.domains.data.controller import POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND
 from daita.domains.data.sql import PostgreSQLUpdateIntent, ResourceSchema
 from daita.llm.models import (

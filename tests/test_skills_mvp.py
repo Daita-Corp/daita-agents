@@ -11,6 +11,7 @@ import pytest
 
 import daita.skills.store as skill_module
 from daita import Agent, SQLiteSource
+from daita.hosting.embedded import EmbeddedAgent
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -875,13 +876,15 @@ async def test_custom_context_builder_remains_unwrapped(tmp_path):
     provider = MockModelProvider((_stop(),))
     context = CustomContext()
     tools = NoTools()
-    agent = await Agent.create(
-        "custom-skill-context",
-        root=tmp_path,
-        model=provider,
-        model_profile=_profile(provider),
-        context_builder=context,
-        tools=tools,
+    agent = Agent(
+        await EmbeddedAgent.create(
+            "custom-skill-context",
+            root=tmp_path,
+            model=provider,
+            model_profile=_profile(provider),
+            context_builder=context,
+            tools=tools,
+        )
     )
     try:
         await agent.save_skill("procedure", "SKILL_INDEX_SENTINEL", "SECRET_BODY")

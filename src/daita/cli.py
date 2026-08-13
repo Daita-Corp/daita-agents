@@ -267,7 +267,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run one agent request")
     run.add_argument("name")
     run.add_argument("message")
-    run.add_argument("--model", required=True, help="provider:model")
+    run.add_argument(
+        "--model",
+        help="provider:model override for this invocation only",
+    )
     run.add_argument("--base-url")
     run.add_argument("--context-window", type=int)
     run.add_argument("--max-output", type=int)
@@ -1272,19 +1275,33 @@ async def _execute(args: argparse.Namespace) -> object:
         finally:
             await agent.close()
     if args.command == "run":
-        provider, profile = _model_configuration(
-            args.model,
-            base_url=args.base_url,
-            context_window=args.context_window,
-            max_output=args.max_output,
-        )
-        agent = await Agent.open(
-            args.name,
-            root=args.root,
-            model=provider,
-            model_profile=profile,
-            observer=_write_event_jsonl if args.events_jsonl else None,
-        )
+        if args.model is None and any(
+            value is not None
+            for value in (args.base_url, args.context_window, args.max_output)
+        ):
+            raise ValueError(
+                "--base-url, --context-window, and --max-output require --model"
+            )
+        if args.model is None:
+            agent = await Agent.open(
+                args.name,
+                root=args.root,
+                observer=_write_event_jsonl if args.events_jsonl else None,
+            )
+        else:
+            provider, profile = _model_configuration(
+                args.model,
+                base_url=args.base_url,
+                context_window=args.context_window,
+                max_output=args.max_output,
+            )
+            agent = await Agent.open(
+                args.name,
+                root=args.root,
+                model=provider,
+                model_profile=profile,
+                observer=_write_event_jsonl if args.events_jsonl else None,
+            )
         try:
             result = await agent.run(
                 args.message,

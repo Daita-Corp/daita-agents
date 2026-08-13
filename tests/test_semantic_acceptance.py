@@ -221,13 +221,13 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         clock=lambda: NOW,
     )
     try:
-        first = await agent.run("When we say booked revenue, use invoices.booked_at.")
+        first = await agent.learn("When we say booked revenue, use invoices.booked_at.")
         assert first.final_text == "definition saved"
         teaching = _learning_invocation_message(
             "/learn Correct booked revenue to exclude completed refunds."
         )
         assert teaching is not None
-        second = await agent.run(teaching)
+        second = await agent.learn(teaching)
         assert second.final_text == "definition corrected"
         skill = await agent.run("/monthly-report Apply it to invoices.")
         assert skill.final_text == "skill applied"
@@ -381,6 +381,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
             conversation_id="semantic-read-conversation",
             source_id=source.id,
         )
+        runtime.select_explicit_learning_run(read_run.id)
         listed = (
             await runtime.execute_all(
                 read_run,
@@ -418,6 +419,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         assert conflict_maintenance["state"] == "conflicting"
         assert conflict_maintenance["usable_as_current_meaning"] is False
         assert conflict_maintenance["requires_revalidation"] is True
+        runtime.clear_explicit_learning_run(read_run.id)
 
         output = io.StringIO()
         handled = await _handle_knowledge_command(

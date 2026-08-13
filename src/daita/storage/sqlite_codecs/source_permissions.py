@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from ..sqlite_records import PostgreSQLUpdateScope, SourceReadMode, SourceReadScope
 from .common import (
-    JsonValue,
     dump_payload,
     integer,
     load_payload,

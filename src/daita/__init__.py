@@ -1,8 +1,8 @@
 """Daita agent."""
 
 from .adapters import LocalDirectorySource, PostgreSQLSource, SQLiteSource
-from .agent import Agent
 from .adapters.postgresql_write import PostgreSQLUpdateReadiness
+from .agent import Agent
 from .artifacts import (
     ArtifactDeliveryReceipt,
     ArtifactDestination,

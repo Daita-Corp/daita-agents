@@ -16,8 +16,10 @@ from .adapters.postgresql import (
     PostgreSQLSourceError,
 )
 from .adapters.postgresql_write import PostgreSQLUpdateReadiness
-from .adapters.protocols import ResourceAdapterError as SourceRefreshError
-from .adapters.protocols import ResourceSource
+from .adapters.protocols import (
+    ResourceAdapterError as SourceRefreshError,
+    ResourceSource,
+)
 from .artifacts.models import (
     ArtifactDeliveryReceipt,
     ArtifactDestination,
@@ -54,7 +56,6 @@ from .llm.models import ModelProfile
 from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
-from .loop.driver import ContextBuilder, ToolRuntime
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
 from .observation import AgentObserver
 from .security import KeychainStore, SecretProvider, SecretReference
@@ -109,8 +110,6 @@ class Agent:
         config: AgentConfig | None = None,
         model: ModelProvider | None = None,
         model_profile: ModelProfile | None = None,
-        context_builder: ContextBuilder | None = None,
-        tools: ToolRuntime | None = None,
         limits: LoopLimits | None = None,
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
@@ -132,8 +131,6 @@ class Agent:
                 config=config,
                 model=model,
                 model_profile=model_profile,
-                context_builder=context_builder,
-                tools=tools,
                 limits=limits,
                 clock=clock,
                 id_factory=id_factory,
@@ -158,8 +155,6 @@ class Agent:
         config: AgentConfig | None = None,
         model: ModelProvider | None = None,
         model_profile: ModelProfile | None = None,
-        context_builder: ContextBuilder | None = None,
-        tools: ToolRuntime | None = None,
         limits: LoopLimits | None = None,
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
@@ -181,8 +176,6 @@ class Agent:
                 config=config,
                 model=model,
                 model_profile=model_profile,
-                context_builder=context_builder,
-                tools=tools,
                 limits=limits,
                 clock=clock,
                 id_factory=id_factory,
@@ -280,6 +273,21 @@ class Agent:
         source_id: str | None = None,
     ) -> LoopExit:
         return await self._embedded.run(
+            message,
+            conversation_id=conversation_id,
+            source_id=source_id,
+        )
+
+    async def learn(
+        self,
+        message: str,
+        *,
+        conversation_id: str | None = None,
+        source_id: str | None = None,
+    ) -> LoopExit:
+        """Run one explicit user-authorized foreground learning action."""
+
+        return await self._embedded.learn(
             message,
             conversation_id=conversation_id,
             source_id=source_id,

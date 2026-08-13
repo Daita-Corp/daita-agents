@@ -2325,7 +2325,11 @@ async def _run_message(
     run_arguments: dict[str, Any] = {"conversation_id": conversation_id}
     if override_source_id is not None:
         run_arguments["source_id"] = override_source_id
-    run_request = agent.run(effective_message, **run_arguments)
+    run_request = (
+        agent.learn(str(effective_message), **run_arguments)
+        if isinstance(effective_message, _LearningInvocation)
+        else agent.run(effective_message, **run_arguments)
+    )
     run = asyncio.create_task(run_request)
     try:
         return await run
@@ -4103,6 +4107,10 @@ async def _skill_invocation_message(agent: Agent, message: str) -> str | None:
     return message if skill is not None else None
 
 
+class _LearningInvocation(str):
+    """Process-local marker for the explicit /learn control-plane action."""
+
+
 def _learning_invocation_message(message: str) -> str | None:
     parts = message.split(maxsplit=1)
     if not parts or parts[0] != "/learn":
@@ -4110,7 +4118,7 @@ def _learning_invocation_message(message: str) -> str | None:
     if len(parts) == 1 or not parts[1].strip():
         raise ValueError("usage: /learn <material>")
     material = parts[1].strip()
-    return (
+    return _LearningInvocation(
         "Treat the following as an explicit teaching request. Determine whether it "
         "belongs in stable user preferences, agent-wide business memory, a current "
         "resource/field-scoped semantic annotation, or a reusable procedural skill. "

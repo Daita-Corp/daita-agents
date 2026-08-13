@@ -31,7 +31,8 @@ copy them into SQLite.
   first-open admission plus the structured CLI/TUI failure already provides the
   required operational path without creating a second public surface.
 - Each published durable change has one immutable migration file. The current
-  ledger therefore has separate receipt-table and PostgreSQL-admission entries.
+  ledger therefore has separate receipt-table, historical PostgreSQL-admission,
+  and scoped-source-permission entries.
 
 ## Ownership and ledger rules
 
@@ -60,11 +61,12 @@ layers do not implement alternate compatibility paths.
 ## Persisted-record codecs
 
 Record shape evolution is separate from database migration. SQLite persistence
-uses explicit codecs for identity/identifiers, sources, receipts, catalog
-syncs/snapshots, artifact references, transcript/run records, semantic
-annotations, and learning candidates/review stamps. Each codec declares its
-required fields, additive defaults, nested records, enums, datetimes, decimals,
-and unknown-field policy. Stored class-name text never selects a Python type.
+uses explicit codecs for identity/identifiers, sources, source-permission
+scopes, receipts, catalog syncs/snapshots, artifact references, transcript/run
+records, semantic annotations, and learning candidates/review stamps. Each
+codec declares its required fields, additive defaults, nested records, enums,
+datetimes, decimals, and unknown-field policy. Stored class-name text never
+selects a Python type.
 
 An additive payload default that leaves the physical schema and invariants
 unchanged is a codec change, not a ledger entry. A physical table, index,
@@ -105,8 +107,8 @@ and detach deletes both scope families atomically.
 
 Source refresh is not reattachment or configuration mutation. It reopens the
 persisted registration for discovery and atomically replaces catalog truth only
-after discovery succeeds. It cannot change admission, credentials, identity, or
-attachment lifecycle.
+after discovery succeeds. It cannot change permission scopes, credentials,
+identity, or attachment lifecycle.
 
 ## Release certification
 
@@ -114,8 +116,8 @@ Every durable revision adds focused fixture and migration contracts. The suite
 must prove exact journal validation, fresh stamping, current no-write open,
 known-prefix traversal, preledger admission, row/file preservation, rollback,
 cancellation, downgrade refusal, legacy/damage classification, diagnostics,
-lock release, credential-reference preservation, codec compatibility, and
-write-admission cutover.
+lock release, credential-reference preservation, codec compatibility, and the
+historical-admission/scoped-permission cutover.
 
 Before publishing, build the baseline and candidate wheels once, then run the
 isolated two-wheel lifecycle:

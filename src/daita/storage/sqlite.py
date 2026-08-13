@@ -120,8 +120,8 @@ from .sqlite_records import (
     SourceReadScope,
     database_write_aware as _database_write_aware,
     database_write_receipt_id,
-    postgresql_update_authorization_fingerprint,
     database_write_text as _database_write_text,
+    postgresql_update_authorization_fingerprint,
     validate_database_write_receipt_id,
 )
 from .sqlite_schema import (

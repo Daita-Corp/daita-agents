@@ -208,3 +208,23 @@ def test_postgresql_query_error_remains_structured_at_tool_result_boundary() -> 
     details = error["details"]
     assert isinstance(details, Mapping)
     assert dict(details) == {}
+
+
+def test_unexpected_executor_error_is_redacted_at_tool_result_boundary() -> None:
+    call = ToolCall(id="call-secret", name="data_query_postgresql")
+
+    result = data_controller._exception_result(
+        call,
+        RuntimeError("secret=/tmp/private-connection-fragment"),
+    )
+
+    assert result.is_error is True
+    serialized = repr(result.output)
+    assert "secret=" not in serialized
+    assert "/tmp/private-connection-fragment" not in serialized
+    error = result.output["error"]
+    assert isinstance(error, Mapping)
+    assert error["code"] == "tool_execution_failed"
+    assert error["message"] == (
+        "The tool could not complete because of an unexpected internal error."
+    )

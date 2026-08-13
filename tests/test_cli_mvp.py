@@ -12,6 +12,7 @@ import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -504,6 +505,72 @@ def test_current_run_writes_exactly_one_terminal_json_record_to_stdout():
     assert records[0]["text"] == "bounded answer"
     assert {"run_id", "status", "reason", "text", "steps"} <= set(records[0])
     provider.assert_consumed()
+
+
+def test_run_without_model_opens_the_persisted_route_without_injection():
+    result = SimpleNamespace(
+        run_id="run-persisted",
+        conversation_id="conversation-persisted",
+        kind=SimpleNamespace(value="completed"),
+        reason="completed",
+        final_text="persisted answer",
+        steps=1,
+        artifacts=(),
+        artifact_deliveries=(),
+    )
+    agent = AsyncMock()
+    agent.run.return_value = result
+    arguments = cli.build_parser().parse_args(["run", "runner", "use persisted route"])
+
+    with (
+        patch.object(Agent, "open", new=AsyncMock(return_value=agent)) as opened,
+        patch.object(
+            cli,
+            "_model_configuration",
+            side_effect=AssertionError("default run must not construct an override"),
+        ),
+    ):
+        record = asyncio.run(cli._execute(arguments))
+
+    assert isinstance(record, dict)
+    assert record["text"] == "persisted answer"
+    opened.assert_awaited_once_with("runner", root=None, observer=None)
+    agent.run.assert_awaited_once_with(
+        "use persisted route",
+        conversation_id=None,
+    )
+    agent.close.assert_awaited_once()
+
+
+def test_run_override_options_require_an_explicit_invocation_local_model():
+    arguments = cli.build_parser().parse_args(
+        ["run", "runner", "question", "--base-url", "https://models.invalid"]
+    )
+
+    with pytest.raises(ValueError, match="require --model"):
+        asyncio.run(cli._execute(arguments))
+
+
+def test_run_without_model_reports_missing_persisted_configuration():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        create_code, _stdout, _stderr = _invoke(
+            ["--root", str(root), "create", "unconfigured-runner"]
+        )
+        assert create_code == 0
+        code, stdout, stderr = _invoke(
+            [
+                "--root",
+                str(root),
+                "run",
+                "unconfigured-runner",
+                "question",
+            ]
+        )
+
+    assert code == 1
+    assert stdout == ""
+    assert "agent execution requires a model" in stderr.lower()
 
 
 def test_current_diagnostics_use_stderr_and_leave_stdout_empty():

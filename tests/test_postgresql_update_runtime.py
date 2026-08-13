@@ -9,31 +9,33 @@ import pytest
 
 from daita import Agent
 from daita._json import canonical_json
-from daita.adapters import postgresql as postgresql_module
-from daita.adapters import postgresql_write as write_module
+from daita.adapters import (
+    postgresql as postgresql_module,
+    postgresql_write as write_module,
+)
 from daita.adapters.models import (
     DiscoveryRequest,
     SourceRegistration,
     source_registration_id,
 )
-from daita.catalog.models import ResourceKind, catalog_resource_id
 from daita.capabilities import (
     ApprovalDecision,
     ApprovalRequest,
     CapabilityRegistry,
     ToolExecution,
 )
+from daita.catalog.models import ResourceKind, catalog_resource_id
+from daita.domains.data import context as context_module
 from daita.domains.data.capabilities import (
     POSTGRESQL_UPDATE_TOOL_NAME,
     PostgreSQLPreviewFingerprint,
+    PostgreSQLUpdateExecutor,
     PostgreSQLUpdatePreview,
     PostgreSQLUpdatePreviewChecks,
     PostgreSQLUpdateResult,
-    PostgreSQLUpdateExecutor,
     postgresql_update_declarations,
     postgresql_update_preview_declarations,
 )
-from daita.domains.data import context as context_module
 from daita.domains.data.controller import (
     POSTGRESQL_UPDATE_CAPABILITY_ID,
     DataToolRuntime,
@@ -42,12 +44,15 @@ from daita.domains.data.sql import PostgreSQLUpdateCommand, PostgreSQLUpdateInte
 from daita.llm.models import (
     FinishReason,
     MessageRole,
+    ModelRequest,
     ModelResponse,
     TextBlock,
     ToolCall,
+    ToolDefinition,
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.loop import AgentLoop, InMemoryTranscriptStore, LoopExitKind
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite import DatabaseWriteOutcome, DatabaseWriteReceipt
@@ -1393,6 +1398,95 @@ async def test_runtime_cancellation_waits_for_definite_executor_completion() -> 
     backend.execute_gate.set()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert len(backend.executions) == 1
+
+
+class _RuntimeTranscriptContext:
+    async def build(
+        self,
+        run: RunInput,
+        messages,
+        tools: tuple[ToolDefinition, ...],
+        *,
+        step: int,
+        final: bool = False,
+    ) -> ModelRequest:
+        del run, step, final
+        return ModelRequest(messages=messages, tools=tools)
+
+
+@pytest.mark.parametrize("outcome_unknown", (False, True))
+async def test_cancelled_loop_persists_classified_write_result_before_interrupt(
+    outcome_unknown: bool,
+) -> None:
+    lock = asyncio.Lock()
+    backend = _RuntimeBackend(lock)
+    backend.execute_gate = asyncio.Event()
+    receipt_id = "database-write-receipt:sha256:" + "a" * 64
+    if outcome_unknown:
+        backend.execute_error = write_module.PostgreSQLUpdateExecutionError(
+            "write_outcome_unknown",
+            "Commit certainty was lost.",
+            {
+                "receipt_id": receipt_id,
+                "outcome": "outcome_unknown",
+                "affected_rows": None,
+            },
+        )
+
+    async def approve(request: ApprovalRequest):
+        del request
+        return ApprovalDecision.APPROVE
+
+    transcripts = InMemoryTranscriptStore()
+    loop = AgentLoop(
+        model=MockModelProvider(
+            (
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=(_runtime_call(),),
+                ),
+            )
+        ),
+        context_builder=_RuntimeTranscriptContext(),
+        tools=_runtime_with_backend(backend, lock, approve),
+        transcripts=transcripts,
+        clock=lambda: NOW,
+    )
+    task = asyncio.create_task(loop.run(_runtime_run()))
+    await backend.execute_started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    backend.execute_gate.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    transcript = await transcripts.load(_runtime_run().id)
+    tool_messages = tuple(
+        message for message in transcript.messages if message.role is MessageRole.TOOL
+    )
+    assert len(tool_messages) == 1
+    result = tool_messages[0].content[0]
+    assert isinstance(result, ToolResultBlock)
+    assert result.call_id == _runtime_call().id
+    if outcome_unknown:
+        assert _runtime_error(result) == "write_outcome_unknown"
+        error = result.output["error"]
+        assert isinstance(error, Mapping)
+        details = error["details"]
+        assert isinstance(details, Mapping)
+        assert details["receipt_id"] == receipt_id
+        assert details["outcome"] == "outcome_unknown"
+    else:
+        assert result.is_error is False
+        data = result.output["data"]
+        assert isinstance(data, Mapping)
+        assert data["receipt_id"] == receipt_id
+    terminal = await transcripts.result(_runtime_run().id)
+    assert terminal is not None
+    assert terminal.kind is LoopExitKind.INTERRUPTED
     assert len(backend.executions) == 1
 
 

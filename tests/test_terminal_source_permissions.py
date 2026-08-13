@@ -10,10 +10,10 @@ from daita.catalog.models import ResourceKind, catalog_resource_id
 from daita.storage.sqlite_records import (
     PostgreSQLUpdateScope,
     SourcePermissionResource,
-    SourcePermissionState,
-    SourcePermissionSummary,
     SourcePermissionsInspection,
     SourcePermissionsPreview,
+    SourcePermissionState,
+    SourcePermissionSummary,
     SourceReadMode,
     SourceReadScope,
 )

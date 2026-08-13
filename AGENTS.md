@@ -413,7 +413,7 @@ specific agent loop.
 | `src/daita/capabilities.py` | capability declarations and registry |
 | `src/daita/domains/data/context.py` | current model request construction |
 | `src/daita/domains/data/controller.py` | tool projection and execution boundary |
-| `src/daita/domains/data/sql.py` | catalog-scoped SQL validation |
+| `src/daita/domains/data/sql/` | catalog-scoped SQL validation |
 | `src/daita/catalog/service.py` | normalized catalog lifecycle |
 | `src/daita/storage/sqlite.py` | sole durable state operation/admission boundary |
 | `src/daita/storage/sqlite_schema.py` | exact physical schemas and validators |

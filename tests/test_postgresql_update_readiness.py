@@ -9,8 +9,10 @@ import pytest
 
 from daita import Agent, PostgreSQLSource, PostgreSQLUpdateReadiness
 from daita._json import canonical_json
-from daita.adapters import postgresql as postgresql_module
-from daita.adapters import postgresql_write as write_module
+from daita.adapters import (
+    postgresql as postgresql_module,
+    postgresql_write as write_module,
+)
 from daita.adapters.models import SourceRegistration
 from daita.catalog.models import ResourceKind, TabularColumn
 from daita.domains.data.sql import (

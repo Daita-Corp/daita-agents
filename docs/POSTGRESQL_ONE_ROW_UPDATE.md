@@ -119,13 +119,17 @@ shared staging data, a persistent customer database, or
 1. Close other Daita processes using the temporary root.
 2. Start the fixture externally and wait for its health check.
 3. Use a new root under `/private/tmp` and attach only `write_canary` with the
-   `daita_writer` credential. Confirm the returned registration is read-only.
+   `daita_writer` credential. Inspect its permissions and confirm `all` read
+   access with zero exact update scopes; the public registration contains no
+   permission projection.
 4. Run readiness for `write_canary.accounts` and assignment column `status`.
+   Confirm it returns `resource_update_not_allowed` before source I/O.
 5. Configure the exact table and assignment-column scope through
    `/source permissions`.
-6. Confirm current native PostgreSQL privilege readiness.
-7. Rerun readiness and request a preview for canary key `42`. Confirm the exact
-   before/after value without approving an unintended assignment.
+6. Rerun readiness and confirm both the exact Daita scope and native PostgreSQL
+   privileges are ready.
+7. Request a preview for canary key `42`. Confirm the exact before/after value
+   without approving an unintended assignment.
 8. Approve the exact once-only update card. Confirm one committed row, one
    receipt, and agreement between result and receipt identity.
 9. Read the row independently and verify the intended after-state.

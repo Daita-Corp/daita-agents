@@ -44,11 +44,6 @@ from daita.semantics import (
     SemanticSubject,
 )
 from daita.storage.sqlite import DatabaseWriteOutcome, DatabaseWriteReceipt
-from daita.storage.sqlite_records import (
-    PostgreSQLUpdateScope,
-    SourceReadMode,
-    SourceReadScope,
-)
 from daita.storage.sqlite_codecs import (
     decode_catalog_snapshot,
     decode_catalog_sync,
@@ -78,6 +73,11 @@ from daita.storage.sqlite_codecs import (
     encode_semantic_annotation,
     encode_source,
     encode_source_read_scope,
+)
+from daita.storage.sqlite_records import (
+    PostgreSQLUpdateScope,
+    SourceReadMode,
+    SourceReadScope,
 )
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)

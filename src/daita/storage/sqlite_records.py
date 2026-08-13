@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
-from collections.abc import Iterable, Mapping
 
 from .._json import canonical_json
 from ..adapters.models import SourceRegistration

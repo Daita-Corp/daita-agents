@@ -29,8 +29,8 @@ from ..domains.data.capabilities import (
     PostgreSQLUpdateResult,
 )
 from ..domains.data.controller import (
-    POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
     POSTGRESQL_UPDATE_CAPABILITY_ID,
+    POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
     PostgreSQLUpdateCatalogReader,
 )
 from ..domains.data.sql import (

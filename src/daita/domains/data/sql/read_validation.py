@@ -7,11 +7,11 @@ from typing import Literal
 
 from .analysis import (
     _MAX_CANDIDATES,
-    _LexicalRelation,
-    _LexicalScope,
     _direct_scope_columns,
     _explain_prefix,
     _is_legal_output_alias,
+    _LexicalRelation,
+    _LexicalScope,
     _load_sqlglot,
     _relation_column_matches,
     _scope_projection,
@@ -22,6 +22,7 @@ from .analysis import (
     analyze_sqlite_sql,
 )
 from .contracts import (
+    _ASCII_IDENTIFIER_CASE_TRANSLATION,
     MAX_SQL_PARAMETERS,
     ResourceSchema,
     SqlAnalysisError,
@@ -29,11 +30,10 @@ from .contracts import (
     SqlTableReference,
     SqlValidationIssue,
     SqlValidationResult,
-    _ASCII_IDENTIFIER_CASE_TRANSLATION,
-    _SqlDialect,
     _identifier_key,
     _required_text,
     _short_identifier,
+    _SqlDialect,
 )
 
 _MAX_ISSUES = 32

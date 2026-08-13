@@ -1,4 +1,5 @@
 import sqlite3
+import inspect
 from collections.abc import Mapping
 from dataclasses import fields
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from daita.domains.data.context import (
     _neutral_message,
     _project_completed_history,
 )
+from daita.hosting.embedded import EmbeddedAgent
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     CanonicalMessage,
@@ -42,6 +44,10 @@ from daita.loop import (
 from daita.storage.sqlite import SQLiteStateStore
 
 NOW = datetime(2026, 7, 21, tzinfo=timezone.utc)
+
+
+def test_context_builder_exposes_only_fixed_absolute_history_bounds():
+    assert "retain_messages" not in inspect.signature(DataContextBuilder).parameters
 
 
 class TranscriptContext:
@@ -665,13 +671,15 @@ async def test_historical_tools_are_rewritten_redacted_and_provider_neutral(
             _stop("third answer"),
         )
     )
-    agent = await Agent.create(
-        "historical-tools",
-        root=tmp_path,
-        model=provider,
-        model_profile=_profile(provider),
-        tools=ReplayTools(),
-        context_builder=TranscriptContext(),
+    agent = Agent(
+        await EmbeddedAgent.create(
+            "historical-tools",
+            root=tmp_path,
+            model=provider,
+            model_profile=_profile(provider),
+            tools=ReplayTools(),
+            context_builder=TranscriptContext(),
+        )
     )
     try:
         first = await agent.run("first tool turn")
