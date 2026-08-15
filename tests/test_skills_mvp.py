@@ -24,7 +24,6 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
-from daita.storage.sqlite_migrations import migration_rows
 from daita.skills import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,
     SKILL_INDEX_MAX_CHARACTERS,
@@ -45,6 +44,7 @@ from daita.skills.capabilities import (
     SKILL_VIEW_OUTPUT_KIND,
     SKILL_VIEW_TOOL_NAME,
 )
+from daita.storage.sqlite_migrations import migration_rows
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
 

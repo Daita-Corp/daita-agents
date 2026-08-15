@@ -5,8 +5,10 @@ from datetime import UTC, datetime
 
 import pytest
 
-from daita.adapters import postgresql as postgresql_module
-from daita.adapters import postgresql_write as write_module
+from daita.adapters import (
+    postgresql as postgresql_module,
+    postgresql_write as write_module,
+)
 from daita.adapters.models import SourceRegistration, source_registration_id
 from daita.catalog.models import ResourceKind, TabularColumn
 from daita.domains.data.sql import PostgreSQLUpdateIntent, ResourceSchema

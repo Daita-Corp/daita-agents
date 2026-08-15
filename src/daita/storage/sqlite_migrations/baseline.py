@@ -6,16 +6,16 @@ import sqlite3
 
 from ..sqlite_schema import (
     BASE_TABLE_SQL,
+    CURRENT_TABLES,
     JOURNAL_TABLE_SQL,
     POSTGRESQL_UPDATE_SCOPE_TABLE_SQL,
     RECEIPT_TABLE_SQL,
-    CURRENT_TABLES,
     SOURCE_READ_SCOPE_TABLE_SQL,
     require_healthy,
     require_schema,
 )
-from .runner import MIGRATIONS, insert_journal_row
 from .generalized_postgresql_updates import validate_target
+from .runner import MIGRATIONS, insert_journal_row
 
 
 def create_current(connection: sqlite3.Connection) -> None:

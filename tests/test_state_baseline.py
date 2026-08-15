@@ -25,8 +25,11 @@ from daita.storage.sqlite_codecs import (
     encode_receipt,
     encode_run_input,
 )
-from daita.storage.sqlite_migrations import CURRENT_REVISION, migration_rows
-from daita.storage.sqlite_migrations import runner as migration_runner
+from daita.storage.sqlite_migrations import (
+    CURRENT_REVISION,
+    migration_rows,
+    runner as migration_runner,
+)
 from daita.storage.sqlite_migrations.generalized_postgresql_updates import (
     MIGRATION as GENERALIZED_UPDATE_MIGRATION,
 )

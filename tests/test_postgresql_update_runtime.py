@@ -6,8 +6,10 @@ from datetime import UTC, datetime
 import pytest
 
 from daita._json import FrozenJsonObject
-from daita.adapters import postgresql as postgresql_module
-from daita.adapters import postgresql_write as write_module
+from daita.adapters import (
+    postgresql as postgresql_module,
+    postgresql_write as write_module,
+)
 from daita.adapters.models import SourceRegistration, source_registration_id
 from daita.capabilities import (
     AccessMode,
