@@ -280,7 +280,7 @@ async def test_write_selected_many_all_current_and_future_table_exclusion(tmp_pa
         await agent.close()
 
 
-async def test_advanced_columns_bound_stale_preview_and_exact_binding(tmp_path):
+async def test_advanced_columns_support_wide_exact_binding_and_stale_preview(tmp_path):
     agent = await Agent.create("permission-bound", root=tmp_path, clock=lambda: NOW)
     source = _registration(agent.id)
     snapshot, resources = _snapshot(
@@ -294,22 +294,15 @@ async def test_advanced_columns_bound_stale_preview_and_exact_binding(tmp_path):
     try:
         inspection = await agent.inspect_source_permissions(source.id)
         assert inspection.resources[0].requires_advanced_column_selection
-        with pytest.raises(ValueError, match="Advanced"):
-            await agent.preview_source_permissions(
-                source_id=source.id,
-                read_mode="all",
-                read_resource_ids=(),
-                postgresql_update_scopes={wide.id: list(all_columns)},
-            )
         preview = await agent.preview_source_permissions(
             source_id=source.id,
             read_mode="all",
             read_resource_ids=(),
-            postgresql_update_scopes={wide.id: list(all_columns[:2])},
+            postgresql_update_scopes={wide.id: list(all_columns)},
         )
         assert (
             preview.after.postgresql_update_scopes[0].allowed_assignment_columns
-            == all_columns[:2]
+            == all_columns
         )
 
         refreshed, _ = _snapshot(

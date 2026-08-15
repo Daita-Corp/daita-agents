@@ -99,6 +99,92 @@ async def test_detached_source_can_be_attached_again(tmp_path: Path):
         await agent.close()
 
 
+async def test_source_edit_preserves_selected_reads_and_switches_atomically(
+    tmp_path: Path,
+) -> None:
+    current_path = tmp_path / "current.sqlite"
+    edited_path = tmp_path / "edited.sqlite"
+    _database(current_path, "records")
+    _database(edited_path, "records")
+    agent = await Agent.create("source-edit", root=tmp_path)
+    previews: list[object] = []
+    try:
+        current = await agent.attach(SQLiteSource(current_path, name="Warehouse"))
+        current_resources = await agent.list_catalog_resources(source_id=current.id)
+        permission_preview = await agent.preview_source_permissions(
+            source_id=current.id,
+            read_mode="selected",
+            read_resource_ids=(current_resources[0].id,),
+            postgresql_update_scopes={},
+        )
+        await agent.apply_source_permissions(
+            source_id=current.id,
+            confirmation_fingerprint=permission_preview.confirmation_fingerprint,
+        )
+
+        async def confirm(preview: object) -> bool:
+            previews.append(preview)
+            return True
+
+        result = await agent.edit_source(
+            current.id,
+            SQLiteSource(edited_path, name="Warehouse"),
+            confirmation_handler=confirm,
+        )
+
+        assert result is not None and result.identity_changed
+        assert result.previous_credential_deleted
+        assert len(previews) == 1
+        preview = previews[0]
+        assert getattr(preview, "preserved_read_resource_count") == 1
+        assert getattr(preview, "omitted_read_resources") == ()
+        assert await agent.active_source() == result.source
+        sources = await agent.list_sources()
+        assert len(sources) == 2
+        assert (
+            next(source for source in sources if source.id == current.id).active
+            is False
+        )
+        inspection = await agent.inspect_source_permissions(result.source.id)
+        assert inspection.state.read_scope.mode.value == "selected"
+        assert len(inspection.state.read_scope.resource_ids) == 1
+        assert inspection.state.postgresql_update_scopes == ()
+    finally:
+        await agent.close()
+
+
+async def test_source_edit_rejection_leaves_current_source_untouched(
+    tmp_path: Path,
+) -> None:
+    current_path = tmp_path / "current.sqlite"
+    edited_path = tmp_path / "edited.sqlite"
+    _database(current_path, "current_records")
+    _database(edited_path, "edited_records")
+    agent = await Agent.create("source-edit-rejected", root=tmp_path)
+    try:
+        current = await agent.attach(SQLiteSource(current_path, name="Current"))
+
+        async def reject(_preview: object) -> bool:
+            return False
+
+        result = await agent.edit_source(
+            current.id,
+            SQLiteSource(edited_path, name="Edited"),
+            confirmation_handler=reject,
+        )
+
+        assert result is None
+        assert await agent.active_source() == current
+        assert await agent.list_sources() == (current,)
+        resources = await agent.list_catalog_resources(source_id=current.id)
+        assert (
+            len(resources) == 1
+            and resources[0].native_identity == "main.current_records"
+        )
+    finally:
+        await agent.close()
+
+
 async def test_one_run_override_keeps_conversation_source_and_history_isolated(
     tmp_path: Path,
 ):

@@ -87,10 +87,10 @@ from .file_capabilities import (
 )
 from .results import BoundedResultProjection, project_result_rows
 from .sql import (
-    POSTGRESQL_UPDATE_MAX_ASSIGNMENTS,
     POSTGRESQL_UPDATE_MAX_CANONICAL_BYTES,
     PostgreSQLUpdateCell,
     PostgreSQLUpdateCommand,
+    PostgreSQLUpdateFilter,
     PostgreSQLUpdateIntent,
     PostgreSQLUpdateScopeValidationResult,
     PostgreSQLUpdateStatement,
@@ -157,7 +157,6 @@ __all__ = [
     "POSTGRESQL_UPDATE_EVIDENCE_KIND",
     "POSTGRESQL_UPDATE_EXECUTOR_ID",
     "POSTGRESQL_UPDATE_TOOL_NAME",
-    "POSTGRESQL_UPDATE_MAX_ASSIGNMENTS",
     "POSTGRESQL_UPDATE_MAX_CANONICAL_BYTES",
     "POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID",
     "POSTGRESQL_TABULAR_EXPORT_TOOL_NAME",
@@ -175,6 +174,7 @@ __all__ = [
     "PostgreSQLUpdateCatalogReader",
     "ReadScopedCatalogReader",
     "PostgreSQLUpdateCommand",
+    "PostgreSQLUpdateFilter",
     "PostgreSQLUpdateDeclarations",
     "PostgreSQLUpdateExecutor",
     "PostgreSQLUpdateResult",

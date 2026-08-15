@@ -10,6 +10,7 @@ from .common import (
     dump_payload,
     enum_decode,
     enum_encode,
+    integer,
     load_payload,
     optional_datetime_decode,
     optional_datetime_encode,
@@ -44,6 +45,7 @@ def _encode_receipt(value: DatabaseWriteReceipt) -> dict[str, JsonValue]:
             "resource_id": value.resource_id,
             "intent_sha256": value.intent_sha256,
             "preview_fingerprint": value.preview_fingerprint,
+            "expected_affected_rows": value.expected_affected_rows,
             "outcome": enum_encode(value.outcome, "DatabaseWriteOutcome"),
             "affected_rows": value.affected_rows,
             "normalized_error_code": value.normalized_error_code,
@@ -67,6 +69,7 @@ def _decode_receipt(value: JsonValue) -> DatabaseWriteReceipt:
             "resource_id",
             "intent_sha256",
             "preview_fingerprint",
+            "expected_affected_rows",
             "outcome",
             "affected_rows",
             "normalized_error_code",
@@ -85,6 +88,9 @@ def _decode_receipt(value: JsonValue) -> DatabaseWriteReceipt:
         intent_sha256=text(fields["intent_sha256"], "receipt intent hash"),
         preview_fingerprint=text(
             fields["preview_fingerprint"], "receipt preview fingerprint"
+        ),
+        expected_affected_rows=integer(
+            fields["expected_affected_rows"], "expected affected rows"
         ),
         outcome=enum_decode(
             fields["outcome"], DatabaseWriteOutcome, "DatabaseWriteOutcome"

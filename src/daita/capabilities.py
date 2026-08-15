@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -14,6 +15,8 @@ from .artifacts.models import ArtifactDraft
 from .llm.models import ToolDefinition
 
 _T = TypeVar("_T")
+
+MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
 
 
 def _text(value: str, name: str) -> None:
@@ -55,9 +58,27 @@ class ApprovalRequest:
             FrozenJsonObject.from_mapping(self.arguments),
         )
 
+    def render_arguments_for_review(self) -> str | None:
+        return render_approval_arguments(self.arguments.to_dict())
+
 
 class ApprovalHandler(Protocol):
     async def __call__(self, request: ApprovalRequest) -> ApprovalDecision: ...
+
+
+def render_approval_arguments(arguments: Mapping[str, object]) -> str | None:
+    """Render one exact, terminal-safe approval document within its fixed bound."""
+
+    rendered = json.dumps(
+        FrozenJsonObject.from_mapping(arguments).to_dict(),
+        ensure_ascii=True,
+        allow_nan=False,
+        indent=2,
+        sort_keys=True,
+    )
+    if len(rendered) > MAX_APPROVAL_DOCUMENT_CHARACTERS:
+        return None
+    return rendered
 
 
 class CapabilityInputError(ValueError):
@@ -601,10 +622,12 @@ __all__ = [
     "CapabilityRegistry",
     "Executor",
     "ExtensionDeclarations",
+    "MAX_APPROVAL_DOCUMENT_CHARACTERS",
     "SideEffectExecutor",
     "ToolApplicability",
     "ToolExecution",
     "ToolOutput",
     "ToolOutputValidationError",
     "ToolView",
+    "render_approval_arguments",
 ]

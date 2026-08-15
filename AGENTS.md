@@ -32,8 +32,8 @@ Use this order of authority:
 
 ## What the product is
 
-The product is a persistent, read-first data agent with one narrowly bounded,
-explicitly enabled PostgreSQL one-row update, built around one direct loop:
+The product is a persistent, read-first data agent with explicitly enabled,
+structured PostgreSQL updates, built around one direct loop:
 
 ```text
 user message -> model -> zero or more tool calls -> ordered tool results
@@ -154,11 +154,13 @@ clients or executors directly. Do not infer capability behavior from tool-name
 strings when stable capability metadata owns it.
 
 All currently projected data capabilities are non-side-effecting reads except
-the explicitly enabled PostgreSQL one-row update. That bounded write retains
-its resource-scoped readiness, current admission rechecks, preview fingerprint,
-exact once-only approval, one-row limit, and immutable receipt path. Arbitrary
-SQL mutation and every other external data write are outside the MVP. A new
-data write beyond this exact exception requires an explicit design for
+the explicitly enabled structured PostgreSQL update. One cardinality-independent
+plan covers single-row and bulk selections and retains resource-scoped
+readiness, current admission rechecks, an exact target-set preview and
+fingerprint, once-only approval, transactional drift detection, exact affected
+count, and an immutable receipt path. Arbitrary SQL mutation and every other
+external data write are outside the MVP. A new data write beyond this exact
+exception requires an explicit design for
 validation, authorization, transactionality, idempotency, uncertain outcomes,
 and recovery; approval alone is not such a design.
 
@@ -193,15 +195,16 @@ apply at execution. Do not duplicate either system in a generic policy layer.
 identity, sources, current catalog snapshots, run transcripts and terminal
 results, semantic annotations, learning review state, immutable database-write
 receipts, explicit source read scopes, and exact PostgreSQL update scopes. It is
-the sole owner of the immutable
-checksummed `state_migrations` journal, explicit persisted-record codecs, exact
-current/historical schemas, and the bounded preledger bridge. Migrations run
-atomically under the existing agent-home writer boundary and validate their
-source and target schemas. Put each durable change in one owner-local migration
-file; never edit an existing ID/checksum or create migration ownership in
-hosting, the loop, or a new runtime. The isolated preledger unit is the only
-code allowed to read the historical numeric marker, and only until its
-documented minimum-release removal gate is met.
+the sole owner of the immutable checksummed `state_migrations` journal,
+explicit persisted-record codecs, exact current/historical schemas, and the
+bounded preledger bridge. Migrations run only on a verified staged copy under
+the existing agent-home writer boundary, validate their source and target
+schemas, and atomically replace the active database only after complete target
+validation. Put each durable change in one owner-local migration file; never
+edit an existing ID/checksum or create migration ownership in hosting, the
+loop, or a new runtime. The isolated preledger unit is the only code allowed to
+read the historical numeric marker, and only until its documented
+minimum-release removal gate is met.
 
 Source read access is owned only by `source_read_scopes`, and PostgreSQL update
 access is owned only by `postgresql_update_scopes`, never by source connection

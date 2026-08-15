@@ -27,6 +27,7 @@ from daita.memory import (
     MemoryStore,
     MemoryValidationError,
 )
+from daita.storage.sqlite_migrations import migration_rows
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
 
@@ -375,7 +376,7 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
         for table in tables:
             expected_rows = 1 if table == "metadata" else 0
             if table == "state_migrations":
-                expected_rows = 3
+                expected_rows = len(migration_rows())
             assert (
                 connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 == expected_rows

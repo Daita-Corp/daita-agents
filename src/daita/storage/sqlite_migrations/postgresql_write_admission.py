@@ -7,8 +7,8 @@ import sqlite3
 from ..sqlite_codecs import decode_preledger_source, decode_source, encode_source
 from ..sqlite_schema import (
     ADMISSION_TABLE_SQL,
-    CURRENT_TABLES,
     JOURNAL_RECEIPT_TABLES,
+    WRITE_ADMISSION_TABLES,
 )
 from .models import SQLiteMigration
 
@@ -72,7 +72,7 @@ MIGRATION = SQLiteMigration(
     migration_id=MIGRATION_ID,
     definition=DEFINITION,
     source_schema=JOURNAL_RECEIPT_TABLES,
-    target_schema=CURRENT_TABLES,
+    target_schema=WRITE_ADMISSION_TABLES,
     apply=apply,
     validate_target=validate_target,
 )

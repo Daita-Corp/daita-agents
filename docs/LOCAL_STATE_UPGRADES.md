@@ -32,16 +32,41 @@ copy them into SQLite.
   required operational path without creating a second public surface.
 - Each published durable change has one immutable migration file. The current
   ledger therefore has separate receipt-table, historical PostgreSQL-admission,
-  and scoped-source-permission entries.
+  scoped-source-permission, and generalized PostgreSQL-update receipt entries.
+- A supported upgrade is copy-on-write. Daita never runs a migration against
+  the active database file.
 
 ## Ownership and ledger rules
 
 `SQLiteStateStore` is the only owner of local state admission and migration.
-Admission starts only after `EmbeddedAgent` acquires the existing per agent
-process writer lock. The store uses `BEGIN IMMEDIATE`; validates the exact
-source schema, database integrity, and foreign keys; applies the known suffix;
-validates every target; and commits once. DDL, data changes, and journal rows
-therefore roll back together.
+Admission starts only after `EmbeddedAgent` acquires the existing per-agent
+process writer lock. The store first opens the active database read only and
+validates its exact schema, journal prefix, checksums, record ownership,
+database integrity, and foreign keys. For a known older revision it then:
+
+1. creates a standalone SQLite backup candidate and verifies its complete
+   logical fingerprint against the active database;
+2. clones that verified backup into a same-directory staged database;
+3. applies the known migration suffix to the stage in one `BEGIN IMMEDIATE`
+   transaction;
+4. validates the exact current schema, all decodable current records and
+   cross-record invariants, integrity, foreign keys, and final journal on the
+   closed stage;
+5. publishes the pre-upgrade backup as a bounded rollback point; and
+6. atomically activates the staged database with a same-filesystem replace.
+
+Failure or cancellation before activation removes staging artifacts and leaves
+the active database byte-for-byte unchanged. A successful upgrade retains one
+`state.db.rollback-*` database for the immediately prior logical state and
+prunes older Daita-owned rollback points. This rollback file is recovery data,
+not a parallel active state or downgrade API.
+
+Transcript entries and terminal run results already classified as unreadable by
+the foreground history contract are preserved byte-for-byte rather than
+discarded or guessed at; normal history loading continues to skip them
+explicitly. A migration only rewrites a run result when it matches an exact
+historical shape owned by that migration. Every other durable record family
+must decode and satisfy its ownership invariants before activation.
 
 `state_migrations` is an immutable, ordered, checksummed ledger. The rows in an
 existing database must be an exact prefix of the migration definitions shipped
@@ -68,11 +93,11 @@ codec declares its required fields, additive defaults, nested records, enums,
 datetimes, decimals, and unknown-field policy. Stored class-name text never
 selects a Python type.
 
-An additive payload default that leaves the physical schema and invariants
-unchanged is a codec change, not a ledger entry. A physical table, index,
-foreign key, ownership, or cross record invariant change is a migration. This
-keeps package releases from rewriting an entire database merely because one
-serialized record gained an optional field.
+An additive optional payload default that leaves the physical schema and
+invariants unchanged can be a codec change. A required payload field, physical
+table, index, foreign key, ownership rule, or cross-record invariant change is
+a migration. This keeps compatibility explicit without rewriting an entire
+database for every harmless optional addition.
 
 ## Historical PostgreSQL admission and scoped-permission cutover
 
@@ -83,6 +108,14 @@ each active source, and removes the legacy table from the current schema.
 Connection reconstruction remains fail-closed. Refresh preserves exact scopes,
 and detach deletes both scope families atomically.
 
+The fourth immutable migration generalizes the database-write receipt. Every
+historical one-row receipt gains `expected_affected_rows = 1`; its receipt ID,
+execution identity, outcome, timestamps, and other durable fields are retained.
+It also converts the bounded historical scalar run-cost field into the current
+cost-estimate record as `partial`, preserving the amount without falsely
+claiming that legacy pricing was complete. No historical one-row executor or
+runtime path is restored.
+
 ## Preservation matrix
 
 | Durable item | Upgrade treatment |
@@ -90,10 +123,10 @@ and detach deletes both scope families atomically.
 | `metadata` | Preserve agent identity rows byte-for-byte. |
 | `sources` | Preserve identity, lifecycle, connection configuration, and secret references; only remove the obsolete admission key during cutover. |
 | `syncs`, `snapshots` | Preserve current catalog syncs and snapshots byte-for-byte. |
-| `runs`, `messages` | Preserve inputs, complete ordered transcripts, conversation order, and terminal results byte-for-byte. |
+| `runs`, `messages` | Preserve inputs, complete ordered transcripts, conversation order, and terminal results; normalize only the historical scalar cost field. |
 | `semantic_annotations` | Preserve every encoded annotation byte-for-byte. |
 | `learning_candidates` | Preserve candidates and review state byte-for-byte. |
-| `database_write_receipts` | Preserve every existing immutable receipt; create the empty table only when absent. |
+| `database_write_receipts` | Preserve every receipt identity and outcome; add `expected_affected_rows = 1` to historical one-row receipts. |
 | `source_read_scopes` | Create one explicit `all` scope for every active source. |
 | `postgresql_update_scopes` | Create empty; historical broad admission grants no exact table scope. |
 | `state_migrations` | Validate the exact existing prefix and append only the known missing suffix. |
@@ -114,10 +147,11 @@ identity, or attachment lifecycle.
 
 Every durable revision adds focused fixture and migration contracts. The suite
 must prove exact journal validation, fresh stamping, current no-write open,
-known-prefix traversal, preledger admission, row/file preservation, rollback,
-cancellation, downgrade refusal, legacy/damage classification, diagnostics,
-lock release, credential-reference preservation, codec compatibility, and the
-historical-admission/scoped-permission cutover.
+known-prefix traversal, preledger admission, staged-copy equivalence,
+row/file preservation, retained rollback, failure and cancellation before
+activation, downgrade refusal, legacy/damage classification, diagnostics, lock
+release, credential-reference preservation, codec compatibility, and each
+historical cutover.
 
 Before publishing, build the baseline and candidate wheels once, then run the
 isolated two-wheel lifecycle:
@@ -132,9 +166,8 @@ isolated two-wheel lifecycle:
   --candidate-wheel /path/to/candidate.whl
 ```
 
-The smokes install the real prior wheel, create realistic state including an
-enabled PostgreSQL admission, replace the package, open the same home, compare
-the complete logical projection and all non-database files, verify every
-unchanged prior table, verify the intentional source/admission cutover, and
-check the exact journal. Never guess at unknown state, silently initialize over
-it, or use backup restore as the normal upgrade algorithm.
+The smokes install the real prior wheel, create realistic state, replace the
+package, open the same home, compare the complete logical projection and all
+non-database files, verify unchanged prior tables and intentional payload
+transformations, and check the exact journal. Never guess at unknown state or
+silently initialize over it.

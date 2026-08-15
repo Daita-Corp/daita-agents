@@ -182,7 +182,6 @@ async def test_fresh_schema_has_only_scoped_permission_tables(tmp_path: Path) ->
         }
         assert "source_read_scopes" in tables
         assert "postgresql_update_scopes" in tables
-        assert "postgresql_write_admissions" not in tables
         assert (
             tuple(
                 connection.execute(
@@ -267,6 +266,104 @@ async def test_attach_refresh_detach_and_reopen_preserve_narrow_scopes(
         assert connection.execute(
             "SELECT COUNT(*) FROM postgresql_update_scopes"
         ).fetchone() == (0,)
+
+
+async def test_source_edit_atomically_hands_off_catalog_and_scopes(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    current = _registration(native_identity="postgresql:current-reader")
+    current_snapshot, current_resource, current_facet = _snapshot(
+        current,
+        sync_id="sync-current",
+    )
+    await store.commit_snapshot(current_snapshot, registration=current)
+    await store.replace_source_permission_scopes(
+        SourceReadScope(
+            agent_id=current.agent_id,
+            source_id=current.id,
+            mode=SourceReadMode.SELECTED,
+            resource_ids=(current_resource.id,),
+        ),
+        (_scope(current, current_resource, current_facet),),
+    )
+    edited = _registration(native_identity="postgresql:edited-writer")
+    edited_snapshot, edited_resource, _ = _snapshot(
+        edited,
+        sync_id="sync-edited",
+    )
+    edited_read_scope = SourceReadScope(
+        agent_id=edited.agent_id,
+        source_id=edited.id,
+        mode=SourceReadMode.SELECTED,
+        resource_ids=(edited_resource.id,),
+    )
+
+    await store.commit_source_edit(
+        edited_snapshot,
+        registration=edited,
+        replaced_source_id=current.id,
+        replaced_at=NOW + timedelta(minutes=1),
+        read_scope=edited_read_scope,
+    )
+
+    detached = await store.load_source(current.agent_id, current.id)
+    assert detached is not None and not detached.active
+    assert await store.load_source_read_scope(current.agent_id, current.id) is None
+    assert await store.list_postgresql_update_scopes(current.agent_id, current.id) == ()
+    assert await store.load_source(edited.agent_id, edited.id) == edited
+    assert await store.load_source_read_scope(edited.agent_id, edited.id) == (
+        edited_read_scope
+    )
+    assert await store.list_postgresql_update_scopes(edited.agent_id, edited.id) == ()
+    assert await store.load_active_source_id(edited.agent_id) == edited.id
+    refs = await store.list_current_snapshot_refs(edited.agent_id, (edited.id,))
+    assert len(refs) == 1 and refs[0].sync_id == "sync-edited"
+    await store.close()
+
+
+async def test_same_identity_source_edit_updates_connection_and_clears_updates(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    current = _registration()
+    current_snapshot, resource, facet = _snapshot(
+        current,
+        sync_id="sync-current",
+    )
+    await store.commit_snapshot(current_snapshot, registration=current)
+    await store.replace_source_permission_scopes(
+        SourceReadScope.allow_all(agent_id=current.agent_id, source_id=current.id),
+        (_scope(current, resource, facet),),
+    )
+    edited = replace(
+        current,
+        display_name="Edited warehouse",
+        configuration={
+            **dict(current.configuration),
+            "credential_ref": "keychain://agent-permissions%3Apostgresql%3Anew",
+        },
+        attached_at=NOW + timedelta(minutes=1),
+    )
+    edited_snapshot, _, _ = _snapshot(edited, sync_id="sync-edited")
+    read_scope = SourceReadScope.allow_all(
+        agent_id=edited.agent_id,
+        source_id=edited.id,
+    )
+
+    await store.commit_source_edit(
+        edited_snapshot,
+        registration=edited,
+        replaced_source_id=current.id,
+        replaced_at=NOW + timedelta(minutes=2),
+        read_scope=read_scope,
+    )
+
+    assert await store.list_sources(edited.agent_id) == (edited,)
+    assert await store.load_source_read_scope(edited.agent_id, edited.id) == read_scope
+    assert await store.list_postgresql_update_scopes(edited.agent_id, edited.id) == ()
+    assert await store.load_active_source_id(edited.agent_id) == edited.id
+    await store.close()
 
 
 @pytest.mark.parametrize("damage", ("missing", "corrupt", "foreign"))
@@ -466,4 +563,53 @@ async def test_cancel_before_scope_transaction_start_changes_nothing(
         )
         == ()
     )
+
+
+async def test_cancel_before_source_edit_transaction_keeps_current_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    current = _registration(native_identity="postgresql:current")
+    current_snapshot, _, _ = _snapshot(current, sync_id="sync-current")
+    await store.commit_snapshot(current_snapshot, registration=current)
+    edited = _registration(native_identity="postgresql:edited")
+    edited_snapshot, _, _ = _snapshot(edited, sync_id="sync-edited")
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _ControlledGate(sqlite_module._CatalogCommitGate):
+        def start(self, connection: sqlite3.Connection) -> bool:
+            entered.set()
+            assert release.wait(timeout=5)
+            return super().start(connection)
+
+    monkeypatch.setattr(sqlite_module, "_CatalogCommitGate", _ControlledGate)
+    task = asyncio.create_task(
+        store.commit_source_edit(
+            edited_snapshot,
+            registration=edited,
+            replaced_source_id=current.id,
+            replaced_at=NOW + timedelta(minutes=1),
+            read_scope=SourceReadScope.allow_all(
+                agent_id=edited.agent_id,
+                source_id=edited.id,
+            ),
+        )
+    )
+    assert await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert await store.load_source(current.agent_id, current.id) == current
+    assert await store.load_source(edited.agent_id, edited.id) is None
+    assert await store.load_active_source_id(current.agent_id) == current.id
+    assert await store.load_source_read_scope(
+        current.agent_id,
+        current.id,
+    ) == SourceReadScope.allow_all(agent_id=current.agent_id, source_id=current.id)
+    await store.close()
     await store.close()

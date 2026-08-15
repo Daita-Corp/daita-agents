@@ -1,14 +1,23 @@
 from pathlib import Path
 
-FIXTURE = Path("tests/fixtures/postgresql")
+READ_FIXTURE = Path("tests/fixtures/postgresql")
+UPDATE_FIXTURE = Path("tests/fixtures/postgres-large")
 
 
-def test_phase_four_fixture_declares_disposable_least_privileged_writer_and_canary():
-    sql = (FIXTURE / "init.sql").read_text(encoding="utf-8")
-    compose = (FIXTURE / "compose.yaml").read_text(encoding="utf-8")
+def test_postgres_large_is_the_only_update_fixture():
+    read_sql = (READ_FIXTURE / "init.sql").read_text(encoding="utf-8")
+    update_sql = (UPDATE_FIXTURE / "init.sql").read_text(encoding="utf-8")
 
-    assert "tmpfs:" in compose
-    assert "/var/lib/postgresql/data" in compose
+    assert "daita_writer" not in read_sql
+    assert "CREATE ROLE daita_large_writer" in update_sql
+    assert "GRANT SELECT ON support.tickets TO daita_large_writer" in update_sql
+    assert (
+        "GRANT UPDATE (priority) ON support.tickets TO daita_large_writer" in update_sql
+    )
+
+
+def test_update_fixture_role_is_least_privileged_and_externally_owned():
+    sql = (UPDATE_FIXTURE / "init.sql").read_text(encoding="utf-8")
     for attribute in (
         "NOSUPERUSER",
         "NOCREATEDB",
@@ -17,53 +26,18 @@ def test_phase_four_fixture_declares_disposable_least_privileged_writer_and_cana
         "NOBYPASSRLS",
     ):
         assert attribute in sql
-    assert "CREATE ROLE daita_writer" in sql
-    assert "CREATE SCHEMA write_canary" in sql
-    assert "REVOKE ALL PRIVILEGES ON DATABASE daita_fixture FROM PUBLIC" in sql
-    assert "REVOKE ALL PRIVILEGES ON DATABASE postgres FROM PUBLIC" in sql
-    assert "REVOKE ALL PRIVILEGES ON DATABASE template1 FROM PUBLIC" in sql
-    assert "GRANT CONNECT ON DATABASE daita_fixture TO daita_writer" in sql
-    assert "GRANT USAGE ON SCHEMA write_canary TO daita_writer" in sql
-    assert "GRANT SELECT ON write_canary.accounts TO daita_writer" in sql
-    assert "UPDATE (\n    status," in sql
-    assert "canary-42" in sql and "constraint peer" in sql
-    assert "CREATE TABLE write_canary.permission_denied" in sql
-    assert "CREATE TABLE write_canary.no_primary_key" in sql
-    assert "CREATE TABLE write_canary.composite_primary_key" in sql
-    assert "ENABLE ROW LEVEL SECURITY" in sql
-    assert "CREATE TRIGGER reject_trigger_update" in sql
 
-
-def test_fixture_role_administration_is_not_owned_by_production_daita():
     production = "\n".join(
         path.read_text(encoding="utf-8")
         for path in sorted(Path("src/daita").rglob("*.py"))
     )
-
-    assert "CREATE ROLE daita_writer" not in production
-    assert "GRANT CONNECT ON DATABASE" not in production
-    assert "administrator_password" not in production
+    assert "CREATE ROLE daita_large_writer" not in production
+    assert "GRANT UPDATE (priority)" not in production
 
 
-def test_phase_four_rollout_document_covers_required_operational_response():
-    guide = Path("docs/POSTGRESQL_ONE_ROW_UPDATE.md").read_text(encoding="utf-8")
-
-    for required in (
-        "Phase 4 release note",
-        "External least-privilege setup",
-        "Credential handling",
-        "point-in-time",
-        "recovery",
-        "Non-production canary procedure",
-        "preview_source_permissions",
-        "apply_source_permissions",
-        "Unknown-outcome response",
-        "outcome_unknown",
-        "do not retry automatically",
-        "administrator credential",
-        "tests/test_postgresql_update_certification_live.py",
-        "tests/live/test_postgresql_update_acceptance_live.py",
-    ):
-        assert required in guide
-    assert "/Users/jendala/.daita" in guide
-    assert "Never substitute production" in guide
+def test_fixture_docs_route_update_testing_to_postgres_large():
+    readme = (READ_FIXTURE / "README.md").read_text(encoding="utf-8")
+    update_readme = (UPDATE_FIXTURE / "README.md").read_text(encoding="utf-8")
+    assert "dedicated PostgreSQL update fixture" in readme
+    assert "daita_large_writer" in update_readme
+    assert "/source permissions" in update_readme

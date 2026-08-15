@@ -19,7 +19,7 @@ Daita: EMEA led with $4.2M, followed by North America with $3.7M.
 
 Daita begins every source read only and keeps learned context transparent. An
 explicitly opted-in PostgreSQL source can additionally expose the narrow,
-previewed, once-approved one-row update described below; other source access
+previewed, once-approved structured update described below; other source access
 remains read only.
 
 ## Why Daita?
@@ -104,7 +104,7 @@ loop has bounded steps, wall time, tokens, and estimated cost; it does not add
 a verifier pass or a session runtime.
 
 Data access is read first. All current data tools are non-side-effecting reads
-except the explicitly scoped PostgreSQL one-row update. SQL and local paths are
+except the explicitly scoped PostgreSQL update. SQL and local paths are
 checked against the current catalog before source I/O, and every requested tool
 call receives one ordered result even if another call fails.
 
@@ -172,15 +172,23 @@ daita skills --help
 The terminal provides confirmed lifecycle commands:
 
 ```text
+/source edit
 /source permissions
 /source detach <source>
 /conversation clear
 /agent delete
 ```
 
+`/source edit` changes the active source connection without dropping the
+working connection first. Daita validates and catalogs the edited connection,
+shows a redacted review, and requires a `[y/N]` confirmation before one atomic handoff. Read
+intent is preserved only for exact matching resources, PostgreSQL update scopes
+are cleared, and a new conversation starts. If validation, discovery, review,
+or commit fails, the existing connection remains active.
+
 `/source permissions` is the single guided terminal flow for read access
 (`all`, exact selected current resources, or `none`) and exact PostgreSQL
-one-row update access. Users can select one, many, or all current eligible
+update access. Users can select one, many, or all current eligible
 tables, use all eligible assignment columns by default, or choose an exact
 subset through Advanced. One before/after summary and confirmation applies both
 scope families atomically. Future tables are never automatically write-enabled,
@@ -229,42 +237,37 @@ pipx uninstall daita-agents
 
 Local state has its own immutable, checksummed migration journal, independent
 of the package version. On the first normal launch after an upgrade, Daita
-validates the journal and automatically applies its known missing suffix under
-the existing per-agent writer lock. The upgrade is one SQLite transaction: it
-validates the exact source schema and database health, applies each bounded
-change, validates each target, stamps its checksum, and only then commits. No
-separate state command, import, restore, or backup step is part of a routine
-upgrade.
+validates a supported journal prefix under the existing per-agent writer lock
+and automatically applies its known missing suffix to a verified staged copy.
+It validates the complete result and atomically activates it only after every
+check succeeds. No separate state command, import, restore, or backup step is
+part of a routine upgrade, and existing agent homes should never be reset for a
+normal application update.
 
-The supported upgrade preserves agent identity, model configuration and secret
-references, settings, source registrations and current catalogs, the active
-source, exact source permissions, complete conversations and results,
-artifacts, approved memory and user profile, skills, semantics, learning state,
-and database-write receipts. Secret values remain in their existing environment
-or OS keychain location and are never copied into the state database.
+The upgrade preserves identity, configuration and secret references, settings,
+sources and catalogs, active-source selection, exact permissions, complete
+conversations and results, artifacts, approved memory and user profile, skills,
+semantics, learning state, and database-write receipts. Before activation Daita
+retains the verified prior database as one bounded `state.db.rollback-*`
+recovery point. Failure or cancellation before activation removes the staging
+files and will leave the prior database unchanged.
 
-Before changing versions, an optional complete local backup can be made while
-Daita is closed:
+Unknown, reordered, gapped, or checksum-mismatched journals, newer state from
+an attempted package downgrade, recognizable pre-1.0 homes, and damaged schemas
+fail closed without moving, replacing, emptying, or recreating the home. Install
+the same or a newer Daita release for newer state; opening an upgraded home with
+an older package is not a supported downgrade path. See the
+[local state upgrade contract](docs/LOCAL_STATE_UPGRADES.md).
+
+No manual backup is required for compatibility. A complete copy made while
+Daita is closed is optional disaster recovery, not a compatibility mechanism:
 
 ```bash
 cp -a ~/.daita ~/.daita-backup-before-upgrade
 ```
 
-This backup is optional disaster recovery, not a compatibility mechanism. It
-contains agent homes but not secret values held by the OS keychain; those
-keychain entries remain installed and are referenced by the backed-up
-configuration.
-
-Current journaled homes open without a schema write. A supported journal prefix
-or exact historical preledger shape upgrades automatically. Unknown, reordered,
-gapped, or checksum-mismatched journals, newer state (an attempted package
-downgrade), recognizable pre-1.0 homes, and damaged or unexpected schemas are
-reported as distinct descriptive errors in the CLI and terminal UI. Failed
-upgrades roll back and leave the prior database unchanged. Install the same or
-a newer Daita release for newer state; opening an upgraded home with an older
-package is not a supported downgrade path. See the
-[local state upgrade contract](docs/LOCAL_STATE_UPGRADES.md) for diagnostics
-and the release certification procedure.
+Secret values stored in the OS keychain are referenced by the copied
+configuration but are not duplicated into the agent home.
 
 Use `pipx reinstall daita-agents` to repair missing or damaged application
 dependencies. Uninstalling the application does not delete existing agent
@@ -318,10 +321,10 @@ the real XLSX runtime, reinstall, state preservation, and uninstall on Python
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
 [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
-The limited PostgreSQL one-row update rollout, external least-privilege role
-template, readiness controls, canary procedure, disablement, backup gate, and
-unknown-outcome response are documented in
-[PostgreSQL one-row update rollout](docs/POSTGRESQL_ONE_ROW_UPDATE.md).
+The PostgreSQL update plan, least-privilege role requirements, exact-impact
+preview, approval, transactional drift handling, receipts, and unknown-outcome
+response are documented in
+[PostgreSQL updates](docs/POSTGRESQL_UPDATES.md).
 
 ## License
 

@@ -181,7 +181,7 @@ def test_survivor_docs_and_examples_describe_only_the_mvp():
     for required in (
         "at most 8 runs, 40 messages, and 24,000 UTF-8 bytes",
         "Data access is read first",
-        "explicitly scoped PostgreSQL one-row update",
+        "explicitly scoped PostgreSQL update",
         "foreground",
         "in-process approve-once callback",
         "does not persist events, collect telemetry",
@@ -632,7 +632,7 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
         assert later_phase not in production
 
 
-def test_phase_c_removes_legacy_permission_surfaces_and_limits_history_owners():
+def test_phase_c_removes_legacy_permission_runtime_but_retains_migration_evidence():
     repository_text = (
         "\n".join(
             path.read_text(encoding="utf-8")
@@ -654,18 +654,17 @@ def test_phase_c_removes_legacy_permission_surfaces_and_limits_history_owners():
         assert removed not in repository_text
 
     historical_terms = ("postgresql_write_" + "admissions", "write_" + "access")
-    allowed = {
-        "storage/sqlite_schema.py",
-        "storage/sqlite_codecs/sources.py",
-        "storage/sqlite_migrations/postgresql_write_admission.py",
-        "storage/sqlite_migrations/scoped_source_permissions.py",
-    }
     matched = {
         path.relative_to(PACKAGE).as_posix()
         for path in PACKAGE.rglob("*.py")
         if any(term in path.read_text(encoding="utf-8") for term in historical_terms)
     }
-    assert matched == allowed
+    assert matched == {
+        "storage/sqlite_codecs/sources.py",
+        "storage/sqlite_migrations/postgresql_write_admission.py",
+        "storage/sqlite_migrations/scoped_source_permissions.py",
+        "storage/sqlite_schema.py",
+    }
 
 
 def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
@@ -1347,13 +1346,27 @@ def test_pricing_semantics_have_one_provider_neutral_owner():
         assert provider not in pricing
 
 
-def test_sqlite_journal_codecs_and_preledger_bridge_have_one_storage_owner():
+def test_sqlite_journal_and_codecs_have_one_append_only_storage_owner():
     pragma_owners = {
         path.relative_to(PACKAGE).as_posix()
         for path in PACKAGE.rglob("*.py")
         if "PRAGMA user_version" in path.read_text(encoding="utf-8")
     }
     assert pragma_owners == {"storage/sqlite_migrations/preledger.py"}
+    migration_files = {
+        path.name for path in (PACKAGE / "storage" / "sqlite_migrations").glob("*.py")
+    }
+    assert migration_files == {
+        "__init__.py",
+        "baseline.py",
+        "database_write_receipts.py",
+        "generalized_postgresql_updates.py",
+        "models.py",
+        "postgresql_write_admission.py",
+        "preledger.py",
+        "runner.py",
+        "scoped_source_permissions.py",
+    }
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
 
     candidates = [PACKAGE / "loop", PACKAGE / "hosting"]

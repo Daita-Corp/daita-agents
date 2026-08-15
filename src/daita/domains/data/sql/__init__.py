@@ -25,10 +25,10 @@ from .contracts import (
     sqlite_identifier_key,
 )
 from .postgresql_update import (
-    POSTGRESQL_UPDATE_MAX_ASSIGNMENTS,
     POSTGRESQL_UPDATE_MAX_CANONICAL_BYTES,
     PostgreSQLUpdateCell,
     PostgreSQLUpdateCommand,
+    PostgreSQLUpdateFilter,
     PostgreSQLUpdateIntent,
     PostgreSQLUpdateScopeValidationResult,
     PostgreSQLUpdateStatement,
@@ -44,10 +44,10 @@ from .read_validation import validate_postgresql_read, validate_sqlite_read
 __all__ = [
     "MAX_SQL_CHARACTERS",
     "MAX_SQL_PARAMETERS",
-    "POSTGRESQL_UPDATE_MAX_ASSIGNMENTS",
     "POSTGRESQL_UPDATE_MAX_CANONICAL_BYTES",
     "PostgreSQLUpdateCell",
     "PostgreSQLUpdateCommand",
+    "PostgreSQLUpdateFilter",
     "PostgreSQLUpdateIntent",
     "PostgreSQLUpdateScopeValidationResult",
     "PostgreSQLUpdateStatement",

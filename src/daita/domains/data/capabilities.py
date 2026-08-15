@@ -1,4 +1,4 @@
-"""SQL reads and the typed PostgreSQL single-row update declarations."""
+"""SQL reads and structured PostgreSQL update declarations."""
 
 from __future__ import annotations
 
@@ -31,9 +31,9 @@ from .results import BoundedResultProjection
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
-    POSTGRESQL_UPDATE_MAX_ASSIGNMENTS,
     PostgreSQLUpdateCell,
     PostgreSQLUpdateCommand,
+    PostgreSQLUpdateFilter,
     PostgreSQLUpdateIntent,
 )
 
@@ -115,14 +115,14 @@ class PostgreSQLReadResult(SqlReadResult):
 @dataclass(frozen=True, slots=True)
 class PostgreSQLPreviewFingerprint:
     intent_sha256: str
-    row_version_sha256: str
+    target_set_sha256: str
     statement_sha256: str
     preview_fingerprint: str
 
     def __post_init__(self) -> None:
         for value, name in (
             (self.intent_sha256, "intent_sha256"),
-            (self.row_version_sha256, "row_version_sha256"),
+            (self.target_set_sha256, "target_set_sha256"),
             (self.statement_sha256, "statement_sha256"),
             (self.preview_fingerprint, "preview_fingerprint"),
         ):
@@ -138,7 +138,7 @@ class PostgreSQLPreviewFingerprint:
 @dataclass(frozen=True, slots=True)
 class PostgreSQLUpdatePreviewChecks:
     compile_only: str = "passed"
-    primary_key_bounded: bool = True
+    target_set_fingerprinted: bool = True
     row_level_security: bool = False
     user_triggers: bool = False
     rewrite_rules: bool = False
@@ -147,7 +147,7 @@ class PostgreSQLUpdatePreviewChecks:
         if self.compile_only != "passed":
             raise ValueError("preview compile_only must be passed")
         for name in (
-            "primary_key_bounded",
+            "target_set_fingerprinted",
             "row_level_security",
             "user_triggers",
             "rewrite_rules",
@@ -155,7 +155,7 @@ class PostgreSQLUpdatePreviewChecks:
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"preview {name} must be boolean")
         if (
-            not self.primary_key_bounded
+            not self.target_set_fingerprinted
             or self.row_level_security
             or self.user_triggers
             or self.rewrite_rules
@@ -165,10 +165,44 @@ class PostgreSQLUpdatePreviewChecks:
     def to_payload(self) -> dict[str, object]:
         return {
             "compile_only": self.compile_only,
-            "primary_key_bounded": self.primary_key_bounded,
+            "target_set_fingerprinted": self.target_set_fingerprinted,
             "row_level_security": self.row_level_security,
             "user_triggers": self.user_triggers,
             "rewrite_rules": self.rewrite_rules,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PostgreSQLUpdateSample:
+    primary_key: tuple[PostgreSQLUpdateCell, ...]
+    before: tuple[PostgreSQLUpdateCell, ...]
+    after: tuple[PostgreSQLUpdateCell, ...]
+
+    def __post_init__(self) -> None:
+        primary_key = tuple(self.primary_key)
+        before = tuple(self.before)
+        after = tuple(self.after)
+        if not primary_key or any(
+            not isinstance(item, PostgreSQLUpdateCell) for item in primary_key
+        ):
+            raise ValueError("update sample requires a primary key")
+        if (
+            not before
+            or any(not isinstance(item, PostgreSQLUpdateCell) for item in before)
+            or any(not isinstance(item, PostgreSQLUpdateCell) for item in after)
+            or tuple(item.column for item in before)
+            != tuple(item.column for item in after)
+        ):
+            raise ValueError("update sample before and after fields must agree")
+        object.__setattr__(self, "primary_key", primary_key)
+        object.__setattr__(self, "before", before)
+        object.__setattr__(self, "after", after)
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "primary_key": tuple(item.to_payload() for item in self.primary_key),
+            "before": tuple(item.to_payload() for item in self.before),
+            "after": tuple(item.to_payload() for item in self.after),
         }
 
 
@@ -179,11 +213,10 @@ class PostgreSQLUpdatePreview:
     resource_name: str
     source_revision: str
     resource_revision: str
-    match: tuple[PostgreSQLUpdateCell, ...]
+    where: tuple[PostgreSQLUpdateFilter, ...]
     assignments: tuple[PostgreSQLUpdateCell, ...]
-    would_affect: int
-    before: tuple[PostgreSQLUpdateCell, ...]
-    after: tuple[PostgreSQLUpdateCell, ...]
+    matched_rows: int
+    samples: tuple[PostgreSQLUpdateSample, ...]
     fingerprint: PostgreSQLPreviewFingerprint
     checks: PostgreSQLUpdatePreviewChecks
     warnings: tuple[str, ...] = ()
@@ -198,18 +231,32 @@ class PostgreSQLUpdatePreview:
         ):
             if not isinstance(text_value, str) or not text_value:
                 raise ValueError(f"{text_name} must be non-empty text")
-        for cell_values, cell_name in (
-            (self.match, "preview match"),
-            (self.assignments, "preview assignments"),
-            (self.before, "preview before"),
-            (self.after, "preview after"),
+        where = tuple(self.where)
+        assignments = tuple(self.assignments)
+        samples = tuple(self.samples)
+        if not where or any(
+            not isinstance(item, PostgreSQLUpdateFilter) for item in where
         ):
-            cells = tuple(cell_values)
-            if any(not isinstance(item, PostgreSQLUpdateCell) for item in cells):
-                raise TypeError(f"{cell_name} must contain update cells")
-            object.__setattr__(self, cell_name.rsplit(" ", 1)[-1], cells)
-        if self.would_affect not in {0, 1} or isinstance(self.would_affect, bool):
-            raise ValueError("preview would_affect must be zero or one")
+            raise TypeError("preview where must contain update filters")
+        if not assignments or any(
+            not isinstance(item, PostgreSQLUpdateCell) for item in assignments
+        ):
+            raise TypeError("preview assignments must contain update cells")
+        if (
+            not isinstance(self.matched_rows, int)
+            or isinstance(self.matched_rows, bool)
+            or self.matched_rows < 0
+        ):
+            raise ValueError("preview matched_rows must be a non-negative integer")
+        if len(samples) > 5 or any(
+            not isinstance(item, PostgreSQLUpdateSample) for item in samples
+        ):
+            raise ValueError("preview samples must be bounded update samples")
+        if len(samples) > self.matched_rows:
+            raise ValueError("preview samples cannot exceed matched rows")
+        object.__setattr__(self, "where", where)
+        object.__setattr__(self, "assignments", assignments)
+        object.__setattr__(self, "samples", samples)
         if not isinstance(self.fingerprint, PostgreSQLPreviewFingerprint):
             raise TypeError("preview fingerprint must be PostgreSQLPreviewFingerprint")
         if not isinstance(self.checks, PostgreSQLUpdatePreviewChecks):
@@ -221,15 +268,6 @@ class PostgreSQLUpdatePreview:
         ):
             raise ValueError("preview warnings must be bounded text")
         object.__setattr__(self, "warnings", warnings)
-        assignment_columns = tuple(item.column for item in self.assignments)
-        if self.would_affect == 0:
-            if self.before or self.after:
-                raise ValueError("a missing preview target cannot expose row values")
-        elif (
-            tuple(item.column for item in self.before) != assignment_columns
-            or tuple(item.column for item in self.after) != assignment_columns
-        ):
-            raise ValueError("preview before/after must contain only changed fields")
         if (
             len(canonical_json(self.tool_data()).encode("utf-8"))
             > _MAX_PREVIEW_OUTPUT_BYTES
@@ -245,12 +283,11 @@ class PostgreSQLUpdatePreview:
                 "resource_name": self.resource_name,
                 "source_revision": self.source_revision,
                 "resource_revision": self.resource_revision,
-                "match": tuple(item.to_payload() for item in self.match),
+                "where": tuple(item.to_payload() for item in self.where),
                 "assignments": tuple(item.to_payload() for item in self.assignments),
-                "would_affect": self.would_affect,
-                "before": tuple(item.to_payload() for item in self.before),
-                "after": tuple(item.to_payload() for item in self.after),
-                "row_version_sha256": fingerprint.row_version_sha256,
+                "matched_rows": self.matched_rows,
+                "samples": tuple(item.to_payload() for item in self.samples),
+                "target_set_sha256": fingerprint.target_set_sha256,
                 "statement_sha256": fingerprint.statement_sha256,
                 "preview_fingerprint": fingerprint.preview_fingerprint,
                 "checks": self.checks.to_payload(),
@@ -262,7 +299,7 @@ class PostgreSQLUpdatePreview:
 
 @dataclass(frozen=True, slots=True)
 class PostgreSQLUpdateResult:
-    """One positively acknowledged committed PostgreSQL update."""
+    """One positively acknowledged committed PostgreSQL update plan."""
 
     receipt_id: str
     source_id: str
@@ -271,7 +308,8 @@ class PostgreSQLUpdateResult:
     resource_revision: str
     preview_fingerprint: str
     intent_sha256: str
-    returned: tuple[PostgreSQLUpdateCell, ...]
+    target_set_sha256: str
+    affected_rows: int
     committed_at: str
 
     def __post_init__(self) -> None:
@@ -288,6 +326,7 @@ class PostgreSQLUpdateResult:
         for value, name in (
             (self.preview_fingerprint, "preview_fingerprint"),
             (self.intent_sha256, "intent_sha256"),
+            (self.target_set_sha256, "target_set_sha256"),
         ):
             if (
                 not isinstance(value, str)
@@ -295,12 +334,12 @@ class PostgreSQLUpdateResult:
                 or not value.startswith("sha256:")
             ):
                 raise ValueError(f"update result {name} must be a sha256 hash")
-        returned = tuple(self.returned)
-        if not returned or any(
-            not isinstance(item, PostgreSQLUpdateCell) for item in returned
+        if (
+            not isinstance(self.affected_rows, int)
+            or isinstance(self.affected_rows, bool)
+            or self.affected_rows < 1
         ):
-            raise ValueError("update result must contain bounded returned cells")
-        object.__setattr__(self, "returned", returned)
+            raise ValueError("update result affected_rows must be positive")
 
     def tool_data(self) -> FrozenJsonObject:
         return FrozenJsonObject.from_mapping(
@@ -313,8 +352,8 @@ class PostgreSQLUpdateResult:
                 "resource_revision": self.resource_revision,
                 "preview_fingerprint": self.preview_fingerprint,
                 "intent_sha256": self.intent_sha256,
-                "affected_rows": 1,
-                "returned": tuple(item.to_payload() for item in self.returned),
+                "target_set_sha256": self.target_set_sha256,
+                "affected_rows": self.affected_rows,
                 "committed_at": self.committed_at,
                 "trust_classification": "untrusted_data",
             }
@@ -460,7 +499,7 @@ class PostgreSQLUpdatePreviewExecutor:
         if (
             result.source_id != intent.source_id
             or result.resource_id != intent.resource_id
-            or result.match != intent.match
+            or result.where != intent.where
         ):
             raise ValueError("preview backend returned a different update identity")
         return ToolOutput(
@@ -490,10 +529,15 @@ class PostgreSQLUpdateExecutor:
             agent_id=self._agent_id,
             intent=command.intent,
         )
-        if preview.would_affect != 1:
+        if preview.matched_rows == 0:
             raise CapabilityInputError(
                 "write_target_not_found",
-                "The previewed primary-key target does not currently exist.",
+                "The previewed target selection does not currently match any rows.",
+            )
+        if preview.matched_rows != command.expected_affected_rows:
+            raise CapabilityInputError(
+                "write_state_changed",
+                "The exact target count differs from the approved update plan.",
             )
         if preview.fingerprint.preview_fingerprint != command.preview_fingerprint:
             raise CapabilityInputError(
@@ -505,7 +549,7 @@ class PostgreSQLUpdateExecutor:
                 "intent_sha256": preview.fingerprint.intent_sha256,
                 "preview_fingerprint": preview.fingerprint.preview_fingerprint,
                 "resource_revision": preview.resource_revision,
-                "row_version_sha256": preview.fingerprint.row_version_sha256,
+                "target_set_sha256": preview.fingerprint.target_set_sha256,
                 "source_revision": preview.source_revision,
                 "statement_sha256": preview.fingerprint.statement_sha256,
             }
@@ -605,11 +649,38 @@ def postgresql_update_preview_extension_declarations() -> ExtensionDeclarations:
         "required": ["column", "value"],
         "additionalProperties": False,
     }
+    filter_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            "column": {"type": "string", "minLength": 1, "maxLength": 256},
+            "operator": {
+                "type": "string",
+                "enum": [
+                    "eq",
+                    "ne",
+                    "lt",
+                    "lte",
+                    "gt",
+                    "gte",
+                    "in",
+                    "not_in",
+                    "is_null",
+                    "is_not_null",
+                ],
+            },
+            "value": {},
+        },
+        "required": ["column", "operator", "value"],
+        "additionalProperties": False,
+    }
     capability = Capability(
         id=POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
         description=(
-            "Validate and preview one literal PostgreSQL row update by its exact "
-            "cataloged primary key without changing the database."
+            "Validate and preview one structured PostgreSQL update over an exact "
+            "catalog-scoped target set without changing the database. When the "
+            "user requested approval or execution, pass the exact successful "
+            "preview immediately to data_update_postgresql; preview alone does "
+            "not request approval."
         ),
         input_schema={
             "type": "object",
@@ -622,20 +693,18 @@ def postgresql_update_preview_extension_declarations() -> ExtensionDeclarations:
                     "type": "string",
                     "pattern": r"^catalog-resource:sha256:[0-9a-f]{64}$",
                 },
-                "match": {
+                "where": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 1,
-                    "items": cell_schema,
+                    "items": filter_schema,
                 },
                 "assignments": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": POSTGRESQL_UPDATE_MAX_ASSIGNMENTS,
                     "items": cell_schema,
                 },
             },
-            "required": ["source_id", "resource_id", "match", "assignments"],
+            "required": ["source_id", "resource_id", "where", "assignments"],
             "additionalProperties": False,
         },
         output_kind=POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
@@ -669,11 +738,36 @@ def postgresql_update_extension_declarations() -> ExtensionDeclarations:
         "required": ["column", "value"],
         "additionalProperties": False,
     }
+    filter_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            "column": {"type": "string", "minLength": 1, "maxLength": 256},
+            "operator": {
+                "type": "string",
+                "enum": [
+                    "eq",
+                    "ne",
+                    "lt",
+                    "lte",
+                    "gt",
+                    "gte",
+                    "in",
+                    "not_in",
+                    "is_null",
+                    "is_not_null",
+                ],
+            },
+            "value": {},
+        },
+        "required": ["column", "operator", "value"],
+        "additionalProperties": False,
+    }
     capability = Capability(
         id=POSTGRESQL_UPDATE_CAPABILITY_ID,
         description=(
-            "Apply one approved literal PostgreSQL row update by its exact "
-            "cataloged primary key and current preview fingerprint."
+            "Submit one exact previewed PostgreSQL update to runtime approval. "
+            "Calling this tool opens the approval interaction and applies the "
+            "update exactly once only if approved and revalidation succeeds."
         ),
         input_schema={
             "type": "object",
@@ -686,35 +780,32 @@ def postgresql_update_extension_declarations() -> ExtensionDeclarations:
                     "type": "string",
                     "pattern": r"^catalog-resource:sha256:[0-9a-f]{64}$",
                 },
-                "match": {
+                "where": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 1,
-                    "items": cell_schema,
+                    "items": filter_schema,
                 },
                 "assignments": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": POSTGRESQL_UPDATE_MAX_ASSIGNMENTS,
                     "items": cell_schema,
                 },
                 "preview_fingerprint": {
                     "type": "string",
                     "pattern": r"^sha256:[0-9a-f]{64}$",
                 },
-                "max_affected_rows": {
+                "expected_affected_rows": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 1,
                 },
             },
             "required": [
                 "source_id",
                 "resource_id",
-                "match",
+                "where",
                 "assignments",
                 "preview_fingerprint",
-                "max_affected_rows",
+                "expected_affected_rows",
             ],
             "additionalProperties": False,
         },
@@ -838,12 +929,11 @@ def _postgresql_update_preview_output_schema() -> dict[str, object]:
         "resource_name",
         "source_revision",
         "resource_revision",
-        "match",
+        "where",
         "assignments",
-        "would_affect",
-        "before",
-        "after",
-        "row_version_sha256",
+        "matched_rows",
+        "samples",
+        "target_set_sha256",
         "statement_sha256",
         "preview_fingerprint",
         "checks",
@@ -859,26 +949,25 @@ def _postgresql_update_preview_output_schema() -> dict[str, object]:
             "resource_name": {"type": "string"},
             "source_revision": {"type": "string"},
             "resource_revision": {"type": "string"},
-            "match": {"type": "array", "items": cell_schema},
+            "where": {"type": "array", "items": {"type": "object"}},
             "assignments": {"type": "array", "items": cell_schema},
-            "would_affect": {"type": "integer", "minimum": 0, "maximum": 1},
-            "before": {"type": "array", "items": cell_schema},
-            "after": {"type": "array", "items": cell_schema},
-            "row_version_sha256": hash_rule,
+            "matched_rows": {"type": "integer", "minimum": 0},
+            "samples": {"type": "array", "items": {"type": "object"}},
+            "target_set_sha256": hash_rule,
             "statement_sha256": hash_rule,
             "preview_fingerprint": hash_rule,
             "checks": {
                 "type": "object",
                 "properties": {
                     "compile_only": {"type": "string", "enum": ["passed"]},
-                    "primary_key_bounded": {"type": "boolean"},
+                    "target_set_fingerprinted": {"type": "boolean"},
                     "row_level_security": {"type": "boolean"},
                     "user_triggers": {"type": "boolean"},
                     "rewrite_rules": {"type": "boolean"},
                 },
                 "required": [
                     "compile_only",
-                    "primary_key_bounded",
+                    "target_set_fingerprinted",
                     "row_level_security",
                     "user_triggers",
                     "rewrite_rules",
@@ -897,12 +986,6 @@ def _postgresql_update_preview_output_schema() -> dict[str, object]:
 
 
 def _postgresql_update_output_schema() -> dict[str, object]:
-    cell_schema = {
-        "type": "object",
-        "properties": {"column": {"type": "string"}, "value": {}},
-        "required": ["column", "value"],
-        "additionalProperties": False,
-    }
     hash_rule = {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"}
     names = (
         "receipt_id",
@@ -913,8 +996,8 @@ def _postgresql_update_output_schema() -> dict[str, object]:
         "resource_revision",
         "preview_fingerprint",
         "intent_sha256",
+        "target_set_sha256",
         "affected_rows",
-        "returned",
         "committed_at",
         "trust_classification",
     )
@@ -932,13 +1015,8 @@ def _postgresql_update_output_schema() -> dict[str, object]:
             "resource_revision": {"type": "string"},
             "preview_fingerprint": hash_rule,
             "intent_sha256": hash_rule,
-            "affected_rows": {"type": "integer", "minimum": 1, "maximum": 1},
-            "returned": {
-                "type": "array",
-                "minItems": 2,
-                "maxItems": POSTGRESQL_UPDATE_MAX_ASSIGNMENTS + 1,
-                "items": cell_schema,
-            },
+            "target_set_sha256": hash_rule,
+            "affected_rows": {"type": "integer", "minimum": 1},
             "committed_at": {"type": "string"},
             "trust_classification": {
                 "type": "string",
@@ -970,6 +1048,7 @@ __all__ = [
     "PostgreSQLUpdateDeclarations",
     "PostgreSQLUpdateExecutor",
     "PostgreSQLUpdateResult",
+    "PostgreSQLUpdateSample",
     "SQLITE_QUERY_EXECUTOR_ID",
     "SQLiteQueryDeclarations",
     "SQLiteQueryExecutor",

@@ -404,6 +404,33 @@ async def test_unreviewable_approval_is_denied_before_prompting(
     assert "Approve this exact change once?" not in output.getvalue()
 
 
+def test_cli_and_tui_share_one_exact_approval_document_renderer():
+    request = ApprovalRequest(
+        run_id="run-shared-renderer",
+        call_id="call-shared-renderer",
+        tool_name="data_update_postgresql",
+        capability_id="data.postgresql.update",
+        arguments=FrozenJsonObject.from_mapping(
+            {
+                "source_id": "source:sha256:" + "a" * 64,
+                "resource_id": "catalog-resource:sha256:" + "b" * 64,
+                "where": [{"column": "status", "operator": "eq", "value": "日本語"}],
+                "assignments": [{"column": "priority", "value": 4}],
+                "preview_fingerprint": "sha256:" + "c" * 64,
+                "expected_affected_rows": 10,
+            }
+        ),
+        reason="write",
+    )
+
+    cli_document = terminal._render_approval_arguments(request)
+    panel = terminal_tui._approval_panel_for_request(request)
+
+    assert cli_document is not None
+    assert panel is not None
+    assert cli_document == panel.arguments_text
+
+
 async def test_cli_and_tui_render_identical_frozen_postgresql_update_arguments(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -412,10 +439,10 @@ async def test_cli_and_tui_render_identical_frozen_postgresql_update_arguments(
         {
             "source_id": "source:sha256:" + "a" * 64,
             "resource_id": "catalog-resource:sha256:" + "b" * 64,
-            "match": [{"column": "account_id", "value": 42}],
+            "where": [{"column": "account_id", "operator": "eq", "value": 42}],
             "assignments": [{"column": "status", "value": "inactive"}],
             "preview_fingerprint": "sha256:" + "c" * 64,
-            "max_affected_rows": 1,
+            "expected_affected_rows": 2500,
         }
     )
     request = ApprovalRequest(
@@ -667,8 +694,9 @@ async def test_local_status_commands_are_bounded_secret_free_and_never_modeled(
     assert "Catalog preview" in text
     assert "Sources" in text
     assert "Settings" in text
-    assert "Commands" in text
-    assert "/source permissions" in text
+    assert "Help" in text
+    assert "Type / to browse commands and their descriptions." in text
+    assert "/source permissions" not in text
     assert "/source write" not in text
     assert "Wheel or Page Up/Page Down review" in text
     assert "Esc Esc clear input" in text
@@ -714,6 +742,88 @@ async def test_source_add_recomputes_catalog_before_returning_to_prompt(
     assert "2 resources" in text
     assert text.count("You › ") >= 2
     assert provider.requests == ()
+
+
+async def test_source_edit_validates_reviews_switches_and_starts_new_conversation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keychain = _Keychain()
+    _, current_source_id = await _ready_agent(tmp_path, keychain)
+    edited = tmp_path / "edited.sqlite"
+    _database(edited, "records")
+    provider = MockModelProvider(
+        (_stop("ready to edit"),), provider_id="openai:test-model"
+    )
+    _install_provider(monkeypatch, provider)
+    output = io.StringIO()
+
+    code = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO(
+            "Check the current source\n"
+            f"/source edit\ny\n{edited}\nEdited SQLite\ny\n/exit\n"
+        ),
+        output_stream=output,
+        keychain=keychain,
+    )
+
+    assert code == 0
+    text = output.getvalue()
+    assert "Edit active source connection" in text
+    assert "current connection remains active" in text
+    assert "Review connection changes" in text
+    assert "Change the active connection? [y/N]" in text
+    assert "Connection updated for Edited SQLite" in text
+    assert "previous source identity was detached" in text
+    assert "Started a new conversation to keep connection context isolated" in text
+    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    try:
+        active = await reopened.active_source()
+        assert active is not None
+        assert active.display_name == "Edited SQLite"
+        assert active.configuration["path"] == str(edited)
+        old = next(
+            source
+            for source in await reopened.list_sources()
+            if source.id == current_source_id
+        )
+        assert not old.active
+    finally:
+        await reopened.close()
+
+
+async def test_source_edit_review_rejection_keeps_active_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keychain = _Keychain()
+    current_path, current_source_id = await _ready_agent(tmp_path, keychain)
+    edited = tmp_path / "edited.sqlite"
+    _database(edited, "records")
+    provider = MockModelProvider((), provider_id="openai:test-model")
+    _install_provider(monkeypatch, provider)
+    output = io.StringIO()
+
+    code = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO(
+            f"/source edit\ny\n{edited}\nEdited SQLite\nNO\n/exit\n"
+        ),
+        output_stream=output,
+        keychain=keychain,
+    )
+
+    assert code == 0
+    assert "Active source connection was not changed" in output.getvalue()
+    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    try:
+        active = await reopened.active_source()
+        assert active is not None and active.id == current_source_id
+        assert active.configuration["path"] == str(current_path)
+        assert await reopened.list_sources() == (active,)
+    finally:
+        await reopened.close()
 
 
 async def test_source_use_and_one_question_override_are_local_and_persisted(

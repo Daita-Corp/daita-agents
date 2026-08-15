@@ -360,11 +360,6 @@ async def test_readiness_passes_only_for_enabled_exact_scope(
     ("resource", "columns", "expected_code"),
     (
         (_resource(primary_key_columns=()), ("status",), "write_primary_key_required"),
-        (
-            _resource(primary_key_columns=("account_id", "status")),
-            ("status",),
-            "write_primary_key_required",
-        ),
         (_resource(), ("account_id",), "write_assignment_invalid"),
         (_resource(), ("missing",), "write_assignment_invalid"),
         (
@@ -572,10 +567,9 @@ async def test_readiness_rejects_wrong_adapter_or_inactive_source_before_connect
         (),
         ("status", "status"),
         ("status\x00hidden",),
-        tuple(f"column_{index}" for index in range(33)),
     ),
 )
-async def test_readiness_rejects_unbounded_assignment_scope_before_source_io(
+async def test_readiness_rejects_malformed_assignment_scope_before_source_io(
     assignment_columns: tuple[str, ...],
 ) -> None:
     backend = write_module.PostgreSQLUpdatePreviewBackend(
@@ -583,7 +577,7 @@ async def test_readiness_rejects_unbounded_assignment_scope_before_source_io(
         _Catalog(),
     )
 
-    with pytest.raises(ValueError, match="one through 32 distinct bounded names"):
+    with pytest.raises(ValueError, match="distinct bounded names"):
         await backend.postgresql_update_readiness(
             agent_id="agent-readiness",
             source_id=SOURCE_ID,

@@ -1,166 +1,151 @@
 # Subscription model sources
 
-Daita has three explicit subscription provider identities:
+Daita can use an existing ChatGPT, Claude Code, or Grok Build subscription
+instead of a separately billed model API key. Subscription calls consume the
+allowance of the connected account, and the models available to that account
+still depend on the provider and plan.
 
-```text
-codex:<model>
-claude-code:<model>
-grok-build:<model>
-```
+Subscription routes are distinct from API-key routes:
 
-They remain distinct from API-billed `openai:<model>`, `anthropic:<model>`,
-`gemini:<model>`, and `grok:<model>` routes. Selecting a CLI subscription never
-silently falls back to an API key, Vertex AI, a custom provider, or a custom
-base URL.
+| Daita option | Uses | Sign-in |
+| --- | --- | --- |
+| **Codex subscription** | A ChatGPT account with access to the selected Codex model | Completed inside Daita |
+| **Claude Code subscription** | The installed Claude Code client and its saved login | Run `claude auth login` first |
+| **Grok Build subscription** | The installed Grok Build client and its saved login | Run `grok login` first |
 
-## Codex through a ChatGPT subscription
+Daita never silently replaces one of these routes with an API key, custom
+endpoint, or different provider. Select an API-backed provider during model
+setup when pay-as-you-go API billing is preferred.
 
-Choose **Codex subscription** during model setup. Daita requests a device code,
-shows the OpenAI verification URL and one-time code, waits for approval, stores
-the OAuth bundle in the OS keychain, and validates the model through the
-ChatGPT Codex Responses transport.
+## Configure Codex through ChatGPT
 
-The Codex CLI is not required, and Daita does not read or mutate `~/.codex`.
-Only a keychain reference is written to the agent configuration.
+The Codex CLI is not required.
 
-## Claude through a Claude Code subscription
+1. Run `daita` and create or open an agent.
+2. During model setup, choose **Codex subscription**.
+3. Choose one of the models offered by Daita.
+4. Open the verification URL shown by Daita and enter the one-time code.
+5. Return to Daita and wait for model validation to complete.
 
-Install and sign in to Claude Code first:
+Daita stores the resulting OAuth credential in the operating-system keychain.
+The agent configuration stores only a reference to that keychain entry. Daita
+does not read or modify `~/.codex`, and it refreshes its own saved connection
+when necessary.
+
+## Configure Claude Code
+
+Install Claude Code using the
+[official setup instructions](https://code.claude.com/docs/en/getting-started),
+then sign in before starting Daita:
 
 ```bash
 claude auth login
 daita
 ```
 
-Choose **Claude Code subscription**. Daita invokes the official client in a
-temporary directory with native tools, MCP, browser access, slash commands,
-session persistence, and API-key endpoint overrides disabled. Daita does not
-copy Claude Code's saved login.
+Choose **Claude Code subscription** during model setup, then choose one of the
+models offered by Daita. The Claude Code executable must remain installed and
+its login must remain valid.
 
-## Grok Build subscription
+Daita invokes the signed-in client in a temporary directory with its native
+tools, browser integration, MCP servers, slash commands, and session persistence
+disabled. Daita does not copy Claude Code's saved credential into the agent
+home or keychain.
 
-Install the official client and sign in:
+## Configure Grok Build
+
+Install Grok Build using the
+[official Grok Build instructions](https://docs.x.ai/build/overview), then sign
+in and confirm that the client runs:
 
 ```bash
-curl -fsSL https://x.ai/cli/install.sh | bash
 grok login
 grok version
 daita
 ```
 
-Choose **Grok Build subscription** and `grok-4.5`. Grok Build does not accept
-prompt content from stdin, so Daita writes the bounded request to an owner-only
-temporary prompt file and passes only that file path as an argument. Before the
-first request, Daita feature-detects the documented headless controls and runs
-`grok inspect --json` under the exact inference environment. Inference starts
-only when inspection confirms API-key authentication is disabled, no config
-layer contributes settings, and no instructions, permissions, hooks, plugins,
-marketplaces, MCP servers, LSP servers, or non-bundled skills/agents were
-discovered. The subscription route accepts only Daita-reviewed built-in model
-identities; it currently accepts `grok-4.5`.
+Choose **Grok Build subscription** during model setup. Daita accepts only the
+built-in Grok models it has explicitly reviewed, which may differ from the
+provider's newest model. Choose from the models Daita displays instead of
+entering a custom provider or model.
 
-Each run uses owner-only temporary working and process-home directories. Grok's
-real `GROK_HOME` remains in place so the official client coordinates through
-its normal lock and can atomically rotate `auth.json`; Daita never opens or
-copies that credential. The child environment forces
-`GROK_DISABLE_API_KEY_AUTH=1` and omits API keys and custom provider variables.
-Because an active Grok config cannot be proven harmless without reproducing the
-client's config semantics, even a settings-only active config is rejected.
+Before each use, Daita checks the installed client's headless controls and the
+configuration reported by `grok inspect`. Active custom providers, API-key
+authentication, instructions, permissions, hooks, plugins, marketplaces, MCP
+servers, or other extensions cause validation to fail because Daita cannot
+guarantee its model-only boundary in their presence.
 
-The invocation also:
+Daita does not copy Grok's saved credential. The Grok client continues to own
+its login and normal credential refresh. Grok Build currently has no control
+that guarantees headless sessions are not persisted, so the client may retain
+the bounded request and response in its own session or log files. Daita does
+not import those records into the agent home.
 
-- replaces the native system prompt with Daita's model-only contract;
-- supplies an empty native-tool allowlist plus explicit native-tool and
-  permission denials;
-- disables planning, subagents, memory, web search/fetch, automatic updates,
-  and alternate-screen UI;
-- limits the native harness to one model turn; and
-- passes Daita's response schema through Grok's native `--json-schema`
-  contract; and
-- reads the documented `streaming-json` event contract, requiring no advertised
-  native tools, one successful `end_turn`, native validated structured output,
-  and model-usage confirmation for the requested built-in model.
+## What the model receives
 
-If the client emits an unexpected event, exceeds one model turn, or reports
-usage for a different model, Daita fails the request closed. The child
-environment omits `XAI_API_KEY`, custom chat-proxy/OIDC/auth-provider variables,
-database secrets, and unrelated provider keys. Daita does not read, copy,
-persist, refresh, or deliberately mutate the saved credential; Grok owns its
-normal official OAuth refresh while it owns the subprocess, and `grok login`
-remains the repair path.
+Subscription models receive the same Daita model request as API-backed models.
+This can include the current conversation, bounded catalog descriptions, and
+data returned by Daita tools when needed to answer the question. Do not treat a
+subscription route as local-only processing.
 
-The current Grok Build headless client does not expose a no-session-persistence
-flag. It may therefore retain its normal session or log records in the user's
-Grok home, including the bounded request and response. Daita still disables
-Grok memory and executes from a disposable directory, and Daita does not import
-those client records into agent state. This is a client limitation rather than
-an implied ephemeral-session guarantee.
+The provider client does not receive a database password, source client, or
+direct connection to an attached data source. It can propose Daita tool calls,
+but Daita validates and executes those calls through its normal catalog and
+permission boundaries. Native client tools are not an alternate path to the
+filesystem, shell, browser, or database.
 
-Official references:
+## Credentials, allowance, and cost limits
 
-- <https://docs.x.ai/build/overview>
-- <https://docs.x.ai/build/cli/headless-scripting>
-- <https://docs.x.ai/build/cli/reference>
-
-## Runtime and security boundary
-
-All three sources use Daita's one direct loop:
-
-```text
-Daita transcript -> subscription model transport -> canonical model response
-       ^                                                  |
-       |                                                  v
-Daita tool result <- Daita DataToolRuntime <- proposed Daita tool call
-```
-
-The CLI adapters translate canonical messages and projected tools into one
-bounded response envelope. A model may propose a Daita tool call, but only
-`CapabilityRegistry` and `DataToolRuntime` validate and execute it. The clients
-receive no source client, executor, database credential, or alternate tool
-path.
-
-Subprocesses are launched directly without a shell. Daita bounds request,
-arguments, stdout, stderr, wall time, JSON depth/node count, response text, tool
-arguments, and tool-call count. It rejects duplicate-key/non-finite JSON and
-terminal controls, and terminates the subprocess group on cancellation,
-timeout, or output overflow. Raw client diagnostics are classified at the
-adapter boundary and are not retained in normalized exceptions.
-
-Returned token usage is recorded when present. Dollar cost is always marked
-`subscription_billing`/unavailable, even if a client emits an API-style dollar
-field, so estimated-cost ceilings fail closed instead of treating subscription
-usage as free.
-
-## Manual end-to-end smoke tests
-
-These checks consume a small amount of allowance. They are intentionally not
-part of the deterministic test suite.
-
-### Grok Build
-
-1. Run `grok login`, then `grok version`.
-2. Run `daita`, create a disposable agent, and choose **Grok Build
-   subscription**.
-3. Select `grok-4.5`; if prompted for unreviewed limits, enter the limits
-   appropriate to the installed client/model configuration.
-4. Acknowledge the allowance warning and validate.
-5. Attach a disposable read-only SQLite/CSV source and ask a question that
-   requires catalog inspection and one data read.
-6. Exit, run `daita` again, reopen the agent, and ask a follow-up without
-   repeating setup.
+- **Codex subscription:** Daita owns a ChatGPT OAuth credential in the OS
+  keychain and stores only its reference in agent configuration.
+- **Claude Code and Grok Build:** the official client owns its saved login;
+  Daita invokes that client without copying the credential.
+- **Allowance:** setup validation and normal requests consume a small amount of
+  the connected subscription allowance.
+- **Dollar estimates:** subscription usage is not treated as zero-cost API
+  usage. Daita records token usage when the provider reports it, but marks the
+  dollar estimate unavailable. A run that requires a complete dollar estimate
+  can therefore stop rather than assume the request is free.
 
 ## Troubleshooting
 
-- **Missing or incompatible Grok Build:** reinstall/update the official client
-  and run `grok login`.
-- **OAuth/configuration error from Grok:** remove per-model API keys, custom
-  providers, MCP servers, skills, and any other active Grok config layer,
-  including user, project, managed, requirements, or system configuration;
-  otherwise run `grok login` and retry. Daita rejects these layers before
-  inference rather than trying to reinterpret their precedence.
-- **Allowance/rate limit:** wait for the connected plan's allowance reset or
-  choose another explicitly configured provider.
-- **Local access error:** launch Daita from a normal terminal where the official
-  client can access its own login state.
-- **Validation:** each validation request consumes a small amount of the
-  connected allowance.
+### The client is missing or incompatible
+
+Update or reinstall the official client, sign in again, and retry model setup:
+
+```bash
+claude auth login
+# or
+grok login
+```
+
+For Grok Build, `grok version` must also succeed. Daita fails closed when the
+installed client does not expose the headless controls it requires.
+
+### Authentication failed
+
+- For Codex, start model setup again and repeat the device-code sign-in.
+- For Claude Code, run `claude auth login` outside Daita.
+- For Grok Build, run `grok login` outside Daita.
+
+If an official client works in a normal terminal but not in Daita, launch Daita
+from that same terminal so the client can access its saved login state.
+
+### The selected model is unavailable
+
+The connected plan may not include the model, or the provider may have changed
+its availability. Reopen model setup and choose another model offered by Daita.
+Do not substitute a custom provider identity under a subscription route.
+
+### Subscription allowance is exhausted
+
+Wait for the provider's allowance to reset or explicitly configure a different
+subscription or API-backed provider.
+
+### Grok configuration could not be isolated
+
+Run `grok inspect` to review the configuration Grok discovers. Remove or disable
+custom providers, API keys, instructions, permissions, hooks, plugins,
+marketplaces, MCP servers, skills, and other active configuration layers, then
+run `grok login` and retry. Daita rejects these layers instead of attempting to
+reinterpret their precedence.

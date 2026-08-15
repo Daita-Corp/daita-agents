@@ -22,8 +22,9 @@ _SOURCE_PERMISSION_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_MAX_RESOURCE_IDS = 10_000
-_SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS = 32
 _SOURCE_PERMISSION_MAX_CATALOG_COLUMNS = 512
+_SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS = _SOURCE_PERMISSION_MAX_CATALOG_COLUMNS
+_SOURCE_PERMISSION_ADVANCED_COLUMN_THRESHOLD = 32
 _SOURCE_PERMISSION_MAX_SUMMARY_EXAMPLES = 5
 
 
@@ -184,7 +185,7 @@ class SourcePermissionResource:
     @property
     def requires_advanced_column_selection(self) -> bool:
         return len(self.eligible_assignment_columns) > (
-            _SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS
+            _SOURCE_PERMISSION_ADVANCED_COLUMN_THRESHOLD
         )
 
 
@@ -589,6 +590,7 @@ class DatabaseWriteReceipt:
     resource_id: str
     intent_sha256: str
     preview_fingerprint: str
+    expected_affected_rows: int
     outcome: DatabaseWriteOutcome
     affected_rows: int | None
     normalized_error_code: str | None
@@ -622,6 +624,12 @@ class DatabaseWriteReceipt:
                 raise ValueError(f"receipt {name} must be a sha256 hash")
         if not isinstance(self.outcome, DatabaseWriteOutcome):
             raise TypeError("receipt outcome must be a DatabaseWriteOutcome")
+        if (
+            not isinstance(self.expected_affected_rows, int)
+            or isinstance(self.expected_affected_rows, bool)
+            or self.expected_affected_rows < 1
+        ):
+            raise ValueError("receipt expected_affected_rows must be positive")
         database_write_aware(self.started_at, "receipt started_at")
         if self.completed_at is not None:
             database_write_aware(self.completed_at, "receipt completed_at")
@@ -658,11 +666,13 @@ class DatabaseWriteReceipt:
                 raise ValueError("started receipt cannot contain terminal fields")
         elif self.outcome is DatabaseWriteOutcome.COMMITTED:
             if (
-                self.affected_rows != 1
+                self.affected_rows != self.expected_affected_rows
                 or self.normalized_error_code is not None
                 or self.completed_at is None
             ):
-                raise ValueError("committed receipt must record one affected row")
+                raise ValueError(
+                    "committed receipt must record the expected affected rows"
+                )
         elif self.outcome is DatabaseWriteOutcome.NOT_COMMITTED:
             if (
                 self.affected_rows != 0
@@ -693,6 +703,7 @@ class DatabaseWriteReceipt:
         resource_id: str,
         intent_sha256: str,
         preview_fingerprint: str,
+        expected_affected_rows: int,
         started_at: datetime,
     ) -> DatabaseWriteReceipt:
         return cls(
@@ -711,6 +722,7 @@ class DatabaseWriteReceipt:
             resource_id=resource_id,
             intent_sha256=intent_sha256,
             preview_fingerprint=preview_fingerprint,
+            expected_affected_rows=expected_affected_rows,
             outcome=DatabaseWriteOutcome.STARTED,
             affected_rows=None,
             normalized_error_code=None,

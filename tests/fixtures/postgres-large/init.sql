@@ -13,6 +13,16 @@ CREATE ROLE daita_large_reader
 
 ALTER ROLE daita_large_reader SET default_transaction_read_only = on;
 
+CREATE ROLE daita_large_writer
+    LOGIN
+    PASSWORD 'daita_large_writer_fixture_password'
+    NOSUPERUSER
+    NOCREATEDB
+    NOCREATEROLE
+    NOINHERIT
+    NOREPLICATION
+    NOBYPASSRLS;
+
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 
 CREATE SCHEMA core;
@@ -1189,6 +1199,10 @@ CREATE INDEX archive_order_items_product_id_idx
 
 ANALYZE;
 
+REVOKE ALL PRIVILEGES ON DATABASE daita_large_fixture FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON DATABASE postgres FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON DATABASE template1 FROM PUBLIC;
+
 GRANT CONNECT ON DATABASE daita_large_fixture TO daita_large_reader;
 GRANT USAGE ON SCHEMA
     core,
@@ -1217,6 +1231,14 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA
     analytics,
     archive
 GRANT SELECT ON TABLES TO daita_large_reader;
+
+-- Keep the production-shape reader read-only. This separate disposable role
+-- exists only for terminal single-selection and bulk update testing against
+-- one existing large fixture table and one exact assignment column.
+GRANT CONNECT ON DATABASE daita_large_fixture TO daita_large_writer;
+GRANT USAGE ON SCHEMA support TO daita_large_writer;
+GRANT SELECT ON support.tickets TO daita_large_writer;
+GRANT UPDATE (priority) ON support.tickets TO daita_large_writer;
 
 CREATE TABLE private.fixture_status (
     ready boolean PRIMARY KEY

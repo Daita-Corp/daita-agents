@@ -129,6 +129,19 @@ def _make_preledger(
         connection.execute("DROP TABLE state_migrations")
         if not receipt_era:
             connection.execute("DROP TABLE database_write_receipts")
+        else:
+            for receipt_id, data in tuple(
+                connection.execute("SELECT id, data FROM database_write_receipts")
+            ):
+                payload = json.loads(data)
+                payload["fields"].pop("expected_affected_rows")
+                connection.execute(
+                    "UPDATE database_write_receipts SET data = ? WHERE id = ?",
+                    (
+                        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                        receipt_id,
+                    ),
+                )
         connection.execute(f"PRAGMA user_version = {marker}")
 
 
@@ -159,7 +172,7 @@ def _make_admission_prefix(
                 "VALUES (?, ?)",
                 (agent_id, source_id),
             )
-        connection.execute("DELETE FROM state_migrations WHERE ordinal = 3")
+        connection.execute("DELETE FROM state_migrations WHERE ordinal >= 3")
 
 
 def _registration(agent_id: str) -> SourceRegistration:
@@ -265,6 +278,7 @@ async def test_every_supported_preledger_shape_upgrades_and_preserves_rows(
             resource_id="catalog-resource:sha256:" + "2" * 64,
             intent_sha256="sha256:" + "3" * 64,
             preview_fingerprint="sha256:" + "4" * 64,
+            expected_affected_rows=1,
             started_at=NOW,
         ).finish(
             DatabaseWriteOutcome.COMMITTED,
@@ -307,7 +321,7 @@ async def test_every_supported_preledger_shape_upgrades_and_preserves_rows(
     assert _journal(path) == migration_rows()
     after = _rows(path, _tables(path))
     for table, rows in old_rows.items():
-        if table == "sources":
+        if table in {"database_write_receipts", "sources"}:
             continue
         assert after[table] == rows
     with sqlite3.connect(path) as connection:
@@ -319,6 +333,11 @@ async def test_every_supported_preledger_shape_upgrades_and_preserves_rows(
         assert connection.execute(
             "SELECT COUNT(*) FROM postgresql_update_scopes"
         ).fetchone() == (0,)
+        if receipt_era:
+            receipt_data = connection.execute(
+                "SELECT data FROM database_write_receipts"
+            ).fetchone()[0]
+            assert json.loads(receipt_data)["fields"]["expected_affected_rows"] == 1
 
 
 @pytest.mark.parametrize("legacy_value", (_MISSING, False, True))
@@ -425,7 +444,7 @@ async def test_detached_preledger_source_never_inherits_embedded_admission(
             "20990101_unknown",
         ),
         (
-            "UPDATE state_migrations SET ordinal = 4 WHERE ordinal = 2",
+            "UPDATE state_migrations SET ordinal = 5 WHERE ordinal = 2",
             "20260812_scoped_source_permissions",
         ),
     ),
@@ -499,7 +518,7 @@ async def test_cancellation_waits_for_atomic_journal_upgrade_to_settle(
     monkeypatch.setattr(
         migration_runner,
         "MIGRATIONS",
-        (*migration_runner.MIGRATIONS[:2], controlled),
+        (*migration_runner.MIGRATIONS[:2], controlled, migration_runner.MIGRATIONS[3]),
     )
     opening = asyncio.create_task(SQLiteStateStore.open(path))
     assert await asyncio.to_thread(entered.wait, 5)
@@ -543,7 +562,7 @@ async def test_scoped_permission_migration_failure_rolls_back_every_change(
     monkeypatch.setattr(
         migration_runner,
         "MIGRATIONS",
-        (*migration_runner.MIGRATIONS[:2], controlled),
+        (*migration_runner.MIGRATIONS[:2], controlled, migration_runner.MIGRATIONS[3]),
     )
     with pytest.raises(StateCompatibilityError) as raised:
         await SQLiteStateStore.open(path)
@@ -578,7 +597,7 @@ async def test_newer_journal_extension_is_a_downgrade_refusal_without_write(
     with sqlite3.connect(path) as connection:
         connection.execute(
             "INSERT INTO state_migrations(ordinal, migration_id, checksum) "
-            "VALUES (4, ?, ?)",
+            "VALUES (5, ?, ?)",
             (future_revision, "f" * 64),
         )
     before = _sha256(path)
@@ -601,7 +620,7 @@ async def test_invalid_later_journal_entry_is_unsupported_without_write(
     with sqlite3.connect(path) as connection:
         connection.execute(
             "INSERT INTO state_migrations(ordinal, migration_id, checksum) "
-            "VALUES (5, 'gapped-future', ?)",
+            "VALUES (6, 'gapped-future', ?)",
             ("f" * 64,),
         )
     before = _sha256(path)
@@ -830,6 +849,11 @@ def test_migration_checksums_are_stable_sha256_values() -> None:
             3,
             "20260812_scoped_source_permissions",
             "2ed3f7017f9d4c683ee17a0ba43c88ad4452c5af1b06223343cd43248f699d95",
+        ),
+        (
+            4,
+            "20260814_generalized_postgresql_updates",
+            "b08069f61481986937a864d33471185c6fbf031affe81f275a271f0e56a8f428",
         ),
     )
 

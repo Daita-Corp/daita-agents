@@ -9,13 +9,13 @@ from ..sqlite_schema import (
     JOURNAL_TABLE_SQL,
     POSTGRESQL_UPDATE_SCOPE_TABLE_SQL,
     RECEIPT_TABLE_SQL,
-    SCOPED_PERMISSION_TABLES,
+    CURRENT_TABLES,
     SOURCE_READ_SCOPE_TABLE_SQL,
     require_healthy,
     require_schema,
 )
 from .runner import MIGRATIONS, insert_journal_row
-from .scoped_source_permissions import validate_target
+from .generalized_postgresql_updates import validate_target
 
 
 def create_current(connection: sqlite3.Connection) -> None:
@@ -33,7 +33,7 @@ def create_current(connection: sqlite3.Connection) -> None:
     )
     for migration in MIGRATIONS:
         insert_journal_row(connection, migration)
-    require_schema(connection, SCOPED_PERMISSION_TABLES)
+    require_schema(connection, CURRENT_TABLES)
     validate_target(connection)
     require_healthy(connection)
     connection.commit()

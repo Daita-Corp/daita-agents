@@ -36,6 +36,8 @@ from .agent import (
     CodexDevicePrompt,
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
+    SourceEditPreview,
+    SourceEditResult,
     SourceRefreshError,
     SourceSelectionError,
 )
@@ -51,7 +53,7 @@ from .learning_candidates import (
     learning_candidate_content_from_mapping,
     learning_candidate_content_to_mapping,
 )
-from .security import KeychainStore
+from .security import KeychainStore, SecretReference
 from .skills import Skill, validate_skill_name
 from .terminal_selection import (
     SelectionCancelled,
@@ -73,6 +75,7 @@ _PROVIDERS = (
 )
 _BUILTIN_PROVIDER_IDS = frozenset(provider for provider, _ in _PROVIDERS[:-1])
 _SUBSCRIPTION_PROVIDER_IDS = frozenset({"codex", "claude-code", "grok-build"})
+_MAX_APPROVAL_DOCUMENT_CHARACTERS = terminal_tui.MAX_APPROVAL_DOCUMENT_CHARACTERS
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,9 +379,7 @@ _POSTGRESQL_CONNECTION_URL_ERROR = (
 )
 _MAX_CHAT_INPUT_CHARACTERS = 16_384
 _MAX_DISPLAY_CHARACTERS = 16_384
-_MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
 _MAX_SOURCE_PICKER_OPTIONS = 128
-_MAX_POSTGRESQL_WRITE_COLUMNS = 32
 _MAX_CATALOG_PREVIEW = 12
 _MAX_SOURCE_PREVIEW = 8
 _DEFAULT_CANDIDATE_REVIEW_COST_LIMIT_USD = Decimal("0.05")
@@ -1302,7 +1303,7 @@ async def _onboard_source(
                 file=output_stream,
             )
             configure_now = _read_line(
-                "Configure one-row update access now? [y/N]: ",
+                "Configure PostgreSQL update access now? [y/N]: ",
                 input_stream,
                 output_stream,
             )
@@ -1691,6 +1692,461 @@ async def _onboard_postgresql(
             await agent.delete_postgresql_password(reference)
 
 
+def _source_configuration_text(source: Any, key: str) -> str:
+    value = source.configuration.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"saved source {key} is invalid")
+    return value
+
+
+def _source_configuration_port(source: Any) -> int:
+    value = source.configuration.get("port")
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= 65_535
+    ):
+        raise ValueError("saved source port is invalid")
+    return value
+
+
+def _source_configuration_schemas(source: Any) -> tuple[str, ...]:
+    value = source.configuration.get("schemas")
+    if (
+        not isinstance(value, (list, tuple))
+        or not value
+        or any(not isinstance(schema, str) or not schema for schema in value)
+    ):
+        raise ValueError("saved source schemas are invalid")
+    return tuple(value)
+
+
+def _source_configuration_credential(source: Any) -> SecretReference | None:
+    value = source.configuration.get("credential_ref")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("saved source credential reference is invalid")
+    return SecretReference.parse(value)
+
+
+def _read_edit_value(
+    label: str,
+    default: str,
+    input_stream: TextIO,
+    output_stream: TextIO,
+) -> str:
+    safe_default = _safe_display(default, fallback="current value", maximum=256)
+    return (
+        _read_line(
+            f"{label} [{safe_default}]: ",
+            input_stream,
+            output_stream,
+        ).strip()
+        or default
+    )
+
+
+def _read_edit_postgresql_port(
+    default: int,
+    input_stream: TextIO,
+    output_stream: TextIO,
+) -> int:
+    while True:
+        value = _read_line(
+            f"Port [{default}]: ",
+            input_stream,
+            output_stream,
+        ).strip()
+        try:
+            port = default if not value else int(value)
+        except ValueError:
+            port = 0
+        if 1 <= port <= 65_535:
+            return port
+        print("Port must be from 1 through 65535.", file=output_stream)
+
+
+def _read_edit_ssl_mode(
+    default: str,
+    input_stream: TextIO,
+    output_stream: TextIO,
+) -> str:
+    while True:
+        value = (
+            _read_line(
+                f"SSL mode [{default}]: ",
+                input_stream,
+                output_stream,
+            ).strip()
+            or default
+        )
+        if value in _SSL_MODES:
+            return value
+        print(
+            "SSL mode must be disable, prefer, allow, require, verify-ca, or "
+            "verify-full.",
+            file=output_stream,
+        )
+
+
+def _postgresql_connection_summary(
+    *,
+    host: str,
+    port: int,
+    database: str,
+    username: str,
+    schemas: tuple[str, ...],
+) -> str:
+    return _safe_display(
+        f"{username}@{host}:{port}/{database} · schemas {', '.join(schemas)}",
+        fallback="PostgreSQL connection",
+        maximum=512,
+    )
+
+
+def _source_connection_summary(source: Any) -> str:
+    if source.adapter_id == "postgresql":
+        return _postgresql_connection_summary(
+            host=_source_configuration_text(source, "host"),
+            port=_source_configuration_port(source),
+            database=_source_configuration_text(source, "database"),
+            username=_source_configuration_text(source, "username"),
+            schemas=_source_configuration_schemas(source),
+        )
+    key = "path" if source.adapter_id == "sqlite" else "root"
+    return _safe_display(
+        _source_configuration_text(source, key),
+        fallback="local source path",
+        maximum=512,
+    )
+
+
+async def _confirm_source_edit(
+    preview: SourceEditPreview,
+    *,
+    current_summary: str,
+    edited_summary: str,
+    output_stream: TextIO,
+    input_stream: TextIO,
+    credential_changed: bool = False,
+) -> bool:
+    print(file=output_stream)
+    print("Review connection changes", file=output_stream)
+    print(f"Current     {current_summary}", file=output_stream)
+    print(f"Edited      {edited_summary}", file=output_stream)
+    print(
+        f"Catalog     {preview.resource_count} resources · "
+        f"{preview.relationship_count} relationships",
+        file=output_stream,
+    )
+    if preview.read_mode.value == "all":
+        read_summary = "all cataloged resources"
+    elif preview.read_mode.value == "none":
+        read_summary = "none"
+    else:
+        read_summary = (
+            f"{preview.preserved_read_resource_count} exact matching resources"
+        )
+    print(f"Read access  {read_summary}", file=output_stream)
+    if preview.omitted_read_resources:
+        shown = ", ".join(
+            _safe_display(item, fallback="resource", maximum=128)
+            for item in preview.omitted_read_resources[:5]
+        )
+        suffix = "" if len(preview.omitted_read_resources) <= 5 else ", …"
+        print(f"Not carried  {shown}{suffix}", file=output_stream)
+    if preview.adapter_id == "postgresql":
+        print(
+            "Update access  none; exact table and column access must be enabled again",
+            file=output_stream,
+        )
+        credential_summary = (
+            "new password saved; previous Daita-owned password deleted after handoff"
+            if credential_changed
+            else "current stored password retained"
+        )
+        print(f"Credential   {credential_summary}", file=output_stream)
+    print("Conversation new; existing history retained", file=output_stream)
+    confirmation = _read_line(
+        "Change the active connection? [y/N]: ",
+        input_stream,
+        output_stream,
+    )
+    return confirmation.strip().casefold() == "y"
+
+
+async def _edit_postgresql_connection(
+    agent: Agent,
+    source: Any,
+    *,
+    input_stream: TextIO,
+    output_stream: TextIO,
+    hidden_input: Callable[[str], str],
+    selection_input: Any = None,
+    selection_output: Any = None,
+) -> SourceEditResult | None:
+    current_host = _source_configuration_text(source, "host")
+    current_port = _source_configuration_port(source)
+    current_database = _source_configuration_text(source, "database")
+    current_username = _source_configuration_text(source, "username")
+    current_ssl_mode = _source_configuration_text(source, "ssl_mode")
+    current_schemas = _source_configuration_schemas(source)
+    current_credential = _source_configuration_credential(source)
+    connection_method = await _select_postgresql_connection_method(
+        input_stream,
+        output_stream,
+        selection_input=selection_input,
+        selection_output=selection_output,
+    )
+    name = _read_edit_value(
+        "Display name",
+        source.display_name,
+        input_stream,
+        output_stream,
+    )
+    password: str | None
+    if connection_method == "url":
+        host, port, database, username, password, ssl_mode = (
+            _read_postgresql_connection_url(hidden_input, output_stream)
+        )
+    else:
+        host = _read_edit_value("Host", current_host, input_stream, output_stream)
+        port = _read_edit_postgresql_port(
+            current_port,
+            input_stream,
+            output_stream,
+        )
+        database = _read_edit_value(
+            "Database",
+            current_database,
+            input_stream,
+            output_stream,
+        )
+        username = _read_edit_value(
+            "Username",
+            current_username,
+            input_stream,
+            output_stream,
+        )
+        ssl_mode = _read_edit_ssl_mode(
+            current_ssl_mode,
+            input_stream,
+            output_stream,
+        )
+        password = None
+    if password is None:
+        password = hidden_input("New password (Enter to keep current): ")
+    while not password and current_credential is None:
+        print("Password cannot be empty for this source.", file=output_stream)
+        password = hidden_input("New password: ")
+
+    credential = current_credential
+    created_credential: SecretReference | None = None
+    result: SourceEditResult | None = None
+    try:
+        if password:
+            secret = password
+            password = None
+            created_credential = await agent.store_postgresql_password(secret)
+            secret = ""
+            credential = created_credential
+        assert credential is not None
+        terminal_tui._write_setup_status(
+            output_stream,
+            "◐ Validating edited PostgreSQL connection",
+            role="progress",
+        )
+        probe = await agent.probe_postgresql(
+            host=host,
+            port=port,
+            database=database,
+            username=username,
+            credential=credential,
+            ssl_mode=ssl_mode,
+        )
+        terminal_tui._write_setup_status(
+            output_stream,
+            "✓ Edited connection validated",
+            role="success",
+        )
+        schemas = await _select_postgresql_schemas(
+            probe,
+            input_stream=input_stream,
+            output_stream=output_stream,
+            selection_input=selection_input,
+            selection_output=selection_output,
+            initial_schemas=current_schemas,
+        )
+        terminal_tui._write_setup_status(
+            output_stream,
+            "… Discovering tables and relationships before applying changes",
+            role="progress",
+        )
+        current_summary = _source_connection_summary(source)
+        edited_summary = _postgresql_connection_summary(
+            host=host,
+            port=port,
+            database=database,
+            username=username,
+            schemas=schemas,
+        )
+
+        async def confirm(preview: SourceEditPreview) -> bool:
+            return await _confirm_source_edit(
+                preview,
+                current_summary=current_summary,
+                edited_summary=edited_summary,
+                output_stream=output_stream,
+                input_stream=input_stream,
+                credential_changed=created_credential is not None,
+            )
+
+        result = await agent.edit_postgresql_source(
+            source.id,
+            host=host,
+            port=port,
+            database=database,
+            username=username,
+            credential=credential,
+            schemas=schemas,
+            ssl_mode=ssl_mode,
+            name=name,
+            confirmation_handler=confirm,
+        )
+        return result
+    finally:
+        password = None
+        if created_credential is not None and result is None:
+            await agent.delete_postgresql_password(created_credential)
+
+
+def _source_configuration_integer(source: Any, key: str) -> int:
+    value = source.configuration.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"saved source {key} is invalid")
+    return value
+
+
+async def _edit_local_connection(
+    agent: Agent,
+    source: Any,
+    *,
+    input_stream: TextIO,
+    output_stream: TextIO,
+) -> SourceEditResult | None:
+    key = "path" if source.adapter_id == "sqlite" else "root"
+    label = "SQLite file" if source.adapter_id == "sqlite" else "CSV/JSON directory"
+    current_path = _source_configuration_text(source, key)
+    edited_path = _read_edit_value(
+        label,
+        current_path,
+        input_stream,
+        output_stream,
+    )
+    name = _read_edit_value(
+        "Display name",
+        source.display_name,
+        input_stream,
+        output_stream,
+    )
+    absolute_path = _absolute_user_path(edited_path)
+    terminal_tui._write_setup_status(
+        output_stream,
+        "… Validating and discovering the edited source",
+        role="progress",
+    )
+    current_summary = _source_connection_summary(source)
+    edited_summary = _safe_display(
+        str(absolute_path),
+        fallback="local source path",
+        maximum=512,
+    )
+
+    async def confirm(preview: SourceEditPreview) -> bool:
+        return await _confirm_source_edit(
+            preview,
+            current_summary=current_summary,
+            edited_summary=edited_summary,
+            output_stream=output_stream,
+            input_stream=input_stream,
+        )
+
+    if source.adapter_id == "sqlite":
+        return await agent.edit_sqlite_source(
+            source.id,
+            absolute_path,
+            name=name,
+            confirmation_handler=confirm,
+        )
+    return await agent.edit_local_directory_source(
+        source.id,
+        absolute_path,
+        name=name,
+        confirmation_handler=confirm,
+        max_depth=_source_configuration_integer(source, "max_depth"),
+        max_files=_source_configuration_integer(source, "max_files"),
+        max_file_bytes=_source_configuration_integer(source, "max_file_bytes"),
+        max_columns=_source_configuration_integer(source, "max_columns"),
+        max_rows=_source_configuration_integer(source, "max_rows"),
+        max_json_nodes=_source_configuration_integer(source, "max_json_nodes"),
+        max_json_depth=_source_configuration_integer(source, "max_json_depth"),
+        max_key_bytes=_source_configuration_integer(source, "max_key_bytes"),
+        max_string_bytes=_source_configuration_integer(source, "max_string_bytes"),
+        max_cell_bytes=_source_configuration_integer(source, "max_cell_bytes"),
+    )
+
+
+async def _edit_active_source_connection(
+    agent: Agent,
+    *,
+    source: Any,
+    input_stream: TextIO,
+    output_stream: TextIO,
+    hidden_input: Callable[[str], str],
+    selection_input: Any = None,
+    selection_output: Any = None,
+) -> SourceEditResult | None:
+    print(file=output_stream)
+    print("Edit active source connection", file=output_stream)
+    print(
+        f"Source      {_safe_display(source.display_name, fallback='source')}",
+        file=output_stream,
+    )
+    print(f"Current     {_source_connection_summary(source)}", file=output_stream)
+    print(
+        "The current connection remains active unless the edited connection "
+        "validates, catalogs, and is confirmed.",
+        file=output_stream,
+    )
+    continue_edit = _read_line(
+        "Continue? [y/N]: ",
+        input_stream,
+        output_stream,
+    )
+    if continue_edit.strip().casefold() != "y":
+        print("Connection changes were not started.", file=output_stream)
+        return None
+    if source.adapter_id == "postgresql":
+        return await _edit_postgresql_connection(
+            agent,
+            source,
+            input_stream=input_stream,
+            output_stream=output_stream,
+            hidden_input=hidden_input,
+            selection_input=selection_input,
+            selection_output=selection_output,
+        )
+    if source.adapter_id in {"sqlite", "local-directory"}:
+        return await _edit_local_connection(
+            agent,
+            source,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
+    raise ValueError("the active source type cannot be edited in the TUI")
+
+
 async def _select_postgresql_connection_method(
     input_stream: TextIO,
     output_stream: TextIO,
@@ -1850,6 +2306,7 @@ async def _select_postgresql_schemas(
     output_stream: TextIO,
     selection_input: Any = None,
     selection_output: Any = None,
+    initial_schemas: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     if not probe.schemas:
         raise PostgreSQLSourceError(
@@ -1878,6 +2335,11 @@ async def _select_postgresql_schemas(
             f"Choose 1 to {min(32, len(probe.schemas))} distinct schema numbers."
         ),
         fallback_prompt="Schemas (comma-separated numbers): ",
+        initial_values=tuple(
+            schema
+            for schema in initial_schemas
+            if any(candidate.name == schema for candidate in probe.schemas)
+        ),
     )
 
 
@@ -2105,6 +2567,8 @@ def _command_uses_terminal_prompts(command: str) -> bool:
     if parts[0] == "/source" and parts[1:] in ([], ["use"]):
         return True
     if parts[0] == "/source" and parts[1:] == ["add"]:
+        return True
+    if parts[0] == "/source" and parts[1:] == ["edit"]:
         return True
     if parts[0] == "/source" and len(parts) >= 3 and parts[1] == "detach":
         return True
@@ -2427,16 +2891,14 @@ async def _advanced_update_columns(
             output_stream=output_stream,
             enhanced_input=selection_input,
             enhanced_output=selection_output,
-            maximum=_MAX_POSTGRESQL_WRITE_COLUMNS,
+            maximum=len(columns),
             initial_values=tuple(
                 column
                 for column in prior.get(resource.resource_id, ())
                 if column in columns
             ),
             empty_message="Select at least one assignment column.",
-            maximum_message=(
-                f"Select at most {_MAX_POSTGRESQL_WRITE_COLUMNS} assignment columns."
-            ),
+            maximum_message=f"Select at most {len(columns)} assignment columns.",
             fallback_prompt="Columns (numbers, ranges, or all): ",
         )
     return result
@@ -2502,7 +2964,7 @@ async def _configure_source_permissions(
             section_options.append(
                 SelectionOption(
                     "write",
-                    "PostgreSQL one-row update access",
+                    "PostgreSQL update access",
                     "None, selected tables, or all current eligible tables",
                 )
             )
@@ -2579,7 +3041,7 @@ async def _configure_source_permissions(
         }
     elif section == "write" and inspection.adapter_id == "postgresql":
         write_mode = await select_one(
-            "PostgreSQL one-row update access",
+            "PostgreSQL update access",
             (
                 SelectionOption("none", "No update access"),
                 SelectionOption(
@@ -2605,7 +3067,7 @@ async def _configure_source_permissions(
         )
         if write_mode != "none" and not eligible:
             print(
-                "No current tables are eligible for one-row update access.",
+                "No current tables are eligible for PostgreSQL update access.",
                 file=output_stream,
             )
             return
@@ -2650,8 +3112,7 @@ async def _configure_source_permissions(
             )
             if requires_advanced:
                 print(
-                    "At least one selected table has more than "
-                    f"{_MAX_POSTGRESQL_WRITE_COLUMNS} eligible columns; "
+                    "At least one selected table has many eligible columns; "
                     "Advanced selection is required.",
                     file=output_stream,
                 )
@@ -2974,6 +3435,136 @@ async def _handle_local_command(
             validated=validated,
         )
         return agent, conversation_id, None
+    if name == "/source" and parts[1:] == ["edit"]:
+        active = await _active_source_for(
+            agent,
+            conversation_id=conversation_id,
+        )
+        if active is None:
+            print(
+                "No active source connection to edit. Use /source add first.",
+                file=output_stream,
+            )
+            return agent, conversation_id, None
+        try:
+            result = await _edit_active_source_connection(
+                agent,
+                source=active,
+                input_stream=input_stream,
+                output_stream=output_stream,
+                hidden_input=hidden_input,
+                selection_input=selection_input,
+                selection_output=selection_output,
+            )
+        except (SelectionCancelled, EOFError):
+            print(
+                "Source connection edit cancelled; the active connection was not "
+                "changed.",
+                file=output_stream,
+            )
+            return agent, conversation_id, None
+        except PostgreSQLSourceError as error:
+            print(
+                _POSTGRESQL_ERRORS.get(
+                    error.code,
+                    "The edited PostgreSQL connection could not be validated. "
+                    "The active connection was not changed.",
+                ),
+                file=output_stream,
+            )
+            return agent, conversation_id, None
+        except ValueError as error:
+            if str(error) == "replacement connection is already attached":
+                message = (
+                    "That connection is already attached. Use /source use to make "
+                    "it active."
+                )
+            else:
+                message = (
+                    "Source connection edit failed validation. The active connection "
+                    "was not changed."
+                )
+            print(message, file=output_stream)
+            return agent, conversation_id, None
+        except ImportError as error:
+            print(
+                _safe_display(
+                    str(error),
+                    fallback="A required source dependency is unavailable.",
+                    maximum=512,
+                ),
+                file=output_stream,
+            )
+            return agent, conversation_id, None
+        except (ConfigError, OSError):
+            print(
+                "Source connection edit failed validation. The active connection "
+                "was not changed.",
+                file=output_stream,
+            )
+            return agent, conversation_id, None
+        except Exception:
+            print(
+                "Source connection edit failed without changing the active source.",
+                file=output_stream,
+            )
+            return agent, conversation_id, None
+        if result is None:
+            print("Active source connection was not changed.", file=output_stream)
+            return agent, conversation_id, None
+        print(
+            "Connection updated for "
+            f"{_safe_display(result.source.display_name, fallback='source')}.",
+            file=output_stream,
+        )
+        print(
+            (
+                "The previous source identity was detached."
+                if result.identity_changed
+                else "The source identity was preserved."
+            ),
+            file=output_stream,
+        )
+        if not result.previous_credential_deleted:
+            print(
+                "Warning: the connection changed, but the previous Daita-owned "
+                "credential could not be deleted.",
+                file=output_stream,
+            )
+        if conversation_id is not None:
+            print(
+                "Started a new conversation to keep connection context isolated.",
+                file=output_stream,
+            )
+        conversation_id = None
+        if result.source.adapter_id == "postgresql":
+            print(
+                "PostgreSQL update access is disabled for this connection.",
+                file=output_stream,
+            )
+            configure_now = _read_line(
+                "Configure update access now? [y/N]: ",
+                input_stream,
+                output_stream,
+            )
+            if configure_now.strip().casefold() == "y":
+                try:
+                    await _configure_source_permissions(
+                        agent,
+                        input_stream=input_stream,
+                        output_stream=output_stream,
+                        selection_input=selection_input,
+                        selection_output=selection_output,
+                        preselected_source_id=result.source.id,
+                        preselected_section="write",
+                    )
+                except (SelectionCancelled, EOFError):
+                    print(
+                        "Update access setup cancelled; the edited connection remains "
+                        "active with no update access.",
+                        file=output_stream,
+                    )
+        return agent, conversation_id, "sources"
     if name == "/source" and len(parts) >= 3 and parts[1] == "detach":
         try:
             selected = await agent.resolve_source(" ".join(parts[2:]))
@@ -3147,7 +3738,7 @@ async def _handle_local_command(
         print("Usage: /resume <conversation-id>", file=output_stream)
     elif name == "/source":
         print(
-            "Usage: /source | /source use <name> | /source add | "
+            "Usage: /source | /source use <name> | /source add | /source edit | "
             "/source refresh <source-id> | /source detach <source> | "
             "/source permissions",
             file=output_stream,
@@ -3168,7 +3759,7 @@ async def _handle_local_command(
     }:
         print(f"Usage: {name}", file=output_stream)
     else:
-        print("Unknown command. Type /help for commands.", file=output_stream)
+        print("Unknown command. Type / to browse commands.", file=output_stream)
     return agent, conversation_id, None
 
 
@@ -3392,37 +3983,12 @@ def _write_model_configuration(
 
 
 def _write_chat_help(output_stream: TextIO) -> None:
-    print("Commands", file=output_stream)
-    for line in (
-        "/model",
-        "/sources",
-        "/source",
-        "/source use <name>",
-        "/source add",
-        "/source refresh <id>",
-        "/source detach <source>",
-        "/source permissions",
-        '@"source name" <question>',
-        "/catalog",
-        "/settings",
-        "/new",
-        "/resume <id>",
-        "/conversation clear",
-        "/learn <material>",
-        "/review [cost-usd]",
-        "/memory [list|show|edit|accept|reject <id>|clear-rejected]",
-        "/user [edit]",
-        "/skills [show|edit|delete <name>]",
-        "/skills create [name]",
-        "/skills use <name> [request]",
-        "/<skill-name> [request]",
-        "/status",
-        "/conversation",
-        "/agent delete",
-        "/help",
-        "/exit",
-    ):
-        print(f"  {line}", file=output_stream)
+    print("Help", file=output_stream)
+    print("  Type / to browse commands and their descriptions.", file=output_stream)
+    print(
+        '  Use @"source name" <question> to ask another source directly.',
+        file=output_stream,
+    )
     print("Controls", file=output_stream)
     for line in (
         "Enter submit · Ctrl-J newline · Esc Esc clear input · Ctrl-D exit",
@@ -4511,15 +5077,7 @@ def _safe_display(
 
 
 def _render_approval_arguments(request: ApprovalRequest) -> str | None:
-    rendered = json.dumps(
-        request.arguments.to_dict(),
-        ensure_ascii=True,
-        indent=2,
-        sort_keys=True,
-    )
-    if len(rendered) > _MAX_APPROVAL_DOCUMENT_CHARACTERS:
-        return None
-    return rendered
+    return request.render_arguments_for_review()
 
 
 def _render_model_answer(

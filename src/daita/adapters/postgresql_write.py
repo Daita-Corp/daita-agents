@@ -1,4 +1,4 @@
-"""Typed PostgreSQL update preview and transactional execution boundary."""
+"""Structured PostgreSQL update preview and transactional execution boundary."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from ..domains.data.capabilities import (
     PostgreSQLUpdatePreview,
     PostgreSQLUpdatePreviewChecks,
     PostgreSQLUpdateResult,
+    PostgreSQLUpdateSample,
 )
 from ..domains.data.controller import (
     POSTGRESQL_UPDATE_CAPABILITY_ID,
@@ -36,6 +37,7 @@ from ..domains.data.controller import (
 from ..domains.data.sql import (
     PostgreSQLUpdateCell,
     PostgreSQLUpdateCommand,
+    PostgreSQLUpdateFilter,
     PostgreSQLUpdateIntent,
     ValidatedPostgreSQLUpdate,
     render_postgresql_update_statement,
@@ -209,7 +211,7 @@ class PostgreSQLUpdateReadiness:
                 raise ValueError(f"{name} must be bounded non-empty text")
         assignment_columns = tuple(self.assignment_columns)
         if (
-            not 1 <= len(assignment_columns) <= 32
+            not assignment_columns
             or len(assignment_columns) != len(set(assignment_columns))
             or any(
                 not isinstance(column, str) or not column or len(column) > 256
@@ -291,7 +293,7 @@ class DatabaseWriteReceiptStore(Protocol):
 
 
 class PostgreSQLUpdatePreviewBackend:
-    """Validate, compile, and inspect one update without executing mutation."""
+    """Validate, compile, and inspect one update plan without mutating."""
 
     def __init__(
         self,
@@ -391,7 +393,7 @@ class PostgreSQLUpdatePreviewBackend:
         if not isinstance(assignment_columns, tuple):
             raise TypeError("assignment_columns must be a tuple")
         if (
-            not 1 <= len(assignment_columns) <= 32
+            not assignment_columns
             or len(assignment_columns) != len(set(assignment_columns))
             or any(
                 not isinstance(column, str)
@@ -401,9 +403,7 @@ class PostgreSQLUpdatePreviewBackend:
                 for column in assignment_columns
             )
         ):
-            raise ValueError(
-                "assignment_columns must contain one through 32 distinct bounded names"
-            )
+            raise ValueError("assignment_columns must contain distinct bounded names")
 
         registration = await self._sources.load_source(agent_id, source_id)
         if (
@@ -614,25 +614,10 @@ class PostgreSQLUpdatePreviewBackend:
                 readonly=True,
             )
             await transaction.start()
-            timeout_milliseconds = max(
-                1,
-                int(self._statement_timeout_seconds * 1_000),
-            )
-            lock_timeout_milliseconds = max(
-                1,
-                int(self._lock_timeout_seconds * 1_000),
-            )
-            await connection.execute(
-                "SELECT set_config('statement_timeout', $1, true)",
-                f"{timeout_milliseconds}ms",
-            )
-            await connection.execute(
-                "SELECT set_config('lock_timeout', $1, true)",
-                f"{lock_timeout_milliseconds}ms",
-            )
-            await connection.execute(
-                "SELECT set_config('search_path', $1, true)",
-                "pg_catalog",
+            await _configure_write_transaction(
+                connection,
+                statement_timeout_seconds=self._statement_timeout_seconds,
+                lock_timeout_seconds=self._lock_timeout_seconds,
             )
             stage = "structure"
             structure = await _load_structure(
@@ -660,35 +645,25 @@ class PostgreSQLUpdatePreviewBackend:
             )
             guardrails = _admitted_guardrails(raw_guardrails)
             stage = "compile"
-            explain_sql = (
-                "EXPLAIN (FORMAT JSON, VERBOSE FALSE, COSTS FALSE) " + statement.sql
-            )
             await connection.fetch(
-                explain_sql,
+                "EXPLAIN (FORMAT JSON, VERBOSE FALSE, COSTS FALSE) " + statement.sql,
                 *bound_update_parameters,
                 timeout=self._statement_timeout_seconds,
             )
             stage = "preview"
-            preview_sql = _preview_select_sql(validated)
-            rows = tuple(
-                await connection.fetch(
-                    preview_sql,
-                    _bound_value(validated.match[0], validated),
-                    timeout=self._statement_timeout_seconds,
-                )
+            scan = await _scan_target_rows(
+                connection,
+                _target_select_sql(validated, statement.selection_where_sql),
+                _bound_where_parameters(validated),
+                validated,
             )
-            if len(rows) > 1:
-                raise PostgreSQLUpdatePreviewError(
-                    "write_guardrail_rejected",
-                    "The primary-key preview exceeded the one-row bound.",
-                )
             result = _build_preview(
                 agent_id=agent_id,
                 validated=validated,
                 statement_sha256=statement.statement_sha256,
                 live_structure_sha256=live_structure_sha256,
                 guardrails=guardrails,
-                row=(rows[0] if rows else None),
+                scan=scan,
             )
             await transaction.commit()
             transaction_finished = True
@@ -735,7 +710,7 @@ class PostgreSQLUpdatePreviewBackend:
         execution: ToolExecution,
         command: PostgreSQLUpdateCommand,
     ) -> PostgreSQLUpdateResult:
-        """Execute one receipt-backed update and classify commit certainty exactly."""
+        """Execute one receipt-backed update and classify commit certainty."""
 
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("update agent_id must be non-empty text")
@@ -789,6 +764,7 @@ class PostgreSQLUpdatePreviewBackend:
             resource_id=validated.resource_id,
             intent_sha256=validated.intent_sha256,
             preview_fingerprint=command.preview_fingerprint,
+            expected_affected_rows=command.expected_affected_rows,
             started_at=self._clock(),
         )
         try:
@@ -832,7 +808,8 @@ class PostgreSQLUpdatePreviewBackend:
         transaction = None
         transaction_finished = False
         commit_attempted = False
-        returned_cells: tuple[PostgreSQLUpdateCell, ...] = ()
+        target_set_sha256: str | None = None
+        affected_rows: int | None = None
         terminal_outcome = DatabaseWriteOutcome.NOT_COMMITTED
         terminal_code: str | None = "write_not_committed"
         cancelled: asyncio.CancelledError | None = None
@@ -875,49 +852,45 @@ class PostgreSQLUpdatePreviewBackend:
                 timeout=self._statement_timeout_seconds,
             )
             guardrails = _admitted_guardrails(raw_guardrails)
-            locked_rows = tuple(
-                await connection.fetch(
-                    _locked_row_select_sql(validated),
-                    _bound_value(validated.match[0], validated),
-                    timeout=self._statement_timeout_seconds,
-                )
+            scan = await _scan_target_rows(
+                connection,
+                _target_select_sql(
+                    validated,
+                    statement.selection_where_sql,
+                    for_update=True,
+                ),
+                _bound_where_parameters(validated),
+                validated,
             )
-            if len(locked_rows) != 1:
-                code = (
-                    "write_target_not_found"
-                    if not locked_rows
-                    else "write_affected_rows_mismatch"
-                )
-                raise PostgreSQLUpdateExecutionError(
-                    code,
-                    "The locked primary-key target no longer matches the approved preview.",
-                )
             locked_preview = _build_preview(
                 agent_id=agent_id,
                 validated=validated,
                 statement_sha256=statement.statement_sha256,
                 live_structure_sha256=live_structure_sha256,
                 guardrails=guardrails,
-                row=locked_rows[0],
+                scan=scan,
             )
+            target_set_sha256 = locked_preview.fingerprint.target_set_sha256
             if (
-                locked_preview.would_affect != 1
+                locked_preview.matched_rows != command.expected_affected_rows
                 or locked_preview.fingerprint.preview_fingerprint
                 != command.preview_fingerprint
             ):
                 raise PostgreSQLUpdateExecutionError(
                     "write_state_changed",
-                    "The target row or write guardrails changed after approval.",
+                    "The exact target set or write guardrails changed after approval.",
                 )
-            returned_rows = await _fetch_update_rows(
-                connection,
+            status = await connection.execute(
                 statement.sql,
-                _bound_update_parameters(validated),
+                *_bound_update_parameters(validated),
+                timeout=self._statement_timeout_seconds,
             )
-            returned_cells = _verified_returned_cells(
-                returned_rows,
-                validated,
-            )
+            affected_rows = _affected_rows_from_status(status)
+            if affected_rows != command.expected_affected_rows:
+                raise PostgreSQLUpdateExecutionError(
+                    "write_affected_rows_mismatch",
+                    "PostgreSQL changed a different number of rows than the approved plan.",
+                )
             commit_attempted = True
             await transaction.commit()
             transaction_finished = True
@@ -974,7 +947,7 @@ class PostgreSQLUpdatePreviewBackend:
             terminal_outcome,
             completed_at=completed_at,
             affected_rows=(
-                1
+                affected_rows
                 if terminal_outcome is DatabaseWriteOutcome.COMMITTED
                 else (
                     0
@@ -1032,6 +1005,8 @@ class PostgreSQLUpdatePreviewBackend:
                     ),
                 },
             )
+        assert affected_rows is not None
+        assert target_set_sha256 is not None
         return PostgreSQLUpdateResult(
             receipt_id=receipt.receipt_id,
             source_id=validated.source_id,
@@ -1040,7 +1015,8 @@ class PostgreSQLUpdatePreviewBackend:
             resource_revision=validated.resource_revision,
             preview_fingerprint=command.preview_fingerprint,
             intent_sha256=validated.intent_sha256,
-            returned=returned_cells,
+            target_set_sha256=target_set_sha256,
+            affected_rows=affected_rows,
             committed_at=completed_at.isoformat(),
         )
 
@@ -1072,72 +1048,176 @@ async def _configure_write_transaction(
     )
 
 
-def _locked_row_select_sql(validated: ValidatedPostgreSQLUpdate) -> str:
-    preview = _preview_select_sql(validated)
-    if not preview.endswith(" LIMIT 2"):
-        raise RuntimeError("bounded PostgreSQL preview shape changed")
-    return preview[: -len(" LIMIT 2")] + " LIMIT 2 FOR UPDATE"
+@dataclass(frozen=True, slots=True)
+class _TargetScan:
+    matched_rows: int
+    target_set_sha256: str
+    samples: tuple[PostgreSQLUpdateSample, ...]
 
 
-async def _fetch_update_rows(
+def _target_select_sql(
+    validated: ValidatedPostgreSQLUpdate,
+    where_sql: str,
+    *,
+    for_update: bool = False,
+) -> str:
+    assignments = tuple(validated.assignments)
+    row_expression = (
+        "ROW(" + ", ".join(_identifier(item.column) for item in assignments) + ")"
+    )
+    size_check = (
+        f"pg_catalog.pg_column_size({row_expression}) <= {_PREVIEW_VALUE_BYTES}"
+    )
+    selected = [
+        f'{_identifier(column)} AS "__daita_primary_key_{index}"'
+        for index, column in enumerate(validated.primary_key_columns)
+    ]
+    selected.extend(
+        f"CASE WHEN {size_check} THEN {_identifier(cell.column)} ELSE NULL END "
+        f'AS "__daita_before_{index}"'
+        for index, cell in enumerate(assignments)
+    )
+    selected.extend(
+        (
+            f'{size_check} AS "__daita_within_preview_limit"',
+            'xmin::pg_catalog.text AS "__daita_xmin"',
+        )
+    )
+    order_by = ", ".join(
+        _identifier(column) for column in validated.primary_key_columns
+    )
+    suffix = " FOR UPDATE" if for_update else ""
+    return (
+        "/* daita:postgresql.update_target_set */ SELECT "
+        + ", ".join(selected)
+        + " FROM ONLY "
+        + _identifier(validated.schema_name)
+        + "."
+        + _identifier(validated.relation_name)
+        + " WHERE "
+        + where_sql
+        + " ORDER BY "
+        + order_by
+        + suffix
+    )
+
+
+async def _scan_target_rows(
     connection: object,
     sql: str,
     parameters: tuple[object, ...],
-) -> tuple[object, ...]:
+    validated: ValidatedPostgreSQLUpdate,
+) -> _TargetScan:
     cursor_factory = getattr(connection, "cursor")(sql, *parameters)
     cursor = (
         await cursor_factory if inspect.isawaitable(cursor_factory) else cursor_factory
     )
-    fetch = getattr(cursor, "fetch", None)
-    if not callable(fetch):
-        raise PostgreSQLUpdateExecutionError(
-            "write_affected_rows_mismatch",
-            "PostgreSQL did not provide a bounded RETURNING cursor.",
+    digest = sha256()
+    matched_rows = 0
+    samples: list[PostgreSQLUpdateSample] = []
+
+    async def accept(row: object) -> None:
+        nonlocal matched_rows
+        primary_key = tuple(
+            PostgreSQLUpdateCell(
+                column,
+                _preview_json_value_for_type(
+                    _record_value(row, f"__daita_primary_key_{index}"),
+                    validated.type_for(column)[1],
+                ),
+            )
+            for index, column in enumerate(validated.primary_key_columns)
         )
-    fetched_rows = fetch(2)
-    if not inspect.isawaitable(fetched_rows):
-        raise PostgreSQLUpdateExecutionError(
-            "write_affected_rows_mismatch",
-            "PostgreSQL did not provide an asynchronous bounded RETURNING cursor.",
+        within_preview_limit = (
+            _record_value(row, "__daita_within_preview_limit") is True
         )
-    return tuple(await fetched_rows)
+        before = (
+            tuple(
+                PostgreSQLUpdateCell(
+                    cell.column,
+                    _preview_json_value_for_type(
+                        _record_value(row, f"__daita_before_{index}"),
+                        validated.type_for(cell.column)[1],
+                    ),
+                )
+                for index, cell in enumerate(validated.assignments)
+            )
+            if within_preview_limit
+            else ()
+        )
+        assigned_state: object = (
+            tuple(item.to_payload() for item in before)
+            if within_preview_limit
+            else {
+                "oversized_row_version": _bounded_row_version_fact(row, "__daita_xmin")
+            }
+        )
+        digest.update(
+            canonical_json(
+                {
+                    "primary_key": tuple(item.to_payload() for item in primary_key),
+                    "assigned_values": assigned_state,
+                }
+            ).encode("utf-8")
+        )
+        digest.update(b"\n")
+        matched_rows += 1
+        if len(samples) >= 5 or not within_preview_limit:
+            return
+        samples.append(
+            PostgreSQLUpdateSample(
+                primary_key=primary_key,
+                before=before,
+                after=validated.assignments,
+            )
+        )
+
+    iterator = getattr(cursor, "__aiter__", None)
+    if callable(iterator):
+        async for row in cursor:
+            await accept(row)
+    else:
+        fetch = getattr(cursor, "fetch", None)
+        if not callable(fetch):
+            raise PostgreSQLUpdatePreviewError(
+                "write_preview_failed",
+                "PostgreSQL did not provide a streaming target cursor.",
+            )
+        while True:
+            batch = fetch(256)
+            if not inspect.isawaitable(batch):
+                raise PostgreSQLUpdatePreviewError(
+                    "write_preview_failed",
+                    "PostgreSQL did not provide an asynchronous target cursor.",
+                )
+            rows = tuple(await batch)
+            if not rows:
+                break
+            for row in rows:
+                await accept(row)
+            if len(rows) < 256:
+                break
+
+    return _TargetScan(
+        matched_rows=matched_rows,
+        target_set_sha256="sha256:" + digest.hexdigest(),
+        samples=tuple(samples),
+    )
 
 
-def _verified_returned_cells(
-    rows: tuple[object, ...],
-    validated: ValidatedPostgreSQLUpdate,
-) -> tuple[PostgreSQLUpdateCell, ...]:
-    if len(rows) != 1:
+def _affected_rows_from_status(value: object) -> int:
+    if not isinstance(value, str):
         raise PostgreSQLUpdateExecutionError(
             "write_affected_rows_mismatch",
-            "The generated update did not return exactly one row.",
+            "PostgreSQL returned an invalid update status.",
         )
-    row = rows[0]
-    intended = (validated.match[0], *validated.assignments)
-    returned: list[PostgreSQLUpdateCell] = []
-    for cell in intended:
-        type_name = validated.type_for(cell.column)[1]
-        try:
-            current = _preview_json_value_for_type(
-                _record_value(row, cell.column),
-                type_name,
-            )
-            expected = _preview_json_value_for_type(
-                _bound_value(cell, validated),
-                type_name,
-            )
-        except PostgreSQLUpdatePreviewError:
-            raise PostgreSQLUpdateExecutionError(
-                "write_affected_rows_mismatch",
-                "The generated update returned invalid bounded values.",
-            ) from None
-        if current != expected:
-            raise PostgreSQLUpdateExecutionError(
-                "write_affected_rows_mismatch",
-                "The generated update returned values different from the approved intent.",
-            )
-        returned.append(PostgreSQLUpdateCell(cell.column, current))
-    return tuple(returned)
+    prefix, separator, count = value.rpartition(" ")
+    if separator != " " or prefix != "UPDATE" or not count.isdecimal():
+        raise PostgreSQLUpdateExecutionError(
+            "write_affected_rows_mismatch",
+            "PostgreSQL returned an invalid update status.",
+        )
+    return int(count)
 
 
 def _raise_duplicate_receipt(
@@ -1153,6 +1233,7 @@ def _raise_duplicate_receipt(
         and existing.resource_id == proposed.resource_id
         and existing.intent_sha256 == proposed.intent_sha256
         and existing.preview_fingerprint == proposed.preview_fingerprint
+        and existing.expected_affected_rows == proposed.expected_affected_rows
     )
     if not same_identity:
         raise PostgreSQLUpdateExecutionError(
@@ -1175,7 +1256,7 @@ def _raise_duplicate_receipt(
             "receipt_id": existing.receipt_id,
             "outcome": outcome,
             "affected_rows": (
-                1
+                existing.affected_rows
                 if outcome == "committed"
                 else 0 if outcome == "not_committed" else None
             ),
@@ -1483,41 +1564,6 @@ def _distinct_labels(values: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _preview_select_sql(validated: ValidatedPostgreSQLUpdate) -> str:
-    assignments = tuple(validated.assignments)
-    row_expression = (
-        "ROW(" + ", ".join(_identifier(item.column) for item in assignments) + ")"
-    )
-    size_check = (
-        f"pg_catalog.pg_column_size({row_expression}) <= {_PREVIEW_VALUE_BYTES}"
-    )
-    selected = [f'{_identifier(validated.match[0].column)} AS "__daita_primary_key_0"']
-    selected.extend(
-        f"CASE WHEN {size_check} THEN {_identifier(cell.column)} ELSE NULL END "
-        f'AS "__daita_before_{index}"'
-        for index, cell in enumerate(assignments)
-    )
-    selected.extend(
-        (
-            f'{size_check} AS "__daita_within_preview_limit"',
-            'tableoid::pg_catalog.text AS "__daita_tableoid"',
-            'ctid::pg_catalog.text AS "__daita_ctid"',
-            'xmin::pg_catalog.text AS "__daita_xmin"',
-        )
-    )
-    return (
-        "/* daita:postgresql.update_preview_row */ SELECT "
-        + ", ".join(selected)
-        + " FROM ONLY "
-        + _identifier(validated.schema_name)
-        + "."
-        + _identifier(validated.relation_name)
-        + " WHERE "
-        + _identifier(validated.match[0].column)
-        + " = $1 LIMIT 2"
-    )
-
-
 def _build_preview(
     *,
     agent_id: str,
@@ -1525,51 +1571,8 @@ def _build_preview(
     statement_sha256: str,
     live_structure_sha256: str,
     guardrails: Mapping[str, object],
-    row: object | None,
+    scan: _TargetScan,
 ) -> PostgreSQLUpdatePreview:
-    would_affect = 0 if row is None else 1
-    before: tuple[PostgreSQLUpdateCell, ...] = ()
-    tuple_facts: dict[str, str] = {}
-    live_primary_key: FrozenJsonValue | None = None
-    if row is not None:
-        if _record_value(row, "__daita_within_preview_limit") is not True:
-            raise PostgreSQLUpdatePreviewError(
-                "write_preview_failed",
-                "The selected before-image exceeds the fixed preview bound.",
-            )
-        before = tuple(
-            PostgreSQLUpdateCell(
-                cell.column,
-                _preview_json_value_for_type(
-                    _record_value(row, f"__daita_before_{index}"),
-                    validated.type_for(cell.column)[1],
-                ),
-            )
-            for index, cell in enumerate(validated.assignments)
-        )
-        live_primary_key = _preview_json_value_for_type(
-            _record_value(row, "__daita_primary_key_0"),
-            validated.type_for(validated.match[0].column)[1],
-        )
-        tuple_facts = {
-            "tableoid": _bounded_system_fact(row, "__daita_tableoid"),
-            "ctid": _bounded_system_fact(row, "__daita_ctid"),
-            "xmin": _bounded_system_fact(row, "__daita_xmin"),
-        }
-    row_version_sha256 = _sha256_json(
-        {
-            "relation": {
-                "oid": guardrails["relation_oid"],
-                "schema": validated.schema_name,
-                "name": validated.relation_name,
-            },
-            "match": tuple(item.to_payload() for item in validated.match),
-            "live_primary_key": live_primary_key,
-            "before": tuple(item.to_payload() for item in before),
-            "tuple": tuple_facts,
-            "would_affect": would_affect,
-        }
-    )
     fingerprint_payload = {
         "agent_id": agent_id,
         "capability_id": POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
@@ -1577,7 +1580,7 @@ def _build_preview(
         "resource_id": validated.resource_id,
         "source_revision": validated.source_revision,
         "resource_revision": validated.resource_revision,
-        "match": tuple(item.to_payload() for item in validated.match),
+        "where": tuple(item.to_payload() for item in validated.where),
         "assignments": tuple(item.to_payload() for item in validated.assignments),
         "live_relation_identity": {
             "oid": guardrails["relation_oid"],
@@ -1585,41 +1588,67 @@ def _build_preview(
             "name": validated.relation_name,
         },
         "live_structure_sha256": live_structure_sha256,
-        "row_version_sha256": row_version_sha256,
-        "would_affect": would_affect,
+        "target_set_sha256": scan.target_set_sha256,
+        "matched_rows": scan.matched_rows,
         "guardrails": dict(guardrails),
         "statement_sha256": statement_sha256,
     }
-    fingerprint = PostgreSQLPreviewFingerprint(
-        intent_sha256=validated.intent_sha256,
-        row_version_sha256=row_version_sha256,
-        statement_sha256=statement_sha256,
-        preview_fingerprint=_sha256_json(fingerprint_payload),
-    )
+    warnings: list[str] = []
+    if scan.matched_rows == 0:
+        warnings.append("target_not_found")
+    if len(scan.samples) < min(scan.matched_rows, 5):
+        warnings.append("oversized_sample_values_omitted")
     return PostgreSQLUpdatePreview(
         source_id=validated.source_id,
         resource_id=validated.resource_id,
         resource_name=validated.resource_name,
         source_revision=validated.source_revision,
         resource_revision=validated.resource_revision,
-        match=validated.match,
+        where=validated.where,
         assignments=validated.assignments,
-        would_affect=would_affect,
-        before=before,
-        after=(validated.assignments if row is not None else ()),
-        fingerprint=fingerprint,
+        matched_rows=scan.matched_rows,
+        samples=scan.samples,
+        fingerprint=PostgreSQLPreviewFingerprint(
+            intent_sha256=validated.intent_sha256,
+            target_set_sha256=scan.target_set_sha256,
+            statement_sha256=statement_sha256,
+            preview_fingerprint=_sha256_json(fingerprint_payload),
+        ),
         checks=PostgreSQLUpdatePreviewChecks(),
-        warnings=(() if row is not None else ("target_not_found",)),
+        warnings=tuple(warnings),
     )
 
 
 def _bound_update_parameters(
     validated: ValidatedPostgreSQLUpdate,
 ) -> tuple[object, ...]:
-    return tuple(
-        _bound_value(cell, validated)
-        for cell in (*validated.assignments, *validated.match)
+    return (
+        *tuple(_bound_value(cell, validated) for cell in validated.assignments),
+        *_bound_where_parameters(validated),
     )
+
+
+def _bound_where_parameters(
+    validated: ValidatedPostgreSQLUpdate,
+) -> tuple[object, ...]:
+    parameters: list[object] = []
+    for predicate in validated.where:
+        if predicate.operator in {"is_null", "is_not_null"}:
+            continue
+        values = (
+            predicate.value
+            if predicate.operator in {"in", "not_in"}
+            else (predicate.value,)
+        )
+        assert isinstance(values, tuple)
+        parameters.extend(
+            _bound_value(
+                PostgreSQLUpdateCell(predicate.column, value),
+                validated,
+            )
+            for value in values
+        )
+    return tuple(parameters)
 
 
 def _bound_value(
@@ -1728,7 +1757,7 @@ def _record_value(record: object, name: str) -> object:
     return value
 
 
-def _bounded_system_fact(record: object, name: str) -> str:
+def _bounded_row_version_fact(record: object, name: str) -> str:
     value = _record_value(record, name)
     rendered = str(value)
     if not rendered or len(rendered) > 128:

@@ -27,6 +27,7 @@ def _started(call_id: str = "call-one") -> DatabaseWriteReceipt:
         resource_id="catalog-resource:sha256:" + "2" * 64,
         intent_sha256="sha256:" + "3" * 64,
         preview_fingerprint="sha256:" + "4" * 64,
+        expected_affected_rows=7,
         started_at=STARTED_AT,
     )
 
@@ -34,7 +35,7 @@ def _started(call_id: str = "call-one") -> DatabaseWriteReceipt:
 @pytest.mark.parametrize(
     ("outcome", "affected_rows", "error_code"),
     (
-        (DatabaseWriteOutcome.COMMITTED, 1, None),
+        (DatabaseWriteOutcome.COMMITTED, 7, None),
         (DatabaseWriteOutcome.NOT_COMMITTED, 0, "write_constraint_violation"),
         (DatabaseWriteOutcome.OUTCOME_UNKNOWN, None, "write_outcome_unknown"),
     ),
@@ -119,6 +120,7 @@ async def test_receipts_reject_invalid_or_repeated_execution_identity(tmp_path):
             resource_id=started.resource_id,
             intent_sha256="sha256:" + "9" * 64,
             preview_fingerprint=started.preview_fingerprint,
+            expected_affected_rows=started.expected_affected_rows,
             started_at=started.started_at,
         )
         with pytest.raises(
@@ -174,6 +176,7 @@ async def test_receipt_payload_contains_only_bounded_metadata(tmp_path):
         "capability_id",
         "completed_at",
         "intent_sha256",
+        "expected_affected_rows",
         "normalized_error_code",
         "outcome",
         "preview_fingerprint",

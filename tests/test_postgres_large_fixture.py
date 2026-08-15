@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 from collections.abc import Mapping
 from decimal import Decimal
@@ -7,14 +8,16 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent
+from daita import Agent, ApprovalDecision, ApprovalRequest, terminal
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
+    ModelRequest,
     ModelResponse,
     ToolCall,
     ToolResultBlock,
 )
+from daita.llm.protocols import ModelProvider
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import SecretReference
 
@@ -41,7 +44,7 @@ class _Secrets:
         return self.password
 
 
-def _profile(provider: MockModelProvider) -> ModelProfile:
+def _profile(provider: ModelProvider) -> ModelProfile:
     return ModelProfile(
         id=provider.provider_id,
         context_window_tokens=128_000,
@@ -61,6 +64,169 @@ def _tool_results(provider: MockModelProvider) -> tuple[ToolResultBlock, ...]:
     )
 
 
+class _BulkUpdateProvider:
+    def __init__(self) -> None:
+        self._source_id = ""
+        self._resource_id = ""
+        self._desired_priority = ""
+        self._phase = 0
+        self._matched_rows = 0
+        self._requests: list[ModelRequest] = []
+
+    @property
+    def provider_id(self) -> str:
+        return "mock:postgres-large-bulk-update"
+
+    @property
+    def requests(self) -> tuple[ModelRequest, ...]:
+        return tuple(self._requests)
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        return isinstance(request, ModelRequest)
+
+    def configure(
+        self,
+        *,
+        source_id: str,
+        resource_id: str,
+        desired_priority: str,
+    ) -> None:
+        self._source_id = source_id
+        self._resource_id = resource_id
+        self._desired_priority = desired_priority
+        self._phase = 0
+        self._matched_rows = 0
+
+    def _plan(self) -> dict[str, object]:
+        return {
+            "source_id": self._source_id,
+            "resource_id": self._resource_id,
+            "where": [
+                {
+                    "column": "ticket_status",
+                    "operator": "eq",
+                    "value": "waiting",
+                },
+                {"column": "category", "operator": "eq", "value": "billing"},
+            ],
+            "assignments": [{"column": "priority", "value": self._desired_priority}],
+        }
+
+    @staticmethod
+    def _latest_result(request: ModelRequest, call_id: str) -> ToolResultBlock:
+        for message in reversed(request.messages):
+            for block in reversed(message.content):
+                if isinstance(block, ToolResultBlock) and block.call_id == call_id:
+                    return block
+        raise AssertionError(f"missing tool result {call_id}")
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        self._requests.append(request)
+        if self._phase == 0:
+            self._phase = 1
+            return ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="bulk-preview",
+                        name="data_preview_postgresql_update",
+                        arguments=self._plan(),
+                    ),
+                ),
+            )
+        if self._phase == 1:
+            preview = self._latest_result(request, "bulk-preview")
+            assert preview.is_error is False
+            data = preview.output["data"]
+            assert isinstance(data, Mapping)
+            matched_rows = data["matched_rows"]
+            preview_fingerprint = data["preview_fingerprint"]
+            assert isinstance(matched_rows, int)
+            assert matched_rows > 1
+            assert isinstance(preview_fingerprint, str)
+            self._matched_rows = matched_rows
+            self._phase = 2
+            return ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="bulk-update",
+                        name="data_update_postgresql",
+                        arguments={
+                            **self._plan(),
+                            "preview_fingerprint": preview_fingerprint,
+                            "expected_affected_rows": matched_rows,
+                        },
+                    ),
+                ),
+            )
+        if self._phase == 2:
+            update = self._latest_result(request, "bulk-update")
+            assert update.is_error is False
+            data = update.output["data"]
+            assert isinstance(data, Mapping)
+            assert data["outcome"] == "committed"
+            assert data["affected_rows"] == self._matched_rows
+            self._phase = 3
+            return ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="bulk-readback",
+                        name="data_query_postgresql",
+                        arguments={
+                            "source_id": self._source_id,
+                            "sql": (
+                                "SELECT priority, COUNT(*) AS matched_rows "
+                                "FROM support.tickets "
+                                "WHERE ticket_status = $1 AND category = $2 "
+                                "GROUP BY priority ORDER BY priority"
+                            ),
+                            "parameters": ["waiting", "billing"],
+                        },
+                    ),
+                ),
+            )
+        if self._phase == 3:
+            readback = self._latest_result(request, "bulk-readback")
+            assert readback.is_error is False
+            data = readback.output["data"]
+            assert isinstance(data, Mapping)
+            rows = data["rows"]
+            assert isinstance(rows, tuple)
+            assert len(rows) == 1
+            row = rows[0]
+            assert isinstance(row, Mapping)
+            assert row["priority"] == self._desired_priority
+            assert row["matched_rows"] == self._matched_rows
+            self._phase = 4
+            return ModelResponse(
+                finish_reason=FinishReason.STOP,
+                text=(f"Committed and verified {self._matched_rows} ticket updates."),
+            )
+        raise AssertionError("bulk update provider received an unexpected model call")
+
+
+async def _restore_bulk_priority(*, port: int, password: str) -> None:
+    import asyncpg  # type: ignore[import-untyped]
+
+    connection = await asyncpg.connect(
+        host="127.0.0.1",
+        port=port,
+        database="daita_large_fixture",
+        user="daita_large_writer",
+        password=password,
+        ssl=False,
+    )
+    try:
+        await connection.execute(
+            "UPDATE support.tickets SET priority = 'low' "
+            "WHERE ticket_status = 'waiting' AND category = 'billing'"
+        )
+    finally:
+        await connection.close()
+
+
 def test_postgres_large_fixture_declares_its_bounded_contract():
     compose = (FIXTURE / "compose.yaml").read_text(encoding="utf-8")
     init = (FIXTURE / "init.sql").read_text(encoding="utf-8")
@@ -78,6 +244,12 @@ def test_postgres_large_fixture_declares_its_bounded_contract():
     assert "CREATE TYPE catalog.lifecycle_state AS ENUM" in init
     assert "CREATE VIEW analytics.monthly_revenue" in init
     assert "daita_large_reader" in init
+    assert "CREATE ROLE daita_large_writer" in init
+    assert "NOBYPASSRLS" in init
+    assert "REVOKE ALL PRIVILEGES ON DATABASE daita_large_fixture FROM PUBLIC" in init
+    assert "GRANT SELECT ON support.tickets TO daita_large_writer" in init
+    assert "GRANT UPDATE (priority) ON support.tickets TO daita_large_writer" in init
+    assert "daita_large_writer_fixture_password" in readme
     assert "34 supported base tables and 47" in readme
     assert "DAITA_RUN_POSTGRES_LARGE_FIXTURE=1" in readme
 
@@ -254,3 +426,179 @@ async def test_daita_catalogs_and_queries_large_multi_schema_postgresql(tmp_path
         provider.assert_consumed()
     finally:
         await agent.close()
+
+
+@pytest.mark.acceptance
+@pytest.mark.integration
+@pytest.mark.requires_db
+@pytest.mark.skipif(
+    os.environ.get("DAITA_RUN_POSTGRES_LARGE_FIXTURE") != "1",
+    reason=(
+        "set DAITA_RUN_POSTGRES_LARGE_FIXTURE=1 after recreating "
+        "tests/fixtures/postgres-large/compose.yaml"
+    ),
+)
+async def test_terminal_write_permissions_use_large_support_tickets(
+    tmp_path: Path,
+) -> None:
+    password = os.environ.get(
+        "DAITA_LARGE_POSTGRES_WRITER_PASSWORD",
+        "daita_large_writer_fixture_password",
+    )
+    port = int(os.environ.get("DAITA_LARGE_POSTGRES_PORT", "55433"))
+    credential = SecretReference.keychain("fixture:postgres-large:writer-credential")
+    secrets = _Secrets(password)
+    provider = MockModelProvider(())
+    agent = await Agent.create(
+        "postgres-large-terminal-write-permissions",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        secret_provider=secrets,
+    )
+    try:
+        source = await agent.attach_postgresql(
+            host="127.0.0.1",
+            port=port,
+            database="daita_large_fixture",
+            username="daita_large_writer",
+            credential=credential,
+            schemas=("support",),
+            ssl_mode="disable",
+            name="Large PostgreSQL write canary",
+        )
+        inspection = await agent.inspect_source_permissions(source.id)
+        tickets = next(
+            resource
+            for resource in inspection.resources
+            if resource.display_name == "support.tickets"
+        )
+        assert "priority" in tickets.eligible_assignment_columns
+        priority_choice = tickets.eligible_assignment_columns.index("priority") + 1
+        output = io.StringIO()
+
+        await terminal._configure_source_permissions(
+            agent,
+            input_stream=io.StringIO(f"2\nall\n2\n{priority_choice}\ny\n"),
+            output_stream=output,
+            preselected_source_id=source.id,
+            preselected_section="write",
+        )
+
+        after = await agent.inspect_source_permissions(source.id)
+        assert len(after.state.postgresql_update_scopes) == 1
+        scope = after.state.postgresql_update_scopes[0]
+        assert scope.resource_id == tickets.resource_id
+        assert scope.allowed_assignment_columns == ("priority",)
+        readiness = await agent.postgresql_update_readiness(
+            source.id,
+            tickets.resource_id,
+            ("priority",),
+        )
+        assert readiness.ready_for_preview is True
+        rendered = output.getvalue()
+        assert "support.tickets" in rendered
+        assert "Source permissions updated atomically" in rendered
+        assert "No external database mutation was executed" in rendered
+        assert provider.requests == ()
+    finally:
+        await agent.close()
+
+
+@pytest.mark.acceptance
+@pytest.mark.integration
+@pytest.mark.requires_db
+@pytest.mark.skipif(
+    os.environ.get("DAITA_RUN_POSTGRES_LARGE_FIXTURE") != "1",
+    reason=(
+        "set DAITA_RUN_POSTGRES_LARGE_FIXTURE=1 after recreating "
+        "tests/fixtures/postgres-large/compose.yaml"
+    ),
+)
+async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
+    tmp_path: Path,
+) -> None:
+    password = os.environ.get(
+        "DAITA_LARGE_POSTGRES_WRITER_PASSWORD",
+        "daita_large_writer_fixture_password",
+    )
+    port = int(os.environ.get("DAITA_LARGE_POSTGRES_PORT", "55433"))
+    credential = SecretReference.keychain("fixture:postgres-large:bulk-credential")
+    secrets = _Secrets(password)
+    provider = _BulkUpdateProvider()
+    approvals: list[ApprovalRequest] = []
+
+    async def approve_once(request: ApprovalRequest) -> ApprovalDecision:
+        approvals.append(request)
+        return ApprovalDecision.APPROVE
+
+    agent = await Agent.create(
+        "postgres-large-bulk-update",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        secret_provider=secrets,
+        approval_handler=approve_once,
+    )
+    try:
+        source = await agent.attach_postgresql(
+            host="127.0.0.1",
+            port=port,
+            database="daita_large_fixture",
+            username="daita_large_writer",
+            credential=credential,
+            schemas=("support",),
+            ssl_mode="disable",
+            name="Large PostgreSQL bulk update",
+        )
+        inspection = await agent.inspect_source_permissions(source.id)
+        tickets = next(
+            resource
+            for resource in inspection.resources
+            if resource.display_name == "support.tickets"
+        )
+        permissions = await agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode="all",
+            read_resource_ids=(),
+            postgresql_update_scopes={tickets.resource_id: ("priority",)},
+        )
+        await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=permissions.confirmation_fingerprint,
+        )
+
+        provider.configure(
+            source_id=source.id,
+            resource_id=tickets.resource_id,
+            desired_priority="high",
+        )
+        applied = await agent.run(
+            "Set waiting billing tickets to high priority and verify the result."
+        )
+        assert applied.final_text is not None
+        assert applied.final_text.startswith("Committed and verified ")
+
+        provider.configure(
+            source_id=source.id,
+            resource_id=tickets.resource_id,
+            desired_priority="low",
+        )
+        restored = await agent.run(
+            "Restore waiting billing tickets to low priority and verify the result."
+        )
+        assert restored.final_text is not None
+        assert restored.final_text.startswith("Committed and verified ")
+
+        assert len(approvals) == 2
+        assert all(item.tool_name == "data_update_postgresql" for item in approvals)
+        for request in approvals:
+            expected_rows = request.arguments["expected_affected_rows"]
+            preview_fingerprint = request.arguments["preview_fingerprint"]
+            assert isinstance(expected_rows, int)
+            assert expected_rows > 1
+            assert isinstance(preview_fingerprint, str)
+            assert preview_fingerprint.startswith("sha256:")
+    finally:
+        await agent.close()
+        await _restore_bulk_priority(port=port, password=password)

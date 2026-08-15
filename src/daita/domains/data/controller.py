@@ -1343,40 +1343,43 @@ class DataToolRuntime:
         selected_candidate: LearningCandidate | None,
     ) -> tuple[ToolResultBlock, bool]:
         async with self._mutation_lock:
-            try:
-                current = await side_effect.preflight(execution)
-                await self._validate_semantic_preflight(run, capability, current)
-            except asyncio.CancelledError:
-                raise
-            except (
-                CapabilityInputError,
-                SemanticDigestMismatchError,
-                SemanticNotFoundError,
-                SemanticValidationError,
-                SkillNotFoundError,
-                ArtifactError,
-            ):
-                return (
-                    _error(
-                        call,
-                        "state_changed",
-                        "The validated state changed while approval was pending.",
-                        {"capability_id": capability.id},
-                    ),
-                    False,
-                )
-            if not isinstance(current, FrozenJsonObject):
-                raise ValueError("side-effect preflight must return FrozenJsonObject")
-            if current != fingerprint:
-                return (
-                    _error(
-                        call,
-                        "state_changed",
-                        "The validated state changed while approval was pending.",
-                        {"capability_id": capability.id},
-                    ),
-                    False,
-                )
+            if capability.id != POSTGRESQL_UPDATE_CAPABILITY_ID:
+                try:
+                    current = await side_effect.preflight(execution)
+                    await self._validate_semantic_preflight(run, capability, current)
+                except asyncio.CancelledError:
+                    raise
+                except (
+                    CapabilityInputError,
+                    SemanticDigestMismatchError,
+                    SemanticNotFoundError,
+                    SemanticValidationError,
+                    SkillNotFoundError,
+                    ArtifactError,
+                ):
+                    return (
+                        _error(
+                            call,
+                            "state_changed",
+                            "The validated state changed while approval was pending.",
+                            {"capability_id": capability.id},
+                        ),
+                        False,
+                    )
+                if not isinstance(current, FrozenJsonObject):
+                    raise ValueError(
+                        "side-effect preflight must return FrozenJsonObject"
+                    )
+                if current != fingerprint:
+                    return (
+                        _error(
+                            call,
+                            "state_changed",
+                            "The validated state changed while approval was pending.",
+                            {"capability_id": capability.id},
+                        ),
+                        False,
+                    )
             candidate, execution_error, cancelled = await _execute_definitely(
                 side_effect,
                 execution,

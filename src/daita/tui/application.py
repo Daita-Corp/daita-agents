@@ -1792,7 +1792,7 @@ def _create_application(
             ),
             (
                 "class:tui.empty",
-                "\n Ask a question about your data, or type /help for commands.\n",
+                "\n Ask a question about your data, or type / to browse commands.\n",
             ),
         ]
 

@@ -125,7 +125,9 @@ def _without_state_databases(values: dict[str, str]) -> dict[str, str]:
     return {
         name: digest
         for name, digest in values.items()
-        if not name.endswith("/state.db") and "/run/" not in f"/{name}"
+        if not name.endswith("/state.db")
+        and "/state.db.rollback-" not in f"/{name}"
+        and "/run/" not in f"/{name}"
     }
 
 
@@ -382,7 +384,8 @@ asyncio.run(main())
             if any(
                 migrated_rows.get(table) != rows
                 for table, rows in expected_database_rows.items()
-                if table != "sources"
+                if table
+                not in {"database_write_receipts", "sources", "state_migrations"}
             ):
                 raise AssertionError(
                     "managed candidate migration changed baseline-owned rows"
@@ -397,6 +400,16 @@ asyncio.run(main())
                     2,
                     "20260811_postgresql_write_admission",
                     "451840240521fe5ad424d43e0bc5b7df2d124b3261b35be64b53bd36e08431d0",
+                ),
+                (
+                    3,
+                    "20260812_scoped_source_permissions",
+                    "2ed3f7017f9d4c683ee17a0ba43c88ad4452c5af1b06223343cd43248f699d95",
+                ),
+                (
+                    4,
+                    "20260814_generalized_postgresql_updates",
+                    "b08069f61481986937a864d33471185c6fbf031affe81f275a271f0e56a8f428",
                 ),
             )
             with sqlite3.connect(state_path) as connection:

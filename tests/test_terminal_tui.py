@@ -5869,6 +5869,7 @@ async def test_slash_completion_covers_the_documented_surface_and_remains_local(
         "/source",
         "/source use <name>",
         "/source add",
+        "/source edit",
         "/source refresh <id>",
         "/source detach <source>",
         "/source permissions",

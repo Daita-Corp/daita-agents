@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TypeVar
@@ -107,7 +106,6 @@ def _source() -> SourceRegistration:
             "schemas": ("public",),
             "ssl_mode": "require",
             "username": "reader",
-            "write_access": True,
         },
         attached_at=NOW,
     )
@@ -123,11 +121,12 @@ def _receipt() -> DatabaseWriteReceipt:
         resource_id="catalog-resource:sha256:" + "2" * 64,
         intent_sha256="sha256:" + "3" * 64,
         preview_fingerprint="sha256:" + "4" * 64,
+        expected_affected_rows=3,
         started_at=NOW,
     ).finish(
         DatabaseWriteOutcome.COMMITTED,
         completed_at=NOW + timedelta(seconds=1),
-        affected_rows=1,
+        affected_rows=3,
         normalized_error_code=None,
     )
 
@@ -293,7 +292,7 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
 
     encoded_source = encode_source(source)
     stored_source = decode_source(encoded_source)
-    assert stored_source.configuration.get("write_access") is None
+    assert stored_source == source
     assert encode_source(stored_source) == encoded_source
     assert decode_identifier(encode_identifier("source-codec")) == "source-codec"
     assert decode_review_stamps(encode_review_stamps((stamp,))) == (stamp,)
@@ -425,18 +424,3 @@ def test_malformed_enum_datetime_decimal_and_nested_records_are_rejected() -> No
     message_payload["fields"]["content"][0]["__record__"] = "UnknownBlock"
     with pytest.raises(ValueError, match="unsupported"):
         decode_message(json.dumps(message_payload))
-
-
-def test_current_source_codec_rejects_embedded_postgresql_admission() -> None:
-    payload = json.loads(encode_source(_source()))
-    payload["fields"]["configuration"]["write_access"] = True
-    with pytest.raises(ValueError, match="embedded write admission"):
-        decode_source(json.dumps(payload))
-
-    source = _source()
-    invalid_projection = replace(
-        source,
-        configuration={**dict(source.configuration), "write_access": "yes"},
-    )
-    with pytest.raises(ValueError, match="admission must be boolean"):
-        encode_source(invalid_projection)

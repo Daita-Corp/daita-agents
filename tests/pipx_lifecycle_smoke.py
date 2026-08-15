@@ -110,7 +110,11 @@ def _home_hashes(home: Path) -> dict[str, str]:
 
 
 def _without_state_database(values: dict[str, str]) -> dict[str, str]:
-    return {name: digest for name, digest in values.items() if name != "state.db"}
+    return {
+        name: digest
+        for name, digest in values.items()
+        if name != "state.db" and not name.startswith("state.db.rollback-")
+    }
 
 
 def _database_rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
@@ -292,6 +296,7 @@ assert len(content) > 0
 import asyncio
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
+import inspect
 import json
 from pathlib import Path
 import sqlite3
@@ -432,7 +437,7 @@ async def main():
     )
     resource = (await agent.list_catalog_resources())[0]
     transcript = await agent.transcript(run.run_id)
-    receipt = DatabaseWriteReceipt.start(
+    receipt_arguments = dict(
         agent_id=agent.id,
         run_id=run.run_id,
         call_id="upgrade-receipt-call",
@@ -442,7 +447,12 @@ async def main():
         intent_sha256="sha256:" + "6" * 64,
         preview_fingerprint="sha256:" + "7" * 64,
         started_at=transcript.run.created_at,
-    ).finish(
+    )
+    if "expected_affected_rows" in inspect.signature(
+        DatabaseWriteReceipt.start
+    ).parameters:
+        receipt_arguments["expected_affected_rows"] = 1
+    receipt = DatabaseWriteReceipt.start(**receipt_arguments).finish(
         DatabaseWriteOutcome.COMMITTED,
         completed_at=transcript.run.created_at + timedelta(seconds=1),
         affected_rows=1,
@@ -848,7 +858,7 @@ assert any(item.startswith("XlsxWriter") for item in requirements)
         if any(
             migrated_database_rows.get(table) != rows
             for table, rows in preserved_database_rows.items()
-            if table != "sources"
+            if table not in {"database_write_receipts", "sources", "state_migrations"}
         ):
             raise AssertionError(
                 "candidate migration changed rows owned by the baseline format"

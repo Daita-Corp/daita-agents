@@ -8,9 +8,11 @@ minimal receipt needed to classify an external database-write attempt.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sqlite3
+import tempfile
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -101,14 +103,17 @@ from .sqlite_migrations import (
     MIGRATIONS,
     MigrationJournalError,
     MigrationJournalNewerError,
+    create_current,
+    inspect_journal,
+    upgrade_journaled,
+)
+from .sqlite_migrations.preledger import (
     PreledgerAdmissionError,
     PreledgerLegacyError,
     PreledgerNewerError,
+    PreledgerShape,
     bridge as bridge_preledger,
-    create_current,
     identify as identify_preledger,
-    inspect_journal,
-    upgrade_journaled,
 )
 from .sqlite_records import (
     DatabaseWriteOutcome,
@@ -125,6 +130,7 @@ from .sqlite_records import (
     validate_database_write_receipt_id,
 )
 from .sqlite_schema import (
+    CURRENT_TABLES,
     SCOPED_PERMISSION_TABLES,
     require_healthy,
     require_schema,
@@ -298,6 +304,13 @@ class _UpgradeCommitGate:
                 connection.rollback()
                 return False
             connection.commit()
+            return True
+
+    def activate(self, callback: Callable[[], None]) -> bool:
+        with self._lock:
+            if self._cancelled:
+                return False
+            callback()
             self._committed = True
             return True
 
@@ -335,8 +348,8 @@ class SQLiteStateStore:
         upgrade_gate = _UpgradeCommitGate()
 
         def admit() -> None:
-            _initialize(resolved, upgrade_gate=upgrade_gate)
-            _recover_started_database_write_receipts(resolved, resolved_clock)
+            if _initialize(resolved, upgrade_gate=upgrade_gate):
+                _recover_started_database_write_receipts(resolved, resolved_clock)
 
         worker = asyncio.create_task(asyncio.to_thread(admit))
         cancelled = False
@@ -1195,6 +1208,211 @@ class SQLiteStateStore:
         if committed is None:
             raise AssertionError("catalog transaction stopped without cancellation")
         async with self._decoded_catalog_snapshot_lock:
+            self._publish_decoded_catalog_snapshot(committed)
+        return committed
+
+    async def commit_source_edit(
+        self,
+        snapshot: SourceCatalogSnapshot,
+        *,
+        registration: SourceRegistration,
+        replaced_source_id: str,
+        replaced_at: datetime,
+        read_scope: SourceReadScope,
+    ) -> SourceCatalogSnapshot:
+        """Atomically hand one active source connection to discovered truth."""
+
+        if not isinstance(registration, SourceRegistration) or not registration.active:
+            raise ValueError("source edit requires an active replacement registration")
+        if not isinstance(replaced_source_id, str) or not replaced_source_id:
+            raise ValueError("replaced_source_id must be a non-empty string")
+        sync = snapshot.sync
+        if registration.agent_id != sync.agent_id or registration.id != sync.source_id:
+            raise ValueError("catalog snapshot and replacement registration disagree")
+        if (
+            read_scope.agent_id != registration.agent_id
+            or read_scope.source_id != registration.id
+        ):
+            raise ValueError("replacement read scope belongs to another source")
+        snapshot_resource_ids = {resource.id for resource in snapshot.resources}
+        if (
+            read_scope.mode is SourceReadMode.SELECTED
+            and not set(read_scope.resource_ids) <= snapshot_resource_ids
+        ):
+            raise ValueError("replacement read scope is outside discovered catalog")
+        gate = _CatalogCommitGate()
+
+        def write() -> SourceCatalogSnapshot | None:
+            connection = _connect(self.path)
+            try:
+                if not gate.start(connection):
+                    return None
+                replaced_row = _source_state_row(
+                    connection,
+                    registration.agent_id,
+                    replaced_source_id,
+                )
+                if replaced_row is None:
+                    raise ValueError("source edit requires an active owned source")
+                replaced = _decode_source_state(
+                    connection,
+                    row_agent_id=replaced_row[0],
+                    row_source_id=replaced_row[1],
+                    source_data=replaced_row[2],
+                    read_scope_data=replaced_row[3],
+                    update_scope_count=replaced_row[4],
+                )
+                if not replaced.active:
+                    raise ValueError("source edit requires an active owned source")
+                if replaced.adapter_id != registration.adapter_id:
+                    raise ValueError("source edit cannot change source type")
+
+                if registration.id != replaced.id:
+                    replacement_row = _source_state_row(
+                        connection,
+                        registration.agent_id,
+                        registration.id,
+                    )
+                    if replacement_row is None:
+                        connection.execute(
+                            "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
+                            (
+                                registration.agent_id,
+                                registration.id,
+                                encode_source(registration),
+                            ),
+                        )
+                    else:
+                        existing_replacement = _decode_source_state(
+                            connection,
+                            row_agent_id=replacement_row[0],
+                            row_source_id=replacement_row[1],
+                            source_data=replacement_row[2],
+                            read_scope_data=replacement_row[3],
+                            update_scope_count=replacement_row[4],
+                        )
+                        if existing_replacement.active:
+                            raise ValueError(
+                                "replacement connection is already attached"
+                            )
+                        if (
+                            existing_replacement.adapter_id != registration.adapter_id
+                            or existing_replacement.native_identity
+                            != registration.native_identity
+                        ):
+                            raise ValueError(
+                                "replacement source identity conflicts with stored state"
+                            )
+                        connection.execute(
+                            """UPDATE sources SET data = ?
+                               WHERE agent_id = ? AND id = ?""",
+                            (
+                                encode_source(registration),
+                                registration.agent_id,
+                                registration.id,
+                            ),
+                        )
+                    detached = replaced.detach(replaced_at)
+                    connection.execute(
+                        """UPDATE sources SET data = ?
+                           WHERE agent_id = ? AND id = ?""",
+                        (
+                            encode_source(detached),
+                            replaced.agent_id,
+                            replaced.id,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE sources SET data = ?
+                           WHERE agent_id = ? AND id = ?""",
+                        (
+                            encode_source(registration),
+                            registration.agent_id,
+                            registration.id,
+                        ),
+                    )
+
+                for source_id in {replaced.id, registration.id}:
+                    connection.execute(
+                        """DELETE FROM source_read_scopes
+                           WHERE agent_id = ? AND source_id = ?""",
+                        (registration.agent_id, source_id),
+                    )
+                    connection.execute(
+                        """DELETE FROM postgresql_update_scopes
+                           WHERE agent_id = ? AND source_id = ?""",
+                        (registration.agent_id, source_id),
+                    )
+                connection.execute(
+                    """INSERT INTO source_read_scopes(agent_id, source_id, data)
+                       VALUES (?, ?, ?)""",
+                    (
+                        read_scope.agent_id,
+                        read_scope.source_id,
+                        encode_source_read_scope(read_scope),
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO metadata(key, data) VALUES (?, ?)
+                       ON CONFLICT(key) DO UPDATE SET data = excluded.data""",
+                    (
+                        _active_source_key(registration.agent_id),
+                        encode_identifier(registration.id),
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO syncs(agent_id, id, source_id, data)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(agent_id, id) DO UPDATE SET data = excluded.data""",
+                    (
+                        sync.agent_id,
+                        sync.id,
+                        sync.source_id,
+                        encode_catalog_sync(sync),
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO snapshots(agent_id, source_id, sync_id, data)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(agent_id, source_id) DO UPDATE SET
+                         sync_id = excluded.sync_id, data = excluded.data""",
+                    (
+                        sync.agent_id,
+                        sync.source_id,
+                        sync.id,
+                        encode_catalog_snapshot(snapshot),
+                    ),
+                )
+                _commit_catalog_transaction(connection)
+                return snapshot
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled_before_start = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled_before_start = (
+                    gate.cancel_before_start() or cancelled_before_start
+                )
+        committed = worker.result()
+        if cancelled_before_start:
+            if committed is not None:
+                raise AssertionError("cancelled source edit transaction committed")
+            raise asyncio.CancelledError
+        if committed is None:
+            raise AssertionError("source edit transaction stopped without cancellation")
+        async with self._decoded_catalog_snapshot_lock:
+            self._evict_decoded_catalog_source(
+                registration.agent_id,
+                replaced_source_id,
+            )
             self._publish_decoded_catalog_snapshot(committed)
         return committed
 
@@ -2778,32 +2996,356 @@ async def _run_candidate_transaction(
     return result
 
 
-def _initialize(path: Path, *, upgrade_gate: _UpgradeCommitGate | None = None) -> None:
+def _validate_current_records(connection: sqlite3.Connection) -> None:
+    identity: AgentIdentity | None = None
+    active_sources: dict[str, str] = {}
+    for key, data in connection.execute("SELECT key, data FROM metadata"):
+        if key == "identity":
+            if identity is not None:
+                raise ValueError("state contains duplicate agent identity")
+            identity = decode_identity(data)
+        elif isinstance(key, str) and key.startswith(_ACTIVE_SOURCE_KEY_PREFIX):
+            agent_id = key.removeprefix(_ACTIVE_SOURCE_KEY_PREFIX)
+            active_sources[agent_id] = decode_identifier(data)
+        elif isinstance(key, str) and key.startswith(
+            _LEARNING_REVIEW_STAMPS_KEY_PREFIX
+        ):
+            agent_id = key.removeprefix(_LEARNING_REVIEW_STAMPS_KEY_PREFIX)
+            if not agent_id:
+                raise ValueError("stored learning review owner is invalid")
+            decode_review_stamps(data)
+        else:
+            raise ValueError("state metadata key is unsupported")
+
+    sources: dict[tuple[str, str], SourceRegistration] = {}
+    for agent_id, source_id, data in connection.execute(
+        "SELECT agent_id, id, data FROM sources"
+    ):
+        registration = decode_source(data)
+        if registration.agent_id != agent_id or registration.id != source_id:
+            raise ValueError("stored source ownership is invalid")
+        sources[(agent_id, source_id)] = registration
+    if identity is not None and any(agent_id != identity.id for agent_id, _ in sources):
+        raise ValueError("stored source belongs to another agent")
+    for agent_id, source_id in active_sources.items():
+        active_registration = sources.get((agent_id, source_id))
+        if active_registration is None or not active_registration.active:
+            raise ValueError("stored active source selection is invalid")
+
+    syncs: dict[tuple[str, str], CatalogSync] = {}
+    for agent_id, sync_id, source_id, data in connection.execute(
+        "SELECT agent_id, id, source_id, data FROM syncs"
+    ):
+        sync = decode_catalog_sync(data)
+        if (
+            sync.agent_id != agent_id
+            or sync.id != sync_id
+            or sync.source_id != source_id
+            or (agent_id, source_id) not in sources
+        ):
+            raise ValueError("stored catalog sync ownership is invalid")
+        syncs[(agent_id, sync_id)] = sync
+    for agent_id, source_id, sync_id, data in connection.execute(
+        "SELECT agent_id, source_id, sync_id, data FROM snapshots"
+    ):
+        snapshot = decode_catalog_snapshot(data)
+        if (
+            snapshot.sync.agent_id != agent_id
+            or snapshot.sync.source_id != source_id
+            or snapshot.sync.id != sync_id
+            or syncs.get((agent_id, sync_id)) != snapshot.sync
+        ):
+            raise ValueError("stored catalog snapshot ownership is invalid")
+
+    run_ids: set[str] = set()
+    message_positions: dict[str, list[int]] = {}
+    for (
+        run_id,
+        agent_id,
+        conversation_id,
+        turn_index,
+        input_data,
+        result,
+    ) in connection.execute(
+        """SELECT id, agent_id, conversation_id, turn_index, input, result
+           FROM runs"""
+    ):
+        run_input = decode_run_input(input_data)
+        if (
+            run_input.id != run_id
+            or run_input.agent_id != agent_id
+            or run_input.conversation_id != conversation_id
+            or not isinstance(turn_index, int)
+            or isinstance(turn_index, bool)
+            or turn_index < 0
+        ):
+            raise ValueError("stored run ownership is invalid")
+        if result is not None:
+            try:
+                exit_record = decode_loop_exit(result)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if (
+                    exit_record.run_id != run_id
+                    or exit_record.conversation_id != conversation_id
+                ):
+                    raise ValueError("stored run result ownership is invalid")
+        run_ids.add(run_id)
+    for run_id, position, data in connection.execute(
+        "SELECT run_id, position, data FROM messages ORDER BY run_id, position"
+    ):
+        if run_id not in run_ids:
+            raise ValueError("stored message belongs to an unknown run")
+        try:
+            decode_message(data)
+        except (TypeError, ValueError):
+            pass
+        message_positions.setdefault(run_id, []).append(position)
+    if any(
+        positions != list(range(len(positions)))
+        for positions in message_positions.values()
+    ):
+        raise ValueError("stored transcript message positions are not contiguous")
+
+    for agent_id, annotation_id, data in connection.execute(
+        "SELECT agent_id, id, data FROM semantic_annotations"
+    ):
+        annotation = decode_semantic_annotation(data)
+        if annotation.agent_id != agent_id or annotation.id != annotation_id:
+            raise ValueError("stored semantic annotation ownership is invalid")
+    for agent_id, candidate_id, data in connection.execute(
+        "SELECT agent_id, id, data FROM learning_candidates"
+    ):
+        candidate = decode_learning_candidate(data)
+        if candidate.agent_id != agent_id or candidate.id != candidate_id:
+            raise ValueError("stored learning candidate ownership is invalid")
+
+
+def _logical_state_fingerprint(connection: sqlite3.Connection) -> str:
+    objects = tuple(
+        connection.execute("""SELECT type, name, tbl_name, sql FROM sqlite_master
+               WHERE name NOT LIKE 'sqlite_%'
+               ORDER BY type, name""")
+    )
+    rows = {
+        table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
+        for table in sorted(table_names(connection))
+    }
+    material = json.dumps(
+        {"objects": objects, "rows": rows},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(material.encode("utf-8")).hexdigest()
+
+
+def _temporary_state_path(path: Path, label: str) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=f".{path.name}.{label}-",
+        suffix=".db",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    candidate = Path(raw_path)
+    os.chmod(candidate, 0o600)
+    return candidate
+
+
+def _copy_state_database(
+    source: Path,
+    destination: Path,
+    *,
+    expected_fingerprint: str,
+) -> None:
+    with _connect_read_only(source) as source_connection:
+        if _logical_state_fingerprint(source_connection) != expected_fingerprint:
+            raise RuntimeError("state changed while its upgrade copy was prepared")
+        destination_connection = _connect(destination)
+        try:
+            source_connection.backup(destination_connection)
+            destination_connection.commit()
+        finally:
+            destination_connection.close()
+    os.chmod(destination, 0o600)
+    with _connect_read_only(destination) as copied_connection:
+        if _logical_state_fingerprint(copied_connection) != expected_fingerprint:
+            raise RuntimeError("state upgrade copy does not match its source")
+        require_healthy(copied_connection)
+
+
+def _rollback_state_path(
+    path: Path,
+    *,
+    found_revision: str,
+    fingerprint: str,
+) -> Path:
+    revision = re.sub(r"[^A-Za-z0-9._-]+", "-", found_revision).strip("-._")
+    if not revision:
+        revision = "unknown"
+    return path.with_name(f"{path.name}.rollback-{revision[:80]}-{fingerprint[:12]}")
+
+
+def _fsync_state_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _prune_older_rollback_points(path: Path, retained: Path) -> None:
+    for candidate in path.parent.glob(f"{path.name}.rollback-*"):
+        if candidate == retained:
+            continue
+        try:
+            candidate.unlink()
+        except OSError:
+            pass
+
+
+def _upgrade_staged_state(
+    path: Path,
+    *,
+    applied: int | None,
+    expected_preledger: PreledgerShape | None,
+    source_fingerprint: str,
+    found_revision: str,
+    upgrade_gate: _UpgradeCommitGate | None,
+) -> bool:
+    rollback_candidate = _temporary_state_path(path, "rollback")
+    staged = _temporary_state_path(path, "upgrade")
+    retained_rollback = _rollback_state_path(
+        path,
+        found_revision=found_revision,
+        fingerprint=source_fingerprint,
+    )
+    published_rollback = False
+    activated = False
+    try:
+        _copy_state_database(
+            path,
+            rollback_candidate,
+            expected_fingerprint=source_fingerprint,
+        )
+        _copy_state_database(
+            rollback_candidate,
+            staged,
+            expected_fingerprint=source_fingerprint,
+        )
+
+        connection = _connect(staged)
+        try:
+            if upgrade_gate is None:
+                connection.execute("BEGIN IMMEDIATE")
+            elif not upgrade_gate.start(connection):
+                return False
+            if applied is None:
+                assert expected_preledger is not None
+                bridge_preledger(connection, expected_preledger)
+                bridged = inspect_journal(connection)
+                if bridged >= len(MIGRATIONS):
+                    raise RuntimeError("pre-ledger bridge unexpectedly reached current")
+                upgrade_journaled(connection, bridged)
+            else:
+                if inspect_journal(connection) != applied:
+                    raise RuntimeError("migration journal changed during admission")
+                upgrade_journaled(connection, applied)
+            require_schema(connection, CURRENT_TABLES)
+            require_healthy(connection)
+            if upgrade_gate is None:
+                connection.commit()
+            elif not upgrade_gate.commit(connection):
+                return False
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+        with _connect_read_only(staged) as staged_connection:
+            if inspect_journal(staged_connection) != len(MIGRATIONS):
+                raise RuntimeError("staged state did not reach the current revision")
+            _validate_current_records(staged_connection)
+
+        os.chmod(staged, 0o600)
+        os.chmod(rollback_candidate, 0o600)
+        _fsync_state_file(staged)
+        _fsync_state_file(rollback_candidate)
+
+        def activate() -> None:
+            nonlocal activated, published_rollback
+            if retained_rollback.exists():
+                with _connect_read_only(retained_rollback) as existing_rollback:
+                    if (
+                        _logical_state_fingerprint(existing_rollback)
+                        != source_fingerprint
+                    ):
+                        raise RuntimeError(
+                            "existing rollback point has conflicting state"
+                        )
+                rollback_candidate.unlink()
+            else:
+                os.replace(rollback_candidate, retained_rollback)
+                published_rollback = True
+            try:
+                os.replace(staged, path)
+            except BaseException:
+                if published_rollback:
+                    retained_rollback.unlink(missing_ok=True)
+                    published_rollback = False
+                raise
+            activated = True
+
+        if upgrade_gate is None:
+            activate()
+        elif not upgrade_gate.activate(activate):
+            return False
+        _prune_older_rollback_points(path, retained_rollback)
+        return True
+    finally:
+        rollback_candidate.unlink(missing_ok=True)
+        staged.unlink(missing_ok=True)
+        if published_rollback and not activated:
+            retained_rollback.unlink(missing_ok=True)
+
+
+def _initialize(
+    path: Path,
+    *,
+    upgrade_gate: _UpgradeCommitGate | None = None,
+) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
-        os.chmod(path, 0o600)
-        _admit_existing_state(path, upgrade_gate=upgrade_gate)
-        return
+        admitted = _admit_existing_state(path, upgrade_gate=upgrade_gate)
+        if admitted:
+            os.chmod(path, 0o600)
+        return admitted
     with _connect(path) as connection:
         create_current(connection)
     os.chmod(path, 0o600)
+    return True
 
 
 def _admit_existing_state(
     path: Path,
     *,
     upgrade_gate: _UpgradeCommitGate | None = None,
-) -> None:
+) -> bool:
     try:
-        with _connect_read_only(path) as read_connection:
-            if "state_migrations" in table_names(read_connection):
-                applied = inspect_journal(read_connection)
+        with _connect_read_only(path) as connection:
+            if "state_migrations" in table_names(connection):
+                applied = inspect_journal(connection)
                 if applied == len(MIGRATIONS):
-                    return
+                    return True
                 expected_preledger = None
+                found_revision = MIGRATIONS[applied - 1].migration_id
             else:
                 applied = None
-                expected_preledger = identify_preledger(read_connection)
+                expected_preledger = identify_preledger(connection)
+                found_revision = expected_preledger.value
+            source_fingerprint = _logical_state_fingerprint(connection)
     except (MigrationJournalNewerError, PreledgerNewerError) as error:
         raise StateCompatibilityError(
             StateCompatibilityCode.NEWER_REVISION,
@@ -2844,58 +3386,35 @@ def _admit_existing_state(
             found_revision=error.found_revision or "invalid-journal",
         ) from None
     except PreledgerAdmissionError:
-        raise _damaged_state_error(
-            path,
-            "unsupported-preledger-state",
-        ) from None
+        raise _damaged_state_error(path, "unsupported-preledger-state") from None
     except StateCompatibilityError:
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError):
         raise _damaged_state_error(path, None) from None
 
-    connection: sqlite3.Connection | None = None
     try:
-        connection = _connect(path)
-        if upgrade_gate is None:
-            connection.execute("BEGIN IMMEDIATE")
-        elif not upgrade_gate.start(connection):
-            return
-        if applied is None:
-            assert expected_preledger is not None
-            bridge_preledger(connection, expected_preledger)
-        else:
-            if inspect_journal(connection) != applied:
-                raise RuntimeError("migration journal changed during admission")
-            upgrade_journaled(connection, applied)
-        require_schema(connection, SCOPED_PERMISSION_TABLES)
-        require_healthy(connection)
-        if upgrade_gate is None:
-            connection.commit()
-        elif not upgrade_gate.commit(connection):
-            return
+        return _upgrade_staged_state(
+            path,
+            applied=applied,
+            expected_preledger=expected_preledger,
+            source_fingerprint=source_fingerprint,
+            found_revision=found_revision,
+            upgrade_gate=upgrade_gate,
+        )
     except BaseException as error:
-        if connection is not None:
-            connection.rollback()
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
             raise
         raise StateCompatibilityError(
             StateCompatibilityCode.UPGRADE_FAILED,
             path,
             (
-                "Daita could not update the local state safely. No changes were "
-                "committed. Reinstall the prior working Daita package before "
-                "continuing, then report this upgrade failure."
+                "Daita could not update the local state safely. The active "
+                "database was not replaced. Reinstall the prior working Daita "
+                "package before continuing, then report this upgrade failure."
             ),
             current_revision=CURRENT_REVISION,
-            found_revision=(
-                expected_preledger.value
-                if applied is None and expected_preledger is not None
-                else "journal-prefix"
-            ),
+            found_revision=found_revision,
         ) from None
-    finally:
-        if connection is not None:
-            connection.close()
 
 
 def _damaged_state_error(

@@ -4,7 +4,7 @@ import io
 from collections.abc import Mapping
 from datetime import UTC, datetime
 
-from daita import terminal
+from daita import terminal, terminal_tui
 from daita.adapters.models import SourceRegistration
 from daita.catalog.models import ResourceKind, catalog_resource_id
 from daita.storage.sqlite_records import (
@@ -27,23 +27,31 @@ class _PermissionAgent:
         self.source = SourceRegistration.build(
             agent_id=AGENT_ID,
             adapter_id="postgresql",
-            native_identity="postgresql:terminal-permissions",
-            display_name="Terminal warehouse",
+            native_identity="postgresql:large-fixture-terminal-permissions",
+            display_name="Large PostgreSQL write canary",
             configuration={},
             attached_at=NOW,
         )
-        self.resources = tuple(
+        self.resources = (
             SourcePermissionResource(
                 resource_id=catalog_resource_id(
                     self.source.id,
                     ResourceKind.TABLE,
-                    f"public.{name}",
+                    "support.tickets",
                 ),
-                display_name=f"public.{name}",
+                display_name="support.tickets",
                 resource_kind="table",
-                eligible_assignment_columns=("status", "updated_at"),
-            )
-            for name in ("accounts", "orders")
+                eligible_assignment_columns=("priority",),
+            ),
+            SourcePermissionResource(
+                resource_id=catalog_resource_id(
+                    self.source.id,
+                    ResourceKind.TABLE,
+                    "support.ticket_events",
+                ),
+                display_name="support.ticket_events",
+                resource_kind="table",
+            ),
         )
         self.state = SourcePermissionState(
             SourceReadScope.allow_all(
@@ -164,11 +172,35 @@ async def test_terminal_write_permissions_use_all_columns_and_cancel_changes_not
 
     assert len(agent.preview_calls) == 1
     assert agent.preview_calls[0]["postgresql_update_scopes"] == {
-        resource.resource_id: resource.eligible_assignment_columns
-        for resource in agent.resources
+        agent.resources[0].resource_id: ("priority",)
     }
     assert agent.apply_calls == []
     assert "Source permissions were not changed" in output.getvalue()
+
+
+async def test_advanced_write_permissions_can_select_more_than_32_columns():
+    agent = _PermissionAgent()
+    columns = tuple(f"column_{index}" for index in range(33))
+    wide_resource = SourcePermissionResource(
+        resource_id=agent.resources[0].resource_id,
+        display_name=agent.resources[0].display_name,
+        resource_kind="table",
+        eligible_assignment_columns=columns,
+    )
+    agent.resources = (wide_resource, agent.resources[1])
+    inspection = await agent.inspect_source_permissions(agent.source.id)
+
+    selected = await terminal._advanced_update_columns(
+        (wide_resource,),
+        inspection,
+        input_stream=io.StringIO("all\n"),
+        output_stream=io.StringIO(),
+        selection_input=None,
+        selection_output=None,
+    )
+
+    assert len(selected[wide_resource.resource_id]) == 33
+    assert set(selected[wide_resource.resource_id]) == set(columns)
 
 
 async def test_legacy_source_command_is_unknown_and_routes_to_current_usage():
@@ -194,8 +226,9 @@ async def test_legacy_source_command_is_unknown_and_routes_to_current_usage():
     assert agent.apply_calls == []
 
 
-def test_permission_command_uses_external_prompt_path_and_help_completion():
+def test_permission_command_uses_external_prompt_path_and_slash_completion():
     assert terminal._command_uses_terminal_prompts("/source permissions") is True
-    output = io.StringIO()
-    terminal._write_chat_help(output)
-    assert "/source permissions" in output.getvalue()
+    assert "/source permissions" in {
+        display
+        for _insertion, display, _description in terminal_tui._SLASH_COMMAND_COMPLETIONS
+    }

@@ -43,6 +43,9 @@ from .hosting.embedded import (
     AgentNotFoundError,
     EmbeddedAgent,
     HostActiveError,
+    SourceEditConfirmationHandler,
+    SourceEditPreview as SourceEditPreview,
+    SourceEditResult,
     SourceSelectionError,
 )
 from .learning_candidates import (
@@ -501,6 +504,21 @@ class Agent:
     async def attach(self, source: ResourceSource) -> SourceRegistration:
         return await self._embedded.attach(source)
 
+    async def edit_source(
+        self,
+        source_id: str,
+        source: ResourceSource,
+        *,
+        confirmation_handler: SourceEditConfirmationHandler,
+    ) -> SourceEditResult | None:
+        """Validate, review, and atomically edit one active source connection."""
+
+        return await self._embedded.edit_source(
+            source_id,
+            source,
+            confirmation_handler=confirmation_handler,
+        )
+
     async def attach_sqlite(
         self,
         path: str | Path,
@@ -509,6 +527,21 @@ class Agent:
     ) -> SourceRegistration:
         return await self._embedded.attach_sqlite(path, name=name)
 
+    async def edit_sqlite_source(
+        self,
+        source_id: str,
+        path: str | Path,
+        *,
+        confirmation_handler: SourceEditConfirmationHandler,
+        name: str | None = None,
+    ) -> SourceEditResult | None:
+        return await self._embedded.edit_sqlite_source(
+            source_id,
+            path,
+            confirmation_handler=confirmation_handler,
+            name=name,
+        )
+
     async def attach_local_directory(
         self,
         root: str | Path,
@@ -516,6 +549,41 @@ class Agent:
         name: str | None = None,
     ) -> SourceRegistration:
         return await self._embedded.attach_local_directory(root, name=name)
+
+    async def edit_local_directory_source(
+        self,
+        source_id: str,
+        root: str | Path,
+        *,
+        confirmation_handler: SourceEditConfirmationHandler,
+        name: str | None = None,
+        max_depth: int = 8,
+        max_files: int = 1_000,
+        max_file_bytes: int = 2 * 1024 * 1024,
+        max_columns: int = 512,
+        max_rows: int = 100_000,
+        max_json_nodes: int = 500_000,
+        max_json_depth: int = 32,
+        max_key_bytes: int = 1_024,
+        max_string_bytes: int = 256 * 1024,
+        max_cell_bytes: int = 1024 * 1024,
+    ) -> SourceEditResult | None:
+        return await self._embedded.edit_local_directory_source(
+            source_id,
+            root,
+            confirmation_handler=confirmation_handler,
+            name=name,
+            max_depth=max_depth,
+            max_files=max_files,
+            max_file_bytes=max_file_bytes,
+            max_columns=max_columns,
+            max_rows=max_rows,
+            max_json_nodes=max_json_nodes,
+            max_json_depth=max_json_depth,
+            max_key_bytes=max_key_bytes,
+            max_string_bytes=max_string_bytes,
+            max_cell_bytes=max_cell_bytes,
+        )
 
     async def store_postgresql_password(self, password: str) -> SecretReference:
         return await self._embedded.store_postgresql_password(password)
@@ -565,6 +633,35 @@ class Agent:
             username=username,
             credential=credential,
             schemas=schemas,
+            port=port,
+            ssl_mode=ssl_mode,
+            name=name,
+        )
+
+    async def edit_postgresql_source(
+        self,
+        source_id: str,
+        *,
+        host: str,
+        database: str,
+        username: str,
+        credential: SecretReference,
+        schemas: tuple[str, ...],
+        confirmation_handler: SourceEditConfirmationHandler,
+        port: int = 5432,
+        ssl_mode: str = "require",
+        name: str | None = None,
+    ) -> SourceEditResult | None:
+        """Edit PostgreSQL with a reviewed atomic connection handoff."""
+
+        return await self._embedded.edit_postgresql_source(
+            source_id,
+            host=host,
+            database=database,
+            username=username,
+            credential=credential,
+            schemas=schemas,
+            confirmation_handler=confirmation_handler,
             port=port,
             ssl_mode=ssl_mode,
             name=name,
