@@ -119,6 +119,41 @@ async def test_sqlite_execution_fails_closed_on_symlink_substitution(
         )
 
 
+async def test_sqlite_connect_failure_rechecks_admitted_path_identity(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = tmp_path / "admitted-connect-failure.sqlite"
+    replacement = tmp_path / "replacement-connect-failure.sqlite"
+    for path, value in ((database, "admitted"), (replacement, "replacement")):
+        with sqlite3.connect(path) as connection:
+            connection.execute("CREATE TABLE records (value TEXT)")
+            connection.execute("INSERT INTO records VALUES (?)", (value,))
+    with sqlite3.connect(database) as connection:
+        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
+    admitted = sqlite_query_module._regular_unaliased_path(str(database))
+
+    def replace_then_fail(*args, **kwargs):
+        del args, kwargs
+        replacement.replace(database)
+        raise sqlite3.OperationalError("controlled descriptor open failure")
+
+    monkeypatch.setattr(sqlite_query_module.sqlite3, "connect", replace_then_fail)
+
+    with pytest.raises(
+        sqlite_query_module.SQLiteQueryError,
+        match="changed after admission",
+    ):
+        await sqlite_query_module._run_query(
+            admitted,
+            "SELECT value FROM records",
+            (),
+            expected_schema_version=schema_version,
+            max_rows=10,
+            max_bytes=10_000,
+        )
+
+
 @pytest.mark.parametrize("execution", ("query", "exact_export"))
 async def test_sqlite_execution_fails_closed_for_live_wal_database(
     tmp_path,

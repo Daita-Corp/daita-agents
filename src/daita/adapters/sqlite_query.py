@@ -661,11 +661,18 @@ def _connect_admitted_read_only(
                 "source_descriptor_unavailable",
                 "SQLite source identity cannot be bound safely on this platform.",
             )
-        connection = sqlite3.connect(
-            f"{descriptor_path.as_uri()}?mode=ro",
-            uri=True,
-            timeout=5.0,
-        )
+        try:
+            connection = sqlite3.connect(
+                f"{descriptor_path.as_uri()}?mode=ro",
+                uri=True,
+                timeout=5.0,
+            )
+        except sqlite3.Error:
+            # Some platforms fail while SQLite opens the admitted descriptor if
+            # its original path was replaced. Recheck the path identity before
+            # normalizing that connector error so substitution remains explicit.
+            _require_admitted_identity(admitted)
+            raise
         _require_admitted_identity(admitted)
         return connection, descriptor
     except BaseException:
