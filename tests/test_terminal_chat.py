@@ -17,8 +17,10 @@ from daita import (
     Agent,
     ApprovalDecision,
     ApprovalRequest,
+    PostgreSQLUpdateReadiness,
     Skill,
     SQLiteSource,
+    cli,
     terminal,
     terminal_tui,
 )
@@ -51,6 +53,56 @@ class _Keychain:
 
     async def delete(self, reference: SecretReference) -> None:
         self.values.pop(reference.name, None)
+
+
+def _ready_postgresql_result(
+    source_id: str,
+    resource_id: str,
+    *,
+    daita_scope_ready: bool = True,
+    requested_columns_update: bool = True,
+    rejection_codes: tuple[str, ...] = (),
+    remediation_categories: tuple[str, ...] = (),
+) -> PostgreSQLUpdateReadiness:
+    return PostgreSQLUpdateReadiness(
+        source_id=source_id,
+        resource_id=resource_id,
+        assignment_columns=("status",),
+        daita_scope_ready=daita_scope_ready,
+        ready_for_preview=not rejection_codes,
+        proves_execution=False,
+        role_attributes=FrozenJsonObject.from_mapping(
+            {
+                "superuser": False,
+                "bypass_rls": False,
+                "create_database": False,
+                "create_role": False,
+                "replication": False,
+            }
+        ),
+        privileges=FrozenJsonObject.from_mapping(
+            {
+                "database_connect": True,
+                "schema_usage": True,
+                "table_select": True,
+                "requested_columns_update": requested_columns_update,
+            }
+        ),
+        relation=FrozenJsonObject.from_mapping(
+            {
+                "catalog_admitted": True,
+                "base_table": True,
+                "partition": False,
+                "inheritance": False,
+                "row_level_security": False,
+                "force_row_level_security": False,
+                "user_triggers": False,
+                "rewrite_rules": False,
+            }
+        ),
+        rejection_codes=rejection_codes,
+        remediation_categories=remediation_categories,
+    )
 
 
 def _stop(text: str, *, provider_id: str = "openai:test-model") -> ModelResponse:
@@ -352,6 +404,70 @@ async def test_unreviewable_approval_is_denied_before_prompting(
     assert "Approve this exact change once?" not in output.getvalue()
 
 
+def test_cli_and_tui_share_one_exact_approval_document_renderer():
+    request = ApprovalRequest(
+        run_id="run-shared-renderer",
+        call_id="call-shared-renderer",
+        tool_name="data_update_postgresql",
+        capability_id="data.postgresql.update",
+        arguments=FrozenJsonObject.from_mapping(
+            {
+                "source_id": "source:sha256:" + "a" * 64,
+                "resource_id": "catalog-resource:sha256:" + "b" * 64,
+                "where": [{"column": "status", "operator": "eq", "value": "日本語"}],
+                "assignments": [{"column": "priority", "value": 4}],
+                "preview_fingerprint": "sha256:" + "c" * 64,
+                "expected_affected_rows": 10,
+            }
+        ),
+        reason="write",
+    )
+
+    cli_document = terminal._render_approval_arguments(request)
+    panel = terminal_tui._approval_panel_for_request(request)
+
+    assert cli_document is not None
+    assert panel is not None
+    assert cli_document == panel.arguments_text
+
+
+async def test_cli_and_tui_render_identical_frozen_postgresql_update_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    arguments = FrozenJsonObject.from_mapping(
+        {
+            "source_id": "source:sha256:" + "a" * 64,
+            "resource_id": "catalog-resource:sha256:" + "b" * 64,
+            "where": [{"column": "account_id", "operator": "eq", "value": 42}],
+            "assignments": [{"column": "status", "value": "inactive"}],
+            "preview_fingerprint": "sha256:" + "c" * 64,
+            "expected_affected_rows": 2500,
+        }
+    )
+    request = ApprovalRequest(
+        run_id="run-update",
+        call_id="call-update",
+        tool_name="data_update_postgresql",
+        capability_id="data.postgresql.update",
+        arguments=arguments,
+        reason="write",
+    )
+    frozen_arguments = request.arguments
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+
+    decision = await cli._prompt_for_exact_approval(request)
+    panel = terminal_tui._approval_panel_for_request(request)
+
+    assert decision is ApprovalDecision.DENY
+    assert panel is not None
+    cli_output = capsys.readouterr().out
+    cli_arguments = cli_output.split("Arguments:\n", 1)[1]
+    assert json.loads(cli_arguments) == json.loads(panel.arguments_text)
+    assert json.loads(panel.arguments_text) == arguments.to_dict()
+    assert request.arguments is frozen_arguments
+
+
 @pytest.mark.parametrize(
     ("command", "confirmation", "setup_name"),
     (
@@ -578,7 +694,10 @@ async def test_local_status_commands_are_bounded_secret_free_and_never_modeled(
     assert "Catalog preview" in text
     assert "Sources" in text
     assert "Settings" in text
-    assert "Commands" in text
+    assert "Help" in text
+    assert "Type / to browse commands and their descriptions." in text
+    assert "/source permissions" not in text
+    assert "/source write" not in text
     assert "Wheel or Page Up/Page Down review" in text
     assert "Esc Esc clear input" in text
     assert "Animated status shows the active tool" in text
@@ -623,6 +742,88 @@ async def test_source_add_recomputes_catalog_before_returning_to_prompt(
     assert "2 resources" in text
     assert text.count("You › ") >= 2
     assert provider.requests == ()
+
+
+async def test_source_edit_validates_reviews_switches_and_starts_new_conversation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keychain = _Keychain()
+    _, current_source_id = await _ready_agent(tmp_path, keychain)
+    edited = tmp_path / "edited.sqlite"
+    _database(edited, "records")
+    provider = MockModelProvider(
+        (_stop("ready to edit"),), provider_id="openai:test-model"
+    )
+    _install_provider(monkeypatch, provider)
+    output = io.StringIO()
+
+    code = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO(
+            "Check the current source\n"
+            f"/source edit\ny\n{edited}\nEdited SQLite\ny\n/exit\n"
+        ),
+        output_stream=output,
+        keychain=keychain,
+    )
+
+    assert code == 0
+    text = output.getvalue()
+    assert "Edit active source connection" in text
+    assert "current connection remains active" in text
+    assert "Review connection changes" in text
+    assert "Change the active connection? [y/N]" in text
+    assert "Connection updated for Edited SQLite" in text
+    assert "previous source identity was detached" in text
+    assert "Started a new conversation to keep connection context isolated" in text
+    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    try:
+        active = await reopened.active_source()
+        assert active is not None
+        assert active.display_name == "Edited SQLite"
+        assert active.configuration["path"] == str(edited)
+        old = next(
+            source
+            for source in await reopened.list_sources()
+            if source.id == current_source_id
+        )
+        assert not old.active
+    finally:
+        await reopened.close()
+
+
+async def test_source_edit_review_rejection_keeps_active_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keychain = _Keychain()
+    current_path, current_source_id = await _ready_agent(tmp_path, keychain)
+    edited = tmp_path / "edited.sqlite"
+    _database(edited, "records")
+    provider = MockModelProvider((), provider_id="openai:test-model")
+    _install_provider(monkeypatch, provider)
+    output = io.StringIO()
+
+    code = await run_terminal_application(
+        root=tmp_path,
+        input_stream=io.StringIO(
+            f"/source edit\ny\n{edited}\nEdited SQLite\nNO\n/exit\n"
+        ),
+        output_stream=output,
+        keychain=keychain,
+    )
+
+    assert code == 0
+    assert "Active source connection was not changed" in output.getvalue()
+    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    try:
+        active = await reopened.active_source()
+        assert active is not None and active.id == current_source_id
+        assert active.configuration["path"] == str(current_path)
+        assert await reopened.list_sources() == (active,)
+    finally:
+        await reopened.close()
 
 
 async def test_source_use_and_one_question_override_are_local_and_persisted(
@@ -760,7 +961,8 @@ async def test_failed_source_refresh_preserves_previous_committed_catalog(
     )
 
     assert code == 0
-    assert "without replacing committed catalog truth" in output.getvalue()
+    assert "existing catalog is still available" in output.getvalue()
+    assert "Check that the source is available" in output.getvalue()
     assert "records" in output.getvalue()
     reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
     try:

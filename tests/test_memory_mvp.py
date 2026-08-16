@@ -2,7 +2,7 @@ import asyncio
 import os
 import sqlite3
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -27,8 +27,9 @@ from daita.memory import (
     MemoryStore,
     MemoryValidationError,
 )
+from daita.storage.sqlite_migrations import migration_rows
 
-NOW = datetime(2026, 7, 22, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 22, tzinfo=UTC)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -359,19 +360,27 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
             )
         }
         assert tables == {
+            "database_write_receipts",
             "learning_candidates",
             "messages",
             "metadata",
+            "postgresql_update_scopes",
             "runs",
             "semantic_annotations",
             "snapshots",
+            "source_read_scopes",
             "sources",
+            "state_migrations",
             "syncs",
         }
         for table in tables:
-            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[
-                0
-            ] == (1 if table == "metadata" else 0)
+            expected_rows = 1 if table == "metadata" else 0
+            if table == "state_migrations":
+                expected_rows = len(migration_rows())
+            assert (
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                == expected_rows
+            )
 
 
 def test_exact_document_limits_are_fixed():

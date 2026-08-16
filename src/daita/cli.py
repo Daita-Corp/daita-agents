@@ -10,10 +10,11 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Protocol
 
 from . import (
     Agent,
@@ -40,6 +41,7 @@ from .artifacts.models import (
     artifact_destination_to_mapping,
     artifact_ref_to_mapping,
 )
+from .errors import StateCompatibilityError
 from .learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
     learning_candidate_content_to_mapping,
@@ -185,6 +187,21 @@ def build_parser() -> argparse.ArgumentParser:
     sources = commands.add_parser("sources", help="list attached sources")
     sources.add_argument("name")
 
+    readiness = commands.add_parser(
+        "postgresql-update-readiness",
+        help="inspect one resource and assignment-column update scope",
+    )
+    readiness.add_argument("name")
+    readiness.add_argument("source_id")
+    readiness.add_argument("resource_id")
+    readiness.add_argument(
+        "--assignment-column",
+        action="append",
+        dest="assignment_columns",
+        required=True,
+        help="exact catalog column proposed for assignment; repeat as needed",
+    )
+
     detach = commands.add_parser("detach", help="detach a source")
     detach.add_argument("name")
     detach.add_argument("source_id")
@@ -251,7 +268,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run one agent request")
     run.add_argument("name")
     run.add_argument("message")
-    run.add_argument("--model", required=True, help="provider:model")
+    run.add_argument(
+        "--model",
+        help="provider:model override for this invocation only",
+    )
     run.add_argument("--base-url")
     run.add_argument("--context-window", type=int)
     run.add_argument("--max-output", type=int)
@@ -1256,19 +1276,33 @@ async def _execute(args: argparse.Namespace) -> object:
         finally:
             await agent.close()
     if args.command == "run":
-        provider, profile = _model_configuration(
-            args.model,
-            base_url=args.base_url,
-            context_window=args.context_window,
-            max_output=args.max_output,
-        )
-        agent = await Agent.open(
-            args.name,
-            root=args.root,
-            model=provider,
-            model_profile=profile,
-            observer=_write_event_jsonl if args.events_jsonl else None,
-        )
+        if args.model is None and any(
+            value is not None
+            for value in (args.base_url, args.context_window, args.max_output)
+        ):
+            raise ValueError(
+                "--base-url, --context-window, and --max-output require --model"
+            )
+        if args.model is None:
+            agent = await Agent.open(
+                args.name,
+                root=args.root,
+                observer=_write_event_jsonl if args.events_jsonl else None,
+            )
+        else:
+            provider, profile = _model_configuration(
+                args.model,
+                base_url=args.base_url,
+                context_window=args.context_window,
+                max_output=args.max_output,
+            )
+            agent = await Agent.open(
+                args.name,
+                root=args.root,
+                model=provider,
+                model_profile=profile,
+                observer=_write_event_jsonl if args.events_jsonl else None,
+            )
         try:
             result = await agent.run(
                 args.message,
@@ -1364,6 +1398,19 @@ async def _execute(args: argparse.Namespace) -> object:
                 "source_id": registration.id,
                 "adapter": registration.adapter_id,
                 "name": registration.display_name,
+            }
+        if args.command == "postgresql-update-readiness":
+            readiness_result = await agent.postgresql_update_readiness(
+                args.source_id,
+                args.resource_id,
+                tuple(args.assignment_columns),
+            )
+            return {
+                "readiness": readiness_result.to_mapping(),
+                "guidance": (
+                    "Apply any role or grant remediation externally; Daita does "
+                    "not accept administrator credentials."
+                ),
             }
         if args.command == "memory":
             if args.memory_command == "read":
@@ -1551,6 +1598,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             file=sys.stderr,
         )
+        return 1
+    except StateCompatibilityError as error:
+        if args.command is None:
+            print("Daita could not open this local agent state.", file=sys.stderr)
+            print(file=sys.stderr)
+            print(str(error), file=sys.stderr)
+            print(file=sys.stderr)
+            print(f"State: {error.path}", file=sys.stderr)
+            print("Local data changed: no", file=sys.stderr)
+        else:
+            print(
+                json.dumps({"error": error.to_mapping()}, sort_keys=True),
+                file=sys.stderr,
+            )
         return 1
     except (ValueError, RuntimeError, OSError, ImportError) as error:
         print(json.dumps({"error": str(error)}), file=sys.stderr)

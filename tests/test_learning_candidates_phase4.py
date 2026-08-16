@@ -6,7 +6,7 @@ import json
 import sqlite3
 from collections import defaultdict
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -141,8 +141,8 @@ def _stored_candidate(index: int, *, agent_id: str = "agent-one"):
         catalog_revisions=(),
         candidate_fingerprint=digest,
         status=LearningCandidateStatus.AWAITING_REVIEW,
-        created_at=datetime(2026, 7, 28, tzinfo=timezone.utc),
-        updated_at=datetime(2026, 7, 28, tzinfo=timezone.utc),
+        created_at=datetime(2026, 7, 28, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 28, tzinfo=UTC),
     )
     stamp = LearningCandidateReviewStamp(
         run_id=run_id,

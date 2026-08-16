@@ -394,7 +394,7 @@ async def test_multi_select_space_toggles_and_untoggles_without_committing_empty
             )
         )
         pipe.send_text("  \r")
-        await asyncio.sleep(0.02)
+        await _wait_for_output(output, "Select at least one option.")
         assert not task.done()
         assert "Select at least one option." in output.text
         pipe.send_text("\x1b[B \r")
@@ -582,6 +582,82 @@ async def test_multi_select_numbered_fallback_rejects_more_than_32_choices():
     )
 
     assert selected == tuple(f"schema-{index}" for index in range(32, 0, -1))
+
+
+async def test_multi_select_bulk_matches_preserve_selection_across_filters_and_counts():
+    selected, output = await _enhanced_choices("beta\x01\x7f\x7f\x7f\x7fgamma\x01\r")
+
+    assert selected == ("beta-id", "gamma-id")
+    assert "Selected 0 of 3" in output.text
+
+
+async def test_multi_select_all_eligible_and_clear_actions_are_exact():
+    selected, output = await _enhanced_choices("\x05\x18 \r")
+
+    assert selected == ("alpha-id",)
+    assert "Selected 0 of 3" in output.text
+
+
+def test_multi_selection_state_reports_counts_and_preserves_bulk_filtered_sets():
+    state = terminal_selection._MultiSelectionState(
+        terminal_selection._normalize_options(_OPTIONS),
+        maximum=3,
+        empty_message="empty",
+        maximum_message="maximum",
+    )
+
+    state.filter_text = "beta"
+    state.select_all_matches()
+    assert state.selected_count == 1
+    state.filter_text = "gamma"
+    state.select_all_matches()
+    assert state.selected_count == 2
+    assert state.total_count == 3
+    assert state.selected_values() == ("beta-id", "gamma-id")
+    state.select_all()
+    assert state.selected_count == 3
+    state.clear_selection()
+    assert state.selected_count == 0
+
+
+async def test_multi_select_fallback_accepts_ranges_and_all():
+    options = tuple(
+        SelectionOption(f"resource-{index}", f"Resource {index}")
+        for index in range(1, 6)
+    )
+
+    ranged = await select_many(
+        "Resources",
+        options,
+        input_stream=io.StringIO("1-2,4\n"),
+        output_stream=io.StringIO(),
+        maximum=5,
+    )
+    all_selected = await select_many(
+        "Resources",
+        options,
+        input_stream=io.StringIO("all\n"),
+        output_stream=io.StringIO(),
+        maximum=5,
+    )
+
+    assert ranged == ("resource-1", "resource-2", "resource-4")
+    assert all_selected == tuple(f"resource-{index}" for index in range(1, 6))
+
+
+def test_selector_admits_complete_product_bound_and_never_truncates():
+    admitted = tuple(
+        SelectionOption(index, f"Resource {index}") for index in range(10_000)
+    )
+
+    displayed = terminal_selection._normalize_options(admitted)
+
+    assert len(displayed) == 10_000
+    assert displayed[-1].value == 9_999
+    with pytest.raises(ValueError, match="at most 10000"):
+        terminal_selection._normalize_options(
+            (*admitted, SelectionOption(10_000, "Too many"))
+        )
 
 
 async def test_multi_select_import_failure_propagates_installation_error(

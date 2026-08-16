@@ -9,7 +9,7 @@ import stat
 import time as time_module
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from importlib import import_module
@@ -408,7 +408,7 @@ class ExactXlsxProvenance:
         object.__setattr__(
             self,
             "created_at",
-            self.created_at.astimezone(timezone.utc).replace(microsecond=0),
+            self.created_at.astimezone(UTC).replace(microsecond=0),
         )
 
 
@@ -1201,10 +1201,7 @@ def _unsafe_zip_name(value: str) -> bool:
 
 def _utc_z(value: datetime) -> str:
     return (
-        value.astimezone(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
+        value.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     )
 
 

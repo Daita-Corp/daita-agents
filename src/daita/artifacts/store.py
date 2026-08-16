@@ -10,7 +10,7 @@ import re
 import stat
 import threading
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import NoReturn, Protocol
@@ -42,7 +42,7 @@ _COMMIT_TIMEOUT_SECONDS = 30.0
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _new_id(prefix: str) -> str:

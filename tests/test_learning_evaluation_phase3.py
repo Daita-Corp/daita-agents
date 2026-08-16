@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Mapping
 
 import pytest
 
@@ -34,7 +33,7 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.observation import AgentEvent, AgentEventKind
 
-NOW = datetime(2026, 7, 28, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 28, 12, tzinfo=UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,7 +400,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         clock=lambda: NOW,
     )
     learned_lifecycle_start = len(events)
-    teaching_exit = await teaching_agent.run(
+    teaching_exit = await teaching_agent.learn(
         "When we say paid contribution margin, use line total minus quantity times "
         "unit cost for paid orders, report by region and currency, and never compare "
         "currencies without conversion.",
@@ -553,7 +552,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
     )
     denied_baseline_events = tuple(events[denied_baseline_start:])
     denied_learned_start = len(events)
-    denied_teaching = await denied_agent.run(
+    denied_teaching = await denied_agent.learn(
         "When we say paid contribution margin, use the durable paid-order formula.",
         source_id=denied_source.id,
     )

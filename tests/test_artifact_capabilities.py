@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -611,7 +611,7 @@ async def test_hosted_composition_does_not_project_local_delivery_tools_or_paths
             id="run-hosted",
             agent_id="agent-hosted",
             message="Create a file.",
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         ),
         (
             CanonicalMessage(

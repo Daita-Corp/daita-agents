@@ -1,5 +1,5 @@
 from dataclasses import FrozenInstanceError, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -41,7 +41,7 @@ from daita.llm.providers.openai_compatible import (
 from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from daita.storage.sqlite import SQLiteStateStore
 
-NOW = datetime(2026, 7, 26, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 26, tzinfo=UTC)
 
 
 def _complete(

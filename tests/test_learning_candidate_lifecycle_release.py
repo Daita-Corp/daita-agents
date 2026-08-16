@@ -6,7 +6,7 @@ import sqlite3
 import threading
 from collections import defaultdict
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -16,7 +16,7 @@ from daita import (
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
 )
-from daita.hosting.embedded import AgentHomeError
+from daita.hosting.embedded import AgentHomeError, EmbeddedAgent
 from daita.learning_candidates import (
     LearningCandidate,
     LearningCandidateAction,
@@ -256,7 +256,7 @@ async def test_semantic_acceptance_projects_only_its_exact_write_tool(tmp_path):
             resource_id=resource.id,
             revision=resource.current_revision,
         )
-        now = datetime(2026, 7, 29, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 29, tzinfo=UTC)
         candidate = LearningCandidate(
             id="candidate-semantic",
             agent_id=agent.id,
@@ -490,7 +490,7 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
         )
         foreground._cursor = 0
 
-        result = await agent.run(
+        result = await agent.learn(
             "Review, replace, and delete semantic definitions.",
             source_id=first_source.id,
         )
@@ -552,15 +552,17 @@ async def test_acceptance_fails_closed_when_loop_uses_a_different_runtime(tmp_pa
     reviewer = MockModelProvider(
         [_review_response("run-1", "Our fiscal year begins in February.")]
     )
-    agent = await Agent.create(
-        "candidate-custom-runtime",
-        root=tmp_path,
-        model=foreground,
-        model_profile=foreground.model_profile,
-        context_builder=_TranscriptContext(),
-        tools=_NoTools(),
-        reviewer_model=reviewer,
-        id_factory=_ids(),
+    agent = Agent(
+        await EmbeddedAgent.create(
+            "candidate-custom-runtime",
+            root=tmp_path,
+            model=foreground,
+            model_profile=foreground.model_profile,
+            context_builder=_TranscriptContext(),
+            tools=_NoTools(),
+            reviewer_model=reviewer,
+            id_factory=_ids(),
+        )
     )
     try:
         await agent.run("Remember that our fiscal year begins in February.")

@@ -1,6 +1,7 @@
 """Daita agent."""
 
 from .adapters import LocalDirectorySource, PostgreSQLSource, SQLiteSource
+from .adapters.postgresql_write import PostgreSQLUpdateReadiness
 from .agent import Agent
 from .artifacts import (
     ArtifactDeliveryReceipt,
@@ -84,6 +85,7 @@ __all__ = [
     "ModelRoute",
     "ModelRouteCandidate",
     "PostgreSQLSource",
+    "PostgreSQLUpdateReadiness",
     "RetryPolicy",
     "ResourceRevisionBinding",
     "SQLiteSource",

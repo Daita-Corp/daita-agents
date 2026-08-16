@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -15,7 +15,11 @@ from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
 )
-from .adapters.protocols import ResourceSource
+from .adapters.postgresql_write import PostgreSQLUpdateReadiness
+from .adapters.protocols import (
+    ResourceAdapterError as SourceRefreshError,
+    ResourceSource,
+)
 from .artifacts.models import (
     ArtifactDeliveryReceipt,
     ArtifactDestination,
@@ -39,6 +43,9 @@ from .hosting.embedded import (
     AgentNotFoundError,
     EmbeddedAgent,
     HostActiveError,
+    SourceEditConfirmationHandler,
+    SourceEditPreview as SourceEditPreview,
+    SourceEditResult,
     SourceSelectionError,
 )
 from .learning_candidates import (
@@ -52,7 +59,6 @@ from .llm.models import ModelProfile
 from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
-from .loop.driver import ContextBuilder, ToolRuntime
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
 from .observation import AgentObserver
 from .security import KeychainStore, SecretProvider, SecretReference
@@ -63,6 +69,11 @@ from .semantics import (
     SemanticKind,
 )
 from .skills import Skill, SkillSummary
+from .storage.sqlite_records import (
+    SourcePermissionsInspection,
+    SourcePermissionsPreview,
+    SourceReadMode,
+)
 
 
 class Agent:
@@ -102,8 +113,6 @@ class Agent:
         config: AgentConfig | None = None,
         model: ModelProvider | None = None,
         model_profile: ModelProfile | None = None,
-        context_builder: ContextBuilder | None = None,
-        tools: ToolRuntime | None = None,
         limits: LoopLimits | None = None,
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
@@ -125,8 +134,6 @@ class Agent:
                 config=config,
                 model=model,
                 model_profile=model_profile,
-                context_builder=context_builder,
-                tools=tools,
                 limits=limits,
                 clock=clock,
                 id_factory=id_factory,
@@ -151,8 +158,6 @@ class Agent:
         config: AgentConfig | None = None,
         model: ModelProvider | None = None,
         model_profile: ModelProfile | None = None,
-        context_builder: ContextBuilder | None = None,
-        tools: ToolRuntime | None = None,
         limits: LoopLimits | None = None,
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
@@ -174,8 +179,6 @@ class Agent:
                 config=config,
                 model=model,
                 model_profile=model_profile,
-                context_builder=context_builder,
-                tools=tools,
                 limits=limits,
                 clock=clock,
                 id_factory=id_factory,
@@ -273,6 +276,21 @@ class Agent:
         source_id: str | None = None,
     ) -> LoopExit:
         return await self._embedded.run(
+            message,
+            conversation_id=conversation_id,
+            source_id=source_id,
+        )
+
+    async def learn(
+        self,
+        message: str,
+        *,
+        conversation_id: str | None = None,
+        source_id: str | None = None,
+    ) -> LoopExit:
+        """Run one explicit user-authorized foreground learning action."""
+
+        return await self._embedded.learn(
             message,
             conversation_id=conversation_id,
             source_id=source_id,
@@ -486,6 +504,21 @@ class Agent:
     async def attach(self, source: ResourceSource) -> SourceRegistration:
         return await self._embedded.attach(source)
 
+    async def edit_source(
+        self,
+        source_id: str,
+        source: ResourceSource,
+        *,
+        confirmation_handler: SourceEditConfirmationHandler,
+    ) -> SourceEditResult | None:
+        """Validate, review, and atomically edit one active source connection."""
+
+        return await self._embedded.edit_source(
+            source_id,
+            source,
+            confirmation_handler=confirmation_handler,
+        )
+
     async def attach_sqlite(
         self,
         path: str | Path,
@@ -494,6 +527,21 @@ class Agent:
     ) -> SourceRegistration:
         return await self._embedded.attach_sqlite(path, name=name)
 
+    async def edit_sqlite_source(
+        self,
+        source_id: str,
+        path: str | Path,
+        *,
+        confirmation_handler: SourceEditConfirmationHandler,
+        name: str | None = None,
+    ) -> SourceEditResult | None:
+        return await self._embedded.edit_sqlite_source(
+            source_id,
+            path,
+            confirmation_handler=confirmation_handler,
+            name=name,
+        )
+
     async def attach_local_directory(
         self,
         root: str | Path,
@@ -501,6 +549,41 @@ class Agent:
         name: str | None = None,
     ) -> SourceRegistration:
         return await self._embedded.attach_local_directory(root, name=name)
+
+    async def edit_local_directory_source(
+        self,
+        source_id: str,
+        root: str | Path,
+        *,
+        confirmation_handler: SourceEditConfirmationHandler,
+        name: str | None = None,
+        max_depth: int = 8,
+        max_files: int = 1_000,
+        max_file_bytes: int = 2 * 1024 * 1024,
+        max_columns: int = 512,
+        max_rows: int = 100_000,
+        max_json_nodes: int = 500_000,
+        max_json_depth: int = 32,
+        max_key_bytes: int = 1_024,
+        max_string_bytes: int = 256 * 1024,
+        max_cell_bytes: int = 1024 * 1024,
+    ) -> SourceEditResult | None:
+        return await self._embedded.edit_local_directory_source(
+            source_id,
+            root,
+            confirmation_handler=confirmation_handler,
+            name=name,
+            max_depth=max_depth,
+            max_files=max_files,
+            max_file_bytes=max_file_bytes,
+            max_columns=max_columns,
+            max_rows=max_rows,
+            max_json_nodes=max_json_nodes,
+            max_json_depth=max_json_depth,
+            max_key_bytes=max_key_bytes,
+            max_string_bytes=max_string_bytes,
+            max_cell_bytes=max_cell_bytes,
+        )
 
     async def store_postgresql_password(self, password: str) -> SecretReference:
         return await self._embedded.store_postgresql_password(password)
@@ -542,6 +625,8 @@ class Agent:
         ssl_mode: str = "require",
         name: str | None = None,
     ) -> SourceRegistration:
+        """Attach PostgreSQL with all reads and zero exact update scopes."""
+
         return await self._embedded.attach_postgresql(
             host=host,
             database=database,
@@ -551,6 +636,131 @@ class Agent:
             port=port,
             ssl_mode=ssl_mode,
             name=name,
+        )
+
+    async def edit_postgresql_source(
+        self,
+        source_id: str,
+        *,
+        host: str,
+        database: str,
+        username: str,
+        credential: SecretReference,
+        schemas: tuple[str, ...],
+        confirmation_handler: SourceEditConfirmationHandler,
+        port: int = 5432,
+        ssl_mode: str = "require",
+        name: str | None = None,
+    ) -> SourceEditResult | None:
+        """Edit PostgreSQL with a reviewed atomic connection handoff."""
+
+        return await self._embedded.edit_postgresql_source(
+            source_id,
+            host=host,
+            database=database,
+            username=username,
+            credential=credential,
+            schemas=schemas,
+            confirmation_handler=confirmation_handler,
+            port=port,
+            ssl_mode=ssl_mode,
+            name=name,
+        )
+
+    async def inspect_source_permissions(
+        self,
+        source_id: str,
+    ) -> SourcePermissionsInspection:
+        """Return exact scopes and safe complete-catalog permission choices."""
+
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        return await self._embedded.inspect_source_permissions(source_id)
+
+    async def preview_source_permissions(
+        self,
+        *,
+        source_id: str,
+        read_mode: SourceReadMode | str,
+        read_resource_ids: tuple[str, ...],
+        postgresql_update_scopes: Mapping[str, Sequence[str]],
+    ) -> SourcePermissionsPreview:
+        """Preview one exact final scope state without changing durable state."""
+
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        if isinstance(read_mode, str):
+            try:
+                read_mode = SourceReadMode(read_mode)
+            except ValueError:
+                raise ValueError("read_mode must be all, selected, or none") from None
+        if not isinstance(read_mode, SourceReadMode):
+            raise TypeError("read_mode must be SourceReadMode or string")
+        if not isinstance(read_resource_ids, tuple) or any(
+            not isinstance(resource_id, str) or not resource_id
+            for resource_id in read_resource_ids
+        ):
+            raise TypeError("read_resource_ids must be a tuple of non-empty strings")
+        if not isinstance(postgresql_update_scopes, Mapping):
+            raise TypeError("postgresql_update_scopes must be a mapping")
+        normalized_updates: dict[str, tuple[str, ...]] = {}
+        for resource_id, columns in postgresql_update_scopes.items():
+            if not isinstance(resource_id, str) or not resource_id:
+                raise ValueError("update scope resource ids must be non-empty strings")
+            if isinstance(columns, (str, bytes)) or not isinstance(
+                columns,
+                (list, tuple),
+            ):
+                raise TypeError("update scope columns must be lists or tuples")
+            normalized = tuple(columns)
+            if any(not isinstance(column, str) or not column for column in normalized):
+                raise TypeError("update scope columns must be non-empty strings")
+            normalized_updates[resource_id] = normalized
+        return await self._embedded.preview_source_permissions(
+            source_id=source_id,
+            read_mode=read_mode,
+            read_resource_ids=read_resource_ids,
+            postgresql_update_scopes=normalized_updates,
+        )
+
+    async def apply_source_permissions(
+        self,
+        *,
+        source_id: str,
+        confirmation_fingerprint: str,
+    ) -> SourcePermissionsInspection:
+        """Apply one exact confirmed preview after locked current-state checks."""
+
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        if not isinstance(confirmation_fingerprint, str) or not (
+            confirmation_fingerprint.startswith("sha256:")
+            and len(confirmation_fingerprint) == 71
+        ):
+            raise ValueError("confirmation_fingerprint must be a sha256 fingerprint")
+        return await self._embedded.apply_source_permissions(
+            source_id=source_id,
+            confirmation_fingerprint=confirmation_fingerprint,
+        )
+
+    async def postgresql_update_readiness(
+        self,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> PostgreSQLUpdateReadiness:
+        """Return bounded non-mutating readiness for one exact update scope."""
+
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        if not isinstance(resource_id, str) or not resource_id:
+            raise ValueError("resource_id must be a non-empty string")
+        if not isinstance(assignment_columns, tuple):
+            raise TypeError("assignment_columns must be a tuple")
+        return await self._embedded.postgresql_update_readiness(
+            source_id,
+            resource_id,
+            assignment_columns,
         )
 
     async def detach(self, source_id: str) -> SourceRegistration:
@@ -626,6 +836,7 @@ __all__ = [
     "HostActiveError",
     "PostgreSQLProbeResult",
     "PostgreSQLSourceError",
+    "SourceRefreshError",
     "SourceSelectionError",
     "CatalogSummary",
 ]

@@ -6,7 +6,7 @@ import base64
 import inspect
 import io
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -203,7 +203,7 @@ def _event(
 ) -> AgentEvent:
     return AgentEvent(
         kind=kind,
-        occurred_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+        occurred_at=datetime(2026, 7, 23, tzinfo=UTC),
         run_id=run_id,
         conversation_id=conversation_id,
         data=FrozenJsonObject.from_mapping(data),
@@ -236,7 +236,7 @@ def _tool_transcript(
             id=run_id,
             agent_id="agent-one",
             message="question",
-            created_at=datetime(2026, 7, 23, tzinfo=timezone.utc),
+            created_at=datetime(2026, 7, 23, tzinfo=UTC),
             conversation_id="conversation-one",
         ),
         messages=(
@@ -5242,6 +5242,7 @@ def test_tui_command_output_is_captured_without_leaking_above_the_shell():
         "/source",
         "/source use",
         "/source add",
+        "/source permissions",
         "/memory edit",
         "/review",
         "/user edit",
@@ -5868,8 +5869,10 @@ async def test_slash_completion_covers_the_documented_surface_and_remains_local(
         "/source",
         "/source use <name>",
         "/source add",
+        "/source edit",
         "/source refresh <id>",
         "/source detach <source>",
+        "/source permissions",
         "/catalog",
         "/settings",
         "/new",

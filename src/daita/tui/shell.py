@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TextIO
 
-from ..capabilities import ApprovalRequest
+from ..capabilities import (
+    MAX_APPROVAL_DOCUMENT_CHARACTERS,
+    ApprovalRequest,
+    render_approval_arguments,
+)
 from .capabilities import (
     MAX_RENDER_WIDTH as _MAX_RENDER_WIDTH,
     MIN_USABLE_COLUMNS as _MIN_USABLE_COLUMNS,
@@ -29,20 +32,23 @@ from .text import (
 )
 from .tool_view import _SENSITIVE_KEY_PARTS
 
-MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
-
-
 _SLASH_COMMAND_COMPLETIONS = (
     ("/model", "/model", "Choose or validate the active model"),
     ("/sources", "/sources", "List registered data sources"),
     ("/source", "/source", "Choose the active query source"),
     ("/source use ", "/source use <name>", "Use a source for new conversations"),
     ("/source add", "/source add", "Add a data source"),
+    ("/source edit", "/source edit", "Edit the active source connection"),
     ("/source refresh ", "/source refresh <id>", "Refresh a source catalog"),
     (
         "/source detach ",
         "/source detach <source>",
         "Detach a source and delete its Daita-owned credential",
+    ),
+    (
+        "/source permissions",
+        "/source permissions",
+        "Configure read and PostgreSQL update access",
     ),
     ("/catalog", "/catalog", "Show the current catalog summary"),
     ("/settings", "/settings", "Show agent and model settings"),
@@ -76,7 +82,7 @@ _SLASH_COMMAND_COMPLETIONS = (
     ("/status", "/status", "Show current agent status"),
     ("/conversation", "/conversation", "Show the current conversation ID"),
     ("/agent delete", "/agent delete", "Permanently delete this agent"),
-    ("/help", "/help", "Show command help"),
+    ("/help", "/help", "Show controls and usage help"),
     ("/exit", "/exit", "Exit Daita"),
 )
 _SLASH_COMMAND_SURFACE = tuple(
@@ -527,14 +533,8 @@ def _approval_panel_for_request(
     arguments = request.arguments.to_dict()
     if _contains_sensitive_key(arguments):
         return None
-    rendered = json.dumps(
-        arguments,
-        ensure_ascii=True,
-        allow_nan=False,
-        indent=2,
-        sort_keys=True,
-    )
-    if len(rendered) > MAX_APPROVAL_DOCUMENT_CHARACTERS:
+    rendered = render_approval_arguments(arguments)
+    if rendered is None:
         return None
     return ApprovalPanelState(
         tool_name=_sanitize_terminal_text(

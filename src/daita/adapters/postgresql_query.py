@@ -21,7 +21,7 @@ from ..artifacts.renderers import (
     ExactXlsxRenderer,
 )
 from ..domains.data.capabilities import PostgreSQLReadResult
-from ..domains.data.controller import CatalogSchemaReader
+from ..domains.data.controller import ReadScopedCatalogReader
 from ..domains.data.export_capabilities import (
     ExactTabularExportResult,
     ExactTabularProgress,
@@ -31,6 +31,7 @@ from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_postgresql_read
 from ..errors import PluginError
 from ..security import SecretProvider, default_secret_provider
+from ..storage.sqlite_records import SourcePermissionStateError
 from .postgresql import (
     _DEFAULT_MAX_COLUMNS,
     _DEFAULT_MAX_INDEXES,
@@ -69,7 +70,7 @@ class PostgreSQLQueryBackend:
     def __init__(
         self,
         sources: SourceStore,
-        catalog: CatalogSchemaReader,
+        catalog: ReadScopedCatalogReader,
         secret_provider: SecretProvider | None = None,
         *,
         statement_timeout_seconds: float = 5.0,
@@ -77,8 +78,9 @@ class PostgreSQLQueryBackend:
     ) -> None:
         if not isinstance(sources, SourceStore):
             raise TypeError("sources must implement SourceStore")
-        if not callable(getattr(catalog, "resource_schemas", None)):
-            raise TypeError("catalog must provide resource_schemas")
+        for method_name in ("resource_schemas", "readable_resource_ids"):
+            if not callable(getattr(catalog, method_name, None)):
+                raise TypeError(f"catalog must provide {method_name}")
         provider = default_secret_provider(secret_provider)
         if not isinstance(provider, SecretProvider):
             raise TypeError("secret_provider must implement SecretProvider")
@@ -139,13 +141,29 @@ class PostgreSQLQueryBackend:
                 "The selected source is not a PostgreSQL source.",
             )
         resources = await self._catalog.resource_schemas(agent_id, source_id)
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError:
+            raise PostgreSQLQueryError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from None
         validation = validate_postgresql_read(
             sql,
             source_id=source_id,
             resources=resources,
             parameters=parameters,
+            allowed_resource_ids=readable,
         )
         if not validation.valid or validation.analysis is None:
+            if "resource_out_of_scope" in validation.issue_codes:
+                raise PostgreSQLQueryError(
+                    "resource_read_not_allowed",
+                    "One or more requested resources are not available for reading.",
+                )
             codes = ",".join(validation.issue_codes[:8]) or "invalid_sql"
             raise PostgreSQLQueryError(
                 "query_revalidation_failed",
@@ -314,13 +332,29 @@ class PostgreSQLQueryBackend:
                 "The selected source is not a PostgreSQL source.",
             )
         resources = await self._catalog.resource_schemas(agent_id, source_id)
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError:
+            raise PostgreSQLQueryError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from None
         validation = validate_postgresql_read(
             sql,
             source_id=source_id,
             resources=resources,
             parameters=parameters,
+            allowed_resource_ids=readable,
         )
         if not validation.valid or validation.analysis is None:
+            if "resource_out_of_scope" in validation.issue_codes:
+                raise PostgreSQLQueryError(
+                    "resource_read_not_allowed",
+                    "One or more requested resources are not available for reading.",
+                )
             codes = ",".join(validation.issue_codes[:8]) or "invalid_sql"
             raise PostgreSQLQueryError(
                 "query_revalidation_failed",

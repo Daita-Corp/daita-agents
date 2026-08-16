@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -14,6 +15,8 @@ from .artifacts.models import ArtifactDraft
 from .llm.models import ToolDefinition
 
 _T = TypeVar("_T")
+
+MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
 
 
 def _text(value: str, name: str) -> None:
@@ -55,9 +58,27 @@ class ApprovalRequest:
             FrozenJsonObject.from_mapping(self.arguments),
         )
 
+    def render_arguments_for_review(self) -> str | None:
+        return render_approval_arguments(self.arguments.to_dict())
+
 
 class ApprovalHandler(Protocol):
     async def __call__(self, request: ApprovalRequest) -> ApprovalDecision: ...
+
+
+def render_approval_arguments(arguments: Mapping[str, object]) -> str | None:
+    """Render one exact, terminal-safe approval document within its fixed bound."""
+
+    rendered = json.dumps(
+        FrozenJsonObject.from_mapping(arguments).to_dict(),
+        ensure_ascii=True,
+        allow_nan=False,
+        indent=2,
+        sort_keys=True,
+    )
+    if len(rendered) > MAX_APPROVAL_DOCUMENT_CHARACTERS:
+        return None
+    return rendered
 
 
 class CapabilityInputError(ValueError):
@@ -177,16 +198,14 @@ class Capability:
 class ToolApplicability:
     source_adapter_ids: tuple[str, ...] = ()
     minimum_active_sources: int = 0
-    required_configuration_flags: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("source_adapter_ids", "required_configuration_flags"):
-            values = tuple(getattr(self, name))
-            if any(not isinstance(value, str) or not value for value in values):
-                raise ValueError(f"{name} must contain non-empty strings")
-            if len(values) != len(set(values)):
-                raise ValueError(f"{name} cannot contain duplicates")
-            object.__setattr__(self, name, values)
+        source_adapter_ids = tuple(self.source_adapter_ids)
+        if any(not isinstance(value, str) or not value for value in source_adapter_ids):
+            raise ValueError("source_adapter_ids must contain non-empty strings")
+        if len(source_adapter_ids) != len(set(source_adapter_ids)):
+            raise ValueError("source_adapter_ids cannot contain duplicates")
+        object.__setattr__(self, "source_adapter_ids", source_adapter_ids)
         if (
             not isinstance(self.minimum_active_sources, int)
             or isinstance(self.minimum_active_sources, bool)
@@ -216,12 +235,14 @@ class ToolView:
 @dataclass(frozen=True, slots=True)
 class ToolExecution:
     run_id: str
+    call_id: str
     capability_id: str
     arguments: Mapping[str, object] = field(default_factory=dict)
     conversation_id: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.run_id, "tool run_id")
+        _text(self.call_id, "tool call_id")
         _text(self.capability_id, "tool capability_id")
         if self.conversation_id is not None:
             _text(self.conversation_id, "tool conversation_id")
@@ -601,10 +622,12 @@ __all__ = [
     "CapabilityRegistry",
     "Executor",
     "ExtensionDeclarations",
+    "MAX_APPROVAL_DOCUMENT_CHARACTERS",
     "SideEffectExecutor",
     "ToolApplicability",
     "ToolExecution",
     "ToolOutput",
     "ToolOutputValidationError",
     "ToolView",
+    "render_approval_arguments",
 ]

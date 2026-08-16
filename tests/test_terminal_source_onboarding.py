@@ -135,6 +135,52 @@ async def test_terminal_onboards_local_sources_and_renders_polished_ready_screen
         await reopened.close()
 
 
+async def test_postgresql_post_attach_yes_reuses_permission_flow_with_source_selected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keychain = _Keychain()
+    agent = await _configured_agent(tmp_path, keychain)
+    calls: list[dict[str, object]] = []
+
+    async def fake_probe(self: Agent, **kwargs: Any) -> PostgreSQLProbeResult:
+        del self, kwargs
+        return PostgreSQLProbeResult.build((("analytics", True),))
+
+    async def fake_attach(self: Agent, **kwargs: Any):
+        del self, kwargs
+        return SimpleNamespace(
+            id="source:sha256:" + "a" * 64,
+            display_name="Warehouse",
+        )
+
+    async def fake_permissions(permission_agent: Agent, **kwargs: Any) -> None:
+        assert permission_agent is agent
+        calls.append(dict(kwargs))
+
+    monkeypatch.setattr(Agent, "probe_postgresql", fake_probe)
+    monkeypatch.setattr(Agent, "attach_postgresql", fake_attach)
+    monkeypatch.setattr(terminal, "_configure_source_permissions", fake_permissions)
+    output = io.StringIO()
+    try:
+        attached = await terminal._onboard_source(
+            agent,
+            input_stream=io.StringIO(
+                "3\n2\nWarehouse\ndb.example.test\n5432\nwarehouse\nreader\n\n1\ny\n"
+            ),
+            output_stream=output,
+            hidden_input=lambda _prompt: "database-secret",
+        )
+    finally:
+        await agent.close()
+
+    assert attached.id == "source:sha256:" + "a" * 64
+    assert len(calls) == 1
+    assert calls[0]["preselected_source_id"] == attached.id
+    assert calls[0]["preselected_section"] == "write"
+    assert "Source attached and cataloged with read access" in output.getvalue()
+
+
 async def test_terminal_postgresql_probe_selects_only_requested_schemas(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -185,6 +231,7 @@ async def test_terminal_postgresql_probe_selects_only_requested_schemas(
     assert "analytics, reporting" in text
     assert "Connection validated" in text
     assert "more than 100 schemas exist; showing the first 100" in text
+    assert "Configure PostgreSQL update access now? [y/N]" in text
     assert "Schemas selected" in text
     assert "Discovering tables and relationships" in text
     assert "Stage 4 status" not in text
@@ -214,6 +261,16 @@ def test_postgresql_connection_url_parser_normalizes_supported_fields():
         None,
         "require",
     )
+
+
+def test_source_edit_command_uses_prompt_path_and_slash_completion() -> None:
+    assert terminal._command_uses_terminal_prompts("/source edit") is True
+    assert "/source edit" in {
+        display
+        for _insertion, display, _description in (
+            terminal.terminal_tui._SLASH_COMMAND_COMPLETIONS
+        )
+    }
 
 
 @pytest.mark.parametrize(
@@ -380,6 +437,84 @@ async def test_terminal_postgresql_url_without_password_prompts_for_password(
     assert len(attached) == 1
     reference = attached[0]["credential"]
     assert keychain.values[reference.name] == "separate-password"
+
+
+async def test_postgresql_source_edit_rejection_redacts_and_removes_new_credential(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keychain = _Keychain()
+    agent = await _configured_agent(tmp_path, keychain)
+    old_reference = await agent.store_postgresql_password("old-database-secret")
+    credentials_before_edit = dict(keychain.values)
+    source = SimpleNamespace(
+        id="source:sha256:" + "a" * 64,
+        adapter_id="postgresql",
+        display_name="Warehouse",
+        configuration={
+            "host": "db.example.test",
+            "port": 5432,
+            "database": "warehouse",
+            "username": "reader",
+            "schemas": ("analytics",),
+            "ssl_mode": "require",
+            "credential_ref": old_reference.to_uri(),
+        },
+    )
+    edit_calls: list[dict[str, Any]] = []
+
+    async def fake_probe(self: Agent, **kwargs: Any) -> PostgreSQLProbeResult:
+        del self, kwargs
+        return PostgreSQLProbeResult.build((("analytics", True),))
+
+    async def fake_edit(
+        self: Agent,
+        source_id: str,
+        **kwargs: Any,
+    ) -> None:
+        del self
+        edit_calls.append({"source_id": source_id, **kwargs})
+        confirmed = await kwargs["confirmation_handler"](
+            SimpleNamespace(
+                resource_count=4,
+                relationship_count=1,
+                read_mode=SimpleNamespace(value="all"),
+                preserved_read_resource_count=4,
+                omitted_read_resources=(),
+                adapter_id="postgresql",
+            )
+        )
+        assert confirmed is False
+        return None
+
+    monkeypatch.setattr(Agent, "probe_postgresql", fake_probe)
+    monkeypatch.setattr(Agent, "edit_postgresql_source", fake_edit)
+    output = io.StringIO()
+    try:
+        result = await terminal._edit_postgresql_connection(
+            agent,
+            source,
+            input_stream=io.StringIO("2\n\n\n\n\nwriter\n\n1\nNO\n"),
+            output_stream=output,
+            hidden_input=lambda _prompt: "new-database-secret",
+        )
+    finally:
+        await agent.close()
+
+    assert result is None
+    assert len(edit_calls) == 1
+    assert edit_calls[0]["username"] == "writer"
+    new_reference = edit_calls[0]["credential"]
+    assert isinstance(new_reference, SecretReference)
+    assert new_reference != old_reference
+    assert keychain.values == credentials_before_edit
+    rendered = output.getvalue()
+    assert "reader@db.example.test:5432/warehouse" in rendered
+    assert "writer@db.example.test:5432/warehouse" in rendered
+    assert "new-database-secret" not in rendered
+    assert "old-database-secret" not in rendered
+    assert "credential_ref" not in rendered
+    assert "keychain://" not in rendered
 
 
 async def test_enhanced_postgresql_schema_toggling_attaches_stable_names_only(

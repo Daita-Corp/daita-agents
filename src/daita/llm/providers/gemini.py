@@ -6,7 +6,7 @@ import asyncio
 import base64
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Protocol, cast
 from uuid import uuid4
@@ -64,7 +64,7 @@ def _new_id(prefix: str) -> str:
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class GeminiProvider:

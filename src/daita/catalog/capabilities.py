@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
+from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
     Capability,
@@ -32,11 +34,11 @@ from .models import (
     CATALOG_TRAVERSAL_MAX_RESOURCE_IDS,
     CatalogSchemaRequest,
     CatalogSearchRequest,
+    CatalogSearchResult,
     CatalogTraversalRequest,
     RelationshipKind,
     ResourceKind,
 )
-from .service import CatalogService
 
 CATALOG_SEARCH_CAPABILITY_ID = "catalog.search"
 CATALOG_SCHEMA_CAPABILITY_ID = "catalog.schema"
@@ -55,10 +57,27 @@ class CatalogDeclarations:
     tool_views: tuple[ToolView, ...]
 
 
+class CatalogProjection(Protocol):
+    async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult: ...
+
+    async def inspect_resource(
+        self,
+        agent_id: str,
+        resource_id: str,
+    ) -> FrozenJsonObject: ...
+
+    async def schema_slice(self, request: CatalogSchemaRequest) -> FrozenJsonObject: ...
+
+    async def traverse(
+        self,
+        request: CatalogTraversalRequest,
+    ) -> FrozenJsonObject: ...
+
+
 class CatalogSearchExecutor:
     executor_id = "catalog.search.executor"
 
-    def __init__(self, agent_id: str, service: CatalogService) -> None:
+    def __init__(self, agent_id: str, service: CatalogProjection) -> None:
         self._agent_id = agent_id
         self._service = service
 
@@ -108,7 +127,7 @@ class CatalogSearchExecutor:
 class CatalogInspectExecutor:
     executor_id = "catalog.inspect.executor"
 
-    def __init__(self, agent_id: str, service: CatalogService) -> None:
+    def __init__(self, agent_id: str, service: CatalogProjection) -> None:
         self._agent_id = agent_id
         self._service = service
 
@@ -127,7 +146,7 @@ class CatalogInspectExecutor:
 class CatalogSchemaExecutor:
     executor_id = "catalog.schema.executor"
 
-    def __init__(self, agent_id: str, service: CatalogService) -> None:
+    def __init__(self, agent_id: str, service: CatalogProjection) -> None:
         self._agent_id = agent_id
         self._service = service
 
@@ -172,7 +191,7 @@ class CatalogSchemaExecutor:
 class CatalogTraverseExecutor:
     executor_id = "catalog.traverse.executor"
 
-    def __init__(self, agent_id: str, service: CatalogService) -> None:
+    def __init__(self, agent_id: str, service: CatalogProjection) -> None:
         self._agent_id = agent_id
         self._service = service
 
@@ -218,7 +237,7 @@ class CatalogTraverseExecutor:
 
 def catalog_declarations(
     agent_id: str,
-    service: CatalogService,
+    service: CatalogProjection,
 ) -> CatalogDeclarations:
     search_executor = CatalogSearchExecutor(agent_id, service)
     schema_executor = CatalogSchemaExecutor(agent_id, service)

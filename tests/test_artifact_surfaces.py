@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -153,7 +153,7 @@ async def test_public_save_has_no_overwrite_and_reports_final_collision_path(
 
 
 def _surface_records() -> tuple[ArtifactRef, ArtifactDeliveryReceipt, LoopExit]:
-    now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 1, tzinfo=UTC)
     ref = ArtifactRef(
         artifact_id="artifact-00000000000000000000000000000001",
         run_id="run-00000000000000000000000000000001",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Protocol, cast
 
@@ -58,7 +58,7 @@ from ...learning_candidates import (
     candidate_matches_mutation_call,
 )
 from ...llm.models import MessageRole, ToolCall, ToolDefinition, ToolResultBlock
-from ...loop.models import RunInput, Transcript
+from ...loop.models import ClassifiedToolResultsCancelled, RunInput, Transcript
 from ...memory.capabilities import MEMORY_SET_CAPABILITY_ID, MEMORY_SET_TOOL_NAME
 from ...observation import (
     AgentEvent,
@@ -98,6 +98,7 @@ from ...skills.store import (
     SkillValidationError,
     validate_skill_name,
 )
+from ...storage.sqlite_records import SourcePermissionStateError
 from .export_capabilities import (
     ARTIFACT_CONVERT_CAPABILITY_ID,
     ARTIFACT_LIST_CAPABILITY_ID,
@@ -113,19 +114,23 @@ from .file_capabilities import (
     LOCAL_FILE_READ_CAPABILITY_ID,
     LOCAL_FILE_READ_EVIDENCE_KIND,
 )
-from .sql import ResourceSchema, validate_postgresql_read, validate_sqlite_read
+from .sql import (
+    PostgreSQLUpdateCommand,
+    PostgreSQLUpdateIntent,
+    ResourceSchema,
+    validate_postgresql_read,
+    validate_postgresql_update_intent,
+    validate_sqlite_read,
+)
 
 SQLITE_QUERY_CAPABILITY_ID = "data.sqlite.query"
 SQLITE_QUERY_EVIDENCE_KIND = "data.sqlite.query_result"
 POSTGRESQL_QUERY_CAPABILITY_ID = "data.postgresql.query"
 POSTGRESQL_QUERY_EVIDENCE_KIND = "data.postgresql.query_result"
-SQLITE_UPDATE_IMPACT_CAPABILITY_ID = "data.sqlite.update_impact"
-SQLITE_UPDATE_IMPACT_EVIDENCE_KIND = "data.sqlite.update_impact"
-SQLITE_UPDATE_IMPACT_TOOL_NAME = "data_preview_sqlite_update"
-SQLITE_UPDATE_CAPABILITY_ID = "data.sqlite.update"
-SQLITE_UPDATE_EVIDENCE_KIND = "data.sqlite.update_result"
-SQLITE_UPDATE_TOOL_NAME = "data_update_sqlite"
-
+POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID = "data.postgresql.update_impact"
+POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND = "data.postgresql.update_impact"
+POSTGRESQL_UPDATE_CAPABILITY_ID = "data.postgresql.update"
+POSTGRESQL_UPDATE_EVIDENCE_KIND = "data.postgresql.update_result"
 _MVP_CAPABILITIES = frozenset(
     {
         CATALOG_SEARCH_CAPABILITY_ID,
@@ -134,6 +139,8 @@ _MVP_CAPABILITIES = frozenset(
         CATALOG_TRAVERSE_CAPABILITY_ID,
         SQLITE_QUERY_CAPABILITY_ID,
         POSTGRESQL_QUERY_CAPABILITY_ID,
+        POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+        POSTGRESQL_UPDATE_CAPABILITY_ID,
         LOCAL_FILE_READ_CAPABILITY_ID,
         SKILL_VIEW_CAPABILITY_ID,
         SKILL_SAVE_CAPABILITY_ID,
@@ -165,25 +172,6 @@ _SEMANTIC_CAPABILITIES = frozenset(
 _EXACT_TABULAR_CAPABILITIES = frozenset(
     {SQLITE_TABULAR_EXPORT_CAPABILITY_ID, POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}
 )
-_SEMANTIC_MANAGEMENT_SIGNALS = (
-    "business meaning",
-    "correct the definition",
-    "define ",
-    "definition",
-    "explicit teaching request",
-    "learn ",
-    " means ",
-    "remember ",
-    "replace ",
-    "resource/field-scoped semantic annotation",
-    "semantic",
-    "should mean",
-    "supersede",
-    "teach ",
-    "teaching material:",
-    "we mean",
-    "when we say",
-)
 
 
 class CatalogSchemaReader(Protocol):
@@ -192,6 +180,24 @@ class CatalogSchemaReader(Protocol):
         agent_id: str,
         source_id: str,
     ) -> tuple[ResourceSchema, ...]: ...
+
+
+class ReadScopedCatalogReader(CatalogSchemaReader, Protocol):
+    async def readable_resource_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> frozenset[str]: ...
+
+
+class PostgreSQLUpdateCatalogReader(CatalogSchemaReader, Protocol):
+    async def postgresql_update_scope_issue(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> tuple[str, str] | None: ...
 
 
 class CatalogDataReader(CatalogSchemaReader, Protocol):
@@ -208,9 +214,28 @@ class CatalogDataReader(CatalogSchemaReader, Protocol):
     async def source_routing_facts(
         self,
         agent_id: str,
-        configuration_flags: tuple[str, ...],
         source_ids: tuple[str, ...] = (),
     ) -> tuple[Mapping[str, object], ...]: ...
+
+    async def readable_resource_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> frozenset[str]: ...
+
+    async def postgresql_update_scope_issue(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> tuple[str, str] | None: ...
+
+    async def postgresql_update_applicable_source_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> frozenset[str]: ...
 
     async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None: ...
 
@@ -278,12 +303,23 @@ class DataToolRuntime:
         self._approval_handler = approval_handler
         self._mutation_lock = mutation_lock or asyncio.Lock()
         self._observer = observer
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._transcripts = transcripts
         self._artifacts = artifacts
         self._artifact_delivery = artifact_delivery
         self._selected_learning_candidates: dict[str, LearningCandidate] = {}
         self._successful_learning_candidate_mutations: set[str] = set()
+        self._explicit_learning_runs: set[str] = set()
+
+    def select_explicit_learning_run(self, run_id: str) -> None:
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("explicit learning run_id must be non-empty text")
+        if self._explicit_learning_runs:
+            raise RuntimeError("explicit learning guard exceeds its live bound")
+        self._explicit_learning_runs.add(run_id)
+
+    def clear_explicit_learning_run(self, run_id: str) -> None:
+        self._explicit_learning_runs.discard(run_id)
 
     def select_learning_candidate(
         self,
@@ -358,7 +394,22 @@ class DataToolRuntime:
         for index, call in enumerate(calls):
             if self._is_side_effecting(call, projected):
                 await finish_reads()
-                results[index] = await self._execute_one(run, call, projected)
+                try:
+                    results[index] = await self._execute_one(run, call, projected)
+                except ClassifiedToolResultsCancelled as cancelled:
+                    if len(cancelled.results) != 1:
+                        raise RuntimeError(
+                            "one tool execution returned multiple classified results"
+                        ) from cancelled
+                    results[index] = cancelled.results[0]
+                    completed = results[: index + 1]
+                    if any(result is None for result in completed):
+                        raise RuntimeError(
+                            "classified cancellation left an incomplete result prefix"
+                        ) from cancelled
+                    raise ClassifiedToolResultsCancelled(
+                        cast(tuple[ToolResultBlock, ...], tuple(completed))
+                    ) from None
             else:
                 reads.append((index, call))
         await finish_reads()
@@ -422,6 +473,7 @@ class DataToolRuntime:
                 raise ValueError("tool execution identity changed")
             execution = ToolExecution(
                 run_id=run.id,
+                call_id=call.id,
                 capability_id=capability.id,
                 arguments=arguments,
                 conversation_id=run.conversation_id or run.id,
@@ -521,7 +573,7 @@ class DataToolRuntime:
             result = _exception_result(call, error)
         self._emit_tool_completed(run, call, result, started)
         if cancelled_after_mutation:
-            raise asyncio.CancelledError
+            raise ClassifiedToolResultsCancelled((result,))
         return result
 
     async def _commit_artifact_output(
@@ -859,6 +911,22 @@ class DataToolRuntime:
                 },
             )
         resources = await self._catalog.resource_schemas(run.agent_id, source_id)
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError:
+            raise ArtifactError(
+                "artifact_incomplete_export",
+                "Current source permission state no longer proves the exact export.",
+                {
+                    "reason": "permission_state_invalid",
+                    "completed_rows": draft.provenance.row_count or 0,
+                    "completed_columns": len(draft.provenance.columns),
+                    "completed_bytes": len(draft.content),
+                },
+            )
         validator = (
             validate_postgresql_read
             if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
@@ -869,6 +937,7 @@ class DataToolRuntime:
             source_id=source_id,
             resources=resources,
             parameters=parameters,
+            allowed_resource_ids=readable,
         )
         if (
             not validation.valid
@@ -1274,40 +1343,43 @@ class DataToolRuntime:
         selected_candidate: LearningCandidate | None,
     ) -> tuple[ToolResultBlock, bool]:
         async with self._mutation_lock:
-            try:
-                current = await side_effect.preflight(execution)
-                await self._validate_semantic_preflight(run, capability, current)
-            except asyncio.CancelledError:
-                raise
-            except (
-                CapabilityInputError,
-                SemanticDigestMismatchError,
-                SemanticNotFoundError,
-                SemanticValidationError,
-                SkillNotFoundError,
-                ArtifactError,
-            ):
-                return (
-                    _error(
-                        call,
-                        "state_changed",
-                        "The validated state changed while approval was pending.",
-                        {"capability_id": capability.id},
-                    ),
-                    False,
-                )
-            if not isinstance(current, FrozenJsonObject):
-                raise ValueError("side-effect preflight must return FrozenJsonObject")
-            if current != fingerprint:
-                return (
-                    _error(
-                        call,
-                        "state_changed",
-                        "The validated state changed while approval was pending.",
-                        {"capability_id": capability.id},
-                    ),
-                    False,
-                )
+            if capability.id != POSTGRESQL_UPDATE_CAPABILITY_ID:
+                try:
+                    current = await side_effect.preflight(execution)
+                    await self._validate_semantic_preflight(run, capability, current)
+                except asyncio.CancelledError:
+                    raise
+                except (
+                    CapabilityInputError,
+                    SemanticDigestMismatchError,
+                    SemanticNotFoundError,
+                    SemanticValidationError,
+                    SkillNotFoundError,
+                    ArtifactError,
+                ):
+                    return (
+                        _error(
+                            call,
+                            "state_changed",
+                            "The validated state changed while approval was pending.",
+                            {"capability_id": capability.id},
+                        ),
+                        False,
+                    )
+                if not isinstance(current, FrozenJsonObject):
+                    raise ValueError(
+                        "side-effect preflight must return FrozenJsonObject"
+                    )
+                if current != fingerprint:
+                    return (
+                        _error(
+                            call,
+                            "state_changed",
+                            "The validated state changed while approval was pending.",
+                            {"capability_id": capability.id},
+                        ),
+                        False,
+                    )
             candidate, execution_error, cancelled = await _execute_definitely(
                 side_effect,
                 execution,
@@ -1563,7 +1635,13 @@ class DataToolRuntime:
             )
         )
         facts = await self._catalog.semantic_resource_facts(agent_id, resource_ids)
-        return inspect_semantic_annotations(annotations, facts)
+        readable_fact_ids = {fact.resource_id for fact in facts}
+        readable_annotations = tuple(
+            annotation
+            for annotation in annotations
+            if set(annotation.subject.resource_ids) <= readable_fact_ids
+        )
+        return inspect_semantic_annotations(readable_annotations, facts)
 
     async def _semantic_annotation_issue(
         self,
@@ -1844,6 +1922,13 @@ class DataToolRuntime:
         )
         if source_scope_error is not None:
             return source_scope_error
+        read_scope_error = await self._validate_resource_read_scope(
+            run,
+            capability,
+            arguments,
+        )
+        if read_scope_error is not None:
+            return read_scope_error
         if capability.access_mode is AccessMode.WRITE:
             if (
                 capability.id
@@ -1855,15 +1940,18 @@ class DataToolRuntime:
                     SKILL_DELETE_CAPABILITY_ID,
                     ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
                     ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
+                    POSTGRESQL_UPDATE_CAPABILITY_ID,
                 }
                 and capability.side_effecting
             ):
-                return None
-            return (
-                "write_not_enabled",
-                "Write tools are not enabled in the MVP agent loop.",
-                {"capability_id": capability.id},
-            )
+                if capability.id != POSTGRESQL_UPDATE_CAPABILITY_ID:
+                    return None
+            else:
+                return (
+                    "write_not_enabled",
+                    "Write tools are not enabled in the MVP agent loop.",
+                    {"capability_id": capability.id},
+                )
         if capability.id == SKILL_VIEW_CAPABILITY_ID:
             name = arguments.get("name")
             try:
@@ -1961,6 +2049,15 @@ class DataToolRuntime:
         }:
             return await self._validate_sql(run, capability, arguments)
         if capability.id in {
+            POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+            POSTGRESQL_UPDATE_CAPABILITY_ID,
+        }:
+            return await self._validate_postgresql_update_call(
+                run,
+                arguments,
+                execution=capability.id == POSTGRESQL_UPDATE_CAPABILITY_ID,
+            )
+        if capability.id in {
             LOCAL_FILE_READ_CAPABILITY_ID,
             LOCAL_FILE_COPY_CAPABILITY_ID,
         }:
@@ -1978,6 +2075,128 @@ class DataToolRuntime:
                     "The selected file is not a current tabular catalog resource.",
                     {"resource_id": resource_id, "source_id": source_id},
                 )
+        return None
+
+    async def _validate_postgresql_update_call(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        *,
+        execution: bool,
+    ) -> tuple[str, str, Mapping[str, object]] | None:
+        source_id = arguments.get("source_id")
+        if not isinstance(source_id, str):
+            return (
+                "write_source_not_available",
+                "PostgreSQL update requires an exact current source.",
+                {},
+            )
+        adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
+        if adapter_id != "postgresql":
+            return (
+                "write_source_not_available",
+                "The selected source is not an active PostgreSQL source owned by this agent.",
+                {"source_id": source_id},
+            )
+        try:
+            intent = (
+                PostgreSQLUpdateCommand.from_mapping(arguments).intent
+                if execution
+                else PostgreSQLUpdateIntent.from_mapping(arguments)
+            )
+        except (TypeError, ValueError):
+            return (
+                "write_assignment_invalid",
+                "The PostgreSQL update intent is malformed.",
+                {},
+            )
+        try:
+            scope_issue = await self._catalog.postgresql_update_scope_issue(
+                run.agent_id,
+                source_id,
+                intent.resource_id,
+                tuple(item.column for item in intent.assignments),
+            )
+        except SourcePermissionStateError:
+            return (
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+                {},
+            )
+        if scope_issue is not None:
+            return scope_issue[0], scope_issue[1], {}
+        validation = validate_postgresql_update_intent(
+            intent,
+            resources=await self._catalog.resource_schemas(
+                run.agent_id,
+                source_id,
+            ),
+        )
+        if validation.valid:
+            return None
+        issue = validation.issues[0]
+        return (
+            issue.code,
+            issue.message,
+            {"source_id": source_id, "resource_id": intent.resource_id},
+        )
+
+    async def _validate_resource_read_scope(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> tuple[str, str, Mapping[str, object]] | None:
+        resource_ids: tuple[object, ...] = ()
+        if capability.id in {
+            CATALOG_INSPECT_CAPABILITY_ID,
+            LOCAL_FILE_READ_CAPABILITY_ID,
+            LOCAL_FILE_COPY_CAPABILITY_ID,
+            POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+            POSTGRESQL_UPDATE_CAPABILITY_ID,
+        }:
+            resource_ids = (arguments.get("resource_id"),)
+        elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
+            raw = arguments.get("resource_ids", ())
+            resource_ids = raw if isinstance(raw, tuple) else ()
+        elif capability.id == CATALOG_TRAVERSE_CAPABILITY_ID:
+            raw_from = arguments.get("from_resource_ids", ())
+            raw_to = arguments.get("to_resource_ids", ())
+            resource_ids = (
+                *(raw_from if isinstance(raw_from, tuple) else ()),
+                *(raw_to if isinstance(raw_to, tuple) else ()),
+            )
+        elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:
+            resource_ids = (arguments.get("resource_id"),)
+        elif capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
+            subject = arguments.get("subject")
+            raw = subject.get("resource_ids") if isinstance(subject, Mapping) else ()
+            resource_ids = raw if isinstance(raw, tuple) else ()
+
+        requested = tuple(
+            resource_id for resource_id in resource_ids if isinstance(resource_id, str)
+        )
+        if not requested:
+            return None
+        source_id = arguments.get("source_id")
+        source_ids = (source_id,) if isinstance(source_id, str) else ()
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                source_ids,
+            )
+        except SourcePermissionStateError:
+            return (
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+                {},
+            )
+        if any(resource_id not in readable for resource_id in requested):
+            return (
+                "resource_read_not_allowed",
+                "The requested resource is not available for reading.",
+                {},
+            )
         return None
 
     async def _current_conversation_artifact_ref(
@@ -2047,6 +2266,11 @@ class DataToolRuntime:
             return semantic_scope_error
         resource_ids: tuple[object, ...] = ()
         if capability.id == CATALOG_INSPECT_CAPABILITY_ID:
+            resource_ids = (arguments.get("resource_id"),)
+        elif capability.id in {
+            POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+            POSTGRESQL_UPDATE_CAPABILITY_ID,
+        }:
             resource_ids = (arguments.get("resource_id"),)
         elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
             value = arguments.get("resource_ids", ())
@@ -2178,6 +2402,17 @@ class DataToolRuntime:
                 },
             )
         resources = await self._catalog.resource_schemas(run.agent_id, source_id)
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError:
+            return (
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+                {},
+            )
         validator = (
             validate_postgresql_read
             if expected_adapter == "postgresql"
@@ -2188,9 +2423,17 @@ class DataToolRuntime:
             source_id=source_id,
             resources=resources,
             parameters=parameters,
+            allowed_resource_ids=readable,
         )
         if result.valid:
             return None
+        issue_codes = {issue.code for issue in result.issues}
+        if issue_codes & {"resource_out_of_scope", "unknown_resource"}:
+            return (
+                "resource_read_not_allowed",
+                "One or more requested resources are not available for reading.",
+                {},
+            )
         return (
             "sql_validation_failed",
             "The SQL read is invalid. Correct all reported issues before retrying.",
@@ -2208,15 +2451,14 @@ class DataToolRuntime:
         )
 
     async def _projected_tool_names(self, run: RunInput) -> tuple[str, ...]:
-        candidates: list[tuple[str, ToolApplicability]] = []
-        required_flags: set[str] = set()
+        candidates: list[tuple[str, str, ToolApplicability]] = []
         selected_candidate = self._selected_learning_candidates.get(run.id)
         candidate_mutation_tool = (
             None
             if selected_candidate is None
             else _learning_candidate_mutation_tool(selected_candidate)
         )
-        semantic_requested = _semantic_management_requested(run.message)
+        semantic_requested = run.id in self._explicit_learning_runs
         artifact_refs = (
             ()
             if self._artifacts is None
@@ -2260,25 +2502,45 @@ class DataToolRuntime:
                 has_current_run_artifacts or has_prior_conversation_artifacts
             ):
                 continue
-            candidates.append((name, view.applicability))
-            required_flags.update(view.applicability.required_configuration_flags)
-        required = tuple(sorted(required_flags))
+            candidates.append((name, capability.id, view.applicability))
         facts = (
             await self._catalog.source_routing_facts(
                 run.agent_id,
-                required,
                 (run.source_id,),
             )
             if run.source_id is not None
             else await self._catalog.source_routing_facts(
                 run.agent_id,
-                required,
             )
+        )
+        has_update_candidates = any(
+            capability_id
+            in {
+                POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+                POSTGRESQL_UPDATE_CAPABILITY_ID,
+            }
+            for _, capability_id, _ in candidates
+        )
+        update_source_ids = (
+            await self._catalog.postgresql_update_applicable_source_ids(
+                run.agent_id,
+                (() if run.source_id is None else (run.source_id,)),
+            )
+            if has_update_candidates
+            else frozenset()
         )
         return tuple(
             name
-            for name, applicability in candidates
+            for name, capability_id, applicability in candidates
             if _applicable(applicability, facts)
+            and (
+                capability_id
+                not in {
+                    POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+                    POSTGRESQL_UPDATE_CAPABILITY_ID,
+                }
+                or bool(update_source_ids)
+            )
         )
 
     async def _semantic_maintenance_requested(self, run: RunInput) -> bool:
@@ -2337,11 +2599,6 @@ def _learning_candidate_mutation_tool(candidate: LearningCandidate) -> str:
     )
 
 
-def _semantic_management_requested(message: str) -> bool:
-    normalized = " ".join(message.casefold().split())
-    return any(signal in normalized for signal in _SEMANTIC_MANAGEMENT_SIGNALS)
-
-
 def _without_runtime_owned_semantic_evidence(
     arguments: Mapping[str, object],
 ) -> Mapping[str, object]:
@@ -2378,6 +2635,10 @@ async def _execute_definitely(
         except asyncio.CancelledError:
             cancelled = True
             continue
+        except BaseException:
+            if worker.done():
+                break
+            raise
     try:
         return worker.result(), None, cancelled
     except BaseException as error:
@@ -2390,11 +2651,17 @@ def _exception_result(call: ToolCall, error: BaseException) -> ToolResultBlock:
     if isinstance(error, ArtifactError):
         return _error(call, error.code, error.message, error.details)
     if isinstance(error, PluginError):
-        return _error(call, error.error_code, str(error))
+        details = getattr(error, "details", None)
+        return _error(
+            call,
+            error.error_code,
+            str(error),
+            details if isinstance(details, Mapping) else None,
+        )
     return _error(
         call,
         "tool_execution_failed",
-        f"{type(error).__name__}: {error}",
+        "The tool could not complete because of an unexpected internal error.",
     )
 
 
@@ -2422,12 +2689,6 @@ def _applicable(
         adapter_id = fact.get("adapter_id")
         if applicability.source_adapter_ids and adapter_id not in set(
             applicability.source_adapter_ids
-        ):
-            continue
-        flags = fact.get("configuration_flags", {})
-        if not isinstance(flags, Mapping) or any(
-            flags.get(flag) is not True
-            for flag in applicability.required_configuration_flags
         ):
             continue
         matching.append(fact)
@@ -2490,6 +2751,12 @@ __all__ = [
     "DataToolRuntime",
     "POSTGRESQL_QUERY_CAPABILITY_ID",
     "POSTGRESQL_QUERY_EVIDENCE_KIND",
+    "POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID",
+    "POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND",
+    "POSTGRESQL_UPDATE_CAPABILITY_ID",
+    "POSTGRESQL_UPDATE_EVIDENCE_KIND",
+    "PostgreSQLUpdateCatalogReader",
+    "ReadScopedCatalogReader",
     "SQLITE_QUERY_CAPABILITY_ID",
     "SQLITE_QUERY_EVIDENCE_KIND",
 ]

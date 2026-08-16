@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 from enum import Enum
+from pathlib import Path
 
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 
@@ -104,6 +105,59 @@ class AgentError(DaitaError):
             error_code=error_code,
             retryability=retryability,
         )
+
+
+class StateCompatibilityCode(str, Enum):
+    """Stable classification of local agent-home admission failures."""
+
+    NEWER_REVISION = "state_revision_newer"
+    LEGACY = "state_legacy"
+    DAMAGED = "state_database_damaged"
+    REVISION_UNSUPPORTED = "state_revision_unsupported"
+    UPGRADE_FAILED = "state_upgrade_failed"
+
+
+class StateCompatibilityError(DaitaError):
+    """A local state database cannot be safely admitted by this release."""
+
+    def __init__(
+        self,
+        code: StateCompatibilityCode,
+        path: Path,
+        message: str,
+        *,
+        current_revision: str,
+        found_revision: str | None = None,
+    ) -> None:
+        if not isinstance(code, StateCompatibilityCode):
+            raise TypeError("state compatibility code is invalid")
+        if not isinstance(path, Path) or not path.is_absolute():
+            raise ValueError("state compatibility path must be absolute")
+        if not isinstance(current_revision, str) or not current_revision.strip():
+            raise ValueError("current state revision must be non-empty text")
+        if found_revision is not None and (
+            not isinstance(found_revision, str) or not found_revision.strip()
+        ):
+            raise ValueError("found state revision must be non-empty text")
+        self.code = code
+        self.path = path
+        self.found_revision = found_revision
+        self.current_revision = current_revision
+        super().__init__(
+            message,
+            error_code=code.value,
+            retryability=ErrorRetryability.PERMANENT,
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "code": self.code.value,
+            "message": str(self),
+            "state_path": str(self.path),
+            "found_revision": self.found_revision,
+            "current_revision": self.current_revision,
+            "state_changed": False,
+        }
 
 
 class ConfigError(DaitaError):
@@ -310,6 +364,8 @@ __all__ = [
     "RateLimitError",
     "RetryableError",
     "SkillError",
+    "StateCompatibilityCode",
+    "StateCompatibilityError",
     "TransientError",
     "ValidationError",
 ]

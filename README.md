@@ -1,4 +1,4 @@
-![Daita: persistent, read-only data agents](assets/banner.png)
+![Daita: persistent data agents](assets/banner.png)
 
 # Daita
 
@@ -17,8 +17,10 @@ You:   Which region led paid revenue last quarter?
 Daita: EMEA led with $4.2M, followed by North America with $3.7M.
 ```
 
-Daita keeps source access read only and learned context transparent, so it can
-become more useful over time without giving up human control.
+Daita begins every source read only and keeps learned context transparent. An
+explicitly opted-in PostgreSQL source can additionally expose the narrow,
+previewed, once-approved structured update described below; other source access
+remains read only.
 
 ## Why Daita?
 
@@ -27,7 +29,7 @@ become more useful over time without giving up human control.
 | **Talk to real data** | Query SQLite, PostgreSQL, CSV, and JSON without writing SQL. |
 | **Use your preferred model** | OpenAI, Anthropic, Gemini, Grok, Ollama, a custom OpenAI compatible endpoint, or supported Codex, Claude Code, and Grok Build subscriptions. |
 | **Keep useful context** | Persist conversations, user approved memory, and reusable Markdown skills. |
-| **Stay in control** | Validate SQL against the current catalog and approve agent proposed local changes. |
+| **Stay in control** | Validate reads against the current catalog and require resource scoped readiness, preview, and exact approval for the limited PostgreSQL update. |
 
 ## Quick start
 
@@ -101,9 +103,10 @@ model like any other result, so it can correct the call on the next step. The
 loop has bounded steps, wall time, tokens, and estimated cost; it does not add
 a verifier pass or a session runtime.
 
-Data access remains read only. SQL and local paths are checked against the
-current catalog before source I/O, and every requested tool call receives one
-ordered result even if another call fails.
+Data access is read first. All current data tools are non-side-effecting reads
+except the explicitly scoped PostgreSQL update. SQL and local paths are
+checked against the current catalog before source I/O, and every requested tool
+call receives one ordered result even if another call fails.
 
 Agent identity, source registrations, catalog snapshots, transcripts, and
 terminal results live in a small SQLite database inside the agent home.
@@ -169,10 +172,27 @@ daita skills --help
 The terminal provides confirmed lifecycle commands:
 
 ```text
+/source edit
+/source permissions
 /source detach <source>
 /conversation clear
 /agent delete
 ```
+
+`/source edit` changes the active source connection without dropping the
+working connection first. Daita validates and catalogs the edited connection,
+shows a redacted review, and requires a `[y/N]` confirmation before one atomic handoff. Read
+intent is preserved only for exact matching resources, PostgreSQL update scopes
+are cleared, and a new conversation starts. If validation, discovery, review,
+or commit fails, the existing connection remains active.
+
+`/source permissions` is the single guided terminal flow for read access
+(`all`, exact selected current resources, or `none`) and exact PostgreSQL
+update access. Users can select one, many, or all current eligible
+tables, use all eligible assignment columns by default, or choose an exact
+subset through Advanced. One before/after summary and confirmation applies both
+scope families atomically. Future tables are never automatically write-enabled,
+and the flow never changes PostgreSQL roles or grants.
 
 Source detachment disables access and deletes a Daita-owned PostgreSQL
 credential. Its non-secret registration remains as inactive lifecycle history
@@ -215,29 +235,39 @@ pipx reinstall daita-agents
 pipx uninstall daita-agents
 ```
 
-Version 1.0.0 establishes the first supported agent home format. Beginning with
-the next release, every release candidate must open and preserve agent homes
-created by the immediately preceding release. An upgrade preserves agent
-identity, model configuration, source registrations and catalogs,
-conversations, approved memory and user profile, semantics, learning
-candidates, and skills. It never silently resets incompatible state.
+Local state has its own immutable, checksummed migration journal, independent
+of the package version. On the first normal launch after an upgrade, Daita
+validates a supported journal prefix under the existing per-agent writer lock
+and automatically applies its known missing suffix to a verified staged copy.
+It validates the complete result and atomically activates it only after every
+check succeeds. No separate state command, import, restore, or backup step is
+part of a routine upgrade, and existing agent homes should never be reset for a
+normal application update.
 
-Before changing versions, an optional complete local backup can be made while
-Daita is closed:
+The upgrade preserves identity, configuration and secret references, settings,
+sources and catalogs, active-source selection, exact permissions, complete
+conversations and results, artifacts, approved memory and user profile, skills,
+semantics, learning state, and database-write receipts. Before activation Daita
+retains the verified prior database as one bounded `state.db.rollback-*`
+recovery point. Failure or cancellation before activation removes the staging
+files and will leave the prior database unchanged.
+
+Unknown, reordered, gapped, or checksum-mismatched journals, newer state from
+an attempted package downgrade, recognizable pre-1.0 homes, and damaged schemas
+fail closed without moving, replacing, emptying, or recreating the home. Install
+the same or a newer Daita release for newer state; opening an upgraded home with
+an older package is not a supported downgrade path. See the
+[local state upgrade contract](docs/LOCAL_STATE_UPGRADES.md).
+
+No manual backup is required for compatibility. A complete copy made while
+Daita is closed is optional disaster recovery, not a compatibility mechanism:
 
 ```bash
 cp -a ~/.daita ~/.daita-backup-before-upgrade
 ```
 
-The backup contains the agent homes but not secret values held by the OS
-keychain. Those keychain entries remain installed and are referenced by the
-backed-up configuration.
-
-If an installed release cannot admit an existing state database, it exits
-before writing to that database and reports that the agent home was preserved.
-Restore the complete backup before installing an older version; opening a home
-with an older release after a newer release has changed its format is not a
-supported downgrade path.
+Secret values stored in the OS keychain are referenced by the copied
+configuration but are not duplicated into the agent home.
 
 Use `pipx reinstall daita-agents` to repair missing or damaged application
 dependencies. Uninstalling the application does not delete existing agent
@@ -290,6 +320,11 @@ the real XLSX runtime, reinstall, state preservation, and uninstall on Python
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
 [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
+The PostgreSQL update plan, least-privilege role requirements, exact-impact
+preview, approval, transactional drift handling, receipts, and unknown-outcome
+response are documented in
+[PostgreSQL updates](docs/POSTGRESQL_UPDATES.md).
 
 ## License
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -70,7 +70,7 @@ from daita.llm.models import (
 )
 from daita.loop.models import RunInput
 
-_OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+_OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1347,6 +1347,7 @@ async def test_schema_capability_validates_output_and_is_smaller_than_inspection
         output = await executor.execute(
             ToolExecution(
                 run_id="schema-capability",
+                call_id="schema-capability-call",
                 capability_id=capability.id,
                 arguments={
                     "resource_ids": tuple(resource.id for resource in resources),
@@ -2018,16 +2019,15 @@ async def test_schema_slice_reopens_with_one_decode_and_identical_payload(
     expected = canonical_json(await _schema(agent, resource_ids=resource_ids))
     await agent.close()
 
-    original_loads = sqlite_store._loads
+    original_decode = sqlite_store.decode_catalog_snapshot
     decode_count = 0
 
-    def counting_loads(value: str) -> object:
+    def counting_decode(value: str):
         nonlocal decode_count
-        if '"__record__":"SourceCatalogSnapshot"' in value:
-            decode_count += 1
-        return original_loads(value)
+        decode_count += 1
+        return original_decode(value)
 
-    monkeypatch.setattr(sqlite_store, "_loads", counting_loads)
+    monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", counting_decode)
     reopened = await Agent.open("catalog-schema-coherent-reopen", root=tmp_path)
     try:
         first = await _schema(reopened, resource_ids=resource_ids)
@@ -2196,23 +2196,22 @@ async def test_validation_schema_reopen_decodes_and_compiles_once(
     source_id = source.id
     await agent.close()
 
-    original_loads = sqlite_store._loads
+    original_decode = sqlite_store.decode_catalog_snapshot
     original_compile = catalog_service._compile_source_index
     decode_count = 0
     compile_count = 0
 
-    def counting_loads(value: str) -> object:
+    def counting_decode(value: str):
         nonlocal decode_count
-        if '"__record__":"SourceCatalogSnapshot"' in value:
-            decode_count += 1
-        return original_loads(value)
+        decode_count += 1
+        return original_decode(value)
 
     def counting_compile(snapshot):
         nonlocal compile_count
         compile_count += 1
         return original_compile(snapshot)
 
-    monkeypatch.setattr(sqlite_store, "_loads", counting_loads)
+    monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", counting_decode)
     monkeypatch.setattr(catalog_service, "_compile_source_index", counting_compile)
     reopened = await Agent.open("catalog-validation-reopen", root=tmp_path)
     try:

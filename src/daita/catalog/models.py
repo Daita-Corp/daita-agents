@@ -274,6 +274,11 @@ class TabularColumn:
     nullable: bool
     primary_key_ordinal: int | None = None
     default_expression: str | None = None
+    native_type_namespace: str | None = None
+    native_type_name: str | None = None
+    identity: bool = False
+    generated: bool = False
+    updatable: bool = False
 
     def __post_init__(self) -> None:
         _required_text(self.name, "column name", maximum=256)
@@ -288,15 +293,41 @@ class TabularColumn:
             "column default_expression",
             maximum=2_048,
         )
+        _optional_text(
+            self.native_type_namespace,
+            "column native_type_namespace",
+            maximum=128,
+        )
+        _optional_text(
+            self.native_type_name,
+            "column native_type_name",
+            maximum=128,
+        )
+        if (self.native_type_namespace is None) is not (self.native_type_name is None):
+            raise ValueError(
+                "column native type namespace and name must be provided together"
+            )
+        for value, name in (
+            (self.identity, "column identity"),
+            (self.generated, "column generated"),
+            (self.updatable, "column updatable"),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be a boolean")
 
     def to_payload(self) -> dict[str, object]:
         return {
             "default_expression": self.default_expression,
             "name": self.name,
             "native_type": self.native_type,
+            "native_type_name": self.native_type_name,
+            "native_type_namespace": self.native_type_namespace,
             "nullable": self.nullable,
             "ordinal": self.ordinal,
             "primary_key_ordinal": self.primary_key_ordinal,
+            "identity": self.identity,
+            "generated": self.generated,
+            "updatable": self.updatable,
         }
 
 

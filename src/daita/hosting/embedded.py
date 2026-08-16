@@ -5,25 +5,31 @@ from __future__ import annotations
 import asyncio
 import errno
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import tomllib
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Self, TypeVar, cast
 from uuid import uuid4
 
-from .._json import FrozenJsonObject
+from .._json import FrozenJsonObject, canonical_json
 from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySource
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
 from ..adapters.postgresql_query import PostgreSQLQueryBackend
+from ..adapters.postgresql_write import (
+    PostgreSQLUpdatePreviewBackend,
+    PostgreSQLUpdateReadiness,
+)
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.sqlite import SQLiteSource
 from ..adapters.sqlite_query import SQLiteQueryBackend
@@ -43,6 +49,8 @@ from ..catalog.models import (
     CatalogSummary,
     CatalogSync,
     CatalogSyncStatus,
+    ResourceKind,
+    SourceCatalogSnapshot,
 )
 from ..catalog.service import CatalogService
 from ..config import AgentConfig
@@ -53,10 +61,15 @@ from ..domains.data import (
     artifact_capability_declarations,
     local_file_read_declarations,
     postgresql_query_declarations,
+    postgresql_update_declarations,
+    postgresql_update_preview_declarations,
     sqlite_query_declarations,
 )
 from ..domains.data.context import _project_completed_history
-from ..errors import AgentError
+from ..domains.data.sql import (
+    validate_postgresql_update_scope,
+)
+from ..errors import AgentError, StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity
 from ..learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
@@ -117,11 +130,28 @@ from ..semantics import (
 from ..skills import Skill, SkillStore, SkillSummary
 from ..skills.capabilities import skill_declarations
 from ..storage.sqlite import SQLiteStateStore
+from ..storage.sqlite_records import (
+    PostgreSQLUpdateScope,
+    SourcePermissionResource,
+    SourcePermissionsInspection,
+    SourcePermissionsPreview,
+    SourcePermissionState,
+    SourcePermissionSummary,
+    SourceReadMode,
+    SourceReadScope,
+    postgresql_update_authorization_fingerprint,
+)
 
 _AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_AGENT_HOME_CANDIDATES = 256
 _MAX_DISCOVERED_AGENTS = 100
+_LEGACY_STATE_ROOT_MARKERS = (
+    "catalog.json",
+    "graph",
+    "memory",
+    "sessions",
+)
 _MODEL_CONFIG_NAME = "config.json"
 _MAX_MODEL_CONFIG_BYTES = 64 * 1_024
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
@@ -140,7 +170,7 @@ _T = TypeVar("_T")
 
 
 def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _new_id(prefix: str) -> str:
@@ -229,6 +259,37 @@ class SourceSelectionError(AgentError, ValueError):
     """A requested source is missing, ambiguous, or outside current admission."""
 
 
+@dataclass(frozen=True, slots=True)
+class SourceEditPreview:
+    """Safe bounded facts shown immediately before a source connection edit."""
+
+    current_source_id: str
+    replacement_source_id: str
+    display_name: str
+    adapter_id: str
+    resource_count: int
+    relationship_count: int
+    read_mode: SourceReadMode
+    preserved_read_resource_count: int
+    omitted_read_resources: tuple[str, ...]
+
+    @property
+    def identity_changed(self) -> bool:
+        return self.current_source_id != self.replacement_source_id
+
+
+@dataclass(frozen=True, slots=True)
+class SourceEditResult:
+    """Committed source connection edit plus best-effort credential cleanup."""
+
+    source: SourceRegistration
+    identity_changed: bool
+    previous_credential_deleted: bool
+
+
+SourceEditConfirmationHandler = Callable[[SourceEditPreview], Awaitable[bool]]
+
+
 class _WriterLock:
     def __init__(self, path: Path, descriptor: int) -> None:
         self.path = path
@@ -292,6 +353,7 @@ class EmbeddedAgent:
         catalog_service: CatalogService,
         data_view: CatalogDataView,
         data_tool_runtime: DataToolRuntime,
+        postgresql_update_backend: PostgreSQLUpdatePreviewBackend,
         memory_store: MemoryStore,
         skill_store: SkillStore,
         candidate_reviewer: OneShotCandidateReviewer,
@@ -325,6 +387,7 @@ class EmbeddedAgent:
         self._catalog_service = catalog_service
         self._data_view = data_view
         self._data_tool_runtime = data_tool_runtime
+        self._postgresql_update_backend = postgresql_update_backend
         self._memory_store = memory_store
         self._skill_store = skill_store
         self._candidate_reviewer = candidate_reviewer
@@ -336,6 +399,8 @@ class EmbeddedAgent:
         self._id_factory = id_factory
         self._mutation_lock = mutation_lock
         self._run_lock = asyncio.Lock()
+        self._source_permission_confirmation_key = secrets.token_bytes(32)
+        self._source_permission_previews: dict[str, SourcePermissionsPreview] = {}
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
         self._model_reopen_required = False
@@ -711,7 +776,7 @@ class EmbeddedAgent:
     ) -> Self:
         catalog_service = CatalogService(store, store)
         data_view = CatalogDataView(store, catalog_service, store)
-        catalog = catalog_declarations(identity.id, catalog_service)
+        catalog = catalog_declarations(identity.id, data_view)
         sqlite_backend = SQLiteQueryBackend(store, data_view)
         postgresql_backend = PostgreSQLQueryBackend(
             store, data_view, secret_provider or keychain
@@ -721,7 +786,22 @@ class EmbeddedAgent:
             identity.id,
             postgresql_backend,
         )
-        local_file_backend = LocalDirectoryReadBackend(store, store)
+        postgresql_preview_backend = PostgreSQLUpdatePreviewBackend(
+            store,
+            data_view,
+            secret_provider or keychain,
+            receipt_store=store,
+            clock=clock,
+        )
+        postgresql_preview = postgresql_update_preview_declarations(
+            identity.id,
+            postgresql_preview_backend,
+        )
+        postgresql_update = postgresql_update_declarations(
+            identity.id,
+            postgresql_preview_backend,
+        )
+        local_file_backend = LocalDirectoryReadBackend(store, store, data_view)
         local_files = local_file_read_declarations(identity.id, local_file_backend)
         mutation_lock = asyncio.Lock()
         memory_store = MemoryStore(home, mutation_lock)
@@ -777,6 +857,8 @@ class EmbeddedAgent:
                 *catalog.capabilities,
                 *sqlite.capabilities,
                 *postgresql.capabilities,
+                *postgresql_preview.capabilities,
+                *postgresql_update.capabilities,
                 *local_files.capabilities,
                 *memory.capabilities,
                 *skills.capabilities,
@@ -787,6 +869,8 @@ class EmbeddedAgent:
                 *catalog.executors,
                 *sqlite.executors,
                 *postgresql.executors,
+                *postgresql_preview.executors,
+                *postgresql_update.executors,
                 *local_files.executors,
                 *memory.executors,
                 *skills.executors,
@@ -797,6 +881,8 @@ class EmbeddedAgent:
                 *catalog.tool_views,
                 *sqlite.tool_views,
                 *postgresql.tool_views,
+                *postgresql_preview.tool_views,
+                *postgresql_update.tool_views,
                 *local_files.tool_views,
                 *memory.tool_views,
                 *skills.tool_views,
@@ -864,6 +950,7 @@ class EmbeddedAgent:
             catalog_service=catalog_service,
             data_view=data_view,
             data_tool_runtime=data_tool_runtime,
+            postgresql_update_backend=postgresql_preview_backend,
             memory_store=memory_store,
             skill_store=skill_store,
             candidate_reviewer=candidate_reviewer,
@@ -1059,6 +1146,22 @@ class EmbeddedAgent:
             source_id=source_id,
         )
 
+    async def learn(
+        self,
+        message: str,
+        *,
+        conversation_id: str | None = None,
+        source_id: str | None = None,
+    ) -> LoopExit:
+        """Run one explicit user-authorized foreground learning action."""
+
+        return await self._run(
+            message,
+            conversation_id=conversation_id,
+            source_id=source_id,
+            explicit_learning=True,
+        )
+
     async def _run(
         self,
         message: str,
@@ -1068,6 +1171,7 @@ class EmbeddedAgent:
         learning_candidate_id: str | None = None,
         learning_candidate_text: str | None = None,
         learning_candidate: LearningCandidate | None = None,
+        explicit_learning: bool = False,
     ) -> LoopExit:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
@@ -1102,6 +1206,7 @@ class EmbeddedAgent:
                 learning_candidate_id=learning_candidate_id,
                 learning_candidate_text=learning_candidate_text,
                 learning_candidate=learning_candidate,
+                explicit_learning=explicit_learning,
             )
 
     async def _run_locked(
@@ -1114,6 +1219,7 @@ class EmbeddedAgent:
         learning_candidate_id: str | None,
         learning_candidate_text: str | None,
         learning_candidate: LearningCandidate | None,
+        explicit_learning: bool = False,
         run_id: str | None = None,
     ) -> LoopExit:
         """Run once while the caller owns the foreground lifecycle lock."""
@@ -1209,6 +1315,8 @@ class EmbeddedAgent:
                 run_input.id,
                 cast(LearningCandidate, learning_candidate),
             )
+        if explicit_learning:
+            self._data_tool_runtime.select_explicit_learning_run(run_input.id)
         try:
             return await loop.run(
                 run_input,
@@ -1220,6 +1328,8 @@ class EmbeddedAgent:
                 assert self._data_context_builder is not None
                 self._data_context_builder.clear_learning_candidate(run_input.id)
                 self._data_tool_runtime.clear_learning_candidate(run_input.id)
+            if explicit_learning:
+                self._data_tool_runtime.clear_explicit_learning_run(run_input.id)
 
     async def transcript(self, run_id: str) -> Transcript:
         self._require_open()
@@ -1347,18 +1457,19 @@ class EmbeddedAgent:
     async def select_source(self, selector: str) -> SourceRegistration:
         """Persist one active source as the default for subsequent conversations."""
 
-        async with self._mutation_lock:
-            self._require_open()
-            sources = tuple(
-                source
-                for source in await self._store.list_sources(self.identity.id)
-                if source.active
-            )
-            selected = _resolve_source_selector(selector, sources)
-            return await self._store.set_active_source_id(
-                self.identity.id,
-                selected.id,
-            )
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                sources = tuple(
+                    source
+                    for source in await self._store.list_sources(self.identity.id)
+                    if source.active
+                )
+                selected = _resolve_source_selector(selector, sources)
+                return await self._store.set_active_source_id(
+                    self.identity.id,
+                    selected.id,
+                )
 
     async def read_memory(self) -> str:
         self._require_open()
@@ -1383,22 +1494,23 @@ class EmbeddedAgent:
     ) -> LearningReviewResult:
         """Explicitly trigger one bounded auxiliary review request."""
 
-        self._require_open()
-        if max_estimated_cost_usd is None or self._candidate_reviewer.enabled:
-            return await self._candidate_reviewer.review(
+        async with self._run_lock:
+            self._require_open()
+            if max_estimated_cost_usd is None or self._candidate_reviewer.enabled:
+                return await self._candidate_reviewer.review(
+                    max_estimated_cost_usd=max_estimated_cost_usd,
+                )
+            if self.model_route is None:
+                return await self._candidate_reviewer.review()
+            model, profile = _candidate_reviewer_from_route(
+                self.model_route,
+                secret_provider=self._secret_provider or self._keychain,
+            )
+            return await self._candidate_reviewer.review_with_model(
+                model=model,
+                profile=profile,
                 max_estimated_cost_usd=max_estimated_cost_usd,
             )
-        if self.model_route is None:
-            return await self._candidate_reviewer.review()
-        model, profile = _candidate_reviewer_from_route(
-            self.model_route,
-            secret_provider=self._secret_provider or self._keychain,
-        )
-        return await self._candidate_reviewer.review_with_model(
-            model=model,
-            profile=profile,
-            max_estimated_cost_usd=max_estimated_cost_usd,
-        )
 
     async def list_learning_candidates(
         self,
@@ -1651,18 +1763,20 @@ class EmbeddedAgent:
         *,
         attached_at: datetime,
     ) -> SourceRegistration:
-        async with self._mutation_lock:
-            self._require_open()
-            return await self._attach_source_locked(
-                source,
-                attached_at=attached_at,
-            )
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                return await self._attach_source_locked(
+                    source,
+                    attached_at=attached_at,
+                )
 
     async def _attach_source_locked(
         self,
         source: ResourceSource,
         *,
         attached_at: datetime,
+        persisted_registration: SourceRegistration | None = None,
     ) -> SourceRegistration:
         adapter = await source.open(
             agent_id=self.identity.id,
@@ -1671,9 +1785,16 @@ class EmbeddedAgent:
         )
         if not isinstance(adapter, ResourceAdapter):
             raise TypeError("source open() must return ResourceAdapter")
-        registration = adapter.registration
+        opened_registration = adapter.registration
+        registration = opened_registration
         sync: CatalogSync | None = None
         try:
+            if persisted_registration is not None:
+                if persisted_registration != opened_registration:
+                    raise ValueError(
+                        "refreshed source registration disagrees with persisted identity"
+                    )
+                registration = persisted_registration
             self._capabilities.validate_declarations(adapter.declarations())
             sync = CatalogSync(
                 id=self._id_factory("catalog-sync"),
@@ -1722,6 +1843,138 @@ class EmbeddedAgent:
         finally:
             await adapter.close()
 
+    async def edit_source(
+        self,
+        source_id: str,
+        source: ResourceSource,
+        *,
+        confirmation_handler: SourceEditConfirmationHandler,
+    ) -> SourceEditResult | None:
+        """Validate, review, and atomically edit one active source connection."""
+
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        if not isinstance(source, ResourceSource):
+            raise TypeError("source must implement ResourceSource")
+        if not callable(confirmation_handler):
+            raise TypeError("confirmation_handler must be callable")
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                current = await self._store.load_source(self.identity.id, source_id)
+                if current is None or not current.active:
+                    raise ValueError("source edit requires an active owned source")
+                current_read_scope = await self._store.load_source_read_scope(
+                    self.identity.id,
+                    source_id,
+                )
+                if current_read_scope is None:
+                    raise ValueError("active source is missing its read scope")
+                current_resources = await self._store.list_resources(
+                    self.identity.id,
+                    source_id,
+                )
+                attached_at = self._clock()
+                adapter = await source.open(
+                    agent_id=self.identity.id,
+                    attached_at=attached_at,
+                    clock=self._clock,
+                )
+                if not isinstance(adapter, ResourceAdapter):
+                    raise TypeError("source open() must return ResourceAdapter")
+                committed = False
+                try:
+                    registration = adapter.registration
+                    if registration.adapter_id != current.adapter_id:
+                        raise ValueError("source edit cannot change source type")
+                    if registration.id != current.id:
+                        existing = await self._store.load_source(
+                            self.identity.id,
+                            registration.id,
+                        )
+                        if existing is not None and existing.active:
+                            raise ValueError(
+                                "replacement connection is already attached"
+                            )
+                    self._capabilities.validate_declarations(adapter.declarations())
+                    sync = CatalogSync(
+                        id=self._id_factory("catalog-sync"),
+                        agent_id=self.identity.id,
+                        source_id=registration.id,
+                        adapter_id=registration.adapter_id,
+                        status=CatalogSyncStatus.RUNNING,
+                        started_at=self._clock(),
+                    )
+                    discovery = await adapter.discover(
+                        DiscoveryRequest(
+                            agent_id=self.identity.id,
+                            source_id=registration.id,
+                            sync_id=sync.id,
+                            requested_at=sync.started_at,
+                        )
+                    )
+                    read_scope, omitted = _source_edit_read_scope(
+                        current_read_scope=current_read_scope,
+                        current_resources=current_resources,
+                        replacement=discovery.snapshot,
+                    )
+                    preview = SourceEditPreview(
+                        current_source_id=current.id,
+                        replacement_source_id=registration.id,
+                        display_name=registration.display_name,
+                        adapter_id=registration.adapter_id,
+                        resource_count=len(discovery.snapshot.resources),
+                        relationship_count=len(discovery.snapshot.relationships),
+                        read_mode=read_scope.mode,
+                        preserved_read_resource_count=(
+                            len(discovery.snapshot.resources)
+                            if read_scope.mode is SourceReadMode.ALL
+                            else len(read_scope.resource_ids)
+                        ),
+                        omitted_read_resources=omitted,
+                    )
+                    confirmed = await confirmation_handler(preview)
+                    if not isinstance(confirmed, bool):
+                        raise TypeError("source edit confirmation must return bool")
+                    if not confirmed:
+                        return None
+                    await self._store.commit_source_edit(
+                        discovery.snapshot,
+                        registration=registration,
+                        replaced_source_id=current.id,
+                        replaced_at=max(self._clock(), current.attached_at),
+                        read_scope=read_scope,
+                    )
+                    committed = True
+                    old_reference = _owned_source_credential_reference(
+                        current,
+                        agent_id=self.identity.id,
+                    )
+                    new_reference = _owned_source_credential_reference(
+                        registration,
+                        agent_id=self.identity.id,
+                    )
+                    previous_credential_deleted = True
+                    if old_reference is not None and old_reference != new_reference:
+                        try:
+                            await asyncio.wait_for(
+                                self._keychain.delete(old_reference),
+                                timeout=_CREDENTIAL_CLEANUP_TIMEOUT_SECONDS,
+                            )
+                        except BaseException:
+                            previous_credential_deleted = False
+                    return SourceEditResult(
+                        source=registration,
+                        identity_changed=registration.id != current.id,
+                        previous_credential_deleted=previous_credential_deleted,
+                    )
+                finally:
+                    try:
+                        await adapter.close()
+                    except BaseException:
+                        if not committed:
+                            raise
+
     async def attach_sqlite(
         self,
         path: str | Path,
@@ -1732,6 +1985,20 @@ class EmbeddedAgent:
 
         return await self.attach(SQLiteSource(path=path, name=name))
 
+    async def edit_sqlite_source(
+        self,
+        source_id: str,
+        path: str | Path,
+        *,
+        confirmation_handler: SourceEditConfirmationHandler,
+        name: str | None = None,
+    ) -> SourceEditResult | None:
+        return await self.edit_source(
+            source_id,
+            SQLiteSource(path=path, name=name),
+            confirmation_handler=confirmation_handler,
+        )
+
     async def attach_local_directory(
         self,
         root: str | Path,
@@ -1741,6 +2008,43 @@ class EmbeddedAgent:
         """Attach one ordinary bounded CSV/JSON directory source."""
 
         return await self.attach(LocalDirectorySource(root=root, name=name))
+
+    async def edit_local_directory_source(
+        self,
+        source_id: str,
+        root: str | Path,
+        *,
+        confirmation_handler: SourceEditConfirmationHandler,
+        name: str | None = None,
+        max_depth: int = 8,
+        max_files: int = 1_000,
+        max_file_bytes: int = 2 * 1024 * 1024,
+        max_columns: int = 512,
+        max_rows: int = 100_000,
+        max_json_nodes: int = 500_000,
+        max_json_depth: int = 32,
+        max_key_bytes: int = 1_024,
+        max_string_bytes: int = 256 * 1024,
+        max_cell_bytes: int = 1024 * 1024,
+    ) -> SourceEditResult | None:
+        return await self.edit_source(
+            source_id,
+            LocalDirectorySource(
+                root=root,
+                name=name,
+                max_depth=max_depth,
+                max_files=max_files,
+                max_file_bytes=max_file_bytes,
+                max_columns=max_columns,
+                max_rows=max_rows,
+                max_json_nodes=max_json_nodes,
+                max_json_depth=max_json_depth,
+                max_key_bytes=max_key_bytes,
+                max_string_bytes=max_string_bytes,
+                max_cell_bytes=max_cell_bytes,
+            ),
+            confirmation_handler=confirmation_handler,
+        )
 
     async def store_postgresql_password(self, password: str) -> SecretReference:
         """Store one database password for an in-process onboarding attempt."""
@@ -1847,46 +2151,453 @@ class EmbeddedAgent:
             )
         )
 
-    async def detach(self, source_id: str) -> SourceRegistration:
+    async def edit_postgresql_source(
+        self,
+        source_id: str,
+        *,
+        host: str,
+        database: str,
+        username: str,
+        credential: SecretReference,
+        schemas: tuple[str, ...],
+        confirmation_handler: SourceEditConfirmationHandler,
+        port: int = 5432,
+        ssl_mode: str = "require",
+        name: str | None = None,
+    ) -> SourceEditResult | None:
+        """Edit PostgreSQL through the ordinary validated source boundary."""
+
+        return await self.edit_source(
+            source_id,
+            PostgreSQLSource(
+                host=host,
+                port=port,
+                database=database,
+                username=username,
+                credential=credential,
+                schemas=schemas,
+                ssl_mode=ssl_mode,
+                name=name,
+                secret_provider=self._secret_provider or self._keychain,
+            ),
+            confirmation_handler=confirmation_handler,
+        )
+
+    async def inspect_source_permissions(
+        self,
+        source_id: str,
+    ) -> SourcePermissionsInspection:
+        """Inspect exact scopes against complete trusted current catalog truth."""
+
         async with self._mutation_lock:
             self._require_open()
-            detached = await self._store.detach_source(
-                self.identity.id, source_id, self._clock()
+            return await self._inspect_source_permissions_locked(source_id)
+
+    async def preview_source_permissions(
+        self,
+        *,
+        source_id: str,
+        read_mode: SourceReadMode,
+        read_resource_ids: tuple[str, ...],
+        postgresql_update_scopes: Mapping[str, tuple[str, ...]],
+    ) -> SourcePermissionsPreview:
+        """Build and retain one bounded in-process exact confirmation preview."""
+
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                inspection = await self._inspect_source_permissions_locked(source_id)
+                preview = await self._build_source_permissions_preview(
+                    inspection,
+                    read_mode=read_mode,
+                    read_resource_ids=read_resource_ids,
+                    postgresql_update_scopes=postgresql_update_scopes,
+                )
+                self._source_permission_previews[source_id] = preview
+                return preview
+
+    async def apply_source_permissions(
+        self,
+        *,
+        source_id: str,
+        confirmation_fingerprint: str,
+    ) -> SourcePermissionsInspection:
+        """Revalidate and atomically apply one exact in-process preview."""
+
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                preview = self._source_permission_previews.get(source_id)
+                if preview is None or not hmac.compare_digest(
+                    preview.confirmation_fingerprint,
+                    confirmation_fingerprint,
+                ):
+                    raise ValueError(
+                        "permission confirmation is unknown or expired; preview again"
+                    )
+                current = await self._inspect_source_permissions_locked(source_id)
+                if current.catalog_generation != preview.catalog_generation:
+                    raise ValueError(
+                        "source catalog changed after preview; preview again"
+                    )
+                if current.state == preview.after:
+                    return current
+                if current.state != preview.before:
+                    raise ValueError(
+                        "source permissions changed after preview; preview again"
+                    )
+
+                update_mapping = {
+                    scope.resource_id: scope.allowed_assignment_columns
+                    for scope in preview.after.postgresql_update_scopes
+                }
+                revalidated = await self._build_source_permissions_preview(
+                    current,
+                    read_mode=preview.after.read_scope.mode,
+                    read_resource_ids=preview.after.read_scope.resource_ids,
+                    postgresql_update_scopes=update_mapping,
+                )
+                if revalidated.after != preview.after:
+                    raise ValueError(
+                        "source permission facts changed after preview; preview again"
+                    )
+                await self._store.replace_source_permission_scopes(
+                    preview.after.read_scope,
+                    preview.after.postgresql_update_scopes,
+                )
+                return await self._inspect_source_permissions_locked(source_id)
+
+    async def _inspect_source_permissions_locked(
+        self,
+        source_id: str,
+    ) -> SourcePermissionsInspection:
+        registration = await self._store.load_source(self.identity.id, source_id)
+        if (
+            registration is None
+            or registration.agent_id != self.identity.id
+            or registration.id != source_id
+            or not registration.active
+        ):
+            raise ValueError("unknown active source for this agent")
+        read_scope = await self._store.load_source_read_scope(
+            self.identity.id,
+            source_id,
+        )
+        if read_scope is None:
+            raise ValueError("active source is missing its read scope")
+        update_scopes = await self._store.list_postgresql_update_scopes(
+            self.identity.id,
+            source_id,
+        )
+        refs = await self._store.list_current_snapshot_refs(
+            self.identity.id,
+            (source_id,),
+        )
+        if len(refs) > 1:
+            raise ValueError("source has multiple current catalog generations")
+        catalog_generation = None if not refs else refs[0].sync_id
+        resources = tuple(
+            resource
+            for resource in await self._store.list_resources(
+                self.identity.id,
+                source_id,
             )
-            reference = _owned_source_credential_reference(
-                detached,
-                agent_id=self.identity.id,
+            if resource.agent_id == self.identity.id and resource.source_id == source_id
+        )
+        schemas = (
+            await self._data_view.resource_schemas(self.identity.id, source_id)
+            if registration.adapter_id == "postgresql"
+            else ()
+        )
+        schemas_by_resource_id = {schema.resource_id: schema for schema in schemas}
+        choices: list[SourcePermissionResource] = []
+        for resource in resources:
+            eligible_columns: tuple[str, ...] = ()
+            schema = schemas_by_resource_id.get(resource.id)
+            if schema is not None and resource.kind is ResourceKind.TABLE:
+                eligible_columns = tuple(
+                    column
+                    for column in schema.columns
+                    if validate_postgresql_update_scope(
+                        source_id,
+                        resource.id,
+                        (column,),
+                        resources=(schema,),
+                    ).valid
+                )
+            choices.append(
+                SourcePermissionResource(
+                    resource_id=resource.id,
+                    display_name=resource.native_identity,
+                    resource_kind=resource.kind.value,
+                    eligible_assignment_columns=eligible_columns,
+                )
             )
-            if reference is not None:
-                try:
-                    await self._keychain.delete(reference)
-                except Exception:
-                    raise AgentHomeError(
-                        "source was detached, but its stored credential "
-                        "could not be deleted"
-                    ) from None
-            return detached
+        return SourcePermissionsInspection(
+            source_id=source_id,
+            source_display_name=registration.display_name,
+            adapter_id=registration.adapter_id,
+            catalog_generation=catalog_generation,
+            state=SourcePermissionState(read_scope, update_scopes),
+            resources=tuple(choices),
+        )
+
+    async def _build_source_permissions_preview(
+        self,
+        inspection: SourcePermissionsInspection,
+        *,
+        read_mode: SourceReadMode,
+        read_resource_ids: tuple[str, ...],
+        postgresql_update_scopes: Mapping[str, tuple[str, ...]],
+    ) -> SourcePermissionsPreview:
+        if not isinstance(read_mode, SourceReadMode):
+            raise TypeError("read_mode must be SourceReadMode")
+        if not isinstance(read_resource_ids, tuple):
+            raise TypeError("read_resource_ids must be a tuple")
+        if not isinstance(postgresql_update_scopes, Mapping):
+            raise TypeError("postgresql_update_scopes must be a mapping")
+        current_resources = {
+            resource.resource_id: resource for resource in inspection.resources
+        }
+        requested_read = SourceReadScope(
+            agent_id=self.identity.id,
+            source_id=inspection.source_id,
+            mode=read_mode,
+            resource_ids=read_resource_ids,
+        )
+        if requested_read.mode is SourceReadMode.SELECTED:
+            unknown_read_ids = set(requested_read.resource_ids) - set(current_resources)
+            if unknown_read_ids:
+                raise ValueError(
+                    "selected read resources are not current resources of this source"
+                )
+        if postgresql_update_scopes and inspection.adapter_id != "postgresql":
+            raise ValueError(
+                "PostgreSQL update scopes require an active PostgreSQL source"
+            )
+
+        registration = await self._store.load_source(
+            self.identity.id,
+            inspection.source_id,
+        )
+        if (
+            registration is None
+            or not registration.active
+            or registration.adapter_id != inspection.adapter_id
+        ):
+            raise ValueError("source identity changed during permission preview")
+        tabular_by_resource_id = {
+            item.resource.id: item
+            for item in await self._catalog_service.tabular_resources(
+                self.identity.id,
+                inspection.source_id,
+            )
+        }
+        update_scopes: list[PostgreSQLUpdateScope] = []
+        requested_update_ids: set[str] = set()
+        for resource_id, raw_columns in postgresql_update_scopes.items():
+            if not isinstance(resource_id, str) or not resource_id:
+                raise ValueError("update scope resource ids must be non-empty text")
+            if not isinstance(raw_columns, tuple):
+                raise TypeError("update scope columns must be tuples")
+            resource = current_resources.get(resource_id)
+            if resource is None or not resource.postgresql_update_eligible:
+                raise ValueError(
+                    "PostgreSQL update scope requires a current eligible table"
+                )
+            selected_columns = tuple(sorted(raw_columns))
+            if (
+                not selected_columns
+                or len(selected_columns) != len(set(selected_columns))
+                or not set(selected_columns)
+                <= set(resource.eligible_assignment_columns)
+            ):
+                raise ValueError(
+                    "update scope columns must be a non-empty eligible subset"
+                )
+            requested_update_ids.add(resource_id)
+            tabular = tabular_by_resource_id.get(resource_id)
+            if tabular is None or tabular.resource.kind is not ResourceKind.TABLE:
+                raise ValueError(
+                    "PostgreSQL update scope requires exact current table facts"
+                )
+            update_scopes.append(
+                PostgreSQLUpdateScope(
+                    agent_id=self.identity.id,
+                    source_id=inspection.source_id,
+                    resource_id=resource_id,
+                    allowed_assignment_columns=selected_columns,
+                    authorization_fingerprint=(
+                        postgresql_update_authorization_fingerprint(
+                            source=registration,
+                            resource=tabular.resource,
+                            facet=tabular.facet,
+                            allowed_assignment_columns=selected_columns,
+                        )
+                    ),
+                )
+            )
+
+        automatic_read_additions: set[str] = set()
+        if requested_read.mode is SourceReadMode.ALL:
+            final_read_scope = requested_read
+        else:
+            requested_ids = set(requested_read.resource_ids)
+            automatic_read_additions = requested_update_ids - requested_ids
+            final_ids = requested_ids | requested_update_ids
+            final_read_scope = (
+                SourceReadScope(
+                    agent_id=self.identity.id,
+                    source_id=inspection.source_id,
+                    mode=SourceReadMode.SELECTED,
+                    resource_ids=tuple(final_ids),
+                )
+                if final_ids
+                else SourceReadScope(
+                    agent_id=self.identity.id,
+                    source_id=inspection.source_id,
+                    mode=SourceReadMode.NONE,
+                )
+            )
+        effective_read_ids = (
+            set(current_resources)
+            if final_read_scope.mode is SourceReadMode.ALL
+            else set(final_read_scope.resource_ids)
+        )
+        dependent_revocations = tuple(
+            scope.resource_id
+            for scope in inspection.state.postgresql_update_scopes
+            if scope.resource_id not in effective_read_ids
+        )
+
+        after = SourcePermissionState(
+            final_read_scope,
+            tuple(update_scopes),
+        )
+        names = {
+            resource.resource_id: resource.display_name
+            for resource in inspection.resources
+        }
+        summary = SourcePermissionSummary(
+            source_display_name=inspection.source_display_name,
+            read_mode=final_read_scope.mode,
+            selected_read_resource_count=(
+                len(current_resources)
+                if final_read_scope.mode is SourceReadMode.ALL
+                else len(final_read_scope.resource_ids)
+            ),
+            postgresql_update_table_count=len(update_scopes),
+            postgresql_update_table_examples=tuple(
+                names.get(scope.resource_id, scope.resource_id)
+                for scope in sorted(
+                    update_scopes,
+                    key=lambda item: names.get(item.resource_id, item.resource_id),
+                )[:5]
+            ),
+            automatic_read_addition_examples=tuple(
+                names.get(resource_id, resource_id)
+                for resource_id in sorted(
+                    automatic_read_additions,
+                    key=lambda item: names.get(item, item),
+                )[:5]
+            ),
+            dependent_update_revocation_examples=tuple(
+                names.get(resource_id, resource_id)
+                for resource_id in sorted(
+                    dependent_revocations,
+                    key=lambda item: names.get(item, item),
+                )[:5]
+            ),
+        )
+        material = {
+            "source_id": inspection.source_id,
+            "adapter_id": inspection.adapter_id,
+            "catalog_generation": inspection.catalog_generation,
+            "before": _source_permission_state_payload(inspection.state),
+            "after": _source_permission_state_payload(after),
+            "automatic_read_additions": tuple(sorted(automatic_read_additions)),
+            "dependent_update_revocations": tuple(sorted(dependent_revocations)),
+        }
+        confirmation_fingerprint = (
+            "sha256:"
+            + hmac.new(
+                self._source_permission_confirmation_key,
+                canonical_json(material).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+        )
+        return SourcePermissionsPreview(
+            source_id=inspection.source_id,
+            catalog_generation=inspection.catalog_generation,
+            before=inspection.state,
+            after=after,
+            automatic_read_additions=tuple(automatic_read_additions),
+            dependent_update_revocations=dependent_revocations,
+            summary=summary,
+            confirmation_fingerprint=confirmation_fingerprint,
+        )
+
+    async def postgresql_update_readiness(
+        self,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+    ) -> PostgreSQLUpdateReadiness:
+        """Inspect one exact PostgreSQL update scope without mutating state."""
+
+        self._require_open()
+        return await self._postgresql_update_backend.postgresql_update_readiness(
+            agent_id=self.identity.id,
+            source_id=source_id,
+            resource_id=resource_id,
+            assignment_columns=assignment_columns,
+        )
+
+    async def detach(self, source_id: str) -> SourceRegistration:
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                detached = await self._store.detach_source(
+                    self.identity.id, source_id, self._clock()
+                )
+                reference = _owned_source_credential_reference(
+                    detached,
+                    agent_id=self.identity.id,
+                )
+                if reference is not None:
+                    try:
+                        await self._keychain.delete(reference)
+                    except Exception:
+                        raise AgentHomeError(
+                            "source was detached, but its stored credential "
+                            "could not be deleted"
+                        ) from None
+                return detached
 
     async def refresh_source(self, source_id: str) -> SourceRegistration:
         """Refresh one active source using its exact admitted registration."""
 
         if not isinstance(source_id, str) or not source_id:
             raise ValueError("source_id must be a non-empty string")
-        async with self._mutation_lock:
-            self._require_open()
-            registration = await self._store.load_source(self.identity.id, source_id)
-            if registration is None or not registration.active:
-                raise ValueError("unknown active source for this agent")
-            source = _source_from_registration(
-                registration,
-                secret_provider=default_secret_provider(
-                    self._secret_provider or self._keychain
-                ),
-            )
-            return await self._attach_source_locked(
-                source,
-                attached_at=registration.attached_at,
-            )
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                registration = await self._store.load_source(
+                    self.identity.id, source_id
+                )
+                if registration is None or not registration.active:
+                    raise ValueError("unknown active source for this agent")
+                source = _source_from_registration(
+                    registration,
+                    secret_provider=default_secret_provider(
+                        self._secret_provider or self._keychain
+                    ),
+                )
+                return await self._attach_source_locked(
+                    source,
+                    attached_at=registration.attached_at,
+                    persisted_registration=registration,
+                )
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         self._require_open()
@@ -1949,6 +2660,9 @@ class EmbeddedAgent:
             raise asyncio.CancelledError
 
     async def _finish_close(self) -> None:
+        async with self._run_lock:
+            async with self._mutation_lock:
+                pass
         first_error: BaseException | None = None
         for store in (
             self._candidate_reviewer,
@@ -1976,6 +2690,25 @@ class EmbeddedAgent:
     def _require_open(self) -> None:
         if self._closed:
             raise AgentHomeError("embedded agent is closed")
+
+
+def _source_permission_state_payload(
+    state: SourcePermissionState,
+) -> dict[str, object]:
+    return {
+        "read": {
+            "mode": state.read_scope.mode.value,
+            "resource_ids": state.read_scope.resource_ids,
+        },
+        "postgresql_updates": tuple(
+            {
+                "resource_id": scope.resource_id,
+                "allowed_assignment_columns": scope.allowed_assignment_columns,
+                "authorization_fingerprint": scope.authorization_fingerprint,
+            }
+            for scope in state.postgresql_update_scopes
+        ),
+    }
 
 
 def _source_from_registration(
@@ -2058,7 +2791,7 @@ def _source_from_registration(
         }
         allowed = required | {"credential_ref"}
         fields = set(configuration)
-        if fields != required and fields != allowed:
+        if not required <= fields or not fields <= allowed:
             raise AgentHomeError("PostgreSQL source configuration is invalid")
         raw_schemas = configuration["schemas"]
         if not isinstance(raw_schemas, tuple) or any(
@@ -2363,6 +3096,74 @@ def _credential_reference_is_owned(
     suffix = reference.name[len(prefix) :]
     return len(suffix) == 24 and all(
         character in "0123456789abcdef" for character in suffix
+    )
+
+
+def _source_edit_read_scope(
+    *,
+    current_read_scope: SourceReadScope,
+    current_resources: tuple[CatalogResource, ...],
+    replacement: SourceCatalogSnapshot,
+) -> tuple[SourceReadScope, tuple[str, ...]]:
+    """Carry read intent only across exact kind/native-identity matches."""
+
+    if current_read_scope.mode is SourceReadMode.ALL:
+        return (
+            SourceReadScope.allow_all(
+                agent_id=replacement.sync.agent_id,
+                source_id=replacement.sync.source_id,
+            ),
+            (),
+        )
+    if current_read_scope.mode is SourceReadMode.NONE:
+        return (
+            SourceReadScope(
+                agent_id=replacement.sync.agent_id,
+                source_id=replacement.sync.source_id,
+                mode=SourceReadMode.NONE,
+            ),
+            (),
+        )
+
+    current_by_id = {resource.id: resource for resource in current_resources}
+    replacement_by_identity: dict[tuple[ResourceKind, str], list[CatalogResource]] = {}
+    for resource in replacement.resources:
+        replacement_by_identity.setdefault(
+            (resource.kind, resource.native_identity),
+            [],
+        ).append(resource)
+    preserved: list[str] = []
+    omitted: list[str] = []
+    for resource_id in current_read_scope.resource_ids:
+        current = current_by_id.get(resource_id)
+        if current is None:
+            omitted.append(resource_id)
+            continue
+        matches = replacement_by_identity.get(
+            (current.kind, current.native_identity),
+            [],
+        )
+        if len(matches) != 1:
+            omitted.append(current.native_identity)
+            continue
+        preserved.append(matches[0].id)
+    if not preserved:
+        return (
+            SourceReadScope(
+                agent_id=replacement.sync.agent_id,
+                source_id=replacement.sync.source_id,
+                mode=SourceReadMode.NONE,
+            ),
+            tuple(sorted(omitted)),
+        )
+    return (
+        SourceReadScope(
+            agent_id=replacement.sync.agent_id,
+            source_id=replacement.sync.source_id,
+            mode=SourceReadMode.SELECTED,
+            resource_ids=tuple(preserved),
+        ),
+        tuple(sorted(omitted)),
     )
 
 
@@ -2936,6 +3737,7 @@ def _admit_agent_home(
             "agent name must contain 1-64 ASCII letters, digits, '_' or '-'"
         )
     state_root = _resolve_state_root(root)
+    _reject_legacy_state_root(state_root)
     state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     agents_root = state_root / "agents"
     agents_root.mkdir(mode=0o700, exist_ok=True)
@@ -2962,6 +3764,7 @@ def _candidate_agent_homes(root: str | Path | None) -> tuple[Path, ...]:
         return ()
     if not state_root.is_dir():
         raise AgentHomeError("agent state root must be a directory")
+    _reject_legacy_state_root(state_root)
     agents_root = state_root / "agents"
     if not agents_root.exists():
         return ()
@@ -2988,6 +3791,24 @@ def _candidate_agent_homes(root: str | Path | None) -> tuple[Path, ...]:
             continue
         candidates.append(home)
     return tuple(candidates)
+
+
+def _reject_legacy_state_root(state_root: Path) -> None:
+    if (state_root / "agents").exists() or not state_root.exists():
+        return
+    if not any((state_root / marker).exists() for marker in _LEGACY_STATE_ROOT_MARKERS):
+        return
+    raise StateCompatibilityError(
+        StateCompatibilityCode.LEGACY,
+        state_root,
+        (
+            "This local data directory belongs to the unsupported pre-1.0 Daita "
+            "framework. It was left unchanged. Use a separate current root "
+            "and keep this directory intact for a deliberate legacy export/import."
+        ),
+        current_revision=SQLiteStateStore.current_revision,
+        found_revision="pre-1.0-framework",
+    )
 
 
 def _resolve_state_root(root: str | Path | None) -> Path:

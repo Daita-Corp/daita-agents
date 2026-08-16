@@ -1,7 +1,8 @@
 """Small SQLite state store for one embedded agent.
 
 The database persists only product state the MVP actually uses: identity,
-attached sources, current catalog snapshots, and exact run transcripts.
+attached sources, current catalog snapshots, exact run transcripts, and the
+minimal receipt needed to classify an external database-write attempt.
 """
 
 from __future__ import annotations
@@ -11,24 +12,19 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import fields, is_dataclass
-from datetime import datetime, timezone
-from decimal import Decimal
-from enum import Enum
+from dataclasses import replace
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import TypeVar
 
 from .._json import FrozenJsonObject
 from ..adapters.models import SourceRegistration
 from ..artifacts.models import (
-    ArtifactAuthorship,
-    ArtifactDeliveryReceipt,
-    ArtifactProvenance,
     ArtifactRef,
-    ArtifactResourceBinding,
     artifact_ref_from_mapping,
 )
 from ..catalog.models import (
@@ -39,130 +35,112 @@ from ..catalog.models import (
     CatalogSnapshotRef,
     CatalogSummary,
     CatalogSync,
-    CatalogSyncStatus,
     FacetKind,
-    RelationshipDirection,
-    RelationshipFieldPair,
     RelationshipKind,
-    RelationshipProvenance,
-    ResourceKind,
-    Sensitivity,
     SourceCatalogSnapshot,
 )
 from ..catalog.protocols import CatalogStoreError
+from ..errors import StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..learning_candidates import (
     LEARNING_CANDIDATE_MAX_RECORDS,
     LEARNING_REVIEW_MAX_PROPOSALS,
     LEARNING_REVIEW_MAX_STAMPS,
-    DocumentCandidateContent,
     LearningCandidate,
-    LearningCandidateAction,
     LearningCandidateError,
     LearningCandidateNotFoundError,
     LearningCandidateRejectionReason,
     LearningCandidateReviewStamp,
-    LearningCandidateRunReference,
     LearningCandidateStatus,
-    LearningCandidateTarget,
     LearningReviewRunTail,
-    SemanticCandidateContent,
-    SkillCandidateContent,
 )
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
-    ModelUsage,
-    TextBlock,
-    ToolCall,
     ToolResultBlock,
-)
-from ..llm.pricing import (
-    CostBasis,
-    CostComponent,
-    CostEstimate,
-    CostEstimateStatus,
-    PricingModifier,
-    PricingUsageRange,
 )
 from ..loop.models import ConversationRun, LoopExit, LoopExitKind, RunInput, Transcript
 from ..semantics import (
     SEMANTIC_MAX_ANNOTATIONS,
-    ResourceRevisionBinding,
     SemanticAnnotation,
     SemanticDigestMismatchError,
-    SemanticEvidence,
-    SemanticEvidenceKind,
-    SemanticFieldReference,
-    SemanticKind,
     SemanticNotFoundError,
-    SemanticSubject,
     SemanticValidationError,
     semantic_annotation_sha256,
+)
+from .sqlite_codecs import (
+    decode_catalog_snapshot,
+    decode_catalog_sync,
+    decode_identifier,
+    decode_identity,
+    decode_learning_candidate,
+    decode_loop_exit,
+    decode_message,
+    decode_postgresql_update_scope,
+    decode_receipt,
+    decode_review_stamps,
+    decode_run_input,
+    decode_semantic_annotation,
+    decode_source,
+    decode_source_read_scope,
+    encode_catalog_snapshot,
+    encode_catalog_sync,
+    encode_identifier,
+    encode_identity,
+    encode_learning_candidate,
+    encode_loop_exit,
+    encode_message,
+    encode_postgresql_update_scope,
+    encode_receipt,
+    encode_review_stamps,
+    encode_run_input,
+    encode_semantic_annotation,
+    encode_source,
+    encode_source_read_scope,
+)
+from .sqlite_migrations import (
+    CURRENT_REVISION,
+    MIGRATIONS,
+    MigrationJournalError,
+    MigrationJournalNewerError,
+    create_current,
+    inspect_journal,
+    upgrade_journaled,
+)
+from .sqlite_migrations.preledger import (
+    PreledgerAdmissionError,
+    PreledgerLegacyError,
+    PreledgerNewerError,
+    PreledgerShape,
+    bridge as bridge_preledger,
+    identify as identify_preledger,
+)
+from .sqlite_records import (
+    DatabaseWriteOutcome,
+    DatabaseWriteReceipt,
+    DatabaseWriteReceiptConflictError,
+    PostgreSQLUpdateScope,
+    SourcePermissionStateError,
+    SourceReadMode,
+    SourceReadScope,
+    database_write_aware as _database_write_aware,
+    database_write_receipt_id,
+    database_write_text as _database_write_text,
+    postgresql_update_authorization_fingerprint,
+    validate_database_write_receipt_id,
+)
+from .sqlite_schema import (
+    CURRENT_TABLES,
+    SCOPED_PERMISSION_TABLES,
+    require_healthy,
+    require_schema,
+    table_names,
 )
 
 _CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH = 64
 _ACTIVE_SOURCE_KEY_PREFIX = "active_source:"
 _LEARNING_REVIEW_STAMPS_KEY_PREFIX = "learning_review_stamps:"
 _T = TypeVar("_T")
-_V1_TABLE_DEFINITIONS = {
-    "learning_candidates": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "messages": (
-        ("run_id", "TEXT", 1, None, 1),
-        ("position", "INTEGER", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "metadata": (
-        ("key", "TEXT", 0, None, 1),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "runs": (
-        ("id", "TEXT", 0, None, 1),
-        ("agent_id", "TEXT", 1, None, 0),
-        ("conversation_id", "TEXT", 1, None, 0),
-        ("turn_index", "INTEGER", 1, None, 0),
-        ("input", "TEXT", 1, None, 0),
-        ("result", "TEXT", 0, None, 0),
-    ),
-    "semantic_annotations": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "snapshots": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("source_id", "TEXT", 1, None, 2),
-        ("sync_id", "TEXT", 1, None, 0),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "sources": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("data", "TEXT", 1, None, 0),
-    ),
-    "syncs": (
-        ("agent_id", "TEXT", 1, None, 1),
-        ("id", "TEXT", 1, None, 2),
-        ("source_id", "TEXT", 1, None, 0),
-        ("data", "TEXT", 1, None, 0),
-    ),
-}
-_V1_MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
-_V1_NAMED_INDEXES = {
-    "runs_conversation_turn": (
-        "runs",
-        True,
-        ("agent_id", "conversation_id", "turn_index"),
-    )
-}
-_INCOMPATIBLE_STATE_MESSAGE = (
-    "state database is not compatible with this Daita release; "
-    "the agent home was preserved"
-)
 
 
 def _active_source_key(agent_id: str) -> str:
@@ -171,6 +149,106 @@ def _active_source_key(agent_id: str) -> str:
 
 def _learning_review_stamps_key(agent_id: str) -> str:
     return f"{_LEARNING_REVIEW_STAMPS_KEY_PREFIX}{agent_id}"
+
+
+def _decode_owned_read_scope(
+    connection: sqlite3.Connection,
+    registration: SourceRegistration,
+    data: object,
+) -> SourceReadScope | None:
+    if not registration.active:
+        if data is not None:
+            raise SourcePermissionStateError(
+                "detached source unexpectedly retains a read scope"
+            )
+        return None
+    if not isinstance(data, str):
+        raise SourcePermissionStateError("active source is missing its read scope")
+    try:
+        scope = decode_source_read_scope(
+            data,
+            agent_id=registration.agent_id,
+            source_id=registration.id,
+        )
+        if scope.mode is SourceReadMode.SELECTED:
+            _require_nonforeign_read_resources(connection, scope)
+        return scope
+    except SourcePermissionStateError:
+        raise
+    except (TypeError, ValueError):
+        raise SourcePermissionStateError(
+            "active source read scope is undecodable"
+        ) from None
+
+
+def _require_nonforeign_read_resources(
+    connection: sqlite3.Connection,
+    scope: SourceReadScope,
+) -> None:
+    requested = set(scope.resource_ids)
+    if not requested:
+        return
+    for (data,) in connection.execute(
+        "SELECT data FROM snapshots WHERE agent_id = ?",
+        (scope.agent_id,),
+    ):
+        snapshot = decode_catalog_snapshot(data)
+        for resource in snapshot.resources:
+            if resource.id in requested and resource.source_id != scope.source_id:
+                raise SourcePermissionStateError(
+                    "active source read scope contains a foreign resource"
+                )
+
+
+def _decode_source_state(
+    connection: sqlite3.Connection,
+    *,
+    row_agent_id: object,
+    row_source_id: object,
+    source_data: object,
+    read_scope_data: object,
+    update_scope_count: object,
+) -> SourceRegistration:
+    if (
+        not isinstance(row_agent_id, str)
+        or not isinstance(row_source_id, str)
+        or not isinstance(source_data, str)
+        or not isinstance(update_scope_count, int)
+        or isinstance(update_scope_count, bool)
+        or update_scope_count < 0
+    ):
+        raise SourcePermissionStateError("stored source permission state is invalid")
+    try:
+        registration = decode_source(source_data)
+    except (TypeError, ValueError):
+        raise SourcePermissionStateError(
+            "stored source registration is invalid"
+        ) from None
+    if registration.agent_id != row_agent_id or registration.id != row_source_id:
+        raise SourcePermissionStateError("stored source ownership is invalid")
+    _decode_owned_read_scope(connection, registration, read_scope_data)
+    if update_scope_count and (
+        not registration.active or registration.adapter_id != "postgresql"
+    ):
+        raise SourcePermissionStateError("stored PostgreSQL update scope is foreign")
+    return registration
+
+
+def _source_state_row(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    source_id: str,
+) -> tuple[object, ...] | None:
+    return connection.execute(
+        """SELECT s.agent_id, s.id, s.data, r.data,
+                  (SELECT COUNT(*) FROM postgresql_update_scopes AS u
+                   WHERE u.agent_id = s.agent_id AND u.source_id = s.id)
+           FROM sources AS s
+           LEFT JOIN source_read_scopes AS r
+             ON r.agent_id = s.agent_id AND r.source_id = s.id
+           WHERE s.agent_id = ? AND s.id = ?""",
+        (agent_id, source_id),
+    ).fetchone()
 
 
 class _CatalogCommitGate:
@@ -201,8 +279,53 @@ class _CatalogCommitGate:
             return True
 
 
+class _UpgradeCommitGate:
+    """Let task cancellation veto a not-yet-committed state migration."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._committed = False
+
+    def start(self, connection: sqlite3.Connection) -> bool:
+        with self._lock:
+            if self._cancelled:
+                return False
+        connection.execute("BEGIN IMMEDIATE")
+        with self._lock:
+            if self._cancelled:
+                connection.rollback()
+                return False
+            return True
+
+    def commit(self, connection: sqlite3.Connection) -> bool:
+        with self._lock:
+            if self._cancelled:
+                connection.rollback()
+                return False
+            connection.commit()
+            return True
+
+    def activate(self, callback: Callable[[], None]) -> bool:
+        with self._lock:
+            if self._cancelled:
+                return False
+            callback()
+            self._committed = True
+            return True
+
+    def cancel_before_commit(self) -> bool:
+        with self._lock:
+            if self._committed:
+                return False
+            self._cancelled = True
+            return True
+
+
 class SQLiteStateStore:
-    """One fixed-format persistence boundary for the launched v1 agent home."""
+    """Sole persistence and upgrade boundary for one admitted agent home."""
+
+    current_revision = CURRENT_REVISION
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -212,9 +335,33 @@ class SQLiteStateStore:
         self._decoded_catalog_snapshot_lock = asyncio.Lock()
 
     @classmethod
-    async def open(cls, path: str | Path, **_: object) -> SQLiteStateStore:
+    async def open(
+        cls,
+        path: str | Path,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        **_: object,
+    ) -> SQLiteStateStore:
         resolved = Path(path).resolve()
-        await asyncio.to_thread(_initialize, resolved)
+        resolved_clock = clock or (lambda: datetime.now(UTC))
+
+        upgrade_gate = _UpgradeCommitGate()
+
+        def admit() -> None:
+            if _initialize(resolved, upgrade_gate=upgrade_gate):
+                _recover_started_database_write_receipts(resolved, resolved_clock)
+
+        worker = asyncio.create_task(asyncio.to_thread(admit))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+                upgrade_gate.cancel_before_commit()
+        worker.result()
+        if cancelled:
+            raise asyncio.CancelledError
         return cls(resolved)
 
     async def close(self) -> None:
@@ -228,7 +375,7 @@ class SQLiteStateStore:
                     "SELECT data FROM metadata WHERE key = 'identity'"
                 ).fetchone()
                 if row is not None:
-                    current = _expect(_loads(row[0]), AgentIdentity)
+                    current = decode_identity(row[0])
                     if current != identity:
                         raise AgentIdentityConflictError(
                             "state database already belongs to another agent"
@@ -236,7 +383,7 @@ class SQLiteStateStore:
                     return current
                 connection.execute(
                     "INSERT INTO metadata(key, data) VALUES ('identity', ?)",
-                    (_dumps(identity),),
+                    (encode_identity(identity),),
                 )
                 return identity
 
@@ -248,7 +395,7 @@ class SQLiteStateStore:
                 row = connection.execute(
                     "SELECT data FROM metadata WHERE key = 'identity'"
                 ).fetchone()
-            return None if row is None else _expect(_loads(row[0]), AgentIdentity)
+            return None if row is None else decode_identity(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -256,23 +403,43 @@ class SQLiteStateStore:
         self, registration: SourceRegistration
     ) -> SourceRegistration:
         def write() -> SourceRegistration:
+            stored = registration
             with _connect(self.path) as connection:
-                row = connection.execute(
-                    "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
-                    (registration.agent_id, registration.id),
-                ).fetchone()
+                connection.execute("BEGIN IMMEDIATE")
+                row = _source_state_row(
+                    connection,
+                    registration.agent_id,
+                    registration.id,
+                )
                 if row is not None:
-                    current = _expect(_loads(row[0]), SourceRegistration)
-                    if current != registration:
+                    current = _decode_source_state(
+                        connection,
+                        row_agent_id=row[0],
+                        row_source_id=row[1],
+                        source_data=row[2],
+                        read_scope_data=row[3],
+                        update_scope_count=row[4],
+                    )
+                    if current != stored:
                         raise ValueError(
                             f"source registration already exists: {registration.id}"
                         )
                     return current
                 connection.execute(
                     "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
-                    (registration.agent_id, registration.id, _dumps(registration)),
+                    (stored.agent_id, stored.id, encode_source(stored)),
                 )
-                return registration
+                if stored.active:
+                    scope = SourceReadScope.allow_all(
+                        agent_id=stored.agent_id,
+                        source_id=stored.id,
+                    )
+                    connection.execute(
+                        """INSERT INTO source_read_scopes(agent_id, source_id, data)
+                           VALUES (?, ?, ?)""",
+                        (stored.agent_id, stored.id, encode_source_read_scope(scope)),
+                    )
+                return stored
 
         return await asyncio.to_thread(write)
 
@@ -281,11 +448,19 @@ class SQLiteStateStore:
     ) -> SourceRegistration | None:
         def read() -> SourceRegistration | None:
             with _connect(self.path) as connection:
-                row = connection.execute(
-                    "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
-                    (agent_id, source_id),
-                ).fetchone()
-            return None if row is None else _expect(_loads(row[0]), SourceRegistration)
+                row = _source_state_row(connection, agent_id, source_id)
+                return (
+                    None
+                    if row is None
+                    else _decode_source_state(
+                        connection,
+                        row_agent_id=row[0],
+                        row_source_id=row[1],
+                        source_data=row[2],
+                        read_scope_data=row[3],
+                        update_scope_count=row[4],
+                    )
+                )
 
         return await asyncio.to_thread(read)
 
@@ -293,12 +468,421 @@ class SQLiteStateStore:
         def read() -> tuple[SourceRegistration, ...]:
             with _connect(self.path) as connection:
                 rows = connection.execute(
-                    "SELECT data FROM sources WHERE agent_id = ? ORDER BY id",
+                    """SELECT s.agent_id, s.id, s.data, r.data,
+                              (SELECT COUNT(*)
+                               FROM postgresql_update_scopes AS u
+                               WHERE u.agent_id = s.agent_id
+                                 AND u.source_id = s.id)
+                       FROM sources AS s
+                       LEFT JOIN source_read_scopes AS r
+                         ON r.agent_id = s.agent_id AND r.source_id = s.id
+                       WHERE s.agent_id = ? ORDER BY s.id""",
                     (agent_id,),
                 ).fetchall()
-            return tuple(_expect(_loads(row[0]), SourceRegistration) for row in rows)
+                return tuple(
+                    _decode_source_state(
+                        connection,
+                        row_agent_id=row_agent_id,
+                        row_source_id=row_source_id,
+                        source_data=data,
+                        read_scope_data=read_scope_data,
+                        update_scope_count=update_scope_count,
+                    )
+                    for (
+                        row_agent_id,
+                        row_source_id,
+                        data,
+                        read_scope_data,
+                        update_scope_count,
+                    ) in rows
+                )
 
         return await asyncio.to_thread(read)
+
+    async def load_source_read_scope(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> SourceReadScope | None:
+        """Load one exact active-source scope; invalid state never becomes all."""
+
+        def read() -> SourceReadScope | None:
+            with _connect(self.path) as connection:
+                row = _source_state_row(connection, agent_id, source_id)
+                if row is None:
+                    return None
+                registration = _decode_source_state(
+                    connection,
+                    row_agent_id=row[0],
+                    row_source_id=row[1],
+                    source_data=row[2],
+                    read_scope_data=row[3],
+                    update_scope_count=row[4],
+                )
+                return _decode_owned_read_scope(connection, registration, row[3])
+
+        return await asyncio.to_thread(read)
+
+    async def list_postgresql_update_scopes(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> tuple[PostgreSQLUpdateScope, ...]:
+        def read() -> tuple[PostgreSQLUpdateScope, ...]:
+            with _connect(self.path) as connection:
+                source_row = _source_state_row(connection, agent_id, source_id)
+                if source_row is None:
+                    return ()
+                registration = _decode_source_state(
+                    connection,
+                    row_agent_id=source_row[0],
+                    row_source_id=source_row[1],
+                    source_data=source_row[2],
+                    read_scope_data=source_row[3],
+                    update_scope_count=source_row[4],
+                )
+                if not registration.active:
+                    return ()
+                if registration.adapter_id != "postgresql":
+                    if source_row[4]:
+                        raise SourcePermissionStateError(
+                            "non-PostgreSQL source retains update scopes"
+                        )
+                    return ()
+                rows = connection.execute(
+                    """SELECT resource_id, authorization_fingerprint, data
+                       FROM postgresql_update_scopes
+                       WHERE agent_id = ? AND source_id = ?
+                       ORDER BY resource_id""",
+                    (agent_id, source_id),
+                ).fetchall()
+                try:
+                    return tuple(
+                        decode_postgresql_update_scope(
+                            data,
+                            agent_id=agent_id,
+                            source_id=source_id,
+                            resource_id=resource_id,
+                            authorization_fingerprint=fingerprint,
+                        )
+                        for resource_id, fingerprint, data in rows
+                    )
+                except (TypeError, ValueError):
+                    raise SourcePermissionStateError(
+                        "stored PostgreSQL update scope is undecodable"
+                    ) from None
+
+        return await asyncio.to_thread(read)
+
+    async def replace_source_permission_scopes(
+        self,
+        read_scope: SourceReadScope,
+        update_scopes: tuple[PostgreSQLUpdateScope, ...],
+    ) -> SourceRegistration:
+        """Atomically replace only the two narrow scope families for one source."""
+
+        if not isinstance(read_scope, SourceReadScope):
+            raise TypeError("read_scope must be a SourceReadScope")
+        if not isinstance(update_scopes, tuple) or any(
+            not isinstance(scope, PostgreSQLUpdateScope) for scope in update_scopes
+        ):
+            raise TypeError("update_scopes must be a tuple of PostgreSQLUpdateScope")
+        if len({scope.resource_id for scope in update_scopes}) != len(update_scopes):
+            raise ValueError("update_scopes cannot contain duplicate resources")
+        gate = _CatalogCommitGate()
+
+        def write() -> SourceRegistration | None:
+            connection = _connect(self.path)
+            try:
+                if not gate.start(connection):
+                    return None
+                row = _source_state_row(
+                    connection,
+                    read_scope.agent_id,
+                    read_scope.source_id,
+                )
+                if row is None:
+                    raise ValueError("permission scopes require an active owned source")
+                registration = _decode_source_state(
+                    connection,
+                    row_agent_id=row[0],
+                    row_source_id=row[1],
+                    source_data=row[2],
+                    read_scope_data=row[3],
+                    update_scope_count=row[4],
+                )
+                if not registration.active:
+                    raise ValueError("permission scopes require an active owned source")
+                _require_nonforeign_read_resources(connection, read_scope)
+                if any(
+                    scope.agent_id != read_scope.agent_id
+                    or scope.source_id != read_scope.source_id
+                    for scope in update_scopes
+                ):
+                    raise ValueError("update scope belongs to another source")
+                update_resource_ids = {scope.resource_id for scope in update_scopes}
+                if read_scope.mode is SourceReadMode.NONE and update_resource_ids:
+                    raise ValueError("PostgreSQL update scope requires read access")
+                if (
+                    read_scope.mode is SourceReadMode.SELECTED
+                    and not update_resource_ids <= set(read_scope.resource_ids)
+                ):
+                    raise ValueError("PostgreSQL update scope must be a read subset")
+                if update_scopes and registration.adapter_id != "postgresql":
+                    raise ValueError(
+                        "PostgreSQL update scopes require a PostgreSQL source"
+                    )
+
+                snapshot = _current_source_snapshot(
+                    connection,
+                    read_scope.agent_id,
+                    read_scope.source_id,
+                )
+                resources = (
+                    {}
+                    if snapshot is None
+                    else {item.id: item for item in snapshot.resources}
+                )
+                facets = (
+                    {}
+                    if snapshot is None
+                    else {
+                        item.resource_id: item
+                        for item in snapshot.facets
+                        if item.kind is FacetKind.TABULAR
+                    }
+                )
+                for scope in update_scopes:
+                    resource = resources.get(scope.resource_id)
+                    facet = facets.get(scope.resource_id)
+                    if resource is None or facet is None:
+                        raise ValueError(
+                            "PostgreSQL update scope requires a current table resource"
+                        )
+                    expected = postgresql_update_authorization_fingerprint(
+                        source=registration,
+                        resource=resource,
+                        facet=facet,
+                        allowed_assignment_columns=scope.allowed_assignment_columns,
+                    )
+                    if scope.authorization_fingerprint != expected:
+                        raise ValueError(
+                            "PostgreSQL update authorization fingerprint is stale"
+                        )
+
+                connection.execute(
+                    """INSERT INTO source_read_scopes(agent_id, source_id, data)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(agent_id, source_id)
+                       DO UPDATE SET data = excluded.data""",
+                    (
+                        read_scope.agent_id,
+                        read_scope.source_id,
+                        encode_source_read_scope(read_scope),
+                    ),
+                )
+                connection.execute(
+                    """DELETE FROM postgresql_update_scopes
+                       WHERE agent_id = ? AND source_id = ?""",
+                    (read_scope.agent_id, read_scope.source_id),
+                )
+                for scope in sorted(update_scopes, key=lambda item: item.resource_id):
+                    connection.execute(
+                        """INSERT INTO postgresql_update_scopes(
+                               agent_id, source_id, resource_id,
+                               authorization_fingerprint, data
+                           ) VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            scope.agent_id,
+                            scope.source_id,
+                            scope.resource_id,
+                            scope.authorization_fingerprint,
+                            encode_postgresql_update_scope(scope),
+                        ),
+                    )
+                connection.commit()
+                return registration
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled_before_start = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled_before_start = (
+                    gate.cancel_before_start() or cancelled_before_start
+                )
+        updated = worker.result()
+        if cancelled_before_start:
+            if updated is not None:
+                raise AssertionError(
+                    "cancelled source permission transaction committed"
+                )
+            raise asyncio.CancelledError
+        if updated is None:
+            raise AssertionError(
+                "source permission transaction stopped without cancellation"
+            )
+        return updated
+
+    async def load_database_write_receipt(
+        self,
+        agent_id: str,
+        receipt_id: str,
+    ) -> DatabaseWriteReceipt | None:
+        _database_write_text(agent_id, "receipt agent_id")
+        validate_database_write_receipt_id(receipt_id)
+
+        def read() -> DatabaseWriteReceipt | None:
+            with _connect(self.path) as connection:
+                row = connection.execute(
+                    """SELECT data FROM database_write_receipts
+                       WHERE agent_id = ? AND id = ?""",
+                    (agent_id, receipt_id),
+                ).fetchone()
+            return None if row is None else decode_receipt(row[0])
+
+        return await asyncio.to_thread(read)
+
+    async def load_database_write_receipt_for_call(
+        self,
+        agent_id: str,
+        run_id: str,
+        call_id: str,
+    ) -> DatabaseWriteReceipt | None:
+        _database_write_text(agent_id, "receipt agent_id")
+        _database_write_text(run_id, "receipt run_id")
+        _database_write_text(call_id, "receipt call_id")
+
+        def read() -> DatabaseWriteReceipt | None:
+            with _connect(self.path) as connection:
+                row = connection.execute(
+                    """SELECT data FROM database_write_receipts
+                       WHERE agent_id = ? AND run_id = ? AND call_id = ?""",
+                    (agent_id, run_id, call_id),
+                ).fetchone()
+            return None if row is None else decode_receipt(row[0])
+
+        return await asyncio.to_thread(read)
+
+    async def start_database_write_receipt(
+        self,
+        receipt: DatabaseWriteReceipt,
+    ) -> DatabaseWriteReceipt:
+        if not isinstance(receipt, DatabaseWriteReceipt):
+            raise TypeError("receipt must be a DatabaseWriteReceipt")
+        if receipt.outcome is not DatabaseWriteOutcome.STARTED:
+            raise ValueError(
+                "database write execution must begin with a started receipt"
+            )
+
+        def write() -> DatabaseWriteReceipt:
+            with _connect(self.path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    """SELECT data FROM database_write_receipts
+                       WHERE agent_id = ?
+                         AND (id = ? OR (run_id = ? AND call_id = ?))""",
+                    (
+                        receipt.agent_id,
+                        receipt.receipt_id,
+                        receipt.run_id,
+                        receipt.call_id,
+                    ),
+                ).fetchone()
+                if current is not None:
+                    raise DatabaseWriteReceiptConflictError(
+                        "execution identity already has a receipt"
+                    )
+                connection.execute(
+                    """INSERT INTO database_write_receipts(
+                           agent_id, id, run_id, call_id, data
+                       ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        receipt.agent_id,
+                        receipt.receipt_id,
+                        receipt.run_id,
+                        receipt.call_id,
+                        encode_receipt(receipt),
+                    ),
+                )
+                return receipt
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+        result = worker.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def finish_database_write_receipt(
+        self,
+        receipt: DatabaseWriteReceipt,
+    ) -> DatabaseWriteReceipt:
+        if not isinstance(receipt, DatabaseWriteReceipt):
+            raise TypeError("receipt must be a DatabaseWriteReceipt")
+        if receipt.outcome is DatabaseWriteOutcome.STARTED:
+            raise ValueError(
+                "finish requires a terminal receipt, not a started receipt"
+            )
+
+        def write() -> DatabaseWriteReceipt:
+            with _connect(self.path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    """SELECT data FROM database_write_receipts
+                       WHERE agent_id = ?
+                         AND (id = ? OR (run_id = ? AND call_id = ?))""",
+                    (
+                        receipt.agent_id,
+                        receipt.receipt_id,
+                        receipt.run_id,
+                        receipt.call_id,
+                    ),
+                ).fetchone()
+                if row is None:
+                    raise DatabaseWriteReceiptConflictError(
+                        "started receipt does not exist"
+                    )
+                current = decode_receipt(row[0])
+                if current.outcome is not DatabaseWriteOutcome.STARTED:
+                    if current == receipt:
+                        return current
+                    raise DatabaseWriteReceiptConflictError(
+                        "terminal receipt is immutable"
+                    )
+                if current != receipt.as_started():
+                    raise DatabaseWriteReceiptConflictError(
+                        "terminal receipt does not match its started identity"
+                    )
+                connection.execute(
+                    """UPDATE database_write_receipts SET data = ?
+                       WHERE agent_id = ? AND id = ?""",
+                    (encode_receipt(receipt), receipt.agent_id, receipt.receipt_id),
+                )
+                return receipt
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+        result = worker.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     async def load_active_source_id(self, agent_id: str) -> str | None:
         def read() -> str | None:
@@ -309,8 +893,8 @@ class SQLiteStateStore:
                 ).fetchone()
             if row is None:
                 return None
-            source_id = _loads(row[0])
-            if not isinstance(source_id, str) or not source_id:
+            source_id = decode_identifier(row[0])
+            if not source_id:
                 raise ValueError("stored active source id is invalid")
             return source_id
 
@@ -329,19 +913,23 @@ class SQLiteStateStore:
         def write() -> SourceRegistration:
             with _connect(self.path) as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                row = connection.execute(
-                    "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
-                    (agent_id, source_id),
-                ).fetchone()
+                row = _source_state_row(connection, agent_id, source_id)
                 if row is None:
                     raise ValueError("unknown active source for this agent")
-                registration = _expect(_loads(row[0]), SourceRegistration)
+                registration = _decode_source_state(
+                    connection,
+                    row_agent_id=row[0],
+                    row_source_id=row[1],
+                    source_data=row[2],
+                    read_scope_data=row[3],
+                    update_scope_count=row[4],
+                )
                 if not registration.active:
                     raise ValueError("unknown active source for this agent")
                 connection.execute(
                     """INSERT INTO metadata(key, data) VALUES (?, ?)
                        ON CONFLICT(key) DO UPDATE SET data = excluded.data""",
-                    (_active_source_key(agent_id), _dumps(source_id)),
+                    (_active_source_key(agent_id), encode_identifier(source_id)),
                 )
                 return registration
 
@@ -373,19 +961,31 @@ class SQLiteStateStore:
                 ).fetchone()
                 if row is None:
                     raise KeyError(f"unknown source: {source_id}")
-                current = _expect(_loads(row[0]), SourceRegistration)
+                current = decode_source(row[0])
                 detached = (
                     current if not current.active else current.detach(detached_at)
                 )
                 connection.execute(
                     "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
-                    (_dumps(detached), agent_id, source_id),
+                    (encode_source(detached), agent_id, source_id),
+                )
+                connection.execute(
+                    """DELETE FROM source_read_scopes
+                       WHERE agent_id = ? AND source_id = ?""",
+                    (agent_id, source_id),
+                )
+                connection.execute(
+                    """DELETE FROM postgresql_update_scopes
+                       WHERE agent_id = ? AND source_id = ?""",
+                    (agent_id, source_id),
                 )
                 selection = connection.execute(
                     "SELECT data FROM metadata WHERE key = ?",
                     (_active_source_key(agent_id),),
                 ).fetchone()
-                selected_id = None if selection is None else _loads(selection[0])
+                selected_id = (
+                    None if selection is None else decode_identifier(selection[0])
+                )
                 if selected_id == source_id:
                     connection.execute(
                         "DELETE FROM metadata WHERE key = ?",
@@ -396,7 +996,7 @@ class SQLiteStateStore:
                         "SELECT data FROM sources WHERE agent_id = ? ORDER BY id",
                         (agent_id,),
                     ).fetchall():
-                        candidate = _expect(_loads(data), SourceRegistration)
+                        candidate = decode_source(data)
                         if candidate.active:
                             remaining.append(candidate)
                     if len(remaining) == 1:
@@ -404,7 +1004,7 @@ class SQLiteStateStore:
                             "INSERT INTO metadata(key, data) VALUES (?, ?)",
                             (
                                 _active_source_key(agent_id),
-                                _dumps(remaining[0].id),
+                                encode_identifier(remaining[0].id),
                             ),
                         )
                 connection.commit()
@@ -444,7 +1044,12 @@ class SQLiteStateStore:
                     """INSERT INTO syncs(agent_id, id, source_id, data)
                        VALUES (?, ?, ?, ?)
                        ON CONFLICT(agent_id, id) DO UPDATE SET data = excluded.data""",
-                    (sync.agent_id, sync.id, sync.source_id, _dumps(sync)),
+                    (
+                        sync.agent_id,
+                        sync.id,
+                        sync.source_id,
+                        encode_catalog_sync(sync),
+                    ),
                 )
                 return sync
 
@@ -469,50 +1074,114 @@ class SQLiteStateStore:
                 if not gate.start(connection):
                     return None
                 if registration is not None:
-                    row = connection.execute(
-                        "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
-                        (registration.agent_id, registration.id),
-                    ).fetchone()
+                    stored_registration = registration
+                    row = _source_state_row(
+                        connection,
+                        stored_registration.agent_id,
+                        stored_registration.id,
+                    )
                     if row is None:
                         connection.execute(
                             "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
                             (
-                                registration.agent_id,
-                                registration.id,
-                                _dumps(registration),
+                                stored_registration.agent_id,
+                                stored_registration.id,
+                                encode_source(stored_registration),
                             ),
                         )
+                        if stored_registration.active:
+                            attach_scope = SourceReadScope.allow_all(
+                                agent_id=stored_registration.agent_id,
+                                source_id=stored_registration.id,
+                            )
+                            connection.execute(
+                                """INSERT INTO source_read_scopes(
+                                       agent_id, source_id, data
+                                   ) VALUES (?, ?, ?)""",
+                                (
+                                    stored_registration.agent_id,
+                                    stored_registration.id,
+                                    encode_source_read_scope(attach_scope),
+                                ),
+                            )
                     else:
-                        current = _expect(_loads(row[0]), SourceRegistration)
-                        if current != registration:
-                            raise ValueError(
-                                "source registration already exists: "
-                                f"{registration.id}"
+                        current = _decode_source_state(
+                            connection,
+                            row_agent_id=row[0],
+                            row_source_id=row[1],
+                            source_data=row[2],
+                            read_scope_data=row[3],
+                            update_scope_count=row[4],
+                        )
+                        if current != stored_registration:
+                            if (
+                                current.active
+                                or not stored_registration.active
+                                or current.adapter_id != stored_registration.adapter_id
+                                or current.native_identity
+                                != stored_registration.native_identity
+                            ):
+                                raise ValueError(
+                                    "source registration already exists: "
+                                    f"{stored_registration.id}"
+                                )
+                            connection.execute(
+                                """UPDATE sources SET data = ?
+                                   WHERE agent_id = ? AND id = ?""",
+                                (
+                                    encode_source(stored_registration),
+                                    stored_registration.agent_id,
+                                    stored_registration.id,
+                                ),
+                            )
+                            attach_scope = SourceReadScope.allow_all(
+                                agent_id=stored_registration.agent_id,
+                                source_id=stored_registration.id,
+                            )
+                            connection.execute(
+                                """INSERT INTO source_read_scopes(
+                                       agent_id, source_id, data
+                                   ) VALUES (?, ?, ?)""",
+                                (
+                                    stored_registration.agent_id,
+                                    stored_registration.id,
+                                    encode_source_read_scope(attach_scope),
+                                ),
                             )
                     selection = connection.execute(
                         "SELECT 1 FROM metadata WHERE key = ?",
-                        (_active_source_key(registration.agent_id),),
+                        (_active_source_key(stored_registration.agent_id),),
                     ).fetchone()
                     if selection is None:
                         connection.execute(
                             "INSERT INTO metadata(key, data) VALUES (?, ?)",
                             (
-                                _active_source_key(registration.agent_id),
-                                _dumps(registration.id),
+                                _active_source_key(stored_registration.agent_id),
+                                encode_identifier(stored_registration.id),
                             ),
                         )
                 connection.execute(
                     """INSERT INTO syncs(agent_id, id, source_id, data)
                        VALUES (?, ?, ?, ?)
                        ON CONFLICT(agent_id, id) DO UPDATE SET data = excluded.data""",
-                    (sync.agent_id, sync.id, sync.source_id, _dumps(sync)),
+                    (
+                        sync.agent_id,
+                        sync.id,
+                        sync.source_id,
+                        encode_catalog_sync(sync),
+                    ),
                 )
                 connection.execute(
                     """INSERT INTO snapshots(agent_id, source_id, sync_id, data)
                        VALUES (?, ?, ?, ?)
                        ON CONFLICT(agent_id, source_id) DO UPDATE SET
                          sync_id = excluded.sync_id, data = excluded.data""",
-                    (sync.agent_id, sync.source_id, sync.id, _dumps(snapshot)),
+                    (
+                        sync.agent_id,
+                        sync.source_id,
+                        sync.id,
+                        encode_catalog_snapshot(snapshot),
+                    ),
                 )
                 _commit_catalog_transaction(connection)
                 return snapshot
@@ -539,6 +1208,211 @@ class SQLiteStateStore:
         if committed is None:
             raise AssertionError("catalog transaction stopped without cancellation")
         async with self._decoded_catalog_snapshot_lock:
+            self._publish_decoded_catalog_snapshot(committed)
+        return committed
+
+    async def commit_source_edit(
+        self,
+        snapshot: SourceCatalogSnapshot,
+        *,
+        registration: SourceRegistration,
+        replaced_source_id: str,
+        replaced_at: datetime,
+        read_scope: SourceReadScope,
+    ) -> SourceCatalogSnapshot:
+        """Atomically hand one active source connection to discovered truth."""
+
+        if not isinstance(registration, SourceRegistration) or not registration.active:
+            raise ValueError("source edit requires an active replacement registration")
+        if not isinstance(replaced_source_id, str) or not replaced_source_id:
+            raise ValueError("replaced_source_id must be a non-empty string")
+        sync = snapshot.sync
+        if registration.agent_id != sync.agent_id or registration.id != sync.source_id:
+            raise ValueError("catalog snapshot and replacement registration disagree")
+        if (
+            read_scope.agent_id != registration.agent_id
+            or read_scope.source_id != registration.id
+        ):
+            raise ValueError("replacement read scope belongs to another source")
+        snapshot_resource_ids = {resource.id for resource in snapshot.resources}
+        if (
+            read_scope.mode is SourceReadMode.SELECTED
+            and not set(read_scope.resource_ids) <= snapshot_resource_ids
+        ):
+            raise ValueError("replacement read scope is outside discovered catalog")
+        gate = _CatalogCommitGate()
+
+        def write() -> SourceCatalogSnapshot | None:
+            connection = _connect(self.path)
+            try:
+                if not gate.start(connection):
+                    return None
+                replaced_row = _source_state_row(
+                    connection,
+                    registration.agent_id,
+                    replaced_source_id,
+                )
+                if replaced_row is None:
+                    raise ValueError("source edit requires an active owned source")
+                replaced = _decode_source_state(
+                    connection,
+                    row_agent_id=replaced_row[0],
+                    row_source_id=replaced_row[1],
+                    source_data=replaced_row[2],
+                    read_scope_data=replaced_row[3],
+                    update_scope_count=replaced_row[4],
+                )
+                if not replaced.active:
+                    raise ValueError("source edit requires an active owned source")
+                if replaced.adapter_id != registration.adapter_id:
+                    raise ValueError("source edit cannot change source type")
+
+                if registration.id != replaced.id:
+                    replacement_row = _source_state_row(
+                        connection,
+                        registration.agent_id,
+                        registration.id,
+                    )
+                    if replacement_row is None:
+                        connection.execute(
+                            "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
+                            (
+                                registration.agent_id,
+                                registration.id,
+                                encode_source(registration),
+                            ),
+                        )
+                    else:
+                        existing_replacement = _decode_source_state(
+                            connection,
+                            row_agent_id=replacement_row[0],
+                            row_source_id=replacement_row[1],
+                            source_data=replacement_row[2],
+                            read_scope_data=replacement_row[3],
+                            update_scope_count=replacement_row[4],
+                        )
+                        if existing_replacement.active:
+                            raise ValueError(
+                                "replacement connection is already attached"
+                            )
+                        if (
+                            existing_replacement.adapter_id != registration.adapter_id
+                            or existing_replacement.native_identity
+                            != registration.native_identity
+                        ):
+                            raise ValueError(
+                                "replacement source identity conflicts with stored state"
+                            )
+                        connection.execute(
+                            """UPDATE sources SET data = ?
+                               WHERE agent_id = ? AND id = ?""",
+                            (
+                                encode_source(registration),
+                                registration.agent_id,
+                                registration.id,
+                            ),
+                        )
+                    detached = replaced.detach(replaced_at)
+                    connection.execute(
+                        """UPDATE sources SET data = ?
+                           WHERE agent_id = ? AND id = ?""",
+                        (
+                            encode_source(detached),
+                            replaced.agent_id,
+                            replaced.id,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE sources SET data = ?
+                           WHERE agent_id = ? AND id = ?""",
+                        (
+                            encode_source(registration),
+                            registration.agent_id,
+                            registration.id,
+                        ),
+                    )
+
+                for source_id in {replaced.id, registration.id}:
+                    connection.execute(
+                        """DELETE FROM source_read_scopes
+                           WHERE agent_id = ? AND source_id = ?""",
+                        (registration.agent_id, source_id),
+                    )
+                    connection.execute(
+                        """DELETE FROM postgresql_update_scopes
+                           WHERE agent_id = ? AND source_id = ?""",
+                        (registration.agent_id, source_id),
+                    )
+                connection.execute(
+                    """INSERT INTO source_read_scopes(agent_id, source_id, data)
+                       VALUES (?, ?, ?)""",
+                    (
+                        read_scope.agent_id,
+                        read_scope.source_id,
+                        encode_source_read_scope(read_scope),
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO metadata(key, data) VALUES (?, ?)
+                       ON CONFLICT(key) DO UPDATE SET data = excluded.data""",
+                    (
+                        _active_source_key(registration.agent_id),
+                        encode_identifier(registration.id),
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO syncs(agent_id, id, source_id, data)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(agent_id, id) DO UPDATE SET data = excluded.data""",
+                    (
+                        sync.agent_id,
+                        sync.id,
+                        sync.source_id,
+                        encode_catalog_sync(sync),
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO snapshots(agent_id, source_id, sync_id, data)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(agent_id, source_id) DO UPDATE SET
+                         sync_id = excluded.sync_id, data = excluded.data""",
+                    (
+                        sync.agent_id,
+                        sync.source_id,
+                        sync.id,
+                        encode_catalog_snapshot(snapshot),
+                    ),
+                )
+                _commit_catalog_transaction(connection)
+                return snapshot
+            except BaseException:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled_before_start = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled_before_start = (
+                    gate.cancel_before_start() or cancelled_before_start
+                )
+        committed = worker.result()
+        if cancelled_before_start:
+            if committed is not None:
+                raise AssertionError("cancelled source edit transaction committed")
+            raise asyncio.CancelledError
+        if committed is None:
+            raise AssertionError("source edit transaction stopped without cancellation")
+        async with self._decoded_catalog_snapshot_lock:
+            self._evict_decoded_catalog_source(
+                registration.agent_id,
+                replaced_source_id,
+            )
             self._publish_decoded_catalog_snapshot(committed)
         return committed
 
@@ -647,7 +1521,7 @@ class SQLiteStateStore:
                     "SELECT data FROM syncs WHERE agent_id = ? AND id = ?",
                     (agent_id, sync_id),
                 ).fetchone()
-            return None if row is None else _expect(_loads(row[0]), CatalogSync)
+            return None if row is None else decode_catalog_sync(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -779,7 +1653,7 @@ class SQLiteStateStore:
                 raise RuntimeError(
                     "stored semantic annotation collection exceeds bound"
                 )
-            return tuple(_expect(_loads(data), SemanticAnnotation) for (data,) in rows)
+            return tuple(decode_semantic_annotation(data) for (data,) in rows)
 
         return await asyncio.to_thread(read)
 
@@ -800,7 +1674,7 @@ class SQLiteStateStore:
                        WHERE agent_id = ? AND id = ?""",
                     (agent_id, annotation_id),
                 ).fetchone()
-            return None if row is None else _expect(_loads(row[0]), SemanticAnnotation)
+            return None if row is None else decode_semantic_annotation(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -854,14 +1728,13 @@ class SQLiteStateStore:
                     (agent_id, annotation.id),
                 ).fetchone()
                 changed = (
-                    row is None
-                    or _expect(_loads(row[0]), SemanticAnnotation) != annotation
+                    row is None or decode_semantic_annotation(row[0]) != annotation
                 )
                 connection.execute(
                     """INSERT INTO semantic_annotations(agent_id, id, data)
                        VALUES (?, ?, ?)
                        ON CONFLICT(agent_id, id) DO UPDATE SET data = excluded.data""",
-                    (agent_id, annotation.id, _dumps(annotation)),
+                    (agent_id, annotation.id, encode_semantic_annotation(annotation)),
                 )
                 connection.commit()
                 return changed
@@ -995,7 +1868,7 @@ class SQLiteStateStore:
                 unreadable_run_count = 0
                 for run_id, turn_index, input_data, result_data in rows:
                     try:
-                        result = _expect(_loads(result_data), LoopExit)
+                        result = decode_loop_exit(result_data)
                         if result.kind is not LoopExitKind.COMPLETED:
                             continue
                         message_rows = connection.execute(
@@ -1006,10 +1879,9 @@ class SQLiteStateStore:
                         record = ConversationRun(
                             turn_index=int(turn_index),
                             transcript=Transcript(
-                                run=_expect(_loads(input_data), RunInput),
+                                run=decode_run_input(input_data),
                                 messages=tuple(
-                                    _expect(_loads(data), CanonicalMessage)
-                                    for (data,) in message_rows
+                                    decode_message(data) for (data,) in message_rows
                                 ),
                             ),
                             result=result,
@@ -1055,7 +1927,7 @@ class SQLiteStateStore:
                        WHERE agent_id = ? AND id = ?""",
                     (agent_id, candidate_id),
                 ).fetchone()
-            return None if row is None else _expect(_loads(row[0]), LearningCandidate)
+            return None if row is None else decode_learning_candidate(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -1145,7 +2017,7 @@ class SQLiteStateStore:
                 connection.execute(
                     """INSERT INTO learning_candidates(agent_id, id, data)
                        VALUES (?, ?, ?)""",
-                    (agent_id, candidate.id, _dumps(candidate)),
+                    (agent_id, candidate.id, encode_learning_candidate(candidate)),
                 )
                 by_id[candidate.id] = candidate
                 identities.add(candidate.candidate_identity_sha256)
@@ -1155,7 +2027,7 @@ class SQLiteStateStore:
                    ON CONFLICT(key) DO UPDATE SET data = excluded.data""",
                 (
                     _learning_review_stamps_key(agent_id),
-                    _dumps(tuple(merged_stamps)),
+                    encode_review_stamps(tuple(merged_stamps)),
                 ),
             )
             return tuple(inserted)
@@ -1226,7 +2098,7 @@ class SQLiteStateStore:
             connection.execute(
                 """UPDATE learning_candidates SET data = ?
                    WHERE agent_id = ? AND id = ?""",
-                (_dumps(candidate), agent_id, candidate.id),
+                (encode_learning_candidate(candidate), agent_id, candidate.id),
             )
             return candidate
 
@@ -1257,21 +2129,16 @@ class SQLiteStateStore:
                 current,
                 expected_fingerprint=expected_fingerprint,
             )
-            rejected = LearningCandidate(
-                **{
-                    **{
-                        field.name: getattr(current, field.name)
-                        for field in fields(current)
-                    },
-                    "status": LearningCandidateStatus.REJECTED,
-                    "updated_at": rejected_at,
-                    "rejection_reason": reason,
-                }
+            rejected = replace(
+                current,
+                status=LearningCandidateStatus.REJECTED,
+                updated_at=rejected_at,
+                rejection_reason=reason,
             )
             connection.execute(
                 """UPDATE learning_candidates SET data = ?
                    WHERE agent_id = ? AND id = ?""",
-                (_dumps(rejected), agent_id, candidate_id),
+                (encode_learning_candidate(rejected), agent_id, candidate_id),
             )
             return rejected
 
@@ -1299,20 +2166,15 @@ class SQLiteStateStore:
                 current,
                 expected_fingerprint=expected_fingerprint,
             )
-            accepted = LearningCandidate(
-                **{
-                    **{
-                        field.name: getattr(current, field.name)
-                        for field in fields(current)
-                    },
-                    "status": LearningCandidateStatus.ACCEPTED,
-                    "updated_at": accepted_at,
-                }
+            accepted = replace(
+                current,
+                status=LearningCandidateStatus.ACCEPTED,
+                updated_at=accepted_at,
             )
             connection.execute(
                 """UPDATE learning_candidates SET data = ?
                    WHERE agent_id = ? AND id = ?""",
-                (_dumps(accepted), agent_id, candidate_id),
+                (encode_learning_candidate(accepted), agent_id, candidate_id),
             )
             return accepted
 
@@ -1366,7 +2228,7 @@ class SQLiteStateStore:
                             run.agent_id,
                             run.conversation_id,
                             int(row[0]),
-                            _dumps(run),
+                            encode_run_input(run),
                         ),
                     )
                 except sqlite3.IntegrityError as error:
@@ -1391,7 +2253,7 @@ class SQLiteStateStore:
                     raise KeyError(f"unknown run: {run_id}")
                 connection.execute(
                     "INSERT INTO messages(run_id, position, data) VALUES (?, ?, ?)",
-                    (run_id, int(row[0]), _dumps(message)),
+                    (run_id, int(row[0]), encode_message(message)),
                 )
 
         await asyncio.to_thread(write)
@@ -1402,7 +2264,11 @@ class SQLiteStateStore:
                 cursor = connection.execute(
                     """UPDATE runs SET result = ?
                        WHERE id = ? AND conversation_id = ?""",
-                    (_dumps(result), result.run_id, result.conversation_id),
+                    (
+                        encode_loop_exit(result),
+                        result.run_id,
+                        result.conversation_id,
+                    ),
                 )
                 if cursor.rowcount != 1:
                     raise KeyError(f"unknown run: {result.run_id}")
@@ -1422,10 +2288,8 @@ class SQLiteStateStore:
                     (run_id,),
                 ).fetchall()
             return Transcript(
-                run=_expect(_loads(run_row[0]), RunInput),
-                messages=tuple(
-                    _expect(_loads(row[0]), CanonicalMessage) for row in rows
-                ),
+                run=decode_run_input(run_row[0]),
+                messages=tuple(decode_message(row[0]) for row in rows),
             )
 
         return await asyncio.to_thread(read)
@@ -1438,7 +2302,7 @@ class SQLiteStateStore:
                 ).fetchone()
             if row is None:
                 raise KeyError(f"unknown run: {run_id}")
-            return None if row[0] is None else _expect(_loads(row[0]), LoopExit)
+            return None if row[0] is None else decode_loop_exit(row[0])
 
         return await asyncio.to_thread(read)
 
@@ -1481,7 +2345,7 @@ class SQLiteStateStore:
                 ).fetchall()
             refs: dict[str, ArtifactRef] = {}
             for stored_run_id, stored_conversation_id, data in rows:
-                message = _expect(_loads(data), CanonicalMessage)
+                message = decode_message(data)
                 if message.role is not MessageRole.TOOL:
                     continue
                 for block in message.content:
@@ -1540,16 +2404,13 @@ class SQLiteStateStore:
                         (run_id,),
                     ).fetchall()
                     transcript = Transcript(
-                        run=_expect(_loads(input_data), RunInput),
+                        run=decode_run_input(input_data),
                         messages=tuple(
-                            _expect(_loads(message[0]), CanonicalMessage)
-                            for message in message_rows
+                            decode_message(message[0]) for message in message_rows
                         ),
                     )
                     result = (
-                        None
-                        if result_data is None
-                        else _expect(_loads(result_data), LoopExit)
+                        None if result_data is None else decode_loop_exit(result_data)
                     )
                     records.append(
                         ConversationRun(
@@ -1665,7 +2526,7 @@ class SQLiteStateStore:
                 ).fetchone()
             if row is None:
                 return None
-            run = _expect(_loads(row[0]), RunInput)
+            run = decode_run_input(row[0])
             return run.conversation_source_id or run.source_id
 
         return await asyncio.to_thread(read)
@@ -1698,7 +2559,7 @@ class SQLiteStateStore:
                     exists = True
                     if result_data is None:
                         continue
-                    result = _expect(_loads(result_data), LoopExit)
+                    result = decode_loop_exit(result_data)
                     if result.kind is not LoopExitKind.COMPLETED:
                         continue
                     if len(records) >= limit:
@@ -1713,9 +2574,9 @@ class SQLiteStateStore:
                         ConversationRun(
                             turn_index=int(turn_index),
                             transcript=Transcript(
-                                run=_expect(_loads(input_data), RunInput),
+                                run=decode_run_input(input_data),
                                 messages=tuple(
-                                    _expect(_loads(message[0]), CanonicalMessage)
+                                    decode_message(message[0])
                                     for message in message_rows
                                 ),
                             ),
@@ -1829,8 +2690,25 @@ def _current_snapshot_row(
     return str(row[0]), str(row[1])
 
 
+def _current_source_snapshot(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    source_id: str,
+) -> SourceCatalogSnapshot | None:
+    row = connection.execute(
+        "SELECT data FROM snapshots WHERE agent_id = ? AND source_id = ?",
+        (agent_id, source_id),
+    ).fetchone()
+    if row is None:
+        return None
+    snapshot = decode_catalog_snapshot(row[0])
+    if snapshot.sync.agent_id != agent_id or snapshot.sync.source_id != source_id:
+        raise SourcePermissionStateError("stored catalog snapshot ownership is invalid")
+    return snapshot
+
+
 def _decode_catalog_snapshot(value: str) -> SourceCatalogSnapshot:
-    return _expect(_loads(value), SourceCatalogSnapshot)
+    return decode_catalog_snapshot(value)
 
 
 def _validate_semantic_owner(
@@ -1857,7 +2735,7 @@ def _semantic_rows(
     if len(rows) > SEMANTIC_MAX_ANNOTATIONS:
         raise RuntimeError("stored semantic annotation collection exceeds bound")
     return tuple(
-        (annotation_id, _expect(_loads(data), SemanticAnnotation), data)
+        (annotation_id, decode_semantic_annotation(data), data)
         for annotation_id, data in rows
     )
 
@@ -2023,7 +2901,7 @@ def _learning_candidate_rows(
     ).fetchall()
     if len(rows) > LEARNING_CANDIDATE_MAX_RECORDS:
         raise RuntimeError("stored learning candidate collection exceeds bound")
-    values = tuple(_expect(_loads(data), LearningCandidate) for (data,) in rows)
+    values = tuple(decode_learning_candidate(data) for (data,) in rows)
     if any(item.agent_id != agent_id for item in values):
         raise RuntimeError("stored learning candidate owner is invalid")
     return values
@@ -2039,11 +2917,7 @@ def _learning_review_stamps(
     ).fetchone()
     if row is None:
         return ()
-    value = _loads(row[0])
-    if not isinstance(value, tuple) or any(
-        not isinstance(item, LearningCandidateReviewStamp) for item in value
-    ):
-        raise RuntimeError("stored learning review stamps are invalid")
+    value = decode_review_stamps(row[0])
     if len(value) > LEARNING_REVIEW_MAX_STAMPS or len(set(value)) != len(value):
         raise RuntimeError("stored learning review stamps exceed their bound")
     return value
@@ -2061,7 +2935,7 @@ def _load_learning_candidate_required(
     ).fetchone()
     if row is None:
         raise LearningCandidateNotFoundError(candidate_id)
-    candidate = _expect(_loads(row[0]), LearningCandidate)
+    candidate = decode_learning_candidate(row[0])
     _validate_learning_candidate_owner(agent_id, candidate)
     return candidate
 
@@ -2122,142 +2996,490 @@ async def _run_candidate_transaction(
     return result
 
 
-def _initialize(path: Path) -> None:
+def _validate_current_records(connection: sqlite3.Connection) -> None:
+    identity: AgentIdentity | None = None
+    active_sources: dict[str, str] = {}
+    for key, data in connection.execute("SELECT key, data FROM metadata"):
+        if key == "identity":
+            if identity is not None:
+                raise ValueError("state contains duplicate agent identity")
+            identity = decode_identity(data)
+        elif isinstance(key, str) and key.startswith(_ACTIVE_SOURCE_KEY_PREFIX):
+            agent_id = key.removeprefix(_ACTIVE_SOURCE_KEY_PREFIX)
+            active_sources[agent_id] = decode_identifier(data)
+        elif isinstance(key, str) and key.startswith(
+            _LEARNING_REVIEW_STAMPS_KEY_PREFIX
+        ):
+            agent_id = key.removeprefix(_LEARNING_REVIEW_STAMPS_KEY_PREFIX)
+            if not agent_id:
+                raise ValueError("stored learning review owner is invalid")
+            decode_review_stamps(data)
+        else:
+            raise ValueError("state metadata key is unsupported")
+
+    sources: dict[tuple[str, str], SourceRegistration] = {}
+    for agent_id, source_id, data in connection.execute(
+        "SELECT agent_id, id, data FROM sources"
+    ):
+        registration = decode_source(data)
+        if registration.agent_id != agent_id or registration.id != source_id:
+            raise ValueError("stored source ownership is invalid")
+        sources[(agent_id, source_id)] = registration
+    if identity is not None and any(agent_id != identity.id for agent_id, _ in sources):
+        raise ValueError("stored source belongs to another agent")
+    for agent_id, source_id in active_sources.items():
+        active_registration = sources.get((agent_id, source_id))
+        if active_registration is None or not active_registration.active:
+            raise ValueError("stored active source selection is invalid")
+
+    syncs: dict[tuple[str, str], CatalogSync] = {}
+    for agent_id, sync_id, source_id, data in connection.execute(
+        "SELECT agent_id, id, source_id, data FROM syncs"
+    ):
+        sync = decode_catalog_sync(data)
+        if (
+            sync.agent_id != agent_id
+            or sync.id != sync_id
+            or sync.source_id != source_id
+            or (agent_id, source_id) not in sources
+        ):
+            raise ValueError("stored catalog sync ownership is invalid")
+        syncs[(agent_id, sync_id)] = sync
+    for agent_id, source_id, sync_id, data in connection.execute(
+        "SELECT agent_id, source_id, sync_id, data FROM snapshots"
+    ):
+        snapshot = decode_catalog_snapshot(data)
+        if (
+            snapshot.sync.agent_id != agent_id
+            or snapshot.sync.source_id != source_id
+            or snapshot.sync.id != sync_id
+            or syncs.get((agent_id, sync_id)) != snapshot.sync
+        ):
+            raise ValueError("stored catalog snapshot ownership is invalid")
+
+    run_ids: set[str] = set()
+    message_positions: dict[str, list[int]] = {}
+    for (
+        run_id,
+        agent_id,
+        conversation_id,
+        turn_index,
+        input_data,
+        result,
+    ) in connection.execute(
+        """SELECT id, agent_id, conversation_id, turn_index, input, result
+           FROM runs"""
+    ):
+        run_input = decode_run_input(input_data)
+        if (
+            run_input.id != run_id
+            or run_input.agent_id != agent_id
+            or run_input.conversation_id != conversation_id
+            or not isinstance(turn_index, int)
+            or isinstance(turn_index, bool)
+            or turn_index < 0
+        ):
+            raise ValueError("stored run ownership is invalid")
+        if result is not None:
+            try:
+                exit_record = decode_loop_exit(result)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if (
+                    exit_record.run_id != run_id
+                    or exit_record.conversation_id != conversation_id
+                ):
+                    raise ValueError("stored run result ownership is invalid")
+        run_ids.add(run_id)
+    for run_id, position, data in connection.execute(
+        "SELECT run_id, position, data FROM messages ORDER BY run_id, position"
+    ):
+        if run_id not in run_ids:
+            raise ValueError("stored message belongs to an unknown run")
+        try:
+            decode_message(data)
+        except (TypeError, ValueError):
+            pass
+        message_positions.setdefault(run_id, []).append(position)
+    if any(
+        positions != list(range(len(positions)))
+        for positions in message_positions.values()
+    ):
+        raise ValueError("stored transcript message positions are not contiguous")
+
+    for agent_id, annotation_id, data in connection.execute(
+        "SELECT agent_id, id, data FROM semantic_annotations"
+    ):
+        annotation = decode_semantic_annotation(data)
+        if annotation.agent_id != agent_id or annotation.id != annotation_id:
+            raise ValueError("stored semantic annotation ownership is invalid")
+    for agent_id, candidate_id, data in connection.execute(
+        "SELECT agent_id, id, data FROM learning_candidates"
+    ):
+        candidate = decode_learning_candidate(data)
+        if candidate.agent_id != agent_id or candidate.id != candidate_id:
+            raise ValueError("stored learning candidate ownership is invalid")
+
+
+def _logical_state_fingerprint(connection: sqlite3.Connection) -> str:
+    objects = tuple(
+        connection.execute("""SELECT type, name, tbl_name, sql FROM sqlite_master
+               WHERE name NOT LIKE 'sqlite_%'
+               ORDER BY type, name""")
+    )
+    rows = {
+        table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
+        for table in sorted(table_names(connection))
+    }
+    material = json.dumps(
+        {"objects": objects, "rows": rows},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(material.encode("utf-8")).hexdigest()
+
+
+def _temporary_state_path(path: Path, label: str) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=f".{path.name}.{label}-",
+        suffix=".db",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    candidate = Path(raw_path)
+    os.chmod(candidate, 0o600)
+    return candidate
+
+
+def _copy_state_database(
+    source: Path,
+    destination: Path,
+    *,
+    expected_fingerprint: str,
+) -> None:
+    with _connect_read_only(source) as source_connection:
+        if _logical_state_fingerprint(source_connection) != expected_fingerprint:
+            raise RuntimeError("state changed while its upgrade copy was prepared")
+        destination_connection = _connect(destination)
+        try:
+            source_connection.backup(destination_connection)
+            destination_connection.commit()
+        finally:
+            destination_connection.close()
+    os.chmod(destination, 0o600)
+    with _connect_read_only(destination) as copied_connection:
+        if _logical_state_fingerprint(copied_connection) != expected_fingerprint:
+            raise RuntimeError("state upgrade copy does not match its source")
+        require_healthy(copied_connection)
+
+
+def _rollback_state_path(
+    path: Path,
+    *,
+    found_revision: str,
+    fingerprint: str,
+) -> Path:
+    revision = re.sub(r"[^A-Za-z0-9._-]+", "-", found_revision).strip("-._")
+    if not revision:
+        revision = "unknown"
+    return path.with_name(f"{path.name}.rollback-{revision[:80]}-{fingerprint[:12]}")
+
+
+def _fsync_state_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _prune_older_rollback_points(path: Path, retained: Path) -> None:
+    for candidate in path.parent.glob(f"{path.name}.rollback-*"):
+        if candidate == retained:
+            continue
+        try:
+            candidate.unlink()
+        except OSError:
+            pass
+
+
+def _upgrade_staged_state(
+    path: Path,
+    *,
+    applied: int | None,
+    expected_preledger: PreledgerShape | None,
+    source_fingerprint: str,
+    found_revision: str,
+    upgrade_gate: _UpgradeCommitGate | None,
+) -> bool:
+    rollback_candidate = _temporary_state_path(path, "rollback")
+    staged = _temporary_state_path(path, "upgrade")
+    retained_rollback = _rollback_state_path(
+        path,
+        found_revision=found_revision,
+        fingerprint=source_fingerprint,
+    )
+    published_rollback = False
+    activated = False
+    try:
+        _copy_state_database(
+            path,
+            rollback_candidate,
+            expected_fingerprint=source_fingerprint,
+        )
+        _copy_state_database(
+            rollback_candidate,
+            staged,
+            expected_fingerprint=source_fingerprint,
+        )
+
+        connection = _connect(staged)
+        try:
+            if upgrade_gate is None:
+                connection.execute("BEGIN IMMEDIATE")
+            elif not upgrade_gate.start(connection):
+                return False
+            if applied is None:
+                assert expected_preledger is not None
+                bridge_preledger(connection, expected_preledger)
+                bridged = inspect_journal(connection)
+                if bridged >= len(MIGRATIONS):
+                    raise RuntimeError("pre-ledger bridge unexpectedly reached current")
+                upgrade_journaled(connection, bridged)
+            else:
+                if inspect_journal(connection) != applied:
+                    raise RuntimeError("migration journal changed during admission")
+                upgrade_journaled(connection, applied)
+            require_schema(connection, CURRENT_TABLES)
+            require_healthy(connection)
+            if upgrade_gate is None:
+                connection.commit()
+            elif not upgrade_gate.commit(connection):
+                return False
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+        with _connect_read_only(staged) as staged_connection:
+            if inspect_journal(staged_connection) != len(MIGRATIONS):
+                raise RuntimeError("staged state did not reach the current revision")
+            _validate_current_records(staged_connection)
+
+        os.chmod(staged, 0o600)
+        os.chmod(rollback_candidate, 0o600)
+        _fsync_state_file(staged)
+        _fsync_state_file(rollback_candidate)
+
+        def activate() -> None:
+            nonlocal activated, published_rollback
+            if retained_rollback.exists():
+                with _connect_read_only(retained_rollback) as existing_rollback:
+                    if (
+                        _logical_state_fingerprint(existing_rollback)
+                        != source_fingerprint
+                    ):
+                        raise RuntimeError(
+                            "existing rollback point has conflicting state"
+                        )
+                rollback_candidate.unlink()
+            else:
+                os.replace(rollback_candidate, retained_rollback)
+                published_rollback = True
+            try:
+                os.replace(staged, path)
+            except BaseException:
+                if published_rollback:
+                    retained_rollback.unlink(missing_ok=True)
+                    published_rollback = False
+                raise
+            activated = True
+
+        if upgrade_gate is None:
+            activate()
+        elif not upgrade_gate.activate(activate):
+            return False
+        _prune_older_rollback_points(path, retained_rollback)
+        return True
+    finally:
+        rollback_candidate.unlink(missing_ok=True)
+        staged.unlink(missing_ok=True)
+        if published_rollback and not activated:
+            retained_rollback.unlink(missing_ok=True)
+
+
+def _initialize(
+    path: Path,
+    *,
+    upgrade_gate: _UpgradeCommitGate | None = None,
+) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
-        _validate_existing_state(path)
-        os.chmod(path, 0o600)
-        return
+        admitted = _admit_existing_state(path, upgrade_gate=upgrade_gate)
+        if admitted:
+            os.chmod(path, 0o600)
+        return admitted
     with _connect(path) as connection:
-        connection.executescript("""
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                data TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sources (
-                agent_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(agent_id, id)
-            );
-            CREATE TABLE IF NOT EXISTS syncs (
-                agent_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                source_id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(agent_id, id)
-            );
-            CREATE TABLE IF NOT EXISTS snapshots (
-                agent_id TEXT NOT NULL,
-                source_id TEXT NOT NULL,
-                sync_id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(agent_id, source_id)
-            );
-            CREATE TABLE IF NOT EXISTS runs (
-                id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                conversation_id TEXT NOT NULL,
-                turn_index INTEGER NOT NULL,
-                input TEXT NOT NULL,
-                result TEXT
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-                position INTEGER NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(run_id, position)
-            );
-            CREATE TABLE IF NOT EXISTS semantic_annotations (
-                agent_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(agent_id, id)
-            );
-            CREATE TABLE IF NOT EXISTS learning_candidates (
-                agent_id TEXT NOT NULL,
-                id TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY(agent_id, id)
-            );
-            """)
-        connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS runs_conversation_turn
-               ON runs(agent_id, conversation_id, turn_index)""")
+        create_current(connection)
     os.chmod(path, 0o600)
+    return True
 
 
-def _validate_existing_state(path: Path) -> None:
+def _admit_existing_state(
+    path: Path,
+    *,
+    upgrade_gate: _UpgradeCommitGate | None = None,
+) -> bool:
     try:
         with _connect_read_only(path) as connection:
-            tables = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-                )
-            }
-            if tables != set(_V1_TABLE_DEFINITIONS):
-                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
-            for table, expected in _V1_TABLE_DEFINITIONS.items():
-                actual = tuple(
-                    (row[1], str(row[2]).upper(), row[3], row[4], row[5])
-                    for row in connection.execute(f"PRAGMA table_info({table})")
-                )
-                if actual != expected:
-                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+            if "state_migrations" in table_names(connection):
+                applied = inspect_journal(connection)
+                if applied == len(MIGRATIONS):
+                    return True
+                expected_preledger = None
+                found_revision = MIGRATIONS[applied - 1].migration_id
+            else:
+                applied = None
+                expected_preledger = identify_preledger(connection)
+                found_revision = expected_preledger.value
+            source_fingerprint = _logical_state_fingerprint(connection)
+    except (MigrationJournalNewerError, PreledgerNewerError) as error:
+        raise StateCompatibilityError(
+            StateCompatibilityCode.NEWER_REVISION,
+            path,
+            (
+                "This local state was created by a newer Daita release. Install "
+                "the same or a newer package. No state was changed."
+            ),
+            current_revision=CURRENT_REVISION,
+            found_revision=(
+                error.found_revision
+                if isinstance(error, MigrationJournalNewerError)
+                else "newer-preledger-state"
+            ),
+        ) from None
+    except PreledgerLegacyError:
+        raise StateCompatibilityError(
+            StateCompatibilityCode.LEGACY,
+            path,
+            (
+                "This agent home belongs to the unsupported pre-1.0 Daita "
+                "framework. Keep it intact and use a current agent home; this "
+                "release will not overwrite or partially import it."
+            ),
+            current_revision=CURRENT_REVISION,
+            found_revision="pre-1.0-framework",
+        ) from None
+    except MigrationJournalError as error:
+        raise StateCompatibilityError(
+            StateCompatibilityCode.REVISION_UNSUPPORTED,
+            path,
+            (
+                "This local state has an unknown, incomplete, reordered, or edited "
+                "migration history. No state was changed. Install the matching "
+                "Daita release before continuing."
+            ),
+            current_revision=CURRENT_REVISION,
+            found_revision=error.found_revision or "invalid-journal",
+        ) from None
+    except PreledgerAdmissionError:
+        raise _damaged_state_error(path, "unsupported-preledger-state") from None
+    except StateCompatibilityError:
+        raise
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        raise _damaged_state_error(path, None) from None
 
-            messages_foreign_keys = tuple(
-                (row[2], row[3], row[4], row[5], row[6], row[7])
-                for row in connection.execute("PRAGMA foreign_key_list(messages)")
-            )
-            if messages_foreign_keys != _V1_MESSAGES_FOREIGN_KEYS:
-                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
-            for table in set(_V1_TABLE_DEFINITIONS) - {"messages"}:
-                if tuple(connection.execute(f"PRAGMA foreign_key_list({table})")):
-                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+    try:
+        return _upgrade_staged_state(
+            path,
+            applied=applied,
+            expected_preledger=expected_preledger,
+            source_fingerprint=source_fingerprint,
+            found_revision=found_revision,
+            upgrade_gate=upgrade_gate,
+        )
+    except BaseException as error:
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise StateCompatibilityError(
+            StateCompatibilityCode.UPGRADE_FAILED,
+            path,
+            (
+                "Daita could not update the local state safely. The active "
+                "database was not replaced. Reinstall the prior working Daita "
+                "package before continuing, then report this upgrade failure."
+            ),
+            current_revision=CURRENT_REVISION,
+            found_revision=found_revision,
+        ) from None
 
-            named_indexes = {
-                row[0]: row[1]
-                for row in connection.execute(
-                    "SELECT name, tbl_name FROM sqlite_master "
-                    "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
-                )
-            }
-            if named_indexes != {
-                name: definition[0] for name, definition in _V1_NAMED_INDEXES.items()
-            }:
-                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
-            for name, (
-                table,
-                expected_unique,
-                expected_columns,
-            ) in _V1_NAMED_INDEXES.items():
-                indexes = {
-                    row[1]: bool(row[2])
-                    for row in connection.execute(f"PRAGMA index_list({table})")
-                    if not str(row[1]).startswith("sqlite_autoindex")
-                }
-                if indexes != {name: expected_unique}:
-                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
-                columns = tuple(
-                    row[2] for row in connection.execute(f"PRAGMA index_info({name})")
-                )
-                if columns != expected_columns:
-                    raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
 
-            extra_objects = tuple(
+def _damaged_state_error(
+    path: Path,
+    found_revision: str | None,
+) -> StateCompatibilityError:
+    return StateCompatibilityError(
+        StateCompatibilityCode.DAMAGED,
+        path,
+        (
+            "This agent state database is damaged or does not match its declared "
+            "Daita revision. No state was changed. Reinstall the matching Daita "
+            "release or restore the database through your normal recovery process."
+        ),
+        current_revision=CURRENT_REVISION,
+        found_revision=found_revision,
+    )
+
+
+def _recover_started_database_write_receipts(
+    path: Path,
+    clock: Callable[[], datetime],
+) -> None:
+    try:
+        with _connect_read_only(path) as connection:
+            rows = tuple(
                 connection.execute(
-                    "SELECT type, name FROM sqlite_master "
-                    "WHERE type IN ('trigger', 'view') "
-                    "AND name NOT LIKE 'sqlite_%'"
+                    "SELECT agent_id, id, data FROM database_write_receipts"
                 )
             )
-            if extra_objects:
-                raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE)
+        started = tuple(
+            (agent_id, receipt_id, receipt)
+            for agent_id, receipt_id, data in rows
+            if (receipt := decode_receipt(data)).outcome is DatabaseWriteOutcome.STARTED
+        )
+        if not started:
+            return
+        completed_at = _database_write_aware(clock(), "receipt recovery completed_at")
+        with _connect(path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for agent_id, receipt_id, receipt in started:
+                recovered = receipt.finish(
+                    DatabaseWriteOutcome.OUTCOME_UNKNOWN,
+                    completed_at=completed_at,
+                    affected_rows=None,
+                    normalized_error_code="write_outcome_unknown",
+                )
+                result = connection.execute(
+                    """UPDATE database_write_receipts SET data = ?
+                       WHERE agent_id = ? AND id = ? AND data = ?""",
+                    (
+                        encode_receipt(recovered),
+                        agent_id,
+                        receipt_id,
+                        encode_receipt(receipt),
+                    ),
+                )
+                if result.rowcount != 1:
+                    raise RuntimeError(
+                        "database write receipt changed during startup recovery"
+                    )
     except RuntimeError:
         raise
-    except (OSError, sqlite3.Error):
-        raise RuntimeError(_INCOMPATIBLE_STATE_MESSAGE) from None
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        raise _damaged_state_error(path, CURRENT_REVISION) from None
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -2281,131 +3503,17 @@ def _commit_catalog_transaction(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
-_RECORD_TYPES: dict[str, type[Any]] = {
-    record.__name__: record
-    for record in (
-        AgentIdentity,
-        SourceRegistration,
-        CatalogFacet,
-        RelationshipFieldPair,
-        CatalogRelationship,
-        CatalogResourceRevision,
-        CatalogResource,
-        CatalogSync,
-        SourceCatalogSnapshot,
-        RunInput,
-        LoopExit,
-        ArtifactResourceBinding,
-        ArtifactProvenance,
-        ArtifactRef,
-        ArtifactDeliveryReceipt,
-        TextBlock,
-        ToolCall,
-        ToolResultBlock,
-        CanonicalMessage,
-        ModelUsage,
-        PricingModifier,
-        PricingUsageRange,
-        CostComponent,
-        CostEstimate,
-        SemanticFieldReference,
-        SemanticEvidence,
-        ResourceRevisionBinding,
-        SemanticSubject,
-        SemanticAnnotation,
-        DocumentCandidateContent,
-        SemanticCandidateContent,
-        SkillCandidateContent,
-        LearningCandidateRunReference,
-        LearningCandidateReviewStamp,
-        LearningCandidate,
-    )
-}
-_ENUM_TYPES: dict[str, type[Enum]] = {
-    enum.__name__: enum
-    for enum in (
-        CatalogSyncStatus,
-        FacetKind,
-        RelationshipDirection,
-        RelationshipKind,
-        RelationshipProvenance,
-        ResourceKind,
-        Sensitivity,
-        ArtifactAuthorship,
-        LoopExitKind,
-        MessageRole,
-        CostBasis,
-        CostEstimateStatus,
-        SemanticEvidenceKind,
-        SemanticKind,
-        LearningCandidateStatus,
-        LearningCandidateRejectionReason,
-        LearningCandidateTarget,
-        LearningCandidateAction,
-    )
-}
-
-
-def _pack(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {str(key): _pack(item) for key, item in value.items()}
-    if is_dataclass(value) and not isinstance(value, type):
-        return {
-            "__record__": type(value).__name__,
-            "fields": {
-                field.name: _pack(getattr(value, field.name)) for field in fields(value)
-            },
-        }
-    if isinstance(value, Enum):
-        return {"__enum__": type(value).__name__, "value": value.value}
-    if isinstance(value, datetime):
-        timestamp = value.isoformat()
-        offset = value.utcoffset()
-        if offset is not None and offset.total_seconds() == 0:
-            timestamp = (
-                value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-            )
-        return {"__datetime__": timestamp}
-    if isinstance(value, Decimal):
-        return {"__decimal__": str(value)}
-    if isinstance(value, (tuple, list)):
-        return [_pack(item) for item in value]
-    return value
-
-
-def _unpack(value: object) -> object:
-    if isinstance(value, list):
-        return tuple(_unpack(item) for item in value)
-    if not isinstance(value, dict):
-        return value
-    if "__datetime__" in value:
-        return datetime.fromisoformat(str(value["__datetime__"]))
-    if "__decimal__" in value:
-        return Decimal(str(value["__decimal__"]))
-    if "__enum__" in value:
-        enum = _ENUM_TYPES[str(value["__enum__"])]
-        return enum(value["value"])
-    if "__record__" in value:
-        record = _RECORD_TYPES[str(value["__record__"])]
-        raw_fields = value["fields"]
-        if not isinstance(raw_fields, dict):
-            raise ValueError("invalid stored record fields")
-        return record(**{name: _unpack(item) for name, item in raw_fields.items()})
-    return {key: _unpack(item) for key, item in value.items()}
-
-
-def _dumps(value: object) -> str:
-    return json.dumps(_pack(value), sort_keys=True, separators=(",", ":"))
-
-
-def _loads(value: str) -> object:
-    return _unpack(json.loads(value))
-
-
-def _expect(value: object, expected: type[Any]) -> Any:
-    if not isinstance(value, expected):
-        raise TypeError(f"stored value is not {expected.__name__}")
-    return value
-
-
-__all__ = ["SQLiteStateStore"]
+__all__ = [
+    "DatabaseWriteOutcome",
+    "DatabaseWriteReceipt",
+    "DatabaseWriteReceiptConflictError",
+    "PostgreSQLUpdateScope",
+    "SQLiteStateStore",
+    "SourcePermissionStateError",
+    "SourceReadMode",
+    "SourceReadScope",
+    "StateCompatibilityCode",
+    "StateCompatibilityError",
+    "database_write_receipt_id",
+    "postgresql_update_authorization_fingerprint",
+]

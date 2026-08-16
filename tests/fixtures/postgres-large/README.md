@@ -26,6 +26,11 @@ relationships. It includes approximately 10,000 customers, 5,000 products,
 100,000 current orders, 300,000 current order items, 80,000 invoices, 240,000
 invoice lines, 20,000 support tickets, and 20,000 archived orders.
 
+The separate `daita_large_writer` role is available only for disposable TUI
+update testing. It can catalog and select `support.tickets`, and its
+only PostgreSQL mutation privilege is column-scoped `UPDATE (priority)` on
+that table. The production-shape `daita_large_reader` remains read-only.
+
 Two deliberate PostgreSQL boundary cases are present:
 
 - `catalog.unsupported_type_probe` uses a custom enum. Daita currently omits
@@ -85,6 +90,40 @@ Useful manual prompts include:
 - “How does support-ticket volume relate to customer revenue?”
 - “Explain the relationship path from refunds to products.”
 
+## TUI update tests
+
+Recreate the tmpfs-backed fixture after changing `init.sql`, then use a new
+agent root under `/private/tmp`. Attach a second PostgreSQL source with these
+values:
+
+```text
+Display name: Large PostgreSQL write canary
+Host: 127.0.0.1
+Port: 55433
+Database: daita_large_fixture
+Username: daita_large_writer
+Password: daita_large_writer_fixture_password
+Schema: support
+SSL mode: disable
+```
+
+Through `/source permissions`, select PostgreSQL update access,
+`support.tickets`, Advanced column selection, and only `priority`. The
+deterministic fresh-fixture canary is `ticket_id = 42`, whose initial priority
+is `medium`. Use it to verify that a single-row selection goes through the same
+preview and `[Y] Approve once` flow as a bulk selection.
+
+For a deterministic bulk target, select tickets where `ticket_status =
+'waiting'` and `category = 'billing'`. On a fresh fixture those rows have
+priority `low`. Preview changing their priority to `high`, confirm the exact
+matched row count and bounded before/after samples, deny once, and verify no
+rows changed. Repeat and approve once, independently read the aggregate back,
+then preview and approve restoring the same selection to `low`.
+
+Finally restore ticket 42 to `medium` if it was changed and remove update
+access. Never use `daita_large_reader` or the fixture administrator credential
+for update testing.
+
 ## Run the opt-in fixture test
 
 The test uses PostgreSQL I/O but a fake model boundary, so it incurs no model
@@ -93,6 +132,7 @@ cost:
 ```bash
 DAITA_RUN_POSTGRES_LARGE_FIXTURE=1 \
 DAITA_LARGE_POSTGRES_PASSWORD=daita_large_fixture_password \
+DAITA_LARGE_POSTGRES_WRITER_PASSWORD=daita_large_writer_fixture_password \
 .venv/bin/python -m pytest tests/test_postgres_large_fixture.py -v
 ```
 

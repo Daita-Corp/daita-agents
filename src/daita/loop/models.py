@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,7 +10,7 @@ from decimal import Decimal
 from enum import Enum
 
 from ..artifacts.models import ArtifactDeliveryReceipt, ArtifactRef
-from ..llm.models import CanonicalMessage, ModelUsage
+from ..llm.models import CanonicalMessage, ModelUsage, ToolResultBlock
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -160,6 +161,19 @@ class Transcript:
         if any(not isinstance(message, CanonicalMessage) for message in messages):
             raise TypeError("transcript messages must be CanonicalMessage records")
         object.__setattr__(self, "messages", messages)
+
+
+class ClassifiedToolResultsCancelled(asyncio.CancelledError):
+    """Carry already-classified ordered tool results across cancellation."""
+
+    def __init__(self, results: tuple[ToolResultBlock, ...]) -> None:
+        results = tuple(results)
+        if not results or any(
+            not isinstance(item, ToolResultBlock) for item in results
+        ):
+            raise TypeError("classified cancellation requires one or more tool results")
+        super().__init__()
+        self.results = results
 
 
 @dataclass(frozen=True, slots=True)

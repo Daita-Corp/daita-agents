@@ -1,6 +1,8 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
+
+import pytest
 
 from daita.agent import Agent
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
@@ -26,7 +28,7 @@ from daita.loop import (
 )
 from daita.observation import AgentEvent, AgentEventKind
 
-NOW = datetime(2026, 7, 21, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 class TranscriptContext:
@@ -143,6 +145,142 @@ async def test_step_limit_gets_one_tool_free_wrap_up_call():
     assert result.reason == "step_limit_reached"
     assert result.final_text == "partial answer"
     assert provider.requests[1].tools == ()
+
+
+async def test_tool_free_wrap_up_rejects_outstanding_calls_without_execution():
+    provider = MockModelProvider(
+        (
+            response_with_calls("one"),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                text="invalid partial answer",
+                tool_calls=(ToolCall(id="unexecuted", name="lookup"),),
+            ),
+        )
+    )
+    tools = ScriptedTools({"one": ToolResultBlock(call_id="one", output={"value": 1})})
+    transcripts = InMemoryTranscriptStore()
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=tools,
+        transcripts=transcripts,
+        limits=LoopLimits(max_steps=1),
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(
+        RunInput(
+            id="run-wrap-up-calls",
+            agent_id="agent-1",
+            message="question",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "tool_free_wrap_up_returned_tool_calls"
+    assert [call.id for call in tools.calls] == ["one"]
+    transcript = await transcripts.load("run-wrap-up-calls")
+    assert all(
+        call.id != "unexecuted"
+        for message in transcript.messages
+        for call in message.tool_calls
+    )
+
+
+@pytest.mark.parametrize("failure_site", ("context", "tool_contract"))
+async def test_unexpected_loop_failures_best_effort_terminalize_started_run(
+    failure_site: str,
+):
+    class BrokenContext(TranscriptContext):
+        async def build(self, run, messages, tools, *, step, final=False):
+            if failure_site == "context":
+                raise RuntimeError("context exploded")
+            return await super().build(
+                run,
+                messages,
+                tools,
+                step=step,
+                final=final,
+            )
+
+    class BrokenTools(ScriptedTools):
+        async def execute_all(self, run, calls):
+            if failure_site == "tool_contract":
+                return ()
+            return await super().execute_all(run, calls)
+
+    provider = MockModelProvider((response_with_calls("one"),))
+    transcripts = InMemoryTranscriptStore()
+    loop = AgentLoop(
+        model=provider,
+        context_builder=BrokenContext(),
+        tools=BrokenTools({"one": ToolResultBlock(call_id="one", output={"value": 1})}),
+        transcripts=transcripts,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises((RuntimeError, ValueError)):
+        await loop.run(
+            RunInput(
+                id=f"run-unexpected-{failure_site}",
+                agent_id="agent-1",
+                message="question",
+                created_at=NOW,
+            )
+        )
+
+    terminal = await transcripts.result(f"run-unexpected-{failure_site}")
+    assert terminal is not None
+    assert terminal.kind is LoopExitKind.FAILED
+    assert terminal.reason == "unexpected_internal_error"
+
+
+async def test_terminalization_failure_never_masks_pending_cancellation():
+    class FinishFailsStore(InMemoryTranscriptStore):
+        async def finish(self, result):
+            del result
+            raise RuntimeError("finish failed")
+
+    model_started = asyncio.Event()
+
+    class HangingProvider:
+        provider_id = "mock:hanging-cancel"
+
+        def supports_request_policy(self, request: ModelRequest) -> bool:
+            del request
+            return True
+
+        async def generate(self, request: ModelRequest) -> ModelResponse:
+            del request
+            model_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    store = FinishFailsStore()
+    loop = AgentLoop(
+        model=HangingProvider(),
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools({}),
+        transcripts=store,
+        clock=lambda: NOW,
+    )
+    task = asyncio.create_task(
+        loop.run(
+            RunInput(
+                id="run-finish-fails-on-cancel",
+                agent_id="agent-1",
+                message="question",
+                created_at=NOW,
+            )
+        )
+    )
+    await model_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 async def test_text_response_finishes_without_readiness_or_repair_passes():
@@ -442,8 +580,6 @@ async def test_embedded_streaming_persists_only_one_finalized_sqlite_message(tmp
         root=tmp_path,
         model=provider,
         model_profile=provider.model_profile,
-        context_builder=TranscriptContext(),
-        tools=ScriptedTools({}),
         clock=lambda: NOW,
     )
     try:

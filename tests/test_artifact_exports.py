@@ -6,7 +6,7 @@ import threading
 import time as time_module
 from collections import defaultdict
 from collections.abc import Mapping
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
@@ -123,7 +123,7 @@ def test_exact_csv_frozen_scalar_escaping_and_dialect_contract() -> None:
                 Decimal("12.3400"),
                 date(2026, 8, 1),
                 time(1, 2, 3, 4, tzinfo=timezone(timedelta(hours=-5))),
-                datetime(2026, 8, 1, 1, 2, 3, 4, tzinfo=timezone.utc),
+                datetime(2026, 8, 1, 1, 2, 3, 4, tzinfo=UTC),
                 b"\x00\xff",
                 UUID("ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB"),
             ),
@@ -373,7 +373,7 @@ async def test_postgresql_exact_adapter_streams_typed_values_without_json_projec
         (
             (
                 Decimal("1.2300"),
-                datetime(2026, 8, 1, tzinfo=timezone.utc),
+                datetime(2026, 8, 1, tzinfo=UTC),
                 b"abc",
                 True,
             ),
@@ -485,6 +485,14 @@ class _CatalogSchemas:
         del agent_id
         return tuple(item for item in self.resources if item.source_id == source_id)
 
+    async def readable_resource_ids(self, agent_id: str, source_ids=()):
+        del agent_id
+        return frozenset(
+            item.resource_id
+            for item in self.resources
+            if not source_ids or item.source_id in source_ids
+        )
+
 
 class _Transaction:
     def __init__(self) -> None:
@@ -523,7 +531,7 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
         native_identity="offline-contract",
         display_name="Offline PostgreSQL",
         configuration={},
-        attached_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        attached_at=datetime(2026, 8, 1, tzinfo=UTC),
     )
     source_revision = "sha256:" + "3" * 64
     resource = ResourceSchema(
@@ -580,7 +588,7 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
         parameters=(Decimal("1.20"),),
         format_name=format_name,
         parameters_sha256="sha256:" + "0" * 64,
-        created_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
         max_rows=100_000,
         max_columns=256,
         max_bytes=64 * 1024 * 1024,
@@ -818,7 +826,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
             (),
             "sql_validation_failed",
         ),
-        ("SELECT * FROM missing", (), "sql_validation_failed"),
+        ("SELECT * FROM missing", (), "resource_read_not_allowed"),
     ),
 )
 async def test_csv_export_reuses_current_sql_and_catalog_validation(

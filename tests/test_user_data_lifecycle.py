@@ -4,7 +4,7 @@ import io
 import json
 import sqlite3
 import stat
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -23,7 +23,7 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.security import KeychainSecretProvider, SecretReference
 from daita.skills import Skill
 
-NOW = datetime(2026, 7, 29, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 29, tzinfo=UTC)
 
 
 class _Keychain:

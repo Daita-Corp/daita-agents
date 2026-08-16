@@ -1,8 +1,11 @@
 """Managed-installer lifecycle smoke against one already-built candidate wheel.
 
 The smoke renders deterministic immutable download fixtures into the canonical
-``scripts/install.sh`` source. It does not claim public artifact, clean-machine,
-or real-terminal evidence and it never contacts the public installer endpoint.
+``scripts/install.sh`` source. With a baseline wheel, it creates agent state
+under that package, installs the distinct candidate artifact (including during
+same-package-version release development), and opens the state to certify its
+format migration. It does not claim public artifact, clean-machine, or
+real-terminal evidence and it never contacts the public installer endpoint.
 
 By default, uv and Python are deterministic local fixtures. Supplying the five
 ``--real-*`` arguments instead consumes an already-downloaded official uv
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import subprocess
 import tempfile
 from pathlib import Path
@@ -51,10 +55,7 @@ def _arguments() -> argparse.Namespace:
         parser.error("all five --real-* bootstrap arguments are required together")
     candidate = arguments.candidate_wheel.resolve(strict=True)
     _, candidate_version, _ = wheel_metadata(candidate)
-    if candidate_version == "1.0.0":
-        if arguments.baseline_wheel is not None:
-            parser.error("Daita 1.0.0 is candidate-only; 0.x is not a valid baseline")
-    elif arguments.baseline_wheel is None:
+    if candidate_version != "1.0.0" and arguments.baseline_wheel is None:
         parser.error("later 1.x candidates require --baseline-wheel")
     return arguments
 
@@ -120,6 +121,37 @@ def _tree_hashes(root: Path) -> dict[str, str]:
     }
 
 
+def _without_state_databases(values: dict[str, str]) -> dict[str, str]:
+    return {
+        name: digest
+        for name, digest in values.items()
+        if not name.endswith("/state.db")
+        and "/state.db.rollback-" not in f"/{name}"
+        and "/run/" not in f"/{name}"
+    }
+
+
+def _without_run_files(values: dict[str, str]) -> dict[str, str]:
+    return {
+        name: digest for name, digest in values.items() if "/run/" not in f"/{name}"
+    }
+
+
+def _database_rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
+    with sqlite3.connect(path) as connection:
+        tables = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        )
+        return {
+            table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
+            for table in tables
+        }
+
+
 def _current_generation(root: Path) -> Path:
     current = root / "current"
     if not current.is_symlink():
@@ -145,8 +177,17 @@ def _assert_preserved(
     expected_agent_hashes: dict[str, str],
     sentinels: dict[Path, str],
 ) -> None:
-    if _tree_hashes(agent_root) != expected_agent_hashes:
-        raise AssertionError("managed lifecycle changed Daita application data")
+    actual_agent_hashes = _without_run_files(_tree_hashes(agent_root))
+    durable_expected_hashes = _without_run_files(expected_agent_hashes)
+    if actual_agent_hashes != durable_expected_hashes:
+        changed = sorted(
+            name
+            for name in set(actual_agent_hashes) | set(durable_expected_hashes)
+            if actual_agent_hashes.get(name) != durable_expected_hashes.get(name)
+        )
+        raise AssertionError(
+            "managed lifecycle changed Daita application data: " + ", ".join(changed)
+        )
     for path, expected in sentinels.items():
         if sha256(path) != expected:
             raise AssertionError(f"managed lifecycle changed sentinel: {path}")
@@ -194,12 +235,9 @@ def main() -> int:
             baseline_name, baseline_version, _ = wheel_metadata(baseline)
             if baseline_name != "daita-agents":
                 raise AssertionError("baseline is not a daita-agents wheel")
-            if (
-                baseline_version.startswith("0.")
-                or baseline_version == candidate_version
-            ):
+            if baseline_version.startswith("0.") or baseline == candidate:
                 raise AssertionError(
-                    "cross-version smoke requires a distinct supported 1.x baseline"
+                    "upgrade smoke requires a distinct supported 1.x baseline wheel"
                 )
             baseline_fixture = _create_fixture(
                 workspace / "baseline-fixture",
@@ -238,9 +276,59 @@ def main() -> int:
             ],
             env=environment,
         )
+        seed_generation = _current_generation(managed_root)
+        seed_manifest = _manifest(seed_generation / "manifest")
+        seed_python = seed_generation / seed_manifest["generation_python"]
+        seed_write_admission = """
+import asyncio
+from datetime import UTC, datetime
+from pathlib import Path
+import sys
+
+from daita import Agent
+from daita.adapters.models import SourceRegistration
+
+
+async def main():
+    root = Path(sys.argv[1])
+    agent = await Agent.open("preservation-agent", root=root)
+    source = SourceRegistration.build(
+        agent_id=agent.id,
+        adapter_id="postgresql",
+        native_identity="postgresql:managed-upgrade-warehouse",
+        display_name="Managed upgrade warehouse",
+        configuration={
+            "credential_ref": "env:DAITA_MANAGED_UPGRADE_TEST_PASSWORD",
+            "database": "warehouse",
+            "host": "db.example.test",
+            "port": 5432,
+            "schemas": ("public",),
+            "ssl_mode": "require",
+            "username": "reader",
+        },
+        attached_at=datetime(2026, 7, 30, tzinfo=UTC),
+    )
+    await agent._embedded._store.register_source(source)
+    await agent.close()
+
+
+asyncio.run(main())
+"""
+        _run(
+            [
+                str(seed_python),
+                "-I",
+                "-c",
+                seed_write_admission,
+                str(agent_root),
+            ],
+            env=environment,
+        )
         artifact = agent_root / "preserved-artifact.csv"
         artifact.write_text("id,value\n1,preserved\n", encoding="utf-8")
         expected_agent_hashes = _tree_hashes(agent_root)
+        state_path = agent_root / "agents" / "preservation-agent" / "state.db"
+        expected_database_rows = _database_rows(state_path)
 
         if arguments.baseline_wheel is not None:
             _run(
@@ -261,9 +349,139 @@ def main() -> int:
         if "usage: daita" not in help_result.stdout:
             raise AssertionError("managed launcher help is unavailable")
 
+        _run(
+            [
+                str(launcher),
+                "--root",
+                str(agent_root),
+                "sources",
+                "preservation-agent",
+            ],
+            env=environment,
+        )
+        opened_agent_hashes = _tree_hashes(agent_root)
+        if arguments.baseline_wheel is None:
+            if _without_run_files(opened_agent_hashes) != _without_run_files(
+                expected_agent_hashes
+            ):
+                raise AssertionError("current-format managed open changed agent state")
+        else:
+            if _without_state_databases(
+                opened_agent_hashes
+            ) != _without_state_databases(expected_agent_hashes):
+                before_files = _without_state_databases(expected_agent_hashes)
+                after_files = _without_state_databases(opened_agent_hashes)
+                changed = sorted(
+                    name
+                    for name in set(before_files) | set(after_files)
+                    if before_files.get(name) != after_files.get(name)
+                )
+                raise AssertionError(
+                    "managed candidate open changed state outside the migrated database: "
+                    + ", ".join(changed)
+                )
+            migrated_rows = _database_rows(state_path)
+            if any(
+                migrated_rows.get(table) != rows
+                for table, rows in expected_database_rows.items()
+                if table
+                not in {"database_write_receipts", "sources", "state_migrations"}
+            ):
+                raise AssertionError(
+                    "managed candidate migration changed baseline-owned rows"
+                )
+            expected_journal = (
+                (
+                    1,
+                    "20260810_database_write_receipts",
+                    "0cf5d23bf0426851e51c24450d1f8febd221880e74c78fc39648b6a1dd015b84",
+                ),
+                (
+                    2,
+                    "20260811_postgresql_write_admission",
+                    "451840240521fe5ad424d43e0bc5b7df2d124b3261b35be64b53bd36e08431d0",
+                ),
+                (
+                    3,
+                    "20260812_scoped_source_permissions",
+                    "2ed3f7017f9d4c683ee17a0ba43c88ad4452c5af1b06223343cd43248f699d95",
+                ),
+                (
+                    4,
+                    "20260814_generalized_postgresql_updates",
+                    "b08069f61481986937a864d33471185c6fbf031affe81f275a271f0e56a8f428",
+                ),
+            )
+            with sqlite3.connect(state_path) as connection:
+                journal = tuple(
+                    connection.execute(
+                        "SELECT ordinal, migration_id, checksum "
+                        "FROM state_migrations ORDER BY ordinal"
+                    )
+                )
+            if journal != expected_journal:
+                raise AssertionError(
+                    "managed candidate did not stamp the immutable migration journal"
+                )
+            expected_agent_hashes = opened_agent_hashes
+
         generation = _current_generation(managed_root)
         manifest = _manifest(generation / "manifest")
         python = generation / manifest["generation_python"]
+        inspect_write_admission = """
+import asyncio
+from pathlib import Path
+import sys
+
+from daita import Agent
+from daita.adapters.models import source_registration_id
+
+
+async def main():
+    agent = await Agent.open("preservation-agent", root=Path(sys.argv[1]))
+    sources = await agent.list_sources()
+    admitted = [
+        source
+        for source in sources
+        if source.adapter_id == "postgresql"
+    ]
+    assert len(admitted) == 1
+    assert admitted[0].id == source_registration_id(
+        agent.id,
+        "postgresql",
+        "postgresql:managed-upgrade-warehouse",
+    )
+    assert admitted[0].native_identity == "postgresql:managed-upgrade-warehouse"
+    assert admitted[0].display_name == "Managed upgrade warehouse"
+    assert admitted[0].active is True
+    assert admitted[0].attached_at.isoformat() == "2026-07-30T00:00:00+00:00"
+    assert dict(admitted[0].configuration) == {
+        "credential_ref": "env:DAITA_MANAGED_UPGRADE_TEST_PASSWORD",
+        "database": "warehouse",
+        "host": "db.example.test",
+        "port": 5432,
+        "schemas": ("public",),
+        "ssl_mode": "require",
+        "username": "reader",
+    }
+    permissions = await agent.inspect_source_permissions(admitted[0].id)
+    assert permissions.state.read_scope.mode.value == "all"
+    assert permissions.state.postgresql_update_scopes == ()
+    await agent.close()
+
+
+asyncio.run(main())
+"""
+        _run(
+            [
+                str(python),
+                "-I",
+                "-c",
+                inspect_write_admission,
+                str(agent_root),
+            ],
+            env=environment,
+        )
         if manifest["wheel_sha256"] != candidate_sha:
             raise AssertionError(
                 "managed installer did not consume the candidate wheel"

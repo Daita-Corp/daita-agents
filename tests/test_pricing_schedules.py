@@ -2,7 +2,7 @@ import copy
 import json
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from importlib import resources
 
@@ -48,7 +48,7 @@ from daita.llm.providers.openai_compatible import OpenAICompatibleProvider
 from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from daita.storage.sqlite import SQLiteStateStore
 
-NOW = datetime(2026, 7, 26, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 26, 12, tzinfo=UTC)
 SOURCE = PricingSource(
     purpose="rates",
     url="https://example.com/pricing",
@@ -104,7 +104,7 @@ def _schedule(
         2026,
         1,
         1,
-        tzinfo=timezone.utc,
+        tzinfo=UTC,
     ),
     effective_until: datetime | None = None,
     qualifiers: tuple[PricingQualifier, ...] = (
@@ -329,12 +329,12 @@ def test_schedule_parser_rejects_every_record_and_array_bound():
 def test_effective_periods_are_start_inclusive_end_exclusive_and_future_safe():
     first = _schedule(
         "closed",
-        effective_from=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        effective_until=datetime(2026, 2, 1, tzinfo=timezone.utc),
+        effective_from=datetime(2026, 1, 1, tzinfo=UTC),
+        effective_until=datetime(2026, 2, 1, tzinfo=UTC),
     )
     future = _schedule(
         "future",
-        effective_from=datetime(2026, 2, 1, tzinfo=timezone.utc),
+        effective_from=datetime(2026, 2, 1, tzinfo=UTC),
     )
     schedules = validate_pricing_schedules((first, future))
 
@@ -344,7 +344,7 @@ def test_effective_periods_are_start_inclusive_end_exclusive_and_future_safe():
             provider="provider",
             model="exact-model",
             endpoint="responses",
-            requested_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            requested_at=datetime(2026, 1, 1, tzinfo=UTC),
             qualifiers={"service_tier": "default", "region": "global"},
         )
         == first
@@ -362,7 +362,7 @@ def test_effective_periods_are_start_inclusive_end_exclusive_and_future_safe():
                 23,
                 59,
                 59,
-                tzinfo=timezone.utc,
+                tzinfo=UTC,
             ),
             qualifiers={"service_tier": "default", "region": "global"},
         )
@@ -374,7 +374,7 @@ def test_effective_periods_are_start_inclusive_end_exclusive_and_future_safe():
             provider="provider",
             model="exact-model",
             endpoint="responses",
-            requested_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+            requested_at=datetime(2026, 2, 1, tzinfo=UTC),
             qualifiers={"service_tier": "default", "region": "global"},
         )
         == future
@@ -385,7 +385,7 @@ def test_effective_periods_are_start_inclusive_end_exclusive_and_future_safe():
             provider="provider",
             model="exact-model",
             endpoint="responses",
-            requested_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+            requested_at=datetime(2025, 12, 31, tzinfo=UTC),
             qualifiers={"service_tier": "default", "region": "global"},
         )
         is None
@@ -1078,11 +1078,11 @@ def test_anthropic_sonnet_transition_haiku_and_unknown_dimensions_fail_closed():
     )
     introductory = sonnet._decode_response(  # noqa: SLF001
         response,
-        requested_at=datetime(2026, 8, 31, 23, 59, 59, tzinfo=timezone.utc),
+        requested_at=datetime(2026, 8, 31, 23, 59, 59, tzinfo=UTC),
     )
     standard = sonnet._decode_response(  # noqa: SLF001
         response,
-        requested_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        requested_at=datetime(2026, 9, 1, tzinfo=UTC),
     )
     assert introductory.usage.cost_estimate.amount_usd == Decimal("12")
     assert standard.usage.cost_estimate.amount_usd == Decimal("18")

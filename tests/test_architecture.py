@@ -1,4 +1,5 @@
 import ast
+import inspect
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -9,6 +10,13 @@ from daita.storage.sqlite import SQLiteStateStore
 
 PACKAGE = Path(daita.__file__).parent
 ROOT = PACKAGE.parents[1]
+
+
+def test_public_agent_facade_cannot_replace_composed_context_or_tool_runtime():
+    for method in (daita.Agent.create, daita.Agent.open):
+        parameters = inspect.signature(method).parameters
+        assert "context_builder" not in parameters
+        assert "tools" not in parameters
 
 
 def _python_text(root: Path) -> str:
@@ -105,6 +113,7 @@ def test_public_surface_is_focused():
         "ModelRoute",
         "ModelRouteCandidate",
         "PostgreSQLSource",
+        "PostgreSQLUpdateReadiness",
         "RetryPolicy",
         "ResourceRevisionBinding",
         "SQLiteSource",
@@ -171,7 +180,8 @@ def test_survivor_docs_and_examples_describe_only_the_mvp():
 
     for required in (
         "at most 8 runs, 40 messages, and 24,000 UTF-8 bytes",
-        "Data access remains read-only",
+        "Data access is read first",
+        "explicitly scoped PostgreSQL update",
         "foreground",
         "in-process approve-once callback",
         "does not persist events, collect telemetry",
@@ -351,7 +361,7 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
 
 def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
-    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
         encoding="utf-8"
     )
@@ -363,7 +373,7 @@ def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners(
     assert _class_owners("SemanticSubject") == {"semantics.py"}
     assert 'SEMANTIC_SAVE_TOOL_NAME = "semantic_save"' in semantics
     assert 'SEMANTIC_DELETE_TOOL_NAME = "semantic_delete"' in semantics
-    assert "CREATE TABLE IF NOT EXISTS semantic_annotations" in storage
+    assert "CREATE TABLE semantic_annotations" in schema
     assert "semantic_resource_facts" in controller
     assert "semantic_annotation_issue" in controller
     assert "bind_current_semantic_evidence" in controller
@@ -403,6 +413,7 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
         encoding="utf-8"
     )
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     evaluation = (PACKAGE / "evaluation.py").read_text(encoding="utf-8")
     candidates = (PACKAGE / "learning_candidates.py").read_text(encoding="utf-8")
     package_text = _python_text(PACKAGE)
@@ -415,11 +426,13 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
     assert "semantic-maintenance" in semantics
     assert "review material only" in context
     assert "_decorate_semantic_view" in controller
-    assert "_semantic_management_requested" in controller
+    assert "_semantic_management_requested" not in controller
+    assert "_SEMANTIC_MANAGEMENT_SIGNALS" not in controller
+    assert "select_explicit_learning_run" in controller
     assert "_semantic_maintenance_requested" in controller
     assert "capability.id in _SEMANTIC_CAPABILITIES" in controller
     assert "semantic_annotations" in storage
-    assert "CREATE TABLE IF NOT EXISTS learning_candidates" in storage
+    assert "CREATE TABLE learning_candidates" in schema
     assert "tools=()" in candidates
     assert "AgentLoop" not in candidates
     assert "DataToolRuntime" not in candidates
@@ -465,6 +478,7 @@ async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branc
         assert write_tools == {
             "artifact_save_local",
             "artifact_set_export_location",
+            "data_update_postgresql",
             "memory_set",
             "semantic_delete",
             "semantic_save",
@@ -473,6 +487,184 @@ async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branc
         }
     finally:
         await agent.close()
+
+
+async def test_database_write_phase_three_registers_only_the_postgresql_update_slice(
+    tmp_path,
+):
+    agent = await daita.Agent.create("database-write-phase-two", root=tmp_path)
+    try:
+        registry = agent._embedded._capabilities
+        capability_ids = {
+            registry.resolve_tool(name)[1].id for name in registry.tool_names
+        }
+        preview_tool = "data_preview_postgresql_update"
+        preview_capability = "data.postgresql.update_impact"
+        update_tool = "data_update_postgresql"
+        update_capability = "data.postgresql.update"
+        forbidden_tools = {
+            "data_preview_sqlite_update",
+            "data_update_sqlite",
+        }
+        forbidden_capabilities = {
+            "data.sqlite.update_impact",
+            "data.sqlite.update",
+        }
+
+        assert preview_tool in registry.tool_names
+        preview = registry.resolve_tool(preview_tool)[1]
+        assert preview.id == preview_capability
+        assert preview.access_mode is AccessMode.READ
+        assert preview.side_effecting is False
+        assert update_tool in registry.tool_names
+        update = registry.resolve_tool(update_tool)[1]
+        assert update.id == update_capability
+        assert update.access_mode is AccessMode.WRITE
+        assert update.side_effecting is True
+        _, update_executor = registry.resolve_execution(update.id)
+        assert callable(getattr(update_executor, "preflight", None))
+        assert forbidden_tools.isdisjoint(registry.tool_names)
+        assert forbidden_capabilities.isdisjoint(capability_ids)
+
+        controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+            encoding="utf-8"
+        )
+        package_text = _python_text(PACKAGE)
+        for dormant_name in forbidden_tools | forbidden_capabilities:
+            assert f'"{dormant_name}"' not in package_text
+            assert f"'{dormant_name}'" not in package_text
+        assert "class PostgreSQLUpdateExecutor" in package_text
+        write_backend = (PACKAGE / "adapters" / "postgresql_write.py").read_text(
+            encoding="utf-8"
+        )
+        assert "start_database_write_receipt" in write_backend
+        assert "finish_database_write_receipt" in write_backend
+        assert "database_write_receipts" not in write_backend
+        assert "SideEffectExecutor" not in write_backend
+        assert "approval_handler" not in write_backend
+        assert "_execute_side_effect" in controller
+        assert "ApprovalRequest" in controller
+        capabilities_owner = (
+            PACKAGE / "domains" / "data" / "capabilities.py"
+        ).read_text(encoding="utf-8")
+        assert ".execute_update(" in capabilities_owner
+        assert ".execute_update(" not in controller
+        assert ".execute_update(" not in (PACKAGE / "loop" / "driver.py").read_text(
+            encoding="utf-8"
+        )
+        embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+        assert embedded.count("mutation_lock = asyncio.Lock()") == 1
+        assert "pending_database_write" not in package_text
+        assert "database_write_events" not in package_text
+        assert "DbRuntime" not in package_text
+        assert "RuntimeKernel" not in package_text
+        for method in (
+            "inspect_source_permissions",
+            "preview_source_permissions",
+            "apply_source_permissions",
+        ):
+            assert method in _class_methods(PACKAGE / "agent.py", "Agent")
+            assert method in _class_methods(
+                PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
+            )
+            assert method not in controller
+            assert method not in (
+                PACKAGE / "domains" / "data" / "context.py"
+            ).read_text(encoding="utf-8")
+    finally:
+        await agent.close()
+
+
+def test_database_write_phase_four_control_plane_keeps_current_owners():
+    agent_methods = _class_methods(PACKAGE / "agent.py", "Agent")
+    embedded_methods = _class_methods(
+        PACKAGE / "hosting" / "embedded.py",
+        "EmbeddedAgent",
+    )
+    backend_methods = _class_methods(
+        PACKAGE / "adapters" / "postgresql_write.py",
+        "PostgreSQLUpdatePreviewBackend",
+    )
+    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+        encoding="utf-8"
+    )
+    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    cli = (PACKAGE / "cli.py").read_text(encoding="utf-8")
+    terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
+    terminal_shell = (PACKAGE / "tui" / "shell.py").read_text(encoding="utf-8")
+
+    assert "postgresql_update_readiness" in agent_methods
+    assert "postgresql_update_readiness" in embedded_methods
+    assert "postgresql_update_readiness" in backend_methods
+    assert _class_owners("PostgreSQLUpdateReadiness") == {
+        "adapters/postgresql_write.py"
+    }
+    assert "postgresql_update_readiness" not in controller
+    assert "postgresql_update_readiness" not in context
+    assert ".postgresql_update_readiness(" in cli
+    assert ".postgresql_update_readiness(" not in terminal
+    assert "inspect_source_permissions" in terminal
+    assert "preview_source_permissions" in terminal
+    assert "apply_source_permissions" in terminal
+    assert '"/source permissions"' in terminal
+    assert '"/source permissions"' in terminal_shell
+    for obsolete_terminal_command in (
+        "/source write inspect",
+        "/source write enable",
+        "/source write disable",
+        "/source write readiness",
+    ):
+        assert obsolete_terminal_command not in terminal
+        assert obsolete_terminal_command not in terminal_shell
+    production = _python_text(PACKAGE)
+    for administration in (
+        "CREATE ROLE daita_writer",
+        "GRANT CONNECT ON DATABASE",
+        "administrator_password",
+    ):
+        assert administration not in production
+    for later_phase in (
+        "data_insert_postgresql",
+        "data_delete_postgresql",
+        "execute_postgresql_sql",
+        "reconcile_database_write",
+    ):
+        assert later_phase not in production
+
+
+def test_phase_c_removes_legacy_permission_runtime_but_retains_migration_evidence():
+    repository_text = (
+        "\n".join(
+            path.read_text(encoding="utf-8")
+            for root in (PACKAGE, ROOT / "tests", ROOT / "docs", ROOT / "examples")
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix in {".py", ".md"}
+        )
+        + (ROOT / "README.md").read_text(encoding="utf-8")
+        + (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    )
+    for removed in (
+        "/source " + "config",
+        "set_source_" + "write_access",
+        "_configure_postgresql_" + "source",
+        "source-write-" + "access",
+        "clear_postgresql_" + "update_scopes",
+        "required_configuration_" + "flags",
+    ):
+        assert removed not in repository_text
+
+    historical_terms = ("postgresql_write_" + "admissions", "write_" + "access")
+    matched = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if any(term in path.read_text(encoding="utf-8") for term in historical_terms)
+    }
+    assert matched == {
+        "storage/sqlite_codecs/sources.py",
+        "storage/sqlite_migrations/postgresql_write_admission.py",
+        "storage/sqlite_migrations/scoped_source_permissions.py",
+        "storage/sqlite_schema.py",
+    }
 
 
 def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
@@ -991,7 +1183,7 @@ def test_stage_four_summary_is_catalog_owned_and_not_loop_or_storage_state():
         "relationship_count",
     ):
         assert field_name not in loop
-    assert "readiness" not in storage.lower()
+    assert "readiness_state" not in storage.lower()
 
 
 def test_catalog_schema_slice_extends_existing_catalog_and_capability_owners():
@@ -1006,7 +1198,8 @@ def test_catalog_schema_slice_extends_existing_catalog_and_capability_owners():
     loop = _python_text(PACKAGE / "loop")
     assert 'name="catalog_schema"' in capabilities
     assert 'CATALOG_SCHEMA_EVIDENCE_KIND = "catalog.schema_slice"' in capabilities
-    assert "catalog_declarations(identity.id, catalog_service)" in embedded
+    assert "catalog_declarations(identity.id, data_view)" in embedded
+    assert "catalog_service = CatalogService(store, store)" in embedded
     assert "catalog_schema" not in loop
     for prohibited in (
         "CatalogSchemaCache",
@@ -1153,8 +1346,30 @@ def test_pricing_semantics_have_one_provider_neutral_owner():
         assert provider not in pricing
 
 
-def test_new_mvp_owners_have_no_version_or_compatibility_framework():
-    candidates = [PACKAGE / "loop", PACKAGE / "hosting", PACKAGE / "storage"]
+def test_sqlite_journal_and_codecs_have_one_append_only_storage_owner():
+    pragma_owners = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if "PRAGMA user_version" in path.read_text(encoding="utf-8")
+    }
+    assert pragma_owners == {"storage/sqlite_migrations/preledger.py"}
+    migration_files = {
+        path.name for path in (PACKAGE / "storage" / "sqlite_migrations").glob("*.py")
+    }
+    assert migration_files == {
+        "__init__.py",
+        "baseline.py",
+        "database_write_receipts.py",
+        "generalized_postgresql_updates.py",
+        "models.py",
+        "postgresql_write_admission.py",
+        "preledger.py",
+        "runner.py",
+        "scoped_source_permissions.py",
+    }
+    assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
+
+    candidates = [PACKAGE / "loop", PACKAGE / "hosting"]
     candidates.extend(
         path
         for path in (PACKAGE / "memory", PACKAGE / "skills", PACKAGE / "observation.py")
@@ -1165,13 +1380,46 @@ def test_new_mvp_owners_have_no_version_or_compatibility_framework():
         for path in candidates
     ).lower()
     for term in (
-        "compatibility decoder",
-        "compatibility migration",
         "migration framework",
         "schema_version",
         "schema-version",
+        "user_version",
+        "sqlite_migrations",
+        "sqlite_codecs",
     ):
         assert term not in text
+
+    assert (PACKAGE / "storage" / "sqlite_migrations").is_dir()
+    assert (PACKAGE / "storage" / "sqlite_codecs").is_dir()
+    assert not (PACKAGE / "migrations").exists()
+    production = _python_text(PACKAGE)
+    for obsolete in (
+        "STATE_FORMAT_VERSION",
+        "_UNVERSIONED_STATE_FORMAT",
+        "_StateMigration",
+        "_STATE_MIGRATIONS",
+        "_state_migration_path",
+        "_unversioned_state_format",
+        "_migrate_existing_state",
+        "_migrate_v1_to_v2",
+        "_migrate_v2_to_v3",
+        "_require_current_source_records",
+        "_UNVERSIONED_STATE_SCHEMAS",
+        "_RECORD_TYPES",
+        "_ENUM_TYPES",
+        "def _pack(",
+        "def _unpack(",
+        "def _dumps(",
+        "def _loads(",
+    ):
+        assert obsolete not in production
+
+    for path in PACKAGE.rglob("*.py"):
+        relative = path.relative_to(PACKAGE).as_posix()
+        text = path.read_text(encoding="utf-8")
+        if not relative.startswith("storage/"):
+            assert "sqlite_migrations" not in text
+            assert "sqlite_codecs" not in text
 
 
 async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
@@ -1202,19 +1450,37 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
         }
 
         assert tables == {
+            "database_write_receipts",
             "learning_candidates",
             "messages",
             "metadata",
+            "postgresql_update_scopes",
             "runs",
             "semantic_annotations",
             "snapshots",
+            "source_read_scopes",
             "sources",
+            "state_migrations",
             "syncs",
         }
         assert columns == {
+            "database_write_receipts": (
+                "agent_id",
+                "id",
+                "run_id",
+                "call_id",
+                "data",
+            ),
             "learning_candidates": ("agent_id", "id", "data"),
             "messages": ("run_id", "position", "data"),
             "metadata": ("key", "data"),
+            "postgresql_update_scopes": (
+                "agent_id",
+                "source_id",
+                "resource_id",
+                "authorization_fingerprint",
+                "data",
+            ),
             "runs": (
                 "id",
                 "agent_id",
@@ -1225,7 +1491,9 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             ),
             "semantic_annotations": ("agent_id", "id", "data"),
             "snapshots": ("agent_id", "source_id", "sync_id", "data"),
+            "source_read_scopes": ("agent_id", "source_id", "data"),
             "sources": ("agent_id", "id", "data"),
+            "state_migrations": ("ordinal", "migration_id", "checksum"),
             "syncs": ("agent_id", "id", "source_id", "data"),
         }
         assert named_indexes == {"runs_conversation_turn": "runs"}

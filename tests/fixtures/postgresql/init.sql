@@ -344,6 +344,13 @@ ANALYZE analytics.payments;
 ANALYZE analytics.shipments;
 ANALYZE analytics.support_tickets;
 
+-- Make database admission explicit for fixture roles instead of inheriting the
+-- PostgreSQL default CONNECT/TEMP privileges from PUBLIC. The owner/superuser
+-- remains available for external fixture setup and verification.
+REVOKE ALL PRIVILEGES ON DATABASE daita_fixture FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON DATABASE postgres FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON DATABASE template1 FROM PUBLIC;
+
 GRANT CONNECT ON DATABASE daita_fixture TO daita_reader;
 GRANT USAGE ON SCHEMA analytics TO daita_reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO daita_reader;

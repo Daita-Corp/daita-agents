@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+
+import pytest
 
 from daita import (
     Agent,
@@ -29,10 +31,11 @@ from daita.semantics import (
     SEMANTIC_SAVE_TOOL_NAME,
     SEMANTIC_VIEW_CAPABILITY_ID,
     SEMANTIC_VIEW_TOOL_NAME,
+    SemanticValidationError,
 )
 from daita.terminal import _learning_invocation_message
 
-NOW = datetime(2026, 7, 28, 14, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 28, 14, tzinfo=UTC)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -156,16 +159,17 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
     )
     try:
         runtime = agent._embedded._data_tool_runtime
-        definitions = await runtime.definitions(
-            RunInput(
-                id="projection-run",
-                agent_id=agent.id,
-                message="Teach this resource definition.",
-                created_at=NOW,
-                conversation_id="projection-conversation",
-                source_id=source.id,
-            )
+        projection_run = RunInput(
+            id="projection-run",
+            agent_id=agent.id,
+            message="Teach this resource definition.",
+            created_at=NOW,
+            conversation_id="projection-conversation",
+            source_id=source.id,
         )
+        runtime.select_explicit_learning_run(projection_run.id)
+        definitions = await runtime.definitions(projection_run)
+        runtime.clear_explicit_learning_run(projection_run.id)
         names = {item.name for item in definitions}
         assert {
             SEMANTIC_LIST_TOOL_NAME,
@@ -216,6 +220,22 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             SEMANTIC_SAVE_TOOL_NAME,
             SEMANTIC_DELETE_TOOL_NAME,
         }.intersection(item.name for item in ordinary)
+        incidental = await runtime.definitions(
+            RunInput(
+                id="incidental-run",
+                agent_id=agent.id,
+                message="Remember the definition while answering this semantic query.",
+                created_at=NOW,
+                conversation_id="incidental-conversation",
+                source_id=source.id,
+            )
+        )
+        assert not {
+            SEMANTIC_LIST_TOOL_NAME,
+            SEMANTIC_VIEW_TOOL_NAME,
+            SEMANTIC_SAVE_TOOL_NAME,
+            SEMANTIC_DELETE_TOOL_NAME,
+        }.intersection(item.name for item in incidental)
     finally:
         await agent.close()
 
@@ -236,7 +256,7 @@ async def test_missing_approval_and_denial_bind_current_evidence_without_state(
         clock=lambda: NOW,
     )
     try:
-        await agent.run("When we say booked revenue, use booked_at.")
+        await agent.learn("When we say booked revenue, use booked_at.")
         assert _error_code(_tool_results(provider)[0]) == "approval_required"
         assert await agent.list_semantic_annotations() == ()
     finally:
@@ -277,7 +297,7 @@ async def test_missing_approval_and_denial_bind_current_evidence_without_state(
         clock=lambda: NOW,
     )
     try:
-        result = await agent.run("Booked revenue means booked_at.")
+        result = await agent.learn("Booked revenue means booked_at.")
         assert _error_code(_tool_results(provider)[0]) == "approval_denied"
         assert len(approvals) == 1
         assert approvals[0].tool_name == SEMANTIC_SAVE_TOOL_NAME
@@ -355,9 +375,9 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
             "Teach missing.",
             "Teach invalid evidence.",
         ):
-            await agent.run(prompt)
+            await agent.learn(prompt)
         assert tuple(_error_code(item) for item in _tool_results(provider)) == (
-            "semantic_unknown_resource",
+            "resource_read_not_allowed",
             "source_scope_violation",
             "semantic_stale_revision",
             "semantic_unknown_field",
@@ -435,7 +455,7 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
             "Delete the definition without loading.",
             "Delete the definition from a stale view.",
         ):
-            await agent.run(message)
+            await agent.learn(message)
         results = _tool_results(provider)
         assert results[0].is_error is False
         assert tuple(_error_code(item) for item in results[1:]) == (
@@ -450,16 +470,19 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
         assert current.annotation.statement == (
             "Booked revenue uses invoices.booked_at."
         )
+        delete_run = RunInput(
+            id="delete-approved-run",
+            agent_id=agent.id,
+            message="forget the definition",
+            created_at=NOW,
+            conversation_id="delete-approved-conversation",
+            source_id=source.id,
+        )
+        runtime = agent._embedded._data_tool_runtime
+        runtime.select_explicit_learning_run(delete_run.id)
         deleted = (
-            await agent._embedded._data_tool_runtime.execute_all(
-                RunInput(
-                    id="delete-approved-run",
-                    agent_id=agent.id,
-                    message="forget the definition",
-                    created_at=NOW,
-                    conversation_id="delete-approved-conversation",
-                    source_id=source.id,
-                ),
+            await runtime.execute_all(
+                delete_run,
                 (
                     ToolCall(
                         id="delete-approved",
@@ -472,6 +495,7 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
                 ),
             )
         )[0]
+        runtime.clear_explicit_learning_run(delete_run.id)
         assert deleted.is_error is False
         assert len(approvals) == 2
         assert await agent.read_semantic_annotation("booked-revenue") is None
@@ -479,8 +503,11 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
         await agent.close()
 
 
-async def test_state_change_during_semantic_approval_returns_state_changed(tmp_path):
-    database, source, resource = await _seed_source(tmp_path, "semantic-state-change")
+async def test_state_change_during_semantic_approval_returns_state_changed(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _database, source, resource = await _seed_source(tmp_path, "semantic-state-change")
     provider = MockModelProvider(
         (
             _call(
@@ -493,13 +520,9 @@ async def test_state_change_during_semantic_approval_returns_state_changed(tmp_p
             _stop("state changed"),
         )
     )
-    agent: Agent
 
     async def approve(request: ApprovalRequest) -> ApprovalDecision:
         assert request.tool_name == SEMANTIC_SAVE_TOOL_NAME
-        with sqlite3.connect(database) as connection:
-            connection.execute("ALTER TABLE invoices ADD COLUMN currency TEXT")
-        await agent.refresh_source(source.id)
         return ApprovalDecision.APPROVE
 
     agent = await Agent.open(
@@ -512,7 +535,19 @@ async def test_state_change_during_semantic_approval_returns_state_changed(tmp_p
         clock=lambda: NOW,
     )
     try:
-        await agent.run("Booked revenue means booked_at.")
+        runtime = agent._embedded._data_tool_runtime
+        original_validation = runtime._validate_semantic_preflight
+        validations = 0
+
+        async def state_changes(run, capability, fingerprint):
+            nonlocal validations
+            validations += 1
+            if validations == 2:
+                raise SemanticValidationError("semantic facts changed")
+            return await original_validation(run, capability, fingerprint)
+
+        monkeypatch.setattr(runtime, "_validate_semantic_preflight", state_changes)
+        await agent.learn("Booked revenue means booked_at.")
         result = _tool_results(provider)[0]
         assert _error_code(result) == "state_changed"
         assert await agent.read_semantic_annotation("booked-revenue") is None
@@ -558,7 +593,7 @@ async def test_tool_result_evidence_is_valid_and_save_is_recalled_after_reopen(
         clock=lambda: NOW,
     )
     try:
-        result = await agent.run(
+        result = await agent.learn(
             "Confirm and save the booked revenue definition from the current data."
         )
         assert result.final_text == "saved"
@@ -637,7 +672,7 @@ async def test_natural_language_and_learn_route_to_semantics_without_new_command
         clock=lambda: NOW,
     )
     try:
-        await agent.run(
+        await agent.learn(
             "When we say booked revenue, we mean the invoices booked_at field."
         )
         prompt = "\n".join(

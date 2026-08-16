@@ -11,13 +11,14 @@ from typing import Any, Generic, TextIO, TypeVar
 from ._installation import repair_guidance
 
 _Value = TypeVar("_Value")
-_MAX_OPTIONS = 128
+_MAX_OPTIONS = 10_000
 _MAX_LABEL_CHARACTERS = 128
 _MAX_DESCRIPTION_CHARACTERS = 256
 _MAX_SEARCH_TERMS = 8
 _MAX_FILTER_CHARACTERS = 64
 _MAX_VALIDATION_CHARACTERS = 256
-_MAX_MULTI_SELECTIONS = 32
+_DEFAULT_MAX_MULTI_SELECTIONS = 32
+_MAX_MULTI_SELECTIONS = 10_000
 _NO_SELECTION = object()
 
 
@@ -97,6 +98,7 @@ class _MultiSelectionState(_SelectionState[_Value]):
         maximum: int,
         empty_message: str,
         maximum_message: str,
+        initial_values: tuple[_Value, ...] = (),
     ) -> None:
         super().__init__(options)
         self.declared_options = options
@@ -105,6 +107,11 @@ class _MultiSelectionState(_SelectionState[_Value]):
         self.maximum_message = maximum_message
         self.selected_identities: set[int] = set()
         self.validation_message = ""
+        for option in options:
+            if any(option.value == value for value in initial_values):
+                self.selected_identities.add(option.identity)
+        if len(self.selected_identities) > maximum:
+            raise ValueError("initial multi-selection exceeds the declared maximum")
 
     def toggle(self) -> None:
         option = self.current_option()
@@ -129,6 +136,35 @@ class _MultiSelectionState(_SelectionState[_Value]):
             for option in self.declared_options
             if option.identity in self.selected_identities
         )
+
+    @property
+    def selected_count(self) -> int:
+        return len(self.selected_identities)
+
+    @property
+    def total_count(self) -> int:
+        return len(self.declared_options)
+
+    def select_all_matches(self) -> None:
+        proposed = self.selected_identities | {
+            option.identity for option in self.visible
+        }
+        if len(proposed) > self.maximum:
+            self.validation_message = self.maximum_message
+            return
+        self.selected_identities = proposed
+        self.validation_message = ""
+
+    def select_all(self) -> None:
+        if len(self.declared_options) > self.maximum:
+            self.validation_message = self.maximum_message
+            return
+        self.selected_identities = {option.identity for option in self.declared_options}
+        self.validation_message = ""
+
+    def clear_selection(self) -> None:
+        self.selected_identities.clear()
+        self.validation_message = ""
 
 
 async def select_one(
@@ -211,12 +247,13 @@ async def select_many(
     output_stream: TextIO,
     enhanced_input: Any = None,
     enhanced_output: Any = None,
-    maximum: int = _MAX_MULTI_SELECTIONS,
+    maximum: int = _DEFAULT_MAX_MULTI_SELECTIONS,
     empty_message: str | None = None,
     maximum_message: str | None = None,
     invalid_message: str | None = None,
     fallback_prompt: str = "Choices (comma-separated numbers): ",
     show_title_in_fallback: bool = True,
+    initial_values: tuple[_Value, ...] = (),
 ) -> tuple[_Value, ...]:
     """Select stable values using enhanced navigation or numbered fallback."""
 
@@ -291,6 +328,7 @@ async def select_many(
         maximum=maximum,
         empty_message=safe_empty_message,
         maximum_message=safe_maximum_message,
+        initial_values=initial_values,
     )
     try:
         application = _create_multi_application(
@@ -475,6 +513,21 @@ def _create_multi_application(
         state.toggle()
         invalidate(event)
 
+    @keys.add("c-a")
+    def select_all_matches(event: Any) -> None:
+        state.select_all_matches()
+        invalidate(event)
+
+    @keys.add("c-e")
+    def select_all_eligible(event: Any) -> None:
+        state.select_all()
+        invalidate(event)
+
+    @keys.add("c-x")
+    def clear_selection(event: Any) -> None:
+        state.clear_selection()
+        invalidate(event)
+
     @keys.add("enter")
     def confirm(event: Any) -> None:
         if not terminal_usable():
@@ -616,11 +669,12 @@ def _render_multi_fragments(
         return _small_terminal_fragments(size, glyphs)
     narrow = size is not None and size[0] < 70
     help_text = (
-        "  ↑/↓ move · Space toggle · Enter continue · type to filter · Esc back\n"
+        "  ↑/↓ move · Space toggle · Ctrl-A matches · Ctrl-E all · Ctrl-X clear\n"
+        "  Enter continue · type to filter · Esc back\n"
         if glyphs.prompt == "›"
         else (
-            "  Up/Down move | Space toggle | Enter continue | "
-            "type to filter | Esc back\n"
+            "  Up/Down move | Space toggle | Ctrl-A matches | Ctrl-E all | "
+            "Ctrl-X clear\n  Enter continue | type to filter | Esc back\n"
         )
     )
     fragments = [
@@ -642,6 +696,13 @@ def _render_multi_fragments(
                 f"  {state.validation_message}\n",
             )
         )
+    fragments.append(
+        (
+            "class:selection.help",
+            f"  Selected {state.selected_count} of {state.total_count}"
+            f" · {len(state.visible)} matching\n",
+        )
+    )
     fragments.append(("", "\n"))
     visible = state.visible
     if not visible:
@@ -734,13 +795,13 @@ def _select_numbered_many(
         if value == "":
             raise EOFError
         raw = value.rstrip("\r\n").strip()
-        pieces = tuple(piece.strip() for piece in raw.split(","))
-        try:
-            indexes = (
-                tuple(int(piece) for piece in pieces) if raw and all(pieces) else ()
-            )
-        except ValueError:
-            indexes = ()
+        if raw.casefold() == "all":
+            indexes = tuple(range(1, len(options) + 1))
+        elif raw.casefold() == "clear":
+            print("Selection cleared.", file=output_stream)
+            continue
+        else:
+            indexes = _parse_numbered_selection(raw)
         if (
             indexes
             and len(indexes) <= maximum
@@ -749,6 +810,30 @@ def _select_numbered_many(
         ):
             return tuple(options[index - 1].value for index in indexes)
         print(invalid_message, file=output_stream)
+
+
+def _parse_numbered_selection(raw: str) -> tuple[int, ...]:
+    if not raw:
+        return ()
+    indexes: list[int] = []
+    try:
+        for piece in (item.strip() for item in raw.split(",")):
+            if not piece:
+                return ()
+            if "-" not in piece:
+                indexes.append(int(piece))
+                continue
+            start_text, separator, end_text = piece.partition("-")
+            if not separator or not start_text or not end_text:
+                return ()
+            start = int(start_text)
+            end = int(end_text)
+            if start > end:
+                return ()
+            indexes.extend(range(start, end + 1))
+    except ValueError:
+        return ()
+    return tuple(indexes)
 
 
 def _normalize_options(

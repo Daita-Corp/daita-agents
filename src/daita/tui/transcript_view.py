@@ -230,7 +230,7 @@ def _render_startup_fragments(
         return [
             (
                 "class:tui.empty",
-                "\n  Ask a question about your data, or type /help for commands.\n",
+                "\n  Ask a question about your data, or type / to browse commands.\n",
             )
         ]
     capabilities = capabilities or _terminal_capabilities()
@@ -424,7 +424,7 @@ def _render_startup_fragments(
             )
         )
 
-    welcome = "Ask a question about your data, or type /help for commands."
+    welcome = "Ask a question about your data, or type / to browse commands."
     welcome = _truncate_display_text(welcome, safe_width, marker=marker)[0]
     fragments.extend(
         [

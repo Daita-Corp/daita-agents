@@ -3,7 +3,7 @@ import os
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import fields
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
@@ -11,6 +11,7 @@ import pytest
 
 import daita.skills.store as skill_module
 from daita import Agent, SQLiteSource
+from daita.hosting.embedded import EmbeddedAgent
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -43,8 +44,9 @@ from daita.skills.capabilities import (
     SKILL_VIEW_OUTPUT_KIND,
     SKILL_VIEW_TOOL_NAME,
 )
+from daita.storage.sqlite_migrations import migration_rows
 
-NOW = datetime(2026, 7, 22, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 22, tzinfo=UTC)
 
 
 def _profile(provider: MockModelProvider, *, context: int = 20_000) -> ModelProfile:
@@ -778,9 +780,9 @@ async def test_parallel_skill_and_data_reads_start_together_and_keep_order(
         assert loop is not None
         runtime = loop._tools
         skill_store = agent._embedded._skill_store
-        catalog_service = agent._embedded._catalog_service
+        data_view = agent._embedded._data_view
         original_read = skill_store.read_skill_with_digest
-        original_search = catalog_service.search
+        original_search = data_view.search
         started: set[str] = set()
         release = asyncio.Event()
 
@@ -799,7 +801,7 @@ async def test_parallel_skill_and_data_reads_start_together_and_keep_order(
             return await original_search(request)
 
         monkeypatch.setattr(skill_store, "read_skill_with_digest", slow_read)
-        monkeypatch.setattr(catalog_service, "search", slow_search)
+        monkeypatch.setattr(data_view, "search", slow_search)
         run = RunInput(
             id="parallel-run",
             agent_id=agent.id,
@@ -875,13 +877,15 @@ async def test_custom_context_builder_remains_unwrapped(tmp_path):
     provider = MockModelProvider((_stop(),))
     context = CustomContext()
     tools = NoTools()
-    agent = await Agent.create(
-        "custom-skill-context",
-        root=tmp_path,
-        model=provider,
-        model_profile=_profile(provider),
-        context_builder=context,
-        tools=tools,
+    agent = Agent(
+        await EmbeddedAgent.create(
+            "custom-skill-context",
+            root=tmp_path,
+            model=provider,
+            model_profile=_profile(provider),
+            context_builder=context,
+            tools=tools,
+        )
     )
     try:
         await agent.save_skill("procedure", "SKILL_INDEX_SENTINEL", "SECRET_BODY")
@@ -929,19 +933,27 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
             )
         }
         assert tables == {
+            "database_write_receipts",
             "learning_candidates",
             "messages",
             "metadata",
+            "postgresql_update_scopes",
             "runs",
             "semantic_annotations",
             "snapshots",
+            "source_read_scopes",
             "sources",
+            "state_migrations",
             "syncs",
         }
         for table in tables:
-            assert connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[
-                0
-            ] == (1 if table == "metadata" else 0)
+            expected_rows = 1 if table == "metadata" else 0
+            if table == "state_migrations":
+                expected_rows = len(migration_rows())
+            assert (
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                == expected_rows
+            )
 
 
 def test_records_limits_and_absent_lifecycle_state_are_exact():

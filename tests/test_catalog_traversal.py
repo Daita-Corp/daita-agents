@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -28,7 +28,7 @@ from daita.catalog import (
 from daita.catalog.models import CatalogRelationship
 from daita.catalog.protocols import CatalogResourceNotFoundError, CatalogStoreError
 
-_OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+_OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -834,6 +834,7 @@ async def test_traversal_capability_validates_the_explicit_truncation_contract(
     output = await executor.execute(
         ToolExecution(
             run_id="catalog-traversal-capability",
+            call_id="catalog-traversal-call",
             capability_id=capability.id,
             arguments={
                 "from_resource_ids": (graph.resource_ids["a"],),

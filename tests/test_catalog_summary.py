@@ -4,7 +4,7 @@ import asyncio
 import sqlite3
 import threading
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -42,25 +42,24 @@ def _database(path: Path, *, with_tables: bool = True) -> None:
 def _snapshot_decode_counter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Callable[[], int]:
-    original_loads = sqlite_store._loads
+    original_decode = sqlite_store.decode_catalog_snapshot
     counter_lock = threading.Lock()
     count = 0
 
-    def counting_loads(value: str) -> object:
+    def counting_decode(value: str):
         nonlocal count
-        if '"__record__":"SourceCatalogSnapshot"' in value:
-            with counter_lock:
-                count += 1
-        return original_loads(value)
+        with counter_lock:
+            count += 1
+        return original_decode(value)
 
-    monkeypatch.setattr(sqlite_store, "_loads", counting_loads)
+    monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", counting_decode)
     return lambda: count
 
 
 async def test_catalog_summary_aggregates_current_active_snapshots_and_latest_sync(
     tmp_path: Path,
 ):
-    first_time = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+    first_time = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
     current_time = first_time
 
     def clock() -> datetime:
@@ -122,7 +121,7 @@ async def test_catalog_summary_aggregates_current_active_snapshots_and_latest_sy
 async def test_empty_successful_snapshot_is_not_ready_but_retains_sync_time(
     tmp_path: Path,
 ):
-    completed_at = datetime(2026, 7, 22, 13, 0, tzinfo=timezone.utc)
+    completed_at = datetime(2026, 7, 22, 13, 0, tzinfo=UTC)
     database = tmp_path / "empty.sqlite"
     _database(database, with_tables=False)
     agent = await Agent.create("empty", root=tmp_path, clock=lambda: completed_at)
@@ -703,17 +702,17 @@ async def test_failed_snapshot_decode_does_not_publish_a_cache_entry(
         source = await agent.attach(SQLiteSource(database))
         reader = SQLiteStateStore(agent.home / "state.db")
         ref = (await reader.list_current_snapshot_refs(agent.id, (source.id,)))[0]
-        original_loads = sqlite_store._loads
+        original_decode = sqlite_store.decode_catalog_snapshot
         fail_next_snapshot = True
 
-        def failing_loads(value: str) -> object:
+        def failing_decode(value: str):
             nonlocal fail_next_snapshot
-            if fail_next_snapshot and '"__record__":"SourceCatalogSnapshot"' in value:
+            if fail_next_snapshot:
                 fail_next_snapshot = False
                 raise ValueError("forced snapshot decode failure")
-            return original_loads(value)
+            return original_decode(value)
 
-        monkeypatch.setattr(sqlite_store, "_loads", failing_loads)
+        monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", failing_decode)
         with pytest.raises(ValueError, match="forced snapshot decode failure"):
             await reader.load_current_snapshot(ref)
         assert reader._decoded_catalog_snapshots == {}
@@ -796,7 +795,7 @@ async def test_failed_snapshot_commit_does_not_publish_candidate_cache(
 async def test_running_partial_and_failed_syncs_never_contribute_or_replace_truth(
     tmp_path: Path,
 ):
-    started_at = datetime(2026, 7, 22, 14, 0, tzinfo=timezone.utc)
+    started_at = datetime(2026, 7, 22, 14, 0, tzinfo=UTC)
     agent = await Agent.create("sync-state", root=tmp_path, clock=lambda: started_at)
     store = SQLiteStateStore(agent.home / "state.db")
     try:

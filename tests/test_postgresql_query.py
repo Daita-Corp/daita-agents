@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import traceback
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -62,6 +62,14 @@ class _CatalogSchemas:
         del agent_id
         return tuple(item for item in self.resources if item.source_id == source_id)
 
+    async def readable_resource_ids(self, agent_id: str, source_ids=()):
+        del agent_id
+        return frozenset(
+            item.resource_id
+            for item in self.resources
+            if not source_ids or item.source_id in source_ids
+        )
+
 
 def _backend() -> tuple[
     postgresql_query_module.PostgreSQLQueryBackend,
@@ -74,7 +82,7 @@ def _backend() -> tuple[
         native_identity="offline-query-contract",
         display_name="Offline PostgreSQL",
         configuration={},
-        attached_at=datetime(2026, 8, 5, tzinfo=timezone.utc),
+        attached_at=datetime(2026, 8, 5, tzinfo=UTC),
     )
     source_revision = "sha256:" + "3" * 64
     resource = ResourceSchema(
@@ -135,7 +143,7 @@ async def test_postgresql_backend_preserves_safe_connection_failure(
                 parameters=(),
                 format_name="csv",
                 parameters_sha256="sha256:" + "0" * 64,
-                created_at=datetime(2026, 8, 5, tzinfo=timezone.utc),
+                created_at=datetime(2026, 8, 5, tzinfo=UTC),
                 max_rows=100_000,
                 max_columns=256,
                 max_bytes=64 * 1024 * 1024,
@@ -200,3 +208,23 @@ def test_postgresql_query_error_remains_structured_at_tool_result_boundary() -> 
     details = error["details"]
     assert isinstance(details, Mapping)
     assert dict(details) == {}
+
+
+def test_unexpected_executor_error_is_redacted_at_tool_result_boundary() -> None:
+    call = ToolCall(id="call-secret", name="data_query_postgresql")
+
+    result = data_controller._exception_result(
+        call,
+        RuntimeError("secret=/tmp/private-connection-fragment"),
+    )
+
+    assert result.is_error is True
+    serialized = repr(result.output)
+    assert "secret=" not in serialized
+    assert "/tmp/private-connection-fragment" not in serialized
+    error = result.output["error"]
+    assert isinstance(error, Mapping)
+    assert error["code"] == "tool_execution_failed"
+    assert error["message"] == (
+        "The tool could not complete because of an unexpected internal error."
+    )

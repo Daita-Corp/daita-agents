@@ -25,6 +25,7 @@ from daita.llm.models import (
     ToolCall,
 )
 from daita.llm.profiles import reviewed_model_profile
+from daita.llm.protocols import provider_has_complete_pricing
 from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelRoute, ModelRouteCandidate, RetryPolicy
 from daita.security import (
@@ -1064,6 +1065,43 @@ async def test_missing_configured_credential_is_normalized_as_authentication():
 
     assert caught.value.code is ProviderErrorCode.AUTHENTICATION_ERROR
     assert "missing-key" not in str(caught.value)
+
+
+def test_lazy_model_route_exposes_pricing_without_resolving_credential():
+    class _CountingSecrets(EmptySecretProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def resolve(self, reference: SecretReference) -> str:
+            del reference
+            self.calls += 1
+            return "not-read-by-pricing-preflight"
+
+    profile = reviewed_model_profile("openai:gpt-5.6-sol")
+    assert profile is not None
+    route = ModelRoute(
+        (
+            ModelRouteCandidate(
+                provider_id=profile.id,
+                profile=profile,
+                secret_reference=SecretReference.keychain("hidden-reference"),
+            ),
+        ),
+        RetryPolicy(attempts=3, backoff_seconds=0),
+    )
+    secrets = _CountingSecrets()
+    provider = create_model_route_provider(route, secret_provider=secrets)
+    request = ModelRequest(
+        messages=(
+            CanonicalMessage(
+                role=MessageRole.USER,
+                content=(TextBlock("hello"),),
+            ),
+        )
+    )
+
+    assert provider_has_complete_pricing(provider, request) is True
+    assert secrets.calls == 0
 
 
 @pytest.mark.parametrize(
