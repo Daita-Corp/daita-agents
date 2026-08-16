@@ -5,15 +5,23 @@ from __future__ import annotations
 from rich.text import Text
 from textual.widgets import Static
 
+from daita import __version__
+
 from ..sanitization import sanitize_terminal_text
 
-_WIDE_LOGO = """\
-██████╗  █████╗ ██╗████████╗ █████╗
-██╔══██╗██╔══██╗██║╚══██╔══╝██╔══██╗
-██║  ██║███████║██║   ██║   ███████║
-██║  ██║██╔══██║██║   ██║   ██╔══██║
-██████╔╝██║  ██║██║   ██║   ██║  ██║
-╚═════╝ ╚═╝  ╚═╝╚═╝   ╚═╝   ╚═╝  ╚═╝"""
+_LOGO_WIDTH = 15
+_LOGO_GAP = 5
+_WIDE_MINIMUM = 64
+_LOGO_LINES = (
+    ("████████████▄", "bold #ACFD21"),
+    ("█████      ███▄", "bold #ACFD21"),
+    ("█████       ███", "bold #70DF43"),
+    ("█████       ███", "bold #70DF43"),
+    ("█████       ███", "bold #70DF43"),
+    ("█████       ███", "bold #46BF69"),
+    ("█████      ███▀", "bold #46BF69"),
+    ("████████████▀", "bold #46BF69"),
+)
 
 
 class WelcomeView(Static):
@@ -44,23 +52,73 @@ class WelcomeView(Static):
         )
         self._refresh_content()
 
-    def _refresh_content(self) -> None:
-        width = self.size.width or 80
-        content = Text(justify="center")
-        if width >= 58:
-            content.append(_WIDE_LOGO, style="bold #ACFD21")
+    def _detail_lines(self) -> tuple[Text, ...]:
+        heading = Text("DAITA", style="bold")
+        heading.append(f"  {__version__}", style="dim")
+        lines = [
+            heading,
+            Text(),
+            Text("Your persistent data agent", style="bold #ACFD21"),
+        ]
+        if self._booting:
+            lines.extend((Text(), Text("Starting your workspace…", style="dim")))
         else:
-            content.append("D  A  I  T  A", style="bold #ACFD21")
-        content.append("\n\nDAITA · Your persistent data agent", style="bold")
+            lines.extend(
+                (
+                    Text(
+                        f"{self._agent}  ·  {self._model}  ·  {self._source}",
+                        style="dim",
+                    ),
+                    Text(),
+                    Text("Ask a question to begin", style="bold"),
+                    Text("Type / for commands  ·  @ for sources", style="dim"),
+                )
+            )
+        while len(lines) < len(_LOGO_LINES):
+            lines.append(Text())
+        return tuple(lines)
+
+    def _wide_content(self, width: int) -> Text:
+        available = max(1, width - 4)
+        detail_width = min(52, available - _LOGO_WIDTH - _LOGO_GAP)
+        canvas_width = _LOGO_WIDTH + _LOGO_GAP + detail_width
+        left_padding = max(0, (width - canvas_width) // 2)
+        content = Text(no_wrap=True, overflow="crop")
+        details = self._detail_lines()
+        for index, ((logo, logo_style), detail) in enumerate(
+            zip(_LOGO_LINES, details, strict=True)
+        ):
+            content.append(" " * left_padding)
+            content.append(logo.ljust(_LOGO_WIDTH), style=logo_style)
+            content.append(" " * _LOGO_GAP)
+            detail.truncate(detail_width, overflow="ellipsis")
+            content.append_text(detail)
+            if index < len(_LOGO_LINES) - 1:
+                content.append("\n")
+        return content
+
+    def _compact_content(self) -> Text:
+        content = Text(justify="center", no_wrap=True, overflow="crop")
+        for index, (line, style) in enumerate(_LOGO_LINES):
+            content.append(line, style=style)
+            if index < len(_LOGO_LINES) - 1:
+                content.append("\n")
+        content.append("\n\nDAITA", style="bold")
+        content.append(f"  {__version__}", style="dim")
         if self._booting:
             content.append("\nStarting your workspace…", style="dim")
         else:
-            content.append(
-                f"\n{self._agent}  ·  {self._model}  ·  {self._source}",
-                style="dim",
-            )
-            content.append("\n\nAsk a question to begin", style="#ACFD21")
+            content.append("\nAsk a question to begin", style="bold")
             content.append("\nType / for commands  ·  @ for sources", style="dim")
+        return content
+
+    def _refresh_content(self) -> None:
+        width = self.size.width or 80
+        content = (
+            self._wide_content(width)
+            if width >= _WIDE_MINIMUM
+            else self._compact_content()
+        )
         self.update(content)
 
 

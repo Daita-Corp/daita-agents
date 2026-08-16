@@ -247,7 +247,10 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: P
     boot = DaitaApp(start_bootstrap=False)
     async with boot.run_test(size=(80, 24)):
         welcome = boot.query_one("#boot", WelcomeView)
-        assert "DAITA" in str(welcome.content)
+        assert "DAITA  1.0.0" in str(welcome.content)
+        assert "█████       ███" in str(welcome.content)
+        assert "████████████▄" in str(welcome.content)
+        assert "Your persistent data agent" in str(welcome.content)
         assert "Starting your workspace" in str(welcome.content)
         boot.exit(0)
 
