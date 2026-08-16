@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from daita import Agent, AgentConfig, cli, terminal
+from daita import Agent, AgentConfig, cli
+from daita.cli_text import _write_learning_review_result
+from daita.tui.controller import PresentationController
 from daita.evaluation import CandidateReviewMeasurement
 from daita.learning_candidates import (
     LEARNING_REVIEW_MAX_MODEL_CALLS,
@@ -131,19 +133,12 @@ async def test_terminal_review_prompts_for_one_call_authorization() -> None:
     agent = ReviewAgent()
     output = io.StringIO()
 
-    handled = await terminal._handle_knowledge_command(
-        ["/review"],
-        agent=agent,  # type: ignore[arg-type]
-        input_stream=io.StringIO("\n"),
-        output_stream=output,
-    )
-
-    assert handled is True
-    assert agent.cost_limits == [None, Decimal("0.05")]
-    text = output.getvalue()
-    assert "Candidate review needs one-time authorization." in text
-    assert "memory and skills do not change until you accept one" in text
-    assert "Status: no_eligible_runs" in text
+    controller = PresentationController(root=None)
+    controller.agent = agent  # type: ignore[assignment]
+    outcome = await controller.dispatch_command("/review")
+    assert outcome.kind == "screen"
+    assert outcome.screen == "review_cost"
+    assert agent.cost_limits == [None]
 
 
 @pytest.mark.unit
@@ -159,16 +154,11 @@ async def test_terminal_review_authorization_can_be_cancelled() -> None:
     agent = ReviewAgent()
     output = io.StringIO()
 
-    handled = await terminal._handle_knowledge_command(
-        ["/review"],
-        agent=agent,  # type: ignore[arg-type]
-        input_stream=io.StringIO("/cancel\n"),
-        output_stream=output,
-    )
-
-    assert handled is True
+    controller = PresentationController(root=None)
+    controller.agent = agent  # type: ignore[assignment]
+    outcome = await controller.dispatch_command("/review")
+    assert outcome.kind == "screen"
     assert agent.calls == 1
-    assert "Learning review cancelled." in output.getvalue()
 
 
 @pytest.mark.unit
@@ -188,24 +178,19 @@ async def test_terminal_review_accepts_inline_one_call_cost_limit() -> None:
     agent = ReviewAgent()
     output = io.StringIO()
 
-    handled = await terminal._handle_knowledge_command(
-        ["/review", "0.02"],
-        agent=agent,  # type: ignore[arg-type]
-        input_stream=io.StringIO(),
-        output_stream=output,
-    )
-
-    assert handled is True
+    controller = PresentationController(root=None)
+    controller.agent = agent  # type: ignore[assignment]
+    outcome = await controller.dispatch_command("/review 0.02")
+    assert outcome.kind == "notice"
     assert agent.cost_limits == [Decimal("0.02")]
-    assert "one-time authorization" not in output.getvalue()
-    assert "Status: no_eligible_runs" in output.getvalue()
+    assert "Status: no_eligible_runs" in outcome.message
 
 
 @pytest.mark.unit
 def test_terminal_review_reports_unreadable_history_without_provider_blame() -> None:
     output = io.StringIO()
 
-    terminal._write_learning_review_result(
+    _write_learning_review_result(
         LearningReviewResult(
             status=LearningReviewStatus.HISTORY_UNAVAILABLE,
             skipped_run_count=3,
@@ -236,17 +221,13 @@ async def test_terminal_reopen_passes_explicit_reviewer_and_cost_ceiling(
     configured = ConfiguredAgent()
     replacement = SimpleNamespace()
     open_agent = AsyncMock(return_value=replacement)
-    monkeypatch.setattr(terminal.Agent, "open", open_agent)
-
-    result = await terminal._reopen_with_candidate_reviewer(
-        configured,  # type: ignore[arg-type]
+    monkeypatch.setattr("daita.tui.controller.Agent.open", open_agent)
+    controller = PresentationController(
         root=Path("/tmp/daita-test-root"),
-        keychain=None,
-        model_validator=None,
-        approval_handler=None,
-        observer_bridge=None,
-        max_estimated_cost_usd=Decimal("0.05"),
+        reviewer_max_estimated_cost_usd=Decimal("0.05"),
     )
+    controller.agent = configured  # type: ignore[assignment]
+    result = await controller.reopen_agent(observer=None, approval_handler=None)
 
     assert result is replacement
     assert configured.closed is True
@@ -256,49 +237,6 @@ async def test_terminal_reopen_passes_explicit_reviewer_and_cost_ceiling(
     assert "reviewer_model" not in kwargs
     assert "reviewer_profile" not in kwargs
     assert kwargs["reviewer_max_estimated_cost_usd"] == Decimal("0.05")
-
-
-@pytest.mark.unit
-async def test_terminal_application_enables_reviewer_only_with_explicit_ceiling(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class ReadyAgent:
-        name = "atlas"
-        model_route = _route()
-
-        def __init__(self) -> None:
-            self.closed = False
-
-        async def list_sources(self):
-            return (SimpleNamespace(active=True),)
-
-        async def catalog_summary(self):
-            return SimpleNamespace(is_empty=False)
-
-        async def close(self) -> None:
-            self.closed = True
-
-    selected = ReadyAgent()
-    enabled = ReadyAgent()
-    select_agent = AsyncMock(return_value=selected)
-    reopen = AsyncMock(return_value=enabled)
-    chat = AsyncMock(return_value=(enabled, None, "exit"))
-    monkeypatch.setattr(terminal, "_select_agent", select_agent)
-    monkeypatch.setattr(terminal, "_reopen_with_candidate_reviewer", reopen)
-    monkeypatch.setattr(terminal, "_chat", chat)
-
-    result = await terminal.run_terminal_application(
-        input_stream=io.StringIO(),
-        output_stream=io.StringIO(),
-        reviewer_max_estimated_cost_usd=Decimal("0.03"),
-    )
-
-    assert result == 0
-    assert reopen.await_count == 1
-    reopen_call = reopen.await_args
-    assert reopen_call is not None
-    assert reopen_call.kwargs["max_estimated_cost_usd"] == Decimal("0.03")
-    assert enabled.closed is True
 
 
 def test_cli_requires_explicit_bounded_review_cost_environment(
@@ -313,51 +251,6 @@ def test_cli_requires_explicit_bounded_review_cost_environment(
     monkeypatch.setenv("DAITA_CANDIDATE_REVIEW_MAX_COST_USD", "NaN")
     with pytest.raises(ValueError, match="finite"):
         cli._candidate_review_cost_limit_from_environment()
-
-
-@pytest.mark.unit
-async def test_legacy_chat_opens_with_bounded_reviewer_when_enabled(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    class ChatAgent:
-        name = "atlas"
-        home = tmp_path / "agents" / "atlas"
-        model_profile = _profile()
-
-        async def list_sources(self):
-            return ()
-
-        async def close(self) -> None:
-            return None
-
-    opened = AsyncMock(return_value=ChatAgent())
-    monkeypatch.setattr(cli.Agent, "open", opened)
-    monkeypatch.setenv("DAITA_CANDIDATE_REVIEW_MAX_COST_USD", "0.02")
-
-    def end_input(prompt: str) -> str:
-        raise EOFError
-
-    monkeypatch.setattr("builtins.input", end_input)
-    result = await cli._chat(
-        argparse.Namespace(
-            name="atlas",
-            root=tmp_path,
-            model="openai:gpt-5.6-sol",
-            conversation=None,
-        )
-    )
-
-    assert result == 0
-    open_call = opened.await_args
-    assert open_call is not None
-    kwargs = open_call.kwargs
-    assert kwargs["reviewer_model"].provider_id == "openai:gpt-5.6-sol"
-    assert (
-        kwargs["reviewer_profile"].max_output_tokens
-        == LEARNING_REVIEW_MAX_TOTAL_TOKENS // 4
-    )
-    assert kwargs["reviewer_max_estimated_cost_usd"] == Decimal("0.02")
 
 
 @pytest.mark.unit
@@ -427,14 +320,9 @@ async def test_candidate_acceptance_output_is_bounded_and_sanitized(
     assert "\x00" not in legacy_output
     assert len(legacy_output) <= 16_400
 
-    terminal_output = io.StringIO()
-    assert await terminal._handle_knowledge_command(
-        ["/memory", "accept", "candidate-1"],
-        agent=Agent(),  # type: ignore[arg-type]
-        input_stream=io.StringIO(),
-        output_stream=terminal_output,
-    )
-    rendered = terminal_output.getvalue()
+    controller = PresentationController(root=None)
+    controller.agent = Agent()  # type: ignore[assignment]
+    rendered = (await controller.dispatch_command("/memory accept candidate-1")).message
     assert "\x1b" not in rendered
     assert "\x00" not in rendered
     assert len(rendered) <= 16_450

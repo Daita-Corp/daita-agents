@@ -33,7 +33,9 @@ from daita.semantics import (
     SEMANTIC_VIEW_TOOL_NAME,
     SemanticValidationError,
 )
-from daita.terminal import _learning_invocation_message
+from daita.tui.commands import (
+    learning_invocation_message as _learning_invocation_message,
+)
 
 NOW = datetime(2026, 7, 28, 14, tzinfo=UTC)
 

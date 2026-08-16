@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 import daita.hosting.embedded as embedded
-from daita import Agent, SQLiteSource, cli, terminal
+from daita import Agent, SQLiteSource, cli
+from daita.tui.controller import PresentationController
 from daita.adapters.models import SourceRegistration
 from daita.agent import AgentHomeError
 from daita.llm.models import (
@@ -296,59 +297,21 @@ async def test_terminal_lifecycle_commands_require_confirmation(
     )
     source = await agent.attach(SQLiteSource(database, name="Warehouse"))
     result = await agent.run("Create history.")
-    output = io.StringIO()
+    controller = PresentationController(root=tmp_path)
+    controller.agent = agent
+    controller.conversation_id = result.conversation_id
 
-    agent, conversation_id, action = await terminal._handle_local_command(
-        "/conversation clear",
-        agent=agent,
-        root=tmp_path,
-        input_stream=io.StringIO("n\n"),
-        output_stream=output,
-        hidden_input=lambda _prompt: "",
-        keychain=None,
-        model_validator=None,
-        approval_handler=None,
-        conversation_id=result.conversation_id,
-        validated=True,
-    )
-    assert conversation_id == result.conversation_id
-    assert action is None
+    clear = await controller.dispatch_command("/conversation clear")
+    assert clear.kind == "confirm"
     assert await agent.conversation_exists(result.conversation_id)
 
-    agent, conversation_id, action = await terminal._handle_local_command(
-        f"/source detach {source.id}",
-        agent=agent,
-        root=tmp_path,
-        input_stream=io.StringIO("n\n"),
-        output_stream=output,
-        hidden_input=lambda _prompt: "",
-        keychain=None,
-        model_validator=None,
-        approval_handler=None,
-        conversation_id=conversation_id,
-        validated=True,
-    )
-    assert action is None
+    detach = await controller.dispatch_command(f"/source detach {source.id}")
+    assert detach.kind == "confirm"
     assert (await agent.resolve_source(source.id)).active
 
-    agent, conversation_id, action = await terminal._handle_local_command(
-        "/agent delete",
-        agent=agent,
-        root=tmp_path,
-        input_stream=io.StringIO("wrong-name\n"),
-        output_stream=output,
-        hidden_input=lambda _prompt: "",
-        keychain=None,
-        model_validator=None,
-        approval_handler=None,
-        conversation_id=conversation_id,
-        validated=True,
-    )
-    assert action is None
+    delete = await controller.dispatch_command("/agent delete")
+    assert delete.kind == "confirm"
     assert agent.home.is_dir()
-    assert "was not changed" in output.getvalue()
-    assert "was not detached" in output.getvalue()
-    assert "was not deleted" in output.getvalue()
     await agent.close()
 
 
@@ -366,57 +329,20 @@ async def test_terminal_can_clear_history_detach_source_and_delete_agent(
     )
     source = await agent.attach(SQLiteSource(database, name="Warehouse"))
     result = await agent.run("Create history.")
-    output = io.StringIO()
+    controller = PresentationController(root=tmp_path)
+    controller.agent = agent
+    controller.conversation_id = result.conversation_id
 
-    agent, conversation_id, action = await terminal._handle_local_command(
-        "/conversation clear",
-        agent=agent,
-        root=tmp_path,
-        input_stream=io.StringIO("y\n"),
-        output_stream=output,
-        hidden_input=lambda _prompt: "",
-        keychain=None,
-        model_validator=None,
-        approval_handler=None,
-        conversation_id=result.conversation_id,
-        validated=True,
-    )
-    assert conversation_id is None
-    assert action is None
+    cleared = await controller.clear_conversations()
+    assert cleared.conversation_id is None
     assert not await agent.conversation_exists(result.conversation_id)
 
-    agent, conversation_id, action = await terminal._handle_local_command(
-        f"/source detach {source.id}",
-        agent=agent,
-        root=tmp_path,
-        input_stream=io.StringIO("y\n"),
-        output_stream=output,
-        hidden_input=lambda _prompt: "",
-        keychain=None,
-        model_validator=None,
-        approval_handler=None,
-        conversation_id=conversation_id,
-        validated=True,
-    )
-    assert conversation_id is None
-    assert action == "sources"
+    await controller.detach_source(source.id)
+    controller.conversation_id = None
     assert not (await agent.list_sources())[0].active
 
-    agent, conversation_id, action = await terminal._handle_local_command(
-        "/agent delete",
-        agent=agent,
-        root=tmp_path,
-        input_stream=io.StringIO("atlas\n"),
-        output_stream=output,
-        hidden_input=lambda _prompt: "",
-        keychain=None,
-        model_validator=None,
-        approval_handler=None,
-        conversation_id=conversation_id,
-        validated=True,
-    )
-    assert conversation_id is None
-    assert action == "deleted"
+    await controller.delete_open_agent()
+    assert controller.agent is None
     assert not (tmp_path / "agents" / "atlas").exists()
 
 

@@ -510,7 +510,7 @@ for module in (
     "google.genai",
     "keyring",
     "openai",
-    "prompt_toolkit",
+    "textual",
     "rich",
     "sqlglot",
     "xlsxwriter",

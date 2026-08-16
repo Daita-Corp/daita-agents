@@ -43,10 +43,10 @@ Use `--file -` or `--instructions-file -` to read complete UTF-8 content from
 stdin. `memory read` and `memory edit` default to the `memory` target; pass
 `--target user` for the user profile. The edit commands require an available
 `$EDITOR`, accept editor arguments safely, and write only after a successful
-exit and public validation. In interactive `chat`, the bounded `/memory`,
-`/user`, and `/skills` commands are local and make no model call.
+exit and public validation. In the interactive Textual app, the bounded
+`/memory`, `/user`, and `/skills` commands are local and make no model call.
 
 These CLI writes are explicit caller mutations, so they require no model
-approval. A memory or skill change requested by the model during `chat` remains
-on the exact once-only in-process approval path. The non-interactive `run`
-command never installs an approval handler.
+approval. A memory or skill change requested by the model during an interactive
+run remains on the exact once-only in-process approval path. The non-interactive
+`run` command never installs an approval handler.

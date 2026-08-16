@@ -1,0 +1,207 @@
+Screen {
+    background: $background;
+    color: $foreground;
+}
+
+#boot {
+    width: 100%;
+    height: 100%;
+    content-align: center middle;
+    background: $background;
+}
+
+#chat {
+    padding: 0 1;
+    background: $background;
+}
+
+#status-bar {
+    height: 1;
+    background: $panel;
+}
+
+#status-primary {
+    width: 1fr;
+    height: 1;
+    padding-left: 1;
+    text-overflow: ellipsis;
+}
+
+#context-window {
+    width: auto;
+    height: 1;
+    min-width: 11;
+    padding: 0 1;
+    text-align: right;
+}
+
+#welcome {
+    width: 100%;
+    height: 1fr;
+    content-align: center middle;
+    background: $background;
+}
+
+#activity-bar {
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+    background: $background;
+    border-left: solid $primary 55%;
+}
+
+#notice-bar {
+    height: auto;
+    max-height: 8;
+    padding: 0 1;
+    color: $warning;
+    background: $panel;
+    border-left: solid $warning;
+}
+
+#composer {
+    height: auto;
+    min-height: 3;
+    max-height: 8;
+    padding: 0 1;
+    color: $foreground;
+    background: $boost;
+    border: round $border;
+}
+
+#composer:focus {
+    border: round $primary;
+}
+
+#transcript {
+    height: 1fr;
+    padding: 0 1;
+    background: $background;
+}
+
+.transcript-user {
+    color: $text-muted;
+    padding: 1 0 0 1;
+    border-left: solid $primary 45%;
+}
+
+.transcript-assistant {
+    color: $foreground;
+    padding: 1 0 0 1;
+    border-left: solid $border;
+}
+
+.transcript-notice {
+    color: $warning;
+    padding: 1 0 0 1;
+    border-left: solid $warning 60%;
+}
+
+#completions {
+    height: auto;
+    max-height: 12;
+    background: $panel;
+    border: tall $primary;
+    display: none;
+}
+
+#completion-title {
+    height: 1;
+    padding: 0 1;
+    color: $primary;
+    background: $panel;
+    text-style: bold;
+}
+
+#completion-list {
+    height: auto;
+    max-height: 9;
+    padding: 0 1;
+    background: $panel;
+    border: none;
+}
+
+#completion-list > .option-list--option-highlighted {
+    color: #000000;
+    background: $primary;
+    text-style: bold;
+}
+
+ModalScreen {
+    align: center middle;
+    background: $background 82%;
+}
+
+#picker,
+#confirm,
+#editor-prompt,
+#review-cost {
+    width: 88%;
+    max-width: 100;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    background: $surface;
+    border: tall $border;
+}
+
+#approval {
+    width: 92%;
+    max-width: 110;
+    height: 90%;
+    padding: 1 2;
+    background: $surface;
+    border: tall $warning;
+}
+
+#onboard,
+#permissions,
+#source-edit {
+    padding: 1 2;
+    background: $background;
+}
+
+#picker-title,
+#onboard-title,
+#approval-title,
+#confirm-message {
+    color: $primary;
+    text-style: bold;
+    padding-bottom: 1;
+}
+
+#picker-options {
+    height: 1fr;
+    background: $surface;
+}
+
+#onboard-error,
+#picker-error,
+#editor-prompt-error,
+#review-cost-error {
+    color: $error;
+}
+
+#approval-document {
+    height: 1fr;
+    color: $foreground;
+    background: $background;
+    border: tall $warning;
+    padding: 1;
+}
+
+#confirm-actions,
+#approval-yes,
+#approval-no {
+    margin-top: 1;
+}
+
+Input,
+Select {
+    background: $boost;
+}
+
+.too-small {
+    color: $foreground;
+    background: $error;
+}

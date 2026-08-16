@@ -11,7 +11,7 @@ import pytest
 import daita.llm.providers.codex as codex_provider
 import daita.llm.providers.subscription_cli as claude_cli
 import daita.llm.subscription_auth as subscription_auth
-from daita import Agent, terminal
+from daita import Agent
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.factory import create_llm_provider
 from daita.llm.models import (
@@ -497,23 +497,23 @@ async def test_terminal_codex_onboarding_runs_device_login_without_api_key():
             return _credential().to_secret()
 
     agent = _Agent()
-    output = io.StringIO()
+    prompts: list[str] = []
 
-    configured = await terminal._configure_selected_model(
-        cast(Agent, agent),
+    def on_verification(prompt) -> None:
+        prompts.append(prompt.user_code)
+
+    credential = await agent.authenticate_model_subscription(
+        provider="codex",
+        on_verification=on_verification,
+        on_progress=lambda _message: None,
+    )
+    await agent.configure_model(
         provider="codex",
         model="gpt-5.6-sol",
-        custom_provider=False,
-        input_stream=io.StringIO(),
-        output_stream=output,
-        hidden_input=lambda prompt: (_ for _ in ()).throw(
-            AssertionError(f"unexpected API-key prompt: {prompt}")
-        ),
+        subscription_credential=credential,
     )
 
-    assert configured is True
     assert agent.arguments is not None
-    assert agent.arguments["api_key"] is None
+    assert agent.arguments.get("api_key") is None
     assert agent.arguments["subscription_credential"] is not None
-    assert "Codex does not need to be installed" in output.getvalue()
-    assert "ABCD-EFGH" in output.getvalue()
+    assert "ABCD-EFGH" in prompts

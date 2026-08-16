@@ -19,8 +19,9 @@ from daita import (
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningReviewStatus,
-    terminal,
 )
+from daita.cli_text import _write_memory_surface
+from daita.tui.controller import PresentationController
 from daita.evaluation import CandidateReviewMeasurement, CandidateReviewReport
 from daita.learning_candidates import (
     LEARNING_CANDIDATE_MAX_RECORDS,
@@ -679,27 +680,21 @@ async def test_memory_terminal_surface_lists_shows_and_rejects_one_candidate(
         await agent.run("Remember that our fiscal year begins in February.")
         candidate = (await agent.review_learning_candidates()).candidates[0]
         output = io.StringIO()
-        await terminal._write_memory_surface(agent, "", output)
+        await _write_memory_surface(agent, "", output)
         assert "Pending candidates:" in output.getvalue()
         assert candidate.candidate.id in output.getvalue()
 
-        shown = io.StringIO()
-        assert await terminal._handle_knowledge_command(
-            ["/memory", "show", candidate.candidate.id],
-            agent=agent,
-            input_stream=io.StringIO(),
-            output_stream=shown,
+        controller = PresentationController(root=tmp_path)
+        controller.agent = agent
+        shown = await controller.dispatch_command(
+            f"/memory show {candidate.candidate.id}"
         )
-        assert "Proposed content:" in shown.getvalue()
+        assert "Learning candidate:" in shown.message
 
-        rejected = io.StringIO()
-        assert await terminal._handle_knowledge_command(
-            ["/memory", "reject", candidate.candidate.id],
-            agent=agent,
-            input_stream=io.StringIO(),
-            output_stream=rejected,
+        rejected = await controller.dispatch_command(
+            f"/memory reject {candidate.candidate.id}"
         )
-        assert "rejected" in rejected.getvalue()
+        assert "rejected" in rejected.message
     finally:
         await agent.close()
 

@@ -56,7 +56,7 @@ from .llm import (
 from .llm.profiles import reviewed_model_profile
 from .security import SecretReference
 from .skills import validate_skill_name
-from .terminal import (
+from .cli_text import (
     _edit_learning_candidate,
     _learning_invocation_message,
     _render_model_answer,
@@ -67,8 +67,8 @@ from .terminal import (
     _write_learning_review_result,
     _write_memory_surface,
     _write_semantic_view,
-    run_terminal_application,
 )
+from .terminal import run_terminal_application
 
 _SKILL_DESCRIPTION_PLACEHOLDER = "Describe when the agent should use this skill."
 _SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
@@ -278,9 +278,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--conversation-id")
     run.add_argument("--events-jsonl", action="store_true")
 
-    chat = commands.add_parser("chat", help="chat interactively with an agent")
+    chat = commands.add_parser(
+        "chat",
+        help="open the same interactive Textual app as `daita`",
+    )
     chat.add_argument("name")
-    chat.add_argument("--model", required=True, help="provider:model")
+    chat.add_argument("--model", help="ignored; model setup happens inside the app")
     chat.add_argument("--conversation")
 
     memory = commands.add_parser("memory", help="manage agent memory")
@@ -1050,187 +1053,6 @@ async def _prompt_for_exact_approval(
         print("Enter y to approve or n to deny.")
 
 
-async def _handle_chat_command(
-    command: str,
-    *,
-    agent: Agent,
-    model_id: str,
-    state_root: Path,
-    conversation_id: str | None,
-    totals: _ChatTotals,
-) -> tuple[bool, str | None]:
-    parts = command.split()
-    name = parts[0] if parts else ""
-    if name == "/exit" and len(parts) == 1:
-        return True, conversation_id
-    if name == "/help" and len(parts) == 1:
-        _write_help()
-        return False, conversation_id
-    try:
-        if await _handle_knowledge_chat_command(parts, agent):
-            return False, conversation_id
-    except (ValueError, RuntimeError, OSError, ImportError) as error:
-        _write_local_diagnostic(f"Knowledge command failed: {error}")
-        return False, conversation_id
-    if name == "/sources" and len(parts) == 1:
-        _write_sources(await agent.list_sources())
-        return False, conversation_id
-    if name == "/status" and len(parts) == 1:
-        print(f"Agent: {agent.name}")
-        profile = agent.model_profile
-        print(f"Model: {profile.id if profile is not None else model_id}")
-        _write_sources(await agent.list_sources())
-        print(f"Conversation: {conversation_id or 'new'}")
-        print(
-            f"This process: {totals.turns} turns, {totals.steps} steps, "
-            f"{totals.tokens} tokens, {format_cost_estimate(totals.cost_estimate)}"
-        )
-        return False, conversation_id
-    if name == "/conversation" and len(parts) == 1:
-        if conversation_id is None:
-            print("Conversation: new")
-        else:
-            _write_resume(
-                state_root,
-                agent.name,
-                model_id,
-                conversation_id,
-            )
-        return False, conversation_id
-    if name == "/new" and len(parts) == 1:
-        print("Conversation: new")
-        return False, None
-    if name == "/resume" and len(parts) == 2:
-        candidate = parts[1]
-        try:
-            await agent.conversation_runs(candidate)
-        except (TypeError, ValueError) as error:
-            _write_local_diagnostic(f"Cannot resume conversation: {error}")
-            return False, conversation_id
-        print(f"Conversation: {candidate}")
-        return False, candidate
-    if name == "/resume":
-        _write_local_diagnostic("Usage: /resume <conversation-id>")
-    elif name in {
-        "/exit",
-        "/help",
-        "/sources",
-        "/status",
-        "/conversation",
-        "/new",
-    }:
-        _write_local_diagnostic(f"Usage: {name}")
-    else:
-        _write_local_diagnostic("Unknown command. Type /help for commands.")
-    return False, conversation_id
-
-
-async def _chat(args: argparse.Namespace) -> int:
-    provider, profile = _model_configuration(args.model)
-    review_cost_limit = _candidate_review_cost_limit_from_environment()
-    reviewer_model: ModelProvider | None = None
-    reviewer_profile: ModelProfile | None = None
-    if review_cost_limit is not None:
-        reviewer_model, reviewer_profile = _reviewer_model_configuration(args.model)
-    approval_handler: ApprovalHandler = _prompt_for_exact_approval
-    agent = await Agent.open(
-        args.name,
-        root=args.root,
-        model=provider,
-        model_profile=profile,
-        reviewer_model=reviewer_model,
-        reviewer_profile=reviewer_profile,
-        reviewer_max_estimated_cost_usd=review_cost_limit,
-        approval_handler=approval_handler,
-    )
-    conversation_id: str | None = args.conversation
-    last_completed_conversation_id: str | None = None
-    totals = _ChatTotals()
-    interrupted = False
-    try:
-        state_root = agent.home.parent.parent
-        _write_startup(
-            agent,
-            args.model,
-            await agent.list_sources(),
-            conversation_id,
-        )
-        while True:
-            try:
-                message = input("You › ")
-            except EOFError:
-                print()
-                break
-            except KeyboardInterrupt:
-                print()
-                interrupted = True
-                break
-            message = message.strip()
-            if not message:
-                continue
-            if message.startswith("/"):
-                try:
-                    learning_invocation = _learning_invocation_message(message)
-                except ValueError as error:
-                    _write_local_diagnostic(f"Learning command failed: {error}")
-                    continue
-                if learning_invocation is not None:
-                    message = learning_invocation
-                else:
-                    try:
-                        skill_invocation = await _skill_invocation_message(
-                            agent, message
-                        )
-                    except ValueError as error:
-                        _write_local_diagnostic(f"Skill invocation failed: {error}")
-                        continue
-                    if skill_invocation is None:
-                        should_exit, conversation_id = await _handle_chat_command(
-                            message,
-                            agent=agent,
-                            model_id=args.model,
-                            state_root=state_root,
-                            conversation_id=conversation_id,
-                            totals=totals,
-                        )
-                        if should_exit:
-                            break
-                        continue
-
-            creates_conversation = conversation_id is None
-            result = await agent.run(message, conversation_id=conversation_id)
-            conversation_id = result.conversation_id
-            last_completed_conversation_id = result.conversation_id
-            totals.add(result)
-            if creates_conversation:
-                print(f"Conversation: {conversation_id}")
-            print()
-            print("Daita")
-            if result.final_text is not None:
-                print(result.final_text)
-            else:
-                print(f"{result.kind.value}: {result.reason}")
-            await _write_artifact_outcomes(agent, result, sys.stdout)
-            print()
-            print(
-                f"{result.steps} steps · {result.usage.total_tokens} tokens · "
-                f"{format_cost_estimate(result.usage.cost_estimate)}"
-            )
-            print()
-
-        resume_id = conversation_id or last_completed_conversation_id
-        if resume_id is None:
-            print("No conversation was created.")
-        else:
-            print(f"Conversation saved as {resume_id}.")
-            print()
-            print("Resume with:")
-            print(_resume_command(state_root, agent.name, args.model, resume_id))
-        return 130 if interrupted else 0
-    finally:
-        await agent.close()
-
-
 async def _execute(args: argparse.Namespace) -> object:
     if args.command == "create":
         agent = await Agent.create(args.name, root=args.root)
@@ -1326,7 +1148,13 @@ async def _execute(args: argparse.Namespace) -> object:
         finally:
             await agent.close()
     if args.command == "chat":
-        return await _chat(args)
+        return await run_terminal_application(
+            root=args.root,
+            agent_name=args.name,
+            reviewer_max_estimated_cost_usd=(
+                _candidate_review_cost_limit_from_environment()
+            ),
+        )
     if args.command == "memory" and args.memory_command == "review":
         _validate_candidate_review_cost_limit(args.cost_limit)
         provider, profile = _reviewer_model_configuration(args.model)

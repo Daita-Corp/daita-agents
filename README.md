@@ -52,7 +52,9 @@ pipx install --python python3.12 daita-agents
 ```
 
 The first launch guides you through creating an agent, choosing a model, and
-attaching a read only source. API-backed models store their key in the OS
+attaching a read only source inside one full-screen Textual application; setup,
+chat, pickers, secret entry, confirmations, and approvals never fall back to a
+second line-oriented interface. API-backed models store their key in the OS
 keychain; local Ollama models need no key. Choosing **Codex subscription** starts
 a ChatGPT device-code sign-in inside Daita—installing the Codex CLI is not
 required. **Claude Code subscription** uses the installed, signed-in Claude Code
@@ -77,18 +79,29 @@ Compare paid revenue by region and plan.
 
 Run `daita` again for a returning launch. Daita reopens the only agent
 automatically or shows a picker when several exist. Use `daita --agent atlas`
-to select one directly.
+to select one directly. The retained `daita chat` spelling is a strict alias of
+the same Textual application, not a separate chat implementation.
 
 Inside the terminal, use `/help` to see available commands and shipped
-controls. Press Enter to submit, Ctrl-J for a newline, and Ctrl-D to exit from
-an empty prompt. Press Escape twice to clear the current input. Ctrl-C copies
-an application-owned selection; without a selection it cancels an active run.
-The animated status shows the active tool without filling the transcript with
-tool cards. After a run, press Ctrl-O to show or hide that run's recorded tool
-calls and results. Clipboard requests that a terminal cannot acknowledge are
-reported as requests, not successful copies. If pointer or clipboard support
-is unavailable, use the terminal's own selection bypass modifier (often
-Shift) and copy command.
+controls. Type `/` to open the command palette, continue typing to filter it,
+and use Up/Down plus Tab or Enter to insert the highlighted command. Type `@`
+to choose a registered source for one question without changing the persistent
+active source. Escape closes an open palette before participating in the normal
+double-Escape input clear. Press Enter to submit, Ctrl-J for a newline, and
+Ctrl-D to exit from an empty prompt. Ctrl-C copies an application-owned
+selection; without a selection it cancels an active run. The animated status
+shows the active tool without filling the transcript with tool cards. After a
+run, press Ctrl-O to show or hide that run's recorded tool calls and results.
+Clipboard requests that a terminal cannot acknowledge are reported as
+requests, not successful copies. If pointer or clipboard support is
+unavailable, use the terminal's own selection bypass modifier (often Shift)
+and copy command.
+
+`/memory edit`, `/user edit`, `/memory edit <candidate-id>`, and `/skills
+create` or `/skills edit` use the configured `$EDITOR`. Textual temporarily
+restores the ordinary terminal while that external editor runs, then reacquires
+the full-screen UI. Source configuration, passwords, selection, and approval
+remain inside Textual.
 
 ## How it works
 
@@ -181,7 +194,7 @@ The terminal provides confirmed lifecycle commands:
 
 `/source edit` changes the active source connection without dropping the
 working connection first. Daita validates and catalogs the edited connection,
-shows a redacted review, and requires a `[y/N]` confirmation before one atomic handoff. Read
+shows a redacted Textual confirmation before one atomic handoff. Read
 intent is preserved only for exact matching resources, PostgreSQL update scopes
 are cleared, and a new conversation starts. If validation, discovery, review,
 or commit fails, the existing connection remains active.

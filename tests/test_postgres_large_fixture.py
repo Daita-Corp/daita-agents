@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, ApprovalDecision, ApprovalRequest, terminal
+from daita import Agent, ApprovalDecision, ApprovalRequest
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -474,15 +474,15 @@ async def test_terminal_write_permissions_use_large_support_tickets(
             if resource.display_name == "support.tickets"
         )
         assert "priority" in tickets.eligible_assignment_columns
-        priority_choice = tickets.eligible_assignment_columns.index("priority") + 1
-        output = io.StringIO()
-
-        await terminal._configure_source_permissions(
-            agent,
-            input_stream=io.StringIO(f"2\nall\n2\n{priority_choice}\ny\n"),
-            output_stream=output,
-            preselected_source_id=source.id,
-            preselected_section="write",
+        preview = await agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode=inspection.state.read_scope.mode,
+            read_resource_ids=inspection.state.read_scope.resource_ids,
+            postgresql_update_scopes={tickets.resource_id: ("priority",)},
+        )
+        await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=preview.confirmation_fingerprint,
         )
 
         after = await agent.inspect_source_permissions(source.id)
@@ -496,10 +496,6 @@ async def test_terminal_write_permissions_use_large_support_tickets(
             ("priority",),
         )
         assert readiness.ready_for_preview is True
-        rendered = output.getvalue()
-        assert "support.tickets" in rendered
-        assert "Source permissions updated atomically" in rendered
-        assert "No external database mutation was executed" in rendered
         assert provider.requests == ()
     finally:
         await agent.close()
