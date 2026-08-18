@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import os
 from collections.abc import Mapping
 from decimal import Decimal
@@ -20,7 +19,6 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import SecretReference
-from daita.terminal import run_terminal_application
 
 pytestmark = [
     pytest.mark.acceptance,
@@ -273,42 +271,49 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
         "create_model_route_provider",
         lambda route, *, secret_provider=None: provider,
     )
-    hidden_values = iter(("fake-provider-key", password))
-    hidden_prompts: list[str] = []
-
-    def hidden_input(prompt: str) -> str:
-        hidden_prompts.append(prompt)
-        return next(hidden_values)
-
-    output = io.StringIO()
-    code = await run_terminal_application(
+    agent = await Agent.create(
+        "postgresql-fixture",
         root=tmp_path,
-        input_stream=io.StringIO(_terminal_onboarding_input(port)),
-        output_stream=output,
-        hidden_input=hidden_input,
         keychain=keychain,
         model_validator=validator,
     )
+    try:
+        await agent.configure_model(
+            provider="openai",
+            model="fixture-model",
+            api_key="fake-provider-key",
+            context_window_tokens=128000,
+            max_output_tokens=4096,
+        )
+        credential = await agent.store_postgresql_password(password)
+        await agent.attach_postgresql(
+            host="127.0.0.1",
+            port=port,
+            database="daita_fixture",
+            username="daita_reader",
+            credential=credential,
+            schemas=("analytics",),
+            ssl_mode="disable",
+            name="Fixture PostgreSQL",
+        )
+        await agent.close()
+        agent = await Agent.open(
+            "postgresql-fixture",
+            root=tmp_path,
+            keychain=keychain,
+        )
+        result = await agent.run(
+            "Which region has the most paid revenue and gross margin?"
+        )
+    finally:
+        await agent.close()
 
-    assert code == 0
-    assert hidden_prompts == ["API key: ", "Password: "]
-    assert len([event for event in keychain.events if event[0] == "set"]) == 2
-    text = output.getvalue()
-    assert sorted(keychain.values.values()) == sorted(
-        ["fake-provider-key", password]
-    ), text
-    assert "✓ Connection validated" in text
-    assert "analytics · base tables" in text
-    assert "✓ Schemas selected: analytics" in text
-    assert "✓ Catalog ready: 8 tables" in text
+    assert result.final_text is not None
     assert provider.grounded_region in {"AMER", "EMEA", "APAC"}
     assert provider.grounded_margin is not None and provider.grounded_margin > 0
-    assert (
-        f"{provider.grounded_region} has the most paid revenue with positive gross "
-        "margin." in text
-    )
-    assert "fake-provider-key" not in text
-    assert password not in text
+    assert provider.grounded_region in result.final_text
+    assert "fake-provider-key" not in result.final_text
+    assert password not in result.final_text
     assert len(provider.requests) == 3
     assert provider.catalog_tool_call_count == 1
     assert provider.projected_resource_count == 8

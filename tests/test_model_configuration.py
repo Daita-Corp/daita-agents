@@ -1,5 +1,4 @@
 import asyncio
-import io
 import json
 import subprocess
 import sys
@@ -10,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 import daita.hosting.embedded as embedded
-from daita import Agent, LoopLimits, terminal
+from daita import Agent, LoopLimits
 from daita.agent import AgentModelConfigurationError
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.factory import create_model_route_provider
@@ -29,12 +28,14 @@ from daita.llm.protocols import provider_has_complete_pricing
 from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelRoute, ModelRouteCandidate, RetryPolicy
 from daita.security import (
+    CredentialSession,
     EmptySecretProvider,
+    EnvironmentSecretProvider,
     KeychainSecretProvider,
     SecretReference,
     SecretResolutionError,
+    default_secret_provider,
 )
-from daita.terminal import run_terminal_application
 
 
 class _FakeKeychain:
@@ -359,105 +360,6 @@ async def test_manual_model_retains_explicit_limits_and_disables_parallel_tools(
         await reopened.close()
 
 
-@pytest.mark.parametrize(
-    ("code", "message"),
-    (
-        (
-            ProviderErrorCode.AUTHENTICATION_ERROR,
-            "The API key was rejected. Replace it and retry.",
-        ),
-        (
-            ProviderErrorCode.MODEL_NOT_FOUND,
-            "This account cannot access test-model.",
-        ),
-        (
-            ProviderErrorCode.RATE_LIMIT_ERROR,
-            "The provider rate-limited the validation request.",
-        ),
-        (
-            ProviderErrorCode.PROVIDER_UNAVAILABLE,
-            "The provider could not be reached.",
-        ),
-        (
-            ProviderErrorCode.TIMEOUT,
-            "The provider did not respond before the timeout.",
-        ),
-        (
-            ProviderErrorCode.INVALID_REQUEST,
-            "The provider rejected this model configuration.",
-        ),
-        (
-            ProviderErrorCode.OUTPUT_LIMIT,
-            "The model exhausted its validation output budget before calling the tool.",
-        ),
-    ),
-)
-async def test_terminal_maps_normalized_validation_errors(tmp_path, code, message):
-    keychain = _FakeKeychain()
-    provider = _provider("openai:test-model", ModelProviderError(code))
-    output = io.StringIO()
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO("atlas\n1\n4\ntest-model\n8192\n1024\n"),
-        output_stream=output,
-        hidden_input=lambda prompt: "top-secret",
-        keychain=keychain,
-        model_validator=provider,
-    )
-
-    assert result == 0
-    assert message in output.getvalue()
-    assert "top-secret" not in output.getvalue()
-    assert not (tmp_path / "agents" / "atlas" / "config.json").exists()
-    assert keychain.values == {}
-
-
-async def test_suggested_model_is_exactly_validated_and_only_route_is_persisted(
-    tmp_path,
-):
-    keychain = _FakeKeychain()
-    suggestion = "gemini-3.6-flash"
-    validator = _provider(f"gemini:{suggestion}")
-    output = io.StringIO()
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO("atlas\n3\n1\n"),
-        output_stream=output,
-        hidden_input=lambda prompt: "suggestion-secret",
-        keychain=keychain,
-        model_validator=validator,
-    )
-
-    assert result == 0
-    assert validator.provider_id == f"gemini:{suggestion}"
-    assert len(validator.requests) == 1
-    config = (tmp_path / "agents" / "atlas" / "config.json").read_text(encoding="utf-8")
-    assert f"gemini:{suggestion}" in config
-    expected_profile = reviewed_model_profile(f"gemini:{suggestion}")
-    assert expected_profile is not None
-    assert expected_profile.context_window_tokens == 1_048_576
-    assert expected_profile.max_output_tokens == 65_536
-    assert expected_profile.supports_tools is True
-    assert expected_profile.supports_parallel_tools is False
-    assert expected_profile.supports_reasoning is True
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
-    try:
-        assert reopened.model_profile == expected_profile
-    finally:
-        await reopened.close()
-    home = tmp_path / "agents" / "atlas"
-    persisted = b"\n".join(
-        path.read_bytes() for path in home.rglob("*") if path.is_file()
-    )
-    for item in terminal._MODEL_SUGGESTIONS["gemini"]:
-        assert item.label.encode() not in persisted
-        assert item.description.encode() not in persisted
-        if item.recommendation is not None:
-            assert item.recommendation.encode() not in persisted
-
-
 async def test_reviewed_openai_suggestions_use_authoritative_profile_facts(tmp_path):
     for suggestion in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
         profile = reviewed_model_profile(f"openai:{suggestion}")
@@ -467,38 +369,6 @@ async def test_reviewed_openai_suggestions_use_authoritative_profile_facts(tmp_p
         assert profile.supports_tools is True
         assert profile.supports_parallel_tools is False
         assert profile.supports_reasoning is True
-
-
-async def test_unreviewed_suggestion_requires_explicit_limits_before_validation(
-    tmp_path,
-):
-    keychain = _FakeKeychain()
-    suggestion = "claude-opus-4-8"
-    provider_id = f"anthropic:{suggestion}"
-    validator = _provider(provider_id)
-    output = io.StringIO()
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO("atlas\n2\n1\n24000\n3000\n"),
-        output_stream=output,
-        hidden_input=lambda prompt: "suggestion-secret",
-        keychain=keychain,
-        model_validator=validator,
-    )
-
-    assert result == 0
-    assert reviewed_model_profile(provider_id) is None
-    assert "unreviewed model requires explicit hard token limits" in output.getvalue()
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
-    try:
-        assert reopened.model_profile is not None
-        assert reopened.model_profile.id == provider_id
-        assert reopened.model_profile.context_window_tokens == 24_000
-        assert reopened.model_profile.max_output_tokens == 3_000
-        assert reopened.model_profile.supports_parallel_tools is False
-    finally:
-        await reopened.close()
 
 
 async def test_stale_profile_is_rejected_with_reconfiguration_error(tmp_path):
@@ -522,191 +392,6 @@ async def test_stale_profile_is_rejected_with_reconfiguration_error(tmp_path):
         match="must be replaced",
     ):
         await Agent.open("atlas", root=tmp_path, keychain=keychain)
-
-
-async def test_terminal_replaces_stale_profile_only_after_fresh_validation(tmp_path):
-    await _create_unconfigured(tmp_path)
-    keychain = _FakeKeychain()
-    await _configure(
-        tmp_path,
-        keychain,
-        _provider("openai:legacy-model"),
-        model="legacy-model",
-    )
-    path = tmp_path / "agents" / "atlas" / "config.json"
-    document = json.loads(path.read_text(encoding="utf-8"))
-    candidate = document["model_route"]["candidates"][0]
-    candidate["provider_id"] = "openai:gpt-5.6-sol"
-    candidate["profile"]["id"] = "openai:gpt-5.6-sol"
-    path.write_text(json.dumps(document), encoding="utf-8")
-    before = path.read_bytes()
-
-    cancelled_output = io.StringIO()
-    cancelled = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO(),
-        output_stream=cancelled_output,
-        keychain=keychain,
-    )
-
-    assert cancelled == 0
-    assert "Setup cancelled." in cancelled_output.getvalue()
-    assert path.read_bytes() == before
-
-    output = io.StringIO()
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO("1\n1\n"),
-        output_stream=output,
-        hidden_input=lambda prompt: "replacement-secret",
-        keychain=keychain,
-        model_validator=_provider("openai:gpt-5.6-sol"),
-    )
-
-    assert result == 0
-    assert "no longer meets current safety checks" in output.getvalue()
-    assert path.read_bytes() != before
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
-    try:
-        assert reopened.model_profile == reviewed_model_profile("openai:gpt-5.6-sol")
-    finally:
-        await reopened.close()
-
-
-async def test_valid_unlisted_manual_model_uses_exact_existing_validation_path(
-    tmp_path,
-):
-    keychain = _FakeKeychain()
-    validator = _provider("gemini:private-tool-model")
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO("atlas\n3\n4\nprivate-tool-model\n16384\n2048\n"),
-        output_stream=io.StringIO(),
-        hidden_input=lambda prompt: "manual-secret",
-        keychain=keychain,
-        model_validator=validator,
-    )
-
-    assert result == 0
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
-    try:
-        assert reopened.model_route is not None
-        assert (
-            reopened.model_route.candidates[0].provider_id
-            == "gemini:private-tool-model"
-        )
-        assert reopened.model_profile is not None
-        assert reopened.model_profile.context_window_tokens == 16_384
-        assert reopened.model_profile.max_output_tokens == 2_048
-        assert reopened.model_profile.supports_parallel_tools is False
-    finally:
-        await reopened.close()
-
-
-async def test_validation_failure_returns_to_same_provider_model_menu(tmp_path):
-    keychain = _FakeKeychain()
-    provider_id = "openai:retry-model"
-    validator = MockModelProvider(
-        (
-            ModelProviderError(ProviderErrorCode.AUTHENTICATION_ERROR),
-            _tool_validation_response(provider_id),
-        ),
-        provider_id=provider_id,
-    )
-    output = io.StringIO()
-    secrets = iter(("first-secret", "second-secret"))
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO(
-            "atlas\n"
-            "1\n"
-            "4\n"
-            "retry-model\n"
-            "8192\n"
-            "1024\n"
-            "4\n"
-            "retry-model\n"
-            "8192\n"
-            "1024\n"
-        ),
-        output_stream=output,
-        hidden_input=lambda prompt: next(secrets),
-        keychain=keychain,
-        model_validator=validator,
-    )
-
-    assert result == 0
-    assert output.getvalue().count("Select an OpenAI API model") == 2
-    assert output.getvalue().count("Select a model provider") == 1
-    assert "The API key was rejected. Replace it and retry." in output.getvalue()
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
-    try:
-        assert reopened.model_route is not None
-        assert reopened.model_route.candidates[0].provider_id == provider_id
-    finally:
-        await reopened.close()
-
-
-async def test_model_menu_can_explicitly_return_to_provider_selection(tmp_path):
-    keychain = _FakeKeychain()
-    validator = _provider("anthropic:manual-claude")
-    output = io.StringIO()
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO(
-            "atlas\n" "1\n" "5\n" "2\n" "4\n" "manual-claude\n" "8192\n" "1024\n"
-        ),
-        output_stream=output,
-        hidden_input=lambda prompt: "anthropic-secret",
-        keychain=keychain,
-        model_validator=validator,
-    )
-
-    assert result == 0
-    assert output.getvalue().count("Select a model provider") == 2
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
-    try:
-        assert reopened.model_route is not None
-        assert reopened.model_route.candidates[0].provider_id == (
-            "anthropic:manual-claude"
-        )
-    finally:
-        await reopened.close()
-
-
-async def test_terminal_normalizes_keychain_setup_failure_without_raw_diagnostics(
-    tmp_path,
-):
-    class FailingKeychain(_FakeKeychain):
-        async def set(self, reference: SecretReference, value: str) -> None:
-            del reference, value
-            raise SecretResolutionError(
-                "secret_provider_unavailable",
-                "raw keychain diagnostic containing top-secret",
-            )
-
-    keychain = FailingKeychain()
-    output = io.StringIO()
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO("atlas\n1\n4\ntest-model\n8192\n1024\n"),
-        output_stream=output,
-        hidden_input=lambda prompt: "top-secret",
-        keychain=keychain,
-        model_validator=_provider("openai:test-model"),
-    )
-
-    assert result == 0
-    assert (
-        "The API key could not be saved to the OS keychain. "
-        "Check keychain access and retry."
-    ) in output.getvalue()
-    assert "raw keychain diagnostic" not in output.getvalue()
-    assert "top-secret" not in output.getvalue()
 
 
 async def test_failed_validation_preserves_previous_route_and_credential(tmp_path):
@@ -1016,6 +701,70 @@ async def test_keychain_set_delete_use_bounded_daita_service_and_account():
     assert len(reference.name) <= 256
 
 
+async def test_credential_session_reuses_and_invalidates_native_secrets():
+    keychain = _FakeKeychain()
+    session = CredentialSession(keychain)
+    reference = SecretReference.keychain("agent:postgresql:credential")
+
+    await session.set(reference, "first-secret")
+    assert await session.resolve(reference) == "first-secret"
+    assert await session.resolve(reference) == "first-secret"
+
+    await session.delete(reference)
+    keychain.values[reference.name] = "replacement-secret"
+    assert await session.resolve(reference) == "replacement-secret"
+
+    await session.close()
+    with pytest.raises(SecretResolutionError, match="credential session is closed"):
+        await session.resolve(reference)
+
+
+async def test_credential_session_coalesces_concurrent_native_reads():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _BlockingKeychain(_FakeKeychain):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resolve_calls = 0
+
+        async def resolve(self, reference: SecretReference) -> str:
+            self.resolve_calls += 1
+            entered.set()
+            await release.wait()
+            return await super().resolve(reference)
+
+    keychain = _BlockingKeychain()
+    reference = SecretReference.keychain("agent:postgresql:shared")
+    keychain.values[reference.name] = "one-secret"
+    session = CredentialSession(keychain)
+
+    first = asyncio.create_task(session.resolve(reference))
+    await entered.wait()
+    second = asyncio.create_task(session.resolve(reference))
+    await asyncio.sleep(0)
+    assert keychain.resolve_calls == 1
+
+    release.set()
+    assert await asyncio.gather(first, second) == ["one-secret", "one-secret"]
+    assert keychain.resolve_calls == 1
+    await session.close()
+
+
+def test_default_provider_cannot_bypass_a_credential_session():
+    session = CredentialSession(_FakeKeychain())
+
+    provider = default_secret_provider(session)
+
+    assert provider.providers[0] is session
+    assert len(provider.providers) == 2
+    assert isinstance(provider.providers[1], EnvironmentSecretProvider)
+    assert not any(
+        isinstance(candidate, KeychainSecretProvider)
+        for candidate in provider.providers[1:]
+    )
+
+
 async def test_missing_keyring_uses_the_application_repair_guidance():
     keychain = KeychainSecretProvider()
     reference = SecretReference.keychain("agent:openai:test")
@@ -1185,6 +934,7 @@ blocked = {
     "openai",
     "prompt_toolkit",
     "sqlglot",
+    "textual",
 }
 original = builtins.__import__
 
@@ -1208,139 +958,6 @@ import daita.terminal
     assert completed.returncode == 0, completed.stderr
 
 
-async def test_terminal_onboarding_hides_key_before_stage_three_source_setup(tmp_path):
-    keychain = _FakeKeychain()
-    provider = _provider("openai:gpt-test")
-    output = io.StringIO()
-    secret_prompts = []
-
-    def hidden(prompt):
-        secret_prompts.append(prompt)
-        return "terminal-secret"
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO("atlas\n1\n4\ngpt-test\n8192\n1024\n"),
-        output_stream=output,
-        hidden_input=hidden,
-        keychain=keychain,
-        model_validator=provider,
-    )
-
-    text = output.getvalue()
-    assert result == 0
-    assert secret_prompts == ["API key: "]
-    assert "terminal-secret" not in text
-    assert "may incur a tiny API charge" in text
-    assert "✓ Model configuration validated" in text
-    assert "Select a data source" in text
-    assert "terminal-secret" not in (
-        tmp_path / "agents" / "atlas" / "config.json"
-    ).read_text(encoding="utf-8")
-
-
-async def test_ollama_does_not_request_an_api_key(tmp_path):
-    output = io.StringIO()
-
-    def forbidden_hidden_input(prompt):
-        raise AssertionError(f"unexpected hidden prompt: {prompt}")
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO("atlas\n5\n4\nllama-test\n8192\n1024\n\n"),
-        output_stream=output,
-        hidden_input=forbidden_hidden_input,
-        keychain=_FakeKeychain(),
-        model_validator=_provider("ollama:llama-test"),
-    )
-
-    assert result == 0
-    assert "✓ Model configuration validated" in output.getvalue()
-
-
-async def test_grok_build_terminal_selection_validates_without_api_key(tmp_path):
-    provider_id = "grok-build:grok-4.5"
-    output = io.StringIO()
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO("atlas\n8\n1\n500000\n8192\n"),
-        output_stream=output,
-        hidden_input=lambda prompt: (_ for _ in ()).throw(
-            AssertionError(f"unexpected API-key prompt: {prompt}")
-        ),
-        keychain=_FakeKeychain(),
-        model_validator=_provider(provider_id),
-    )
-
-    assert result == 0
-    text = output.getvalue()
-    assert "Grok Build subscription" in text
-    assert "small amount of subscription allowance" in text
-    assert "✓ Model configuration validated" in text
-    persisted = json.loads(
-        (tmp_path / "agents" / "atlas" / "config.json").read_text(encoding="utf-8")
-    )
-    assert persisted["model_route"]["candidates"][0]["secret_reference"] is None
-
-
-async def test_custom_terminal_provider_requires_and_persists_base_url(tmp_path):
-    output = io.StringIO()
-    keychain = _FakeKeychain()
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO(
-            "atlas\n"
-            "9\n"
-            "acme\n"
-            "acme-model\n"
-            "8192\n"
-            "1024\n"
-            "https://models.acme.test/v1\n"
-        ),
-        output_stream=output,
-        hidden_input=lambda prompt: "custom-secret",
-        keychain=keychain,
-        model_validator=_provider("acme:acme-model"),
-    )
-
-    assert result == 0
-    assert "✓ Model configuration validated" in output.getvalue()
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
-    try:
-        assert reopened.model_route is not None
-        assert (
-            reopened.model_route.candidates[0].base_url == "https://models.acme.test/v1"
-        )
-    finally:
-        await reopened.close()
-
-
-async def test_existing_persisted_route_skips_onboarding_without_health_claim(
-    tmp_path,
-):
-    await _create_unconfigured(tmp_path)
-    keychain = _FakeKeychain()
-    await _configure(tmp_path, keychain, _provider("openai:test-model"))
-    output = io.StringIO()
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO(""),
-        output_stream=output,
-        hidden_input=lambda prompt: (_ for _ in ()).throw(
-            AssertionError(f"unexpected prompt: {prompt}")
-        ),
-        keychain=keychain,
-    )
-
-    assert result == 0
-    assert "Select a model provider" not in output.getvalue()
-    assert "Select a data source" in output.getvalue()
-    assert "OpenAI API · test-model · configured" not in output.getvalue()
-    assert "provider health was not checked this launch" not in output.getvalue()
-
-
 async def test_custom_provider_requires_an_explicit_base_url_before_key_storage(
     tmp_path,
 ):
@@ -1362,26 +979,6 @@ async def test_custom_provider_requires_an_explicit_base_url_before_key_storage(
     finally:
         await agent.close()
     assert keychain.events == []
-
-
-async def test_model_onboarding_interrupt_leaves_no_partial_config_or_lock(tmp_path):
-    class _InterruptingInput(io.StringIO):
-        def readline(self, size=-1):
-            del size
-            raise KeyboardInterrupt
-
-    result = await run_terminal_application(
-        root=tmp_path,
-        input_stream=_InterruptingInput(""),
-        output_stream=io.StringIO(),
-        hidden_input=lambda prompt: "unused",
-        keychain=_FakeKeychain(),
-    )
-
-    assert result == 130
-    assert await Agent.list(root=tmp_path) == ()
-    agent = await Agent.create("after-interrupt", root=tmp_path)
-    await agent.close()
 
 
 async def test_cancelled_close_keeps_writer_lock_until_admitted_configuration_finishes(
@@ -1432,30 +1029,3 @@ async def test_cancelled_close_keeps_writer_lock_until_admitted_configuration_fi
         assert reopened.model_route == route
     finally:
         await reopened.close()
-
-
-async def test_api_key_never_reaches_files_sqlite_repr_transcripts_or_output(tmp_path):
-    secret = "NEVER-PERSIST-THIS-API-KEY"
-    keychain = _FakeKeychain()
-    provider = _provider("openai:test-model")
-    output = io.StringIO()
-    await run_terminal_application(
-        root=tmp_path,
-        input_stream=io.StringIO("atlas\n1\n4\ntest-model\n8192\n1024\n"),
-        output_stream=output,
-        hidden_input=lambda prompt: secret,
-        keychain=keychain,
-        model_validator=provider,
-    )
-
-    home = tmp_path / "agents" / "atlas"
-    for path in home.rglob("*"):
-        if path.is_file():
-            assert secret.encode() not in path.read_bytes()
-    assert secret not in output.getvalue()
-    reopened = await Agent.open("atlas", root=tmp_path)
-    try:
-        assert secret not in repr(reopened.model_route)
-    finally:
-        await reopened.close()
-    assert all(secret not in repr(request) for request in provider.requests)

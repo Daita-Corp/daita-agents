@@ -70,13 +70,13 @@ def test_final_src_layout_has_one_package_owner_and_no_replacement_alias():
 
 
 def test_model_suggestions_remain_terminal_only_presentation_metadata():
-    terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
-    assert "_MODEL_SUGGESTIONS" in terminal
-    assert _class_owners("_ModelSuggestion") == {"terminal.py"}
+    models = (PACKAGE / "tui" / "models.py").read_text(encoding="utf-8")
+    assert "MODEL_SUGGESTIONS" in models
+    assert _class_owners("ModelSuggestion") == {"tui/models.py"}
     for owner in ("catalog", "loop", "llm", "storage"):
         text = _python_text(PACKAGE / owner)
-        assert "_MODEL_SUGGESTIONS" not in text
-        assert "_ModelSuggestion" not in text
+        assert "MODEL_SUGGESTIONS" not in text
+        assert "ModelSuggestion" not in text
 
 
 def test_public_surface_is_focused():
@@ -381,7 +381,8 @@ def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners(
     assert "render_semantic_recall" in context
     assert "semantic_declarations(identity.id, store)" in embedded
     assert "mutation_lock=mutation_lock" in embedded
-    assert "/memory [list|show <id>|edit [id]|accept <id>|" in terminal
+    controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
+    assert "/memory [list|show <id>|edit [id]|accept <id>|" in controller
     assert "/knowledge" not in _python_text(PACKAGE)
 
     expected = {
@@ -591,7 +592,8 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
     context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
     cli = (PACKAGE / "cli.py").read_text(encoding="utf-8")
     terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
-    terminal_shell = (PACKAGE / "tui" / "shell.py").read_text(encoding="utf-8")
+    tui_commands = (PACKAGE / "tui" / "commands.py").read_text(encoding="utf-8")
+    tui_controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
 
     assert "postgresql_update_readiness" in agent_methods
     assert "postgresql_update_readiness" in embedded_methods
@@ -603,11 +605,10 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
     assert "postgresql_update_readiness" not in context
     assert ".postgresql_update_readiness(" in cli
     assert ".postgresql_update_readiness(" not in terminal
-    assert "inspect_source_permissions" in terminal
-    assert "preview_source_permissions" in terminal
-    assert "apply_source_permissions" in terminal
-    assert '"/source permissions"' in terminal
-    assert '"/source permissions"' in terminal_shell
+    assert "inspect_source_permissions" in tui_controller
+    assert "preview_source_permissions" in tui_controller
+    assert "apply_source_permissions" in tui_controller
+    assert '"/source permissions"' in tui_commands
     for obsolete_terminal_command in (
         "/source write inspect",
         "/source write enable",
@@ -615,7 +616,7 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
         "/source write readiness",
     ):
         assert obsolete_terminal_command not in terminal
-        assert obsolete_terminal_command not in terminal_shell
+        assert obsolete_terminal_command not in tui_commands
     production = _python_text(PACKAGE)
     for administration in (
         "CREATE ROLE daita_writer",
@@ -813,38 +814,46 @@ def test_cli_remains_a_presentation_over_the_public_agent_api():
 
 
 def test_terminal_application_remains_a_presentation_over_the_public_agent_api():
-    path = PACKAGE / "terminal.py"
-    text = path.read_text(encoding="utf-8")
+    tui_root = PACKAGE / "tui"
+    text = _python_text(tui_root)
     tree = ast.parse(text)
 
     forbidden_import_roots = {
         "adapters",
-        "capabilities",
         "catalog",
         "domains",
         "hosting",
-        "llm",
+        "loop",
         "storage",
     }
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module:
-            assert node.module.split(".")[0] not in forbidden_import_roots
-        if isinstance(node, ast.Import):
-            assert all(
-                alias.name.split(".")[0] not in {"asyncpg", "keyring", "sqlite3"}
-                for alias in node.names
-            )
+    for path in tui_root.rglob("*.py"):
+        module_tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(module_tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                root = node.module.split(".")[0]
+                if node.module.startswith("daita."):
+                    root = node.module.split(".")[1]
+                assert root not in forbidden_import_roots
+            if isinstance(node, ast.Import):
+                assert all(
+                    alias.name.split(".")[0] not in {"asyncpg", "keyring", "sqlite3"}
+                    for alias in node.names
+                )
 
     for forbidden in (
         "._embedded",
         "AgentLoop",
         "CapabilityRegistry",
         "DataToolRuntime",
-        "ModelProvider",
         "ResourceAdapter",
         "SQLiteStateStore",
         "agent.toml",
         "state.db",
+        "CommandRegistry",
+        "ConversationRuntime",
+        "ReadinessService",
+        "SessionManager",
+        "Workflow",
     ):
         assert forbidden not in text
 
@@ -868,95 +877,67 @@ def test_terminal_application_remains_a_presentation_over_the_public_agent_api()
         "refresh_source",
     } <= public_methods
     assert text.count("agent.run(") == 1
-
-    terminal_classes = {
-        node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
-    }
-    assert terminal_classes.isdisjoint(
-        {
-            "CommandRegistry",
-            "ConversationRuntime",
-            "ReadinessService",
-            "Session",
-            "SessionManager",
-            "Workflow",
-        }
-    )
+    assert not (PACKAGE / "terminal_tui.py").exists()
+    assert not (PACKAGE / "terminal_selection.py").exists()
+    assert not (PACKAGE / "terminal_transcript.py").exists()
 
 
-def test_terminal_presentation_modules_are_the_only_lazy_prompt_toolkit_owners():
+def test_textual_and_rich_stay_behind_the_interactive_entry_boundary():
     owners = {
         path.relative_to(PACKAGE).as_posix()
         for path in PACKAGE.rglob("*.py")
         if "prompt_toolkit" in path.read_text(encoding="utf-8")
     }
-    assert owners == {"terminal_selection.py", "tui/application.py"}
+    assert owners == set()
 
-    for owner, loader in (
-        ("terminal_selection.py", "_load_prompt_toolkit"),
-        ("tui/application.py", "_load_terminal_runtime"),
-    ):
-        tree = ast.parse((PACKAGE / owner).read_text(encoding="utf-8"))
-        imported_modules = {
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module
-        }
-        assert not imported_modules.intersection(
-            {
-                "daita.adapters",
-                "daita.capabilities",
-                "daita.catalog",
-                "daita.domains",
-                "daita.hosting",
-                "daita.loop",
-                "daita.storage",
-            }
+    textual_owners = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if any(
+            line.lstrip().startswith(("from textual", "import textual"))
+            for line in path.read_text(encoding="utf-8").splitlines()
         )
-        top_level_imports = {
-            node.module
-            for node in tree.body
-            if isinstance(node, ast.ImportFrom) and node.module
-        } | {
-            alias.name
-            for node in tree.body
-            if isinstance(node, ast.Import)
-            for alias in node.names
-        }
-        assert not any(
-            module == "prompt_toolkit" or module.startswith("prompt_toolkit.")
-            for module in top_level_imports
-        )
-        assert any(
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == loader
-            and any(
-                isinstance(child, ast.ImportFrom)
-                and child.module
-                and child.module.startswith("prompt_toolkit")
-                for child in ast.walk(node)
-            )
-            for node in tree.body
-        )
-
-
-def test_terminal_tui_facade_has_one_cohesive_owner_per_presentation_concern():
-    facade = ast.parse((PACKAGE / "terminal_tui.py").read_text(encoding="utf-8"))
-
-    assert not any(
-        isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-        for node in facade.body
+    }
+    assert textual_owners
+    assert all(
+        owner.startswith("tui/") or owner == "terminal.py" for owner in textual_owners
     )
-    assert _class_owners("TerminalCapabilities") == {"tui/capabilities.py"}
+    assert "cli.py" not in textual_owners
+    terminal_tree = ast.parse((PACKAGE / "terminal.py").read_text(encoding="utf-8"))
+    top_level = {
+        node.module
+        for node in terminal_tree.body
+        if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in terminal_tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert "textual" not in top_level
+    assert not any(
+        module == "textual" or (module or "").startswith("textual.")
+        for module in top_level
+    )
+    tree = ast.parse((PACKAGE / "terminal.py").read_text(encoding="utf-8"))
+    assert any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_load_textual_app"
+        for node in tree.body
+    )
+
+
+def test_textual_presentation_has_one_owner_per_concern():
     assert _class_owners("ClipboardResult") == {"tui/clipboard.py"}
-    assert _class_owners("TerminalViewState") == {"tui/state.py"}
-    assert _class_owners("StatusProjection") == {"tui/shell.py"}
-    assert _class_owners("ToolCardState") == {"tui/tool_view.py"}
-    assert _class_owners("_RenderedTranscriptMap") == {"tui/transcript_view.py"}
-    assert _class_owners("TerminalApplicationResult") == {"tui/application.py"}
+    assert _class_owners("ToolCardState") == {"tui/models.py"}
+    assert _class_owners("DaitaApp") == {"tui/app.py"}
+    assert _class_owners("PresentationController") == {"tui/controller.py"}
+    assert _class_owners("ApprovalPanel") == {"tui/widgets/approval.py"}
+    assert _class_owners("TranscriptView") == {"tui/widgets/transcript.py"}
+    assert _class_owners("RunObserver") == {"tui/observer.py"}
 
 
-def test_rich_is_lazy_and_owned_only_by_the_focused_terminal_tui():
+def test_rich_is_not_imported_outside_the_textual_boundary():
     owners = {
         path.relative_to(PACKAGE).as_posix()
         for path in PACKAGE.rglob("*.py")
@@ -965,69 +946,15 @@ def test_rich_is_lazy_and_owned_only_by_the_focused_terminal_tui():
             for line in path.read_text(encoding="utf-8").splitlines()
         )
     }
-    assert owners == {"tui/application.py"}
-
-    tree = ast.parse((PACKAGE / "tui" / "application.py").read_text(encoding="utf-8"))
-    top_level_imports = {
-        node.module
-        for node in tree.body
-        if isinstance(node, ast.ImportFrom) and node.module
-    } | {
-        alias.name
-        for node in tree.body
-        if isinstance(node, ast.Import)
-        for alias in node.names
-    }
-    assert not any(
-        module == "rich" or module.startswith("rich.") for module in top_level_imports
-    )
-    assert any(
-        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "_load_terminal_runtime"
-        and any(
-            isinstance(child, ast.ImportFrom)
-            and child.module
-            and child.module.startswith("rich.")
-            for child in ast.walk(node)
-        )
-        for node in tree.body
-    )
+    assert all(owner.startswith("tui/") for owner in owners)
 
 
-def test_phase_a_viewport_state_is_disposable_and_has_one_semantic_owner():
-    assert _class_owners("TranscriptViewport") == {"terminal_transcript.py"}
-    assert _class_owners("TranscriptFollowState") == {"terminal_transcript.py"}
-    state = (PACKAGE / "tui" / "state.py").read_text(encoding="utf-8")
-    assert "transcript_scroll_offset" not in state
-    assert "TranscriptViewport" in state
-    assert "SemanticViewportAnchor" in (PACKAGE / "terminal_transcript.py").read_text(
-        encoding="utf-8"
-    )
-    for owner in (PACKAGE / "loop", PACKAGE / "storage"):
-        text = _python_text(owner)
-        assert "TranscriptViewport" not in text
-        assert "TranscriptFollowState" not in text
-    assert "transcript_viewport" not in (PACKAGE / "terminal_selection.py").read_text(
-        encoding="utf-8"
-    )
-
-
-def test_phase_c_transcript_selection_and_clipboard_stay_in_terminal_owners():
-    transcript = (PACKAGE / "terminal_transcript.py").read_text(encoding="utf-8")
-    state = (PACKAGE / "tui" / "state.py").read_text(encoding="utf-8")
-    clipboard_path = PACKAGE / "tui" / "clipboard.py"
-    clipboard = clipboard_path.read_text(encoding="utf-8")
-    menu_selection = (PACKAGE / "terminal_selection.py").read_text(encoding="utf-8")
+def test_clipboard_stays_truthful_and_out_of_durable_owners():
+    clipboard = (PACKAGE / "tui" / "clipboard.py").read_text(encoding="utf-8")
     storage = _python_text(PACKAGE / "storage")
     loop = _python_text(PACKAGE / "loop")
-
-    assert _class_owners("TranscriptSelection") == {"terminal_transcript.py"}
     assert _class_owners("ClipboardResult") == {"tui/clipboard.py"}
-    assert "SemanticRange" in transcript
-    assert "transcript_selection" in state
     assert "OSC 52" not in storage + loop
-    assert "transcript_selection" not in menu_selection
-
     tree = ast.parse(clipboard)
     top_level_imports = {
         node.module
@@ -1052,47 +979,23 @@ def test_phase_c_transcript_selection_and_clipboard_stay_in_terminal_owners():
     )
 
 
-def test_phase_d_mouse_ownership_and_transient_guidance_stay_disposable_and_lazy():
-    transcript = (PACKAGE / "terminal_transcript.py").read_text(encoding="utf-8")
-    application = (PACKAGE / "tui" / "application.py").read_text(encoding="utf-8")
-    state = (PACKAGE / "tui" / "state.py").read_text(encoding="utf-8")
-    menu_selection = (PACKAGE / "terminal_selection.py").read_text(encoding="utf-8")
-    durable_or_execution = _python_text(PACKAGE / "storage") + _python_text(
-        PACKAGE / "loop"
-    )
-
-    assert "def end_drag(" in transcript
-    assert "mouse_press_owner" in application
-    assert "_SELECTION_COMPLETE_HINT" in application
-    assert "transient_selection_hint" in state
-    assert "mouse_press_owner" not in menu_selection + durable_or_execution
-    assert "transient_selection_hint" not in menu_selection + durable_or_execution
-    assert "prompt_toolkit" not in {
-        node.module
-        for node in ast.parse(application).body
-        if isinstance(node, ast.ImportFrom) and node.module
-    }
-
-
-def test_phase_b_streaming_keeps_partial_state_disposable_and_provider_neutral():
+def test_streaming_keeps_partial_state_disposable_and_provider_neutral():
     loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
-    state = (PACKAGE / "tui" / "state.py").read_text(encoding="utf-8")
+    app = (PACKAGE / "tui" / "app.py").read_text(encoding="utf-8")
     observation = (PACKAGE / "observation.py").read_text(encoding="utf-8")
     storage = _python_text(PACKAGE / "storage")
-    selection = (PACKAGE / "terminal_selection.py").read_text(encoding="utf-8")
 
     assert "ModelStreamCompleted" in loop
     assert "ModelTextDelta" in loop
     assert "stream_model_calls" in loop
-    assert "assistant.partial" in state
+    assert "assistant.partial" in app
     assert "MODEL_TEXT_DELTA" in observation
     assert "assistant.partial" not in storage
     assert "MODEL_TEXT_DELTA" not in storage
-    assert "assistant.partial" not in selection
     for provider in ("openai", "anthropic", "gemini", "grok", "ollama"):
         assert provider not in loop.lower()
 
-    top_level_imports = _imports(PACKAGE / "tui" / "application.py")
+    top_level_imports = _imports(PACKAGE / "tui" / "app.py")
     assert not any(
         module == sdk or module.startswith(f"{sdk}.")
         for module in top_level_imports
@@ -1128,7 +1031,7 @@ def test_native_stream_grammars_end_inside_provider_adapters():
 
 
 def test_schema_multi_selector_has_no_data_runtime_or_persisted_state_owner():
-    selector_path = PACKAGE / "terminal_selection.py"
+    selector_path = PACKAGE / "tui" / "screens" / "selection.py"
     selector_tree = ast.parse(selector_path.read_text(encoding="utf-8"))
     imported_modules = {
         node.module
@@ -1144,7 +1047,6 @@ def test_schema_multi_selector_has_no_data_runtime_or_persisted_state_owner():
         "adapters",
         "capabilities",
         "catalog",
-        "controller",
         "executors",
         "loop",
         "postgresql",
@@ -1154,12 +1056,7 @@ def test_schema_multi_selector_has_no_data_runtime_or_persisted_state_owner():
         any(fragment in module.split(".") for fragment in forbidden_fragments)
         for module in imported_modules
     )
-    public_functions = {
-        node.name
-        for node in selector_tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    assert {"select_one", "select_many"} <= public_functions
+    assert _class_owners("SelectionScreen") == {"tui/screens/selection.py"}
 
     storage = _python_text(PACKAGE / "storage").casefold()
     for persisted_state in (

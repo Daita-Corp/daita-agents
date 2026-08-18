@@ -4,13 +4,13 @@
 
 **The data agent that learns how your business works.**
 
-Daita connects to SQLite, PostgreSQL, CSV, and JSON, catalogs your data, and
+Daita connects to a data source, catalogs your data, and
 returns grounded answers to questions asked in plain language.
 
-With your approval, Daita learns recurring query patterns, business semantics,
+Daita learns recurring query patterns, business semantics,
 and important operational context. It carries that knowledge into future
 conversations through inspectable memory and reusable skills. The more you use
-it, the better it understands your data and the way your business works.
+it, the better it understands your data and the way your project works.
 
 ```text
 You:   Which region led paid revenue last quarter?
@@ -18,8 +18,8 @@ Daita: EMEA led with $4.2M, followed by North America with $3.7M.
 ```
 
 Daita begins every source read only and keeps learned context transparent. An
-explicitly opted-in PostgreSQL source can additionally expose the narrow,
-previewed, once-approved structured update described below; other source access
+explicitly opt-in PostgreSQL source can additionally expose the narrow,
+previewed, once approved structured update described below; other source access
 remains read only.
 
 ## Why Daita?
@@ -52,14 +52,16 @@ pipx install --python python3.12 daita-agents
 ```
 
 The first launch guides you through creating an agent, choosing a model, and
-attaching a read only source. API-backed models store their key in the OS
+attaching a read only source inside our Textual application; setup,
+chat, pickers, secret entry, confirmations, and approvals never fall back to a
+second line oriented interface. API backed models store their key in the OS
 keychain; local Ollama models need no key. Choosing **Codex subscription** starts
-a ChatGPT device-code sign-in inside Daita—installing the Codex CLI is not
-required. **Claude Code subscription** uses the installed, signed-in Claude Code
+a ChatGPT device code sign in inside Daita. Installing the Codex CLI is not
+required. **Claude Code subscription** uses the installed, signed in Claude Code
 client, so run `claude auth login` before selecting it. **Grok Build
-subscription** uses a signed-in `grok` client (`grok login`). The CLI route does
+subscription** uses a signed in `grok` client (`grok login`). The CLI route does
 not store a provider credential in Daita configuration. Gemini remains available
-through its explicit API-key-billed `gemini:<model>` route.
+through its explicit API key billed `gemini:<model>` route.
 
 Subscription calls consume the allowance and follow the model availability of
 the connected plan. Daita keeps all data tools inside its validated direct loop
@@ -77,18 +79,29 @@ Compare paid revenue by region and plan.
 
 Run `daita` again for a returning launch. Daita reopens the only agent
 automatically or shows a picker when several exist. Use `daita --agent atlas`
-to select one directly.
+to select one directly. The retained `daita chat` spelling is a strict alias of
+the same Textual application, not a separate chat implementation.
 
 Inside the terminal, use `/help` to see available commands and shipped
-controls. Press Enter to submit, Ctrl-J for a newline, and Ctrl-D to exit from
-an empty prompt. Press Escape twice to clear the current input. Ctrl-C copies
-an application-owned selection; without a selection it cancels an active run.
-The animated status shows the active tool without filling the transcript with
-tool cards. After a run, press Ctrl-O to show or hide that run's recorded tool
-calls and results. Clipboard requests that a terminal cannot acknowledge are
-reported as requests, not successful copies. If pointer or clipboard support
-is unavailable, use the terminal's own selection bypass modifier (often
-Shift) and copy command.
+controls. Type `/` to open the command palette, continue typing to filter it,
+and use Up/Down plus Tab or Enter to insert the highlighted command. Type `@`
+to choose a registered source for one question without changing the persistent
+active source. Escape closes an open palette before participating in the normal
+double-Escape input clear. Press Enter to submit, Ctrl-J for a newline, and
+Ctrl-D to exit from an empty prompt. Ctrl-C copies an application-owned
+selection; without a selection it cancels an active run. The animated status
+shows the active tool without filling the transcript with tool cards. After a
+run, press Ctrl-O to show or hide that run's recorded tool calls and results.
+Clipboard requests that a terminal cannot acknowledge are reported as
+requests, not successful copies. If pointer or clipboard support is
+unavailable, use the terminal's own selection bypass modifier (often Shift)
+and copy command.
+
+`/memory edit`, `/user edit`, `/memory edit <candidate-id>`, and `/skills
+create` or `/skills edit` use the configured `$EDITOR`. Textual temporarily
+restores the ordinary terminal while that external editor runs, then reacquires
+the full-screen UI. Source configuration, passwords, selection, and approval
+remain inside Textual.
 
 ## How it works
 
@@ -145,7 +158,7 @@ For the complete implementation boundaries, see [AGENTS.md](AGENTS.md).
 
 ## Advanced/headless CLI
 
-The zero argument `daita` command is the normal path. Automation-friendly
+The zero argument `daita` command is the normal path. Automation friendly
 commands use the same public API:
 
 ```bash
@@ -181,7 +194,7 @@ The terminal provides confirmed lifecycle commands:
 
 `/source edit` changes the active source connection without dropping the
 working connection first. Daita validates and catalogs the edited connection,
-shows a redacted review, and requires a `[y/N]` confirmation before one atomic handoff. Read
+shows a redacted Textual confirmation before one atomic handoff. Read
 intent is preserved only for exact matching resources, PostgreSQL update scopes
 are cleared, and a new conversation starts. If validation, discovery, review,
 or commit fails, the existing connection remains active.

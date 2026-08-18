@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import replace
@@ -19,7 +18,6 @@ from daita import (
     SemanticKind,
     SemanticSubject,
     cli,
-    terminal_tui,
 )
 from daita.llm.models import (
     FinishReason,
@@ -32,10 +30,8 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
 from daita.semantics import semantic_annotation_sha256
-from daita.terminal import (
-    _handle_knowledge_command,
-    _learning_invocation_message,
-)
+from daita.tui.commands import SLASH_COMMAND_COMPLETIONS, learning_invocation_message
+from daita.tui.controller import PresentationController
 
 NOW = datetime(2026, 7, 28, 16, tzinfo=UTC)
 
@@ -223,7 +219,7 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
     try:
         first = await agent.learn("When we say booked revenue, use invoices.booked_at.")
         assert first.final_text == "definition saved"
-        teaching = _learning_invocation_message(
+        teaching = learning_invocation_message(
             "/learn Correct booked revenue to exclude completed refunds."
         )
         assert teaching is not None
@@ -421,15 +417,9 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         assert conflict_maintenance["requires_revalidation"] is True
         runtime.clear_explicit_learning_run(read_run.id)
 
-        output = io.StringIO()
-        handled = await _handle_knowledge_command(
-            ["/memory"],
-            agent=agent,
-            input_stream=io.StringIO(),
-            output_stream=output,
-        )
-        assert handled is True
-        rendered = output.getvalue()
+        controller = PresentationController(root=None)
+        controller.agent = agent
+        rendered = (await controller.dispatch_command("/memory")).message
         assert "Global memory:" in rendered
         assert "Active data semantics:" in rendered
         assert "active-time" in rendered
@@ -439,14 +429,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         assert "conflict-a" in rendered
         assert "conflict-b" in rendered
 
-        detail_output = io.StringIO()
-        assert await _handle_knowledge_command(
-            ["/memory", "show", "active-time"],
-            agent=agent,
-            input_stream=io.StringIO(),
-            output_stream=detail_output,
-        )
-        detail = detail_output.getvalue()
+        detail = (await controller.dispatch_command("/memory show active-time")).message
         assert "Verified revisions:" in detail
         assert "Confirmed:" in detail
         assert "Current SHA-256:" in detail
@@ -460,9 +443,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         assert "Conflicts:" in cli_rendered
 
         memory_completion = next(
-            item
-            for item in terminal_tui._SLASH_COMMAND_COMPLETIONS
-            if item[0] == "/memory"
+            item for item in SLASH_COMMAND_COMPLETIONS if item[0] == "/memory"
         )
         assert "duplicate, stale, conflicting, and superseded" in memory_completion[2]
     finally:

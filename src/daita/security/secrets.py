@@ -279,6 +279,94 @@ class KeychainSecretProvider:
         return "KeychainSecretProvider()"
 
 
+class CredentialSession:
+    """Share native credentials in memory for one admitted runtime lifetime."""
+
+    __slots__ = ("_cache", "_closed", "_keychain", "_lock")
+
+    def __init__(self, keychain: KeychainStore) -> None:
+        if not isinstance(keychain, KeychainStore):
+            raise TypeError("keychain must implement KeychainStore")
+        self._keychain = keychain
+        self._cache: dict[SecretReference, str] = {}
+        self._lock = asyncio.Lock()
+        self._closed = False
+
+    async def resolve(self, reference: SecretReference) -> str:
+        _keychain_reference(reference)
+        self._require_open()
+        cached = self._cache.get(reference)
+        if cached is not None:
+            return cached
+        async with self._lock:
+            self._require_open()
+            cached = self._cache.get(reference)
+            if cached is not None:
+                return cached
+            value = await self._keychain.resolve(reference)
+            if not isinstance(value, str) or not value:
+                raise SecretResolutionError(
+                    "secret_provider_invalid_response",
+                    "The configured keychain provider returned an invalid response.",
+                )
+            self._cache[reference] = value
+            return value
+
+    async def set(self, reference: SecretReference, value: str) -> None:
+        _keychain_reference(reference)
+        self._require_open()
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value.encode("utf-8")) > 64 * 1_024
+        ):
+            raise ValueError("keychain secret must be non-empty and at most 64 KiB")
+        async with self._lock:
+            self._require_open()
+            await self._keychain.set(reference, value)
+            self._cache[reference] = value
+
+    async def delete(self, reference: SecretReference) -> None:
+        _keychain_reference(reference)
+        self._require_open()
+        async with self._lock:
+            self._require_open()
+            await self._keychain.delete(reference)
+            self._cache.pop(reference, None)
+
+    async def preload(self, references: Iterable[SecretReference]) -> None:
+        """Resolve native credentials serially before latency-sensitive work."""
+
+        if isinstance(references, (str, bytes)):
+            raise TypeError("credential references must be an iterable of references")
+        unique: list[SecretReference] = []
+        seen: set[SecretReference] = set()
+        for reference in references:
+            _keychain_reference(reference)
+            if reference not in seen:
+                unique.append(reference)
+                seen.add(reference)
+        for reference in unique:
+            await self.resolve(reference)
+
+    async def close(self) -> None:
+        """Forget every resolved value after admitted work has settled."""
+
+        async with self._lock:
+            self._cache.clear()
+            self._closed = True
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise SecretResolutionError(
+                "secret_provider_unavailable",
+                "The credential session is closed.",
+            )
+
+    def __repr__(self) -> str:
+        return "CredentialSession()"
+
+
 class CompositeSecretProvider:
     """Try explicit providers in order without retaining resolved values."""
 
@@ -371,7 +459,7 @@ class CompositeSecretProvider:
 def default_secret_provider(
     primary: SecretProvider | None = None,
 ) -> CompositeSecretProvider:
-    """Compose injected, keychain, then environment resolution in ADR order."""
+    """Compose one admitted primary with only the fallbacks it does not own."""
 
     providers: tuple[SecretProvider, ...]
     if primary is None:
@@ -382,9 +470,13 @@ def default_secret_provider(
         if not isinstance(primary, SecretProvider):
             raise TypeError("primary must implement SecretProvider")
         providers = (
-            primary,
-            KeychainSecretProvider(),
-            EnvironmentSecretProvider(),
+            (primary, EnvironmentSecretProvider())
+            if isinstance(primary, KeychainStore)
+            else (
+                primary,
+                KeychainSecretProvider(),
+                EnvironmentSecretProvider(),
+            )
         )
     return CompositeSecretProvider(providers)
 
@@ -425,6 +517,7 @@ async def _run_blocking_to_completion(
 
 __all__ = [
     "CompositeSecretProvider",
+    "CredentialSession",
     "EmptySecretProvider",
     "EnvironmentSecretProvider",
     "KeychainSecretProvider",

@@ -113,6 +113,7 @@ from ..memory import MemoryStore
 from ..memory.capabilities import memory_set_declarations
 from ..observation import AgentObserver
 from ..security import (
+    CredentialSession,
     KeychainSecretProvider,
     KeychainStore,
     SecretProvider,
@@ -365,8 +366,9 @@ class EmbeddedAgent:
         model_profile: ModelProfile | None,
         model_route: ModelRoute | None,
         limits: LoopLimits,
-        secret_provider: SecretProvider | None,
-        keychain: KeychainStore | None,
+        secret_provider: SecretProvider,
+        keychain: CredentialSession,
+        owns_credential_session: bool,
         model_validator: ModelProvider | None,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
@@ -377,7 +379,8 @@ class EmbeddedAgent:
         self.model_route = model_route
         self._limits = limits
         self._secret_provider = secret_provider
-        self._keychain = keychain or KeychainSecretProvider()
+        self._keychain = keychain
+        self._owns_credential_session = owns_credential_session
         self._model_validator = model_validator
         self._writer_lock = writer_lock
         self._store = store
@@ -531,12 +534,16 @@ class EmbeddedAgent:
             raise TypeError("downloads_directory must be pathlib.Path or None")
         resolved_clock = clock or _utc_now
         resolved_ids = id_factory or _new_id
+        credential_session, owns_credential_session = _resolve_credential_session(
+            keychain
+        )
+        runtime_secrets = secret_provider or credential_session
         model, model_profile, model_route, limits = _resolve_configuration(
             config,
             model=model,
             model_profile=model_profile,
             limits=limits,
-            secret_provider=secret_provider or keychain,
+            secret_provider=runtime_secrets,
         )
         _validate_custom_loop(model, model_profile, context_builder, tools)
         (home, writer_lock), cancelled = await _await_sync_completion(
@@ -589,8 +596,9 @@ class EmbeddedAgent:
                 limits=limits,
                 clock=resolved_clock,
                 id_factory=resolved_ids,
-                secret_provider=secret_provider,
-                keychain=keychain,
+                secret_provider=runtime_secrets,
+                keychain=credential_session,
+                owns_credential_session=owns_credential_session,
                 model_validator=model_validator,
                 reviewer_model=reviewer_model,
                 reviewer_profile=reviewer_profile,
@@ -647,6 +655,10 @@ class EmbeddedAgent:
             raise TypeError("downloads_directory must be pathlib.Path or None")
         resolved_clock = clock or _utc_now
         resolved_ids = id_factory or _new_id
+        credential_session, owns_credential_session = _resolve_credential_session(
+            keychain
+        )
+        runtime_secrets = secret_provider or credential_session
         limit_override = limits
         explicit_configuration = _configuration_was_injected(
             config,
@@ -661,7 +673,7 @@ class EmbeddedAgent:
                 model=model,
                 model_profile=model_profile,
                 limits=limits,
-                secret_provider=secret_provider or keychain,
+                secret_provider=runtime_secrets,
             )
         else:
             model = None
@@ -688,6 +700,14 @@ class EmbeddedAgent:
                 raise AgentIdentityMismatchError(
                     "agent.toml does not match state.db identity"
                 )
+            _, cancelled = await _await_async_completion(
+                lambda: store.recover_unfinished_runs(
+                    identity.id,
+                    created_at=resolved_clock(),
+                )
+            )
+            if cancelled:
+                raise asyncio.CancelledError
             if not explicit_configuration:
                 persisted, cancelled = await _await_sync_completion(
                     lambda: _read_model_configuration(home, identity.id)
@@ -699,7 +719,7 @@ class EmbeddedAgent:
                     model=None,
                     model_profile=None,
                     limits=limit_override,
-                    secret_provider=secret_provider or keychain,
+                    secret_provider=runtime_secrets,
                 )
             artifact_store = await AgentHomeArtifactStore.open(
                 agent_id=identity.id,
@@ -730,8 +750,9 @@ class EmbeddedAgent:
                 limits=limits,
                 clock=resolved_clock,
                 id_factory=resolved_ids,
-                secret_provider=secret_provider,
-                keychain=keychain,
+                secret_provider=runtime_secrets,
+                keychain=credential_session,
+                owns_credential_session=owns_credential_session,
                 model_validator=model_validator,
                 reviewer_model=reviewer_model,
                 reviewer_profile=reviewer_profile,
@@ -763,8 +784,9 @@ class EmbeddedAgent:
         limits: LoopLimits,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
-        secret_provider: SecretProvider | None,
-        keychain: KeychainStore | None,
+        secret_provider: SecretProvider,
+        keychain: CredentialSession,
+        owns_credential_session: bool,
         model_validator: ModelProvider | None,
         reviewer_model: ModelProvider | None,
         reviewer_profile: ModelProfile | None,
@@ -969,8 +991,9 @@ class EmbeddedAgent:
             model_profile=model_profile,
             model_route=model_route,
             limits=limits,
-            secret_provider=secret_provider or keychain,
+            secret_provider=secret_provider,
             keychain=keychain,
+            owns_credential_session=owns_credential_session,
             model_validator=model_validator,
             clock=clock,
             id_factory=id_factory,
@@ -2677,6 +2700,12 @@ class EmbeddedAgent:
             except BaseException as error:
                 if first_error is None:
                     first_error = error
+        if self._owns_credential_session:
+            try:
+                await self._keychain.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
         self._writer_lock.release()
         if first_error is not None:
             raise first_error
@@ -2941,6 +2970,14 @@ def _resolve_configuration(
         if model.provider_id != model_profile.id:
             raise AgentNotConfiguredError("model and profile identities differ")
     return model, model_profile, route, resolved_limits
+
+
+def _resolve_credential_session(
+    keychain: KeychainStore | None,
+) -> tuple[CredentialSession, bool]:
+    if isinstance(keychain, CredentialSession):
+        return keychain, False
+    return CredentialSession(keychain or KeychainSecretProvider()), True
 
 
 def _configuration_was_injected(

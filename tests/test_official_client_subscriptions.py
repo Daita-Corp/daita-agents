@@ -594,6 +594,26 @@ async def test_missing_and_incompatible_clients_are_actionable():
         assert "update" in str(caught.value).casefold()
 
 
+async def test_grok_subscription_total_attempt_timeout_is_normalized():
+    async def hang(command):
+        if (setup := _grok_setup_result(command)) is not None:
+            return setup
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    provider = GrokBuildSubscriptionProvider(
+        "grok-4.5",
+        runner=hang,
+        timeout_seconds=0.01,
+    )
+
+    with pytest.raises(ModelProviderError) as caught:
+        await asyncio.wait_for(provider.generate(_request()), timeout=0.25)
+
+    assert caught.value.code is ProviderErrorCode.TIMEOUT
+    assert caught.value.provider_id == "grok-build:grok-4.5"
+
+
 def _process_exists(process_id: int) -> bool:
     try:
         os.kill(process_id, 0)

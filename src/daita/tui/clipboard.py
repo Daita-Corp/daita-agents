@@ -1,4 +1,4 @@
-"""Bounded clipboard delivery for the terminal presentation."""
+"""One truthful bounded clipboard path for the Textual presentation."""
 
 from __future__ import annotations
 
@@ -87,8 +87,19 @@ def send_osc52_request(
     """Send one bounded, unacknowledged terminal clipboard request."""
 
     try:
-        output.write_raw(osc52_sequence(payload, tmux=tmux))
-        output.flush()
+        sequence = osc52_sequence(payload, tmux=tmux)
+        writer = getattr(output, "write_raw", None)
+        if callable(writer):
+            writer(sequence)
+        elif hasattr(output, "write"):
+            output.write(sequence)
+        else:
+            sys.stdout.write(sequence)
+        flusher = getattr(output, "flush", None)
+        if callable(flusher):
+            flusher()
+        elif hasattr(sys.stdout, "flush"):
+            sys.stdout.flush()
     except Exception:
         return ClipboardResult(
             "failure",
@@ -105,7 +116,7 @@ def send_osc52_request(
 async def deliver_clipboard(
     text: str,
     *,
-    output: Any,
+    output: Any = None,
     platform: str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> ClipboardResult:
@@ -135,7 +146,7 @@ async def deliver_clipboard(
                 f"Copy failed. {FORCE_SELECTION_GUIDANCE}",
             )
     return send_osc52_request(
-        output,
+        sys.stdout if output is None else output,
         payload,
         tmux=bool(environment.get("TMUX")),
     )

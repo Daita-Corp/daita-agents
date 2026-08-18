@@ -1,0 +1,322 @@
+Screen {
+    background: $background;
+    color: $foreground;
+}
+
+#boot {
+    width: 1fr;
+    height: 1fr;
+    margin: 1 2;
+    padding: 1 2;
+    content-align: center middle;
+    background: $background;
+    border: round #2A2A2A;
+}
+
+#chat {
+    padding: 0 1;
+    background: $background;
+}
+
+#status-bar {
+    height: 1;
+    background: $panel;
+}
+
+#status-primary {
+    width: 1fr;
+    height: 1;
+    padding-left: 1;
+    text-overflow: ellipsis;
+}
+
+#context-window {
+    width: auto;
+    height: 1;
+    min-width: 11;
+    padding: 0 1;
+    text-align: right;
+}
+
+#welcome-region {
+    width: 1fr;
+    height: 1fr;
+    align: center middle;
+    background: $background;
+}
+
+#welcome {
+    width: 80%;
+    max-width: 120;
+    height: auto;
+    padding: 1;
+    content-align: center middle;
+    background: $background;
+    border: round #2A2A2A;
+}
+
+#activity-bar {
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+    background: $background;
+    border-left: solid $primary 55%;
+}
+
+#notice-bar {
+    height: auto;
+    max-height: 8;
+    padding: 0 1;
+    color: $warning;
+    background: $panel;
+    border-left: solid $warning;
+}
+
+#composer {
+    height: auto;
+    min-height: 3;
+    max-height: 8;
+    margin-bottom: 1;
+    padding: 0 1;
+    color: $foreground;
+    background: $boost;
+    border: round $border;
+}
+
+#composer:focus {
+    border: round $primary;
+}
+
+#transcript {
+    height: 1fr;
+    padding: 0 1;
+    background: $background;
+}
+
+.transcript-user {
+    color: $text-muted;
+    padding: 1 0 0 1;
+    border-left: solid $primary 45%;
+}
+
+.transcript-assistant {
+    color: $foreground;
+    padding: 1 0 0 1;
+    border-left: solid $border;
+}
+
+.transcript-notice {
+    color: $warning;
+    padding: 1 0 0 1;
+    border-left: solid $warning 60%;
+}
+
+ToolCard,
+ToolCard Collapsible,
+ToolCard Collapsible Contents,
+ToolCard Collapsible Contents Static,
+ToolCard DataTable {
+    color: $foreground;
+    background: $surface;
+}
+
+ToolCard CollapsibleTitle {
+    width: 1fr;
+    color: $text-muted;
+    background: $surface;
+    text-style: none;
+}
+
+ToolCard CollapsibleTitle:hover {
+    color: $foreground;
+    background: $boost;
+}
+
+ToolCard CollapsibleTitle:focus {
+    color: $background;
+    background: $primary;
+    text-style: bold;
+}
+
+#completions {
+    height: auto;
+    max-height: 12;
+    background: $panel;
+    border: round $primary;
+    display: none;
+}
+
+#completion-title {
+    height: 1;
+    padding: 0 1;
+    color: $primary;
+    background: $panel;
+    text-style: bold;
+}
+
+#completion-list {
+    height: auto;
+    max-height: 9;
+    padding: 0 1;
+    background: $panel;
+    border: none;
+}
+
+#completion-list > .option-list--option-highlighted {
+    color: #000000;
+    background: $primary;
+    text-style: bold;
+}
+
+ModalScreen {
+    align: center middle;
+    background: $background 82%;
+}
+
+#picker,
+#confirm,
+#editor-prompt,
+#review-cost,
+#catalog-browser {
+    width: 88%;
+    max-width: 100;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    background: $surface;
+    border: tall $border;
+}
+
+#picker {
+    border: round $border;
+}
+
+#picker-filter {
+    border: round $border-blurred;
+}
+
+#picker-filter:focus {
+    border: round $border;
+}
+
+#onboard,
+#permissions,
+#source-edit {
+    padding: 1 2;
+    background: $background;
+}
+
+#picker-title,
+#onboard-title,
+#confirm-message,
+#catalog-title {
+    color: $primary;
+    text-style: bold;
+    padding-bottom: 1;
+}
+
+#picker-options {
+    height: 1fr;
+    background: $surface;
+}
+
+#catalog-summary {
+    height: auto;
+    padding-bottom: 1;
+    color: $text-muted;
+}
+
+#catalog-browser {
+    height: 88%;
+    border: round $border;
+}
+
+#catalog-tree {
+    height: 1fr;
+    padding: 0 1;
+    background: $background;
+    border: round $border;
+}
+
+#catalog-tree:focus {
+    border: round $primary;
+}
+
+#catalog-help {
+    height: auto;
+    padding-top: 1;
+    color: $text-muted;
+}
+
+#onboard-error,
+#picker-error,
+#editor-prompt-error,
+#review-cost-error {
+    color: $error;
+}
+
+#approval-inline {
+    display: none;
+    height: auto;
+    max-height: 45%;
+    margin-top: 1;
+    padding: 0 1 1 1;
+    color: $foreground;
+    background: $panel;
+    border-left: solid $warning 70%;
+}
+
+#approval-inline-title {
+    height: 1;
+    color: $warning;
+    text-style: bold;
+}
+
+#approval-inline-document {
+    height: auto;
+    max-height: 12;
+    padding: 0 1;
+    color: $foreground;
+    background: $panel;
+}
+
+#approval-inline-unreviewable {
+    height: auto;
+    color: $warning;
+}
+
+#approval-inline-actions {
+    height: 3;
+    margin-top: 1;
+}
+
+#approval-inline-actions Button {
+    width: auto;
+    min-width: 14;
+    margin-right: 1;
+    background: $boost;
+    border: round $border;
+}
+
+#approval-inline-yes {
+    color: $primary;
+}
+
+#approval-inline-no,
+#approval-inline-close {
+    color: $warning;
+}
+
+#confirm-actions {
+    margin-top: 1;
+}
+
+Input,
+Select {
+    background: $boost;
+}
+
+.too-small {
+    color: $foreground;
+    background: $error;
+}

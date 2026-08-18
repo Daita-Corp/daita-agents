@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from daita import terminal_selection, terminal_tui
+from daita import terminal
 from daita._installation import (
     MANAGED_REPAIR_GUIDANCE,
     PIPX_REPAIR_GUIDANCE,
@@ -46,8 +46,8 @@ def test_default_distribution_contains_every_supported_production_dependency():
         "google-genai>=1.73.1,<2.0.0",
         "keyring>=25.0.0,<26.0.0",
         "openai>=1.99.9,<2.0.0",
-        "prompt-toolkit>=3.0.52,<4.0.0",
         "rich>=15.0.0,<16.0.0",
+        "textual>=8.2.8,<9.0.0",
         "sqlglot>=30.14.0,<30.15.0",
         "XlsxWriter>=3.2.5,<4.0.0",
     }
@@ -86,7 +86,7 @@ def test_customer_and_fixture_documentation_use_the_complete_pipx_install():
     assert "first launch" in readme
     assert "returning launch" in readme
     assert "default production dependencies" in instructions
-    assert "`prompt-toolkit`" in instructions
+    assert "`textual`" in instructions
     assert "`rich`" in instructions
     assert "imported lazily" in instructions
 
@@ -224,9 +224,7 @@ def _missing_import(module: str, action: Callable[[], object]) -> ImportError:
         ("keyring", lambda: KeychainSecretProvider().client),
         ("sqlglot", lambda: sql._load_sqlglot("sqlite")),
         ("sqlglot", lambda: sql._load_sqlglot("postgresql")),
-        ("prompt_toolkit", terminal_selection._load_prompt_toolkit),
-        ("prompt_toolkit", terminal_tui._load_terminal_runtime),
-        ("rich", terminal_tui._load_terminal_runtime),
+        ("textual", terminal._load_textual_app),
     ),
 )
 def test_missing_default_runtime_dependencies_use_pipx_repair_guidance(
@@ -310,6 +308,7 @@ blocked = {
     "openai",
     "prompt_toolkit",
     "rich",
+    "textual",
     "sqlglot",
     "xlsxwriter",
 }

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import daita.artifacts.delivery as delivery_module
-from daita import Agent, ArtifactDeliveryReceipt, cli, terminal_tui
+from daita import Agent, ArtifactDeliveryReceipt, cli
 from daita.artifacts.models import (
     ArtifactAuthorship,
     ArtifactProvenance,
@@ -25,6 +25,7 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
+from daita.tui.projection import artifact_delivery_messages, completed_tool_pairs
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -283,12 +284,10 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
     None
 ):
     ref, receipt, result = _surface_records()
-    state = terminal_tui.TerminalViewState("agent", "model", "no sources")
-    state.apply_result(result)
     assert any(
-        block.kind == "artifact.delivery"
-        and block.text == f"Saved {receipt.filename} to {receipt.saved_path}"
-        for block in state.blocks
+        receipt.filename in getattr(item, "filename", "")
+        or getattr(item, "saved_path", "") == receipt.saved_path
+        for item in result.artifact_deliveries
     )
     run = RunInput(
         id=ref.run_id,
@@ -330,12 +329,9 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
             ),
         ),
     )
-    failed_state = terminal_tui.TerminalViewState("agent", "model", "no sources")
-    failed_state.hydrate_transcript(failed, run_id=ref.run_id)
+    failed_messages = artifact_delivery_messages(completed_tool_pairs(failed))
     assert any(
-        block.kind == "artifact.delivery"
-        and "remains available; local delivery failed" in block.text
-        for block in failed_state.blocks
+        "remains available; local delivery failed" in text for text in failed_messages
     )
 
     not_delivered = Transcript(
@@ -367,12 +363,12 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
             ),
         ),
     )
-    not_delivered_state = terminal_tui.TerminalViewState("agent", "model", "no sources")
-    not_delivered_state.hydrate_transcript(not_delivered, run_id=ref.run_id)
+    not_delivered_messages = artifact_delivery_messages(
+        completed_tool_pairs(not_delivered)
+    )
     assert any(
-        block.kind == "artifact.delivery"
-        and "was created internally but was not saved locally" in block.text
-        for block in not_delivered_state.blocks
+        "was created internally but was not saved locally" in text
+        for text in not_delivered_messages
     )
 
 

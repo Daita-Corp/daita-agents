@@ -48,7 +48,7 @@ _MAX_RESPONSE_ID_CHARACTERS = 256
 _MAX_JSON_DEPTH = 32
 _MAX_JSON_NODES = 100_000
 _MAX_STREAM_EVENTS = 65_536
-_DEFAULT_TIMEOUT_SECONDS = 300.0
+_DEFAULT_TIMEOUT_SECONDS = 120.0
 _PROCESS_STOP_GRACE_SECONDS = 1.0
 _CONTROL_PROMPT = """\
 Act only as the model inside Daita's direct model/tool loop. Daita, not this
@@ -1035,9 +1035,16 @@ class ClaudeCodeSubscriptionProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            return await self._generate(request)
+            async with asyncio.timeout(self._timeout_seconds):
+                return await self._generate(request)
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            failure = ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                "Claude Code subscription request exceeded its attempt deadline",
+                provider_id=self.provider_id,
+            )
         except ModelProviderError as error:
             failure = error
         except (
@@ -1182,9 +1189,16 @@ class GrokBuildSubscriptionProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            return await self._generate(request)
+            async with asyncio.timeout(self._timeout_seconds):
+                return await self._generate(request)
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            failure = ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                "Grok Build subscription request exceeded its attempt deadline",
+                provider_id=self.provider_id,
+            )
         except ModelProviderError as error:
             failure = error
         except (

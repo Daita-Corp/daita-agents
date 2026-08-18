@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import base64
-import io
 import json
 import time
 from typing import cast
 
+import openai
 import pytest
 
 import daita.llm.providers.codex as codex_provider
 import daita.llm.providers.subscription_cli as claude_cli
 import daita.llm.subscription_auth as subscription_auth
-from daita import Agent, terminal
+from daita import Agent
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.factory import create_llm_provider
 from daita.llm.models import (
@@ -166,6 +167,18 @@ class _Client:
         self.responses = _Responses()
 
 
+class _HangingResponses:
+    async def create(self, **kwargs: object) -> object:
+        del kwargs
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class _HangingClient:
+    def __init__(self) -> None:
+        self.responses = _HangingResponses()
+
+
 async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
     client = _Client()
     provider = CodexSubscriptionProvider(
@@ -199,6 +212,45 @@ async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
     assert "max_output_tokens" not in arguments
     assert arguments["tool_choice"] == "auto"
     assert arguments["parallel_tool_calls"] is False
+
+
+def test_codex_default_client_uses_bounded_transport_without_sdk_retries(monkeypatch):
+    captured: dict[str, object] = {}
+    client = _Client()
+
+    def construct(**kwargs: object) -> _Client:
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", construct)
+    provider = CodexSubscriptionProvider(
+        "gpt-test",
+        credential=_credential().to_secret(),
+    )
+
+    assert provider.client is client
+    timeout = captured["timeout"]
+    assert isinstance(timeout, openai.Timeout)
+    assert timeout.connect == 5.0
+    assert timeout.read == 45.0
+    assert timeout.write == 30.0
+    assert timeout.pool == 5.0
+    assert captured["max_retries"] == 0
+
+
+async def test_codex_total_attempt_timeout_is_normalized(monkeypatch):
+    monkeypatch.setattr(codex_provider, "_CODEX_ATTEMPT_TIMEOUT_SECONDS", 0.01)
+    provider = CodexSubscriptionProvider(
+        "gpt-test",
+        credential=_credential().to_secret(),
+        client=_HangingClient(),
+    )
+
+    with pytest.raises(ModelProviderError) as caught:
+        await asyncio.wait_for(provider.generate(_request()), timeout=0.25)
+
+    assert caught.value.code is ProviderErrorCode.TIMEOUT
+    assert caught.value.provider_id == "codex:gpt-test"
 
 
 async def test_codex_refresh_is_persisted_before_using_rotated_token(monkeypatch):
@@ -284,6 +336,25 @@ async def test_claude_subscription_remains_an_official_client_transport(monkeypa
     assert commands[0].environment["DISABLE_TELEMETRY"] == "1"
     assert commands[0].environment["DISABLE_ERROR_REPORTING"] == "1"
     assert commands[0].environment["DISABLE_BUG_COMMAND"] == "1"
+
+
+async def test_claude_subscription_total_attempt_timeout_is_normalized():
+    async def hang(command):
+        del command
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    provider = ClaudeCodeSubscriptionProvider(
+        "claude-test",
+        runner=hang,
+        timeout_seconds=0.01,
+    )
+
+    with pytest.raises(ModelProviderError) as caught:
+        await asyncio.wait_for(provider.generate(_request()), timeout=0.25)
+
+    assert caught.value.code is ProviderErrorCode.TIMEOUT
+    assert caught.value.provider_id == "claude-code:claude-test"
 
 
 @pytest.mark.parametrize(
@@ -497,23 +568,23 @@ async def test_terminal_codex_onboarding_runs_device_login_without_api_key():
             return _credential().to_secret()
 
     agent = _Agent()
-    output = io.StringIO()
+    prompts: list[str] = []
 
-    configured = await terminal._configure_selected_model(
-        cast(Agent, agent),
+    def on_verification(prompt) -> None:
+        prompts.append(prompt.user_code)
+
+    credential = await agent.authenticate_model_subscription(
+        provider="codex",
+        on_verification=on_verification,
+        on_progress=lambda _message: None,
+    )
+    await agent.configure_model(
         provider="codex",
         model="gpt-5.6-sol",
-        custom_provider=False,
-        input_stream=io.StringIO(),
-        output_stream=output,
-        hidden_input=lambda prompt: (_ for _ in ()).throw(
-            AssertionError(f"unexpected API-key prompt: {prompt}")
-        ),
+        subscription_credential=credential,
     )
 
-    assert configured is True
     assert agent.arguments is not None
-    assert agent.arguments["api_key"] is None
+    assert agent.arguments.get("api_key") is None
     assert agent.arguments["subscription_credential"] is not None
-    assert "Codex does not need to be installed" in output.getvalue()
-    assert "ABCD-EFGH" in output.getvalue()
+    assert "ABCD-EFGH" in prompts

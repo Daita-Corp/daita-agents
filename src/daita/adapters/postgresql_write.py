@@ -37,7 +37,6 @@ from ..domains.data.controller import (
 from ..domains.data.sql import (
     PostgreSQLUpdateCell,
     PostgreSQLUpdateCommand,
-    PostgreSQLUpdateFilter,
     PostgreSQLUpdateIntent,
     ValidatedPostgreSQLUpdate,
     render_postgresql_update_statement,

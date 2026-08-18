@@ -1,1 +1,1 @@
-"""Internal owners for Daita's single terminal user interface."""
+"""Textual presentation package. Importing this package is the lazy UI boundary."""

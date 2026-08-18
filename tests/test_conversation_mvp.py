@@ -1471,7 +1471,9 @@ async def test_inspection_keeps_nonreplayable_runs_but_history_excludes_them(tmp
             assert sentinel not in request
         records = await reopened.conversation_runs(first.conversation_id)
         assert [record.turn_index for record in records] == list(range(6))
-        assert records[4].result is None
+        assert records[4].result is not None
+        assert records[4].result.kind is LoopExitKind.INTERRUPTED
+        assert records[4].result.reason == "previous_process_terminated"
         assert records[1].result is not None
         assert records[2].result is not None
         assert records[3].result is not None
