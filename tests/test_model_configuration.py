@@ -1,5 +1,4 @@
 import asyncio
-import io
 import json
 import subprocess
 import sys
@@ -10,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 import daita.hosting.embedded as embedded
-from daita import Agent, LoopLimits, terminal
+from daita import Agent, LoopLimits
 from daita.agent import AgentModelConfigurationError
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.factory import create_model_route_provider
@@ -29,10 +28,13 @@ from daita.llm.protocols import provider_has_complete_pricing
 from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelRoute, ModelRouteCandidate, RetryPolicy
 from daita.security import (
+    CredentialSession,
     EmptySecretProvider,
+    EnvironmentSecretProvider,
     KeychainSecretProvider,
     SecretReference,
     SecretResolutionError,
+    default_secret_provider,
 )
 
 
@@ -697,6 +699,70 @@ async def test_keychain_set_delete_use_bounded_daita_service_and_account():
         ("delete", "daita", reference.name, None),
     ]
     assert len(reference.name) <= 256
+
+
+async def test_credential_session_reuses_and_invalidates_native_secrets():
+    keychain = _FakeKeychain()
+    session = CredentialSession(keychain)
+    reference = SecretReference.keychain("agent:postgresql:credential")
+
+    await session.set(reference, "first-secret")
+    assert await session.resolve(reference) == "first-secret"
+    assert await session.resolve(reference) == "first-secret"
+
+    await session.delete(reference)
+    keychain.values[reference.name] = "replacement-secret"
+    assert await session.resolve(reference) == "replacement-secret"
+
+    await session.close()
+    with pytest.raises(SecretResolutionError, match="credential session is closed"):
+        await session.resolve(reference)
+
+
+async def test_credential_session_coalesces_concurrent_native_reads():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class _BlockingKeychain(_FakeKeychain):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resolve_calls = 0
+
+        async def resolve(self, reference: SecretReference) -> str:
+            self.resolve_calls += 1
+            entered.set()
+            await release.wait()
+            return await super().resolve(reference)
+
+    keychain = _BlockingKeychain()
+    reference = SecretReference.keychain("agent:postgresql:shared")
+    keychain.values[reference.name] = "one-secret"
+    session = CredentialSession(keychain)
+
+    first = asyncio.create_task(session.resolve(reference))
+    await entered.wait()
+    second = asyncio.create_task(session.resolve(reference))
+    await asyncio.sleep(0)
+    assert keychain.resolve_calls == 1
+
+    release.set()
+    assert await asyncio.gather(first, second) == ["one-secret", "one-secret"]
+    assert keychain.resolve_calls == 1
+    await session.close()
+
+
+def test_default_provider_cannot_bypass_a_credential_session():
+    session = CredentialSession(_FakeKeychain())
+
+    provider = default_secret_provider(session)
+
+    assert provider.providers[0] is session
+    assert len(provider.providers) == 2
+    assert isinstance(provider.providers[1], EnvironmentSecretProvider)
+    assert not any(
+        isinstance(candidate, KeychainSecretProvider)
+        for candidate in provider.providers[1:]
+    )
 
 
 async def test_missing_keyring_uses_the_application_repair_guidance():

@@ -21,7 +21,6 @@ from . import (
     AgentConfig,
     AgentEvent,
     ApprovalDecision,
-    ApprovalHandler,
     ApprovalRequest,
     ArtifactError,
     LearningCandidateRejectionReason,
@@ -51,17 +50,13 @@ from .llm import (
     ModelProfile,
     ModelProvider,
     aggregate_cost_estimates,
-    format_cost_estimate,
 )
 from .llm.profiles import reviewed_model_profile
 from .security import SecretReference
 from .skills import validate_skill_name
 from .cli_text import (
     _edit_learning_candidate,
-    _learning_invocation_message,
     _render_model_answer,
-    _validate_candidate_review_cost_limit,
-    _write_artifact_outcomes,
     _write_learning_candidate_list,
     _write_learning_candidate_view,
     _write_learning_review_result,
@@ -69,6 +64,9 @@ from .cli_text import (
     _write_semantic_view,
 )
 from .terminal import run_terminal_application
+from .tui.models import (
+    validate_candidate_review_cost_limit as _validate_candidate_review_cost_limit,
+)
 
 _SKILL_DESCRIPTION_PLACEHOLDER = "Describe when the agent should use this skill."
 _SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."

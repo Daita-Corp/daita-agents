@@ -30,7 +30,18 @@ class TranscriptView(VerticalScroll):
         return not self._blocks
 
     def set_blocks(self, blocks: tuple[TranscriptBlock, ...]) -> None:
-        self._blocks = list(blocks)
+        incoming = list(blocks)
+        if len(incoming) >= len(self._blocks) and all(
+            prior == current
+            for prior, current in zip(self._blocks, incoming, strict=False)
+        ):
+            additions = incoming[len(self._blocks) :]
+            self._blocks = incoming
+            for block in additions:
+                self._mount_block(block)
+            self._maybe_follow()
+            return
+        self._blocks = incoming
         self._rebuild()
 
     def append_block(self, block: TranscriptBlock) -> None:
@@ -57,7 +68,9 @@ class TranscriptView(VerticalScroll):
 
     def toggle_tools(self) -> None:
         self._tools_visible = not self._tools_visible
-        self._rebuild()
+        for card in self.query(ToolCard):
+            card.display = self._tools_visible
+        self._maybe_follow()
 
     def copy_text(self) -> str:
         parts: list[str] = []
@@ -87,9 +100,11 @@ class TranscriptView(VerticalScroll):
 
     def _mount_block(self, block: TranscriptBlock) -> None:
         if block.kind == "tool":
-            if not self._tools_visible or block.tool_card is None:
+            if block.tool_card is None:
                 return
-            self.mount(ToolCard(block.tool_card))
+            card = ToolCard(block.tool_card)
+            card.display = self._tools_visible
+            self.mount(card)
             return
         classes = "transcript-user" if block.kind == "user" else "transcript-assistant"
         if block.kind == "notice":

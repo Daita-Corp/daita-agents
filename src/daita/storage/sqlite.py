@@ -131,7 +131,6 @@ from .sqlite_records import (
 )
 from .sqlite_schema import (
     CURRENT_TABLES,
-    SCOPED_PERMISSION_TABLES,
     require_healthy,
     require_schema,
     table_names,
@@ -2274,6 +2273,65 @@ class SQLiteStateStore:
                     raise KeyError(f"unknown run: {result.run_id}")
 
         await asyncio.to_thread(write)
+
+    async def recover_unfinished_runs(
+        self,
+        agent_id: str,
+        *,
+        created_at: datetime,
+    ) -> tuple[LoopExit, ...]:
+        """Terminalize runs left unfinished by a previously admitted host."""
+
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("agent_id must be non-empty text")
+
+        def write() -> tuple[LoopExit, ...]:
+            with _connect(self.path) as connection:
+                rows = connection.execute(
+                    """SELECT id, conversation_id
+                       FROM runs
+                       WHERE agent_id = ? AND result IS NULL
+                       ORDER BY conversation_id, turn_index""",
+                    (agent_id,),
+                ).fetchall()
+                recovered: list[LoopExit] = []
+                for run_id, conversation_id in rows:
+                    messages = connection.execute(
+                        "SELECT data FROM messages WHERE run_id = ? ORDER BY position",
+                        (run_id,),
+                    ).fetchall()
+                    steps = sum(
+                        decode_message(row[0]).role is MessageRole.ASSISTANT
+                        for row in messages
+                    )
+                    result = LoopExit(
+                        run_id=run_id,
+                        conversation_id=conversation_id,
+                        kind=LoopExitKind.INTERRUPTED,
+                        reason="previous_process_terminated",
+                        steps=steps,
+                        created_at=created_at,
+                    )
+                    cursor = connection.execute(
+                        "UPDATE runs SET result = ? WHERE id = ? AND result IS NULL",
+                        (encode_loop_exit(result), run_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("unfinished run changed during recovery")
+                    recovered.append(result)
+                return tuple(recovered)
+
+        worker = asyncio.create_task(asyncio.to_thread(write))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+        recovered = worker.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return recovered
 
     async def load(self, run_id: str) -> Transcript:
         def read() -> Transcript:

@@ -38,11 +38,18 @@ Screen {
     text-align: right;
 }
 
-#welcome {
+#welcome-region {
     width: 1fr;
     height: 1fr;
-    margin: 1 2;
-    padding: 1 2;
+    align: center middle;
+    background: $background;
+}
+
+#welcome {
+    width: 80%;
+    max-width: 120;
+    height: auto;
+    padding: 1;
     content-align: center middle;
     background: $background;
     border: round #2A2A2A;
@@ -69,6 +76,7 @@ Screen {
     height: auto;
     min-height: 3;
     max-height: 8;
+    margin-bottom: 1;
     padding: 0 1;
     color: $foreground;
     background: $boost;
@@ -103,11 +111,38 @@ Screen {
     border-left: solid $warning 60%;
 }
 
+ToolCard,
+ToolCard Collapsible,
+ToolCard Collapsible Contents,
+ToolCard Collapsible Contents Static,
+ToolCard DataTable {
+    color: $foreground;
+    background: $surface;
+}
+
+ToolCard CollapsibleTitle {
+    width: 1fr;
+    color: $text-muted;
+    background: $surface;
+    text-style: none;
+}
+
+ToolCard CollapsibleTitle:hover {
+    color: $foreground;
+    background: $boost;
+}
+
+ToolCard CollapsibleTitle:focus {
+    color: $background;
+    background: $primary;
+    text-style: bold;
+}
+
 #completions {
     height: auto;
     max-height: 12;
     background: $panel;
-    border: tall $primary;
+    border: round $primary;
     display: none;
 }
 
@@ -141,7 +176,8 @@ ModalScreen {
 #picker,
 #confirm,
 #editor-prompt,
-#review-cost {
+#review-cost,
+#catalog-browser {
     width: 88%;
     max-width: 100;
     height: auto;
@@ -151,13 +187,16 @@ ModalScreen {
     border: tall $border;
 }
 
-#approval {
-    width: 92%;
-    max-width: 110;
-    height: 90%;
-    padding: 1 2;
-    background: $surface;
-    border: tall $warning;
+#picker {
+    border: round $border;
+}
+
+#picker-filter {
+    border: round $border-blurred;
+}
+
+#picker-filter:focus {
+    border: round $border;
 }
 
 #onboard,
@@ -169,8 +208,8 @@ ModalScreen {
 
 #picker-title,
 #onboard-title,
-#approval-title,
-#confirm-message {
+#confirm-message,
+#catalog-title {
     color: $primary;
     text-style: bold;
     padding-bottom: 1;
@@ -181,6 +220,34 @@ ModalScreen {
     background: $surface;
 }
 
+#catalog-summary {
+    height: auto;
+    padding-bottom: 1;
+    color: $text-muted;
+}
+
+#catalog-browser {
+    height: 88%;
+    border: round $border;
+}
+
+#catalog-tree {
+    height: 1fr;
+    padding: 0 1;
+    background: $background;
+    border: round $border;
+}
+
+#catalog-tree:focus {
+    border: round $primary;
+}
+
+#catalog-help {
+    height: auto;
+    padding-top: 1;
+    color: $text-muted;
+}
+
 #onboard-error,
 #picker-error,
 #editor-prompt-error,
@@ -188,17 +255,59 @@ ModalScreen {
     color: $error;
 }
 
-#approval-document {
-    height: 1fr;
+#approval-inline {
+    display: none;
+    height: auto;
+    max-height: 45%;
+    margin-top: 1;
+    padding: 0 1 1 1;
     color: $foreground;
-    background: $background;
-    border: tall $warning;
-    padding: 1;
+    background: $panel;
+    border-left: solid $warning 70%;
 }
 
-#confirm-actions,
-#approval-yes,
-#approval-no {
+#approval-inline-title {
+    height: 1;
+    color: $warning;
+    text-style: bold;
+}
+
+#approval-inline-document {
+    height: auto;
+    max-height: 12;
+    padding: 0 1;
+    color: $foreground;
+    background: $panel;
+}
+
+#approval-inline-unreviewable {
+    height: auto;
+    color: $warning;
+}
+
+#approval-inline-actions {
+    height: 3;
+    margin-top: 1;
+}
+
+#approval-inline-actions Button {
+    width: auto;
+    min-width: 14;
+    margin-right: 1;
+    background: $boost;
+    border: round $border;
+}
+
+#approval-inline-yes {
+    color: $primary;
+}
+
+#approval-inline-no,
+#approval-inline-close {
+    color: $warning;
+}
+
+#confirm-actions {
     margin-top: 1;
 }
 

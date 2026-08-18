@@ -2,6 +2,7 @@
 
 from .secrets import (
     CompositeSecretProvider,
+    CredentialSession,
     EmptySecretProvider,
     EnvironmentSecretProvider,
     KeychainSecretProvider,
@@ -14,6 +15,7 @@ from .secrets import (
 
 __all__ = [
     "CompositeSecretProvider",
+    "CredentialSession",
     "EmptySecretProvider",
     "EnvironmentSecretProvider",
     "KeychainSecretProvider",

@@ -10,7 +10,10 @@ from textual.containers import Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, OptionList, TextArea
 
+from daita import ApprovalDecision, ApprovalRequest
+
 from ..models import TranscriptBlock
+from ..widgets.approval import ApprovalPanel
 from ..widgets.composer import (
     Composer,
     ComposerCompletionAccepted,
@@ -28,12 +31,12 @@ if TYPE_CHECKING:
 
 class ChatScreen(Screen[None]):
     BINDINGS = [
-        Binding("ctrl+o", "toggle_tools", "Tools"),
-        Binding("ctrl+end", "follow", "Latest"),
-        Binding("ctrl+home", "start", "Start"),
+        Binding("ctrl+o", "toggle_tools", "Tools", priority=True),
+        Binding("ctrl+end", "follow", "Latest", priority=True),
+        Binding("ctrl+home", "start", "Start", priority=True),
         Binding("ctrl+c", "copy_or_cancel", "Copy / Cancel"),
-        Binding("pageup", "page_up", "Page up"),
-        Binding("pagedown", "page_down", "Page down"),
+        Binding("pageup", "page_up", "Page up", priority=True),
+        Binding("pagedown", "page_down", "Page down", priority=True),
     ]
 
     def __init__(self) -> None:
@@ -43,8 +46,10 @@ class ChatScreen(Screen[None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="chat"):
             yield StatusBar()
-            yield WelcomeView(id="welcome")
+            with Vertical(id="welcome-region"):
+                yield WelcomeView(id="welcome")
             yield TranscriptView()
+            yield ApprovalPanel()
             yield ActivityBar()
             yield NoticeBar()
             yield CompletionPopup(id="completions")
@@ -196,14 +201,25 @@ class ChatScreen(Screen[None]):
     def clear_activity(self) -> None:
         self.query_one(ActivityBar).stop()
 
+    async def request_approval(
+        self,
+        request: ApprovalRequest,
+    ) -> ApprovalDecision | None:
+        self._show_conversation(True)
+        return await self.query_one(ApprovalPanel).request(request)
+
     def _show_conversation(self, has_blocks: bool) -> None:
+        self.query_one("#welcome-region", Vertical).display = not has_blocks
         self.query_one(WelcomeView).display = not has_blocks
         self.query_one(TranscriptView).display = has_blocks
 
     def set_submitting(self, submitting: bool) -> None:
         if submitting:
             self.dismiss_completions()
-        self.query_one(Composer).set_submitting(submitting)
+        composer = self.query_one(Composer)
+        composer.set_submitting(submitting)
+        if not submitting:
+            composer.focus()
 
     def composer(self) -> Composer:
         return self.query_one(Composer)

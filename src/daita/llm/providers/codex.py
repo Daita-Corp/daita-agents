@@ -19,6 +19,11 @@ from ..subscription_auth import (
 from .openai import OpenAIResponsesProvider, _OpenAIClient
 
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+_CODEX_ATTEMPT_TIMEOUT_SECONDS = 120.0
+_CODEX_CONNECT_TIMEOUT_SECONDS = 5.0
+_CODEX_READ_TIMEOUT_SECONDS = 45.0
+_CODEX_WRITE_TIMEOUT_SECONDS = 30.0
+_CODEX_POOL_TIMEOUT_SECONDS = 5.0
 
 
 class CodexSubscriptionProvider(OpenAIResponsesProvider):
@@ -67,7 +72,7 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
     def client(self) -> _OpenAIClient:
         if self._client is None:
             try:
-                from openai import AsyncOpenAI
+                from openai import AsyncOpenAI, Timeout
             except ImportError as error:
                 raise ImportError(
                     "Daita's OpenAI runtime dependency is unavailable. "
@@ -84,22 +89,38 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
                         "User-Agent": "daita",
                         "originator": "daita",
                     },
+                    timeout=Timeout(
+                        connect=_CODEX_CONNECT_TIMEOUT_SECONDS,
+                        read=_CODEX_READ_TIMEOUT_SECONDS,
+                        write=_CODEX_WRITE_TIMEOUT_SECONDS,
+                        pool=_CODEX_POOL_TIMEOUT_SECONDS,
+                    ),
+                    max_retries=0,
                 ),
             )
         return self._client
 
     async def _generate(self, request: ModelRequest) -> ModelResponse:
-        await self._ensure_current_credential()
-        completed: ModelResponse | None = None
-        async for event in super()._stream(request):
-            if isinstance(event, ModelStreamCompleted):
-                completed = event.response
-        if completed is None:
+        try:
+            async with asyncio.timeout(_CODEX_ATTEMPT_TIMEOUT_SECONDS):
+                await self._ensure_current_credential()
+                completed: ModelResponse | None = None
+                async for event in super()._stream(request):
+                    if isinstance(event, ModelStreamCompleted):
+                        completed = event.response
+                if completed is None:
+                    raise ModelProviderError(
+                        ProviderErrorCode.MALFORMED_RESPONSE,
+                        "Codex stream ended without a terminal response",
+                        provider_id=self.provider_id,
+                    )
+                return completed
+        except TimeoutError as error:
             raise ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "Codex stream ended without a terminal response",
-            )
-        return completed
+                ProviderErrorCode.TIMEOUT,
+                "Codex subscription request exceeded its attempt deadline",
+                provider_id=self.provider_id,
+            ) from error
 
     async def _ensure_current_credential(self) -> None:
         if not self._credential.needs_refresh:

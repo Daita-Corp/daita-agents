@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import io
 from decimal import Decimal
 from pathlib import Path
@@ -219,7 +218,17 @@ async def test_terminal_reopen_passes_explicit_reviewer_and_cost_ceiling(
             self.closed = True
 
     configured = ConfiguredAgent()
-    replacement = SimpleNamespace()
+
+    class ReplacementAgent:
+        model_route = None
+
+        async def list_sources(self) -> tuple[object, ...]:
+            return ()
+
+        async def close(self) -> None:
+            return None
+
+    replacement = ReplacementAgent()
     open_agent = AsyncMock(return_value=replacement)
     monkeypatch.setattr("daita.tui.controller.Agent.open", open_agent)
     controller = PresentationController(

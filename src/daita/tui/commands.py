@@ -34,7 +34,7 @@ SLASH_COMMAND_COMPLETIONS = (
         "/source permissions",
         "Configure read and PostgreSQL update access",
     ),
-    ("/catalog", "/catalog", "Show the current catalog summary"),
+    ("/catalog", "/catalog", "Browse current catalog resources by source"),
     ("/settings", "/settings", "Show agent and model settings"),
     ("/new", "/new", "Start a new conversation"),
     ("/resume ", "/resume <id>", "Resume a previous conversation"),

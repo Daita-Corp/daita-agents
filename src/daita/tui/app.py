@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -35,9 +34,9 @@ from .models import (
     validate_candidate_review_cost_limit,
 )
 from .observer import ObserverEvent, RunObserver
-from .projection import project_transcript
+from .projection import project_conversation
 from .sanitization import render_model_answer, sanitize_terminal_text
-from .screens.approval import ApprovalScreen
+from .screens.catalog import CatalogScreen
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
@@ -87,6 +86,20 @@ DAITA_THEME = Theme(
 )
 
 
+def _run_failure_notice(result: LoopExit) -> str:
+    if result.reason == "timeout":
+        return (
+            "The model provider timed out after bounded retries. Daita stopped "
+            "waiting; any completed tool results remain available above."
+        )
+    if result.reason == "wall_time_exhausted":
+        return (
+            "The run reached its overall time limit and was stopped. Any completed "
+            "tool results remain available above."
+        )
+    return f"{result.kind.value}: {result.reason}"
+
+
 class DaitaApp(App[int]):
     """One Textual app for onboarding, chat, commands, and approval."""
 
@@ -120,6 +133,7 @@ class DaitaApp(App[int]):
         self._requested_agent = agent_name
         self._observer = RunObserver(self)
         self._run_task: asyncio.Task[None] | None = None
+        self._pending_user_identity: str | None = None
         self._partial_identity = "assistant.partial"
         self._partial_text = ""
         self._context_input_tokens: int | None = None
@@ -174,7 +188,7 @@ class DaitaApp(App[int]):
         if pending is not None and not pending.done():
             pending.set_result(None)
         await self._settle_run()
-        await self.controller.close_agent()
+        await self.controller.close()
 
     async def _settle_run(self) -> None:
         task = self._run_task
@@ -191,7 +205,10 @@ class DaitaApp(App[int]):
             raise asyncio.CancelledError
         if self.size.height < 15:
             raise RuntimeError("terminal is too small to review this change")
-        decision = await self._await_modal(ApprovalScreen(request))
+        screen = self.chat()
+        if screen is None:
+            raise RuntimeError("chat view is unavailable for approval review")
+        decision = await screen.request_approval(request)
         if decision is None:
             raise asyncio.CancelledError
         return decision
@@ -292,7 +309,19 @@ class DaitaApp(App[int]):
         self.invalidate_completion_cache()
         await self._load_completion_cache()
         await self.push_screen(ChatScreen())
+        await self._replace_conversation_transcript()
         await self._refresh_status()
+
+    async def _replace_conversation_transcript(self) -> None:
+        screen = self.chat()
+        if screen is None:
+            return
+        conversation_id = self.controller.conversation_id
+        if conversation_id is None:
+            screen.set_blocks(())
+            return
+        runs = await self.controller.conversation_runs(conversation_id)
+        screen.set_blocks(project_conversation(runs))
 
     def _reset_context_usage(self) -> None:
         self._context_input_tokens = None
@@ -374,8 +403,15 @@ class DaitaApp(App[int]):
     def on_resize(self) -> None:
         self.call_later(self._refresh_status)
 
-    async def on_composer_submitted(self, event: ComposerSubmitted) -> None:
-        await self.submit_composer(event.text)
+    def on_composer_submitted(self, event: ComposerSubmitted) -> None:
+        # A command may await a modal result. Keep that wait out of the App's
+        # message handler so key and mouse events can continue reaching the
+        # modal screen.
+        self.run_worker(
+            self.submit_composer(event.text),
+            name="composer-submit",
+            group="foreground-interaction",
+        )
 
     async def on_composer_limit_reached(self, _event: ComposerLimitReached) -> None:
         screen = self.chat()
@@ -384,8 +420,12 @@ class DaitaApp(App[int]):
                 f"Input is limited to {MAX_COMPOSER_CHARACTERS} characters."
             )
 
-    async def on_composer_exit_requested(self, _event: ComposerExitRequested) -> None:
-        await self._request_exit()
+    def on_composer_exit_requested(self, _event: ComposerExitRequested) -> None:
+        self.run_worker(
+            self._request_exit(),
+            name="exit-request",
+            group="foreground-interaction",
+        )
 
     async def submit_composer(self, raw: str) -> None:
         screen = self.chat()
@@ -431,6 +471,7 @@ class DaitaApp(App[int]):
             return
         if self.controller.conversation_id != prior_conversation_id:
             self._reset_context_usage()
+            await self._replace_conversation_transcript()
             await self._refresh_status()
         if outcome.kind == "exit":
             await self._request_exit()
@@ -494,6 +535,7 @@ class DaitaApp(App[int]):
             if changed:
                 self.controller.conversation_id = None
                 self._reset_context_usage()
+                await self._replace_conversation_transcript()
                 chat = self.chat()
                 if chat is not None:
                     chat.show_notice(
@@ -513,6 +555,33 @@ class DaitaApp(App[int]):
             return
         if screen_name == "permissions":
             await self._await_modal(PermissionsScreen())
+            return
+        if screen_name == "catalog":
+            sources = tuple(
+                source
+                for source in await self.controller.list_sources()
+                if source.active
+            )
+            resource_groups = await asyncio.gather(
+                *(
+                    self.controller.list_catalog_resources(source_id=source.id)
+                    for source in sources
+                )
+            )
+            resources = tuple(
+                resource
+                for source_resources in resource_groups
+                for resource in source_resources
+            )
+            current = await self.controller.active_source()
+            await self._await_modal(
+                CatalogScreen(
+                    summary=await self.controller.catalog_summary(),
+                    sources=sources,
+                    resources=resources,
+                    current_source_id=None if current is None else current.id,
+                )
+            )
             return
         if screen_name == "catalog_repair":
             await self._await_modal(CatalogRepairScreen())
@@ -540,6 +609,7 @@ class DaitaApp(App[int]):
             if accepted:
                 outcome = await self.controller.clear_conversations()
                 self._reset_context_usage()
+                await self._replace_conversation_transcript()
                 chat = self.chat()
                 if chat is not None:
                     chat.show_notice(outcome.message)
@@ -559,6 +629,7 @@ class DaitaApp(App[int]):
                 await self.controller.detach_source(str(payload["source_id"]))
                 self.controller.conversation_id = None
                 self._reset_context_usage()
+                await self._replace_conversation_transcript()
             await self._refresh_status()
             return
         if screen_name == "confirm_delete_skill":
@@ -720,10 +791,12 @@ class DaitaApp(App[int]):
         screen = self.chat()
         if screen is None:
             return
+        pending_user_identity = f"user-{id(message)}"
+        self._pending_user_identity = pending_user_identity
         screen.append_block(
             TranscriptBlock(
                 "user",
-                f"user-{id(message)}",
+                pending_user_identity,
                 sanitize_terminal_text(
                     display or message,
                     maximum=MAX_COMPOSER_CHARACTERS,
@@ -795,11 +868,13 @@ class DaitaApp(App[int]):
         if screen is None:
             return
         screen.remove_block(self._partial_identity)
+        if self._pending_user_identity is not None:
+            screen.remove_block(self._pending_user_identity)
+            self._pending_user_identity = None
         self._partial_text = ""
-        transcript = await self.controller.transcript(result.run_id)
-        screen.set_blocks(project_transcript(transcript, run_id=result.run_id))
+        await self._replace_conversation_transcript()
         if result.kind is not LoopExitKind.COMPLETED:
-            screen.show_notice(f"{result.kind.value}: {result.reason}")
+            screen.show_notice(_run_failure_notice(result))
         elif result.final_text:
             # Canonical assistant text is already in the transcript.
             pass
@@ -845,8 +920,8 @@ class DaitaApp(App[int]):
             await self._refresh_status(running=True, state=f"calling {label}")
             return
         if event.kind is AgentEventKind.TOOL_COMPLETED:
-            screen.set_activity("Thinking")
-            await self._refresh_status(running=True, state="thinking")
+            screen.set_activity("Processing results")
+            await self._refresh_status(running=True, state="working")
             return
         if event.kind is AgentEventKind.APPROVAL_REQUESTED:
             screen.set_activity("Waiting for approval")

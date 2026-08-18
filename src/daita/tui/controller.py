@@ -15,25 +15,27 @@ from typing import Any
 from daita import (
     Agent,
     ApprovalHandler,
+    ConversationRun,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningReviewStatus,
-    LocalDirectorySource,
     LoopExit,
-    PostgreSQLSource,
-    SQLiteSource,
     Transcript,
 )
 from daita.agent import (
     AgentAlreadyExistsError,
     AgentModelConfigurationError,
     AgentNameError,
-    AgentNotFoundError,
     SourceRefreshError,
     SourceSelectionError,
 )
 from daita.observation import AgentObserver
-from daita.security import KeychainStore, SecretReference
+from daita.security import (
+    CredentialSession,
+    KeychainSecretProvider,
+    KeychainStore,
+    SecretReference,
+)
 from daita.skills import Skill, validate_skill_name
 from daita.learning_candidates import (
     learning_candidate_content_from_mapping,
@@ -47,7 +49,6 @@ from .commands import (
     parse_source_override,
 )
 from .models import (
-    DEFAULT_CANDIDATE_REVIEW_COST_LIMIT_USD,
     PROVIDERS,
     SOURCE_TYPE_LABELS,
     CommandOutcome,
@@ -175,7 +176,12 @@ class PresentationController:
         reviewer_max_estimated_cost_usd: Decimal | None = None,
     ) -> None:
         self.root = root
-        self.keychain = keychain
+        if isinstance(keychain, CredentialSession):
+            self.keychain = keychain
+            self._owns_credential_session = False
+        else:
+            self.keychain = CredentialSession(keychain or KeychainSecretProvider())
+            self._owns_credential_session = True
         self.model_validator = model_validator
         self.reviewer_max_estimated_cost_usd = reviewer_max_estimated_cost_usd
         self.model: Any = None
@@ -198,6 +204,11 @@ class PresentationController:
         if agent is not None:
             await agent.close()
 
+    async def close(self) -> None:
+        await self.close_agent()
+        if self._owns_credential_session:
+            await self.keychain.close()
+
     async def open_agent(
         self,
         name: str,
@@ -206,7 +217,7 @@ class PresentationController:
         approval_handler: ApprovalHandler | None,
     ) -> Agent:
         await self.close_agent()
-        self.agent = await Agent.open(
+        opened = await Agent.open(
             name,
             root=self.root,
             model=self.model,
@@ -217,7 +228,36 @@ class PresentationController:
             observer=observer,
             approval_handler=approval_handler,
         )
-        return self.agent
+        try:
+            await self._preload_active_credentials(opened)
+        except BaseException:
+            await opened.close()
+            raise
+        self.agent = opened
+        return opened
+
+    async def _preload_active_credentials(self, agent: Agent) -> None:
+        """Move native secret authorization out of the query hot path."""
+
+        references: list[SecretReference] = []
+        route = agent.model_route
+        if route is not None:
+            references.extend(
+                reference
+                for candidate in route.candidates
+                if (reference := candidate.secret_reference) is not None
+                and reference.scheme == "keychain"
+            )
+        for source in await agent.list_sources():
+            if not source.active:
+                continue
+            raw_reference = source.configuration.get("credential_ref")
+            if not isinstance(raw_reference, str):
+                continue
+            reference = SecretReference.parse(raw_reference)
+            if reference.scheme == "keychain":
+                references.append(reference)
+        await self.keychain.preload(references)
 
     async def create_agent(
         self,
@@ -525,6 +565,11 @@ class PresentationController:
     async def catalog_summary(self) -> Any:
         return await self.require_agent().catalog_summary()
 
+    async def list_catalog_resources(
+        self, *, source_id: str | None = None
+    ) -> tuple[Any, ...]:
+        return await self.require_agent().list_catalog_resources(source_id=source_id)
+
     async def skill_completions(self) -> tuple[tuple[str, str], ...]:
         summaries = await self.require_agent().list_skills()
         return tuple(
@@ -658,8 +703,8 @@ class PresentationController:
             )
         if name == "/catalog" and len(parts) == 1:
             return CommandOutcome(
-                "notice",
-                await self._catalog_text(),
+                "screen",
+                screen="catalog",
                 conversation_id=conversation_id,
             )
         if name == "/settings" and len(parts) == 1:
@@ -736,8 +781,8 @@ class PresentationController:
                     conversation_id=conversation_id,
                 )
             return CommandOutcome(
-                "notice",
-                await self._catalog_text(),
+                "screen",
+                screen="catalog",
                 conversation_id=conversation_id,
             )
         if name == "/source" and parts[1:] == ["permissions"]:
@@ -1109,6 +1154,12 @@ class PresentationController:
     async def transcript(self, run_id: str) -> Transcript:
         return await self.require_agent().transcript(run_id)
 
+    async def conversation_runs(
+        self,
+        conversation_id: str,
+    ) -> tuple[ConversationRun, ...]:
+        return await self.require_agent().conversation_runs(conversation_id)
+
     async def artifact_notices(self, result: LoopExit) -> tuple[str, ...]:
         notices: list[str] = []
         for receipt in result.artifact_deliveries:
@@ -1140,26 +1191,6 @@ class PresentationController:
                 f"  {safe_display(source.display_name, fallback='source')} "
                 f"({label}, {state}) [{source.id}]"
             )
-        return "\n".join(lines)
-
-    async def _catalog_text(self) -> str:
-        agent = self.require_agent()
-        summary = await agent.catalog_summary()
-        preview = await agent.catalog_preview()
-        lines = [
-            "Catalog",
-            f"  Sources     {summary.active_source_count}",
-            f"  Resources   {summary.resource_count}",
-        ]
-        if preview:
-            lines.append("  Preview")
-            for resource in preview:
-                lines.append(
-                    "    "
-                    + safe_display(
-                        getattr(resource, "display_name", None), fallback="resource"
-                    )
-                )
         return "\n".join(lines)
 
     def _settings_text(self) -> str:

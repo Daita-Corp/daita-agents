@@ -31,11 +31,10 @@ class Composer(TextArea):
     ]
 
     can_focus = True
-    compact = True
-    show_line_numbers = False
 
     def __init__(self) -> None:
         super().__init__("", id="composer", language=None)
+        self.compact = True
         self._escape_armed = False
         self.completion_active = False
         self.disabled_reason = ""

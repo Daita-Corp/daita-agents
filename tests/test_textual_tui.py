@@ -16,7 +16,15 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.geometry import Offset
 from textual.selection import Selection
-from textual.widgets import Button, Input, OptionList, Static
+from textual.widgets import (
+    Button,
+    Footer,
+    Input,
+    OptionList,
+    Static,
+    Tree,
+)
+from textual.widgets._collapsible import CollapsibleTitle
 
 from daita import (
     Agent,
@@ -24,6 +32,8 @@ from daita import (
     AgentEventKind,
     ApprovalDecision,
     ApprovalRequest,
+    LoopExit,
+    LoopExitKind,
     SQLiteSource,
 )
 from daita._json import FrozenJsonObject
@@ -35,7 +45,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.tui.app import DaitaApp
+from daita.tui.app import DaitaApp, _run_failure_notice
 from daita.tui.clipboard import (
     MAX_CLIPBOARD_UTF8_BYTES,
     ClipboardResult,
@@ -52,6 +62,8 @@ from daita.tui.models import (
     MAX_COMPOSER_CHARACTERS,
     MIN_READY_ROWS,
     MIN_USABLE_COLUMNS,
+    ToolCardDetails,
+    ToolCardState,
     TranscriptBlock,
 )
 from daita.tui.projection import (
@@ -60,23 +72,27 @@ from daita.tui.projection import (
     redact_presentation_value,
 )
 from daita.tui.sanitization import sanitize_terminal_text
-from daita.tui.screens.approval import ApprovalScreen
+from daita.tui.screens.catalog import CatalogScreen
 from daita.tui.screens.chat import ChatScreen
 from daita.tui.screens.confirm import ConfirmScreen
 from daita.tui.screens.editing import ReviewCostScreen
 from daita.tui.screens.onboarding import AgentCreateScreen, ModelSetupScreen
+from daita.tui.screens.permissions import PermissionsScreen
 from daita.tui.screens.selection import SelectionScreen
 from daita.tui.screens.source_edit import SourceEditScreen
 from daita.tui.models import PickerOption
 from daita.tui.observer import ObserverEvent
 from daita.tui.widgets.composer import Composer, CompletionPopup
+from daita.tui.widgets.approval import ApprovalPanel
 from daita.tui.widgets.status import (
     ActivityBar,
     context_window_text,
     format_token_count,
 )
+from daita.tui.widgets.tool_card import ToolCard
 from daita.tui.widgets.transcript import TranscriptView
 from daita.tui.widgets.welcome import WelcomeView
+from daita.security import CredentialSession, SecretReference, SecretResolutionError
 
 
 def test_sanitize_strips_terminal_controls_and_bounds_text():
@@ -101,6 +117,21 @@ def test_source_override_and_learning_parse():
     assert parse_source_override("hello") is None
     assert parse_source_override("@sales how many") == ("sales", "how many")
     assert parse_source_override('@"north west" total') == ("north west", "total")
+
+
+def test_run_timeout_notice_explains_bounded_stop_and_retained_results():
+    notice = _run_failure_notice(
+        LoopExit(
+            run_id="run-timeout",
+            conversation_id="conversation-timeout",
+            kind=LoopExitKind.FAILED,
+            reason="timeout",
+            created_at=datetime.now(UTC),
+        )
+    )
+
+    assert "timed out after bounded retries" in notice
+    assert "completed tool results remain available" in notice
     with pytest.raises(ValueError, match="usage"):
         learning_invocation_message("/learn")
     assert learning_invocation_message("Remember this") is None
@@ -258,14 +289,20 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: P
     app = DaitaApp(root=tmp_path, start_bootstrap=False)
     app.controller.agent = opened
     try:
-        async with app.run_test(size=(90, 28)) as pilot:
+        async with app.run_test(size=(110, 28)) as pilot:
             await app._show_chat()
             await pilot.pause()
             chat_welcome = app.screen.query_one("#welcome", WelcomeView)
+            welcome_region = app.screen.query_one("#welcome-region")
             transcript = app.screen.query_one(TranscriptView)
+            composer = app.screen.query_one(Composer)
+            footer = app.screen.query_one(Footer)
             assert chat_welcome.display is True
+            assert welcome_region.display is True
             assert transcript.display is False
+            assert footer.region.y == composer.region.y + composer.region.height + 1
             assert "welcome-agent" in str(chat_welcome.content)
+            assert "⣾⣿⣿" in str(chat_welcome.content)
             assert "Type / for commands" in str(chat_welcome.content)
 
             chat = app.chat()
@@ -273,6 +310,7 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: P
             chat.append_block(TranscriptBlock("user", "first", "hello"))
             await pilot.pause()
             assert chat_welcome.display is False
+            assert welcome_region.display is False
             assert transcript.display is True
             app.exit(0)
     finally:
@@ -346,6 +384,25 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
             await pilot.pause()
             assert "ctx 8.5K / 32K" in str(context.content)
 
+            tool_completed = AgentEvent(
+                kind=AgentEventKind.TOOL_COMPLETED,
+                occurred_at=datetime.now(UTC),
+                run_id="run-live",
+                conversation_id="conversation-live",
+                data=FrozenJsonObject.from_mapping(
+                    {
+                        "tool_name": "data_query_postgresql",
+                        "capability_id": "data.postgresql.query",
+                        "call_id": "call-live",
+                        "duration_ms": 10,
+                        "is_error": False,
+                        "error_code": None,
+                    }
+                ),
+            )
+            await app.on_observer_event(ObserverEvent(tool_completed))
+            assert "Processing results" in str(activity.content)
+
             run_completed = AgentEvent(
                 kind=AgentEventKind.RUN_COMPLETED,
                 occurred_at=datetime.now(UTC),
@@ -380,6 +437,7 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
             await pilot.press("/")
             await pilot.pause()
             assert popup.display is True
+            assert popup.styles.border_left[0] == "round"
             assert listing.highlighted == 0
             assert popup.selected_insertion() == "/model"
 
@@ -508,6 +566,176 @@ async def test_selection_screen_filters_without_reordering():
     assert app.return_value == ("b",)
 
 
+async def test_source_permissions_picker_remains_interactive_after_command_submit(
+    tmp_path: Path,
+):
+    database = tmp_path / "permissions.sqlite"
+    _create_sqlite_source(database, "records")
+    opened = await Agent.create("permissions-picker", root=tmp_path)
+    source = await opened.attach(SQLiteSource(database, name="Records"))
+    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app.controller.agent = opened
+    try:
+        async with app.run_test(size=(90, 28)) as pilot:
+            await app._show_chat()
+            composer = app.screen.query_one(Composer)
+            composer.load_text("/source permissions")
+            composer.action_submit()
+            await pilot.pause()
+
+            permissions = app.screen
+            assert isinstance(permissions, PermissionsScreen)
+            assert await pilot.click("#perm-source") is True
+            await pilot.pause()
+
+            picker = app.screen
+            assert isinstance(picker, SelectionScreen)
+            assert picker.query_one("#picker").styles.border_left[0] == "round"
+            assert (
+                picker.query_one("#picker-filter", Input).styles.border_left[0]
+                == "round"
+            )
+            listing = picker.query_one("#picker-options", OptionList)
+            assert await pilot.click(listing, offset=(2, 1)) is True
+            await pilot.pause()
+
+            assert app.screen is permissions
+            assert isinstance(permissions, PermissionsScreen)
+            assert permissions._source_id == source.id
+            assert "Records" in str(permissions.query_one("#perm-body", Static).content)
+            app.exit(0)
+    finally:
+        await opened.close()
+
+
+async def test_source_permissions_configures_exact_postgresql_update_scope():
+    read_scope = SimpleNamespace(mode=SimpleNamespace(value="all"), resource_ids=())
+    initial_state = SimpleNamespace(
+        read_scope=read_scope,
+        postgresql_update_scopes=(),
+    )
+    tickets = SimpleNamespace(
+        resource_id="resource-tickets",
+        display_name="support.tickets",
+        resource_kind="table",
+        eligible_assignment_columns=("priority", "ticket_status"),
+        postgresql_update_eligible=True,
+        requires_advanced_column_selection=False,
+    )
+    inspection = SimpleNamespace(
+        source_id="source-postgresql",
+        source_display_name="Support PostgreSQL",
+        adapter_id="postgresql",
+        catalog_generation="sync-one",
+        state=initial_state,
+        resources=(tickets,),
+    )
+    preview_calls: list[dict[str, object]] = []
+    apply_calls: list[dict[str, object]] = []
+
+    async def inspect_source_permissions(source_id: str):
+        assert source_id == inspection.source_id
+        return inspection
+
+    async def preview_source_permissions(**kwargs: object):
+        preview_calls.append(kwargs)
+        updates = kwargs["postgresql_update_scopes"]
+        assert isinstance(updates, dict)
+        scopes = tuple(
+            SimpleNamespace(
+                resource_id=resource_id,
+                allowed_assignment_columns=tuple(columns),
+            )
+            for resource_id, columns in updates.items()
+        )
+        after = SimpleNamespace(
+            read_scope=SimpleNamespace(
+                mode=SimpleNamespace(value=kwargs["read_mode"]),
+                resource_ids=kwargs["read_resource_ids"],
+            ),
+            postgresql_update_scopes=scopes,
+        )
+        return SimpleNamespace(
+            source_id=inspection.source_id,
+            catalog_generation=inspection.catalog_generation,
+            before=initial_state,
+            after=after,
+            confirmation_fingerprint="sha256:" + "1" * 64,
+        )
+
+    async def apply_source_permissions(**kwargs: object):
+        apply_calls.append(kwargs)
+        return inspection
+
+    def choose_single(app: DaitaApp, identity: str) -> None:
+        picker = app.screen
+        assert isinstance(picker, SelectionScreen)
+        listing = picker.query_one("#picker-options", OptionList)
+        listing.highlighted = next(
+            index
+            for index in range(listing.option_count)
+            if str(listing.get_option_at_index(index).id) == identity
+        )
+        picker.action_confirm()
+
+    def choose_multi(app: DaitaApp, identity: str) -> None:
+        picker = app.screen
+        assert isinstance(picker, SelectionScreen)
+        listing = picker.query_one("#picker-options", OptionList)
+        listing.highlighted = next(
+            index
+            for index in range(listing.option_count)
+            if str(listing.get_option_at_index(index).id) == identity
+        )
+        picker.action_toggle_selected()
+        picker.action_confirm()
+
+    app = DaitaApp(start_bootstrap=False)
+    app.controller.inspect_source_permissions = inspect_source_permissions  # type: ignore[method-assign]
+    app.controller.preview_source_permissions = preview_source_permissions  # type: ignore[method-assign]
+    app.controller.apply_source_permissions = apply_source_permissions  # type: ignore[method-assign]
+    async with app.run_test(size=(100, 32)) as pilot:
+        await app.push_screen(PermissionsScreen(source_id=inspection.source_id))
+        permissions = app.screen
+        assert isinstance(permissions, PermissionsScreen)
+
+        assert await pilot.click("#perm-update") is True
+        await pilot.pause()
+        choose_single(app, "selected")
+        await pilot.pause()
+        choose_multi(app, tickets.resource_id)
+        await pilot.pause()
+        choose_single(app, "advanced")
+        await pilot.pause()
+        choose_multi(app, "priority")
+        await pilot.pause()
+
+        assert app.screen is permissions
+        assert preview_calls == [
+            {
+                "source_id": inspection.source_id,
+                "read_mode": "all",
+                "read_resource_ids": (),
+                "postgresql_update_scopes": {
+                    tickets.resource_id: ("priority",),
+                },
+            }
+        ]
+        body = str(permissions.query_one("#perm-body", Static).content)
+        assert "PostgreSQL update tables: 0 → 1" in body
+        assert "support.tickets: priority" in body
+
+        assert await pilot.click("#perm-apply") is True
+        await pilot.pause()
+        assert apply_calls == [
+            {
+                "source_id": inspection.source_id,
+                "confirmation_fingerprint": "sha256:" + "1" * 64,
+            }
+        ]
+        app.exit(0)
+
+
 async def test_approval_approve_deny_cancel_and_unreviewable():
     request = ApprovalRequest(
         run_id="run-1",
@@ -534,65 +762,60 @@ async def test_approval_approve_deny_cancel_and_unreviewable():
         reason="too big",
     )
 
-    class Harness(App[ApprovalDecision | None]):
-        def __init__(self, target: ApprovalRequest) -> None:
-            super().__init__()
-            self._target = target
+    app = DaitaApp(start_bootstrap=False)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app.push_screen(ChatScreen())
+        chat = app.screen
+        assert isinstance(chat, ChatScreen)
+        panel = chat.query_one(ApprovalPanel)
 
-        def compose(self) -> ComposeResult:
-            yield Static("host")
-
-        def on_mount(self) -> None:
-            self.run_worker(self._present(), exclusive=True)
-
-        async def _present(self) -> None:
-            self.exit(await self.push_screen_wait(ApprovalScreen(self._target)))
-
-    approved = Harness(request)
-    async with approved.run_test(size=(80, 24)) as pilot:
+        approved = asyncio.create_task(app.handle_approval(request))
         await pilot.pause()
+        assert app.screen is chat
+        assert panel.display is True
+        assert panel.styles.border_left[0] == "solid"
+        assert panel.region.y < chat.query_one(Composer).region.y
         await pilot.press("y")
         await pilot.pause()
-    assert approved.return_value is ApprovalDecision.APPROVE
+        assert await approved is ApprovalDecision.APPROVE
+        assert panel.display is False
 
-    denied = Harness(request)
-    async with denied.run_test(size=(80, 24)) as pilot:
+        denied = asyncio.create_task(app.handle_approval(request))
         await pilot.pause()
         await pilot.press("n")
         await pilot.pause()
-    assert denied.return_value is ApprovalDecision.DENY
+        assert await denied is ApprovalDecision.DENY
 
-    cancelled = Harness(request)
-    async with cancelled.run_test(size=(80, 24)) as pilot:
+        cancelled = asyncio.create_task(app.handle_approval(request))
         await pilot.pause()
         await pilot.press("escape")
         await pilot.pause()
-    assert cancelled.return_value is None
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
 
-    hidden = Harness(secret)
-    async with hidden.run_test(size=(80, 24)) as pilot:
+        hidden = asyncio.create_task(app.handle_approval(secret))
         await pilot.pause()
-        assert hidden.screen.query_one("#approval-unreviewable")
-        screen = hidden.screen
-        assert isinstance(screen, ApprovalScreen)
-        screen.action_cancel()
+        assert panel.query_one("#approval-inline-unreviewable").display is True
+        panel.action_cancel()
         await pilot.pause()
-    assert hidden.return_value is None
+        with pytest.raises(asyncio.CancelledError):
+            await hidden
 
-    hidden_oversize = Harness(oversized)
-    async with hidden_oversize.run_test(size=(80, 24)) as pilot:
+        hidden_oversize = asyncio.create_task(app.handle_approval(oversized))
         await pilot.pause()
-        assert hidden_oversize.screen.query_one("#approval-unreviewable")
-        screen = hidden_oversize.screen
-        assert isinstance(screen, ApprovalScreen)
-        screen.action_cancel()
+        assert panel.query_one("#approval-inline-unreviewable").display is True
+        panel.action_cancel()
         await pilot.pause()
-    assert hidden_oversize.return_value is None
+        with pytest.raises(asyncio.CancelledError):
+            await hidden_oversize
+        app.exit(0)
 
-    too_small = Harness(request)
-    async with too_small.run_test(size=(40, 10)) as pilot:
-        await pilot.pause()
-    assert too_small.return_value is None
+    too_small = DaitaApp(start_bootstrap=False)
+    async with too_small.run_test(size=(40, 10)):
+        await too_small.push_screen(ChatScreen())
+        with pytest.raises(RuntimeError, match="too small"):
+            await too_small.handle_approval(request)
+        too_small.exit(0)
 
 
 async def test_destructive_confirm_requires_explicit_yes():
@@ -670,6 +893,283 @@ async def test_composer_submit_runs_agent_once(tmp_path: Path):
             app.exit(0)
     finally:
         await opened.close()
+
+
+async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
+    tmp_path: Path,
+):
+    provider = MockModelProvider(
+        (
+            ModelResponse(finish_reason=FinishReason.STOP, text="First answer"),
+            ModelResponse(finish_reason=FinishReason.STOP, text="Second answer"),
+        )
+    )
+    opened = await Agent.create(
+        "conversation-transcript",
+        root=tmp_path,
+        model=provider,
+        model_profile=_mock_profile(provider),
+    )
+    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app.controller.agent = opened
+    try:
+        async with app.run_test(size=(80, 18)) as pilot:
+            await app._show_chat()
+            await app.submit_composer("First question")
+            assert app._run_task is not None
+            await app._run_task
+            await pilot.pause()
+            conversation_id = app.controller.conversation_id
+            assert conversation_id is not None
+
+            await app.submit_composer("Second question")
+            assert app._run_task is not None
+            await app._run_task
+            await pilot.pause()
+
+            transcript = app.screen.query_one(TranscriptView)
+            rendered = transcript.copy_text()
+            assert rendered.index("First question") < rendered.index("First answer")
+            assert rendered.index("First answer") < rendered.index("Second question")
+            assert rendered.index("Second question") < rendered.index("Second answer")
+
+            await app._handle_command("/new")
+            await pilot.pause()
+            assert "First question" not in transcript.copy_text()
+            assert "Second answer" not in transcript.copy_text()
+
+            await app._handle_command(f"/resume {conversation_id}")
+            await pilot.pause()
+            resumed = transcript.copy_text()
+            assert resumed.index("First question") < resumed.index("First answer")
+            assert resumed.index("First answer") < resumed.index("Second question")
+            assert resumed.index("Second question") < resumed.index("Second answer")
+            app.exit(0)
+    finally:
+        await opened.close()
+
+
+async def test_transcript_history_supports_review_and_latest_navigation():
+    app = DaitaApp(start_bootstrap=False)
+    async with app.run_test(size=(60, 14)) as pilot:
+        await app.push_screen(ChatScreen())
+        chat = app.chat()
+        assert chat is not None
+        chat.set_blocks(
+            tuple(
+                TranscriptBlock(
+                    "assistant" if index % 2 else "user",
+                    f"history-{index}",
+                    f"Turn {index}\n" + "detail\n" * 3,
+                )
+                for index in range(12)
+            )
+        )
+        transcript = chat.query_one(TranscriptView)
+        await pilot.pause()
+        transcript.follow_latest()
+        await pilot.pause()
+        bottom = transcript.scroll_y
+        assert transcript.max_scroll_y > 0
+        assert bottom == transcript.max_scroll_y
+
+        await pilot.press("pageup")
+        await pilot.pause()
+        assert transcript.scroll_y < bottom
+        assert transcript.following is False
+
+        await pilot.press("ctrl+home")
+        await pilot.pause()
+        assert transcript.scroll_y == 0
+
+        await pilot.press("ctrl+end")
+        await pilot.pause()
+        assert transcript.scroll_y == transcript.max_scroll_y
+        assert transcript.following is True
+        app.exit(0)
+
+
+async def test_ctrl_o_toggles_tool_calls_without_exiting_chat():
+    app = DaitaApp(start_bootstrap=False)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app.push_screen(ChatScreen())
+        chat = app.screen
+        assert isinstance(chat, ChatScreen)
+        chat.set_blocks(
+            (
+                TranscriptBlock("user", "user-one", "Inspect the records"),
+                TranscriptBlock(
+                    "tool",
+                    "tool-one",
+                    tool_card=ToolCardState(
+                        run_id="run-one",
+                        call_id="call-one",
+                        capability_id="data.query",
+                        label="Query records",
+                        state="done",
+                        details=ToolCardDetails(summary="Returned one record"),
+                    ),
+                ),
+                TranscriptBlock("assistant", "assistant-one", "Done"),
+            )
+        )
+        composer = chat.query_one(Composer)
+        composer.focus()
+        cards = list(chat.query(ToolCard))
+        assert len(cards) == 1
+        assert cards[0].display is False
+
+        await pilot.press("ctrl+o")
+        await pilot.pause()
+        assert app.screen is chat
+        assert cards[0].display is True
+        assert composer.has_focus is True
+        title = cards[0].query_one(CollapsibleTitle)
+        assert (title.styles.color.r, title.styles.color.g, title.styles.color.b) != (
+            0,
+            0,
+            0,
+        )
+        title.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        detail = cards[0].query_one("#tool-detail-call-one", Static)
+        assert "Returned one record" in str(detail.content)
+        assert (
+            detail.styles.color.r,
+            detail.styles.color.g,
+            detail.styles.color.b,
+        ) != (
+            0,
+            0,
+            0,
+        )
+
+        await pilot.press("ctrl+o")
+        await pilot.pause()
+        assert app.screen is chat
+        assert cards[0].display is False
+        app.exit(0)
+
+
+async def test_tui_credential_session_survives_internal_agent_reopen(tmp_path: Path):
+    class _Keychain:
+        def __init__(self) -> None:
+            self.values: dict[str, str] = {}
+            self.resolve_calls = 0
+
+        async def resolve(self, reference):
+            self.resolve_calls += 1
+            return self.values[reference.name]
+
+        async def set(self, reference, value):
+            self.values[reference.name] = value
+
+        async def delete(self, reference):
+            self.values.pop(reference.name, None)
+
+    keychain = _Keychain()
+    reference = SecretReference.keychain("agent:postgresql:session-test")
+    keychain.values[reference.name] = "session-secret"
+    app = DaitaApp(root=tmp_path, keychain=keychain, start_bootstrap=False)
+    session = app.controller.keychain
+    assert isinstance(session, CredentialSession)
+    assert await session.resolve(reference) == "session-secret"
+    assert keychain.resolve_calls == 1
+
+    created = await app.controller.create_agent(
+        "credential-session",
+        observer=None,
+        approval_handler=None,
+    )
+    assert created._embedded._keychain is session
+
+    reopened = await app.controller.reopen_agent(
+        observer=None,
+        approval_handler=None,
+    )
+    assert reopened._embedded._keychain is session
+    assert await session.resolve(reference) == "session-secret"
+    assert keychain.resolve_calls == 1
+    await app.controller.close()
+    with pytest.raises(SecretResolutionError, match="credential session is closed"):
+        await session.resolve(reference)
+
+
+async def test_tui_preloads_active_credentials_before_accepting_queries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class _Keychain:
+        def __init__(self) -> None:
+            self.values: dict[str, str] = {}
+            self.resolve_calls: list[SecretReference] = []
+
+        async def resolve(self, reference):
+            self.resolve_calls.append(reference)
+            return self.values[reference.name]
+
+        async def set(self, reference, value):
+            self.values[reference.name] = value
+
+        async def delete(self, reference):
+            self.values.pop(reference.name, None)
+
+    model_reference = SecretReference.keychain("agent:codex:active")
+    database_reference = SecretReference.keychain("agent:postgresql:active")
+    inactive_reference = SecretReference.keychain("agent:postgresql:inactive")
+    keychain = _Keychain()
+    keychain.values.update(
+        {
+            model_reference.name: "model-secret",
+            database_reference.name: "database-secret",
+            inactive_reference.name: "inactive-secret",
+        }
+    )
+
+    class _OpenedAgent:
+        model_route = SimpleNamespace(
+            candidates=(SimpleNamespace(secret_reference=model_reference),)
+        )
+
+        async def list_sources(self):
+            return (
+                SimpleNamespace(
+                    active=True,
+                    configuration={"credential_ref": database_reference.to_uri()},
+                ),
+                SimpleNamespace(
+                    active=False,
+                    configuration={"credential_ref": inactive_reference.to_uri()},
+                ),
+            )
+
+        async def close(self):
+            return None
+
+    opened = _OpenedAgent()
+
+    async def open_agent(*args, **kwargs):
+        return opened
+
+    monkeypatch.setattr("daita.tui.controller.Agent.open", open_agent)
+    app = DaitaApp(root=tmp_path, keychain=keychain, start_bootstrap=False)
+
+    assert (
+        await app.controller.open_agent(
+            "credential-preload",
+            observer=None,
+            approval_handler=None,
+        )
+        is opened
+    )
+    assert keychain.resolve_calls == [model_reference, database_reference]
+
+    session = app.controller.keychain
+    assert await session.resolve(model_reference) == "model-secret"
+    assert await session.resolve(database_reference) == "database-secret"
+    assert keychain.resolve_calls == [model_reference, database_reference]
+    await app.controller.close()
 
 
 async def test_one_interactive_run_path_is_unique():
@@ -815,6 +1315,82 @@ async def test_source_edit_screen_reviews_and_switches_atomically(tmp_path: Path
         await opened.close()
 
 
+async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path):
+    first_path = tmp_path / "first.sqlite"
+    second_path = tmp_path / "second.sqlite"
+    _create_sqlite_source(first_path, "orders")
+    _create_sqlite_source(second_path, "tickets")
+    opened = await Agent.create("catalog-browser", root=tmp_path)
+    first = await opened.attach(SQLiteSource(first_path, name="Sales"))
+    await opened.attach(SQLiteSource(second_path, name="Support"))
+    await opened.select_source(first.id)
+    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app.controller.agent = opened
+    try:
+        async with app.run_test(size=(100, 34)) as pilot:
+            await app._show_chat()
+            await pilot.pause()
+            composer = app.screen.query_one(Composer)
+            composer.load_text("/catalog")
+            composer.action_submit()
+            await pilot.pause()
+
+            assert isinstance(app.screen, CatalogScreen)
+            summary = app.screen.query_one("#catalog-summary", Static)
+            assert "2 sources  ·  2 resources  ·  0 relationships" in str(
+                summary.content
+            )
+            tree = app.screen.query_one("#catalog-tree", Tree)
+            browser = app.screen.query_one("#catalog-browser")
+            assert browser.styles.border_left[0] == "round"
+            assert tree.styles.border_left[0] == "round"
+            assert tree.has_focus is True
+            assert tree.cursor_line == 0
+            source_labels = tuple(str(node.label) for node in tree.root.children)
+            assert source_labels[0] == "● Sales  SQLite · 1 resource  current"
+            assert source_labels[1] == "Support  SQLite · 1 resource"
+            resource_labels = tuple(
+                str(node.label)
+                for source_node in tree.root.children
+                for node in source_node.children
+            )
+            assert resource_labels == ("main.orders  table", "main.tickets  table")
+            assert "resource" not in resource_labels
+
+            await pilot.press("down")
+            assert tree.cursor_line == 1
+            await pilot.press("up")
+            assert tree.cursor_line == 0
+            first_source = tree.root.children[0]
+            assert first_source.is_expanded is True
+            await pilot.press("enter")
+            assert first_source.is_expanded is False
+            await pilot.press("enter")
+            assert first_source.is_expanded is True
+            assert await pilot.click(tree, offset=(2, 1)) is True
+            await pilot.pause()
+            assert first_source.is_expanded is False
+            assert await pilot.click(tree, offset=(6, 1)) is True
+            await pilot.pause()
+            assert first_source.is_expanded is True
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, ChatScreen)
+
+            composer = app.screen.query_one(Composer)
+            composer.load_text("/catalog")
+            composer.action_submit()
+            await pilot.pause()
+            assert isinstance(app.screen, CatalogScreen)
+            assert await pilot.click("FooterKey") is True
+            await pilot.pause()
+            assert isinstance(app.screen, ChatScreen)
+            app.exit(0)
+    finally:
+        await opened.close()
+
+
 async def test_model_setup_uses_codex_device_login_without_api_key():
     app = DaitaApp(start_bootstrap=False)
     configured: dict[str, object] = {}
@@ -927,11 +1503,14 @@ async def test_approval_presentation_failure_is_not_converted_to_denial():
         reason="review failure",
     )
 
-    async def fail_to_present(_screen: object) -> object:
+    async def fail_to_present(_request: ApprovalRequest) -> ApprovalDecision | None:
         raise RuntimeError("approval renderer failed")
 
-    app._await_modal = fail_to_present  # type: ignore[assignment]
     async with app.run_test(size=(80, 24)):
+        await app.push_screen(ChatScreen())
+        chat = app.screen
+        assert isinstance(chat, ChatScreen)
+        chat.request_approval = fail_to_present  # type: ignore[assignment]
         with pytest.raises(RuntimeError, match="approval renderer failed"):
             await app.handle_approval(request)
         app.exit(0)

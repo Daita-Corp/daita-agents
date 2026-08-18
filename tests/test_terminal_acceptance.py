@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 from daita.tui.app import DaitaApp
 from daita.tui.screens.onboarding import AgentCreateScreen

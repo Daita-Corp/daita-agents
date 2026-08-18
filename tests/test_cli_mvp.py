@@ -5,12 +5,10 @@ import asyncio
 import io
 import json
 import os
-import re
 import shlex
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
-from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -33,11 +31,6 @@ from daita.llm.models import (
     ModelUsage,
     TextBlock,
     ToolCall,
-)
-from daita.llm.pricing import (
-    CostBasis,
-    CostEstimate,
-    provider_reported_cost_estimate,
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import SecretReference

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import replace

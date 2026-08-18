@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from typing import Any
 
-from daita import Transcript
+from daita import ConversationRun, Transcript
 from daita.llm.models import MessageRole, ToolCall, ToolResultBlock
 
 from .models import ToolCardDetails, ToolCardState, ToolTablePreview, TranscriptBlock
@@ -493,6 +492,25 @@ def project_transcript(
                 blocks.append(
                     TranscriptBlock("tool", f"{run_id}:tool:{call.id}", "", card)
                 )
+    return tuple(blocks)
+
+
+def project_conversation(
+    runs: Sequence[ConversationRun],
+    *,
+    tools_expanded: bool = False,
+) -> tuple[TranscriptBlock, ...]:
+    """Project every persisted run in one conversation in turn order."""
+
+    blocks: list[TranscriptBlock] = []
+    for run in runs:
+        blocks.extend(
+            project_transcript(
+                run.transcript,
+                run_id=run.transcript.run.id,
+                tools_expanded=tools_expanded,
+            )
+        )
     return tuple(blocks)
 
 

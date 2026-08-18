@@ -932,7 +932,7 @@ def test_textual_presentation_has_one_owner_per_concern():
     assert _class_owners("ToolCardState") == {"tui/models.py"}
     assert _class_owners("DaitaApp") == {"tui/app.py"}
     assert _class_owners("PresentationController") == {"tui/controller.py"}
-    assert _class_owners("ApprovalScreen") == {"tui/screens/approval.py"}
+    assert _class_owners("ApprovalPanel") == {"tui/widgets/approval.py"}
     assert _class_owners("TranscriptView") == {"tui/widgets/transcript.py"}
     assert _class_owners("RunObserver") == {"tui/observer.py"}
 

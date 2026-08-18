@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import base64
-import io
 import json
 import time
 from typing import cast
 
+import openai
 import pytest
 
 import daita.llm.providers.codex as codex_provider
@@ -166,6 +167,18 @@ class _Client:
         self.responses = _Responses()
 
 
+class _HangingResponses:
+    async def create(self, **kwargs: object) -> object:
+        del kwargs
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class _HangingClient:
+    def __init__(self) -> None:
+        self.responses = _HangingResponses()
+
+
 async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
     client = _Client()
     provider = CodexSubscriptionProvider(
@@ -199,6 +212,45 @@ async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
     assert "max_output_tokens" not in arguments
     assert arguments["tool_choice"] == "auto"
     assert arguments["parallel_tool_calls"] is False
+
+
+def test_codex_default_client_uses_bounded_transport_without_sdk_retries(monkeypatch):
+    captured: dict[str, object] = {}
+    client = _Client()
+
+    def construct(**kwargs: object) -> _Client:
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", construct)
+    provider = CodexSubscriptionProvider(
+        "gpt-test",
+        credential=_credential().to_secret(),
+    )
+
+    assert provider.client is client
+    timeout = captured["timeout"]
+    assert isinstance(timeout, openai.Timeout)
+    assert timeout.connect == 5.0
+    assert timeout.read == 45.0
+    assert timeout.write == 30.0
+    assert timeout.pool == 5.0
+    assert captured["max_retries"] == 0
+
+
+async def test_codex_total_attempt_timeout_is_normalized(monkeypatch):
+    monkeypatch.setattr(codex_provider, "_CODEX_ATTEMPT_TIMEOUT_SECONDS", 0.01)
+    provider = CodexSubscriptionProvider(
+        "gpt-test",
+        credential=_credential().to_secret(),
+        client=_HangingClient(),
+    )
+
+    with pytest.raises(ModelProviderError) as caught:
+        await asyncio.wait_for(provider.generate(_request()), timeout=0.25)
+
+    assert caught.value.code is ProviderErrorCode.TIMEOUT
+    assert caught.value.provider_id == "codex:gpt-test"
 
 
 async def test_codex_refresh_is_persisted_before_using_rotated_token(monkeypatch):
@@ -284,6 +336,25 @@ async def test_claude_subscription_remains_an_official_client_transport(monkeypa
     assert commands[0].environment["DISABLE_TELEMETRY"] == "1"
     assert commands[0].environment["DISABLE_ERROR_REPORTING"] == "1"
     assert commands[0].environment["DISABLE_BUG_COMMAND"] == "1"
+
+
+async def test_claude_subscription_total_attempt_timeout_is_normalized():
+    async def hang(command):
+        del command
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    provider = ClaudeCodeSubscriptionProvider(
+        "claude-test",
+        runner=hang,
+        timeout_seconds=0.01,
+    )
+
+    with pytest.raises(ModelProviderError) as caught:
+        await asyncio.wait_for(provider.generate(_request()), timeout=0.25)
+
+    assert caught.value.code is ProviderErrorCode.TIMEOUT
+    assert caught.value.provider_id == "claude-code:claude-test"
 
 
 @pytest.mark.parametrize(

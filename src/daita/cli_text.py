@@ -8,7 +8,7 @@ import shlex
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, TextIO
+from typing import TextIO
 
 from daita import Agent, LearningCandidateStatus, LoopExit
 from daita.learning_candidates import (
@@ -18,10 +18,6 @@ from daita.learning_candidates import (
 from daita.semantics import SemanticAnnotationState, SemanticAnnotationView
 from daita.learning_candidates import LearningCandidateView, LearningReviewResult
 
-from .tui.commands import learning_invocation_message as _learning_invocation_message
-from .tui.models import (
-    validate_candidate_review_cost_limit as _validate_candidate_review_cost_limit,
-)
 from .tui.projection import artifact_delivery_messages, completed_tool_pairs
 from .tui.sanitization import MAX_DISPLAY_CHARACTERS, render_model_answer, safe_display
 

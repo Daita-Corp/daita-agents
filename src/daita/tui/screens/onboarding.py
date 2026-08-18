@@ -214,8 +214,11 @@ class ModelSetupScreen(Screen[bool]):
         )
         if selected is None:
             return
-        self._provider = selected[0]
-        suggestions = MODEL_SUGGESTIONS.get(self._provider, ())
+        provider = selected[0]
+        if not isinstance(provider, str):
+            return
+        self._provider = provider
+        suggestions = MODEL_SUGGESTIONS.get(provider, ())
         model_options = tuple(
             PickerOption(
                 item.model_id,
@@ -240,8 +243,11 @@ class ModelSetupScreen(Screen[bool]):
             )
             if chosen is None:
                 return
-            self._model = chosen[0]
-            self.query_one("#model-id", Input).value = self._model
+            model = chosen[0]
+            if not isinstance(model, str):
+                return
+            self._model = model
+            self.query_one("#model-id", Input).value = model
         self.query_one("#model-help", Static).update(
             sanitize_terminal_text(
                 f"{self._provider}:{self._model}",

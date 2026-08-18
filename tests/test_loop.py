@@ -9,6 +9,7 @@ from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
     MessageRole,
+    ModelProfile,
     ModelRequest,
     ModelResponse,
     ModelStreamCompleted,
@@ -19,6 +20,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
+from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
 from daita.loop import (
     AgentLoop,
     InMemoryTranscriptStore,
@@ -119,6 +121,53 @@ async def test_direct_loop_records_every_parallel_result_in_order():
         MessageRole.TOOL,
         MessageRole.TOOL,
     )
+
+
+async def test_post_tool_model_retry_reuses_result_without_reexecuting_tool():
+    provider = MockModelProvider(
+        (
+            response_with_calls("one"),
+            ModelProviderError(ProviderErrorCode.TIMEOUT),
+            ModelResponse(finish_reason=FinishReason.STOP, text="recovered answer"),
+        ),
+        provider_id="mock:subscription",
+    )
+    router = ModelRouter(
+        (
+            ModelProviderRegistration(
+                provider=provider,
+                profile=ModelProfile(
+                    id=provider.provider_id,
+                    context_window_tokens=10_000,
+                    max_output_tokens=1_000,
+                    supports_tools=True,
+                ),
+            ),
+        ),
+        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+    )
+    tools = ScriptedTools({"one": ToolResultBlock(call_id="one", output={"value": 1})})
+    loop = AgentLoop(
+        model=router,
+        context_builder=TranscriptContext(),
+        tools=tools,
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(
+        RunInput(
+            id="run-post-tool-retry",
+            agent_id="agent-1",
+            message="question",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert result.final_text == "recovered answer"
+    assert [call.id for call in tools.calls] == ["one"]
+    assert len(provider.requests) == 3
+    assert provider.requests[1] == provider.requests[2]
 
 
 async def test_step_limit_gets_one_tool_free_wrap_up_call():
