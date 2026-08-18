@@ -21,7 +21,6 @@ from daita import (
     LearningReviewStatus,
 )
 from daita.cli_text import _write_memory_surface
-from daita.tui.controller import PresentationController
 from daita.evaluation import CandidateReviewMeasurement, CandidateReviewReport
 from daita.learning_candidates import (
     LEARNING_CANDIDATE_MAX_RECORDS,
@@ -54,6 +53,7 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
+from daita.tui.controller import PresentationController
 
 
 class _BlockingReviewer:

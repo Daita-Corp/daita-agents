@@ -15,11 +15,11 @@ from daita import ApprovalDecision, ApprovalRequest
 from ..models import TranscriptBlock
 from ..widgets.approval import ApprovalPanel
 from ..widgets.composer import (
+    CompletionPopup,
     Composer,
     ComposerCompletionAccepted,
     ComposerCompletionDismissed,
     ComposerCompletionMoved,
-    CompletionPopup,
 )
 from ..widgets.status import ActivityBar, NoticeBar, StatusBar
 from ..widgets.transcript import TranscriptView

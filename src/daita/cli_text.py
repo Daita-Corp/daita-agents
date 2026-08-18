@@ -12,11 +12,12 @@ from typing import TextIO
 
 from daita import Agent, LearningCandidateStatus, LoopExit
 from daita.learning_candidates import (
+    LearningCandidateView,
+    LearningReviewResult,
     learning_candidate_content_from_mapping,
     learning_candidate_content_to_mapping,
 )
 from daita.semantics import SemanticAnnotationState, SemanticAnnotationView
-from daita.learning_candidates import LearningCandidateView, LearningReviewResult
 
 from .tui.projection import artifact_delivery_messages, completed_tool_pairs
 from .tui.sanitization import MAX_DISPLAY_CHARACTERS, render_model_answer, safe_display

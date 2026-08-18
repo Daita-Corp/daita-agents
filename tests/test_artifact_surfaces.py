@@ -8,7 +8,6 @@ import pytest
 
 import daita.artifacts.delivery as delivery_module
 from daita import Agent, ArtifactDeliveryReceipt, cli
-from daita.tui.projection import artifact_delivery_messages, completed_tool_pairs
 from daita.artifacts.models import (
     ArtifactAuthorship,
     ArtifactProvenance,
@@ -26,6 +25,7 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
+from daita.tui.projection import artifact_delivery_messages, completed_tool_pairs
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:

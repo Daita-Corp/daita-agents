@@ -16,9 +16,9 @@ from ..models import (
     MODEL_SUGGESTIONS,
     POSTGRESQL_CONNECTION_URL_ERROR,
     PROVIDERS,
-    SUBSCRIPTION_PROVIDER_IDS,
-    SSL_MODES,
     SOURCE_TYPES,
+    SSL_MODES,
+    SUBSCRIPTION_PROVIDER_IDS,
     PickerOption,
 )
 from ..sanitization import sanitize_terminal_text

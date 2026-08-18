@@ -10,7 +10,6 @@ import pytest
 
 import daita.hosting.embedded as embedded
 from daita import Agent, SQLiteSource, cli
-from daita.tui.controller import PresentationController
 from daita.adapters.models import SourceRegistration
 from daita.agent import AgentHomeError
 from daita.llm.models import (
@@ -22,6 +21,7 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import KeychainSecretProvider, SecretReference
 from daita.skills import Skill
+from daita.tui.controller import PresentationController
 
 NOW = datetime(2026, 7, 29, tzinfo=UTC)
 

@@ -29,6 +29,10 @@ from daita.agent import (
     SourceRefreshError,
     SourceSelectionError,
 )
+from daita.learning_candidates import (
+    learning_candidate_content_from_mapping,
+    learning_candidate_content_to_mapping,
+)
 from daita.observation import AgentObserver
 from daita.security import (
     CredentialSession,
@@ -37,10 +41,6 @@ from daita.security import (
     SecretReference,
 )
 from daita.skills import Skill, validate_skill_name
-from daita.learning_candidates import (
-    learning_candidate_content_from_mapping,
-    learning_candidate_content_to_mapping,
-)
 
 from .commands import (
     BUILTIN_SLASH_COMMANDS,

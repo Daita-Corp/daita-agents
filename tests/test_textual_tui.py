@@ -45,6 +45,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.security import CredentialSession, SecretReference, SecretResolutionError
 from daita.tui.app import DaitaApp, _run_failure_notice
 from daita.tui.clipboard import (
     MAX_CLIPBOARD_UTF8_BYTES,
@@ -62,10 +63,12 @@ from daita.tui.models import (
     MAX_COMPOSER_CHARACTERS,
     MIN_READY_ROWS,
     MIN_USABLE_COLUMNS,
+    PickerOption,
     ToolCardDetails,
     ToolCardState,
     TranscriptBlock,
 )
+from daita.tui.observer import ObserverEvent
 from daita.tui.projection import (
     approval_review_document,
     project_tool_details,
@@ -80,10 +83,8 @@ from daita.tui.screens.onboarding import AgentCreateScreen, ModelSetupScreen
 from daita.tui.screens.permissions import PermissionsScreen
 from daita.tui.screens.selection import SelectionScreen
 from daita.tui.screens.source_edit import SourceEditScreen
-from daita.tui.models import PickerOption
-from daita.tui.observer import ObserverEvent
-from daita.tui.widgets.composer import Composer, CompletionPopup
 from daita.tui.widgets.approval import ApprovalPanel
+from daita.tui.widgets.composer import CompletionPopup, Composer
 from daita.tui.widgets.status import (
     ActivityBar,
     context_window_text,
@@ -92,7 +93,6 @@ from daita.tui.widgets.status import (
 from daita.tui.widgets.tool_card import ToolCard
 from daita.tui.widgets.transcript import TranscriptView
 from daita.tui.widgets.welcome import WelcomeView
-from daita.security import CredentialSession, SecretReference, SecretResolutionError
 
 
 def test_sanitize_strips_terminal_controls_and_bounds_text():

@@ -11,7 +11,6 @@ import pytest
 
 from daita import Agent, AgentConfig, cli
 from daita.cli_text import _write_learning_review_result
-from daita.tui.controller import PresentationController
 from daita.evaluation import CandidateReviewMeasurement
 from daita.learning_candidates import (
     LEARNING_REVIEW_MAX_MODEL_CALLS,
@@ -27,6 +26,7 @@ from daita.llm.routing import (
     ModelRouteCandidate,
     RetryPolicy,
 )
+from daita.tui.controller import PresentationController
 
 
 def _profile(

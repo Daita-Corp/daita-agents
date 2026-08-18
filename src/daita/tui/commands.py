@@ -7,8 +7,8 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .models import (
     MAX_POSTGRESQL_CONNECTION_URL_BYTES,
-    SSL_MODES,
     SOURCE_TYPE_LABELS,
+    SSL_MODES,
     UserInputError,
 )
 from .sanitization import safe_display

@@ -40,6 +40,15 @@ from .artifacts.models import (
     artifact_destination_to_mapping,
     artifact_ref_to_mapping,
 )
+from .cli_text import (
+    _edit_learning_candidate,
+    _render_model_answer,
+    _write_learning_candidate_list,
+    _write_learning_candidate_view,
+    _write_learning_review_result,
+    _write_memory_surface,
+    _write_semantic_view,
+)
 from .errors import StateCompatibilityError
 from .learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
@@ -54,15 +63,6 @@ from .llm import (
 from .llm.profiles import reviewed_model_profile
 from .security import SecretReference
 from .skills import validate_skill_name
-from .cli_text import (
-    _edit_learning_candidate,
-    _render_model_answer,
-    _write_learning_candidate_list,
-    _write_learning_candidate_view,
-    _write_learning_review_result,
-    _write_memory_surface,
-    _write_semantic_view,
-)
 from .terminal import run_terminal_application
 from .tui.models import (
     validate_candidate_review_cost_limit as _validate_candidate_review_cost_limit,
