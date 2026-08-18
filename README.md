@@ -4,13 +4,13 @@
 
 **The data agent that learns how your business works.**
 
-Daita connects to SQLite, PostgreSQL, CSV, and JSON, catalogs your data, and
+Daita connects to a data source, catalogs your data, and
 returns grounded answers to questions asked in plain language.
 
-With your approval, Daita learns recurring query patterns, business semantics,
+Daita learns recurring query patterns, business semantics,
 and important operational context. It carries that knowledge into future
 conversations through inspectable memory and reusable skills. The more you use
-it, the better it understands your data and the way your business works.
+it, the better it understands your data and the way your project works.
 
 ```text
 You:   Which region led paid revenue last quarter?
@@ -18,8 +18,8 @@ Daita: EMEA led with $4.2M, followed by North America with $3.7M.
 ```
 
 Daita begins every source read only and keeps learned context transparent. An
-explicitly opted-in PostgreSQL source can additionally expose the narrow,
-previewed, once-approved structured update described below; other source access
+explicitly opt-in PostgreSQL source can additionally expose the narrow,
+previewed, once approved structured update described below; other source access
 remains read only.
 
 ## Why Daita?
@@ -52,16 +52,16 @@ pipx install --python python3.12 daita-agents
 ```
 
 The first launch guides you through creating an agent, choosing a model, and
-attaching a read only source inside one full-screen Textual application; setup,
+attaching a read only source inside our Textual application; setup,
 chat, pickers, secret entry, confirmations, and approvals never fall back to a
-second line-oriented interface. API-backed models store their key in the OS
+second line oriented interface. API backed models store their key in the OS
 keychain; local Ollama models need no key. Choosing **Codex subscription** starts
-a ChatGPT device-code sign-in inside Daita—installing the Codex CLI is not
-required. **Claude Code subscription** uses the installed, signed-in Claude Code
+a ChatGPT device code sign in inside Daita. Installing the Codex CLI is not
+required. **Claude Code subscription** uses the installed, signed in Claude Code
 client, so run `claude auth login` before selecting it. **Grok Build
-subscription** uses a signed-in `grok` client (`grok login`). The CLI route does
+subscription** uses a signed in `grok` client (`grok login`). The CLI route does
 not store a provider credential in Daita configuration. Gemini remains available
-through its explicit API-key-billed `gemini:<model>` route.
+through its explicit API key billed `gemini:<model>` route.
 
 Subscription calls consume the allowance and follow the model availability of
 the connected plan. Daita keeps all data tools inside its validated direct loop
@@ -158,7 +158,7 @@ For the complete implementation boundaries, see [AGENTS.md](AGENTS.md).
 
 ## Advanced/headless CLI
 
-The zero argument `daita` command is the normal path. Automation-friendly
+The zero argument `daita` command is the normal path. Automation friendly
 commands use the same public API:
 
 ```bash
