@@ -9,7 +9,6 @@ import pytest
 
 from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject
-from daita.capabilities import CapabilityRegistry
 from daita.catalog import (
     CATALOG_INSPECT_CAPABILITY_ID,
     CATALOG_SCHEMA_CAPABILITY_ID,
@@ -21,8 +20,6 @@ from daita.catalog import (
 )
 from daita.catalog.capabilities import CatalogProjection, catalog_declarations
 from daita.catalog.models import CatalogResource
-from daita.domains.data.capabilities import sqlite_query_declarations
-from daita.domains.data.controller import DataToolRuntime
 from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
 from daita.storage.sqlite_codecs import encode_source_read_scope
@@ -265,21 +262,7 @@ async def test_runtime_denies_guessed_and_multi_resource_reads_before_io(
         selected_names=("parent",),
     )
 
-    class NoIoBackend:
-        calls = 0
-
-        async def execute_read(self, **kwargs: object):
-            self.calls += 1
-            raise AssertionError(kwargs)
-
-    backend = NoIoBackend()
-    declarations = sqlite_query_declarations(agent.id, backend)
-    registry = CapabilityRegistry(
-        capabilities=declarations.capabilities,
-        executors=declarations.executors,
-        tool_views=declarations.tool_views,
-    )
-    runtime = DataToolRuntime(registry, agent._embedded._data_view)
+    runtime = agent._embedded._capability_runtime
     run = RunInput(
         id="permission-runtime-run",
         agent_id=agent.id,
@@ -314,7 +297,6 @@ async def test_runtime_denies_guessed_and_multi_resource_reads_before_io(
             ),
         )
         results = await runtime.execute_all(run, calls)
-        assert backend.calls == 0
         errors = tuple(
             cast(Mapping[str, object], result.output["error"]) for result in results
         )

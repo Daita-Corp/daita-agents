@@ -368,7 +368,8 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         )
         await agent._embedded._store.save_semantic_annotation(agent.id, stale)
 
-        runtime = agent._embedded._data_tool_runtime
+        runtime = agent._embedded._capability_runtime
+        semantic_domain = agent._embedded._semantic_domain
         read_run = RunInput(
             id="semantic-read-run",
             agent_id=agent.id,
@@ -377,7 +378,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
             conversation_id="semantic-read-conversation",
             source_id=source.id,
         )
-        runtime.select_explicit_learning_run(read_run.id)
+        semantic_domain.select_explicit_learning_run(read_run.id)
         listed = (
             await runtime.execute_all(
                 read_run,
@@ -415,7 +416,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         assert conflict_maintenance["state"] == "conflicting"
         assert conflict_maintenance["usable_as_current_meaning"] is False
         assert conflict_maintenance["requires_revalidation"] is True
-        runtime.clear_explicit_learning_run(read_run.id)
+        semantic_domain.clear_explicit_learning_run(read_run.id)
 
         controller = PresentationController(root=None)
         controller.agent = agent

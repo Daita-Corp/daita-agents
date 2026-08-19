@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from hashlib import sha256
 from typing import Protocol
@@ -45,15 +45,27 @@ from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
     Capability,
+    CapabilityDeclarations,
+    CapabilityInputError,
     Executor,
-    ExtensionDeclarations,
-    ToolApplicability,
     ToolExecution,
     ToolOutput,
+    ToolOutputValidationError,
     ToolView,
 )
+from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
-from .sql import MAX_SQL_CHARACTERS, MAX_SQL_PARAMETERS
+from ...llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
+from ...loop.models import RunInput, Transcript
+from ...storage.sqlite_records import SourcePermissionStateError
+from ..learning import LearningCandidateGuard
+from .sql import (
+    MAX_SQL_CHARACTERS,
+    MAX_SQL_PARAMETERS,
+    ResourceSchema,
+    validate_postgresql_read,
+    validate_sqlite_read,
+)
 
 DOCUMENT_CREATE_CAPABILITY_ID = "artifact.create_document"
 DOCUMENT_CREATE_EXECUTOR_ID = "artifact.create_document.executor"
@@ -105,6 +117,7 @@ ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID = "artifact.set_export_location"
 ARTIFACT_SET_EXPORT_LOCATION_EXECUTOR_ID = "artifact.set_export_location.executor"
 ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME = "artifact_set_export_location"
 ARTIFACT_EXPORT_LOCATION_OUTPUT_KIND = "artifact.export_location"
+ARTIFACT_DOMAIN_OWNER_ID = "artifacts"
 
 
 @dataclass(frozen=True, slots=True)
@@ -830,7 +843,7 @@ class ArtifactSetExportLocationExecutor:
         )
 
 
-def artifact_capability_declarations(
+def artifact_declarations(
     delivery: LocalArtifactDelivery,
     artifacts: AgentHomeArtifactStore,
     *,
@@ -840,9 +853,9 @@ def artifact_capability_declarations(
     postgresql_backend: ExactTabularExportBackend,
     clock: Callable[[], datetime],
 ) -> ArtifactCapabilityDeclarations:
-    extension = artifact_extension_declarations()
+    declarations = artifact_capability_declarations()
     return ArtifactCapabilityDeclarations(
-        capabilities=extension.capabilities,
+        capabilities=declarations.capabilities,
         executors=(
             DocumentArtifactExecutor(),
             LocalFileCopyExecutor(agent_id, local_file_backend),
@@ -854,11 +867,11 @@ def artifact_capability_declarations(
             ArtifactSaveLocalExecutor(delivery),
             ArtifactSetExportLocationExecutor(delivery),
         ),
-        tool_views=extension.tool_views,
+        tool_views=declarations.tool_views,
     )
 
 
-def artifact_extension_declarations() -> ExtensionDeclarations:
+def artifact_capability_declarations() -> CapabilityDeclarations:
     document = Capability(
         id=DOCUMENT_CREATE_CAPABILITY_ID,
         description=(
@@ -1151,25 +1164,16 @@ def artifact_extension_declarations() -> ExtensionDeclarations:
             name=LOCAL_FILE_COPY_TOOL_NAME,
             capability_id=local_file_copy.id,
             description=local_file_copy.description,
-            applicability=ToolApplicability(
-                source_adapter_ids=("local-directory",), minimum_active_sources=1
-            ),
         ),
         ToolView(
             name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
             capability_id=sqlite_tabular.id,
             description=sqlite_tabular.description,
-            applicability=ToolApplicability(
-                source_adapter_ids=("sqlite",), minimum_active_sources=1
-            ),
         ),
         ToolView(
             name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
             capability_id=postgresql_tabular.id,
             description=postgresql_tabular.description,
-            applicability=ToolApplicability(
-                source_adapter_ids=("postgresql",), minimum_active_sources=1
-            ),
         ),
         ToolView(
             name=ARTIFACT_LIST_TOOL_NAME,
@@ -1197,11 +1201,886 @@ def artifact_extension_declarations() -> ExtensionDeclarations:
             description=set_location.description,
         ),
     )
-    return ExtensionDeclarations(
+    return CapabilityDeclarations(
+        domain_owner_id="artifacts",
         capabilities=capabilities,
         executor_ids=tuple(item.executor_id for item in capabilities),
         tool_views=views,
     )
+
+
+_EXACT_TABULAR_CAPABILITIES = frozenset(
+    {SQLITE_TABULAR_EXPORT_CAPABILITY_ID, POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}
+)
+_CONVERSATION_ARTIFACT_CAPABILITIES = frozenset(
+    {
+        ARTIFACT_LIST_CAPABILITY_ID,
+        ARTIFACT_READ_CAPABILITY_ID,
+        ARTIFACT_CONVERT_CAPABILITY_ID,
+    }
+)
+_ARTIFACT_ADAPTER_CAPABILITIES = {
+    "local-directory": frozenset({LOCAL_FILE_COPY_CAPABILITY_ID}),
+    "sqlite": frozenset({SQLITE_TABULAR_EXPORT_CAPABILITY_ID}),
+    "postgresql": frozenset({POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}),
+}
+_ARTIFACT_CAPABILITIES = frozenset(
+    {
+        DOCUMENT_CREATE_CAPABILITY_ID,
+        LOCAL_FILE_COPY_CAPABILITY_ID,
+        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+        ARTIFACT_LIST_CAPABILITY_ID,
+        ARTIFACT_READ_CAPABILITY_ID,
+        ARTIFACT_CONVERT_CAPABILITY_ID,
+        ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+        ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
+    }
+)
+
+
+class ArtifactDomainCatalog(Protocol):
+    async def source_routing_facts(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> tuple[Mapping[str, object], ...]: ...
+
+    async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None: ...
+
+    async def resource_schemas(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> tuple[ResourceSchema, ...]: ...
+
+    async def readable_resource_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> frozenset[str]: ...
+
+    async def resource_identity(
+        self,
+        agent_id: str,
+        resource_id: str,
+    ) -> tuple[str, str, str] | None: ...
+
+    async def is_current_tabular_file(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+    ) -> bool: ...
+
+    async def admitted_model_sensitivity(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> ModelSensitivity | None: ...
+
+
+class ArtifactTranscriptReader(Protocol):
+    async def load(self, run_id: str) -> Transcript: ...
+
+
+class ArtifactCapabilityDomain:
+    """Own artifact availability, provenance, conversion, and delivery rules."""
+
+    domain_owner_id = ARTIFACT_DOMAIN_OWNER_ID
+
+    def __init__(
+        self,
+        declarations: CapabilityDeclarations,
+        catalog: ArtifactDomainCatalog,
+        transcripts: ArtifactTranscriptReader,
+        artifacts: AgentHomeArtifactStore,
+        delivery: LocalArtifactDelivery,
+        learning: LearningCandidateGuard,
+    ) -> None:
+        if declarations.domain_owner_id != self.domain_owner_id:
+            raise ValueError("artifact declarations have the wrong domain owner")
+        if {item.id for item in declarations.capabilities} != _ARTIFACT_CAPABILITIES:
+            raise ValueError("artifact domain requires its exact capabilities")
+        self._declarations = declarations
+        self._catalog = catalog
+        self._transcripts = transcripts
+        self._artifacts = artifacts
+        self._delivery = delivery
+        self._learning = learning
+        self._views = tuple(declarations.tool_views)
+        self._capabilities = {item.id: item for item in declarations.capabilities}
+
+    @property
+    def declarations(self) -> CapabilityDeclarations:
+        return self._declarations
+
+    async def project(self, run: RunInput) -> tuple[str, ...]:
+        facts = await self._catalog.source_routing_facts(
+            run.agent_id,
+            (() if run.source_id is None else (run.source_id,)),
+        )
+        adapters = {
+            adapter_id
+            for fact in facts
+            if isinstance((adapter_id := fact.get("adapter_id")), str)
+        }
+        refs = await self._artifacts.list_refs(
+            conversation_id=run.conversation_id or run.id
+        )
+        has_current = any(item.run_id == run.id for item in refs)
+        has_prior = any(item.run_id != run.id for item in refs)
+        names: list[str] = []
+        for view in self._views:
+            capability = self._capabilities[view.capability_id]
+            if not self._learning.allows(
+                run.id,
+                view.name,
+                side_effecting=capability.side_effecting,
+            ):
+                continue
+            required_adapter = next(
+                (
+                    adapter_id
+                    for adapter_id, ids in _ARTIFACT_ADAPTER_CAPABILITIES.items()
+                    if capability.id in ids
+                ),
+                None,
+            )
+            if required_adapter is not None and required_adapter not in adapters:
+                continue
+            if capability.id in _CONVERSATION_ARTIFACT_CAPABILITIES and not has_prior:
+                continue
+            if capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID and not (
+                has_current or has_prior
+            ):
+                continue
+            names.append(view.name)
+        return tuple(names)
+
+    def normalize_arguments(
+        self,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        return arguments
+
+    async def prepare_call(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+    ) -> FrozenJsonObject:
+        if capability.side_effecting:
+            self._learning.validate_side_effect(run.id, call)
+        supplied_source_id = arguments.get("source_id")
+        if (
+            run.source_id is not None
+            and supplied_source_id is not None
+            and supplied_source_id != run.source_id
+        ):
+            raise CapabilityInputError(
+                "source_scope_violation",
+                "This run can only access the source selected by the user.",
+                {
+                    "selected_source_id": run.source_id,
+                    "requested_source_id": supplied_source_id,
+                },
+            )
+        if capability.id in {
+            ARTIFACT_READ_CAPABILITY_ID,
+            ARTIFACT_CONVERT_CAPABILITY_ID,
+        }:
+            artifact_id = arguments.get("artifact_id")
+            ref = (
+                await self._current_ref(run, artifact_id)
+                if isinstance(artifact_id, str)
+                else None
+            )
+            if ref is None:
+                raise CapabilityInputError(
+                    "artifact_missing",
+                    "The requested artifact is not available in the current "
+                    "conversation.",
+                    {"artifact_id": artifact_id},
+                )
+            if capability.id == ARTIFACT_READ_CAPABILITY_ID and ref.media_type not in {
+                "application/json",
+                "text/csv",
+                "text/markdown",
+                "text/plain",
+                XLSX_MEDIA_TYPE,
+            }:
+                raise CapabilityInputError(
+                    "artifact_invalid_format",
+                    "This artifact format does not support a model preview.",
+                    {"media_type": ref.media_type},
+                )
+            if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID and (
+                ref.capability_id not in _EXACT_TABULAR_CAPABILITIES
+                or ref.media_type != XLSX_MEDIA_TYPE
+                or ref.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA
+            ):
+                raise CapabilityInputError(
+                    "artifact_invalid_format",
+                    "Only a Daita-generated exact XLSX artifact can be converted "
+                    "to CSV.",
+                    {"media_type": ref.media_type, "allowed_extensions": (".xlsx",)},
+                )
+        if capability.id in _EXACT_TABULAR_CAPABILITIES:
+            await self._validate_sql(run, capability, arguments)
+        if capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
+            source_id = arguments.get("source_id")
+            resource_id = arguments.get("resource_id")
+            if (
+                not isinstance(source_id, str)
+                or not isinstance(resource_id, str)
+                or not await self._catalog.is_current_tabular_file(
+                    run.agent_id,
+                    source_id,
+                    resource_id,
+                )
+            ):
+                raise CapabilityInputError(
+                    "file_not_current_or_tabular",
+                    "The selected file is not a current tabular catalog resource.",
+                    {"source_id": source_id, "resource_id": resource_id},
+                )
+            await self._require_readable(run, source_id, (resource_id,))
+        return arguments
+
+    async def side_effect_plan(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        execution: ToolExecution,
+        fingerprint: FrozenJsonObject,
+    ) -> SideEffectPlan:
+        if capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID:
+            return SideEffectPlan(
+                approval_required=fingerprint.get("requires_approval") is not False,
+                approval_arguments=fingerprint,
+            )
+        if capability.id == ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID:
+            return SideEffectPlan(
+                approval_arguments=fingerprint,
+                approval_reason=self._delivery.approval_prompt_for_default(fingerprint),
+            )
+        raise ValueError("artifact domain received an unsupported side effect")
+
+    async def finalize_output(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        output: ToolOutput,
+    ) -> ToolOutput:
+        if output.artifact is not None:
+            self._validate_artifact_summary(capability, output)
+            output = replace(
+                output,
+                artifact=await self._bind_provenance(
+                    run,
+                    capability,
+                    arguments,
+                    output.artifact,
+                ),
+            )
+        if capability.side_effecting:
+            self._learning.mark_side_effect_succeeded(run.id)
+        if output.sensitivity is not None:
+            return output
+        source_id = arguments.get("source_id")
+        source_ids = (
+            (source_id,)
+            if isinstance(source_id, str)
+            else (() if run.source_id is None else (run.source_id,))
+        )
+        sensitivity = await self._catalog.admitted_model_sensitivity(
+            run.agent_id,
+            source_ids,
+        )
+        if sensitivity is None:
+            raise CapabilityInputError(
+                "result_classification_unavailable",
+                "The current admitted result scope cannot be classified safely.",
+                {"capability_id": capability.id},
+            )
+        readable = await self._catalog.readable_resource_ids(
+            run.agent_id,
+            source_ids,
+        )
+        return replace(
+            output,
+            sensitivity=sensitivity,
+            sensitivity_provenance={
+                "authority": "artifact_domain_current_scope",
+                "capability_id": capability.id,
+                "source_ids": source_ids,
+                "resource_ids": tuple(sorted(readable)),
+            },
+        )
+
+    def normalize_error(
+        self,
+        call: ToolCall,
+        error: BaseException,
+    ) -> CapabilityFailure | None:
+        return None
+
+    def _validate_artifact_summary(
+        self,
+        capability: Capability,
+        output: ToolOutput,
+    ) -> None:
+        draft = output.artifact
+        assert draft is not None
+        if draft.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA:
+            return
+        if capability.id in _EXACT_TABULAR_CAPABILITIES:
+            valid = (
+                output.data.get("format") in {"csv", "xlsx"}
+                and output.data.get("filename") == draft.suggested_filename
+                and output.data.get("row_count") == draft.provenance.row_count
+                and output.data.get("column_count") == len(draft.provenance.columns)
+            )
+        elif capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
+            valid = (
+                output.data.get("format") in {"csv", "json"}
+                and output.data.get("filename") == draft.suggested_filename
+                and output.data.get("byte_size") == len(draft.content)
+            )
+        elif capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
+            valid = (
+                output.data.get("source_artifact_id")
+                == draft.provenance.derived_from_artifact_id
+                and output.data.get("format") == "csv"
+                and output.data.get("filename") == draft.suggested_filename
+                and output.data.get("row_count") == draft.provenance.row_count
+                and output.data.get("column_count") == len(draft.provenance.columns)
+            )
+        else:
+            raise ToolOutputValidationError(
+                "exact-source artifact came from a non-export capability"
+            )
+        if not valid:
+            raise ToolOutputValidationError(
+                "artifact summary differs from its execution provenance"
+            )
+
+    async def _bind_provenance(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+        draft: ArtifactDraft,
+    ) -> ArtifactDraft:
+        provenance = draft.provenance
+        if provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
+            if capability.id in _EXACT_TABULAR_CAPABILITIES:
+                return await self._bind_exact_export(
+                    run,
+                    capability,
+                    arguments,
+                    draft,
+                )
+            if capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
+                return await self._bind_file_copy(run, arguments, draft)
+            if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
+                return await self._bind_conversion(run, arguments, draft)
+            raise ToolOutputValidationError(
+                "exact-source artifact came from a non-export capability"
+            )
+        if provenance.authorship is not ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS:
+            raise ToolOutputValidationError("artifact authorship is not supported")
+        if not provenance.evidence_call_ids:
+            return replace(
+                draft,
+                sensitivity=_resolved_sensitivity((draft.sensitivity,)),
+                provenance=ArtifactProvenance(
+                    authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
+                ),
+            )
+        try:
+            transcript = await self._transcripts.load(run.id)
+        except KeyError as error:
+            raise CapabilityInputError(
+                "invalid_argument_value",
+                "Artifact evidence must reference the current run.",
+                {"name": "evidence_call_ids"},
+            ) from error
+        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
+            raise CapabilityInputError(
+                "invalid_argument_value",
+                "Artifact evidence belongs to another run.",
+                {"name": "evidence_call_ids"},
+            )
+        bindings: dict[tuple[str, str], ArtifactResourceBinding] = {}
+        sensitivities = [draft.sensitivity]
+        schema_cache: dict[str, dict[str, ResourceSchema]] = {}
+        for call_id in provenance.evidence_call_ids:
+            results = tuple(
+                block
+                for message in transcript.messages
+                if message.role is MessageRole.TOOL
+                for block in message.content
+                if isinstance(block, ToolResultBlock) and block.call_id == call_id
+            )
+            call_exists = any(
+                candidate.id == call_id
+                for message in transcript.messages
+                if message.role is MessageRole.ASSISTANT
+                for candidate in message.tool_calls
+            )
+            if len(results) != 1 or not call_exists or results[0].is_error:
+                raise CapabilityInputError(
+                    "invalid_argument_value",
+                    "Artifact evidence must reference one earlier successful data call.",
+                    {"name": "evidence_call_ids", "call_id": call_id},
+                )
+            block = results[0]
+            if block.output.get("kind") not in {
+                "data.sqlite.query_result",
+                "data.postgresql.query_result",
+                "data.file.read_result",
+            }:
+                raise CapabilityInputError(
+                    "invalid_argument_value",
+                    "Artifact evidence must reference a validated data result.",
+                    {"name": "evidence_call_ids", "call_id": call_id},
+                )
+            data = block.output.get("data")
+            if not isinstance(data, Mapping):
+                raise CapabilityInputError(
+                    "invalid_argument_value",
+                    "Artifact evidence result data is unavailable.",
+                    {"name": "evidence_call_ids", "call_id": call_id},
+                )
+            source_id = data.get("source_id")
+            source_revision = data.get("source_revision")
+            if not isinstance(source_id, str) or not isinstance(source_revision, str):
+                raise CapabilityInputError(
+                    "invalid_argument_value",
+                    "Artifact evidence source identity is unavailable.",
+                    {"name": "evidence_call_ids", "call_id": call_id},
+                )
+            resources: tuple[tuple[str, str], ...]
+            if block.output.get("kind") == "data.file.read_result":
+                resource_id = data.get("resource_id")
+                resource_revision = data.get("resource_revision")
+                resources = (
+                    ((resource_id, resource_revision),)
+                    if isinstance(resource_id, str)
+                    and isinstance(resource_revision, str)
+                    else ()
+                )
+            else:
+                raw_revisions = data.get("resource_revisions")
+                resources = tuple(
+                    (resource_id, revision)
+                    for item in (
+                        raw_revisions if isinstance(raw_revisions, tuple) else ()
+                    )
+                    if isinstance(item, Mapping)
+                    and isinstance((resource_id := item.get("resource_id")), str)
+                    and isinstance((revision := item.get("revision")), str)
+                )
+            schemas = schema_cache.get(source_id)
+            if schemas is None:
+                schemas = {
+                    item.resource_id: item
+                    for item in await self._catalog.resource_schemas(
+                        run.agent_id,
+                        source_id,
+                    )
+                }
+                schema_cache[source_id] = schemas
+            for resource_id, resource_revision in resources:
+                schema = schemas.get(resource_id)
+                if (
+                    schema is None
+                    or schema.revision != resource_revision
+                    or schema.source_revision != source_revision
+                ):
+                    raise CapabilityInputError(
+                        "invalid_argument_value",
+                        "Artifact evidence is no longer current in the catalog.",
+                        {"name": "evidence_call_ids", "call_id": call_id},
+                    )
+                binding = ArtifactResourceBinding(
+                    source_id=source_id,
+                    source_revision=source_revision,
+                    resource_id=resource_id,
+                    resource_revision=resource_revision,
+                )
+                key = (source_id, resource_id)
+                if key in bindings and bindings[key] != binding:
+                    raise CapabilityInputError(
+                        "invalid_argument_value",
+                        "Artifact evidence contains conflicting resource revisions.",
+                        {"name": "evidence_call_ids", "call_id": call_id},
+                    )
+                bindings[key] = binding
+                try:
+                    sensitivities.append(Sensitivity(schema.sensitivity_class))
+                except ValueError:
+                    sensitivities.append(Sensitivity.RESTRICTED)
+        return replace(
+            draft,
+            sensitivity=_resolved_sensitivity(tuple(sensitivities)),
+            provenance=ArtifactProvenance(
+                authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
+                evidence_call_ids=provenance.evidence_call_ids,
+                resource_bindings=tuple(bindings[key] for key in sorted(bindings)),
+            ),
+        )
+
+    async def _bind_exact_export(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+        draft: ArtifactDraft,
+    ) -> ArtifactDraft:
+        source_id = arguments.get("source_id")
+        sql = arguments.get("sql")
+        parameters = arguments.get("parameters", ())
+        if (
+            not isinstance(source_id, str)
+            or not isinstance(sql, str)
+            or not isinstance(parameters, tuple)
+        ):
+            raise ToolOutputValidationError(
+                "exact export execution arguments are unavailable"
+            )
+        expected_adapter = (
+            "postgresql"
+            if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
+            else "sqlite"
+        )
+        if (
+            await self._catalog.source_adapter_id(
+                run.agent_id,
+                source_id,
+            )
+            != expected_adapter
+        ):
+            raise _incomplete_export(draft, "catalog_changed")
+        resources = await self._catalog.resource_schemas(run.agent_id, source_id)
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError as error:
+            raise _incomplete_export(draft, "permission_state_invalid") from error
+        validator = (
+            validate_postgresql_read
+            if expected_adapter == "postgresql"
+            else validate_sqlite_read
+        )
+        validation = validator(
+            sql,
+            source_id=source_id,
+            resources=resources,
+            parameters=parameters,
+            allowed_resource_ids=readable,
+        )
+        if (
+            not validation.valid
+            or validation.analysis is None
+            or validation.source_revision is None
+            or not validation.resource_ids
+            or len(validation.resource_revisions) != len(validation.resource_ids)
+        ):
+            raise _incomplete_export(draft, "catalog_changed")
+        bindings = tuple(
+            ArtifactResourceBinding(
+                source_id=source_id,
+                source_revision=validation.source_revision,
+                resource_id=resource_id,
+                resource_revision=revision,
+            )
+            for resource_id, revision in sorted(validation.resource_revisions)
+        )
+        parameters_sha256 = (
+            "sha256:" + sha256(canonical_json(parameters).encode("utf-8")).hexdigest()
+        )
+        provenance = draft.provenance
+        if (
+            provenance.resource_bindings != bindings
+            or provenance.sql_fingerprint != validation.analysis.sql_fingerprint
+            or provenance.parameters_sha256 != parameters_sha256
+        ):
+            raise ToolOutputValidationError(
+                "exact artifact provenance differs from current runtime facts"
+            )
+        schemas = {item.resource_id: item for item in resources}
+        current: list[Sensitivity] = []
+        for resource_id in validation.resource_ids:
+            schema = schemas.get(resource_id)
+            if schema is None:
+                raise ToolOutputValidationError(
+                    "exact artifact resource is absent from current catalog facts"
+                )
+            try:
+                current.append(Sensitivity(schema.sensitivity_class))
+            except ValueError:
+                current.append(Sensitivity.RESTRICTED)
+        if draft.sensitivity is not _resolved_sensitivity(tuple(current)):
+            raise _incomplete_export(draft, "catalog_changed")
+        return replace(
+            draft,
+            provenance=replace(provenance, resource_bindings=bindings),
+        )
+
+    async def _bind_file_copy(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        draft: ArtifactDraft,
+    ) -> ArtifactDraft:
+        source_id = arguments.get("source_id")
+        resource_id = arguments.get("resource_id")
+        if not isinstance(source_id, str) or not isinstance(resource_id, str):
+            raise ToolOutputValidationError(
+                "local-file copy execution arguments are unavailable"
+            )
+        provenance = draft.provenance
+        if len(provenance.resource_bindings) != 1:
+            raise ToolOutputValidationError(
+                "local-file copy provenance differs from byte-copy facts"
+            )
+        binding = provenance.resource_bindings[0]
+        identity = await self._catalog.resource_identity(run.agent_id, resource_id)
+        if (
+            await self._catalog.source_adapter_id(run.agent_id, source_id)
+            != "local-directory"
+            or identity != (source_id, "file", binding.resource_revision)
+            or not await self._catalog.is_current_tabular_file(
+                run.agent_id,
+                source_id,
+                resource_id,
+            )
+        ):
+            raise _incomplete_export(draft, "catalog_changed")
+        schema = next(
+            (
+                item
+                for item in await self._catalog.resource_schemas(
+                    run.agent_id,
+                    source_id,
+                )
+                if item.resource_id == resource_id
+            ),
+            None,
+        )
+        if (
+            schema is None
+            or schema.revision != binding.resource_revision
+            or schema.source_revision != binding.source_revision
+            or binding.source_id != source_id
+            or binding.resource_id != resource_id
+        ):
+            raise _incomplete_export(draft, "catalog_changed")
+        try:
+            sensitivity = Sensitivity(schema.sensitivity_class)
+        except ValueError:
+            sensitivity = Sensitivity.RESTRICTED
+        if draft.sensitivity is not _resolved_sensitivity((sensitivity,)):
+            raise _incomplete_export(draft, "catalog_changed")
+        return replace(
+            draft,
+            provenance=ArtifactProvenance(
+                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
+                resource_bindings=(
+                    ArtifactResourceBinding(
+                        source_id=source_id,
+                        source_revision=schema.source_revision,
+                        resource_id=resource_id,
+                        resource_revision=schema.revision,
+                    ),
+                ),
+            ),
+        )
+
+    async def _bind_conversion(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        draft: ArtifactDraft,
+    ) -> ArtifactDraft:
+        artifact_id = arguments.get("artifact_id")
+        if not isinstance(artifact_id, str):
+            raise ToolOutputValidationError(
+                "artifact conversion input identity is unavailable"
+            )
+        source = await self._current_ref(run, artifact_id)
+        if source is None:
+            raise ArtifactError(
+                "artifact_missing",
+                "The requested artifact is not available in the current conversation.",
+                {"artifact_id": artifact_id},
+            )
+        await self._artifacts.read_ref(source)
+        provenance = draft.provenance
+        parent = source.provenance
+        if (
+            provenance.derived_from_artifact_id != source.artifact_id
+            or provenance.resource_bindings != parent.resource_bindings
+            or provenance.sql_fingerprint != parent.sql_fingerprint
+            or provenance.parameters_sha256 != parent.parameters_sha256
+            or provenance.columns != parent.columns
+            or provenance.row_count != parent.row_count
+            or draft.sensitivity is not source.sensitivity
+            or draft.media_type != "text/csv"
+        ):
+            raise ToolOutputValidationError(
+                "artifact conversion differs from its verified source snapshot"
+            )
+        return draft
+
+    async def _current_ref(self, run: RunInput, artifact_id: str) -> ArtifactRef | None:
+        return next(
+            (
+                item
+                for item in await self._artifacts.list_refs(
+                    conversation_id=run.conversation_id or run.id
+                )
+                if item.artifact_id == artifact_id
+            ),
+            None,
+        )
+
+    async def _require_readable(
+        self,
+        run: RunInput,
+        source_id: str,
+        resource_ids: tuple[str, ...],
+    ) -> None:
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError as error:
+            raise CapabilityInputError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from error
+        if any(item not in readable for item in resource_ids):
+            raise CapabilityInputError(
+                "resource_read_not_allowed",
+                "The requested resource is not available for reading.",
+            )
+
+    async def _validate_sql(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> None:
+        source_id = arguments.get("source_id")
+        sql = arguments.get("sql")
+        parameters = arguments.get("parameters", ())
+        if (
+            not isinstance(source_id, str)
+            or not isinstance(sql, str)
+            or not sql.strip()
+            or not isinstance(parameters, tuple)
+        ):
+            raise CapabilityInputError(
+                "sql_invalid_input",
+                "SQL reads require source_id, non-empty sql, and an array of "
+                "parameters.",
+            )
+        expected = (
+            "postgresql"
+            if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
+            else "sqlite"
+        )
+        if await self._catalog.source_adapter_id(run.agent_id, source_id) != expected:
+            raise CapabilityInputError(
+                "sql_source_adapter_mismatch",
+                "The selected SQL tool does not match the source adapter.",
+                {"expected_adapter": expected, "source_id": source_id},
+            )
+        schemas = await self._catalog.resource_schemas(run.agent_id, source_id)
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError as error:
+            raise CapabilityInputError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from error
+        validator = (
+            validate_postgresql_read
+            if expected == "postgresql"
+            else validate_sqlite_read
+        )
+        result = validator(
+            sql,
+            source_id=source_id,
+            resources=schemas,
+            parameters=parameters,
+            allowed_resource_ids=readable,
+        )
+        if not result.valid:
+            if {item.code for item in result.issues} & {
+                "resource_out_of_scope",
+                "unknown_resource",
+            }:
+                raise CapabilityInputError(
+                    "resource_read_not_allowed",
+                    "One or more requested resources are not available for reading.",
+                )
+            raise CapabilityInputError(
+                "sql_validation_failed",
+                "The SQL read is invalid. Correct all reported issues before "
+                "retrying.",
+                {
+                    "issues": tuple(
+                        {
+                            "code": item.code,
+                            "message": item.message,
+                            "details": item.details,
+                        }
+                        for item in result.issues
+                    ),
+                    "source_id": source_id,
+                },
+            )
+
+
+def _incomplete_export(draft: ArtifactDraft, reason: str) -> ArtifactError:
+    return ArtifactError(
+        "artifact_incomplete_export",
+        "Current catalog facts no longer prove the exact artifact.",
+        {
+            "reason": reason,
+            "completed_rows": draft.provenance.row_count or 0,
+            "completed_columns": len(draft.provenance.columns),
+            "completed_bytes": len(draft.content),
+        },
+    )
+
+
+def _resolved_sensitivity(values: tuple[Sensitivity, ...]) -> Sensitivity:
+    ordered = {
+        Sensitivity.PUBLIC: 0,
+        Sensitivity.INTERNAL: 1,
+        Sensitivity.CONFIDENTIAL: 2,
+        Sensitivity.RESTRICTED: 3,
+        Sensitivity.UNKNOWN: 3,
+    }
+    selected = max(values, key=lambda item: ordered[item])
+    return Sensitivity.RESTRICTED if selected is Sensitivity.UNKNOWN else selected
 
 
 def _tabular_export_capability(
@@ -1330,6 +2209,7 @@ __all__ = [
     "ARTIFACT_CONVERT_OUTPUT_KIND",
     "ARTIFACT_CONVERT_TOOL_NAME",
     "ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND",
+    "ARTIFACT_DOMAIN_OWNER_ID",
     "ARTIFACT_EXPORT_LOCATION_OUTPUT_KIND",
     "ARTIFACT_LIST_CAPABILITY_ID",
     "ARTIFACT_LIST_EXECUTOR_ID",
@@ -1345,6 +2225,8 @@ __all__ = [
     "ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID",
     "ARTIFACT_SET_EXPORT_LOCATION_EXECUTOR_ID",
     "ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME",
+    "ArtifactCapabilityDomain",
+    "ArtifactDomainCatalog",
     "TABULAR_EXPORT_OUTPUT_KIND",
     "DOCUMENT_CREATE_CAPABILITY_ID",
     "DOCUMENT_CREATE_EXECUTOR_ID",
@@ -1371,6 +2253,6 @@ __all__ = [
     "SQLITE_TABULAR_EXPORT_TOOL_NAME",
     "SQLiteTabularExportExecutor",
     "artifact_capability_declarations",
-    "artifact_extension_declarations",
+    "artifact_declarations",
     "resolved_exact_export_sensitivity",
 ]

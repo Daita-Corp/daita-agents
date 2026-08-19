@@ -25,7 +25,8 @@ from daita.artifacts.renderers import DOCUMENT_ALLOWED_EXTENSIONS, render_model_
 from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import ArtifactPolicy, Capability, ToolOutput
 from daita.catalog.models import Sensitivity
-from daita.domains.data.controller import DataToolRuntime, _resolved_sensitivity
+from daita.capability_runtime import CapabilityRuntime
+from daita.domains.data.export_capabilities import _resolved_sensitivity
 from daita.domains.data.file_capabilities import LocalFileReadExecutor
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
@@ -244,9 +245,9 @@ async def test_capability_without_artifact_policy_rejects_a_draft(
     tmp_path: Path,
 ) -> None:
     store, _ = await _store(tmp_path)
-    runtime = DataToolRuntime(
-        capabilities_module.CapabilityRegistry(),
-        cast(Any, _Catalog()),
+    runtime = CapabilityRuntime(
+        capabilities_module.CapabilityRegistry(declarations=(), executors=()),
+        (),
         artifacts=store,
     )
     capability = Capability(

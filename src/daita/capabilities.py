@@ -8,6 +8,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Protocol, TypeVar
 
 from ._json import FrozenJsonObject, canonical_json
@@ -195,31 +196,10 @@ class Capability:
 
 
 @dataclass(frozen=True, slots=True)
-class ToolApplicability:
-    source_adapter_ids: tuple[str, ...] = ()
-    minimum_active_sources: int = 0
-
-    def __post_init__(self) -> None:
-        source_adapter_ids = tuple(self.source_adapter_ids)
-        if any(not isinstance(value, str) or not value for value in source_adapter_ids):
-            raise ValueError("source_adapter_ids must contain non-empty strings")
-        if len(source_adapter_ids) != len(set(source_adapter_ids)):
-            raise ValueError("source_adapter_ids cannot contain duplicates")
-        object.__setattr__(self, "source_adapter_ids", source_adapter_ids)
-        if (
-            not isinstance(self.minimum_active_sources, int)
-            or isinstance(self.minimum_active_sources, bool)
-            or self.minimum_active_sources < 0
-        ):
-            raise ValueError("minimum_active_sources must be non-negative")
-
-
-@dataclass(frozen=True, slots=True)
 class ToolView:
     name: str
     capability_id: str
     description: str
-    applicability: ToolApplicability = field(default_factory=ToolApplicability)
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -228,8 +208,6 @@ class ToolView:
             (self.description, "tool description"),
         ):
             _text(value, name)
-        if not isinstance(self.applicability, ToolApplicability):
-            raise TypeError("applicability must be ToolApplicability")
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,12 +266,14 @@ class SideEffectExecutor(Executor, Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class ExtensionDeclarations:
+class CapabilityDeclarations:
+    domain_owner_id: str
     capabilities: tuple[Capability, ...] = ()
     executor_ids: tuple[str, ...] = ()
     tool_views: tuple[ToolView, ...] = ()
 
     def __post_init__(self) -> None:
+        _text(self.domain_owner_id, "domain owner id")
         capabilities = tuple(self.capabilities)
         executor_ids = tuple(self.executor_ids)
         views = tuple(self.tool_views)
@@ -318,28 +298,70 @@ class ExtensionDeclarations:
 
 
 class CapabilityRegistry:
-    """Resolve model-facing tools to their declared executor."""
+    """Resolve statically declared tools, capabilities, owners, and executors."""
 
     def __init__(
         self,
         *,
-        capabilities: Iterable[Capability] = (),
+        declarations: Iterable[CapabilityDeclarations] = (),
         executors: Iterable[Executor] = (),
-        tool_views: Iterable[ToolView] = (),
     ) -> None:
-        self._capabilities = _unique(capabilities, lambda item: item.id, "capability")
-        self._executors = _unique(executors, lambda item: item.executor_id, "executor")
-        self._views = _unique(tool_views, lambda item: item.name, "tool")
+        declared = _unique(
+            declarations,
+            lambda item: item.domain_owner_id,
+            "domain owner",
+        )
+        self._declarations = MappingProxyType(declared)
+        capabilities = tuple(
+            capability
+            for declaration in declared.values()
+            for capability in declaration.capabilities
+        )
+        tool_views = tuple(
+            view for declaration in declared.values() for view in declaration.tool_views
+        )
+        self._capabilities = MappingProxyType(
+            _unique(capabilities, lambda item: item.id, "capability")
+        )
+        self._executors = MappingProxyType(
+            _unique(executors, lambda item: item.executor_id, "executor")
+        )
+        self._views = MappingProxyType(
+            _unique(tool_views, lambda item: item.name, "tool")
+        )
+        self._domain_owners = MappingProxyType(
+            {
+                capability.id: declaration.domain_owner_id
+                for declaration in declared.values()
+                for capability in declaration.capabilities
+            }
+        )
         for capability in self._capabilities.values():
             if capability.executor_id not in self._executors:
                 raise ValueError(f"missing executor: {capability.executor_id}")
         for view in self._views.values():
             if view.capability_id not in self._capabilities:
                 raise ValueError(f"missing capability: {view.capability_id}")
+        declared_executor_ids = {
+            executor_id
+            for declaration in declared.values()
+            for executor_id in declaration.executor_ids
+        }
+        if declared_executor_ids != set(self._executors):
+            missing = sorted(declared_executor_ids - set(self._executors))
+            unexpected = sorted(set(self._executors) - declared_executor_ids)
+            raise ValueError(
+                "registered executors must match static declarations: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
 
     @property
     def tool_names(self) -> frozenset[str]:
         return frozenset(self._views)
+
+    @property
+    def domain_owner_ids(self) -> frozenset[str]:
+        return frozenset(self._declarations)
 
     def resolve_tool(self, name: str) -> tuple[ToolView, Capability]:
         try:
@@ -347,6 +369,16 @@ class CapabilityRegistry:
             return view, self._capabilities[view.capability_id]
         except KeyError as error:
             raise KeyError(f"unknown tool: {name}") from error
+
+    def resolve_domain_owner(self, capability_id: str) -> str:
+        try:
+            return self._domain_owners[capability_id]
+        except KeyError as error:
+            raise KeyError(f"unknown capability: {capability_id}") from error
+
+    def resolve_tool_owner(self, name: str) -> tuple[ToolView, Capability, str]:
+        view, capability = self.resolve_tool(name)
+        return view, capability, self.resolve_domain_owner(capability.id)
 
     def tool_definition(self, name: str) -> ToolDefinition:
         view, capability = self.resolve_tool(name)
@@ -366,7 +398,10 @@ class CapabilityRegistry:
 
     def resolve_execution(self, capability_id: str) -> tuple[Capability, Executor]:
         capability = self._capabilities[capability_id]
-        return capability, self._executors[capability.executor_id]
+        executor = self._executors[capability.executor_id]
+        if executor.executor_id != capability.executor_id:
+            raise ValueError(f"executor identity changed: {capability.executor_id}")
+        return capability, executor
 
     def validate_output(self, capability_id: str, output: object) -> ToolOutput:
         capability = self._capabilities[capability_id]
@@ -379,7 +414,11 @@ class CapabilityRegistry:
         _validate(capability.output_schema, output.data, ToolOutputValidationError)
         return output
 
-    def validate_declarations(self, declarations: ExtensionDeclarations) -> None:
+    def validate_declarations(self, declarations: CapabilityDeclarations) -> None:
+        if self._declarations.get(declarations.domain_owner_id) != declarations:
+            raise ValueError(
+                f"domain declaration differs: {declarations.domain_owner_id}"
+            )
         for capability in declarations.capabilities:
             if self._capabilities.get(capability.id) != capability:
                 raise ValueError(f"capability declaration differs: {capability.id}")
@@ -633,10 +672,9 @@ __all__ = [
     "CapabilityInputError",
     "CapabilityRegistry",
     "Executor",
-    "ExtensionDeclarations",
+    "CapabilityDeclarations",
     "MAX_APPROVAL_DOCUMENT_CHARACTERS",
     "SideEffectExecutor",
-    "ToolApplicability",
     "ToolExecution",
     "ToolOutput",
     "ToolOutputValidationError",

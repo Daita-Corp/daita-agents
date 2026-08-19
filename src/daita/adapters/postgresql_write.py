@@ -43,7 +43,7 @@ from ..domains.data.sql import (
     validate_postgresql_update_intent,
     validate_postgresql_update_scope,
 )
-from ..errors import PluginError
+from ..errors import DaitaError
 from ..security import SecretProvider, default_secret_provider
 from ..storage.sqlite import (
     DatabaseWriteOutcome,
@@ -160,7 +160,7 @@ LIMIT 1
 """
 
 
-class PostgreSQLUpdatePreviewError(PluginError):
+class PostgreSQLUpdatePreviewError(DaitaError):
     """Stable preview failure that excludes driver and server diagnostics."""
 
     def __init__(self, code: str, message: str) -> None:
@@ -169,10 +169,10 @@ class PostgreSQLUpdatePreviewError(PluginError):
         if not isinstance(message, str) or not message:
             raise ValueError("preview error message must be non-empty text")
         self.code = code
-        super().__init__(message, plugin_id="postgresql", error_code=code)
+        super().__init__(message, error_code=code)
 
 
-class PostgreSQLUpdateExecutionError(PluginError):
+class PostgreSQLUpdateExecutionError(DaitaError):
     """Stable write failure with bounded receipt/outcome details."""
 
     def __init__(
@@ -182,7 +182,7 @@ class PostgreSQLUpdateExecutionError(PluginError):
         details: Mapping[str, object] | None = None,
     ) -> None:
         self.details = FrozenJsonObject.from_mapping(details or {})
-        super().__init__(message, plugin_id="postgresql", error_code=code)
+        super().__init__(message, error_code=code)
 
 
 @dataclass(frozen=True, slots=True)

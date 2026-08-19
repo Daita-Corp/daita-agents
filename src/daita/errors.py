@@ -198,26 +198,7 @@ class LLMError(DaitaError):
         )
 
 
-class PluginError(DaitaError):
-    """Failure owned by an extension or resource adapter."""
-
-    def __init__(
-        self,
-        message: str = "Extension operation failed.",
-        *,
-        plugin_id: str | None = None,
-        error_code: str = "plugin_error",
-        retryability: ErrorRetryability = ErrorRetryability.UNKNOWN,
-    ) -> None:
-        self.plugin_id = _optional_identifier(plugin_id, "plugin_id")
-        super().__init__(
-            message,
-            error_code=error_code,
-            retryability=retryability,
-        )
-
-
-class SkillError(PluginError):
+class SkillError(DaitaError):
     """Failure owned by skill discovery, selection, or lifecycle."""
 
     def __init__(
@@ -231,7 +212,6 @@ class SkillError(PluginError):
         self.skill_id = _optional_identifier(skill_id, "skill_id")
         super().__init__(
             message,
-            plugin_id=None,
             error_code=error_code,
             retryability=retryability,
         )
@@ -360,7 +340,6 @@ __all__ = [
     "FocusDSLError",
     "LLMError",
     "PermanentError",
-    "PluginError",
     "RateLimitError",
     "RetryableError",
     "SkillError",

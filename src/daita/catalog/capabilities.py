@@ -10,7 +10,6 @@ from ..capabilities import (
     AccessMode,
     Capability,
     Executor,
-    ToolApplicability,
     ToolExecution,
     ToolOutput,
     ToolView,
@@ -470,25 +469,21 @@ def catalog_declarations(
                 name="catalog_search",
                 capability_id=search.id,
                 description=search.description,
-                applicability=ToolApplicability(minimum_active_sources=1),
             ),
             ToolView(
                 name="catalog_schema",
                 capability_id=schema.id,
                 description=schema.description,
-                applicability=ToolApplicability(minimum_active_sources=1),
             ),
             ToolView(
                 name="catalog_inspect",
                 capability_id=inspect.id,
                 description=inspect.description,
-                applicability=ToolApplicability(minimum_active_sources=1),
             ),
             ToolView(
                 name="catalog_traverse",
                 capability_id=traverse.id,
                 description=traverse.description,
-                applicability=ToolApplicability(minimum_active_sources=1),
             ),
         ),
     )

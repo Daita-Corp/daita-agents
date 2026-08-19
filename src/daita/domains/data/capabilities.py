@@ -11,8 +11,7 @@ from ...capabilities import (
     Capability,
     CapabilityInputError,
     Executor,
-    ExtensionDeclarations,
-    ToolApplicability,
+    CapabilityDeclarations,
     ToolExecution,
     ToolOutput,
     ToolView,
@@ -575,9 +574,9 @@ def sqlite_query_declarations(
     agent_id: str, backend: SQLiteReadBackend
 ) -> SQLiteQueryDeclarations:
     executor = SQLiteQueryExecutor(agent_id, backend)
-    extension = sqlite_query_extension_declarations()
+    declarations = sqlite_query_capability_declarations()
     return SQLiteQueryDeclarations(
-        extension.capabilities, (executor,), extension.tool_views
+        declarations.capabilities, (executor,), declarations.tool_views
     )
 
 
@@ -585,9 +584,9 @@ def postgresql_query_declarations(
     agent_id: str, backend: PostgreSQLReadBackend
 ) -> PostgreSQLQueryDeclarations:
     executor = PostgreSQLQueryExecutor(agent_id, backend)
-    extension = postgresql_query_extension_declarations()
+    declarations = postgresql_query_capability_declarations()
     return PostgreSQLQueryDeclarations(
-        extension.capabilities, (executor,), extension.tool_views
+        declarations.capabilities, (executor,), declarations.tool_views
     )
 
 
@@ -596,11 +595,11 @@ def postgresql_update_preview_declarations(
     backend: PostgreSQLUpdatePreviewBackend,
 ) -> PostgreSQLUpdatePreviewDeclarations:
     executor = PostgreSQLUpdatePreviewExecutor(agent_id, backend)
-    extension = postgresql_update_preview_extension_declarations()
+    declarations = postgresql_update_preview_capability_declarations()
     return PostgreSQLUpdatePreviewDeclarations(
-        extension.capabilities,
+        declarations.capabilities,
         (executor,),
-        extension.tool_views,
+        declarations.tool_views,
     )
 
 
@@ -609,37 +608,35 @@ def postgresql_update_declarations(
     backend: PostgreSQLUpdateBackend,
 ) -> PostgreSQLUpdateDeclarations:
     executor = PostgreSQLUpdateExecutor(agent_id, backend)
-    extension = postgresql_update_extension_declarations()
+    declarations = postgresql_update_capability_declarations()
     return PostgreSQLUpdateDeclarations(
-        extension.capabilities,
+        declarations.capabilities,
         (executor,),
-        extension.tool_views,
+        declarations.tool_views,
     )
 
 
-def sqlite_query_extension_declarations() -> ExtensionDeclarations:
+def sqlite_query_capability_declarations() -> CapabilityDeclarations:
     return _query_declarations(
         SQLITE_QUERY_CAPABILITY_ID,
         SQLITE_QUERY_EVIDENCE_KIND,
         SQLITE_QUERY_EXECUTOR_ID,
-        "sqlite",
         "SQLite",
         "data_query_sqlite",
     )
 
 
-def postgresql_query_extension_declarations() -> ExtensionDeclarations:
+def postgresql_query_capability_declarations() -> CapabilityDeclarations:
     return _query_declarations(
         POSTGRESQL_QUERY_CAPABILITY_ID,
         POSTGRESQL_QUERY_EVIDENCE_KIND,
         POSTGRESQL_QUERY_EXECUTOR_ID,
-        "postgresql",
         "PostgreSQL",
         "data_query_postgresql",
     )
 
 
-def postgresql_update_preview_extension_declarations() -> ExtensionDeclarations:
+def postgresql_update_preview_capability_declarations() -> CapabilityDeclarations:
     cell_schema: dict[str, object] = {
         "type": "object",
         "properties": {
@@ -716,19 +713,16 @@ def postgresql_update_preview_extension_declarations() -> ExtensionDeclarations:
         name=POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
-        applicability=ToolApplicability(
-            source_adapter_ids=("postgresql",),
-            minimum_active_sources=1,
-        ),
     )
-    return ExtensionDeclarations(
-        (capability,),
-        (capability.executor_id,),
-        (view,),
+    return CapabilityDeclarations(
+        domain_owner_id="data",
+        capabilities=(capability,),
+        executor_ids=(capability.executor_id,),
+        tool_views=(view,),
     )
 
 
-def postgresql_update_extension_declarations() -> ExtensionDeclarations:
+def postgresql_update_capability_declarations() -> CapabilityDeclarations:
     cell_schema: dict[str, object] = {
         "type": "object",
         "properties": {
@@ -819,22 +813,22 @@ def postgresql_update_extension_declarations() -> ExtensionDeclarations:
         name=POSTGRESQL_UPDATE_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
-        applicability=ToolApplicability(
-            source_adapter_ids=("postgresql",),
-            minimum_active_sources=1,
-        ),
     )
-    return ExtensionDeclarations((capability,), (capability.executor_id,), (view,))
+    return CapabilityDeclarations(
+        domain_owner_id="data",
+        capabilities=(capability,),
+        executor_ids=(capability.executor_id,),
+        tool_views=(view,),
+    )
 
 
 def _query_declarations(
     capability_id: str,
     output_kind: str,
     executor_id: str,
-    adapter_id: str,
     adapter_name: str,
     tool_name: str,
-) -> ExtensionDeclarations:
+) -> CapabilityDeclarations:
     capability = Capability(
         id=capability_id,
         description=f"Run one validated, read-only, bounded {adapter_name} query.",
@@ -864,11 +858,13 @@ def _query_declarations(
         name=tool_name,
         capability_id=capability.id,
         description=capability.description,
-        applicability=ToolApplicability(
-            source_adapter_ids=(adapter_id,), minimum_active_sources=1
-        ),
     )
-    return ExtensionDeclarations((capability,), (executor_id,), (view,))
+    return CapabilityDeclarations(
+        domain_owner_id="data",
+        capabilities=(capability,),
+        executor_ids=(executor_id,),
+        tool_views=(view,),
+    )
 
 
 def _query_output_schema() -> dict[str, object]:
@@ -1055,11 +1051,11 @@ __all__ = [
     "SQLiteReadBackend",
     "SQLiteReadResult",
     "postgresql_query_declarations",
-    "postgresql_query_extension_declarations",
+    "postgresql_query_capability_declarations",
     "postgresql_update_preview_declarations",
-    "postgresql_update_preview_extension_declarations",
+    "postgresql_update_preview_capability_declarations",
     "postgresql_update_declarations",
-    "postgresql_update_extension_declarations",
+    "postgresql_update_capability_declarations",
     "sqlite_query_declarations",
-    "sqlite_query_extension_declarations",
+    "sqlite_query_capability_declarations",
 ]

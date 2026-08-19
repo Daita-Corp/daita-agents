@@ -12,13 +12,12 @@ from daita.capabilities import (
     AccessMode,
     ApprovalDecision,
     Capability,
-    CapabilityRegistry,
     ToolExecution,
     ToolOutput,
     ToolView,
 )
 from daita.catalog.capabilities import CATALOG_SEARCH_CAPABILITY_ID
-from daita.domains.data.controller import DataToolRuntime
+from daita.capability_runtime import CapabilityRuntime
 from daita.domains.data.context import DataContextBuilder, _estimate_input_tokens
 from daita.llm.errors import ContextEvidencePressureExceeded
 from daita.llm.models import (
@@ -51,6 +50,7 @@ from daita.loop import (
 from daita.loop.models import validate_completed_transcript
 from daita.memory.capabilities import MEMORY_SET_CAPABILITY_ID
 from daita.storage.sqlite import SQLiteStateStore
+from _capability_runtime_support import StaticTestDomain, static_registry
 
 NOW = datetime(2026, 8, 18, tzinfo=UTC)
 
@@ -216,7 +216,7 @@ def _runtime(
     recovery_timeout: float = 1.0,
     read_executor: _ReadExecutor | None = None,
     limits: LoopLimits = LoopLimits(),
-) -> DataToolRuntime:
+) -> CapabilityRuntime:
     resolved_read = read_executor or _ReadExecutor()
     read = Capability(
         id=CATALOG_SEARCH_CAPABILITY_ID,
@@ -255,24 +255,22 @@ def _runtime(
     async def approve(_request):
         return ApprovalDecision.APPROVE
 
-    return DataToolRuntime(
-        CapabilityRegistry(
-            capabilities=(read, write),
-            executors=(resolved_read, side_effect),
-            tool_views=(
-                ToolView(
-                    name="stage_a_read",
-                    capability_id=read.id,
-                    description=read.description,
-                ),
-                ToolView(
-                    name="stage_a_write",
-                    capability_id=write.id,
-                    description=write.description,
-                ),
-            ),
+    views = (
+        ToolView(
+            name="stage_a_read",
+            capability_id=read.id,
+            description=read.description,
         ),
-        _RuntimeCatalog(),  # type: ignore[arg-type]
+        ToolView(
+            name="stage_a_write",
+            capability_id=write.id,
+            description=write.description,
+        ),
+    )
+    domain = StaticTestDomain((read, write), views)
+    return CapabilityRuntime(
+        static_registry(domain, (resolved_read, side_effect)),
+        (domain,),
         approval_handler=approve,
         limits=limits,
         side_effect_recovery_timeout_seconds=recovery_timeout,
@@ -875,9 +873,7 @@ async def test_runtime_binds_classification_and_provenance_to_every_success():
 
     result = outcome.ordered_results[0]
     assert result.sensitivity is ModelSensitivity.INTERNAL
-    assert result.sensitivity_provenance["authority"] == (
-        "conservative_runtime_default"
-    )
+    assert result.sensitivity_provenance["authority"] == "test_static_domain"
     assert result.sensitivity_provenance["capability_id"] == (
         CATALOG_SEARCH_CAPABILITY_ID
     )

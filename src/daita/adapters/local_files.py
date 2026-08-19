@@ -19,7 +19,6 @@ from typing import Protocol
 from urllib.parse import quote
 
 from .._json import canonical_json
-from ..capabilities import ExtensionDeclarations
 from ..catalog.models import (
     CatalogFacet,
     CatalogRelationship,
@@ -227,13 +226,6 @@ class LocalDirectoryResourceAdapter:
     @property
     def registration(self) -> SourceRegistration:
         return self._registration
-
-    def declarations(self) -> ExtensionDeclarations:
-        from ..domains.data.file_capabilities import (
-            local_file_read_extension_declarations,
-        )
-
-        return local_file_read_extension_declarations()
 
     async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
         self._require_request(request)

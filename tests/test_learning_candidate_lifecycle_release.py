@@ -292,13 +292,14 @@ async def test_semantic_acceptance_projects_only_its_exact_write_tool(tmp_path):
             created_at=now,
             source_id=source.id,
         )
-        runtime = agent._embedded._data_tool_runtime
-        runtime.select_learning_candidate(run.id, candidate)
+        runtime = agent._embedded._capability_runtime
+        guard = agent._embedded._learning_candidate_guard
+        guard.select(run.id, candidate)
         try:
             names = {definition.name for definition in await runtime.definitions(run)}
         finally:
-            runtime.clear_learning_candidate(run.id)
-            runtime.clear_learning_candidate_outcome(run.id)
+            guard.clear(run.id)
+            guard.clear_outcome(run.id)
 
         write_tools = {
             "memory_set",

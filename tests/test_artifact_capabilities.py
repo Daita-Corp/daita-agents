@@ -19,7 +19,7 @@ from daita.domains.data.export_capabilities import (
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
     ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
     DOCUMENT_CREATE_TOOL_NAME,
-    artifact_extension_declarations,
+    artifact_capability_declarations,
 )
 from daita.llm.models import (
     CanonicalMessage,
@@ -102,7 +102,7 @@ def _result_error_code(result: ToolResultBlock) -> str:
 def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -> None:
     assert not hasattr(data_controller, "_explicit_artifact_request")
     assert not hasattr(data_controller, "_explicit_default_location_request")
-    declarations = artifact_extension_declarations()
+    declarations = artifact_capability_declarations()
     schemas = {
         view.name: next(
             item for item in declarations.capabilities if item.id == view.capability_id
@@ -136,7 +136,7 @@ def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -
 def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite() -> (
     None
 ):
-    extension = artifact_extension_declarations()
+    extension = artifact_capability_declarations()
     view = next(
         item
         for item in extension.tool_views
@@ -173,7 +173,7 @@ def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite()
 
 
 def test_artifact_set_export_location_schema_accepts_only_one_destination_id() -> None:
-    extension = artifact_extension_declarations()
+    extension = artifact_capability_declarations()
     view = next(
         item
         for item in extension.tool_views
@@ -330,7 +330,7 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
             conversation_id=created.conversation_id,
         )
         result = (
-            await agent._embedded._data_tool_runtime.execute_all(
+            await agent._embedded._capability_runtime.execute_all(
                 run,
                 (
                     ToolCall(

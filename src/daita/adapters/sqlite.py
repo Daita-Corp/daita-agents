@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from ..capabilities import ExtensionDeclarations
 from ..catalog.models import (
     CatalogFacet,
     CatalogRelationship,
@@ -32,7 +31,6 @@ from ..catalog.models import (
     TabularIndex,
     catalog_resource_id,
 )
-from ..domains.data.capabilities import sqlite_query_extension_declarations
 from .models import (
     DiscoveryRequest,
     DiscoveryResult,
@@ -111,9 +109,6 @@ class SQLiteResourceAdapter:
     @property
     def registration(self) -> SourceRegistration:
         return self._registration
-
-    def declarations(self) -> ExtensionDeclarations:
-        return sqlite_query_extension_declarations()
 
     async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
         self._require_request(request)

@@ -10,8 +10,7 @@ from ...capabilities import (
     AccessMode,
     Capability,
     Executor,
-    ExtensionDeclarations,
-    ToolApplicability,
+    CapabilityDeclarations,
     ToolExecution,
     ToolOutput,
     ToolView,
@@ -207,15 +206,15 @@ def local_file_read_declarations(
     backend: LocalFileReadBackend,
 ) -> LocalFileReadDeclarations:
     executor = LocalFileReadExecutor(agent_id, backend)
-    extension = local_file_read_extension_declarations()
+    declarations = local_file_read_capability_declarations()
     return LocalFileReadDeclarations(
-        capabilities=extension.capabilities,
+        capabilities=declarations.capabilities,
         executors=(executor,),
-        tool_views=extension.tool_views,
+        tool_views=declarations.tool_views,
     )
 
 
-def local_file_read_extension_declarations() -> ExtensionDeclarations:
+def local_file_read_capability_declarations() -> CapabilityDeclarations:
     """Advertise the stable file-read contract without opening a local root."""
 
     capability = Capability(
@@ -240,12 +239,9 @@ def local_file_read_extension_declarations() -> ExtensionDeclarations:
         name=LOCAL_FILE_READ_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
-        applicability=ToolApplicability(
-            source_adapter_ids=("local-directory",),
-            minimum_active_sources=1,
-        ),
     )
-    return ExtensionDeclarations(
+    return CapabilityDeclarations(
+        domain_owner_id="data",
         capabilities=(capability,),
         executor_ids=(LOCAL_FILE_READ_EXECUTOR_ID,),
         tool_views=(view,),
@@ -290,5 +286,5 @@ __all__ = [
     "LocalFileReadExecutor",
     "LocalFileReadResult",
     "local_file_read_declarations",
-    "local_file_read_extension_declarations",
+    "local_file_read_capability_declarations",
 ]

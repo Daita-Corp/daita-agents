@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 
 from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
     Capability,
+    CapabilityDeclarations,
     CapabilityInputError,
     Executor,
     SideEffectExecutor,
-    ToolApplicability,
     ToolExecution,
     ToolOutput,
     ToolView,
 )
+from ..capability_runtime import CapabilityFailure, SideEffectPlan
+from ..domains.learning import LearningCandidateGuard
+from ..llm.models import ModelSensitivity, ToolCall
+from ..loop.models import RunInput
 from .store import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,
     SKILL_INSTRUCTIONS_MAX_CHARACTERS,
@@ -23,6 +28,7 @@ from .store import (
     SkillStore,
     SkillStoreError,
     SkillValidationError,
+    validate_skill_name,
 )
 
 SKILL_VIEW_CAPABILITY_ID = "skill.view"
@@ -41,6 +47,7 @@ SKILL_DELETE_OUTPUT_KIND = "skill.deleted"
 SKILL_DELETE_TOOL_NAME = "skill_delete"
 
 _SKILL_NAME_PATTERN = "^[a-z][a-z0-9-]{0,63}$"
+SKILL_DOMAIN_OWNER_ID = "skills"
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,7 +297,6 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 name=name,
                 capability_id=capability.id,
                 description=capability.description,
-                applicability=ToolApplicability(minimum_active_sources=0),
             )
             for name, capability in zip(
                 (
@@ -303,6 +309,131 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
             )
         ),
     )
+
+
+class SkillCapabilityDomain:
+    """Own fixed skill applicability, validation, and safe failure semantics."""
+
+    domain_owner_id = SKILL_DOMAIN_OWNER_ID
+
+    def __init__(
+        self,
+        declarations: CapabilityDeclarations,
+        learning: LearningCandidateGuard,
+    ) -> None:
+        if declarations.domain_owner_id != self.domain_owner_id:
+            raise ValueError("skill declarations have the wrong domain owner")
+        if {item.id for item in declarations.capabilities} != {
+            SKILL_VIEW_CAPABILITY_ID,
+            SKILL_SAVE_CAPABILITY_ID,
+            SKILL_DELETE_CAPABILITY_ID,
+        }:
+            raise ValueError("skill domain requires its exact capabilities")
+        self._declarations = declarations
+        self._learning = learning
+        self._views = tuple(declarations.tool_views)
+        self._capabilities = {item.id: item for item in declarations.capabilities}
+
+    @property
+    def declarations(self) -> CapabilityDeclarations:
+        return self._declarations
+
+    async def project(self, run: RunInput) -> tuple[str, ...]:
+        return tuple(
+            view.name
+            for view in self._views
+            if self._learning.allows(
+                run.id,
+                view.name,
+                side_effecting=self._capabilities[view.capability_id].side_effecting,
+            )
+        )
+
+    def normalize_arguments(
+        self,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        return arguments
+
+    async def prepare_call(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+    ) -> FrozenJsonObject:
+        if capability.side_effecting:
+            self._learning.validate_side_effect(run.id, call)
+        if capability.id == SKILL_VIEW_CAPABILITY_ID:
+            name = arguments.get("name")
+            try:
+                if not isinstance(name, str):
+                    raise TypeError("skill name must be text")
+                validate_skill_name(name)
+            except (TypeError, SkillValidationError) as error:
+                raise CapabilityInputError(
+                    "skill_invalid_name",
+                    "Skill names must match [a-z][a-z0-9-]{0,63}.",
+                ) from error
+        return arguments
+
+    async def side_effect_plan(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        execution: ToolExecution,
+        fingerprint: FrozenJsonObject,
+    ) -> SideEffectPlan:
+        return SideEffectPlan()
+
+    async def finalize_output(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        output: ToolOutput,
+    ) -> ToolOutput:
+        if capability.side_effecting:
+            self._learning.mark_side_effect_succeeded(run.id)
+        if output.sensitivity is not None:
+            return output
+        return replace(
+            output,
+            sensitivity=ModelSensitivity.INTERNAL,
+            sensitivity_provenance={
+                "authority": "skill_domain",
+                "capability_id": capability.id,
+            },
+        )
+
+    def normalize_error(
+        self,
+        call: ToolCall,
+        error: BaseException,
+    ) -> CapabilityFailure | None:
+        if (
+            isinstance(error, CapabilityInputError)
+            and error.details.get("name") == "name"
+        ):
+            return CapabilityFailure(
+                "skill_invalid_name",
+                "Skill names must match [a-z][a-z0-9-]{0,63}.",
+            )
+        if isinstance(error, SkillNotFoundError):
+            return CapabilityFailure(
+                "skill_not_found",
+                "The requested skill is not available.",
+                {"name": call.arguments.get("name")},
+            )
+        if isinstance(error, SkillStoreError):
+            return CapabilityFailure(
+                "skill_unavailable",
+                "The requested skill document is unavailable or invalid.",
+            )
+        return None
 
 
 def _name_input_schema() -> dict[str, object]:
@@ -395,6 +526,7 @@ __all__ = [
     "SKILL_DELETE_EXECUTOR_ID",
     "SKILL_DELETE_OUTPUT_KIND",
     "SKILL_DELETE_TOOL_NAME",
+    "SKILL_DOMAIN_OWNER_ID",
     "SKILL_SAVE_CAPABILITY_ID",
     "SKILL_SAVE_EXECUTOR_ID",
     "SKILL_SAVE_OUTPUT_KIND",
@@ -404,6 +536,7 @@ __all__ = [
     "SKILL_VIEW_OUTPUT_KIND",
     "SKILL_VIEW_TOOL_NAME",
     "SkillDeclarations",
+    "SkillCapabilityDomain",
     "SkillDeleteExecutor",
     "SkillSaveExecutor",
     "SkillViewExecutor",

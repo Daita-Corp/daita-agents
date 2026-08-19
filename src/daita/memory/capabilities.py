@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 
 from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
     Capability,
+    CapabilityDeclarations,
     CapabilityInputError,
     Executor,
     SideEffectExecutor,
-    ToolApplicability,
     ToolExecution,
     ToolOutput,
     ToolView,
 )
+from ..capability_runtime import CapabilityFailure, SideEffectPlan
+from ..llm.models import ModelSensitivity, ToolCall
+from ..loop.models import RunInput
+from ..domains.learning import LearningCandidateGuard
 from .store import (
     MEMORY_MAX_CHARACTERS,
     MemoryStore,
@@ -27,6 +32,7 @@ MEMORY_SET_CAPABILITY_ID = "memory.set"
 MEMORY_SET_EXECUTOR_ID = "memory.set.executor"
 MEMORY_SET_OUTPUT_KIND = "memory.replacement"
 MEMORY_SET_TOOL_NAME = "memory_set"
+MEMORY_DOMAIN_OWNER_ID = "memory"
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,10 +137,105 @@ def memory_set_declarations(store: MemoryStore) -> MemoryDeclarations:
                 name=MEMORY_SET_TOOL_NAME,
                 capability_id=capability.id,
                 description=capability.description,
-                applicability=ToolApplicability(minimum_active_sources=0),
             ),
         ),
     )
+
+
+class MemoryCapabilityDomain:
+    """Own projection and result semantics for bounded memory replacement."""
+
+    domain_owner_id = MEMORY_DOMAIN_OWNER_ID
+
+    def __init__(
+        self,
+        declarations: CapabilityDeclarations,
+        learning: LearningCandidateGuard,
+    ) -> None:
+        if declarations.domain_owner_id != self.domain_owner_id:
+            raise ValueError("memory declarations have the wrong domain owner")
+        if {item.id for item in declarations.capabilities} != {
+            MEMORY_SET_CAPABILITY_ID
+        }:
+            raise ValueError("memory domain requires its exact capability")
+        self._declarations = declarations
+        self._learning = learning
+        self._views = tuple(declarations.tool_views)
+        self._capabilities = {item.id: item for item in declarations.capabilities}
+
+    @property
+    def declarations(self) -> CapabilityDeclarations:
+        return self._declarations
+
+    async def project(self, run: RunInput) -> tuple[str, ...]:
+        return tuple(
+            view.name
+            for view in self._views
+            if self._learning.allows(
+                run.id,
+                view.name,
+                side_effecting=self._capabilities[view.capability_id].side_effecting,
+            )
+        )
+
+    def normalize_arguments(
+        self,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        return arguments
+
+    async def prepare_call(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+    ) -> FrozenJsonObject:
+        self._learning.validate_side_effect(run.id, call)
+        return arguments
+
+    async def side_effect_plan(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        execution: ToolExecution,
+        fingerprint: FrozenJsonObject,
+    ) -> SideEffectPlan:
+        return SideEffectPlan()
+
+    async def finalize_output(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        output: ToolOutput,
+    ) -> ToolOutput:
+        self._learning.mark_side_effect_succeeded(run.id)
+        if output.sensitivity is not None:
+            return output
+        return replace(
+            output,
+            sensitivity=ModelSensitivity.INTERNAL,
+            sensitivity_provenance={
+                "authority": "memory_domain",
+                "capability_id": capability.id,
+            },
+        )
+
+    def normalize_error(
+        self,
+        call: ToolCall,
+        error: BaseException,
+    ) -> CapabilityFailure | None:
+        if isinstance(error, MemoryStoreError):
+            return CapabilityFailure(
+                "memory_unavailable",
+                "The selected memory document is unavailable or invalid.",
+            )
+        return None
 
 
 def _replacement_arguments(request: ToolExecution) -> tuple[str, str]:
@@ -152,6 +253,8 @@ __all__ = [
     "MEMORY_SET_EXECUTOR_ID",
     "MEMORY_SET_OUTPUT_KIND",
     "MEMORY_SET_TOOL_NAME",
+    "MEMORY_DOMAIN_OWNER_ID",
+    "MemoryCapabilityDomain",
     "MemoryDeclarations",
     "MemorySetExecutor",
     "memory_set_declarations",

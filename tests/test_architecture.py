@@ -60,6 +60,87 @@ def _imports(path: Path) -> set[str]:
     return imported
 
 
+def test_stage_m1_has_one_common_runtime_and_no_legacy_compatibility_surface():
+    prohibited = (
+        "Data" + "ToolRuntime",
+        "_MVP_" + "CAPABILITIES",
+        "_projected_" + "tool_names",
+        "Tool" + "Applicability",
+        "Extension" + "Declarations",
+        "extension_" + "declarations",
+        "Plugin" + "Error",
+        "plugin_" + "id",
+        "_data_" + "tool_runtime",
+        "Catalog" + "DataReader",
+    )
+    production = _python_text(PACKAGE)
+    for symbol in prohibited:
+        assert symbol not in production
+
+    runtime_path = PACKAGE / "capability_runtime.py"
+    runtime = runtime_path.read_text(encoding="utf-8")
+    runtime_tree = ast.parse(runtime)
+    assert _class_owners("CapabilityRuntime") == {"capability_runtime.py"}
+    assert not {
+        "adapters",
+        "catalog",
+        "domains.data",
+        "memory",
+        "semantics",
+        "skills",
+    } & _imports(runtime_path)
+    assert not {
+        node.id
+        for node in ast.walk(runtime_tree)
+        if isinstance(node, ast.Name) and node.id.endswith("_CAPABILITY_ID")
+    }
+    for prefix in ("artifact.", "catalog.", "data.", "memory.", "semantic.", "skill."):
+        assert prefix not in runtime
+
+
+def test_stage_m1_keeps_loop_context_and_composition_owners_exact():
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
+    assert _class_owners("DataContextBuilder") == {"domains/data/context.py"}
+    assert _class_owners("ToolRuntime") == {"loop/driver.py"}
+    assert "tools: ToolRuntime" in loop
+    assert "_capability_runtime" in embedded
+    assert "CapabilityRuntime(" in embedded
+    assert "capability_runtime" not in loop
+
+
+async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
+    tmp_path,
+):
+    agent = await daita.Agent.create("stage-m1-owners", root=tmp_path)
+    try:
+        registry = agent._embedded._capabilities
+        runtime = agent._embedded._capability_runtime
+        expected_owners = {"artifacts", "data", "memory", "semantics", "skills"}
+        assert registry.domain_owner_ids == expected_owners
+        assert set(runtime._domains) == expected_owners
+
+        resolved = {}
+        for name in registry.tool_names:
+            view, capability, owner_id = registry.resolve_tool_owner(name)
+            assert view.capability_id == capability.id
+            assert registry.resolve_domain_owner(capability.id) == owner_id
+            assert capability in runtime._domains[owner_id].declarations.capabilities
+            resolved[name] = owner_id
+
+        assert resolved["catalog_search"] == "data"
+        assert resolved["data_query_sqlite"] == "data"
+        assert resolved["data_query_postgresql"] == "data"
+        assert resolved["data_read_file"] == "data"
+        assert resolved["data_update_postgresql"] == "data"
+        assert resolved["memory_set"] == "memory"
+        assert resolved["skill_view"] == "skills"
+        assert resolved["semantic_list"] == "semantics"
+        assert resolved["artifact_create_document"] == "artifacts"
+    finally:
+        await agent.close()
+
+
 def test_final_src_layout_has_one_package_owner_and_no_replacement_alias():
     assert PACKAGE == ROOT / "src" / "daita"
     assert not (ROOT / "daita").exists()
@@ -348,13 +429,14 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
         PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
     )
 
-    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+    skill_capabilities = (PACKAGE / "skills" / "capabilities.py").read_text(
         encoding="utf-8"
     )
     context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
-    assert "SKILL_VIEW_CAPABILITY_ID" in controller
-    assert "SKILL_SAVE_CAPABILITY_ID" in controller
-    assert "SKILL_DELETE_CAPABILITY_ID" in controller
+    assert "class SkillCapabilityDomain" in skill_capabilities
+    assert "SKILL_VIEW_CAPABILITY_ID" in skill_capabilities
+    assert "SKILL_SAVE_CAPABILITY_ID" in skill_capabilities
+    assert "SKILL_DELETE_CAPABILITY_ID" in skill_capabilities
     assert "skill_index" in context
     assert "historical skill body redacted" in context
 
@@ -362,9 +444,6 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
 def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
-    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
-        encoding="utf-8"
-    )
     context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
@@ -374,10 +453,10 @@ def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners(
     assert 'SEMANTIC_SAVE_TOOL_NAME = "semantic_save"' in semantics
     assert 'SEMANTIC_DELETE_TOOL_NAME = "semantic_delete"' in semantics
     assert "CREATE TABLE semantic_annotations" in schema
-    assert "semantic_resource_facts" in controller
-    assert "semantic_annotation_issue" in controller
-    assert "bind_current_semantic_evidence" in controller
-    assert "without_runtime_owned_semantic_evidence" in controller
+    assert "class SemanticCapabilityDomain" in semantics
+    assert "semantic_resource_facts" in semantics
+    assert "_annotation_issue" in semantics
+    assert "_bind_current_evidence" in semantics
     assert "render_semantic_recall" in context
     assert "semantic_declarations(identity.id, store)" in embedded
     assert "mutation_lock=mutation_lock" in embedded
@@ -410,9 +489,8 @@ def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners(
 def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
-    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
-        encoding="utf-8"
-    )
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
+    learning = (PACKAGE / "domains" / "learning.py").read_text(encoding="utf-8")
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
     schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     evaluation = (PACKAGE / "evaluation.py").read_text(encoding="utf-8")
@@ -420,23 +498,28 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
     package_text = _python_text(PACKAGE)
 
     assert _class_owners("AgentLoop") == {"loop/driver.py"}
-    assert _class_owners("DataToolRuntime") == {"domains/data/controller.py"}
+    assert _class_owners("CapabilityRuntime") == {"capability_runtime.py"}
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
     assert "semantic_duplicate_identity" in semantics
     assert "SEMANTIC_MAINTENANCE_MAX_NOTICES" in semantics
     assert "semantic-maintenance" in semantics
     assert "review material only" in context
-    assert "_decorate_semantic_view" in controller
-    assert "_semantic_management_requested" not in controller
-    assert "_SEMANTIC_MANAGEMENT_SIGNALS" not in controller
-    assert "select_explicit_learning_run" in controller
-    assert "_semantic_maintenance_requested" in controller
-    assert "capability.id in _SEMANTIC_CAPABILITIES" in controller
+    assert "_decorate_view" in semantics
+    assert "select_explicit_learning_run" in semantics
+    assert "_maintenance_requested" in semantics
+    assert "class LearningCandidateGuard" in learning
+    for capability_id in (
+        "semantics.list",
+        "semantics.view",
+        "semantics.save",
+        "semantics.delete",
+    ):
+        assert capability_id not in runtime
     assert "semantic_annotations" in storage
     assert "CREATE TABLE learning_candidates" in schema
     assert "tools=()" in candidates
     assert "AgentLoop" not in candidates
-    assert "DataToolRuntime" not in candidates
+    assert "CapabilityRuntime" not in candidates
     assert "data_query_sqlite" not in candidates
     assert "data_query_postgresql" not in candidates
     assert "evaluation" not in storage.lower()
@@ -530,6 +613,7 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
             encoding="utf-8"
         )
+        runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
         package_text = _python_text(PACKAGE)
         for dormant_name in forbidden_tools | forbidden_capabilities:
             assert f'"{dormant_name}"' not in package_text
@@ -543,8 +627,8 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         assert "database_write_receipts" not in write_backend
         assert "SideEffectExecutor" not in write_backend
         assert "approval_handler" not in write_backend
-        assert "_execute_side_effect" in controller
-        assert "ApprovalRequest" in controller
+        assert "_execute_side_effect" in runtime
+        assert "ApprovalRequest" in runtime
         capabilities_owner = (
             PACKAGE / "domains" / "data" / "capabilities.py"
         ).read_text(encoding="utf-8")
@@ -703,16 +787,14 @@ def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
 
 def test_observation_owners_keep_tool_events_out_of_loop_and_storage():
     storage = _python_text(PACKAGE / "storage")
-    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
-        encoding="utf-8"
-    )
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
     loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
 
     assert "AgentEvent" not in storage
-    assert "AgentEventKind.TOOL_STARTED" in controller
-    assert "AgentEventKind.TOOL_COMPLETED" in controller
-    assert "AgentEventKind.APPROVAL_REQUESTED" in controller
-    assert "AgentEventKind.APPROVAL_DECIDED" in controller
+    assert "AgentEventKind.TOOL_STARTED" in runtime
+    assert "AgentEventKind.TOOL_COMPLETED" in runtime
+    assert "AgentEventKind.APPROVAL_REQUESTED" in runtime
+    assert "AgentEventKind.APPROVAL_DECIDED" in runtime
     assert "AgentEventKind.TOOL_STARTED" not in loop
     assert "AgentEventKind.TOOL_COMPLETED" not in loop
     assert "AgentEventKind.APPROVAL_REQUESTED" not in loop
@@ -721,9 +803,7 @@ def test_observation_owners_keep_tool_events_out_of_loop_and_storage():
 
 def test_stage_five_governance_extends_existing_execution_and_composition_owners():
     contracts = (PACKAGE / "capabilities.py").read_text(encoding="utf-8")
-    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
-        encoding="utf-8"
-    )
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     loop = _python_text(PACKAGE / "loop").lower()
     storage = _python_text(PACKAGE / "storage").lower()
@@ -735,10 +815,10 @@ def test_stage_five_governance_extends_existing_execution_and_composition_owners
         "class SideEffectExecutor",
     ):
         assert contract in contracts
-    assert controller.count("side_effect.preflight(execution)") == 2
-    assert "async with self._mutation_lock" in controller
-    assert "state_changed" in controller
-    assert "_execute_definitely" in controller
+    assert runtime.count("side_effect.preflight(execution)") == 2
+    assert "async with self._mutation_lock" in runtime
+    assert "state_changed" in runtime
+    assert "_execute_definitely" in runtime
     assert embedded.count("mutation_lock = asyncio.Lock()") == 1
     assert "mutation_lock=mutation_lock" in embedded
     assert "approval_handler=approval_handler" in embedded
@@ -790,7 +870,7 @@ def test_cli_remains_a_presentation_over_the_public_agent_api():
     for forbidden in (
         "._embedded",
         "CapabilityRegistry",
-        "DataToolRuntime",
+        "CapabilityRuntime",
         "executor.execute(",
         "resolve_execution(",
         "SQLiteStateStore",
@@ -844,7 +924,7 @@ def test_terminal_application_remains_a_presentation_over_the_public_agent_api()
         "._embedded",
         "AgentLoop",
         "CapabilityRegistry",
-        "DataToolRuntime",
+        "CapabilityRuntime",
         "ResourceAdapter",
         "SQLiteStateStore",
         "agent.toml",
@@ -1445,7 +1525,7 @@ def test_skill_save_delete_cannot_mutate_registered_execution_identities():
             assert term not in text
 
 
-def test_registry_and_data_runtime_keep_executor_resolution_ownership():
+def test_registry_and_common_runtime_keep_executor_resolution_ownership():
     resolution_owners = {
         path.relative_to(PACKAGE).as_posix()
         for path in PACKAGE.rglob("*.py")
@@ -1456,8 +1536,8 @@ def test_registry_and_data_runtime_keep_executor_resolution_ownership():
         for path in PACKAGE.rglob("*.py")
         if "executor.execute(" in path.read_text(encoding="utf-8")
     }
-    assert resolution_owners == {"capabilities.py", "domains/data/controller.py"}
-    assert resolved_executor_callers == {"domains/data/controller.py"}
+    assert resolution_owners == {"capabilities.py", "capability_runtime.py"}
+    assert resolved_executor_callers == {"capability_runtime.py"}
 
 
 def test_artifacts_have_one_concrete_owner_and_no_storage_renderer_or_policy_registry():
@@ -1526,10 +1606,10 @@ def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_
     from daita.domains.data.export_capabilities import (
         POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        artifact_extension_declarations,
+        artifact_capability_declarations,
     )
 
-    declarations = artifact_extension_declarations()
+    declarations = artifact_capability_declarations()
     for capability in declarations.capabilities:
         if capability.id not in {
             SQLITE_TABULAR_EXPORT_CAPABILITY_ID,

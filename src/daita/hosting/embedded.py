@@ -40,7 +40,12 @@ from ..artifacts.models import (
     ArtifactPayload,
 )
 from ..artifacts.store import AgentHomeArtifactStore
-from ..capabilities import ApprovalHandler, CapabilityRegistry
+from ..capabilities import (
+    ApprovalHandler,
+    CapabilityDeclarations,
+    CapabilityRegistry,
+)
+from ..capability_runtime import CapabilityRuntime
 from ..catalog.capabilities import catalog_declarations
 from ..catalog.models import (
     CatalogResource,
@@ -55,16 +60,20 @@ from ..catalog.models import (
 from ..catalog.service import CatalogService
 from ..config import AgentConfig
 from ..domains.data import (
+    ARTIFACT_DOMAIN_OWNER_ID,
     CatalogDataView,
+    DataCapabilityDomain,
     DataContextBuilder,
-    DataToolRuntime,
-    artifact_capability_declarations,
+    ArtifactCapabilityDomain,
+    artifact_declarations,
     local_file_read_declarations,
     postgresql_query_declarations,
     postgresql_update_declarations,
     postgresql_update_preview_declarations,
     sqlite_query_declarations,
 )
+from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
+from ..domains.learning import LearningCandidateGuard
 from ..domains.data.context import _project_completed_history
 from ..domains.data.sql import (
     validate_postgresql_update_scope,
@@ -110,7 +119,11 @@ from ..loop.driver import (
 )
 from ..loop.models import ConversationRun, LoopExit, LoopLimits, RunInput, Transcript
 from ..memory import MemoryStore
-from ..memory.capabilities import memory_set_declarations
+from ..memory.capabilities import (
+    MEMORY_DOMAIN_OWNER_ID,
+    MemoryCapabilityDomain,
+    memory_set_declarations,
+)
 from ..observation import AgentObserver
 from ..security import (
     CredentialSession,
@@ -125,11 +138,17 @@ from ..semantics import (
     SemanticAnnotationState,
     SemanticAnnotationView,
     SemanticKind,
+    SemanticCapabilityDomain,
+    SEMANTIC_DOMAIN_OWNER_ID,
     inspect_semantic_annotations,
     semantic_declarations,
 )
 from ..skills import Skill, SkillStore, SkillSummary
-from ..skills.capabilities import skill_declarations
+from ..skills.capabilities import (
+    SKILL_DOMAIN_OWNER_ID,
+    SkillCapabilityDomain,
+    skill_declarations,
+)
 from ..storage.sqlite import SQLiteStateStore
 from ..storage.sqlite_records import (
     PostgreSQLUpdateScope,
@@ -353,7 +372,9 @@ class EmbeddedAgent:
         capabilities: CapabilityRegistry,
         catalog_service: CatalogService,
         data_view: CatalogDataView,
-        data_tool_runtime: DataToolRuntime,
+        capability_runtime: CapabilityRuntime,
+        learning_candidate_guard: LearningCandidateGuard,
+        semantic_domain: SemanticCapabilityDomain,
         postgresql_update_backend: PostgreSQLUpdatePreviewBackend,
         memory_store: MemoryStore,
         skill_store: SkillStore,
@@ -389,7 +410,9 @@ class EmbeddedAgent:
         self._capabilities = capabilities
         self._catalog_service = catalog_service
         self._data_view = data_view
-        self._data_tool_runtime = data_tool_runtime
+        self._capability_runtime = capability_runtime
+        self._learning_candidate_guard = learning_candidate_guard
+        self._semantic_domain = semantic_domain
         self._postgresql_update_backend = postgresql_update_backend
         self._memory_store = memory_store
         self._skill_store = skill_store
@@ -862,7 +885,7 @@ class EmbeddedAgent:
         skills = skill_declarations(skill_store)
         semantics = semantic_declarations(identity.id, store)
         artifacts = (
-            artifact_capability_declarations(
+            artifact_declarations(
                 artifact_delivery,
                 artifact_store,
                 agent_id=identity.id,
@@ -874,7 +897,9 @@ class EmbeddedAgent:
             if artifact_store.available
             else None
         )
-        capabilities = CapabilityRegistry(
+        learning_candidate_guard = LearningCandidateGuard()
+        data_declarations = CapabilityDeclarations(
+            domain_owner_id=DATA_DOMAIN_OWNER_ID,
             capabilities=(
                 *catalog.capabilities,
                 *sqlite.capabilities,
@@ -882,11 +907,95 @@ class EmbeddedAgent:
                 *postgresql_preview.capabilities,
                 *postgresql_update.capabilities,
                 *local_files.capabilities,
-                *memory.capabilities,
-                *skills.capabilities,
-                *semantics.capabilities,
-                *(artifacts.capabilities if artifacts is not None else ()),
             ),
+            executor_ids=tuple(
+                item.executor_id
+                for item in (
+                    *catalog.capabilities,
+                    *sqlite.capabilities,
+                    *postgresql.capabilities,
+                    *postgresql_preview.capabilities,
+                    *postgresql_update.capabilities,
+                    *local_files.capabilities,
+                )
+            ),
+            tool_views=(
+                *catalog.tool_views,
+                *sqlite.tool_views,
+                *postgresql.tool_views,
+                *postgresql_preview.tool_views,
+                *postgresql_update.tool_views,
+                *local_files.tool_views,
+            ),
+        )
+        memory_declarations = CapabilityDeclarations(
+            domain_owner_id=MEMORY_DOMAIN_OWNER_ID,
+            capabilities=memory.capabilities,
+            executor_ids=tuple(item.executor_id for item in memory.capabilities),
+            tool_views=memory.tool_views,
+        )
+        skill_declaration_bundle = CapabilityDeclarations(
+            domain_owner_id=SKILL_DOMAIN_OWNER_ID,
+            capabilities=skills.capabilities,
+            executor_ids=tuple(item.executor_id for item in skills.capabilities),
+            tool_views=skills.tool_views,
+        )
+        semantic_declaration_bundle = CapabilityDeclarations(
+            domain_owner_id=SEMANTIC_DOMAIN_OWNER_ID,
+            capabilities=semantics.capabilities,
+            executor_ids=tuple(item.executor_id for item in semantics.capabilities),
+            tool_views=semantics.tool_views,
+        )
+        artifact_declaration_bundle = (
+            None
+            if artifacts is None
+            else CapabilityDeclarations(
+                domain_owner_id=ARTIFACT_DOMAIN_OWNER_ID,
+                capabilities=artifacts.capabilities,
+                executor_ids=tuple(item.executor_id for item in artifacts.capabilities),
+                tool_views=artifacts.tool_views,
+            )
+        )
+        data_domain = DataCapabilityDomain(
+            data_declarations,
+            data_view,
+            learning_candidate_guard,
+        )
+        memory_domain = MemoryCapabilityDomain(
+            memory_declarations,
+            learning_candidate_guard,
+        )
+        skill_domain = SkillCapabilityDomain(
+            skill_declaration_bundle,
+            learning_candidate_guard,
+        )
+        semantic_domain = SemanticCapabilityDomain(
+            semantic_declaration_bundle,
+            data_view,
+            store,
+            learning_candidate_guard,
+        )
+        artifact_domain = (
+            None
+            if artifact_declaration_bundle is None
+            else ArtifactCapabilityDomain(
+                artifact_declaration_bundle,
+                data_view,
+                store,
+                artifact_store,
+                artifact_delivery,
+                learning_candidate_guard,
+            )
+        )
+        domains = (
+            data_domain,
+            memory_domain,
+            skill_domain,
+            semantic_domain,
+            *((artifact_domain,) if artifact_domain is not None else ()),
+        )
+        capabilities = CapabilityRegistry(
+            declarations=tuple(domain.declarations for domain in domains),
             executors=(
                 *catalog.executors,
                 *sqlite.executors,
@@ -899,29 +1008,15 @@ class EmbeddedAgent:
                 *semantics.executors,
                 *(artifacts.executors if artifacts is not None else ()),
             ),
-            tool_views=(
-                *catalog.tool_views,
-                *sqlite.tool_views,
-                *postgresql.tool_views,
-                *postgresql_preview.tool_views,
-                *postgresql_update.tool_views,
-                *local_files.tool_views,
-                *memory.tool_views,
-                *skills.tool_views,
-                *semantics.tool_views,
-                *(artifacts.tool_views if artifacts is not None else ()),
-            ),
         )
-        data_tool_runtime = DataToolRuntime(
+        capability_runtime = CapabilityRuntime(
             capabilities,
-            data_view,
+            domains,
             approval_handler=approval_handler,
             mutation_lock=mutation_lock,
             observer=observer,
             clock=clock,
-            transcripts=store,
             artifacts=artifact_store,
-            artifact_delivery=artifact_delivery,
             limits=limits,
         )
         resolved_context = context_builder
@@ -943,7 +1038,7 @@ class EmbeddedAgent:
                 ),
                 max_context_evidence_bytes=limits.max_context_evidence_bytes,
             )
-            resolved_tools = data_tool_runtime
+            resolved_tools = capability_runtime
         transcripts = store
         loop = (
             None
@@ -973,7 +1068,9 @@ class EmbeddedAgent:
             capabilities=capabilities,
             catalog_service=catalog_service,
             data_view=data_view,
-            data_tool_runtime=data_tool_runtime,
+            capability_runtime=capability_runtime,
+            learning_candidate_guard=learning_candidate_guard,
+            semantic_domain=semantic_domain,
             postgresql_update_backend=postgresql_preview_backend,
             memory_store=memory_store,
             skill_store=skill_store,
@@ -987,7 +1084,7 @@ class EmbeddedAgent:
             artifact_delivery=artifact_delivery,
             candidate_acceptance_supported=(
                 isinstance(resolved_context, DataContextBuilder)
-                and resolved_tools is data_tool_runtime
+                and resolved_tools is capability_runtime
             ),
             mutation_lock=mutation_lock,
             model_profile=model_profile,
@@ -1336,12 +1433,12 @@ class EmbeddedAgent:
                 learning_candidate_id,
                 cast(str, learning_candidate_text),
             )
-            self._data_tool_runtime.select_learning_candidate(
+            self._learning_candidate_guard.select(
                 run_input.id,
                 cast(LearningCandidate, learning_candidate),
             )
         if explicit_learning:
-            self._data_tool_runtime.select_explicit_learning_run(run_input.id)
+            self._semantic_domain.select_explicit_learning_run(run_input.id)
         try:
             return await loop.run(
                 run_input,
@@ -1352,9 +1449,9 @@ class EmbeddedAgent:
             if learning_candidate_id is not None:
                 assert self._data_context_builder is not None
                 self._data_context_builder.clear_learning_candidate(run_input.id)
-                self._data_tool_runtime.clear_learning_candidate(run_input.id)
+                self._learning_candidate_guard.clear(run_input.id)
             if explicit_learning:
-                self._data_tool_runtime.clear_explicit_learning_run(run_input.id)
+                self._semantic_domain.clear_explicit_learning_run(run_input.id)
 
     async def transcript(self, run_id: str) -> Transcript:
         self._require_open()
@@ -1638,9 +1735,7 @@ class EmbeddedAgent:
 
             finalization_cancelled = False
             try:
-                if self._data_tool_runtime.learning_candidate_mutation_succeeded(
-                    run_id
-                ):
+                if self._learning_candidate_guard.mutation_succeeded(run_id):
                     _, finalization_cancelled = await _await_async_completion(
                         lambda: self._candidate_reviewer.mark_accepted(
                             candidate.id,
@@ -1648,7 +1743,7 @@ class EmbeddedAgent:
                         )
                     )
             finally:
-                self._data_tool_runtime.clear_learning_candidate_outcome(run_id)
+                self._learning_candidate_guard.clear_outcome(run_id)
 
             if run_error is not None:
                 raise run_error.with_traceback(run_error.__traceback__)
@@ -1717,7 +1812,7 @@ class EmbeddedAgent:
             self._require_open()
             if annotation.agent_id != self.identity.id:
                 raise ValueError("semantic annotation belongs to another agent")
-            await self._data_tool_runtime.validate_semantic_annotation(
+            await self._semantic_domain.validate_annotation(
                 self.identity.id,
                 annotation,
             )
@@ -1820,7 +1915,6 @@ class EmbeddedAgent:
                         "refreshed source registration disagrees with persisted identity"
                     )
                 registration = persisted_registration
-            self._capabilities.validate_declarations(adapter.declarations())
             sync = CatalogSync(
                 id=self._id_factory("catalog-sync"),
                 agent_id=self.identity.id,
@@ -1921,7 +2015,6 @@ class EmbeddedAgent:
                             raise ValueError(
                                 "replacement connection is already attached"
                             )
-                    self._capabilities.validate_declarations(adapter.declarations())
                     sync = CatalogSync(
                         id=self._id_factory("catalog-sync"),
                         agent_id=self.identity.id,

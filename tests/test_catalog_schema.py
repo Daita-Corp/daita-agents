@@ -59,7 +59,7 @@ from daita.catalog.protocols import (
     CatalogResourceNotFoundError,
     CatalogStoreError,
 )
-from daita.domains.data.controller import DataToolRuntime
+from daita.capability_runtime import CapabilityRuntime
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -1579,7 +1579,7 @@ async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
         )
         loop = agent._embedded._loop
         assert loop is not None
-        runtime = cast(DataToolRuntime, loop._tools)
+        runtime = cast(CapabilityRuntime, loop._tools)
         run = RunInput(
             id="catalog-invalid-input-run",
             agent_id=agent.id,

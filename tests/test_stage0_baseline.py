@@ -2,21 +2,18 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime
-from typing import cast
-
 import pytest
 
 from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject
 from daita.capabilities import (
     Capability,
-    CapabilityRegistry,
     ToolExecution,
     ToolOutput,
     ToolView,
 )
 from daita.catalog.capabilities import CATALOG_SEARCH_CAPABILITY_ID
-from daita.domains.data.controller import CatalogDataReader, DataToolRuntime
+from daita.capability_runtime import CapabilityRuntime
 from daita.domains.data.context import DataContextBuilder
 from daita.llm.errors import RequestSensitivityUnavailable
 from daita.llm.models import (
@@ -35,6 +32,7 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
 from daita.loop import LoopExitKind
 from daita.loop.models import RunInput
+from _capability_runtime_support import StaticTestDomain, static_registry
 
 NOW = datetime(2026, 8, 18, tzinfo=UTC)
 
@@ -245,19 +243,15 @@ async def test_validated_capability_classification_reaches_result_envelope():
         },
         executor_id=_ClassifiedExecutor.executor_id,
     )
-    runtime = DataToolRuntime(
-        CapabilityRegistry(
-            capabilities=(capability,),
-            executors=(_ClassifiedExecutor(),),
-            tool_views=(
-                ToolView(
-                    name="stage0_classified",
-                    capability_id=capability.id,
-                    description="Return one classified value.",
-                ),
-            ),
-        ),
-        cast(CatalogDataReader, _NoSourceCatalog()),
+    view = ToolView(
+        name="stage0_classified",
+        capability_id=capability.id,
+        description="Return one classified value.",
+    )
+    domain = StaticTestDomain((capability,), (view,))
+    runtime = CapabilityRuntime(
+        static_registry(domain, (_ClassifiedExecutor(),)),
+        (domain,),
     )
     run = RunInput(
         id="run-stage0-classified",

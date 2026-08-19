@@ -9,10 +9,13 @@ import pytest
 from daita.adapters import postgresql_query as postgresql_query_module
 from daita.adapters.models import SourceRegistration
 from daita.adapters.postgresql import PostgreSQLSourceError
-from daita.domains.data import controller as data_controller
+from daita.capabilities import Capability, ToolExecution, ToolOutput, ToolView
+from daita.capability_runtime import CapabilityRuntime
 from daita.domains.data.sql import ResourceSchema
 from daita.llm.models import ToolCall
+from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
+from _capability_runtime_support import StaticTestDomain, static_registry
 
 
 class _SourceStore:
@@ -185,15 +188,52 @@ async def test_postgresql_backend_preserves_credential_failure(
     assert str(raised.value) == "PostgreSQL credential resolution failed."
 
 
-def test_postgresql_query_error_remains_structured_at_tool_result_boundary() -> None:
-    call = ToolCall(
-        id="call-postgresql",
-        name="data_query_postgresql",
-        arguments={"source_id": "source-one", "sql": "SELECT 1"},
-    )
+class _FailingExecutor:
+    executor_id = "test.postgresql.failure.executor"
 
-    result = data_controller._exception_result(
-        call,
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        del request
+        raise self.error
+
+
+async def _failure_result(error: BaseException):
+    capability = Capability(
+        id="test.postgresql.failure",
+        description="Exercise normalized executor failures.",
+        input_schema={"type": "object", "properties": {}},
+        output_kind="test.postgresql.failure.output",
+        output_schema={"type": "object", "properties": {}},
+        executor_id=_FailingExecutor.executor_id,
+    )
+    view = ToolView(
+        name="test_postgresql_failure",
+        capability_id=capability.id,
+        description=capability.description,
+    )
+    domain = StaticTestDomain((capability,), (view,))
+    runtime = CapabilityRuntime(
+        static_registry(domain, (_FailingExecutor(error),)),
+        (domain,),
+    )
+    outcome = await runtime.execute_all(
+        RunInput(
+            id="run-postgresql-failure",
+            agent_id="agent-postgresql-failure",
+            message="exercise failure normalization",
+            created_at=datetime(2026, 8, 19, tzinfo=UTC),
+        ),
+        (ToolCall(id="call-postgresql", name=view.name),),
+    )
+    return outcome.ordered_results[0]
+
+
+async def test_postgresql_query_error_remains_structured_at_tool_result_boundary() -> (
+    None
+):
+    result = await _failure_result(
         postgresql_query_module.PostgreSQLQueryError(
             "postgresql_connect_failed",
             "PostgreSQL source could not be opened.",
@@ -210,11 +250,8 @@ def test_postgresql_query_error_remains_structured_at_tool_result_boundary() -> 
     assert dict(details) == {}
 
 
-def test_unexpected_executor_error_is_redacted_at_tool_result_boundary() -> None:
-    call = ToolCall(id="call-secret", name="data_query_postgresql")
-
-    result = data_controller._exception_result(
-        call,
+async def test_unexpected_executor_error_is_redacted_at_tool_result_boundary() -> None:
+    result = await _failure_result(
         RuntimeError("secret=/tmp/private-connection-fragment"),
     )
 

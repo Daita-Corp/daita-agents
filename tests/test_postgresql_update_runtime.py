@@ -16,14 +16,14 @@ from daita.capabilities import (
     ApprovalDecision,
     ApprovalRequest,
     Capability,
-    CapabilityRegistry,
     ToolExecution,
     ToolOutput,
+    ToolView,
 )
+from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.models import ResourceKind, TabularColumn
 from daita.domains.data.controller import (
     POSTGRESQL_UPDATE_CAPABILITY_ID,
-    DataToolRuntime,
 )
 from daita.domains.data.sql import (
     PostgreSQLUpdateCommand,
@@ -34,6 +34,7 @@ from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite import DatabaseWriteOutcome, SQLiteStateStore
+from _capability_runtime_support import StaticTestDomain, static_registry
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 SOURCE_ID = source_registration_id(
@@ -497,9 +498,19 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         approvals.append(request)
         return ApprovalDecision.APPROVE
 
-    runtime = DataToolRuntime(
-        CapabilityRegistry(capabilities=(capability,), executors=(executor,)),
-        _RuntimeCatalog(),  # type: ignore[arg-type]
+    view = ToolView(
+        name="test_update",
+        capability_id=capability.id,
+        description=capability.description,
+    )
+    domain = StaticTestDomain(
+        (capability,),
+        (view,),
+        recheck_after_approval=False,
+    )
+    runtime = CapabilityRuntime(
+        static_registry(domain, (executor,)),
+        (domain,),
         approval_handler=approve,
     )
     run = RunInput(
@@ -510,25 +521,12 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         conversation_id="conversation-runtime-update",
     )
     call = ToolCall(id="call-runtime-update", name="test_update", arguments={})
-    execution = ToolExecution(
-        run_id=run.id,
-        call_id=call.id,
-        capability_id=capability.id,
-        arguments={},
-        conversation_id=run.conversation_id,
-    )
-
-    result, interruption, certainty = await runtime._execute_side_effect(
-        run,
-        call,
-        capability,
-        executor,
-        execution,
-    )
+    outcome = await runtime.execute_all(run, (call,))
+    (result,) = outcome.ordered_results
 
     assert not result.is_error
-    assert interruption is None
-    assert certainty.value == "definite"
+    assert outcome.interruption_kind is None
+    assert outcome.outcome_certainty.value == "definite"
     assert len(approvals) == 1
     assert executor.preflight_count == 1
     assert executor.execute_count == 1

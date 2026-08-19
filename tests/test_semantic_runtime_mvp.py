@@ -160,7 +160,8 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
         clock=lambda: NOW,
     )
     try:
-        runtime = agent._embedded._data_tool_runtime
+        runtime = agent._embedded._capability_runtime
+        semantic_domain = agent._embedded._semantic_domain
         projection_run = RunInput(
             id="projection-run",
             agent_id=agent.id,
@@ -169,9 +170,9 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             conversation_id="projection-conversation",
             source_id=source.id,
         )
-        runtime.select_explicit_learning_run(projection_run.id)
+        semantic_domain.select_explicit_learning_run(projection_run.id)
         definitions = await runtime.definitions(projection_run)
-        runtime.clear_explicit_learning_run(projection_run.id)
+        semantic_domain.clear_explicit_learning_run(projection_run.id)
         names = {item.name for item in definitions}
         assert {
             SEMANTIC_LIST_TOOL_NAME,
@@ -480,8 +481,9 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
             conversation_id="delete-approved-conversation",
             source_id=source.id,
         )
-        runtime = agent._embedded._data_tool_runtime
-        runtime.select_explicit_learning_run(delete_run.id)
+        runtime = agent._embedded._capability_runtime
+        semantic_domain = agent._embedded._semantic_domain
+        semantic_domain.select_explicit_learning_run(delete_run.id)
         deleted = (
             await runtime.execute_all(
                 delete_run,
@@ -497,7 +499,7 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
                 ),
             )
         )[0]
-        runtime.clear_explicit_learning_run(delete_run.id)
+        semantic_domain.clear_explicit_learning_run(delete_run.id)
         assert deleted.is_error is False
         assert len(approvals) == 2
         assert await agent.read_semantic_annotation("booked-revenue") is None
@@ -537,18 +539,24 @@ async def test_state_change_during_semantic_approval_returns_state_changed(
         clock=lambda: NOW,
     )
     try:
-        runtime = agent._embedded._data_tool_runtime
-        original_validation = runtime._validate_semantic_preflight
+        semantic_domain = agent._embedded._semantic_domain
+        original_plan = semantic_domain.side_effect_plan
         validations = 0
 
-        async def state_changes(run, capability, fingerprint):
+        async def state_changes(run, call, capability, execution, fingerprint):
             nonlocal validations
             validations += 1
             if validations == 2:
                 raise SemanticValidationError("semantic facts changed")
-            return await original_validation(run, capability, fingerprint)
+            return await original_plan(
+                run,
+                call,
+                capability,
+                execution,
+                fingerprint,
+            )
 
-        monkeypatch.setattr(runtime, "_validate_semantic_preflight", state_changes)
+        monkeypatch.setattr(semantic_domain, "side_effect_plan", state_changes)
         await agent.learn("Booked revenue means booked_at.")
         result = _tool_results(provider)[0]
         assert _error_code(result) == "state_changed"

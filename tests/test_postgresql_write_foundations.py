@@ -9,7 +9,6 @@ import pytest
 from daita import Agent, PostgreSQLSource
 from daita.adapters import postgresql as postgresql_module
 from daita.adapters.models import DiscoveryRequest, DiscoveryResult, SourceRegistration
-from daita.capabilities import ExtensionDeclarations
 from daita.catalog.models import (
     CatalogFacet,
     CatalogSync,
@@ -20,8 +19,8 @@ from daita.catalog.models import (
     TabularFacet,
 )
 from daita.domains.data.capabilities import (
-    postgresql_update_extension_declarations,
-    postgresql_update_preview_extension_declarations,
+    postgresql_update_capability_declarations,
+    postgresql_update_preview_capability_declarations,
 )
 from daita.domains.data.context import _system_prompt
 from daita.hosting import embedded as embedded_module
@@ -32,8 +31,8 @@ NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 
 
 def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> None:
-    preview = postgresql_update_preview_extension_declarations()
-    update = postgresql_update_extension_declarations()
+    preview = postgresql_update_preview_capability_declarations()
+    update = postgresql_update_capability_declarations()
 
     preview_description = preview.tool_views[0].description
     update_description = update.tool_views[0].description
@@ -214,9 +213,6 @@ async def test_postgresql_refresh_preserves_read_scope_outside_connection_identi
         def registration(self) -> SourceRegistration:
             return connection_registration
 
-        def declarations(self) -> ExtensionDeclarations:
-            return ExtensionDeclarations()
-
         async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
             sync = CatalogSync(
                 id=request.sync_id,
@@ -335,9 +331,6 @@ async def test_committed_source_edit_deletes_only_the_previous_owned_credential(
         @property
         def registration(self) -> SourceRegistration:
             return edited
-
-        def declarations(self) -> ExtensionDeclarations:
-            return ExtensionDeclarations()
 
         async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
             sync = CatalogSync(

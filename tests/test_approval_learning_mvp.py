@@ -17,7 +17,7 @@ from daita.capabilities import (
     SideEffectExecutor,
     ToolExecution,
 )
-from daita.domains.data.controller import DataToolRuntime
+from daita.capability_runtime import CapabilityRuntime
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -127,10 +127,10 @@ def _run(agent: Agent, run_id: str = "approval-run") -> RunInput:
     )
 
 
-def _runtime(agent: Agent) -> DataToolRuntime:
+def _runtime(agent: Agent) -> CapabilityRuntime:
     loop = agent._embedded._loop
     assert loop is not None
-    return cast(DataToolRuntime, loop._tools)
+    return cast(CapabilityRuntime, loop._tools)
 
 
 async def _execute(agent: Agent, *calls: ToolCall):

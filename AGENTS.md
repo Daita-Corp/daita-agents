@@ -27,7 +27,7 @@ Use this order of authority:
 
 1. explicitly accepted task requirements;
 2. current code under `src/daita/` and executable tests under `tests/`;
-3. `README.md` and current focused design documents under `docs/`;
+3. `README.md` and current user-facing documentation under `docs/`;
 4. legacy code and historical documents, as reference only.
 
 ## What the product is
@@ -62,7 +62,9 @@ src/daita/
   loop/                # direct transcript progression and loop records
   llm/                 # canonical model records, routing, provider adapters
   capabilities.py      # tool declarations, registry, schema validation
-  domains/data/        # context building, tool runtime, SQL validation
+  capability_runtime.py # sole domain-neutral model-to-execution boundary
+  domains/             # static capability owners and learning guard state
+  domains/data/        # data context, current validation, SQL, artifacts
   catalog/             # normalized current source/resource truth
   adapters/            # bounded source admission, discovery, and read I/O
   storage/sqlite.py    # sole durable state operation/admission boundary
@@ -74,12 +76,16 @@ src/daita/
   cli.py               # thin local CLI over the public embedded API
 tests/                 # deterministic product tests
 examples/              # offline examples
-docs/                  # focused design documents
+docs/                  # user-facing documentation only
 pyproject.toml         # package dependencies, dev extra, entry point, and tools
 ```
 
 Do not recreate a directory just because the old architecture had one. Add a
 module only when a working vertical slice needs a clear owner.
+
+Keep development-stage status, implementation ledgers, and North Star phase
+closure in the authoritative North Star architecture document rather than
+adding internal development records under `docs/`.
 
 ## Ownership and dependency direction
 
@@ -131,23 +137,36 @@ kind of fact.
 
 ### Capabilities and execution
 
-`daita.capabilities.CapabilityRegistry` owns declared capability, executor,
-and model-facing tool-view identity. It projects tool schemas and validates
-arguments and executor output. Tools are a presentation over capabilities, not
-an alternate execution path.
+`daita.capabilities.CapabilityRegistry` owns immutable capability, tool-view,
+executor, and domain-owner identity and exact resolution. It projects tool
+schemas and validates arguments and executor output. Tools are a presentation
+over capabilities, not an alternate execution path.
 
-`daita.domains.data.controller.DataToolRuntime` is the current tool execution
-boundary. Its order is:
+`daita.capability_runtime.CapabilityRuntime` is the sole production
+model-to-execution boundary. It owns only cross-domain execution mechanics:
+ordered bounded batches, exact registry resolution, common schema validation,
+fixed effect governance, exact executor dispatch, artifact commit, result
+bounds, sensitivity/provenance enforcement, error normalization, and
+observation. Its order is:
 
-1. determine which registered tools apply to the attached sources;
+1. ask each statically composed domain to project applicable tools;
 2. reject a call that was not projected;
-3. resolve tool view and capability identity;
-4. validate arguments against the declared schema;
-5. perform capability-specific validation against current catalog facts;
+3. resolve tool view, capability, and domain owner by exact registry identity;
+4. validate model arguments against the declared schema;
+5. ask the owner to bind arguments and revalidate current admission;
 6. resolve the exact registered executor;
-7. execute once;
-8. validate the output contract; and
-9. return one structured success or error result.
+7. apply the fixed side-effect preflight, approval, recheck, and lock branch;
+8. execute exactly once;
+9. ask the owner to finalize capability-specific result semantics;
+10. validate output, artifact, classification, provenance, and bounds; and
+11. return exactly one structured result per requested call in original order.
+
+Static owners are `DataCapabilityDomain` for catalog, query, update, and local
+file behavior; `MemoryCapabilityDomain`; `SkillCapabilityDomain`;
+`SemanticCapabilityDomain`; and `ArtifactCapabilityDomain`.
+`LearningCandidateGuard` owns the bounded transient learning selection and
+mutation-success state shared by those owners. Applicability and current-state
+validation remain with these concrete owners, never the common runtime.
 
 Do not let `AgentLoop`, `Agent`, a tool view, or model-authored text call source
 clients or executors directly. Do not infer capability behavior from tool-name
@@ -265,15 +284,15 @@ stage in scope, and preserve the direct architecture:
 - learning is the ordinary foreground loop using explicit memory/skill tools,
   not a worker or second model pass;
 - governance is a fixed branch immediately before a side effect at the
-  existing `DataToolRuntime` boundary, not a policy engine;
+  existing `CapabilityRuntime` boundary, not a policy engine;
 - approval is once-only, in-process, and bound to exact frozen arguments; it
   does not create pending state or resume APIs; and
 - observation is one best-effort callback that cannot direct execution and is
   not a durable event or telemetry subsystem.
 
-Extend `CapabilityRegistry`, `DataToolRuntime`, `DataContextBuilder`,
-`EmbeddedAgent`, and `SQLiteStateStore` only for the concerns they already own.
-Do not wrap them in a replacement workflow runtime.
+Extend `CapabilityRegistry`, `CapabilityRuntime`, the appropriate static domain,
+`DataContextBuilder`, `EmbeddedAgent`, and `SQLiteStateStore` only for the
+concerns they already own. Do not wrap them in a replacement workflow runtime.
 
 ## Development setup
 
@@ -397,8 +416,9 @@ Do not add provider branches to `AgentLoop`.
    adapter/backend.
 5. Add concrete validation before executor I/O and retain connector-level
    guardrails.
-6. Return bounded, schema-validated `ToolOutput`; convert expected failures to
-   structured model-visible results at `DataToolRuntime`.
+6. Return bounded, schema-validated `ToolOutput`; let the owning domain
+   normalize expected failures for `CapabilityRuntime` to render as structured
+   model-visible results.
 7. Add focused unit/contract coverage plus one public vertical-slice test.
 
 Do not create a plugin base-class hierarchy, an alternate catalog, or a source-
@@ -414,8 +434,14 @@ specific agent loop.
 | `src/daita/loop/driver.py` | sole direct model/tool progression loop |
 | `src/daita/loop/models.py` | run, transcript, limits, and exit records |
 | `src/daita/capabilities.py` | capability declarations and registry |
+| `src/daita/capability_runtime.py` | sole common model-to-execution runtime |
+| `src/daita/domains/learning.py` | transient learning mutation guard |
 | `src/daita/domains/data/context.py` | current model request construction |
-| `src/daita/domains/data/controller.py` | tool projection and execution boundary |
+| `src/daita/domains/data/controller.py` | data projection and current-state validation |
+| `src/daita/domains/data/export_capabilities.py` | artifact capability owner and executors |
+| `src/daita/memory/capabilities.py` | memory capability owner and executor |
+| `src/daita/skills/capabilities.py` | skill capability owner and executors |
+| `src/daita/semantics.py` | semantic capability owner and records |
 | `src/daita/domains/data/sql/` | catalog-scoped SQL validation |
 | `src/daita/catalog/service.py` | normalized catalog lifecycle |
 | `src/daita/storage/sqlite.py` | sole durable state operation/admission boundary |
