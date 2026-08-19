@@ -160,12 +160,26 @@ class ToolResultBlock:
     call_id: str
     output: Mapping[str, object] = field(default_factory=dict)
     is_error: bool = False
+    sensitivity: ModelSensitivity | None = None
+    sensitivity_provenance: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _required_text(self.call_id, "tool-result call_id")
         if not isinstance(self.is_error, bool):
             raise TypeError("tool-result is_error must be a boolean")
+        if self.sensitivity is not None and not isinstance(
+            self.sensitivity, ModelSensitivity
+        ):
+            raise TypeError("tool-result sensitivity must be ModelSensitivity or None")
+        provenance = FrozenJsonObject.from_mapping(self.sensitivity_provenance)
+        if (self.sensitivity is None) is bool(provenance):
+            raise ValueError(
+                "tool-result sensitivity and provenance must be present together"
+            )
+        if self.is_error and self.sensitivity is not None:
+            raise ValueError("error tool results cannot establish sensitivity")
         object.__setattr__(self, "output", FrozenJsonObject.from_mapping(self.output))
+        object.__setattr__(self, "sensitivity_provenance", provenance)
 
 
 ContentBlock = TextBlock | ToolResultBlock

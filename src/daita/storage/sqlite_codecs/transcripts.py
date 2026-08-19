@@ -5,6 +5,7 @@ from __future__ import annotations
 from ...llm.models import (
     CanonicalMessage,
     MessageRole,
+    ModelSensitivity,
     ModelUsage,
     TextBlock,
     ToolCall,
@@ -166,6 +167,12 @@ def _encode_tool_result(value: ToolResultBlock) -> dict[str, JsonValue]:
             "call_id": value.call_id,
             "output": plain_encode(value.output),
             "is_error": value.is_error,
+            "sensitivity": (
+                None
+                if value.sensitivity is None
+                else enum_encode(value.sensitivity, "ModelSensitivity")
+            ),
+            "sensitivity_provenance": plain_encode(value.sensitivity_provenance),
         },
     )
 
@@ -175,15 +182,33 @@ def _decode_tool_result(value: JsonValue) -> ToolResultBlock:
         value,
         "ToolResultBlock",
         ("call_id",),
-        optional={"output": {}, "is_error": False},
+        optional={
+            "output": {},
+            "is_error": False,
+            "sensitivity": None,
+            "sensitivity_provenance": {},
+        },
     )
     output = plain_decode(mapping(fields["output"], "tool-result output"))
     if not isinstance(output, dict):
         raise ValueError("stored tool-result output is invalid")
+    provenance = plain_decode(
+        mapping(fields["sensitivity_provenance"], "tool-result provenance")
+    )
+    if not isinstance(provenance, dict):
+        raise ValueError("stored tool-result provenance is invalid")
     return ToolResultBlock(
         call_id=text(fields["call_id"], "tool-result call_id"),
         output=output,
         is_error=boolean(fields["is_error"], "tool-result is_error"),
+        sensitivity=(
+            None
+            if fields["sensitivity"] is None
+            else enum_decode(
+                fields["sensitivity"], ModelSensitivity, "ModelSensitivity"
+            )
+        ),
+        sensitivity_provenance=provenance,
     )
 
 

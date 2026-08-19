@@ -15,12 +15,18 @@ from ..artifacts.models import (
     artifact_delivery_receipt_from_mapping,
     artifact_ref_from_mapping,
 )
-from ..llm.errors import ContextWindowExceeded, ModelProviderError, ProviderErrorCode
+from ..llm.errors import (
+    ContextWindowExceeded,
+    ModelProviderError,
+    ProviderErrorCode,
+    RequestSensitivityUnavailable,
+)
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     ModelStreamCompleted,
     ModelTextDelta,
     ModelToolCallDelta,
@@ -41,6 +47,7 @@ from ..llm.protocols import (
     ModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
+    provider_supports_request_policy,
 )
 from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 from .models import (
@@ -188,6 +195,7 @@ class AgentLoop:
         usage = ModelUsage(cost_estimate=CostEstimate.unavailable("no_model_attempts"))
         artifacts: list[ArtifactRef] = []
         artifact_deliveries: list[ArtifactDeliveryReceipt] = []
+        effective_sensitivity: ModelSensitivity | None = None
 
         try:
             user = CanonicalMessage(
@@ -220,6 +228,22 @@ class AgentLoop:
                         step=step,
                     ),
                 )
+                request = _with_minimum_sensitivity(
+                    request,
+                    effective_sensitivity,
+                )
+                effective_sensitivity = request.sensitivity
+                if not provider_supports_request_policy(self._model, request):
+                    return await self._finish(
+                        run,
+                        LoopExitKind.FAILED,
+                        "model_route_ineligible",
+                        step - 1,
+                        usage,
+                        run_started,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
+                    )
                 if not self._cost_limit_allows_request(request):
                     return await self._finish(
                         run,
@@ -332,6 +356,10 @@ class AgentLoop:
                     receipt = _artifact_delivery(result)
                     if receipt is not None:
                         artifact_deliveries.append(receipt)
+                    effective_sensitivity = _raised_sensitivity(
+                        effective_sensitivity,
+                        result,
+                    )
 
                 budget_reason = self._usage_limit_reason(usage)
                 if budget_reason is not None:
@@ -354,6 +382,7 @@ class AgentLoop:
                         budget_reason,
                         deadline,
                         run_started,
+                        effective_sensitivity,
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
                     )
@@ -366,6 +395,7 @@ class AgentLoop:
                 "step_limit_reached",
                 deadline,
                 run_started,
+                effective_sensitivity,
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
             )
@@ -397,6 +427,17 @@ class AgentLoop:
                 run,
                 LoopExitKind.FAILED,
                 "context_window_exceeded",
+                _completed_steps(messages[current_start:]),
+                usage,
+                run_started,
+                artifacts=tuple(artifacts),
+                artifact_deliveries=tuple(artifact_deliveries),
+            )
+        except RequestSensitivityUnavailable:
+            return await self._finish(
+                run,
+                LoopExitKind.FAILED,
+                "request_sensitivity_unavailable",
                 _completed_steps(messages[current_start:]),
                 usage,
                 run_started,
@@ -437,6 +478,7 @@ class AgentLoop:
         reason: str,
         deadline: float,
         run_started: float,
+        effective_sensitivity: ModelSensitivity | None,
         *,
         artifacts: tuple[ArtifactRef, ...],
         artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...],
@@ -462,6 +504,18 @@ class AgentLoop:
                 final=True,
             ),
         )
+        request = _with_minimum_sensitivity(request, effective_sensitivity)
+        if not provider_supports_request_policy(self._model, request):
+            return await self._finish(
+                run,
+                LoopExitKind.FAILED,
+                "model_route_ineligible",
+                steps,
+                usage,
+                run_started,
+                artifacts=artifacts,
+                artifact_deliveries=artifact_deliveries,
+            )
         if not self._cost_limit_allows_request(request):
             return await self._finish(
                 run,
@@ -784,6 +838,27 @@ def _assistant_message(response: ModelResponse) -> CanonicalMessage:
         provider_id=response.provider_id,
         provider_metadata=response.provider_metadata,
     )
+
+
+def _with_minimum_sensitivity(
+    request: ModelRequest,
+    minimum: ModelSensitivity | None,
+) -> ModelRequest:
+    if minimum is None or request.sensitivity.routing_rank >= minimum.routing_rank:
+        return request
+    return replace(request, sensitivity=minimum)
+
+
+def _raised_sensitivity(
+    current: ModelSensitivity | None,
+    result: ToolResultBlock,
+) -> ModelSensitivity | None:
+    candidate = result.sensitivity
+    if candidate is None:
+        return current
+    if current is None or candidate.routing_rank > current.routing_rank:
+        return candidate
+    return current
 
 
 def _add_usage(left: ModelUsage, right: ModelUsage) -> ModelUsage:

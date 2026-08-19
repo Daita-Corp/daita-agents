@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
+from decimal import Decimal
 
 from ..security import SecretReference
 from .errors import ModelProviderError, ProviderErrorCode
@@ -22,6 +23,7 @@ from .protocols import (
     ModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
+    provider_supports_request_policy,
 )
 
 _TRANSIENT = frozenset(
@@ -95,7 +97,9 @@ class ModelRouteCandidate:
         ):
             raise TypeError("secret_reference must be SecretReference or None")
         allowed = frozenset(self.allowed_sensitivities)
-        if not allowed:
+        if not allowed or any(
+            not isinstance(item, ModelSensitivity) for item in allowed
+        ):
             raise ValueError("route candidate requires an allowed sensitivity")
         object.__setattr__(self, "allowed_sensitivities", allowed)
 
@@ -332,7 +336,24 @@ def _eligible(registration: ModelProviderRegistration, request: ModelRequest) ->
         return False
     if request.response_schema is not None and not profile.supports_structured_output:
         return False
-    return registration.provider.supports_request_policy(request) is True
+    return provider_supports_request_policy(registration.provider, request)
+
+
+def autonomous_request_is_admissible(
+    provider: object,
+    request: ModelRequest,
+    *,
+    max_estimated_cost_usd: Decimal | None,
+) -> bool:
+    """Admit a future unattended call only with a bounded, priced route."""
+
+    return (
+        isinstance(max_estimated_cost_usd, Decimal)
+        and max_estimated_cost_usd.is_finite()
+        and max_estimated_cost_usd >= 0
+        and provider_supports_request_policy(provider, request)
+        and provider_has_complete_pricing(provider, request)
+    )
 
 
 def _aggregate_usage(items: Iterable[ModelUsage]) -> ModelUsage:
@@ -353,4 +374,5 @@ __all__ = [
     "ModelRouteCandidate",
     "ModelRouter",
     "RetryPolicy",
+    "autonomous_request_is_admissible",
 ]

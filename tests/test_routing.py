@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
+from daita.llm.factory import create_model_route_provider
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -8,6 +9,7 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     ModelStreamCompleted,
     ModelTextDelta,
     ModelUsage,
@@ -19,7 +21,14 @@ from daita.llm.pricing import (
     CostEstimateStatus,
 )
 from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
-from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
+from daita.llm.routing import (
+    ModelProviderRegistration,
+    ModelRoute,
+    ModelRouteCandidate,
+    ModelRouter,
+    RetryPolicy,
+    autonomous_request_is_admissible,
+)
 
 
 def request():
@@ -30,7 +39,7 @@ def request():
     )
 
 
-def registration(provider, *, streaming=False):
+def registration(provider, *, streaming=False, allowed_sensitivities=None):
     return ModelProviderRegistration(
         provider=provider,
         profile=ModelProfile(
@@ -39,7 +48,109 @@ def registration(provider, *, streaming=False):
             max_output_tokens=1_000,
             supports_streaming=streaming,
         ),
+        allowed_sensitivities=(
+            frozenset({ModelSensitivity.PUBLIC, ModelSensitivity.INTERNAL})
+            if allowed_sensitivities is None
+            else allowed_sensitivities
+        ),
     )
+
+
+async def test_route_admission_uses_request_sensitivity_before_provider_io():
+    provider = MockModelProvider(
+        (ModelResponse(finish_reason=FinishReason.STOP, text="public"),)
+    )
+    router = ModelRouter((registration(provider),))
+
+    public = ModelRequest(
+        messages=request().messages,
+        sensitivity=ModelSensitivity.PUBLIC,
+    )
+    assert (await router.generate(public)).text == "public"
+
+    confidential = ModelRequest(
+        messages=public.messages,
+        sensitivity=ModelSensitivity.CONFIDENTIAL,
+    )
+    try:
+        await router.generate(confidential)
+    except ModelProviderError as error:
+        assert error.code is ProviderErrorCode.INVALID_REQUEST
+    else:
+        raise AssertionError("an ineligible sensitive route must fail closed")
+    assert len(provider.requests) == 1
+
+
+def test_single_lazy_route_enforces_its_configured_sensitivity_set():
+    profile = ModelProfile(
+        id="ollama:stage0",
+        context_window_tokens=10_000,
+        max_output_tokens=1_000,
+    )
+    provider = create_model_route_provider(
+        ModelRoute(
+            (
+                ModelRouteCandidate(
+                    provider_id=profile.id,
+                    profile=profile,
+                    allowed_sensitivities=frozenset({ModelSensitivity.PUBLIC}),
+                ),
+            ),
+            retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        )
+    )
+
+    assert provider.supports_request_policy(
+        ModelRequest(
+            messages=request().messages,
+            sensitivity=ModelSensitivity.PUBLIC,
+        )
+    )
+    assert not provider.supports_request_policy(
+        ModelRequest(
+            messages=request().messages,
+            sensitivity=ModelSensitivity.CONFIDENTIAL,
+        )
+    )
+
+
+def test_autonomous_admission_requires_complete_pricing_and_cost_bound():
+    complete = MockModelProvider((), complete_pricing=True)
+    unavailable = MockModelProvider((), provider_id="mock:unavailable")
+    partially_priced_route = ModelRouter(
+        (registration(complete), registration(unavailable))
+    )
+
+    assert autonomous_request_is_admissible(
+        complete,
+        request(),
+        max_estimated_cost_usd=Decimal("0.05"),
+    )
+    assert not autonomous_request_is_admissible(
+        complete,
+        request(),
+        max_estimated_cost_usd=None,
+    )
+    assert not autonomous_request_is_admissible(
+        unavailable,
+        request(),
+        max_estimated_cost_usd=Decimal("0.05"),
+    )
+    assert not autonomous_request_is_admissible(
+        partially_priced_route,
+        request(),
+        max_estimated_cost_usd=Decimal("0.05"),
+    )
+
+    partial = CostEstimate.partial(
+        Decimal("0.01"),
+        code="pricing_schedule_incomplete",
+    )
+    unavailable_estimate = CostEstimate.unavailable()
+    assert partial.status is CostEstimateStatus.PARTIAL
+    assert partial.amount_usd == Decimal("0.01")
+    assert unavailable_estimate.status is CostEstimateStatus.UNAVAILABLE
+    assert unavailable_estimate.amount_usd is None
 
 
 async def test_router_retries_transient_failure_then_returns():

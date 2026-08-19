@@ -17,6 +17,7 @@ from .protocols import (
     ModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
+    provider_supports_request_policy,
 )
 from .providers import (
     AnthropicProvider,
@@ -143,8 +144,10 @@ class _LazyProvider:
         return self._candidate.provider_id
 
     def supports_request_policy(self, request: ModelRequest) -> bool:
+        if request.sensitivity not in self._candidate.allowed_sensitivities:
+            return False
         if self._provider is not None:
-            return self._provider.supports_request_policy(request)
+            return provider_supports_request_policy(self._provider, request)
         provider_name = self.provider_id.partition(":")[0]
         return (
             request.allow_parallel_tool_calls is None

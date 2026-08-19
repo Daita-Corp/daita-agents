@@ -43,6 +43,7 @@ from .routing import (
     ModelRouteCandidate,
     ModelRouter,
     RetryPolicy,
+    autonomous_request_is_admissible,
 )
 
 __all__ = [
@@ -82,6 +83,7 @@ __all__ = [
     "ToolDefinition",
     "ToolResultBlock",
     "aggregate_cost_estimates",
+    "autonomous_request_is_admissible",
     "create_llm_provider",
     "create_model_route_provider",
     "format_cost_estimate",

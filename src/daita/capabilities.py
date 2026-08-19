@@ -12,7 +12,7 @@ from typing import Protocol, TypeVar
 
 from ._json import FrozenJsonObject, canonical_json
 from .artifacts.models import ArtifactDraft
-from .llm.models import ToolDefinition
+from .llm.models import ModelSensitivity, ToolDefinition
 
 _T = TypeVar("_T")
 
@@ -256,12 +256,24 @@ class ToolOutput:
     kind: str
     data: Mapping[str, object] = field(default_factory=dict)
     artifact: ArtifactDraft | None = None
+    sensitivity: ModelSensitivity | None = None
+    sensitivity_provenance: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _text(self.kind, "tool output kind")
         if self.artifact is not None and not isinstance(self.artifact, ArtifactDraft):
             raise TypeError("artifact must be ArtifactDraft or None")
+        if self.sensitivity is not None and not isinstance(
+            self.sensitivity, ModelSensitivity
+        ):
+            raise TypeError("tool output sensitivity must be ModelSensitivity or None")
+        provenance = FrozenJsonObject.from_mapping(self.sensitivity_provenance)
+        if (self.sensitivity is None) is bool(provenance):
+            raise ValueError(
+                "tool output sensitivity and provenance must be present together"
+            )
         object.__setattr__(self, "data", FrozenJsonObject.from_mapping(self.data))
+        object.__setattr__(self, "sensitivity_provenance", provenance)
 
 
 class Executor(Protocol):

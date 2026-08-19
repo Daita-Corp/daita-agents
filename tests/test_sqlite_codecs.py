@@ -30,7 +30,14 @@ from daita.learning_candidates import (
     LearningCandidateStatus,
     LearningCandidateTarget,
 )
-from daita.llm.models import CanonicalMessage, MessageRole, ModelUsage, TextBlock
+from daita.llm.models import (
+    CanonicalMessage,
+    MessageRole,
+    ModelSensitivity,
+    ModelUsage,
+    TextBlock,
+    ToolResultBlock,
+)
 from daita.llm.pricing import CostBasis, CostComponent, CostEstimate
 from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from daita.semantics import (
@@ -336,6 +343,30 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         == update_scope
     )
     assert encode_postgresql_update_scope(update_scope) == encoded_update_scope
+
+
+def test_classified_tool_result_provenance_round_trips_without_entering_output() -> (
+    None
+):
+    result = ToolResultBlock(
+        call_id="classified-call",
+        output={"value": "untrusted"},
+        sensitivity=ModelSensitivity.RESTRICTED,
+        sensitivity_provenance={
+            "authority": "validated_capability_result",
+            "resource_ids": ("resource-1",),
+        },
+    )
+    message = CanonicalMessage(MessageRole.TOOL, content=(result,))
+
+    decoded = decode_message(encode_message(message))
+
+    assert decoded == message
+    block = decoded.content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert "sensitivity" not in block.output
+    assert block.sensitivity is ModelSensitivity.RESTRICTED
+    assert block.sensitivity_provenance["resource_ids"] == ("resource-1",)
 
 
 def test_source_permission_codecs_reject_unknown_versions_and_noncanonical_sets() -> (

@@ -2708,7 +2708,12 @@ def _success(
     if artifact_ref is not None:
         output["artifact"] = artifact_ref_to_mapping(artifact_ref)
         output["delivery_status"] = "not_delivered"
-    return ToolResultBlock(call_id=call.id, output=output)
+    return ToolResultBlock(
+        call_id=call.id,
+        output=output,
+        sensitivity=result.sensitivity,
+        sensitivity_provenance=result.sensitivity_provenance,
+    )
 
 
 def _resolved_sensitivity(values: tuple[Sensitivity, ...]) -> Sensitivity:

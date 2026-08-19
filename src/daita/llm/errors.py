@@ -26,6 +26,17 @@ class ContextWindowExceeded(LLMError):
         )
 
 
+class RequestSensitivityUnavailable(LLMError):
+    """The current admitted resource scope cannot be classified safely."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The admitted resource scope has no complete sensitivity classification.",
+            error_code="request_sensitivity_unavailable",
+            retryability=ErrorRetryability.PERMANENT,
+        )
+
+
 class ProviderErrorCode(str, Enum):
     """Canonical failures that every model adapter may expose to the runtime."""
 

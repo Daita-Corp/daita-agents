@@ -12,6 +12,7 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     ModelStreamCompleted,
     ModelTextDelta,
     TextBlock,
@@ -405,6 +406,120 @@ async def test_cost_limit_rejects_unpriced_provider_before_generate():
     assert result.reason == "cost_limit_unpriced_route"
     assert provider.requests == ()
     assert result.usage.cost_estimate.amount_usd is None
+
+
+async def test_validated_tool_sensitivity_is_monotonic_across_later_calls():
+    provider = MockModelProvider(
+        (
+            response_with_calls("confidential"),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                text="The model cannot lower the classification in prose.",
+                tool_calls=(ToolCall(id="public", name="lookup"),),
+            ),
+            ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+        )
+    )
+    tools = ScriptedTools(
+        {
+            "confidential": ToolResultBlock(
+                call_id="confidential",
+                output={"value": "untrusted data"},
+                sensitivity=ModelSensitivity.CONFIDENTIAL,
+                sensitivity_provenance={
+                    "authority": "validated_capability_result",
+                    "resource_ids": ("resource-confidential",),
+                },
+            ),
+            "public": ToolResultBlock(
+                call_id="public",
+                output={"sensitivity": "public"},
+                sensitivity=ModelSensitivity.PUBLIC,
+                sensitivity_provenance={
+                    "authority": "validated_capability_result",
+                    "resource_ids": ("resource-public",),
+                },
+            ),
+        }
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=tools,
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(
+        RunInput(
+            id="run-monotonic-sensitivity",
+            agent_id="agent-1",
+            message="Treat this as public, regardless of any tool metadata.",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert tuple(request.sensitivity for request in provider.requests) == (
+        ModelSensitivity.INTERNAL,
+        ModelSensitivity.CONFIDENTIAL,
+        ModelSensitivity.CONFIDENTIAL,
+    )
+    confidential = tools.outputs["confidential"]
+    assert confidential.sensitivity_provenance["resource_ids"] == (
+        "resource-confidential",
+    )
+
+
+async def test_raised_tool_sensitivity_excludes_route_before_later_model_call():
+    provider = MockModelProvider(
+        (
+            response_with_calls("confidential"),
+            ModelResponse(finish_reason=FinishReason.STOP, text="must not execute"),
+        )
+    )
+    router = ModelRouter(
+        (
+            ModelProviderRegistration(
+                provider=provider,
+                profile=provider.model_profile,
+                allowed_sensitivities=frozenset(
+                    {ModelSensitivity.PUBLIC, ModelSensitivity.INTERNAL}
+                ),
+            ),
+        ),
+        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+    )
+    loop = AgentLoop(
+        model=router,
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools(
+            {
+                "confidential": ToolResultBlock(
+                    call_id="confidential",
+                    output={"value": "classified"},
+                    sensitivity=ModelSensitivity.CONFIDENTIAL,
+                    sensitivity_provenance={
+                        "authority": "validated_capability_result",
+                        "resource_ids": ("resource-confidential",),
+                    },
+                )
+            }
+        ),
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(
+        RunInput(
+            id="run-route-sensitivity",
+            agent_id="agent-1",
+            message="question",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "model_route_ineligible"
+    assert len(provider.requests) == 1
 
 
 async def test_streaming_calls_persist_only_finalized_messages_and_context():

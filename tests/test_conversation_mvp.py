@@ -26,6 +26,7 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolDefinition,
@@ -154,6 +155,12 @@ class CatalogSpy:
     def __init__(self, resources=()):
         self.queries = []
         self.resources = resources
+
+    async def admitted_model_sensitivity(
+        self, agent_id: str, source_ids: tuple[str, ...] = ()
+    ) -> ModelSensitivity:
+        del agent_id, source_ids
+        return ModelSensitivity.PUBLIC
 
     async def catalog_context(
         self,

@@ -29,11 +29,32 @@ def provider_has_complete_pricing(
     """Fail closed for providers without an admitted pricing preflight."""
 
     probe = getattr(provider, "has_complete_pricing", None)
-    return callable(probe) and probe(request) is True
+    if not callable(probe):
+        return False
+    try:
+        return probe(request) is True
+    except Exception:
+        return False
+
+
+def provider_supports_request_policy(
+    provider: object,
+    request: ModelRequest,
+) -> bool:
+    """Fail closed when route eligibility cannot be established exactly."""
+
+    probe = getattr(provider, "supports_request_policy", None)
+    if not callable(probe):
+        return False
+    try:
+        return probe(request) is True
+    except Exception:
+        return False
 
 
 __all__ = [
     "ModelProvider",
     "StreamingModelProvider",
     "provider_has_complete_pricing",
+    "provider_supports_request_policy",
 ]

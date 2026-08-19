@@ -24,6 +24,9 @@ from daita.catalog.models import (
     TabularFacet,
     catalog_resource_id,
 )
+from daita.catalog.service import CatalogService
+from daita.domains.data.catalog import CatalogDataView
+from daita.llm.models import ModelSensitivity
 from daita.storage import sqlite as sqlite_module
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_migrations import migration_rows
@@ -191,6 +194,86 @@ async def test_fresh_schema_has_only_scoped_permission_tables(tmp_path: Path) ->
             )
             == migration_rows()
         )
+
+
+async def test_admitted_resource_scope_derives_sensitivity_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "sensitivity.db")
+    registration = _registration()
+    public_snapshot, resource, _ = _snapshot(
+        registration,
+        sync_id="sync-public",
+        sensitivity=Sensitivity.PUBLIC,
+    )
+    await store.commit_snapshot(public_snapshot, registration=registration)
+    view = CatalogDataView(store, CatalogService(store, store), store)
+    try:
+        assert (
+            await view.admitted_model_sensitivity(
+                registration.agent_id,
+                (registration.id,),
+            )
+            is ModelSensitivity.PUBLIC
+        )
+
+        confidential_snapshot, _, _ = _snapshot(
+            registration,
+            sync_id="sync-confidential",
+            sensitivity=Sensitivity.CONFIDENTIAL,
+        )
+        await store.commit_snapshot(confidential_snapshot, registration=registration)
+        assert (
+            await view.admitted_model_sensitivity(
+                registration.agent_id,
+                (registration.id,),
+            )
+            is ModelSensitivity.CONFIDENTIAL
+        )
+
+        unknown_snapshot, _, _ = _snapshot(
+            registration,
+            sync_id="sync-unknown",
+            sensitivity=Sensitivity.UNKNOWN,
+        )
+        await store.commit_snapshot(unknown_snapshot, registration=registration)
+        assert (
+            await view.admitted_model_sensitivity(
+                registration.agent_id,
+                (registration.id,),
+            )
+            is None
+        )
+
+        stale_resource_id = catalog_resource_id(
+            registration.id,
+            ResourceKind.TABLE,
+            "public.missing",
+        )
+        await store.replace_source_permission_scopes(
+            SourceReadScope(
+                agent_id=registration.agent_id,
+                source_id=registration.id,
+                mode=SourceReadMode.SELECTED,
+                resource_ids=(stale_resource_id,),
+            ),
+            (),
+        )
+        assert (
+            await view.admitted_model_sensitivity(
+                registration.agent_id,
+                (registration.id,),
+            )
+            is None
+        )
+        with pytest.raises(SourcePermissionStateError):
+            await view.readable_resource_ids(
+                registration.agent_id,
+                (registration.id,),
+            )
+        assert resource.id != stale_resource_id
+    finally:
+        await store.close()
 
 
 async def test_attach_refresh_detach_and_reopen_preserve_narrow_scopes(

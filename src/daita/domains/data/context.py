@@ -19,7 +19,7 @@ from ...catalog.models import (
     CATALOG_CONTEXT_DEFAULT_LIMIT,
     CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
 )
-from ...llm.errors import ContextWindowExceeded
+from ...llm.errors import ContextWindowExceeded, RequestSensitivityUnavailable
 from ...llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -136,6 +136,12 @@ _SIDE_EFFECT_TOOL_NAMES = frozenset(
 
 
 class CatalogContextReader(Protocol):
+    async def admitted_model_sensitivity(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> ModelSensitivity | None: ...
+
     async def catalog_context(
         self,
         agent_id: str,
@@ -197,6 +203,8 @@ class DataContextBuilder:
             raise TypeError("profile must be ModelProfile")
         if not callable(getattr(catalog, "catalog_context", None)):
             raise TypeError("catalog must provide catalog_context")
+        if not callable(getattr(catalog, "admitted_model_sensitivity", None)):
+            raise TypeError("catalog must provide admitted_model_sensitivity")
         if memory is not None and (
             not callable(getattr(memory, "read_memory", None))
             or not callable(getattr(memory, "read_user_profile", None))
@@ -291,6 +299,16 @@ class DataContextBuilder:
         if any(not isinstance(tool, ToolDefinition) for tool in tools):
             raise TypeError("tools must contain ToolDefinition records")
 
+        sensitivity = ModelSensitivity.PUBLIC
+        if run.source_id is not None:
+            classified = await self._catalog.admitted_model_sensitivity(
+                run.agent_id,
+                (run.source_id,),
+            )
+            if not isinstance(classified, ModelSensitivity):
+                raise RequestSensitivityUnavailable()
+            sensitivity = classified
+
         prior_turns, current_messages, upstream_omitted = _split_working_messages(
             messages
         )
@@ -371,6 +389,7 @@ class DataContextBuilder:
             semantic_query=catalog_query,
             candidate_text=candidate_text,
             artifact_destinations=artifact_destinations,
+            sensitivity=sensitivity,
             final=final,
         )
         validated_prior_turns: list[tuple[CanonicalMessage, ...]] = []
@@ -409,6 +428,7 @@ class DataContextBuilder:
                 semantic_text=semantic_text,
                 candidate_text=candidate_text,
                 artifact_destinations=artifact_destinations,
+                sensitivity=sensitivity,
                 final=final,
                 history_omitted=omitted,
                 profile=self._profile,
@@ -443,6 +463,7 @@ class DataContextBuilder:
                 semantic_text=semantic_text,
                 candidate_text=candidate_text,
                 artifact_destinations=artifact_destinations,
+                sensitivity=sensitivity,
                 final=final,
                 history_omitted=omitted,
                 profile=self._profile,
@@ -471,6 +492,7 @@ class DataContextBuilder:
             semantic_text=semantic_text,
             candidate_text=candidate_text,
             artifact_destinations=artifact_destinations,
+            sensitivity=sensitivity,
             final=final,
             history_omitted=history_omitted,
             profile=self._profile,
@@ -492,6 +514,7 @@ class DataContextBuilder:
         semantic_query: str,
         candidate_text: str,
         artifact_destinations: tuple[ArtifactDestination, ...],
+        sensitivity: ModelSensitivity,
         final: bool,
     ) -> tuple[dict[str, object], str]:
         resources = catalog.get("resources")
@@ -530,6 +553,7 @@ class DataContextBuilder:
                 semantic_text=semantic_text,
                 candidate_text=candidate_text,
                 artifact_destinations=artifact_destinations,
+                sensitivity=sensitivity,
                 final=final,
                 history_omitted=False,
                 profile=self._profile,
@@ -1305,6 +1329,7 @@ def _request(
     semantic_text: str,
     candidate_text: str,
     artifact_destinations: tuple[ArtifactDestination, ...],
+    sensitivity: ModelSensitivity,
     final: bool,
     history_omitted: bool,
     profile: ModelProfile,
@@ -1367,7 +1392,7 @@ def _request(
     return ModelRequest(
         messages=(system, *omission, *messages),
         tools=tools,
-        sensitivity=ModelSensitivity.INTERNAL,
+        sensitivity=sensitivity,
         allow_parallel_tool_calls=(
             True if tools and profile.supports_parallel_tools else None
         ),

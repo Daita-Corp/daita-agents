@@ -27,6 +27,7 @@ from daita.llm.models import (
     MessageRole,
     ModelProfile,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -584,6 +585,12 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
 
 
 class _Catalog:
+    async def admitted_model_sensitivity(
+        self, agent_id: str, source_ids: tuple[str, ...] = ()
+    ) -> ModelSensitivity:
+        del agent_id, source_ids
+        return ModelSensitivity.PUBLIC
+
     async def catalog_context(self, *args, **kwargs) -> FrozenJsonObject:
         del args, kwargs
         return FrozenJsonObject.from_mapping(
