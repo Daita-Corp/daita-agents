@@ -145,6 +145,29 @@ class ModelRoute:
         )
 
 
+@dataclass(slots=True)
+class RunRoute:
+    """One explicit provider-selection handle owned by a single run."""
+
+    candidate_provider_ids: tuple[str, ...]
+    initial_sensitivity: ModelSensitivity
+    selected_provider_id: str | None = None
+
+    def __post_init__(self) -> None:
+        candidates = tuple(self.candidate_provider_ids)
+        if not candidates or len(candidates) != len(set(candidates)):
+            raise ValueError("run route requires distinct candidate provider IDs")
+        if any(not isinstance(item, str) or not item for item in candidates):
+            raise ValueError("run route candidate provider IDs must be non-empty")
+        if not isinstance(self.initial_sensitivity, ModelSensitivity):
+            raise TypeError("run route initial sensitivity is invalid")
+        if self.selected_provider_id is not None and (
+            self.selected_provider_id not in candidates
+        ):
+            raise ValueError("run route selected provider is not a candidate")
+        self.candidate_provider_ids = candidates
+
+
 class ModelRouter:
     """Try eligible providers in order; retry only normalized transient failures."""
 
@@ -203,10 +226,59 @@ class ModelRouter:
             provider_has_complete_pricing(item.provider, request) for item in eligible
         )
 
+    def begin_run(self, sensitivity: ModelSensitivity) -> RunRoute:
+        """Freeze the eligible initial candidate order for one run."""
+
+        if not isinstance(sensitivity, ModelSensitivity):
+            raise TypeError("run route sensitivity must be ModelSensitivity")
+        candidates = tuple(
+            item.provider.provider_id
+            for item in self._candidates
+            if sensitivity in item.allowed_sensitivities
+            and item.profile.available
+            and item.profile.healthy
+        )
+        if not candidates:
+            raise ModelProviderError(
+                ProviderErrorCode.INVALID_REQUEST,
+                "no configured provider is eligible for the run sensitivity",
+            )
+        return RunRoute(candidates, sensitivity)
+
+    def supports_run_request(self, route: RunRoute, request: ModelRequest) -> bool:
+        return any(_eligible(item, request) for item in self._run_candidates(route))
+
+    def has_complete_run_pricing(
+        self,
+        route: RunRoute,
+        request: ModelRequest,
+    ) -> bool:
+        eligible = tuple(
+            item for item in self._run_candidates(route) if _eligible(item, request)
+        )
+        return bool(eligible) and all(
+            provider_has_complete_pricing(item.provider, request) for item in eligible
+        )
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
+        return await self._generate(request, None)
+
+    async def generate_for_run(
+        self,
+        route: RunRoute,
+        request: ModelRequest,
+    ) -> ModelResponse:
+        return await self._generate(request, route)
+
+    async def _generate(
+        self,
+        request: ModelRequest,
+        route: RunRoute | None,
+    ) -> ModelResponse:
         last_error: ModelProviderError | None = None
         attempt_usage: list[ModelUsage] = []
-        for registration in self._candidates:
+        candidates = self._candidates if route is None else self._run_candidates(route)
+        for registration in candidates:
             if not _eligible(registration, request):
                 continue
             for attempt in range(self._retry_policy.attempts):
@@ -229,6 +301,8 @@ class ModelRouter:
                             await self._sleep(delay)
                 else:
                     attempt_usage.append(response.usage)
+                    if route is not None:
+                        route.selected_provider_id = registration.provider.provider_id
                     return replace(
                         response,
                         usage=_aggregate_usage(attempt_usage),
@@ -249,9 +323,28 @@ class ModelRouter:
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         """Route one canonical stream without retrying after visible progress."""
 
+        async for event in self._stream(request, None):
+            yield event
+
+    async def stream_for_run(
+        self,
+        route: RunRoute,
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        async for event in self._stream(request, route):
+            yield event
+
+    async def _stream(
+        self,
+        request: ModelRequest,
+        route: RunRoute | None,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        """Route one canonical stream without retrying after visible progress."""
+
         last_error: ModelProviderError | None = None
         attempt_usage: list[ModelUsage] = []
-        for registration in self._candidates:
+        candidates = self._candidates if route is None else self._run_candidates(route)
+        for registration in candidates:
             if not _eligible(registration, request):
                 continue
             if not registration.profile.supports_streaming or not isinstance(
@@ -272,6 +365,10 @@ class ModelRouter:
                         if isinstance(event, ModelStreamCompleted):
                             completed = True
                             attempt_usage.append(event.response.usage)
+                            if route is not None:
+                                route.selected_provider_id = (
+                                    registration.provider.provider_id
+                                )
                             yield ModelStreamCompleted(
                                 replace(
                                     event.response,
@@ -325,6 +422,22 @@ class ModelRouter:
             "no configured provider can stream this request",
         )
 
+    def _run_candidates(
+        self,
+        route: RunRoute,
+    ) -> tuple[ModelProviderRegistration, ...]:
+        if not isinstance(route, RunRoute):
+            raise TypeError("route must be RunRoute")
+        configured = {item.provider.provider_id: item for item in self._candidates}
+        if any(item not in configured for item in route.candidate_provider_ids):
+            raise ValueError("run route does not belong to this router")
+        provider_ids = (
+            (route.selected_provider_id,)
+            if route.selected_provider_id is not None
+            else route.candidate_provider_ids
+        )
+        return tuple(configured[item] for item in provider_ids)
+
 
 def _eligible(registration: ModelProviderRegistration, request: ModelRequest) -> bool:
     profile = registration.profile
@@ -374,5 +487,6 @@ __all__ = [
     "ModelRouteCandidate",
     "ModelRouter",
     "RetryPolicy",
+    "RunRoute",
     "autonomous_request_is_admissible",
 ]

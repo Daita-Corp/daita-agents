@@ -23,7 +23,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import RunInput
+from daita.loop.models import RunInput, ToolBatchOutcome
 from daita.skills import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,
     SKILL_INDEX_MAX_CHARACTERS,
@@ -599,7 +599,7 @@ async def test_missing_invalid_and_malformed_skill_views_are_bounded_errors(tmp_
         (directory / "SKILL.md").write_text("bad", encoding="utf-8")
         loop = agent._embedded._loop
         assert loop is not None
-        results = await loop._tools.execute_all(
+        outcome = await loop._tools.execute_all(
             RunInput(
                 id="malformed-skill-run",
                 agent_id=agent.id,
@@ -608,7 +608,7 @@ async def test_missing_invalid_and_malformed_skill_views_are_bounded_errors(tmp_
             ),
             (ToolCall(id="bad", name="skill_view", arguments={"name": "broken"}),),
         )
-        error = results[0].output["error"]
+        error = outcome.ordered_results[0].output["error"]
         assert isinstance(error, Mapping)
         assert error["code"] == "skill_unavailable"
         assert "SKILL.md" not in error["message"]
@@ -860,9 +860,25 @@ async def test_direct_operations_emit_no_model_calls_or_observer_events(tmp_path
 
 async def test_custom_context_builder_remains_unwrapped(tmp_path):
     class CustomContext:
-        async def build(self, run, messages, tools, *, step, final=False):
-            del run, step, final
-            return ModelRequest(messages=messages, tools=tools)
+        async def prepare(self, run, messages, tools):
+            del run
+            return messages[:-1], tools
+
+        def project(
+            self,
+            snapshot,
+            messages,
+            *,
+            step,
+            final=False,
+            previous_request_input_tokens=None,
+        ):
+            del step, previous_request_input_tokens
+            static, tools = snapshot
+            return ModelRequest(
+                messages=(*static, *messages),
+                tools=() if final else tools,
+            )
 
     class NoTools:
         async def definitions(self, run):
@@ -872,7 +888,7 @@ async def test_custom_context_builder_remains_unwrapped(tmp_path):
         async def execute_all(self, run, calls):
             del run
             assert calls == ()
-            return ()
+            return ToolBatchOutcome(())
 
     provider = MockModelProvider((_stop(),))
     context = CustomContext()

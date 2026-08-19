@@ -19,7 +19,11 @@ from ...catalog.models import (
     CATALOG_CONTEXT_DEFAULT_LIMIT,
     CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
 )
-from ...llm.errors import ContextWindowExceeded, RequestSensitivityUnavailable
+from ...llm.errors import (
+    ContextEvidencePressureExceeded,
+    ContextWindowExceeded,
+    RequestSensitivityUnavailable,
+)
 from ...llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -80,8 +84,8 @@ from .file_capabilities import (
 _MAXIMUM_PRIOR_COMPLETED_RUNS = 8
 _MAXIMUM_PRIOR_MESSAGES = 40
 _MAXIMUM_PRIOR_UTF8_BYTES = 24_000
-_CURRENT_RUN_GROWTH_RESERVE = 8_000
-_PROVIDER_FRAMING_ALLOWANCE = 1_024
+_CURRENT_RUN_GROWTH_RESERVE = 2_048
+_PROVIDER_FRAMING_TOKEN_ALLOWANCE = 512
 _HISTORY_OMISSION_MARKER = (
     "[Additional earlier conversation history exists outside the active window.]"
 )
@@ -185,8 +189,60 @@ class ArtifactDestinationContextReader(Protocol):
     ) -> tuple[ArtifactDestination, ...]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class RunContextSnapshot:
+    """Immutable static context prepared once for one direct loop run."""
+
+    run_id: str
+    profile: ModelProfile
+    tools: tuple[ToolDefinition, ...]
+    static_messages: tuple[CanonicalMessage, ...]
+    final_static_messages: tuple[CanonicalMessage, ...]
+    initial_sensitivity: ModelSensitivity
+    initial_sensitivity_provenance: FrozenJsonObject
+    static_context_sha256: str
+    max_context_evidence_bytes: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.run_id, str) or not self.run_id:
+            raise ValueError("run context snapshot requires run_id")
+        if not isinstance(self.profile, ModelProfile):
+            raise TypeError("run context snapshot requires a model profile")
+        tools = tuple(self.tools)
+        static_messages = tuple(self.static_messages)
+        final_static_messages = tuple(self.final_static_messages)
+        if any(not isinstance(item, ToolDefinition) for item in tools):
+            raise TypeError("run context snapshot tools are invalid")
+        if any(
+            not isinstance(item, CanonicalMessage)
+            for item in (*static_messages, *final_static_messages)
+        ):
+            raise TypeError("run context snapshot messages are invalid")
+        if not isinstance(self.initial_sensitivity, ModelSensitivity):
+            raise TypeError("run context snapshot sensitivity is invalid")
+        if not isinstance(
+            self.initial_sensitivity_provenance,
+            FrozenJsonObject,
+        ):
+            raise TypeError("run context snapshot provenance must be frozen")
+        if (
+            not isinstance(self.static_context_sha256, str)
+            or len(self.static_context_sha256) != 64
+        ):
+            raise ValueError("run context snapshot requires a SHA-256 digest")
+        if (
+            not isinstance(self.max_context_evidence_bytes, int)
+            or isinstance(self.max_context_evidence_bytes, bool)
+            or self.max_context_evidence_bytes < 1
+        ):
+            raise ValueError("run context evidence bound must be positive")
+        object.__setattr__(self, "tools", tools)
+        object.__setattr__(self, "static_messages", static_messages)
+        object.__setattr__(self, "final_static_messages", final_static_messages)
+
+
 class DataContextBuilder:
-    """Build and budget one request from current work plus bounded history."""
+    """Prepare immutable run context and project bounded model requests."""
 
     def __init__(
         self,
@@ -198,6 +254,7 @@ class DataContextBuilder:
         semantics: SemanticContextReader | None = None,
         artifact_destinations: ArtifactDestinationContextReader | None = None,
         catalog_limit: int = CATALOG_CONTEXT_DEFAULT_LIMIT,
+        max_context_evidence_bytes: int = 512 * 1_024,
     ) -> None:
         if not isinstance(profile, ModelProfile):
             raise TypeError("profile must be ModelProfile")
@@ -234,6 +291,12 @@ class DataContextBuilder:
             or catalog_limit < 1
         ):
             raise ValueError("catalog_limit must be a positive integer")
+        if (
+            not isinstance(max_context_evidence_bytes, int)
+            or isinstance(max_context_evidence_bytes, bool)
+            or max_context_evidence_bytes < 1
+        ):
+            raise ValueError("max_context_evidence_bytes must be positive")
         self._catalog = catalog
         self._memory = memory
         self._skills = skills
@@ -246,6 +309,7 @@ class DataContextBuilder:
         )
         self._profile = profile
         self._catalog_limit = catalog_limit
+        self._max_context_evidence_bytes = max_context_evidence_bytes
         self._selected_learning_candidates: dict[str, tuple[str, str]] = {}
 
     def select_learning_candidate(
@@ -254,7 +318,7 @@ class DataContextBuilder:
         candidate_id: str,
         rendered_candidate: str,
     ) -> None:
-        """Bind one candidate to one fresh run before its first context build."""
+        """Bind one candidate to one fresh run before context preparation."""
 
         if (
             not isinstance(run_id, str)
@@ -281,23 +345,32 @@ class DataContextBuilder:
 
         self._selected_learning_candidates.pop(run_id, None)
 
-    async def build(
+    async def prepare(
         self,
         run: RunInput,
         messages: tuple[CanonicalMessage, ...],
         tools: tuple[ToolDefinition, ...],
-        *,
-        step: int,
-        final: bool = False,
-    ) -> ModelRequest:
+    ) -> RunContextSnapshot:
+        """Read and freeze all static run context exactly once."""
+
         if not isinstance(run, RunInput):
             raise TypeError("run must be RunInput")
-        if not isinstance(step, int) or isinstance(step, bool) or step < 1:
-            raise ValueError("step must be a positive integer")
+        messages = tuple(messages)
+        tools = tuple(tools)
         if any(not isinstance(message, CanonicalMessage) for message in messages):
             raise TypeError("messages must contain CanonicalMessage records")
         if any(not isinstance(tool, ToolDefinition) for tool in tools):
             raise TypeError("tools must contain ToolDefinition records")
+
+        current_user = CanonicalMessage(
+            role=MessageRole.USER,
+            content=(TextBlock(run.message),),
+        )
+        prior_turns, current_messages, upstream_omitted = _split_working_messages(
+            messages
+        )
+        if current_messages != (current_user,):
+            raise ValueError("context must be prepared before the first model response")
 
         sensitivity = ModelSensitivity.PUBLIC
         if run.source_id is not None:
@@ -309,9 +382,6 @@ class DataContextBuilder:
                 raise RequestSensitivityUnavailable()
             sensitivity = classified
 
-        prior_turns, current_messages, upstream_omitted = _split_working_messages(
-            messages
-        )
         memory_text = ""
         user_profile = ""
         if self._memory is not None:
@@ -390,7 +460,6 @@ class DataContextBuilder:
             candidate_text=candidate_text,
             artifact_destinations=artifact_destinations,
             sensitivity=sensitivity,
-            final=final,
         )
         validated_prior_turns: list[tuple[CanonicalMessage, ...]] = []
         schema_history_omitted = False
@@ -429,7 +498,7 @@ class DataContextBuilder:
                 candidate_text=candidate_text,
                 artifact_destinations=artifact_destinations,
                 sensitivity=sensitivity,
-                final=final,
+                final=False,
                 history_omitted=omitted,
                 profile=self._profile,
             )
@@ -464,7 +533,7 @@ class DataContextBuilder:
                 candidate_text=candidate_text,
                 artifact_destinations=artifact_destinations,
                 sensitivity=sensitivity,
-                final=final,
+                final=False,
                 history_omitted=omitted,
                 profile=self._profile,
             )
@@ -479,12 +548,13 @@ class DataContextBuilder:
             or len(selected) < len(prior_turns)
             or any(turn != prior_turns[index] for index, turn in selected)
         )
-        request = _request(
+        selected_messages = (
+            *_flatten([turn for _, turn in selected]),
+            *current_messages,
+        )
+        initial = _request(
             catalog_payload,
-            (
-                *_flatten([turn for _, turn in selected]),
-                *current_messages,
-            ),
+            selected_messages,
             tools,
             memory_text=memory_text,
             user_profile=user_profile,
@@ -493,11 +563,153 @@ class DataContextBuilder:
             candidate_text=candidate_text,
             artifact_destinations=artifact_destinations,
             sensitivity=sensitivity,
-            final=final,
+            final=False,
             history_omitted=history_omitted,
             profile=self._profile,
         )
-        if _estimate_input_tokens(request) > self._profile.maximum_input_tokens:
+        final_request = _request(
+            catalog_payload,
+            selected_messages,
+            (),
+            memory_text=memory_text,
+            user_profile=user_profile,
+            skill_index=skill_index,
+            semantic_text=semantic_text,
+            candidate_text=candidate_text,
+            artifact_destinations=(),
+            sensitivity=sensitivity,
+            final=True,
+            history_omitted=history_omitted,
+            profile=self._profile,
+        )
+        if (
+            max(
+                _estimate_input_tokens(initial),
+                _estimate_input_tokens(final_request),
+            )
+            > self._profile.maximum_input_tokens
+        ):
+            raise ContextWindowExceeded()
+
+        static_messages = initial.messages[:-1]
+        final_static_messages = final_request.messages[:-1]
+        static_material = {
+            "run_id": run.id,
+            "profile_id": self._profile.id,
+            "messages": [_neutral_message(item) for item in static_messages],
+            "final_messages": [
+                _neutral_message(item) for item in final_static_messages
+            ],
+            "tools": [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                }
+                for tool in tools
+            ],
+            "sensitivity": sensitivity.value,
+        }
+        digest = sha256(canonical_json(static_material).encode("utf-8")).hexdigest()
+        provenance = FrozenJsonObject.from_mapping(
+            {
+                "authority": "run_context_snapshot",
+                "run_id": run.id,
+                "source_ids": (() if run.source_id is None else (run.source_id,)),
+                "static_context_sha256": digest,
+            }
+        )
+        return RunContextSnapshot(
+            run_id=run.id,
+            profile=self._profile,
+            tools=tools,
+            static_messages=static_messages,
+            final_static_messages=final_static_messages,
+            initial_sensitivity=sensitivity,
+            initial_sensitivity_provenance=provenance,
+            static_context_sha256=digest,
+            max_context_evidence_bytes=self._max_context_evidence_bytes,
+        )
+
+    def project(
+        self,
+        snapshot: object,
+        messages: tuple[CanonicalMessage, ...],
+        *,
+        step: int,
+        final: bool = False,
+        previous_request_input_tokens: int | None = None,
+    ) -> ModelRequest:
+        """Project one request from immutable static context plus exact transcript."""
+
+        if not isinstance(snapshot, RunContextSnapshot):
+            raise TypeError("snapshot must be RunContextSnapshot")
+        if not isinstance(step, int) or isinstance(step, bool) or step < 1:
+            raise ValueError("step must be positive")
+        messages = tuple(messages)
+        if not messages or messages[0].role is not MessageRole.USER:
+            raise ValueError("current run transcript must begin with its user message")
+        if any(not isinstance(item, CanonicalMessage) for item in messages):
+            raise TypeError("messages must contain CanonicalMessage records")
+        if previous_request_input_tokens is not None and (
+            not isinstance(previous_request_input_tokens, int)
+            or isinstance(previous_request_input_tokens, bool)
+            or previous_request_input_tokens < 0
+        ):
+            raise ValueError("previous request tokens must be non-negative")
+
+        sensitivity = snapshot.initial_sensitivity
+        evidence_bytes = 0
+        classified_results: list[dict[str, object]] = []
+        for message in messages:
+            for block in message.content:
+                if not isinstance(block, ToolResultBlock):
+                    continue
+                evidence_bytes += len(canonical_json(block.output).encode("utf-8"))
+                if block.sensitivity is None:
+                    continue
+                if block.sensitivity.routing_rank > sensitivity.routing_rank:
+                    sensitivity = block.sensitivity
+                classified_results.append(
+                    {
+                        "call_id": block.call_id,
+                        "sensitivity": block.sensitivity.value,
+                        "provenance_sha256": sha256(
+                            canonical_json(block.sensitivity_provenance).encode("utf-8")
+                        ).hexdigest(),
+                    }
+                )
+        if evidence_bytes > snapshot.max_context_evidence_bytes:
+            raise ContextEvidencePressureExceeded()
+
+        provenance = FrozenJsonObject.from_mapping(
+            {
+                "authority": "run_context_snapshot",
+                "static_context_sha256": snapshot.static_context_sha256,
+                "initial_sensitivity": snapshot.initial_sensitivity.value,
+                "initial_sensitivity_provenance": (
+                    snapshot.initial_sensitivity_provenance
+                ),
+                "effective_sensitivity": sensitivity.value,
+                "classified_results": classified_results,
+            }
+        )
+        tools = () if final else snapshot.tools
+        static_messages = (
+            snapshot.final_static_messages if final else snapshot.static_messages
+        )
+        request = ModelRequest(
+            messages=(*static_messages, *messages),
+            tools=tools,
+            sensitivity=sensitivity,
+            sensitivity_provenance=provenance,
+            allow_parallel_tool_calls=(
+                True if tools and snapshot.profile.supports_parallel_tools else None
+            ),
+        )
+        estimate = _estimate_input_tokens(request)
+        accounted = max(estimate, previous_request_input_tokens or 0)
+        if accounted > snapshot.profile.maximum_input_tokens:
             raise ContextWindowExceeded()
         return request
 
@@ -515,7 +727,6 @@ class DataContextBuilder:
         candidate_text: str,
         artifact_destinations: tuple[ArtifactDestination, ...],
         sensitivity: ModelSensitivity,
-        final: bool,
     ) -> tuple[dict[str, object], str]:
         resources = catalog.get("resources")
         if not isinstance(resources, list):
@@ -554,7 +765,7 @@ class DataContextBuilder:
                 candidate_text=candidate_text,
                 artifact_destinations=artifact_destinations,
                 sensitivity=sensitivity,
-                final=final,
+                final=False,
                 history_omitted=False,
                 profile=self._profile,
             )
@@ -1631,6 +1842,14 @@ def _learning_policy(semantic_tools_available: bool) -> str:
 
 
 def _estimate_input_tokens(request: ModelRequest) -> int:
+    """Conservatively estimate tokens without pretending UTF-8 bytes are tokens.
+
+    ASCII material is charged at one token per character, non-ASCII material at
+    one token per UTF-8 byte, plus fixed record/schema framing. This deliberately
+    uses byte-fallback-style upper accounting instead of an average characters-per-
+    token ratio, so punctuation, identifiers, and Unicode remain fail-closed.
+    """
+
     neutral = {
         "messages": [_neutral_message(message) for message in request.messages],
         "tools": [
@@ -1643,9 +1862,27 @@ def _estimate_input_tokens(request: ModelRequest) -> int:
         ],
         "response_schema": request.response_schema,
         "sensitivity": request.sensitivity.value,
+        "sensitivity_provenance": request.sensitivity_provenance,
         "allow_parallel_tool_calls": request.allow_parallel_tool_calls,
     }
-    return len(canonical_json(neutral).encode("utf-8")) + _PROVIDER_FRAMING_ALLOWANCE
+    material = canonical_json(neutral)
+    ascii_characters = sum(ord(character) < 128 for character in material)
+    non_ascii_bytes = sum(
+        len(character.encode("utf-8"))
+        for character in material
+        if ord(character) >= 128
+    )
+    structural_allowance = (
+        len(request.messages) * 12
+        + len(request.tools) * 24
+        + (32 if request.response_schema is not None else 0)
+    )
+    return (
+        ascii_characters
+        + non_ascii_bytes
+        + structural_allowance
+        + _PROVIDER_FRAMING_TOKEN_ALLOWANCE
+    )
 
 
 def _neutral_message(message: CanonicalMessage) -> dict[str, object]:
@@ -1660,6 +1897,10 @@ def _neutral_message(message: CanonicalMessage) -> dict[str, object]:
                     "call_id": block.call_id,
                     "output": block.output,
                     "is_error": block.is_error,
+                    "sensitivity": (
+                        None if block.sensitivity is None else block.sensitivity.value
+                    ),
+                    "sensitivity_provenance": block.sensitivity_provenance,
                 }
             )
     return {
@@ -1691,5 +1932,6 @@ __all__ = [
     "CatalogContextReader",
     "DataContextBuilder",
     "MemoryContextReader",
+    "RunContextSnapshot",
     "SkillContextReader",
 ]

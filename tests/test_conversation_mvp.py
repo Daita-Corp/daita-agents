@@ -40,6 +40,7 @@ from daita.loop import (
     LoopExit,
     LoopExitKind,
     RunInput,
+    ToolBatchOutcome,
     Transcript,
 )
 from daita.storage.sqlite import SQLiteStateStore
@@ -47,14 +48,57 @@ from daita.storage.sqlite import SQLiteStateStore
 NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
+async def _prepared_request(
+    builder: DataContextBuilder,
+    run: RunInput,
+    messages: tuple[CanonicalMessage, ...],
+    tools: tuple[ToolDefinition, ...],
+    *,
+    step: int,
+    final: bool = False,
+) -> ModelRequest:
+    current_start = max(
+        index
+        for index, message in enumerate(messages)
+        if message.role is MessageRole.USER
+    )
+    snapshot = await builder.prepare(
+        run,
+        messages[: current_start + 1],
+        tools,
+    )
+    return builder.project(
+        snapshot,
+        messages[current_start:],
+        step=step,
+        final=final,
+    )
+
+
 def test_context_builder_exposes_only_fixed_absolute_history_bounds():
     assert "retain_messages" not in inspect.signature(DataContextBuilder).parameters
 
 
 class TranscriptContext:
-    async def build(self, run, messages, tools, *, step, final=False):
-        del run, step, final
-        return ModelRequest(messages=messages, tools=tools)
+    async def prepare(self, run, messages, tools):
+        del run
+        return messages[:-1], tools
+
+    def project(
+        self,
+        snapshot,
+        messages,
+        *,
+        step,
+        final=False,
+        previous_request_input_tokens=None,
+    ):
+        del step, previous_request_input_tokens
+        static, tools = snapshot
+        return ModelRequest(
+            messages=(*static, *messages),
+            tools=() if final else tools,
+        )
 
 
 class NoTools:
@@ -65,7 +109,7 @@ class NoTools:
     async def execute_all(self, run, calls):
         del run
         assert calls == ()
-        return ()
+        return ToolBatchOutcome(())
 
 
 class ReplayTools:
@@ -82,29 +126,31 @@ class ReplayTools:
 
     async def execute_all(self, run, calls):
         del run
-        return tuple(
-            ToolResultBlock(
-                call_id=call.id,
-                output=(
-                    {
-                        "kind": "skill.document",
-                        "data": {
-                            "name": "secret-skill",
-                            "instructions": "SECRET SKILL BODY",
-                        },
-                    }
-                    if call.name == "skill_view"
-                    else {
-                        "kind": {
-                            "memory_set": "memory.replacement",
-                            "skill_save": "skill.saved",
-                            "skill_delete": "skill.deleted",
-                        }[call.name],
-                        "data": {"ok": True},
-                    }
-                ),
+        return ToolBatchOutcome(
+            tuple(
+                ToolResultBlock(
+                    call_id=call.id,
+                    output=(
+                        {
+                            "kind": "skill.document",
+                            "data": {
+                                "name": "secret-skill",
+                                "instructions": "SECRET SKILL BODY",
+                            },
+                        }
+                        if call.name == "skill_view"
+                        else {
+                            "kind": {
+                                "memory_set": "memory.replacement",
+                                "skill_save": "skill.saved",
+                                "skill_delete": "skill.deleted",
+                            }[call.name],
+                            "data": {"ok": True},
+                        }
+                    ),
+                )
+                for call in calls
             )
-            for call in calls
         )
 
 
@@ -125,29 +171,31 @@ class FreshQueryTools:
     async def execute_all(self, run, calls):
         del run
         self.calls.extend(calls)
-        return tuple(
-            ToolResultBlock(
-                call_id=call.id,
-                output={
-                    "kind": "data.postgresql.query_result",
-                    "data": {
-                        "columns": ["segment", "paid_revenue"],
-                        "rows": [{"segment": "enterprise", "paid_revenue": 321}],
-                        "total_rows": 1,
-                        "returned_rows": 1,
-                        "truncated": False,
-                        "resource_revisions": [
-                            {
-                                "resource_id": "orders",
-                                "revision": "sha256:" + ("d" * 64),
-                            }
-                        ],
-                        "source_id": "warehouse",
-                        "source_revision": "catalog:current",
+        return ToolBatchOutcome(
+            tuple(
+                ToolResultBlock(
+                    call_id=call.id,
+                    output={
+                        "kind": "data.postgresql.query_result",
+                        "data": {
+                            "columns": ["segment", "paid_revenue"],
+                            "rows": [{"segment": "enterprise", "paid_revenue": 321}],
+                            "total_rows": 1,
+                            "returned_rows": 1,
+                            "truncated": False,
+                            "resource_revisions": [
+                                {
+                                    "resource_id": "orders",
+                                    "revision": "sha256:" + ("d" * 64),
+                                }
+                            ],
+                            "source_id": "warehouse",
+                            "source_revision": "catalog:current",
+                        },
                     },
-                },
+                )
+                for call in calls
             )
-            for call in calls
         )
 
 
@@ -850,7 +898,8 @@ async def test_oversized_analytical_history_keeps_compact_contract_and_requeries
         supports_tools=True,
     )
     builder = DataContextBuilder(catalog, profile=profile)
-    request = await builder.build(
+    request = await _prepared_request(
+        builder,
         RunInput(
             id="enterprise-follow-up",
             agent_id="agent-history",
@@ -1147,13 +1196,14 @@ async def test_whole_request_budget_downgrades_full_turn_before_dropping_it():
         CatalogSpy(),
         profile=ModelProfile(
             id="mock:full-downgrade",
-            context_window_tokens=15_500,
+            context_window_tokens=9_500,
             max_output_tokens=1_000,
             supports_tools=True,
         ),
     )
     current = "current-run-message-must-remain-complete"
-    request = await builder.build(
+    request = await _prepared_request(
+        builder,
         RunInput(
             id="full-downgrade-run",
             agent_id="agent-history",
@@ -1260,7 +1310,7 @@ async def test_final_budget_omits_oldest_turns_and_preserves_current_exchange():
     catalog = CatalogSpy()
     profile = ModelProfile(
         id="mock:budget",
-        context_window_tokens=15_000,
+        context_window_tokens=9_500,
         max_output_tokens=1_000,
         supports_tools=True,
     )
@@ -1283,7 +1333,8 @@ async def test_final_budget_omits_oldest_turns_and_preserves_current_exchange():
             content=(ToolResultBlock(call_id=current_call.id, output={"value": 1}),),
         ),
     )
-    request = await builder.build(
+    request = await _prepared_request(
+        builder,
         RunInput(
             id="budget-run",
             agent_id="agent-history",
@@ -1322,7 +1373,8 @@ async def test_catalog_query_uses_current_and_most_recent_prior_user_message():
             _simple_conversation_record(1),
         )
     )
-    request = await builder.build(
+    request = await _prepared_request(
+        builder,
         RunInput(
             id="referential-run",
             agent_id="agent-history",
@@ -1426,18 +1478,24 @@ async def test_inspection_keeps_nonreplayable_runs_but_history_excludes_them(tmp
                     content=(TextBlock(sentinel),),
                 ),
             )
-            await store.finish(
-                LoopExit(
-                    run_id=run.id,
-                    conversation_id=first.conversation_id,
-                    kind=kind,
-                    reason=kind.value,
-                    created_at=NOW,
-                    final_text=(
-                        "claimed complete" if kind is LoopExitKind.COMPLETED else None
-                    ),
-                )
+            terminal = LoopExit(
+                run_id=run.id,
+                conversation_id=first.conversation_id,
+                kind=kind,
+                reason=kind.value,
+                created_at=NOW,
+                final_text=(
+                    "claimed complete" if kind is LoopExitKind.COMPLETED else None
+                ),
             )
+            if kind is LoopExitKind.COMPLETED:
+                with pytest.raises(
+                    ValueError,
+                    match="atomic transcript completion",
+                ):
+                    await store.finish(terminal)
+            else:
+                await store.finish(terminal)
         unfinished = RunInput(
             id="manual-unfinished",
             agent_id=agent_id,
@@ -1486,7 +1544,8 @@ async def test_inspection_keeps_nonreplayable_runs_but_history_excludes_them(tmp
         assert records[3].result is not None
         assert records[1].result.kind is LoopExitKind.FAILED
         assert records[2].result.kind is LoopExitKind.INTERRUPTED
-        assert records[3].result.kind is LoopExitKind.COMPLETED
+        assert records[3].result.kind is LoopExitKind.INTERRUPTED
+        assert records[3].result.reason == "previous_process_terminated"
     finally:
         await reopened.close()
 
@@ -1597,10 +1656,11 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
         content=(TextBlock(run.message),),
     )
 
-    unchanged = await DataContextBuilder(
-        CatalogSpy((current_resource,)),
-        profile=profile,
-    ).build(
+    unchanged = await _prepared_request(
+        DataContextBuilder(
+            CatalogSpy((current_resource,)),
+            profile=profile,
+        ),
         run,
         (*prior, current_user),
         (),
@@ -1616,10 +1676,11 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
         "sync_id": "catalog-sync-refreshed",
         "source_revision": "catalog:sha256:" + ("f" * 64),
     }
-    changed = await DataContextBuilder(
-        CatalogSpy((changed_resource,)),
-        profile=profile,
-    ).build(
+    changed = await _prepared_request(
+        DataContextBuilder(
+            CatalogSpy((changed_resource,)),
+            profile=profile,
+        ),
         run,
         (*prior, current_user),
         (),

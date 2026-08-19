@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -10,7 +9,13 @@ from decimal import Decimal
 from enum import Enum
 
 from ..artifacts.models import ArtifactDeliveryReceipt, ArtifactRef
-from ..llm.models import CanonicalMessage, ModelUsage, ToolResultBlock
+from ..llm.models import (
+    CanonicalMessage,
+    MessageRole,
+    ModelUsage,
+    TextBlock,
+    ToolResultBlock,
+)
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -63,11 +68,26 @@ class LoopLimits:
     max_total_tokens: int = 100_000
     max_wall_time_seconds: float = 300.0
     max_estimated_cost_usd: Decimal | None = None
+    max_tool_calls_per_response: int = 16
+    max_tool_calls_per_run: int = 64
+    max_tool_result_bytes: int = 256 * 1_024
+    max_tool_result_depth: int = 16
+    max_parallel_reads: int = 8
+    max_parallel_reads_per_source: int = 4
+    max_context_evidence_bytes: int = 512 * 1_024
+    side_effect_recovery_timeout_seconds: float = 10.0
 
     def __post_init__(self) -> None:
         for value, field_name in (
             (self.max_steps, "max_steps"),
             (self.max_total_tokens, "max_total_tokens"),
+            (self.max_tool_calls_per_response, "max_tool_calls_per_response"),
+            (self.max_tool_calls_per_run, "max_tool_calls_per_run"),
+            (self.max_tool_result_bytes, "max_tool_result_bytes"),
+            (self.max_tool_result_depth, "max_tool_result_depth"),
+            (self.max_parallel_reads, "max_parallel_reads"),
+            (self.max_parallel_reads_per_source, "max_parallel_reads_per_source"),
+            (self.max_context_evidence_bytes, "max_context_evidence_bytes"),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{field_name} must be a positive integer")
@@ -89,6 +109,28 @@ class LoopLimits:
             raise ValueError(
                 "max_estimated_cost_usd must be a finite non-negative Decimal or None"
             )
+        if self.max_tool_calls_per_response > self.max_tool_calls_per_run:
+            raise ValueError(
+                "max_tool_calls_per_response cannot exceed max_tool_calls_per_run"
+            )
+        if self.max_parallel_reads_per_source > self.max_parallel_reads:
+            raise ValueError(
+                "max_parallel_reads_per_source cannot exceed max_parallel_reads"
+            )
+        if (
+            not isinstance(self.side_effect_recovery_timeout_seconds, (int, float))
+            or isinstance(self.side_effect_recovery_timeout_seconds, bool)
+            or not math.isfinite(self.side_effect_recovery_timeout_seconds)
+            or not 0 < float(self.side_effect_recovery_timeout_seconds) <= 60
+        ):
+            raise ValueError(
+                "side_effect_recovery_timeout_seconds must be positive and at most 60"
+            )
+        object.__setattr__(
+            self,
+            "side_effect_recovery_timeout_seconds",
+            float(self.side_effect_recovery_timeout_seconds),
+        )
 
 
 class LoopExitKind(str, Enum):
@@ -163,17 +205,114 @@ class Transcript:
         object.__setattr__(self, "messages", messages)
 
 
-class ClassifiedToolResultsCancelled(asyncio.CancelledError):
-    """Carry already-classified ordered tool results across cancellation."""
+def validate_completed_transcript(
+    transcript: Transcript,
+    result: LoopExit,
+) -> None:
+    """Validate the exact per-run message state accepted as completion."""
 
-    def __init__(self, results: tuple[ToolResultBlock, ...]) -> None:
-        results = tuple(results)
-        if not results or any(
-            not isinstance(item, ToolResultBlock) for item in results
+    if not isinstance(transcript, Transcript):
+        raise TypeError("completed transcript must be a Transcript")
+    if not isinstance(result, LoopExit):
+        raise TypeError("completed transcript result must be a LoopExit")
+    if result.kind is not LoopExitKind.COMPLETED:
+        raise ValueError("completed transcript validation requires a completed exit")
+    if result.run_id != transcript.run.id:
+        raise ValueError("completed transcript result belongs to another run")
+    if result.conversation_id != (transcript.run.conversation_id or transcript.run.id):
+        raise ValueError("completed transcript result belongs to another conversation")
+
+    messages = transcript.messages
+    if not messages or messages[0].role is not MessageRole.USER:
+        raise ValueError("completed transcript must begin with its user message")
+    if any(message.role is MessageRole.USER for message in messages[1:]):
+        raise ValueError("completed transcript must contain exactly one user message")
+
+    position = 1
+    while position < len(messages):
+        assistant = messages[position]
+        if assistant.role is not MessageRole.ASSISTANT:
+            raise ValueError("completed transcript expected an assistant message")
+        position += 1
+        if assistant.tool_calls:
+            for call in assistant.tool_calls:
+                if position >= len(messages):
+                    raise ValueError(
+                        "completed transcript is missing an ordered tool result"
+                    )
+                tool_message = messages[position]
+                if (
+                    tool_message.role is not MessageRole.TOOL
+                    or len(tool_message.content) != 1
+                    or not isinstance(tool_message.content[0], ToolResultBlock)
+                    or tool_message.content[0].call_id != call.id
+                ):
+                    raise ValueError(
+                        "completed transcript has an invalid ordered tool result"
+                    )
+                position += 1
+            continue
+
+        if position != len(messages):
+            raise ValueError(
+                "completed transcript has messages after its final assistant"
+            )
+        if (
+            len(assistant.content) != 1
+            or not isinstance(assistant.content[0], TextBlock)
+            or assistant.content[0].text != result.final_text
         ):
-            raise TypeError("classified cancellation requires one or more tool results")
-        super().__init__()
-        self.results = results
+            raise ValueError(
+                "completed transcript final assistant must match LoopExit text"
+            )
+        return
+
+    raise ValueError("completed transcript must end with final assistant text")
+
+
+class ToolBatchInterruption(str, Enum):
+    CANCELLED = "cancelled"
+    DEADLINE = "deadline"
+
+
+class ToolBatchCertainty(str, Enum):
+    DEFINITE = "definite"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolBatchOutcome:
+    """One ordered result for every call plus any bounded interruption state."""
+
+    ordered_results: tuple[ToolResultBlock, ...]
+    interruption_kind: ToolBatchInterruption | None = None
+    outcome_certainty: ToolBatchCertainty = ToolBatchCertainty.DEFINITE
+
+    def __post_init__(self) -> None:
+        results = tuple(self.ordered_results)
+        if any(not isinstance(item, ToolResultBlock) for item in results):
+            raise TypeError("tool batch outcome requires tool-result records")
+        if self.interruption_kind is not None and not isinstance(
+            self.interruption_kind, ToolBatchInterruption
+        ):
+            raise TypeError("tool batch interruption kind is invalid")
+        if not isinstance(self.outcome_certainty, ToolBatchCertainty):
+            raise TypeError("tool batch outcome certainty is invalid")
+        if (
+            self.interruption_kind is None
+            and self.outcome_certainty is ToolBatchCertainty.OUTCOME_UNKNOWN
+        ):
+            raise ValueError("unknown tool outcome requires an interruption")
+        object.__setattr__(self, "ordered_results", results)
+
+    def __iter__(self):
+        return iter(self.ordered_results)
+
+    def __len__(self) -> int:
+        return len(self.ordered_results)
+
+    def __getitem__(self, index: int) -> ToolResultBlock:
+        return self.ordered_results[index]
 
 
 @dataclass(frozen=True, slots=True)

@@ -233,7 +233,14 @@ async def test_sqlite_persists_the_exact_estimate_without_repricing(tmp_path):
     )
 
     await store.start(run)
-    await store.finish(result)
+    await store.append(
+        run.id,
+        CanonicalMessage(role=MessageRole.USER, content=(TextBlock("question"),)),
+    )
+    await store.complete(
+        result,
+        CanonicalMessage(role=MessageRole.ASSISTANT, content=(TextBlock("answer"),)),
+    )
     replacement_schedule = replace(
         _complete("9.99", schedule="public:new"),
         components=(CostComponent("new", Decimal("9.99")),),

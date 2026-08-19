@@ -1341,7 +1341,14 @@ async def test_expanded_component_arithmetic_is_persisted_without_repricing(tmp_
     )
 
     await store.start(run)
-    await store.finish(result)
+    await store.append(
+        run.id,
+        CanonicalMessage(role=MessageRole.USER, content=(TextBlock("question"),)),
+    )
+    await store.complete(
+        result,
+        CanonicalMessage(role=MessageRole.ASSISTANT, content=(TextBlock("answer"),)),
+    )
     restored = await store.result(run.id)
     await store.close()
 

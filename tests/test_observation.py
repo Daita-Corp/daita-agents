@@ -38,6 +38,7 @@ from daita.loop import (
     LoopExitKind,
     LoopLimits,
     RunInput,
+    ToolBatchOutcome,
 )
 from daita.observation import AgentEvent, AgentEventKind
 
@@ -45,15 +46,34 @@ NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 class TranscriptContext:
-    async def build(self, run, messages, tools, *, step, final=False):
-        del run, step, final
-        return ModelRequest(messages=messages, tools=tools)
+    async def prepare(self, run, messages, tools):
+        del run
+        return messages[:-1], tools
+
+    def project(
+        self,
+        snapshot,
+        messages,
+        *,
+        step,
+        final=False,
+        previous_request_input_tokens=None,
+    ):
+        del step, previous_request_input_tokens
+        static, tools = snapshot
+        return ModelRequest(
+            messages=(*static, *messages),
+            tools=() if final else tools,
+        )
 
 
 class OverflowContext:
-    async def build(self, run, messages, tools, *, step, final=False):
-        del run, messages, tools, step, final
+    async def prepare(self, run, messages, tools):
+        del run, messages, tools
         raise ContextWindowExceeded
+
+    def project(self, snapshot, messages, **kwargs):
+        raise AssertionError("overflow context must fail during prepare")
 
 
 class ScriptedTools:
@@ -72,7 +92,7 @@ class ScriptedTools:
 
     async def execute_all(self, run, calls):
         del run
-        return tuple(self.outputs[call.id] for call in calls)
+        return ToolBatchOutcome(tuple(self.outputs[call.id] for call in calls))
 
 
 class OrderingStore(InMemoryTranscriptStore):
@@ -92,6 +112,10 @@ class OrderingStore(InMemoryTranscriptStore):
     async def finish(self, result):
         await super().finish(result)
         self.actions.append(f"persisted:finish:{result.kind.value}")
+
+    async def complete(self, result, final_message):
+        await super().complete(result, final_message)
+        self.actions.append(f"persisted:complete:{result.kind.value}")
 
 
 def _run(run_id="run-observed", conversation_id="conversation-observed"):
@@ -235,9 +259,8 @@ async def test_text_run_order_payloads_and_durable_boundaries():
         "persisted:start",
         "event:run.started",
         "persisted:user",
-        "persisted:assistant",
         "event:model.completed",
-        "persisted:finish:completed",
+        "persisted:complete:completed",
         "event:run.completed",
     ]
     assert all(event.run_id == "run-observed" for event in events)

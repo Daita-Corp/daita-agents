@@ -26,6 +26,18 @@ class ContextWindowExceeded(LLMError):
         )
 
 
+class ContextEvidencePressureExceeded(LLMError):
+    """The exact current run contains more evidence than its fixed bound."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Current tool evidence exceeds the fixed context-pressure bound; "
+            "narrow rows, columns, filters, or aggregation.",
+            error_code="context_evidence_limit_exceeded",
+            retryability=ErrorRetryability.PERMANENT,
+        )
+
+
 class RequestSensitivityUnavailable(LLMError):
     """The current admitted resource scope cannot be classified safely."""
 

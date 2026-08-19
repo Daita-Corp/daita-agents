@@ -59,7 +59,14 @@ from ..llm.models import (
     MessageRole,
     ToolResultBlock,
 )
-from ..loop.models import ConversationRun, LoopExit, LoopExitKind, RunInput, Transcript
+from ..loop.models import (
+    ConversationRun,
+    LoopExit,
+    LoopExitKind,
+    RunInput,
+    Transcript,
+    validate_completed_transcript,
+)
 from ..semantics import (
     SEMANTIC_MAX_ANNOTATIONS,
     SemanticAnnotation,
@@ -2258,11 +2265,14 @@ class SQLiteStateStore:
         await asyncio.to_thread(write)
 
     async def finish(self, result: LoopExit) -> None:
+        if result.kind is LoopExitKind.COMPLETED:
+            raise ValueError("completed runs require atomic transcript completion")
+
         def write() -> None:
             with _connect(self.path) as connection:
                 cursor = connection.execute(
                     """UPDATE runs SET result = ?
-                       WHERE id = ? AND conversation_id = ?""",
+                       WHERE id = ? AND conversation_id = ? AND result IS NULL""",
                     (
                         encode_loop_exit(result),
                         result.run_id,
@@ -2271,6 +2281,62 @@ class SQLiteStateStore:
                 )
                 if cursor.rowcount != 1:
                     raise KeyError(f"unknown run: {result.run_id}")
+
+        await asyncio.to_thread(write)
+
+    async def complete(
+        self,
+        result: LoopExit,
+        final_message: CanonicalMessage,
+    ) -> None:
+        """Atomically append final assistant text and terminal run state."""
+
+        if result.kind is not LoopExitKind.COMPLETED:
+            raise ValueError("atomic transcript completion requires a completed exit")
+        if final_message.role is not MessageRole.ASSISTANT:
+            raise ValueError("atomic completion requires an assistant message")
+
+        def write() -> None:
+            with _connect(self.path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                run_row = connection.execute(
+                    """SELECT input, result FROM runs
+                       WHERE id = ? AND conversation_id = ?""",
+                    (result.run_id, result.conversation_id),
+                ).fetchone()
+                if run_row is None:
+                    raise KeyError(f"unknown run: {result.run_id}")
+                if run_row[1] is not None:
+                    raise ValueError(f"run is already terminal: {result.run_id}")
+                rows = connection.execute(
+                    """SELECT data FROM messages
+                       WHERE run_id = ? ORDER BY position""",
+                    (result.run_id,),
+                ).fetchall()
+                transcript = Transcript(
+                    run=decode_run_input(run_row[0]),
+                    messages=(
+                        *(decode_message(row[0]) for row in rows),
+                        final_message,
+                    ),
+                )
+                validate_completed_transcript(transcript, result)
+                connection.execute(
+                    """INSERT INTO messages(run_id, position, data)
+                       VALUES (?, ?, ?)""",
+                    (result.run_id, len(rows), encode_message(final_message)),
+                )
+                cursor = connection.execute(
+                    """UPDATE runs SET result = ?
+                       WHERE id = ? AND conversation_id = ? AND result IS NULL""",
+                    (
+                        encode_loop_exit(result),
+                        result.run_id,
+                        result.conversation_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("run changed during atomic completion")
 
         await asyncio.to_thread(write)
 

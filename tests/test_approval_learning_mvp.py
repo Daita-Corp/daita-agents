@@ -29,7 +29,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import RunInput
+from daita.loop.models import RunInput, ToolBatchInterruption
 from daita.memory import MEMORY_MAX_CHARACTERS, USER_MAX_CHARACTERS
 from daita.memory.capabilities import (
     MEMORY_SET_CAPABILITY_ID,
@@ -774,8 +774,12 @@ async def test_cancellation_during_approval_propagates_without_decision_or_write
         task = asyncio.create_task(_execute(agent, _memory_call(content="never")))
         await asyncio.wait_for(entered.wait(), timeout=2)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        outcome = await task
+        assert outcome.interruption_kind is ToolBatchInterruption.CANCELLED
+        assert (
+            outcome.ordered_results[0].output["error"]["code"]
+            == "tool_call_interrupted"
+        )
         assert await agent.read_memory() == ""
     finally:
         await agent.close()
@@ -820,8 +824,9 @@ async def test_cancellation_after_atomic_replacement_starts_waits_for_outcome(
         await asyncio.sleep(0.02)
         assert not task.done()
         release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        outcome = await task
+        assert outcome.interruption_kind is ToolBatchInterruption.CANCELLED
+        assert not outcome.ordered_results[0].is_error
         assert await agent.read_memory() == "definite"
     finally:
         release.set()
@@ -890,7 +895,8 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
         assert len(approvals) == 1
         assert approvals[0].arguments["content"] == content
         assert len(provider.requests) == 2
-        assert content in _system_text(provider.requests[1])
+        assert content not in _system_text(provider.requests[1])
+        assert provider.requests[0].messages[0] == provider.requests[1].messages[0]
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"target": "memory", "replaced": True}
@@ -933,9 +939,10 @@ async def test_explicit_reusable_workflow_is_one_approved_foreground_skill(tmp_p
         assert len(approvals) == 1
         assert dict(approvals[0].arguments) == dict(call.arguments)
         assert len(provider.requests) == 2
-        assert "- monthly-revenue: Calculate monthly revenue consistently.\n" in (
+        assert "- monthly-revenue: Calculate monthly revenue consistently.\n" not in (
             _system_text(provider.requests[1])
         )
+        assert provider.requests[0].messages[0] == provider.requests[1].messages[0]
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"name": "monthly-revenue", "changed": True}
@@ -1621,8 +1628,12 @@ async def test_skill_save_cancellation_before_mutation_never_writes(tmp_path):
         task = asyncio.create_task(_execute(agent, _skill_save_call(name="never")))
         await asyncio.wait_for(entered.wait(), timeout=2)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        outcome = await task
+        assert outcome.interruption_kind is ToolBatchInterruption.CANCELLED
+        assert (
+            outcome.ordered_results[0].output["error"]["code"]
+            == "tool_call_interrupted"
+        )
         assert await agent.read_skill("never") is None
     finally:
         await agent.close()
@@ -1654,8 +1665,9 @@ async def test_skill_save_cancellation_after_atomic_mutation_starts_is_definite(
         await asyncio.sleep(0.02)
         assert not task.done()
         release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        outcome = await task
+        assert outcome.interruption_kind is ToolBatchInterruption.CANCELLED
+        assert not outcome.ordered_results[0].is_error
         assert await agent.read_skill("definite") is not None
     finally:
         release.set()

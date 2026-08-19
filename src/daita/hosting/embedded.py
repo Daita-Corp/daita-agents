@@ -922,6 +922,7 @@ class EmbeddedAgent:
             transcripts=store,
             artifacts=artifact_store,
             artifact_delivery=artifact_delivery,
+            limits=limits,
         )
         resolved_context = context_builder
         resolved_tools = tools
@@ -940,6 +941,7 @@ class EmbeddedAgent:
                 artifact_destinations=(
                     artifact_delivery if artifacts is not None else None
                 ),
+                max_context_evidence_bytes=limits.max_context_evidence_bytes,
             )
             resolved_tools = data_tool_runtime
         transcripts = store

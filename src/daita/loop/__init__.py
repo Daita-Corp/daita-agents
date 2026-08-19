@@ -13,6 +13,9 @@ from .models import (
     LoopExitKind,
     LoopLimits,
     RunInput,
+    ToolBatchCertainty,
+    ToolBatchInterruption,
+    ToolBatchOutcome,
     Transcript,
 )
 
@@ -25,6 +28,9 @@ __all__ = [
     "LoopLimits",
     "InMemoryTranscriptStore",
     "RunInput",
+    "ToolBatchCertainty",
+    "ToolBatchInterruption",
+    "ToolBatchOutcome",
     "ToolRuntime",
     "Transcript",
     "TranscriptStore",

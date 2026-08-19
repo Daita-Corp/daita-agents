@@ -43,6 +43,7 @@ from .routing import (
     ModelRouteCandidate,
     ModelRouter,
     RetryPolicy,
+    RunRoute,
     autonomous_request_is_admissible,
 )
 
@@ -77,6 +78,7 @@ __all__ = [
     "OpenAIProvider",
     "ProviderErrorCode",
     "RetryPolicy",
+    "RunRoute",
     "StreamingModelProvider",
     "TextBlock",
     "ToolCall",

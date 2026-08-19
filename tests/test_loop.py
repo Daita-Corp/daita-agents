@@ -28,6 +28,7 @@ from daita.loop import (
     LoopExitKind,
     LoopLimits,
     RunInput,
+    ToolBatchOutcome,
 )
 from daita.observation import AgentEvent, AgentEventKind
 
@@ -35,9 +36,35 @@ NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 class TranscriptContext:
-    async def build(self, run, messages, tools, *, step, final=False):
-        del run, step, final
-        return ModelRequest(messages=messages, tools=tools)
+    async def prepare(self, run, messages, tools):
+        del run
+        return messages[:-1], tools
+
+    def project(
+        self,
+        snapshot,
+        messages,
+        *,
+        step,
+        final=False,
+        previous_request_input_tokens=None,
+    ):
+        del step, previous_request_input_tokens
+        sensitivity = ModelSensitivity.INTERNAL
+        for message in messages:
+            for block in message.content:
+                if (
+                    isinstance(block, ToolResultBlock)
+                    and block.sensitivity is not None
+                    and block.sensitivity.routing_rank > sensitivity.routing_rank
+                ):
+                    sensitivity = block.sensitivity
+        static, tools = snapshot
+        return ModelRequest(
+            messages=(*static, *messages),
+            tools=() if final else tools,
+            sensitivity=sensitivity,
+        )
 
 
 class ScriptedTools:
@@ -58,7 +85,7 @@ class ScriptedTools:
     async def execute_all(self, run, calls):
         del run
         self.calls.extend(calls)
-        return tuple(self.outputs[call.id] for call in calls)
+        return ToolBatchOutcome(tuple(self.outputs[call.id] for call in calls))
 
 
 def response_with_calls(*ids):
@@ -244,16 +271,10 @@ async def test_unexpected_loop_failures_best_effort_terminalize_started_run(
     failure_site: str,
 ):
     class BrokenContext(TranscriptContext):
-        async def build(self, run, messages, tools, *, step, final=False):
+        async def prepare(self, run, messages, tools):
             if failure_site == "context":
                 raise RuntimeError("context exploded")
-            return await super().build(
-                run,
-                messages,
-                tools,
-                step=step,
-                final=final,
-            )
+            return await super().prepare(run, messages, tools)
 
     class BrokenTools(ScriptedTools):
         async def execute_all(self, run, calls):
@@ -271,7 +292,7 @@ async def test_unexpected_loop_failures_best_effort_terminalize_started_run(
         clock=lambda: NOW,
     )
 
-    with pytest.raises((RuntimeError, ValueError)):
+    with pytest.raises((RuntimeError, TypeError)):
         await loop.run(
             RunInput(
                 id=f"run-unexpected-{failure_site}",

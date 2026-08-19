@@ -38,7 +38,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop import AgentLoop, InMemoryTranscriptStore
+from daita.loop import AgentLoop, InMemoryTranscriptStore, ToolBatchOutcome
 from daita.loop.models import LoopExitKind, RunInput
 
 NOW = datetime(2026, 8, 1, 12, tzinfo=UTC)
@@ -651,9 +651,25 @@ async def test_clear_conversations_cancellation_never_leaves_a_persisted_danglin
 
 
 class _LoopContext:
-    async def build(self, run, messages, tools, *, step, final=False):
-        del run, step, final
-        return ModelRequest(messages=messages, tools=tools)
+    async def prepare(self, run, messages, tools):
+        del run
+        return messages[:-1], tools
+
+    def project(
+        self,
+        snapshot,
+        messages,
+        *,
+        step,
+        final=False,
+        previous_request_input_tokens=None,
+    ):
+        del step, previous_request_input_tokens
+        static, tools = snapshot
+        return ModelRequest(
+            messages=(*static, *messages),
+            tools=() if final else tools,
+        )
 
 
 class _LoopTools:
@@ -672,7 +688,7 @@ class _LoopTools:
 
     async def execute_all(self, run, calls):
         del run
-        return tuple(self.results[call.id] for call in calls)
+        return ToolBatchOutcome(tuple(self.results[call.id] for call in calls))
 
 
 def _ref(artifact_id: str, call_id: str) -> ArtifactRef:

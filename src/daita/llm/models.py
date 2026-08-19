@@ -296,6 +296,7 @@ class ModelRequest:
     tools: tuple[ToolDefinition, ...] = ()
     response_schema: Mapping[str, object] | None = None
     sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
+    sensitivity_provenance: Mapping[str, object] = field(default_factory=dict)
     allow_parallel_tool_calls: bool | None = None
 
     def __post_init__(self) -> None:
@@ -324,6 +325,9 @@ class ModelRequest:
                 )
         if not isinstance(self.sensitivity, ModelSensitivity):
             raise TypeError("model-request sensitivity must be ModelSensitivity")
+        sensitivity_provenance = FrozenJsonObject.from_mapping(
+            self.sensitivity_provenance
+        )
         if self.allow_parallel_tool_calls is not None and not isinstance(
             self.allow_parallel_tool_calls,
             bool,
@@ -334,6 +338,11 @@ class ModelRequest:
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "response_schema", response_schema)
+        object.__setattr__(
+            self,
+            "sensitivity_provenance",
+            sensitivity_provenance,
+        )
 
 
 @dataclass(frozen=True, slots=True)

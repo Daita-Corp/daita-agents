@@ -6,7 +6,7 @@ from typing import Any
 import pytest
 
 from daita import Agent
-from daita.hosting.embedded import HostActiveError
+from daita.hosting.embedded import AgentHomeError, HostActiveError
 from daita.llm.models import FinishReason, ModelProfile, ModelRequest, ModelResponse
 from daita.storage.sqlite_records import SourceReadMode
 
@@ -99,6 +99,37 @@ async def test_close_retains_writer_lock_until_blocked_run_terminalizes(tmp_path
         assert persisted[-1].result == result
     finally:
         await reopened.close()
+
+
+async def test_close_rejects_a_queued_run_before_releasing_writer_ownership(tmp_path):
+    provider = _BlockingProvider()
+    agent = await Agent.create(
+        "close-rejects-queued-run",
+        root=tmp_path,
+        model=provider,
+        model_profile=provider.model_profile,
+    )
+    active = asyncio.create_task(agent.run("active run"))
+    await asyncio.wait_for(provider.started.wait(), timeout=1)
+    queued = asyncio.create_task(agent.run("queued run"))
+    await asyncio.sleep(0)
+    closing = asyncio.create_task(agent.close())
+    await asyncio.sleep(0)
+
+    provider.release.set()
+    await asyncio.wait_for(active, timeout=1)
+    with pytest.raises(AgentHomeError, match="closed"):
+        await asyncio.wait_for(queued, timeout=1)
+    await asyncio.wait_for(closing, timeout=1)
+
+    reopened_provider = _BlockingProvider()
+    reopened = await Agent.open(
+        "close-rejects-queued-run",
+        root=tmp_path,
+        model=reopened_provider,
+        model_profile=reopened_provider.model_profile,
+    )
+    await reopened.close()
 
 
 @pytest.mark.parametrize(

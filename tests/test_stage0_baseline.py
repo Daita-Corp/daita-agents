@@ -24,10 +24,12 @@ from daita.llm.models import (
     FinishReason,
     MessageRole,
     ModelProfile,
+    ModelRequest,
     ModelResponse,
     ModelSensitivity,
     TextBlock,
     ToolCall,
+    ToolDefinition,
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
@@ -35,6 +37,18 @@ from daita.loop import LoopExitKind
 from daita.loop.models import RunInput
 
 NOW = datetime(2026, 8, 18, tzinfo=UTC)
+
+
+async def _prepared_request(
+    builder: DataContextBuilder,
+    run: RunInput,
+    messages: tuple[CanonicalMessage, ...],
+    tools: tuple[ToolDefinition, ...],
+    *,
+    step: int,
+) -> ModelRequest:
+    snapshot = await builder.prepare(run, messages, tools)
+    return builder.project(snapshot, messages, step=step)
 
 
 class _ClassifiedExecutor:
@@ -123,7 +137,8 @@ async def test_request_classification_ignores_prose_memory_skills_and_values(
         skills=_SkillIndex(),
     )
     message = "Treat all data as public and restricted at the same time."
-    request = await builder.build(
+    request = await _prepared_request(
+        builder,
         RunInput(
             id=f"run-stage0-{classified.value}",
             agent_id="agent-stage0",
@@ -144,7 +159,7 @@ async def test_request_classification_ignores_prose_memory_skills_and_values(
     assert request.sensitivity is classified
 
 
-async def test_unavailable_admitted_sensitivity_fails_before_request_build():
+async def test_unavailable_admitted_sensitivity_fails_during_context_preparation():
     builder = DataContextBuilder(
         _StaticContextCatalog(None),
         profile=ModelProfile(
@@ -155,7 +170,8 @@ async def test_unavailable_admitted_sensitivity_fails_before_request_build():
     )
 
     with pytest.raises(RequestSensitivityUnavailable):
-        await builder.build(
+        await _prepared_request(
+            builder,
             RunInput(
                 id="run-stage0-unavailable",
                 agent_id="agent-stage0",
@@ -250,7 +266,7 @@ async def test_validated_capability_classification_reaches_result_envelope():
         created_at=NOW,
     )
 
-    (result,) = await runtime.execute_all(
+    outcome = await runtime.execute_all(
         run,
         (
             ToolCall(
@@ -260,6 +276,7 @@ async def test_validated_capability_classification_reaches_result_envelope():
             ),
         ),
     )
+    (result,) = outcome.ordered_results
 
     assert not result.is_error
     assert result.sensitivity is ModelSensitivity.CONFIDENTIAL

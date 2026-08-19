@@ -518,7 +518,7 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         conversation_id=run.conversation_id,
     )
 
-    result, cancelled = await runtime._execute_side_effect(
+    result, interruption, certainty = await runtime._execute_side_effect(
         run,
         call,
         capability,
@@ -527,7 +527,8 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
     )
 
     assert not result.is_error
-    assert cancelled is False
+    assert interruption is None
+    assert certainty.value == "definite"
     assert len(approvals) == 1
     assert executor.preflight_count == 1
     assert executor.execute_count == 1

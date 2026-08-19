@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Protocol, cast
@@ -57,8 +58,21 @@ from ...learning_candidates import (
     SkillCandidateContent,
     candidate_matches_mutation_call,
 )
-from ...llm.models import MessageRole, ToolCall, ToolDefinition, ToolResultBlock
-from ...loop.models import ClassifiedToolResultsCancelled, RunInput, Transcript
+from ...llm.models import (
+    MessageRole,
+    ModelSensitivity,
+    ToolCall,
+    ToolDefinition,
+    ToolResultBlock,
+)
+from ...loop.models import (
+    LoopLimits,
+    RunInput,
+    ToolBatchCertainty,
+    ToolBatchInterruption,
+    ToolBatchOutcome,
+    Transcript,
+)
 from ...memory.capabilities import MEMORY_SET_CAPABILITY_ID, MEMORY_SET_TOOL_NAME
 from ...observation import (
     AgentEvent,
@@ -174,6 +188,23 @@ _EXACT_TABULAR_CAPABILITIES = frozenset(
 )
 
 
+class _ToolExecutionInterrupted(Exception):
+    def __init__(
+        self,
+        result: ToolResultBlock,
+        kind: ToolBatchInterruption,
+        certainty: ToolBatchCertainty,
+    ) -> None:
+        super().__init__(kind.value)
+        self.result = result
+        self.kind = kind
+        self.certainty = certainty
+
+
+class _ToolOutcomeUnknown(RuntimeError):
+    pass
+
+
 class CatalogSchemaReader(Protocol):
     async def resource_schemas(
         self,
@@ -283,6 +314,8 @@ class DataToolRuntime:
         transcripts: TranscriptReader | None = None,
         artifacts: AgentHomeArtifactStore | None = None,
         artifact_delivery: LocalArtifactDelivery | None = None,
+        limits: LoopLimits = LoopLimits(),
+        side_effect_recovery_timeout_seconds: float | None = None,
     ) -> None:
         if not isinstance(registry, CapabilityRegistry):
             raise TypeError("registry must be CapabilityRegistry")
@@ -298,6 +331,21 @@ class DataToolRuntime:
             raise TypeError("clock must be callable or None")
         if transcripts is not None and not callable(getattr(transcripts, "load", None)):
             raise TypeError("transcripts must provide load")
+        if not isinstance(limits, LoopLimits):
+            raise TypeError("limits must be LoopLimits")
+        recovery_timeout = (
+            limits.side_effect_recovery_timeout_seconds
+            if side_effect_recovery_timeout_seconds is None
+            else side_effect_recovery_timeout_seconds
+        )
+        if (
+            not isinstance(recovery_timeout, (int, float))
+            or isinstance(recovery_timeout, bool)
+            or not 0 < float(recovery_timeout) <= 60
+        ):
+            raise ValueError(
+                "side_effect_recovery_timeout_seconds must be positive and at most 60"
+            )
         self._registry = registry
         self._catalog = catalog
         self._approval_handler = approval_handler
@@ -307,6 +355,8 @@ class DataToolRuntime:
         self._transcripts = transcripts
         self._artifacts = artifacts
         self._artifact_delivery = artifact_delivery
+        self._limits = limits
+        self._side_effect_recovery_timeout_seconds = float(recovery_timeout)
         self._selected_learning_candidates: dict[str, LearningCandidate] = {}
         self._successful_learning_candidate_mutations: set[str] = set()
         self._explicit_learning_runs: set[str] = set()
@@ -370,52 +420,131 @@ class DataToolRuntime:
         self,
         run: RunInput,
         calls: tuple[ToolCall, ...],
-    ) -> tuple[ToolResultBlock, ...]:
+    ) -> ToolBatchOutcome:
         if not isinstance(run, RunInput):
             raise TypeError("run must be RunInput")
         calls = tuple(calls)
         if any(not isinstance(call, ToolCall) for call in calls):
             raise TypeError("calls must contain ToolCall records")
+        if len(calls) > self._limits.max_tool_calls_per_response:
+            raise ValueError("tool batch exceeds max_tool_calls_per_response")
         projected = frozenset(await self._projected_tool_names(run))
         results: list[ToolResultBlock | None] = [None] * len(calls)
+        started = [False] * len(calls)
         reads: list[tuple[int, ToolCall]] = []
+        read_gate = asyncio.Semaphore(self._limits.max_parallel_reads)
+        source_gates: dict[str, asyncio.Semaphore] = {}
 
-        async def finish_reads() -> None:
-            if not reads:
-                return
-            indexes = tuple(index for index, _ in reads)
-            completed = await asyncio.gather(
-                *(self._execute_one(run, call, projected) for _, call in reads)
+        async def execute_read(index: int, call: ToolCall) -> ToolResultBlock:
+            source_key = _source_pressure_key(run, call)
+            source_gate = source_gates.setdefault(
+                source_key,
+                asyncio.Semaphore(self._limits.max_parallel_reads_per_source),
             )
-            for index, result in zip(indexes, completed, strict=True):
-                results[index] = result
+            async with read_gate:
+                async with source_gate:
+                    started[index] = True
+                    return await self._execute_one(run, call, projected)
+
+        async def finish_reads() -> ToolBatchInterruption | None:
+            if not reads:
+                return None
+            indexes = tuple(index for index, _ in reads)
+            tasks = tuple(
+                asyncio.create_task(execute_read(index, call)) for index, call in reads
+            )
+            try:
+                await asyncio.wait(tasks)
+            except asyncio.CancelledError as error:
+                interruption = _cancel_interruption(error)
+                for task in tasks:
+                    if not task.done():
+                        task.cancel(interruption.value)
+                settled, pending = await _settle_cancelled_reads(
+                    tasks,
+                    timeout_seconds=self._side_effect_recovery_timeout_seconds,
+                )
+                for task in pending:
+                    task.add_done_callback(_consume_read_task)
+                for index, call, task in zip(
+                    indexes,
+                    (call for _, call in reads),
+                    tasks,
+                    strict=True,
+                ):
+                    value: ToolResultBlock | None = None
+                    if task in settled and not task.cancelled():
+                        try:
+                            value = task.result()
+                        except BaseException:
+                            pass
+                    results[index] = value or _interruption_result(
+                        call,
+                        interruption,
+                        started=started[index],
+                        outcome_unknown=False,
+                    )
+                reads.clear()
+                return interruption
+            for index, task in zip(indexes, tasks, strict=True):
+                results[index] = task.result()
             reads.clear()
+            return None
 
         for index, call in enumerate(calls):
             if self._is_side_effecting(call, projected):
-                await finish_reads()
+                read_interruption = await finish_reads()
+                if read_interruption is not None:
+                    return _interrupted_batch(
+                        calls,
+                        results,
+                        started,
+                        read_interruption,
+                        ToolBatchCertainty.DEFINITE,
+                    )
+                started[index] = True
                 try:
                     results[index] = await self._execute_one(run, call, projected)
-                except ClassifiedToolResultsCancelled as cancelled:
-                    if len(cancelled.results) != 1:
-                        raise RuntimeError(
-                            "one tool execution returned multiple classified results"
-                        ) from cancelled
-                    results[index] = cancelled.results[0]
-                    completed = results[: index + 1]
-                    if any(result is None for result in completed):
-                        raise RuntimeError(
-                            "classified cancellation left an incomplete result prefix"
-                        ) from cancelled
-                    raise ClassifiedToolResultsCancelled(
-                        cast(tuple[ToolResultBlock, ...], tuple(completed))
-                    ) from None
+                except _ToolExecutionInterrupted as interrupted:
+                    results[index] = interrupted.result
+                    return _interrupted_batch(
+                        calls,
+                        results,
+                        started,
+                        interrupted.kind,
+                        interrupted.certainty,
+                    )
+                except asyncio.CancelledError as error:
+                    interruption = _cancel_interruption(error)
+                    results[index] = _interruption_result(
+                        call,
+                        interruption,
+                        started=True,
+                        outcome_unknown=False,
+                    )
+                    return _interrupted_batch(
+                        calls,
+                        results,
+                        started,
+                        interruption,
+                        ToolBatchCertainty.DEFINITE,
+                    )
             else:
                 reads.append((index, call))
-        await finish_reads()
+        read_interruption = await finish_reads()
+        if read_interruption is not None:
+            return _interrupted_batch(
+                calls,
+                results,
+                started,
+                read_interruption,
+                ToolBatchCertainty.DEFINITE,
+            )
         if any(result is None for result in results):
             raise RuntimeError("tool result scheduling left an incomplete call")
-        return cast(tuple[ToolResultBlock, ...], tuple(results))
+        return ToolBatchOutcome(
+            cast(tuple[ToolResultBlock, ...], tuple(results)),
+        )
 
     async def _execute_one(
         self,
@@ -434,7 +563,8 @@ class DataToolRuntime:
             except KeyError:
                 pass
         self._emit_tool_started(run, call, capability)
-        cancelled_after_mutation = False
+        interruption_kind: ToolBatchInterruption | None = None
+        outcome_certainty = ToolBatchCertainty.DEFINITE
         try:
             if view is None or capability is None:
                 result = _error(
@@ -479,12 +609,12 @@ class DataToolRuntime:
                 conversation_id=run.conversation_id or run.id,
             )
             if capability.side_effecting:
-                result, cancelled_after_mutation = await self._execute_side_effect(
-                    run,
-                    call,
-                    capability,
-                    executor,
-                    execution,
+                (
+                    result,
+                    interruption_kind,
+                    outcome_certainty,
+                ) = await self._execute_side_effect(
+                    run, call, capability, executor, execution
                 )
             else:
                 candidate = await executor.execute(execution)
@@ -567,14 +697,82 @@ class DataToolRuntime:
                 str(error),
                 {"id": call.arguments.get("id")},
             )
+        except _ToolExecutionInterrupted:
+            raise
         except asyncio.CancelledError:
             raise
         except Exception as error:
             result = _exception_result(call, error)
+        if not result.is_error:
+            result = await self._classified_result(run, call, capability, result)
+            bound_issue = _tool_result_bound_issue(result, self._limits)
+            if bound_issue is not None:
+                code, message, details = bound_issue
+                result = _error(call, code, message, details)
         self._emit_tool_completed(run, call, result, started)
-        if cancelled_after_mutation:
-            raise ClassifiedToolResultsCancelled((result,))
+        if interruption_kind is not None:
+            raise _ToolExecutionInterrupted(
+                result,
+                interruption_kind,
+                outcome_certainty,
+            )
         return result
+
+    async def _classified_result(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability | None,
+        result: ToolResultBlock,
+    ) -> ToolResultBlock:
+        """Bind code-owned conservative classification to every success."""
+
+        if result.sensitivity is not None:
+            return result
+        if capability is None:
+            return _error(
+                call,
+                "result_classification_unavailable",
+                "The tool result could not be classified by its capability.",
+            )
+        source_id = call.arguments.get("source_id")
+        source_ids = (
+            (source_id,)
+            if isinstance(source_id, str)
+            else (() if run.source_id is None else (run.source_id,))
+        )
+        classify = getattr(self._catalog, "admitted_model_sensitivity", None)
+        if callable(classify):
+            sensitivity = await classify(run.agent_id, source_ids)
+            if not isinstance(sensitivity, ModelSensitivity):
+                return _error(
+                    call,
+                    "result_classification_unavailable",
+                    "The current admitted result scope cannot be classified safely.",
+                    {"capability_id": capability.id},
+                )
+            authority = "current_admitted_resource_scope"
+        else:
+            sensitivity = ModelSensitivity.INTERNAL
+            authority = "conservative_runtime_default"
+        readable = getattr(self._catalog, "readable_resource_ids", None)
+        resource_ids: tuple[str, ...] = ()
+        if callable(readable):
+            current = await readable(run.agent_id, source_ids)
+            if isinstance(current, (set, frozenset, tuple)) and all(
+                isinstance(item, str) for item in current
+            ):
+                resource_ids = tuple(sorted(current))
+        return replace(
+            result,
+            sensitivity=sensitivity,
+            sensitivity_provenance={
+                "authority": authority,
+                "capability_id": capability.id,
+                "source_ids": source_ids,
+                "resource_ids": resource_ids,
+            },
+        )
 
     async def _commit_artifact_output(
         self,
@@ -1203,7 +1401,11 @@ class DataToolRuntime:
         capability: Capability,
         executor: Executor,
         execution: ToolExecution,
-    ) -> tuple[ToolResultBlock, bool]:
+    ) -> tuple[
+        ToolResultBlock,
+        ToolBatchInterruption | None,
+        ToolBatchCertainty,
+    ]:
         if (
             capability.access_mode is not AccessMode.WRITE
             or not capability.side_effecting
@@ -1222,7 +1424,8 @@ class DataToolRuntime:
                     "candidate's exact target content.",
                     {"candidate_id": selected_candidate.id},
                 ),
-                False,
+                None,
+                ToolBatchCertainty.DEFINITE,
             )
         preflight = getattr(executor, "preflight", None)
         if not callable(preflight):
@@ -1253,7 +1456,8 @@ class DataToolRuntime:
                     "This side effect requires an approval handler.",
                     {"capability_id": capability.id},
                 ),
-                False,
+                None,
+                ToolBatchCertainty.DEFINITE,
             )
 
         approval_arguments = (
@@ -1296,7 +1500,8 @@ class DataToolRuntime:
                     "The approval handler failed closed.",
                     {"capability_id": capability.id},
                 ),
-                False,
+                None,
+                ToolBatchCertainty.DEFINITE,
             )
         if not isinstance(decision, ApprovalDecision):
             self._emit_approval_decided(run, call, "failed")
@@ -1307,7 +1512,8 @@ class DataToolRuntime:
                     "The approval handler returned an invalid decision.",
                     {"capability_id": capability.id},
                 ),
-                False,
+                None,
+                ToolBatchCertainty.DEFINITE,
             )
         if decision is ApprovalDecision.DENY:
             self._emit_approval_decided(run, call, "denied")
@@ -1318,7 +1524,8 @@ class DataToolRuntime:
                     "The side effect was denied.",
                     {"capability_id": capability.id},
                 ),
-                False,
+                None,
+                ToolBatchCertainty.DEFINITE,
             )
 
         self._emit_approval_decided(run, call, "approved")
@@ -1341,7 +1548,11 @@ class DataToolRuntime:
         execution: ToolExecution,
         fingerprint: FrozenJsonObject,
         selected_candidate: LearningCandidate | None,
-    ) -> tuple[ToolResultBlock, bool]:
+    ) -> tuple[
+        ToolResultBlock,
+        ToolBatchInterruption | None,
+        ToolBatchCertainty,
+    ]:
         async with self._mutation_lock:
             if capability.id != POSTGRESQL_UPDATE_CAPABILITY_ID:
                 try:
@@ -1364,7 +1575,8 @@ class DataToolRuntime:
                             "The validated state changed while approval was pending.",
                             {"capability_id": capability.id},
                         ),
-                        False,
+                        None,
+                        ToolBatchCertainty.DEFINITE,
                     )
                 if not isinstance(current, FrozenJsonObject):
                     raise ValueError(
@@ -1378,16 +1590,25 @@ class DataToolRuntime:
                             "The validated state changed while approval was pending.",
                             {"capability_id": capability.id},
                         ),
-                        False,
+                        None,
+                        ToolBatchCertainty.DEFINITE,
                     )
-            candidate, execution_error, cancelled = await _execute_definitely(
+            (
+                candidate,
+                execution_error,
+                interruption_kind,
+                outcome_certainty,
+            ) = await _execute_definitely(
                 side_effect,
                 execution,
+                recovery_timeout_seconds=(self._side_effect_recovery_timeout_seconds),
             )
             if execution_error is not None:
-                if isinstance(execution_error, asyncio.CancelledError):
-                    raise execution_error
-                return _exception_result(call, execution_error), cancelled
+                return (
+                    _exception_result(call, execution_error),
+                    interruption_kind,
+                    outcome_certainty,
+                )
             if selected_candidate is not None:
                 self._successful_learning_candidate_mutations.add(run.id)
             output = self._registry.validate_output(capability.id, candidate)
@@ -1395,7 +1616,7 @@ class DataToolRuntime:
                 raise ToolOutputValidationError(
                     "side-effect capability cannot produce an artifact draft"
                 )
-            return _success(call, output), cancelled
+            return _success(call, output), interruption_kind, outcome_certainty
 
     async def _validate_semantic_preflight(
         self,
@@ -2626,26 +2847,191 @@ def _without_runtime_owned_semantic_evidence(
 async def _execute_definitely(
     executor: SideEffectExecutor,
     execution: ToolExecution,
-) -> tuple[ToolOutput | None, BaseException | None, bool]:
+    *,
+    recovery_timeout_seconds: float,
+) -> tuple[
+    ToolOutput | None,
+    BaseException | None,
+    ToolBatchInterruption | None,
+    ToolBatchCertainty,
+]:
     worker = asyncio.create_task(executor.execute(execution))
-    cancelled = False
+    interruption: ToolBatchInterruption | None = None
+    recovery_deadline: float | None = None
     while not worker.done():
+        if recovery_deadline is not None:
+            remaining = recovery_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                worker.cancel(interruption.value if interruption is not None else None)
+                worker.add_done_callback(_consume_background_task)
+                return (
+                    None,
+                    _ToolOutcomeUnknown(),
+                    interruption,
+                    ToolBatchCertainty.OUTCOME_UNKNOWN,
+                )
+            done, _pending = await asyncio.wait((worker,), timeout=remaining)
+            if not done:
+                worker.cancel(interruption.value if interruption is not None else None)
+                worker.add_done_callback(_consume_background_task)
+                return (
+                    None,
+                    _ToolOutcomeUnknown(),
+                    interruption,
+                    ToolBatchCertainty.OUTCOME_UNKNOWN,
+                )
+            break
         try:
             await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancelled = True
+        except asyncio.CancelledError as error:
+            interruption = _cancel_interruption(error)
+            recovery_deadline = (
+                asyncio.get_running_loop().time() + recovery_timeout_seconds
+            )
             continue
         except BaseException:
             if worker.done():
                 break
             raise
     try:
-        return worker.result(), None, cancelled
+        return (
+            worker.result(),
+            None,
+            interruption,
+            ToolBatchCertainty.DEFINITE,
+        )
     except BaseException as error:
-        return None, error, cancelled
+        return (
+            None,
+            error,
+            interruption,
+            ToolBatchCertainty.DEFINITE,
+        )
+
+
+def _consume_background_task(task: asyncio.Task[ToolOutput]) -> None:
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
+async def _settle_cancelled_reads(
+    tasks: tuple[asyncio.Task[ToolResultBlock], ...],
+    *,
+    timeout_seconds: float,
+) -> tuple[
+    set[asyncio.Task[ToolResultBlock]],
+    set[asyncio.Task[ToolResultBlock]],
+]:
+    """Wait a fixed interval for cancelled reads without losing parent control."""
+
+    waiter = asyncio.create_task(asyncio.wait(tasks, timeout=timeout_seconds))
+    while not waiter.done():
+        try:
+            await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            continue
+    done, pending = waiter.result()
+    return set(done), set(pending)
+
+
+def _consume_read_task(task: asyncio.Task[ToolResultBlock]) -> None:
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
+def _cancel_interruption(error: asyncio.CancelledError) -> ToolBatchInterruption:
+    return (
+        ToolBatchInterruption.DEADLINE
+        if error.args and error.args[0] == ToolBatchInterruption.DEADLINE.value
+        else ToolBatchInterruption.CANCELLED
+    )
+
+
+def _interruption_result(
+    call: ToolCall,
+    interruption: ToolBatchInterruption,
+    *,
+    started: bool,
+    outcome_unknown: bool,
+) -> ToolResultBlock:
+    if outcome_unknown:
+        return _error(
+            call,
+            "outcome_unknown",
+            "The tool action started, but its authoritative outcome was not "
+            "available within the bounded recovery wait.",
+            {
+                "interruption_kind": interruption.value,
+                "execution_state": "started",
+                "outcome_certainty": ToolBatchCertainty.OUTCOME_UNKNOWN.value,
+            },
+        )
+    if started:
+        return _error(
+            call,
+            "tool_call_interrupted",
+            "The started read was interrupted before it returned a result.",
+            {
+                "interruption_kind": interruption.value,
+                "execution_state": "started",
+                "outcome_certainty": ToolBatchCertainty.DEFINITE.value,
+            },
+        )
+    return _error(
+        call,
+        "tool_call_not_started",
+        "The tool call did not start before its batch was interrupted.",
+        {
+            "interruption_kind": interruption.value,
+            "execution_state": "not_started",
+            "outcome_certainty": ToolBatchCertainty.DEFINITE.value,
+        },
+    )
+
+
+def _interrupted_batch(
+    calls: tuple[ToolCall, ...],
+    results: list[ToolResultBlock | None],
+    started: list[bool],
+    interruption: ToolBatchInterruption,
+    certainty: ToolBatchCertainty,
+) -> ToolBatchOutcome:
+    ordered = tuple(
+        (
+            result
+            if result is not None
+            else _interruption_result(
+                call,
+                interruption,
+                started=started[index],
+                outcome_unknown=False,
+            )
+        )
+        for index, (call, result) in enumerate(zip(calls, results, strict=True))
+    )
+    return ToolBatchOutcome(
+        ordered_results=ordered,
+        interruption_kind=interruption,
+        outcome_certainty=certainty,
+    )
 
 
 def _exception_result(call: ToolCall, error: BaseException) -> ToolResultBlock:
+    if isinstance(error, _ToolOutcomeUnknown):
+        return _error(
+            call,
+            "outcome_unknown",
+            "The tool action started, but its authoritative outcome was not "
+            "available within the bounded recovery wait.",
+            {
+                "execution_state": "started",
+                "outcome_certainty": ToolBatchCertainty.OUTCOME_UNKNOWN.value,
+            },
+        )
     if isinstance(error, ToolOutputValidationError):
         return _error(call, "invalid_tool_result", str(error))
     if isinstance(error, ArtifactError):
@@ -2678,6 +3064,50 @@ def _result_error_code(result: ToolResultBlock) -> str | None:
 def _duration_ms(started: float) -> int:
     elapsed = asyncio.get_running_loop().time() - started
     return max(0, int(elapsed * 1_000))
+
+
+def _source_pressure_key(run: RunInput, call: ToolCall) -> str:
+    source_id = call.arguments.get("source_id")
+    if isinstance(source_id, str):
+        return source_id
+    if run.source_id is not None:
+        return run.source_id
+    return "__agent_local__"
+
+
+def _tool_result_bound_issue(
+    result: ToolResultBlock,
+    limits: LoopLimits,
+) -> tuple[str, str, Mapping[str, object]] | None:
+    result_bytes = len(canonical_json(result.output).encode("utf-8"))
+    if result_bytes > limits.max_tool_result_bytes:
+        return (
+            "tool_result_too_large",
+            "The tool result exceeded the fixed model-visible byte bound.",
+            {
+                "maximum_bytes": limits.max_tool_result_bytes,
+                "observed_bytes": result_bytes,
+            },
+        )
+    result_depth = _json_depth(result.output)
+    if result_depth > limits.max_tool_result_depth:
+        return (
+            "tool_result_too_deep",
+            "The tool result exceeded the fixed model-visible nesting bound.",
+            {
+                "maximum_depth": limits.max_tool_result_depth,
+                "observed_depth": result_depth,
+            },
+        )
+    return None
+
+
+def _json_depth(value: object) -> int:
+    if isinstance(value, Mapping):
+        return 1 + max((_json_depth(item) for item in value.values()), default=0)
+    if isinstance(value, (tuple, list)):
+        return 1 + max((_json_depth(item) for item in value), default=0)
+    return 0
 
 
 def _applicable(

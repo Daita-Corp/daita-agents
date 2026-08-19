@@ -26,14 +26,28 @@ from daita.llm.models import (
     FinishReason,
     MessageRole,
     ModelProfile,
+    ModelRequest,
     ModelResponse,
     ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
+    ToolDefinition,
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
+
+
+async def _prepared_request(
+    builder: DataContextBuilder,
+    run: RunInput,
+    messages: tuple[CanonicalMessage, ...],
+    tools: tuple[ToolDefinition, ...],
+    *,
+    step: int,
+) -> ModelRequest:
+    snapshot = await builder.prepare(run, messages, tools)
+    return builder.project(snapshot, messages, step=step)
 
 
 def _ids():
@@ -613,7 +627,8 @@ async def test_hosted_composition_does_not_project_local_delivery_tools_or_paths
         supports_tools=True,
     )
     builder = DataContextBuilder(_Catalog(), profile=profile)
-    request = await builder.build(
+    request = await _prepared_request(
+        builder,
         RunInput(
             id="run-hosted",
             agent_id="agent-hosted",
