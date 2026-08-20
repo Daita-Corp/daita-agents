@@ -109,6 +109,64 @@ def test_stage_m1_keeps_loop_context_and_composition_owners_exact():
     assert "capability_runtime" not in loop
 
 
+def test_stage_m2_is_server_neutral_lazy_and_uses_existing_runtime_owners():
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
+    adapter_path = PACKAGE / "adapters" / "mcp.py"
+    adapter = adapter_path.read_text(encoding="utf-8")
+    domain = (PACKAGE / "domains" / "mcp.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    production = _python_text(PACKAGE)
+
+    assert "MCP" not in runtime
+    assert "mcp" not in _imports(PACKAGE / "capability_runtime.py")
+    adapter_tree = ast.parse(adapter)
+    top_level_imports = {
+        alias.name.split(".")[0]
+        for node in adapter_tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert "httpx" not in top_level_imports
+    assert _class_owners("StreamableHTTPMCPClient") == {"adapters/mcp.py"}
+    assert _class_owners("MCPCapabilityDomain") == {"domains/mcp.py"}
+    assert "CapabilityRuntime(" not in adapter
+    assert "CapabilityRuntime(" not in domain
+    assert "activate_mcp_domain" in embedded
+    assert "mcp_domain" in embedded
+    assert "mcp_server_bindings" in (
+        PACKAGE / "storage" / "sqlite_schema.py"
+    ).read_text(encoding="utf-8")
+
+    for fixture_only in (
+        "alpha.fixture.test",
+        "beta.fixture.test",
+        "fixture-alpha",
+        "fixture-beta",
+    ):
+        assert fixture_only not in production
+    for prohibited in (
+        "SupportedMCPServer",
+        "MCPRuntime",
+        "MCPRegistry",
+        "MCPContextBuilder",
+        "singleton_mcp",
+        "built_in_endpoint",
+    ):
+        assert prohibited not in production
+
+    public_operations = {
+        "inspect_mcp_server",
+        "attach_mcp_server",
+        "list_mcp_servers",
+        "refresh_mcp_server",
+        "revoke_mcp_server",
+    }
+    assert public_operations <= _class_methods(PACKAGE / "agent.py", "Agent")
+    assert public_operations <= _class_methods(
+        PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
+    )
+
+
 async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
     tmp_path,
 ):
@@ -191,6 +249,17 @@ def test_public_surface_is_focused():
         "LoopExit",
         "LoopExitKind",
         "LoopLimits",
+        "MCPAdmissionError",
+        "MCPAuthentication",
+        "MCPAuthenticationMode",
+        "MCPBindingState",
+        "MCPBindingStatus",
+        "MCPError",
+        "MCPInspectedTool",
+        "MCPServerBinding",
+        "MCPServerInspection",
+        "MCPToolBinding",
+        "MCPToolSelection",
         "ModelRoute",
         "ModelRouteCandidate",
         "PostgreSQLSource",
@@ -1338,6 +1407,7 @@ def test_sqlite_journal_and_codecs_have_one_append_only_storage_owner():
         "baseline.py",
         "database_write_receipts.py",
         "generalized_postgresql_updates.py",
+        "mcp_server_bindings.py",
         "models.py",
         "postgresql_write_admission.py",
         "preledger.py",
@@ -1429,6 +1499,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
         assert tables == {
             "database_write_receipts",
             "learning_candidates",
+            "mcp_server_bindings",
             "messages",
             "metadata",
             "postgresql_update_scopes",
@@ -1451,6 +1522,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "learning_candidates": ("agent_id", "id", "data"),
             "messages": ("run_id", "position", "data"),
             "metadata": ("key", "data"),
+            "mcp_server_bindings": ("agent_id", "binding_id", "data"),
             "postgresql_update_scopes": (
                 "agent_id",
                 "source_id",

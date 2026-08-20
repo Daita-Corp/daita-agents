@@ -191,7 +191,10 @@ class MemoryCapabilityDomain:
         call: ToolCall,
         capability: Capability,
         arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
+        del request_sensitivity
         self._learning.validate_side_effect(run.id, call)
         return arguments
 
@@ -212,7 +215,10 @@ class MemoryCapabilityDomain:
         capability: Capability,
         arguments: FrozenJsonObject,
         output: ToolOutput,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
+        del request_sensitivity
         self._learning.mark_side_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output

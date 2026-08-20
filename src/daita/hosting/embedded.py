@@ -23,6 +23,18 @@ from uuid import uuid4
 
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySource
+from ..adapters.mcp import (
+    MCPAuthentication,
+    MCPBindingState,
+    MCPBindingStatus,
+    MCPClientFactory,
+    MCPServerBinding,
+    MCPServerInspection,
+    MCPToolSelection,
+    StreamableHTTPMCPClientFactory,
+    mcp_binding_drift_reason,
+    mcp_binding_from_inspection,
+)
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
 from ..adapters.postgresql_query import PostgreSQLQueryBackend
@@ -74,6 +86,7 @@ from ..domains.data import (
 )
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
 from ..domains.learning import LearningCandidateGuard
+from ..domains.mcp import MCPActivatedBinding, activate_mcp_domain
 from ..domains.data.context import _project_completed_history
 from ..domains.data.sql import (
     validate_postgresql_update_scope,
@@ -391,6 +404,8 @@ class EmbeddedAgent:
         keychain: CredentialSession,
         owns_credential_session: bool,
         model_validator: ModelProvider | None,
+        mcp_client_factory: MCPClientFactory,
+        mcp_activated_bindings: tuple[MCPActivatedBinding, ...],
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
     ) -> None:
@@ -403,6 +418,10 @@ class EmbeddedAgent:
         self._keychain = keychain
         self._owns_credential_session = owns_credential_session
         self._model_validator = model_validator
+        self._mcp_client_factory = mcp_client_factory
+        self._mcp_activated_bindings = {
+            item.binding.binding_id: item for item in mcp_activated_bindings
+        }
         self._writer_lock = writer_lock
         self._store = store
         self._loop = loop
@@ -542,6 +561,7 @@ class EmbeddedAgent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        mcp_client_factory: MCPClientFactory | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
         reviewer_model: ModelProvider | None = None,
@@ -606,7 +626,7 @@ class EmbeddedAgent:
                 clock=resolved_clock,
                 id_factory=resolved_ids,
             )
-            embedded = cls._compose(
+            embedded = await cls._compose(
                 identity=identity,
                 home=home,
                 writer_lock=writer_lock,
@@ -620,6 +640,7 @@ class EmbeddedAgent:
                 clock=resolved_clock,
                 id_factory=resolved_ids,
                 secret_provider=runtime_secrets,
+                mcp_client_factory=mcp_client_factory,
                 keychain=credential_session,
                 owns_credential_session=owns_credential_session,
                 model_validator=model_validator,
@@ -663,6 +684,7 @@ class EmbeddedAgent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        mcp_client_factory: MCPClientFactory | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
         reviewer_model: ModelProvider | None = None,
@@ -760,7 +782,7 @@ class EmbeddedAgent:
                 clock=resolved_clock,
                 id_factory=resolved_ids,
             )
-            return cls._compose(
+            return await cls._compose(
                 identity=identity,
                 home=home,
                 writer_lock=writer_lock,
@@ -774,6 +796,7 @@ class EmbeddedAgent:
                 clock=resolved_clock,
                 id_factory=resolved_ids,
                 secret_provider=runtime_secrets,
+                mcp_client_factory=mcp_client_factory,
                 keychain=credential_session,
                 owns_credential_session=owns_credential_session,
                 model_validator=model_validator,
@@ -792,7 +815,7 @@ class EmbeddedAgent:
             raise
 
     @classmethod
-    def _compose(
+    async def _compose(
         cls,
         *,
         identity: AgentIdentity,
@@ -808,6 +831,7 @@ class EmbeddedAgent:
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
         secret_provider: SecretProvider,
+        mcp_client_factory: MCPClientFactory | None,
         keychain: CredentialSession,
         owns_credential_session: bool,
         model_validator: ModelProvider | None,
@@ -987,12 +1011,29 @@ class EmbeddedAgent:
                 learning_candidate_guard,
             )
         )
+        if model is not None and context_builder is None:
+            assert model_profile is not None
+            if not model_profile.supports_tools:
+                raise AgentNotConfiguredError(
+                    "the data agent requires a tool-capable model profile"
+                )
+        resolved_mcp_client_factory = (
+            mcp_client_factory or StreamableHTTPMCPClientFactory()
+        )
+        mcp_domain, mcp_activated_bindings, mcp_executors = await activate_mcp_domain(
+            agent_id=identity.id,
+            store=store,
+            client_factory=resolved_mcp_client_factory,
+            secrets=secret_provider,
+            clock=clock,
+        )
         domains = (
             data_domain,
             memory_domain,
             skill_domain,
             semantic_domain,
             *((artifact_domain,) if artifact_domain is not None else ()),
+            *((mcp_domain,) if mcp_domain is not None else ()),
         )
         capabilities = CapabilityRegistry(
             declarations=tuple(domain.declarations for domain in domains),
@@ -1007,6 +1048,7 @@ class EmbeddedAgent:
                 *skills.executors,
                 *semantics.executors,
                 *(artifacts.executors if artifacts is not None else ()),
+                *mcp_executors,
             ),
         )
         capability_runtime = CapabilityRuntime(
@@ -1023,10 +1065,6 @@ class EmbeddedAgent:
         resolved_tools = tools
         if model is not None and resolved_context is None:
             assert model_profile is not None
-            if not model_profile.supports_tools:
-                raise AgentNotConfiguredError(
-                    "the data agent requires a tool-capable model profile"
-                )
             resolved_context = DataContextBuilder(
                 data_view,
                 profile=model_profile,
@@ -1094,6 +1132,8 @@ class EmbeddedAgent:
             keychain=keychain,
             owns_credential_session=owns_credential_session,
             model_validator=model_validator,
+            mcp_client_factory=resolved_mcp_client_factory,
+            mcp_activated_bindings=mcp_activated_bindings,
             clock=clock,
             id_factory=id_factory,
         )
@@ -1873,6 +1913,171 @@ class EmbeddedAgent:
     async def delete_skill(self, name: str) -> bool:
         self._require_open()
         return await self._skill_store.delete_skill(name)
+
+    async def inspect_mcp_server(
+        self,
+        *,
+        endpoint: str,
+        authentication: MCPAuthentication | None = None,
+    ) -> MCPServerInspection:
+        """Inspect one exact endpoint without persisting execution authority."""
+
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._inspect_mcp_endpoint(
+                endpoint=endpoint,
+                authentication=authentication or MCPAuthentication.no_auth(),
+            )
+
+    async def attach_mcp_server(
+        self,
+        *,
+        endpoint: str,
+        selections: tuple[MCPToolSelection, ...],
+        authentication: MCPAuthentication | None = None,
+        maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
+        binding_id: str | None = None,
+    ) -> MCPBindingStatus:
+        """Persist one exact binding; declarations activate only after reopen."""
+
+        if not isinstance(maximum_outbound_sensitivity, ModelSensitivity):
+            raise TypeError("maximum_outbound_sensitivity is invalid")
+        resolved_authentication = authentication or MCPAuthentication.no_auth()
+        resolved_binding_id = binding_id or self._id_factory("mcp-binding")
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                current = await self._store.load_mcp_binding(
+                    self.identity.id,
+                    resolved_binding_id,
+                )
+                inspection = await self._inspect_mcp_endpoint(
+                    endpoint=endpoint,
+                    authentication=resolved_authentication,
+                )
+                binding = mcp_binding_from_inspection(
+                    binding_id=resolved_binding_id,
+                    agent_id=self.identity.id,
+                    authentication=resolved_authentication,
+                    maximum_outbound_sensitivity=maximum_outbound_sensitivity,
+                    selections=tuple(selections),
+                    inspection=inspection,
+                    prior=current,
+                )
+                stored = await self._store.store_mcp_binding(
+                    binding,
+                    expected_revision=(None if current is None else current.revision),
+                )
+                await self._deactivate_mcp_binding(stored.binding_id)
+                return MCPBindingStatus(stored, None)
+
+    async def list_mcp_servers(self) -> tuple[MCPBindingStatus, ...]:
+        """Return bounded non-secret status for all independently keyed bindings."""
+
+        self._require_open()
+        bindings = await self._store.list_mcp_bindings(self.identity.id)
+        statuses: list[MCPBindingStatus] = []
+        for binding in bindings:
+            activated = self._mcp_activated_bindings.get(binding.binding_id)
+            statuses.append(
+                MCPBindingStatus(
+                    binding,
+                    None if activated is None else activated.binding.revision,
+                )
+            )
+        return tuple(statuses)
+
+    async def refresh_mcp_server(self, binding_id: str) -> MCPBindingStatus:
+        """Check exact remote drift and require reopen for any refreshed revision."""
+
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                current = await self._store.load_mcp_binding(
+                    self.identity.id,
+                    binding_id,
+                )
+                if current is None:
+                    raise ValueError("MCP binding does not exist")
+                if current.state is MCPBindingState.REVOKED:
+                    raise ValueError(
+                        "revoked MCP binding must be explicitly reattached"
+                    )
+                inspection = await self._inspect_mcp_endpoint(
+                    endpoint=current.endpoint,
+                    authentication=current.authentication,
+                )
+                refreshed = current.checked(
+                    observed_at=inspection.observed_at,
+                    stale_reason=mcp_binding_drift_reason(current, inspection),
+                )
+                stored = await self._store.store_mcp_binding(
+                    refreshed,
+                    expected_revision=current.revision,
+                )
+                await self._deactivate_mcp_binding(stored.binding_id)
+                return MCPBindingStatus(stored, None)
+
+    async def revoke_mcp_server(self, binding_id: str) -> MCPBindingStatus:
+        """Make one binding immediately unavailable without affecting siblings."""
+
+        async with self._mutation_lock:
+            self._require_open()
+            activated = self._mcp_activated_bindings.get(binding_id)
+            if activated is None:
+                current = await self._store.load_mcp_binding(
+                    self.identity.id,
+                    binding_id,
+                )
+                if current is None:
+                    raise ValueError("MCP binding does not exist")
+                if current.state is MCPBindingState.REVOKED:
+                    return MCPBindingStatus(current, None)
+                stored = await self._store.store_mcp_binding(
+                    current.revoke(revoked_at=self._clock()),
+                    expected_revision=current.revision,
+                )
+                return MCPBindingStatus(stored, None)
+
+            async with activated.lock:
+                current = await self._store.load_mcp_binding(
+                    self.identity.id,
+                    binding_id,
+                )
+                if current is None:
+                    raise ValueError("MCP binding does not exist")
+                stored = (
+                    current
+                    if current.state is MCPBindingState.REVOKED
+                    else await self._store.store_mcp_binding(
+                        current.revoke(revoked_at=self._clock()),
+                        expected_revision=current.revision,
+                    )
+                )
+                await activated.client.close()
+            self._mcp_activated_bindings.pop(binding_id, None)
+            return MCPBindingStatus(stored, None)
+
+    async def _inspect_mcp_endpoint(
+        self,
+        *,
+        endpoint: str,
+        authentication: MCPAuthentication,
+    ) -> MCPServerInspection:
+        client = self._mcp_client_factory.create(
+            endpoint=endpoint,
+            authentication=authentication,
+            secrets=self._secret_provider,
+        )
+        try:
+            return await client.inspect(observed_at=self._clock())
+        finally:
+            await client.close()
+
+    async def _deactivate_mcp_binding(self, binding_id: str) -> None:
+        activated = self._mcp_activated_bindings.pop(binding_id, None)
+        if activated is not None:
+            await activated.executor.close()
 
     async def attach(self, source: ResourceSource) -> SourceRegistration:
         return await self._attach_source(source, attached_at=self._clock())
@@ -2782,6 +2987,14 @@ class EmbeddedAgent:
             async with self._mutation_lock:
                 pass
         first_error: BaseException | None = None
+        activated_bindings = tuple(self._mcp_activated_bindings.values())
+        self._mcp_activated_bindings.clear()
+        for activated in activated_bindings:
+            try:
+                await activated.executor.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
         for store in (
             self._candidate_reviewer,
             self._memory_store,

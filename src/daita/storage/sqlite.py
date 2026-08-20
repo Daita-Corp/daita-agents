@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from .._json import FrozenJsonObject
+from ..adapters.mcp import MCP_MAX_BINDINGS_PER_AGENT, MCPServerBinding
 from ..adapters.models import SourceRegistration
 from ..artifacts.models import (
     ArtifactRef,
@@ -82,6 +83,7 @@ from .sqlite_codecs import (
     decode_identity,
     decode_learning_candidate,
     decode_loop_exit,
+    decode_mcp_binding,
     decode_message,
     decode_postgresql_update_scope,
     decode_receipt,
@@ -96,6 +98,7 @@ from .sqlite_codecs import (
     encode_identity,
     encode_learning_candidate,
     encode_loop_exit,
+    encode_mcp_binding,
     encode_message,
     encode_postgresql_update_scope,
     encode_receipt,
@@ -404,6 +407,123 @@ class SQLiteStateStore:
             return None if row is None else decode_identity(row[0])
 
         return await asyncio.to_thread(read)
+
+    async def load_mcp_binding(
+        self,
+        agent_id: str,
+        binding_id: str,
+    ) -> MCPServerBinding | None:
+        def read() -> MCPServerBinding | None:
+            with _connect(self.path) as connection:
+                row = connection.execute(
+                    """SELECT data FROM mcp_server_bindings
+                       WHERE agent_id = ? AND binding_id = ?""",
+                    (agent_id, binding_id),
+                ).fetchone()
+            return (
+                None
+                if row is None
+                else decode_mcp_binding(
+                    row[0],
+                    agent_id=agent_id,
+                    binding_id=binding_id,
+                )
+            )
+
+        return await asyncio.to_thread(read)
+
+    async def list_mcp_bindings(
+        self,
+        agent_id: str,
+    ) -> tuple[MCPServerBinding, ...]:
+        def read() -> tuple[MCPServerBinding, ...]:
+            with _connect(self.path) as connection:
+                rows = tuple(
+                    connection.execute(
+                        """SELECT binding_id, data FROM mcp_server_bindings
+                           WHERE agent_id = ? ORDER BY binding_id""",
+                        (agent_id,),
+                    )
+                )
+            if len(rows) > MCP_MAX_BINDINGS_PER_AGENT:
+                raise RuntimeError("stored MCP binding count exceeds its fixed bound")
+            return tuple(
+                decode_mcp_binding(
+                    data,
+                    agent_id=agent_id,
+                    binding_id=binding_id,
+                )
+                for binding_id, data in rows
+            )
+
+        return await asyncio.to_thread(read)
+
+    async def store_mcp_binding(
+        self,
+        binding: MCPServerBinding,
+        *,
+        expected_revision: int | None,
+    ) -> MCPServerBinding:
+        if not isinstance(binding, MCPServerBinding):
+            raise TypeError("binding must be MCPServerBinding")
+        if expected_revision is not None and (
+            not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be positive or None")
+
+        def write(connection: sqlite3.Connection) -> MCPServerBinding:
+            row = connection.execute(
+                """SELECT data FROM mcp_server_bindings
+                   WHERE agent_id = ? AND binding_id = ?""",
+                (binding.agent_id, binding.binding_id),
+            ).fetchone()
+            if row is None:
+                if expected_revision is not None or binding.revision != 1:
+                    raise ValueError("MCP binding revision precondition failed")
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM mcp_server_bindings WHERE agent_id = ?",
+                    (binding.agent_id,),
+                ).fetchone()[0]
+                if count >= MCP_MAX_BINDINGS_PER_AGENT:
+                    raise ValueError("MCP binding count exceeds its fixed bound")
+                connection.execute(
+                    """INSERT INTO mcp_server_bindings(agent_id, binding_id, data)
+                       VALUES (?, ?, ?)""",
+                    (
+                        binding.agent_id,
+                        binding.binding_id,
+                        encode_mcp_binding(binding),
+                    ),
+                )
+                return binding
+            current = decode_mcp_binding(
+                row[0],
+                agent_id=binding.agent_id,
+                binding_id=binding.binding_id,
+            )
+            if (
+                expected_revision is None
+                or current.revision != expected_revision
+                or binding.revision != expected_revision + 1
+            ):
+                raise ValueError("MCP binding revision precondition failed")
+            result = connection.execute(
+                """UPDATE mcp_server_bindings SET data = ?
+                   WHERE agent_id = ? AND binding_id = ? AND data = ?""",
+                (
+                    encode_mcp_binding(binding),
+                    binding.agent_id,
+                    binding.binding_id,
+                    row[0],
+                ),
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("MCP binding changed during its transition")
+            return binding
+
+        return await _run_cancellation_safe_transaction(self.path, write)
 
     async def register_source(
         self, registration: SourceRegistration
@@ -2038,7 +2158,7 @@ class SQLiteStateStore:
             )
             return tuple(inserted)
 
-        return await _run_candidate_transaction(self.path, write)
+        return await _run_cancellation_safe_transaction(self.path, write)
 
     async def edit_learning_candidate(
         self,
@@ -2108,7 +2228,7 @@ class SQLiteStateStore:
             )
             return candidate
 
-        return await _run_candidate_transaction(self.path, write)
+        return await _run_cancellation_safe_transaction(self.path, write)
 
     async def reject_learning_candidate(
         self,
@@ -2148,7 +2268,7 @@ class SQLiteStateStore:
             )
             return rejected
 
-        return await _run_candidate_transaction(self.path, write)
+        return await _run_cancellation_safe_transaction(self.path, write)
 
     async def accept_learning_candidate(
         self,
@@ -2184,7 +2304,7 @@ class SQLiteStateStore:
             )
             return accepted
 
-        return await _run_candidate_transaction(self.path, write)
+        return await _run_cancellation_safe_transaction(self.path, write)
 
     async def clear_rejected_learning_candidates(self, agent_id: str) -> int:
         """Delete only explicit rejection tombstones and reset their review stamps."""
@@ -2209,7 +2329,7 @@ class SQLiteStateStore:
                 )
             return len(rejected_ids)
 
-        return await _run_candidate_transaction(self.path, write)
+        return await _run_cancellation_safe_transaction(self.path, write)
 
     async def start(self, run: RunInput) -> Transcript:
         if run.conversation_id is None:
@@ -3079,7 +3199,7 @@ def _require_candidate_transition(
         )
 
 
-async def _run_candidate_transaction(
+async def _run_cancellation_safe_transaction(
     path: Path,
     callback: Callable[[sqlite3.Connection], _T],
 ) -> _T:
@@ -3140,6 +3260,23 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
             decode_review_stamps(data)
         else:
             raise ValueError("state metadata key is unsupported")
+
+    mcp_binding_counts: dict[str, int] = {}
+    for agent_id, binding_id, data in connection.execute(
+        "SELECT agent_id, binding_id, data FROM mcp_server_bindings"
+    ):
+        mcp_binding_counts[agent_id] = mcp_binding_counts.get(agent_id, 0) + 1
+        if mcp_binding_counts[agent_id] > MCP_MAX_BINDINGS_PER_AGENT:
+            raise ValueError("stored MCP binding count exceeds its fixed bound")
+        binding = decode_mcp_binding(
+            data,
+            agent_id=agent_id,
+            binding_id=binding_id,
+        )
+        if binding.agent_id != agent_id or binding.binding_id != binding_id:
+            raise ValueError("stored MCP binding ownership is invalid")
+        if identity is not None and binding.agent_id != identity.id:
+            raise ValueError("stored MCP binding belongs to another agent")
 
     sources: dict[tuple[str, str], SourceRegistration] = {}
     for agent_id, source_id, data in connection.execute(

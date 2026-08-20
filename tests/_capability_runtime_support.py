@@ -58,7 +58,10 @@ class StaticTestDomain:
         call: ToolCall,
         capability: Capability,
         arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
+        del request_sensitivity
         return arguments
 
     async def side_effect_plan(
@@ -80,7 +83,10 @@ class StaticTestDomain:
         capability: Capability,
         arguments: FrozenJsonObject,
         output: ToolOutput,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
+        del request_sensitivity
         if output.sensitivity is not None:
             return output
         return replace(

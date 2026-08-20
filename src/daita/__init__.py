@@ -1,6 +1,21 @@
 """Daita agent."""
 
-from .adapters import LocalDirectorySource, PostgreSQLSource, SQLiteSource
+from .adapters import (
+    LocalDirectorySource,
+    MCPAdmissionError,
+    MCPAuthentication,
+    MCPAuthenticationMode,
+    MCPBindingState,
+    MCPBindingStatus,
+    MCPError,
+    MCPInspectedTool,
+    MCPServerBinding,
+    MCPServerInspection,
+    MCPToolBinding,
+    MCPToolSelection,
+    PostgreSQLSource,
+    SQLiteSource,
+)
 from .adapters.postgresql_write import PostgreSQLUpdateReadiness
 from .agent import Agent
 from .artifacts import (
@@ -82,6 +97,17 @@ __all__ = [
     "LoopExit",
     "LoopExitKind",
     "LoopLimits",
+    "MCPAdmissionError",
+    "MCPAuthentication",
+    "MCPAuthenticationMode",
+    "MCPBindingState",
+    "MCPBindingStatus",
+    "MCPError",
+    "MCPInspectedTool",
+    "MCPServerBinding",
+    "MCPServerInspection",
+    "MCPToolBinding",
+    "MCPToolSelection",
     "ModelRoute",
     "ModelRouteCandidate",
     "PostgreSQLSource",

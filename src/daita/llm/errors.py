@@ -38,6 +38,29 @@ class ContextEvidencePressureExceeded(LLMError):
         )
 
 
+class ToolSurfaceLimitExceeded(LLMError):
+    """The complete model-visible tool surface exceeds an outer run bound."""
+
+    def __init__(
+        self,
+        *,
+        observed_tools: int,
+        maximum_tools: int,
+        observed_definition_bytes: int,
+        maximum_definition_bytes: int,
+    ) -> None:
+        self.observed_tools = observed_tools
+        self.maximum_tools = maximum_tools
+        self.observed_definition_bytes = observed_definition_bytes
+        self.maximum_definition_bytes = maximum_definition_bytes
+        super().__init__(
+            "The projected model tool surface exceeds its configured count or "
+            "definition-byte bound.",
+            error_code="tool_surface_limit_exceeded",
+            retryability=ErrorRetryability.PERMANENT,
+        )
+
+
 class RequestSensitivityUnavailable(LLMError):
     """The current admitted resource scope cannot be classified safely."""
 

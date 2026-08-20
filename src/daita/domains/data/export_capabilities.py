@@ -1371,7 +1371,10 @@ class ArtifactCapabilityDomain:
         call: ToolCall,
         capability: Capability,
         arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
+        del request_sensitivity
         if capability.side_effecting:
             self._learning.validate_side_effect(run.id, call)
         supplied_source_id = arguments.get("source_id")
@@ -1477,7 +1480,10 @@ class ArtifactCapabilityDomain:
         capability: Capability,
         arguments: FrozenJsonObject,
         output: ToolOutput,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
+        del request_sensitivity
         if output.artifact is not None:
             self._validate_artifact_summary(capability, output)
             output = replace(

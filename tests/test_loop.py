@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import pytest
 
+from daita._json import canonical_json
 from daita.agent import Agent
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
@@ -82,10 +83,23 @@ class ScriptedTools:
             ),
         )
 
-    async def execute_all(self, run, calls):
-        del run
+    async def execute_all(self, run, calls, *, sensitivity):
+        del run, sensitivity
         self.calls.extend(calls)
         return ToolBatchOutcome(tuple(self.outputs[call.id] for call in calls))
+
+
+class StaticDefinitionTools:
+    def __init__(self, definitions):
+        self._definitions = tuple(definitions)
+
+    async def definitions(self, run):
+        del run
+        return self._definitions
+
+    async def execute_all(self, run, calls, *, sensitivity):
+        del run, calls, sensitivity
+        raise AssertionError("an over-limit tool surface must never execute")
 
 
 def response_with_calls(*ids):
@@ -93,6 +107,117 @@ def response_with_calls(*ids):
         finish_reason=FinishReason.TOOL_CALLS,
         tool_calls=tuple(ToolCall(id=call_id, name="lookup") for call_id in ids),
     )
+
+
+@pytest.mark.parametrize("limit_kind", ("count", "definition_bytes"))
+async def test_projected_tool_surface_limits_fail_before_context_or_model(limit_kind):
+    definitions = (
+        ToolDefinition(
+            name="first_tool",
+            description="First bounded tool.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+        ToolDefinition(
+            name="second_tool",
+            description="Second bounded tool with enough text to exceed a tiny bound.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+    )
+
+    class ContextMustNotPrepare(TranscriptContext):
+        async def prepare(self, run, messages, tools):
+            del run, messages, tools
+            raise AssertionError("tool bounds must precede context preparation")
+
+    limits = (
+        LoopLimits(max_projected_tools=1)
+        if limit_kind == "count"
+        else LoopLimits(max_projected_tool_definition_bytes=64)
+    )
+    provider = MockModelProvider(
+        (ModelResponse(finish_reason=FinishReason.STOP, text="must not execute"),)
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=ContextMustNotPrepare(),
+        tools=StaticDefinitionTools(definitions),
+        limits=limits,
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(
+        RunInput(
+            id=f"run-tool-surface-{limit_kind}",
+            agent_id="agent-1",
+            message="question",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "tool_surface_limit_exceeded"
+    assert result.steps == 0
+    assert provider.requests == ()
+
+
+async def test_projected_tool_surface_limits_are_inclusive():
+    definitions = (
+        ToolDefinition(
+            name="lookup",
+            description="Look up one bounded value.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+    )
+    definition_bytes = len(
+        canonical_json(
+            [
+                {
+                    "name": item.name,
+                    "description": item.description,
+                    "input_schema": item.input_schema,
+                }
+                for item in definitions
+            ]
+        ).encode("utf-8")
+    )
+    provider = MockModelProvider(
+        (ModelResponse(finish_reason=FinishReason.STOP, text="done"),)
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=StaticDefinitionTools(definitions),
+        limits=LoopLimits(
+            max_projected_tools=len(definitions),
+            max_projected_tool_definition_bytes=definition_bytes,
+        ),
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(
+        RunInput(
+            id="run-tool-surface-exact-bound",
+            agent_id="agent-1",
+            message="question",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert provider.requests[0].tools == definitions
+
+
+def test_projected_tool_surface_limits_must_be_positive():
+    with pytest.raises(
+        ValueError,
+        match="max_projected_tools must be a positive integer",
+    ):
+        LoopLimits(max_projected_tools=0)
+    with pytest.raises(
+        ValueError,
+        match="max_projected_tool_definition_bytes must be a positive integer",
+    ):
+        LoopLimits(max_projected_tool_definition_bytes=0)
 
 
 async def test_direct_loop_records_every_parallel_result_in_order():
@@ -277,10 +402,10 @@ async def test_unexpected_loop_failures_best_effort_terminalize_started_run(
             return await super().prepare(run, messages, tools)
 
     class BrokenTools(ScriptedTools):
-        async def execute_all(self, run, calls):
+        async def execute_all(self, run, calls, *, sensitivity):
             if failure_site == "tool_contract":
                 return ()
-            return await super().execute_all(run, calls)
+            return await super().execute_all(run, calls, sensitivity=sensitivity)
 
     provider = MockModelProvider((response_with_calls("one"),))
     transcripts = InMemoryTranscriptStore()

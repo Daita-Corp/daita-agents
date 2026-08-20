@@ -20,7 +20,7 @@ from daita.catalog import (
 )
 from daita.catalog.capabilities import CatalogProjection, catalog_declarations
 from daita.catalog.models import CatalogResource
-from daita.llm.models import ToolCall
+from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
 from daita.storage.sqlite_codecs import encode_source_read_scope
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
@@ -296,7 +296,11 @@ async def test_runtime_denies_guessed_and_multi_resource_reads_before_io(
                 },
             ),
         )
-        results = await runtime.execute_all(run, calls)
+        results = await runtime.execute_all(
+            run,
+            calls,
+            sensitivity=ModelSensitivity.INTERNAL,
+        )
         errors = tuple(
             cast(Mapping[str, object], result.output["error"]) for result in results
         )

@@ -82,6 +82,11 @@ UPDATE_SCOPE_TABLE = (
     ("authorization_fingerprint", "TEXT", 1, None, 0),
     ("data", "TEXT", 1, None, 0),
 )
+MCP_BINDING_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("binding_id", "TEXT", 1, None, 2),
+    ("data", "TEXT", 1, None, 0),
+)
 
 RECEIPT_TABLES = {**INITIAL_TABLES, "database_write_receipts": RECEIPT_TABLE}
 JOURNAL_INITIAL_TABLES = {**INITIAL_TABLES, "state_migrations": JOURNAL_TABLE}
@@ -95,7 +100,11 @@ SCOPED_PERMISSION_TABLES = {
     "source_read_scopes": READ_SCOPE_TABLE,
     "postgresql_update_scopes": UPDATE_SCOPE_TABLE,
 }
-CURRENT_TABLES = SCOPED_PERMISSION_TABLES
+GENERALIZED_UPDATE_TABLES = SCOPED_PERMISSION_TABLES
+CURRENT_TABLES = {
+    **GENERALIZED_UPDATE_TABLES,
+    "mcp_server_bindings": MCP_BINDING_TABLE,
+}
 
 MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
 ADMISSION_FOREIGN_KEYS = (
@@ -224,6 +233,15 @@ CREATE TABLE postgresql_update_scopes (
     FOREIGN KEY (agent_id, source_id)
         REFERENCES sources(agent_id, id)
         ON DELETE CASCADE
+)
+"""
+
+MCP_SERVER_BINDING_TABLE_SQL = """
+CREATE TABLE mcp_server_bindings (
+    agent_id TEXT NOT NULL,
+    binding_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, binding_id)
 )
 """
 

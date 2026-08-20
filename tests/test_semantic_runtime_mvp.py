@@ -16,6 +16,7 @@ from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -497,6 +498,7 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
                         },
                     ),
                 ),
+                sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
         semantic_domain.clear_explicit_learning_run(delete_run.id)

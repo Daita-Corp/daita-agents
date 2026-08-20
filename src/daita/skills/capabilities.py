@@ -362,7 +362,10 @@ class SkillCapabilityDomain:
         call: ToolCall,
         capability: Capability,
         arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
+        del request_sensitivity
         if capability.side_effecting:
             self._learning.validate_side_effect(run.id, call)
         if capability.id == SKILL_VIEW_CAPABILITY_ID:
@@ -395,7 +398,10 @@ class SkillCapabilityDomain:
         capability: Capability,
         arguments: FrozenJsonObject,
         output: ToolOutput,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
+        del request_sensitivity
         if capability.side_effecting:
             self._learning.mark_side_effect_succeeded(run.id)
         if output.sensitivity is not None:

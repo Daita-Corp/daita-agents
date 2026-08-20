@@ -11,6 +11,13 @@ from typing import Self
 
 from ._json import FrozenJsonObject
 from .adapters.models import SourceRegistration
+from .adapters.mcp import (
+    MCPAuthentication,
+    MCPBindingStatus,
+    MCPClientFactory,
+    MCPServerInspection,
+    MCPToolSelection,
+)
 from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
@@ -55,7 +62,7 @@ from .learning_candidates import (
     LearningCandidateView,
     LearningReviewResult,
 )
-from .llm.models import ModelProfile
+from .llm.models import ModelProfile, ModelSensitivity
 from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
@@ -117,6 +124,7 @@ class Agent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        mcp_client_factory: MCPClientFactory | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
         reviewer_model: ModelProvider | None = None,
@@ -138,6 +146,7 @@ class Agent:
                 clock=clock,
                 id_factory=id_factory,
                 secret_provider=secret_provider,
+                mcp_client_factory=mcp_client_factory,
                 keychain=keychain,
                 model_validator=model_validator,
                 reviewer_model=reviewer_model,
@@ -162,6 +171,7 @@ class Agent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        mcp_client_factory: MCPClientFactory | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
         reviewer_model: ModelProvider | None = None,
@@ -183,6 +193,7 @@ class Agent:
                 clock=clock,
                 id_factory=id_factory,
                 secret_provider=secret_provider,
+                mcp_client_factory=mcp_client_factory,
                 keychain=keychain,
                 model_validator=model_validator,
                 reviewer_model=reviewer_model,
@@ -500,6 +511,43 @@ class Agent:
 
     async def delete_skill(self, name: str) -> bool:
         return await self._embedded.delete_skill(name)
+
+    async def inspect_mcp_server(
+        self,
+        *,
+        endpoint: str,
+        authentication: MCPAuthentication | None = None,
+    ) -> MCPServerInspection:
+        return await self._embedded.inspect_mcp_server(
+            endpoint=endpoint,
+            authentication=authentication,
+        )
+
+    async def attach_mcp_server(
+        self,
+        *,
+        endpoint: str,
+        selections: tuple[MCPToolSelection, ...],
+        authentication: MCPAuthentication | None = None,
+        maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
+        binding_id: str | None = None,
+    ) -> MCPBindingStatus:
+        return await self._embedded.attach_mcp_server(
+            endpoint=endpoint,
+            selections=selections,
+            authentication=authentication,
+            maximum_outbound_sensitivity=maximum_outbound_sensitivity,
+            binding_id=binding_id,
+        )
+
+    async def list_mcp_servers(self) -> tuple[MCPBindingStatus, ...]:
+        return await self._embedded.list_mcp_servers()
+
+    async def refresh_mcp_server(self, binding_id: str) -> MCPBindingStatus:
+        return await self._embedded.refresh_mcp_server(binding_id)
+
+    async def revoke_mcp_server(self, binding_id: str) -> MCPBindingStatus:
+        return await self._embedded.revoke_mcp_server(binding_id)
 
     async def attach(self, source: ResourceSource) -> SourceRegistration:
         return await self._embedded.attach(source)

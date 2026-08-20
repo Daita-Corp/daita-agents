@@ -24,6 +24,7 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -134,7 +135,11 @@ def _runtime(agent: Agent) -> CapabilityRuntime:
 
 
 async def _execute(agent: Agent, *calls: ToolCall):
-    return await _runtime(agent).execute_all(_run(agent), calls)
+    return await _runtime(agent).execute_all(
+        _run(agent),
+        calls,
+        sensitivity=ModelSensitivity.INTERNAL,
+    )
 
 
 async def _skill_digest(agent: Agent, name: str) -> str:

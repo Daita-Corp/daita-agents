@@ -106,8 +106,8 @@ class NoTools:
         del run
         return ()
 
-    async def execute_all(self, run, calls):
-        del run
+    async def execute_all(self, run, calls, *, sensitivity):
+        del run, sensitivity
         assert calls == ()
         return ToolBatchOutcome(())
 
@@ -124,8 +124,8 @@ class ReplayTools:
             for name in ("memory_set", "skill_save", "skill_delete", "skill_view")
         )
 
-    async def execute_all(self, run, calls):
-        del run
+    async def execute_all(self, run, calls, *, sensitivity):
+        del run, sensitivity
         return ToolBatchOutcome(
             tuple(
                 ToolResultBlock(
@@ -168,8 +168,8 @@ class FreshQueryTools:
             ),
         )
 
-    async def execute_all(self, run, calls):
-        del run
+    async def execute_all(self, run, calls, *, sensitivity):
+        del run, sensitivity
         self.calls.extend(calls)
         return ToolBatchOutcome(
             tuple(

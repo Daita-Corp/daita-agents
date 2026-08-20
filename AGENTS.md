@@ -46,8 +46,10 @@ step. Normal text from the model completes the run; there is no second
 readiness, repair, verification, or synthesis pass.
 
 The loop has only outer step, wall-time, token, and estimated-cost limits. The
-MVP supports catalog-backed reads from SQLite, PostgreSQL, CSV, and JSON. SQL
-and file access are validated against the current catalog before source I/O.
+MVP supports catalog-backed reads from SQLite, PostgreSQL, CSV, and JSON, plus
+explicitly admitted server-neutral remote MCP read tools. SQL and file access
+are validated against the current catalog before source I/O; each MCP call is
+revalidated against its exact binding revision and remote identity.
 
 Agent identity, source registrations, current catalog snapshots, exact run
 transcripts, and terminal run results are persisted in a small SQLite state
@@ -65,6 +67,7 @@ src/daita/
   capability_runtime.py # sole domain-neutral model-to-execution boundary
   domains/             # static capability owners and learning guard state
   domains/data/        # data context, current validation, SQL, artifacts
+  domains/mcp.py       # admitted remote MCP projection and call-time rechecks
   catalog/             # normalized current source/resource truth
   adapters/            # bounded source admission, discovery, and read I/O
   storage/sqlite.py    # sole durable state operation/admission boundary
@@ -201,9 +204,11 @@ and traversal. Data-domain code consumes catalog contracts rather than building
 a second schema graph or querying source clients for planning facts.
 
 `daita.adapters` owns source-specific admission, containment, discovery,
-freshness checks, and I/O. SQLite and local-file paths must be absolute,
-bounded, and resistant to symlink/path escape. PostgreSQL credentials remain
-secret references and integration SDK use stays behind the execution boundary.
+freshness checks, and I/O, plus the single bounded server-neutral Streamable
+HTTP MCP protocol client. SQLite and local-file paths must be absolute,
+bounded, and resistant to symlink/path escape. PostgreSQL and MCP credentials
+remain secret references and integration SDK use stays behind the execution
+boundary.
 
 SQL validation belongs in `daita.domains.data.sql`; connector guardrails still
 apply at execution. Do not duplicate either system in a generic policy layer.
@@ -213,8 +218,9 @@ apply at execution. Do not duplicate either system in a generic policy layer.
 `daita.storage.sqlite.SQLiteStateStore` persists only state used by the MVP:
 identity, sources, current catalog snapshots, run transcripts and terminal
 results, semantic annotations, learning review state, immutable database-write
-receipts, explicit source read scopes, and exact PostgreSQL update scopes. It is
-the sole owner of the immutable checksummed `state_migrations` journal,
+receipts, explicit source read scopes, exact PostgreSQL update scopes, and
+independently keyed MCP server binding aggregates. It is the sole owner of the
+immutable checksummed `state_migrations` journal,
 explicit persisted-record codecs, exact current/historical schemas, and the
 bounded preledger bridge. Migrations run only on a verified staged copy under
 the existing agent-home writer boundary, validate their source and target
@@ -347,14 +353,14 @@ pipx install daita-agents
 daita
 ```
 
-`openai`, `anthropic`, `google-genai`, `asyncpg`, `sqlglot`, `keyring`,
+`openai`, `anthropic`, `google-genai`, `asyncpg`, `sqlglot`, `httpx`, `keyring`,
 `textual`, `rich`, and `XlsxWriter` are default production dependencies.
 `dev` is the only optional dependency group; do not restore provider, keychain,
 database, parser, CLI, recommended, complete, aggregate, or other customer
 extras.
 
 Default installation does not authorize eager imports. Import provider SDKs,
-`asyncpg`, `sqlglot`, `keyring`, `textual`, and Rich only inside the
+`asyncpg`, `sqlglot`, `httpx`, `keyring`, `textual`, and Rich only inside the
 provider/client or terminal-selection boundary that first needs them, and
 XlsxWriter only inside the XLSX renderer boundary—never at module import time.
 Importing `daita` or `daita.cli`, and running headless commands, must not load
@@ -435,6 +441,8 @@ specific agent loop.
 | `src/daita/loop/models.py` | run, transcript, limits, and exit records |
 | `src/daita/capabilities.py` | capability declarations and registry |
 | `src/daita/capability_runtime.py` | sole common model-to-execution runtime |
+| `src/daita/adapters/mcp.py` | bounded server-neutral Streamable HTTP MCP protocol client and records |
+| `src/daita/domains/mcp.py` | static MCP capability owner and call-time binding rechecks |
 | `src/daita/domains/learning.py` | transient learning mutation guard |
 | `src/daita/domains/data/context.py` | current model request construction |
 | `src/daita/domains/data/controller.py` | data projection and current-state validation |

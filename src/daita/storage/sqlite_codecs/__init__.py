@@ -18,6 +18,7 @@ from .learning import (
     encode_learning_candidate,
     encode_review_stamps,
 )
+from .mcp_bindings import decode_mcp_binding, encode_mcp_binding
 from .receipts import decode_receipt, encode_receipt
 from .semantics import decode_semantic_annotation, encode_semantic_annotation
 from .source_permissions import (
@@ -47,6 +48,7 @@ __all__ = [
     "decode_identity",
     "decode_learning_candidate",
     "decode_loop_exit",
+    "decode_mcp_binding",
     "decode_message",
     "decode_preledger_source",
     "decode_postgresql_update_scope",
@@ -62,6 +64,7 @@ __all__ = [
     "encode_identity",
     "encode_learning_candidate",
     "encode_loop_exit",
+    "encode_mcp_binding",
     "encode_message",
     "encode_postgresql_update_scope",
     "encode_receipt",

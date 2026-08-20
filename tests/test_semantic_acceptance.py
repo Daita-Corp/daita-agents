@@ -23,6 +23,7 @@ from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -389,6 +390,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
                         arguments={"limit": 1},
                     ),
                 ),
+                sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
         listed_data = listed.output["data"]
@@ -406,6 +408,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
                         arguments={"id": "conflict-a"},
                     ),
                 ),
+                sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
         assert not conflict_view.is_error

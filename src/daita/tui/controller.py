@@ -20,6 +20,11 @@ from daita import (
     LearningCandidateStatus,
     LearningReviewStatus,
     LoopExit,
+    MCPAdmissionError,
+    MCPBindingState,
+    MCPBindingStatus,
+    MCPServerInspection,
+    MCPToolSelection,
     Transcript,
 )
 from daita.agent import (
@@ -701,6 +706,8 @@ class PresentationController:
                 await self._sources_text(),
                 conversation_id=conversation_id,
             )
+        if name == "/mcp":
+            return await self._mcp_command(parts)
         if name == "/catalog" and len(parts) == 1:
             return CommandOutcome(
                 "screen",
@@ -828,6 +835,177 @@ class PresentationController:
         if name in BUILTIN_SLASH_COMMANDS:
             return CommandOutcome("notice", f"Usage: {name}")
         return CommandOutcome("notice", "Unknown command. Type / to browse commands.")
+
+    async def _mcp_command(self, parts: list[str]) -> CommandOutcome:
+        agent = self.require_agent()
+        conversation_id = self.conversation_id
+        if len(parts) == 1:
+            return CommandOutcome(
+                "screen",
+                screen="mcp_management",
+                conversation_id=conversation_id,
+            )
+        if parts[1:] == ["add"]:
+            return CommandOutcome(
+                "screen",
+                screen="mcp_setup",
+                conversation_id=conversation_id,
+            )
+        if parts[1:] == ["status"]:
+            statuses = await agent.list_mcp_servers()
+            if not statuses:
+                message = "MCP binding details  none"
+            else:
+                lines = ["MCP binding details"]
+                for status in statuses:
+                    binding = status.binding
+                    display_state = (
+                        "needs refresh"
+                        if binding.state is MCPBindingState.STALE
+                        else (
+                            "revoked"
+                            if binding.state is MCPBindingState.REVOKED
+                            else (
+                                "restart required"
+                                if status.reopen_required
+                                else (
+                                    "ready"
+                                    if status.active_in_runtime
+                                    else "unavailable"
+                                )
+                            )
+                        )
+                    )
+                    lines.append(
+                        "  "
+                        + safe_display(binding.binding_id, fallback="binding")
+                        + "  "
+                        + display_state
+                        + "  "
+                        + safe_display(
+                            binding.endpoint, fallback="endpoint unavailable"
+                        )
+                    )
+                message = "\n".join(lines)
+            return CommandOutcome(
+                "notice",
+                message,
+                conversation_id=conversation_id,
+            )
+        if len(parts) == 3 and parts[1] == "inspect":
+            inspection = await self.inspect_mcp_server(parts[2])
+            lines = [
+                "MCP inspection  "
+                + safe_display(inspection.server_name, fallback="unknown server")
+                + "  "
+                + safe_display(inspection.server_version, fallback="unknown version")
+            ]
+            lines.extend(
+                "  "
+                + safe_display(tool.remote_name, fallback="tool")
+                + ("  supported" if tool.supported else "  unsupported")
+                + (
+                    ""
+                    if tool.unsupported_reason is None
+                    else "  "
+                    + safe_display(tool.unsupported_reason, fallback="rejected")
+                )
+                for tool in inspection.tools
+            )
+            return CommandOutcome(
+                "notice",
+                "\n".join(lines),
+                conversation_id=conversation_id,
+            )
+        if len(parts) == 5 and parts[1] == "attach":
+            endpoint, remote_name, local_alias = parts[2:]
+            status = await self.attach_mcp_tools(
+                endpoint,
+                (
+                    MCPToolSelection(
+                        remote_name=remote_name,
+                        local_alias=local_alias,
+                        description=(
+                            "Read the explicitly admitted MCP tool " + remote_name + "."
+                        ),
+                    ),
+                ),
+            )
+            return CommandOutcome(
+                "notice",
+                "MCP binding "
+                + safe_display(status.binding.binding_id, fallback="created")
+                + " attached; reopen Daita to activate it.",
+                conversation_id=conversation_id,
+            )
+        if len(parts) == 3 and parts[1] == "refresh":
+            status = await self.refresh_mcp_server(parts[2])
+            return CommandOutcome(
+                "notice",
+                "MCP binding "
+                + safe_display(status.binding.binding_id, fallback="binding")
+                + " refreshed; state "
+                + safe_display(status.binding.state.value, fallback="unknown")
+                + ".",
+                conversation_id=conversation_id,
+            )
+        if len(parts) == 3 and parts[1] == "revoke":
+            return CommandOutcome(
+                "confirm",
+                "Revoke MCP binding "
+                + safe_display(parts[2], fallback="this binding")
+                + "?",
+                conversation_id=conversation_id,
+                screen="confirm_revoke_mcp",
+                payload={"binding_id": parts[2]},
+            )
+        return CommandOutcome(
+            "notice",
+            "Usage: /mcp | /mcp add | /mcp status | /mcp inspect <endpoint> | "
+            "/mcp attach <endpoint> <remote-tool> <local-alias> | "
+            "/mcp refresh <binding-id> | /mcp revoke <binding-id>",
+            conversation_id=conversation_id,
+        )
+
+    async def list_mcp_servers(self) -> tuple[MCPBindingStatus, ...]:
+        return await self.require_agent().list_mcp_servers()
+
+    async def inspect_mcp_server(self, endpoint: str) -> MCPServerInspection:
+        return await self.require_agent().inspect_mcp_server(endpoint=endpoint)
+
+    async def attach_mcp_tools(
+        self,
+        endpoint: str,
+        selections: tuple[MCPToolSelection, ...],
+    ) -> MCPBindingStatus:
+        try:
+            return await self.require_agent().attach_mcp_server(
+                endpoint=endpoint,
+                selections=selections,
+            )
+        except MCPAdmissionError as error:
+            reason = error.details.get("reason")
+            if error.code != "mcp_schema_unsupported" or not isinstance(reason, str):
+                raise
+            raise UserInputError(
+                "Cannot attach MCP tool: "
+                + safe_display(
+                    reason,
+                    fallback="unsupported schema",
+                    maximum=512,
+                )
+            ) from error
+
+    async def refresh_mcp_server(self, binding_id: str) -> MCPBindingStatus:
+        return await self.require_agent().refresh_mcp_server(binding_id)
+
+    async def revoke_mcp_server(self, binding_id: str) -> str:
+        status = await self.require_agent().revoke_mcp_server(binding_id)
+        return (
+            "MCP binding "
+            + safe_display(status.binding.binding_id, fallback="binding")
+            + " revoked."
+        )
 
     async def _use_source(self, selector: str) -> CommandOutcome:
         prior = await self.require_agent().active_source(

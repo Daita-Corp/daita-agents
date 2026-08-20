@@ -32,7 +32,8 @@ copy them into SQLite.
   required operational path without creating a second public surface.
 - Each published durable change has one immutable migration file. The current
   ledger therefore has separate receipt-table, historical PostgreSQL-admission,
-  scoped-source-permission, and generalized PostgreSQL-update receipt entries.
+  scoped-source-permission, generalized PostgreSQL-update receipt, and MCP
+  server-binding entries.
 - A supported upgrade is copy-on-write. Daita never runs a migration against
   the active database file.
 
@@ -88,10 +89,10 @@ layers do not implement alternate compatibility paths.
 Record shape evolution is separate from database migration. SQLite persistence
 uses explicit codecs for identity/identifiers, sources, source-permission
 scopes, receipts, catalog syncs/snapshots, artifact references, transcript/run
-records, semantic annotations, and learning candidates/review stamps. Each
-codec declares its required fields, additive defaults, nested records, enums,
-datetimes, decimals, and unknown-field policy. Stored class-name text never
-selects a Python type.
+records, semantic annotations, learning candidates/review stamps, and MCP
+server bindings. Each codec declares its required fields, additive defaults,
+nested records, enums, datetimes, decimals, and unknown-field policy. Stored
+class-name text never selects a Python type.
 
 An additive optional payload default that leaves the physical schema and
 invariants unchanged can be a codec change. A required payload field, physical
@@ -116,6 +117,14 @@ cost-estimate record as `partial`, preserving the amount without falsely
 claiming that legacy pricing was complete. No historical one-row executor or
 runtime path is restored.
 
+The fifth immutable migration adds one independently keyed MCP binding
+aggregate per `(agent_id, binding_id)`. Its payload contains only the accepted
+endpoint, authentication mode, secret reference, negotiated remote identity,
+exact read-tool mappings and schema digests, sensitivity ceiling, revision,
+and lifecycle timestamps/state. It stores no resolved secret, protocol
+session, dynamic registry declaration, run, or tool result. Static runtime
+declarations are reconstructed and revalidated only when an agent opens.
+
 ## Preservation matrix
 
 | Durable item | Upgrade treatment |
@@ -129,6 +138,7 @@ runtime path is restored.
 | `database_write_receipts` | Preserve every receipt identity and outcome; add `expected_affected_rows = 1` to historical one-row receipts. |
 | `source_read_scopes` | Create one explicit `all` scope for every active source. |
 | `postgresql_update_scopes` | Create empty; historical broad admission grants no exact table scope. |
+| `mcp_server_bindings` | Create empty on upgrade; preserve each subsequently admitted independently keyed aggregate and secret reference exactly. |
 | `state_migrations` | Validate the exact existing prefix and append only the known missing suffix. |
 | `agent.toml` | Preserve bytes; it remains the manifest cross-check for SQLite identity. |
 | `config.json` | Preserve model route, settings, and secret references byte-for-byte. |

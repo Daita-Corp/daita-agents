@@ -90,8 +90,8 @@ class ScriptedTools:
             ),
         )
 
-    async def execute_all(self, run, calls):
-        del run
+    async def execute_all(self, run, calls, *, sensitivity):
+        del run, sensitivity
         return ToolBatchOutcome(tuple(self.outputs[call.id] for call in calls))
 
 

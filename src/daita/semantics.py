@@ -1646,7 +1646,10 @@ class SemanticCapabilityDomain:
         call: ToolCall,
         capability: Capability,
         arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
+        del request_sensitivity
         if capability.side_effecting:
             self._learning.validate_side_effect(run.id, call)
         if (
@@ -1688,7 +1691,10 @@ class SemanticCapabilityDomain:
         capability: Capability,
         arguments: FrozenJsonObject,
         output: ToolOutput,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
+        del request_sensitivity
         if capability.id == SEMANTIC_VIEW_CAPABILITY_ID:
             output = await self._decorate_view(run, arguments, output)
         elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:

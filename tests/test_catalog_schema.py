@@ -65,6 +65,7 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     ToolCall,
     ToolResultBlock,
 )
@@ -1605,6 +1606,7 @@ async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
                     },
                 ),
             ),
+            sensitivity=ModelSensitivity.INTERNAL,
         )
 
         error_codes = tuple(

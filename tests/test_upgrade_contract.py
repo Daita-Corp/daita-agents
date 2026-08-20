@@ -28,6 +28,9 @@ from daita.storage.sqlite_migrations import migration_rows, runner as migration_
 from daita.storage.sqlite_migrations.postgresql_write_admission import (
     MIGRATION as ADMISSION_MIGRATION,
 )
+from daita.storage.sqlite_migrations.mcp_server_bindings import (
+    MIGRATION as MCP_BINDING_MIGRATION,
+)
 from daita.storage.sqlite_migrations.scoped_source_permissions import (
     MIGRATION as SCOPED_PERMISSION_MIGRATION,
 )
@@ -124,6 +127,7 @@ def _make_preledger(
     with sqlite3.connect(path) as connection:
         for source_id, value in (embedded_admissions or {}).items():
             _embedded_admission(connection, source_id, value)
+        connection.execute("DROP TABLE mcp_server_bindings")
         connection.execute("DROP TABLE postgresql_update_scopes")
         connection.execute("DROP TABLE source_read_scopes")
         connection.execute("DROP TABLE state_migrations")
@@ -148,6 +152,7 @@ def _make_preledger(
 def _make_journal_prefix(path: Path, source_id: str, *, admission: object) -> None:
     with sqlite3.connect(path) as connection:
         _embedded_admission(connection, source_id, admission)
+        connection.execute("DROP TABLE mcp_server_bindings")
         connection.execute("DROP TABLE postgresql_update_scopes")
         connection.execute("DROP TABLE source_read_scopes")
         connection.execute("DELETE FROM state_migrations WHERE ordinal >= 2")
@@ -160,6 +165,7 @@ def _make_admission_prefix(
     admitted: bool,
 ) -> None:
     with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE mcp_server_bindings")
         connection.execute("DROP TABLE postgresql_update_scopes")
         connection.execute("DROP TABLE source_read_scopes")
         connection.execute(ADMISSION_TABLE_SQL)
@@ -444,7 +450,7 @@ async def test_detached_preledger_source_never_inherits_embedded_admission(
             "20990101_unknown",
         ),
         (
-            "UPDATE state_migrations SET ordinal = 5 WHERE ordinal = 2",
+            "UPDATE state_migrations SET ordinal = 6 WHERE ordinal = 2",
             "20260812_scoped_source_permissions",
         ),
     ),
@@ -518,7 +524,11 @@ async def test_cancellation_waits_for_atomic_journal_upgrade_to_settle(
     monkeypatch.setattr(
         migration_runner,
         "MIGRATIONS",
-        (*migration_runner.MIGRATIONS[:2], controlled, migration_runner.MIGRATIONS[3]),
+        (
+            *migration_runner.MIGRATIONS[:2],
+            controlled,
+            *migration_runner.MIGRATIONS[3:],
+        ),
     )
     opening = asyncio.create_task(SQLiteStateStore.open(path))
     assert await asyncio.to_thread(entered.wait, 5)
@@ -562,7 +572,11 @@ async def test_scoped_permission_migration_failure_rolls_back_every_change(
     monkeypatch.setattr(
         migration_runner,
         "MIGRATIONS",
-        (*migration_runner.MIGRATIONS[:2], controlled, migration_runner.MIGRATIONS[3]),
+        (
+            *migration_runner.MIGRATIONS[:2],
+            controlled,
+            *migration_runner.MIGRATIONS[3:],
+        ),
     )
     with pytest.raises(StateCompatibilityError) as raised:
         await SQLiteStateStore.open(path)
@@ -597,7 +611,7 @@ async def test_newer_journal_extension_is_a_downgrade_refusal_without_write(
     with sqlite3.connect(path) as connection:
         connection.execute(
             "INSERT INTO state_migrations(ordinal, migration_id, checksum) "
-            "VALUES (5, ?, ?)",
+            "VALUES (6, ?, ?)",
             (future_revision, "f" * 64),
         )
     before = _sha256(path)
@@ -620,7 +634,7 @@ async def test_invalid_later_journal_entry_is_unsupported_without_write(
     with sqlite3.connect(path) as connection:
         connection.execute(
             "INSERT INTO state_migrations(ordinal, migration_id, checksum) "
-            "VALUES (6, 'gapped-future', ?)",
+            "VALUES (7, 'gapped-future', ?)",
             ("f" * 64,),
         )
     before = _sha256(path)
@@ -855,6 +869,11 @@ def test_migration_checksums_are_stable_sha256_values() -> None:
             "20260814_generalized_postgresql_updates",
             "b08069f61481986937a864d33471185c6fbf031affe81f275a271f0e56a8f428",
         ),
+        (
+            5,
+            "20260819_mcp_server_bindings",
+            "ca5414bfdfd16ba5554524f70cbe7e03ed8deb5bd00f1df4de5b56933b97b476",
+        ),
     )
 
 
@@ -877,6 +896,13 @@ def test_migration_checksum_binds_identity_schemas_transform_and_validation() ->
     )
 
     assert all(variant.checksum != ADMISSION_MIGRATION.checksum for variant in variants)
+
+
+def test_mcp_migration_freezes_its_historical_binding_bound() -> None:
+    validation = MCP_BINDING_MIGRATION.validate_target
+    assert validation is not None
+    assert 32 in validation.__code__.co_consts
+    assert "MCP_MAX_BINDINGS_PER_AGENT" not in validation.__code__.co_names
 
 
 def test_obsolete_numeric_and_reflection_owners_are_absent() -> None:

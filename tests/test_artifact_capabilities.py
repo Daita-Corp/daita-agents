@@ -342,6 +342,7 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
                         },
                     ),
                 ),
+                sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
         assert not result.is_error

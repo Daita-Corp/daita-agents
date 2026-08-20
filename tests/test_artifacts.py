@@ -687,8 +687,8 @@ class _LoopTools:
             ),
         )
 
-    async def execute_all(self, run, calls):
-        del run
+    async def execute_all(self, run, calls, *, sensitivity):
+        del run, sensitivity
         return ToolBatchOutcome(tuple(self.results[call.id] for call in calls))
 
 

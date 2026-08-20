@@ -177,7 +177,9 @@ ModalScreen {
 #confirm,
 #editor-prompt,
 #review-cost,
-#catalog-browser {
+#catalog-browser,
+#mcp-management,
+#mcp-setup {
     width: 88%;
     max-width: 100;
     height: auto;
@@ -213,6 +215,66 @@ ModalScreen {
     color: $primary;
     text-style: bold;
     padding-bottom: 1;
+}
+
+#mcp-title {
+    color: $primary;
+    text-style: bold;
+    padding-bottom: 1;
+}
+
+#mcp-management,
+#mcp-setup {
+    height: 88%;
+    border: round $border;
+}
+
+#mcp-summary,
+#mcp-step {
+    height: auto;
+    padding-bottom: 1;
+    color: $text-muted;
+}
+
+#mcp-list,
+#mcp-inspection {
+    height: 1fr;
+    padding: 1;
+    background: $background;
+    border: round $border;
+}
+
+#mcp-endpoint {
+    margin-bottom: 1;
+    border: round $border-blurred;
+}
+
+#mcp-endpoint:focus {
+    border: round $border;
+}
+
+#mcp-help {
+    height: auto;
+    padding-top: 1;
+    color: $text-muted;
+}
+
+#mcp-actions,
+#mcp-setup-actions {
+    height: auto;
+    margin-top: 1;
+}
+
+#mcp-actions Button,
+#mcp-setup-actions Button {
+    width: auto;
+    min-width: 12;
+    margin-right: 1;
+}
+
+#mcp-error {
+    height: auto;
+    color: $error;
 }
 
 #picker-options {

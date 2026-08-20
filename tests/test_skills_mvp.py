@@ -18,6 +18,7 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -607,6 +608,7 @@ async def test_missing_invalid_and_malformed_skill_views_are_bounded_errors(tmp_
                 created_at=NOW,
             ),
             (ToolCall(id="bad", name="skill_view", arguments={"name": "broken"}),),
+            sensitivity=ModelSensitivity.INTERNAL,
         )
         error = outcome.ordered_results[0].output["error"]
         assert isinstance(error, Mapping)
@@ -823,6 +825,7 @@ async def test_parallel_skill_and_data_reads_start_together_and_keep_order(
                         arguments={"query": "facts"},
                     ),
                 ),
+                sensitivity=ModelSensitivity.INTERNAL,
             ),
             timeout=2,
         )
@@ -885,8 +888,8 @@ async def test_custom_context_builder_remains_unwrapped(tmp_path):
             del run
             return ()
 
-        async def execute_all(self, run, calls):
-            del run
+        async def execute_all(self, run, calls, *, sensitivity):
+            del run, sensitivity
             assert calls == ()
             return ToolBatchOutcome(())
 
@@ -951,6 +954,7 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
         assert tables == {
             "database_write_receipts",
             "learning_candidates",
+            "mcp_server_bindings",
             "messages",
             "metadata",
             "postgresql_update_scopes",

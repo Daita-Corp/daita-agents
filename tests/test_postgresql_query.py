@@ -12,7 +12,7 @@ from daita.adapters.postgresql import PostgreSQLSourceError
 from daita.capabilities import Capability, ToolExecution, ToolOutput, ToolView
 from daita.capability_runtime import CapabilityRuntime
 from daita.domains.data.sql import ResourceSchema
-from daita.llm.models import ToolCall
+from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
 from _capability_runtime_support import StaticTestDomain, static_registry
@@ -226,6 +226,7 @@ async def _failure_result(error: BaseException):
             created_at=datetime(2026, 8, 19, tzinfo=UTC),
         ),
         (ToolCall(id="call-postgresql", name=view.name),),
+        sensitivity=ModelSensitivity.INTERNAL,
     )
     return outcome.ordered_results[0]
 

@@ -8,6 +8,7 @@ import sqlite3
 from ..sqlite_schema import require_healthy, require_schema
 from .database_write_receipts import MIGRATION as RECEIPT_MIGRATION
 from .generalized_postgresql_updates import MIGRATION as GENERALIZED_UPDATE_MIGRATION
+from .mcp_server_bindings import MIGRATION as MCP_BINDING_MIGRATION
 from .models import SQLiteMigration
 from .postgresql_write_admission import MIGRATION as ADMISSION_MIGRATION
 from .scoped_source_permissions import MIGRATION as SCOPED_PERMISSION_MIGRATION
@@ -17,6 +18,7 @@ MIGRATIONS: tuple[SQLiteMigration, ...] = (
     ADMISSION_MIGRATION,
     SCOPED_PERMISSION_MIGRATION,
     GENERALIZED_UPDATE_MIGRATION,
+    MCP_BINDING_MIGRATION,
 )
 CURRENT_REVISION = MIGRATIONS[-1].migration_id
 

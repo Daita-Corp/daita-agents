@@ -16,8 +16,8 @@ from daita.capabilities import (
     ToolView,
 )
 from daita.capability_runtime import CapabilityRuntime
-from daita.llm.models import ToolCall
-from daita.loop.models import RunInput, ToolBatchOutcome
+from daita.llm.models import ModelSensitivity, ToolCall
+from daita.loop.models import LoopLimits, RunInput, ToolBatchOutcome
 from _capability_runtime_support import StaticTestDomain, static_registry
 
 
@@ -54,12 +54,32 @@ class _CurrentAdmissionDomain(StaticTestDomain):
         call: ToolCall,
         capability: Capability,
         arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
-        del run, call, capability, arguments
+        del run, call, capability, arguments, request_sensitivity
         self.prepare_calls += 1
         raise CapabilityInputError(
             "current_admission_denied",
             "The current domain admission no longer permits this call.",
+        )
+
+
+class _OversizedFailureDomain(StaticTestDomain):
+    async def prepare_call(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
+    ) -> FrozenJsonObject:
+        del run, call, capability, arguments, request_sensitivity
+        raise CapabilityInputError(
+            "typed_boundary_failure",
+            "The bounded typed failure occurred.",
+            {"remote_diagnostic": "SECRET-REMOTE-DIAGNOSTIC" * 100},
         )
 
 
@@ -110,6 +130,7 @@ async def test_unprojected_capability_is_rejected_before_executor_io() -> None:
     outcome = await runtime.execute_all(
         _run(),
         (ToolCall(id="call-unavailable", name=view.name, arguments={"value": "x"}),),
+        sensitivity=ModelSensitivity.INTERNAL,
     )
 
     assert _error_code(outcome) == "tool_not_available"
@@ -125,6 +146,7 @@ async def test_schema_and_domain_current_admission_precede_executor_io() -> None
     invalid_schema = await runtime.execute_all(
         _run(),
         (ToolCall(id="call-schema", name=view.name),),
+        sensitivity=ModelSensitivity.INTERNAL,
     )
     assert _error_code(invalid_schema) == "missing_arguments"
     assert domain.prepare_calls == 0
@@ -133,6 +155,7 @@ async def test_schema_and_domain_current_admission_precede_executor_io() -> None
     denied = await runtime.execute_all(
         _run(),
         (ToolCall(id="call-current", name=view.name, arguments={"value": "x"}),),
+        sensitivity=ModelSensitivity.INTERNAL,
     )
     assert _error_code(denied) == "current_admission_denied"
     assert domain.prepare_calls == 1
@@ -160,3 +183,40 @@ def test_registry_execution_and_owner_identity_are_immutable() -> None:
     executor.executor_id = "test.stage_m1.changed"
     with pytest.raises(ValueError, match="executor identity changed"):
         registry.resolve_execution(capability.id)
+
+
+async def test_generic_result_bounds_cover_typed_failures_and_redact_payload() -> None:
+    capability, view = _declaration()
+    executor = _CountingExecutor()
+    domain = _OversizedFailureDomain((capability,), (view,))
+    runtime = CapabilityRuntime(
+        static_registry(domain, (executor,)),
+        (domain,),
+        limits=LoopLimits(max_tool_result_bytes=128),
+    )
+
+    outcome = await runtime.execute_all(
+        _run(),
+        (ToolCall(id="call-bounded", name=view.name, arguments={"value": "x"}),),
+        sensitivity=ModelSensitivity.INTERNAL,
+    )
+
+    assert _error_code(outcome) == "tool_result_too_large"
+    assert "SECRET-REMOTE-DIAGNOSTIC" not in repr(outcome.ordered_results[0])
+    assert executor.calls == 0
+
+
+@pytest.mark.parametrize(
+    "limits, message",
+    (
+        (LoopLimits(max_tool_result_bytes=128), None),
+        ({"max_tool_result_bytes": 127}, "max_tool_result_bytes must be at least 128"),
+        ({"max_tool_result_depth": 2}, "max_tool_result_depth must be at least 3"),
+    ),
+)
+def test_loop_limits_can_represent_the_fixed_bounded_error(limits, message) -> None:
+    if message is None:
+        assert isinstance(limits, LoopLimits)
+        return
+    with pytest.raises(ValueError, match=message):
+        LoopLimits(**limits)

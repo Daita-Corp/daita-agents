@@ -8,6 +8,7 @@ from ..sqlite_schema import (
     BASE_TABLE_SQL,
     CURRENT_TABLES,
     JOURNAL_TABLE_SQL,
+    MCP_SERVER_BINDING_TABLE_SQL,
     POSTGRESQL_UPDATE_SCOPE_TABLE_SQL,
     RECEIPT_TABLE_SQL,
     SOURCE_READ_SCOPE_TABLE_SQL,
@@ -29,6 +30,8 @@ def create_current(connection: sqlite3.Connection) -> None:
         + SOURCE_READ_SCOPE_TABLE_SQL
         + ";\n"
         + POSTGRESQL_UPDATE_SCOPE_TABLE_SQL
+        + ";\n"
+        + MCP_SERVER_BINDING_TABLE_SQL
         + ";\n"
     )
     for migration in MIGRATIONS:

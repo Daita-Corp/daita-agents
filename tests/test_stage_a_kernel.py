@@ -86,8 +86,8 @@ class _NoTools:
         del run
         return ()
 
-    async def execute_all(self, run, calls):
-        del run
+    async def execute_all(self, run, calls, *, sensitivity):
+        del run, sensitivity
         assert calls == ()
         return ToolBatchOutcome(())
 
@@ -431,7 +431,13 @@ async def test_cancelled_batch_keeps_known_side_effect_and_marks_later_call_unst
         ToolCall(id="write", name="stage_a_write"),
         ToolCall(id="later-read", name="stage_a_read"),
     )
-    task = asyncio.create_task(runtime.execute_all(_run("run-batch-known"), calls))
+    task = asyncio.create_task(
+        runtime.execute_all(
+            _run("run-batch-known"),
+            calls,
+            sensitivity=ModelSensitivity.INTERNAL,
+        )
+    )
     await asyncio.wait_for(side_effect.started.wait(), timeout=1)
 
     task.cancel()
@@ -456,7 +462,13 @@ async def test_uncertain_side_effect_wait_is_bounded_and_records_outcome_unknown
         ToolCall(id="write", name="stage_a_write"),
         ToolCall(id="later-read", name="stage_a_read"),
     )
-    task = asyncio.create_task(runtime.execute_all(_run("run-batch-unknown"), calls))
+    task = asyncio.create_task(
+        runtime.execute_all(
+            _run("run-batch-unknown"),
+            calls,
+            sensitivity=ModelSensitivity.INTERNAL,
+        )
+    )
     await asyncio.wait_for(side_effect.started.wait(), timeout=1)
 
     task.cancel()
@@ -481,6 +493,7 @@ async def test_cancellation_resistant_read_has_a_bounded_settlement_wait():
         runtime.execute_all(
             _run("run-bounded-read-cancellation"),
             (ToolCall(id="read", name="stage_a_read", arguments={"query": "x"}),),
+            sensitivity=ModelSensitivity.INTERNAL,
         )
     )
     await asyncio.wait_for(read.started.wait(), timeout=1)
@@ -715,6 +728,7 @@ async def test_successful_fallback_provider_is_sticky_for_run():
                 input_schema={"type": "object", "properties": {}},
             ),
         ),
+        sensitivity=ModelSensitivity.INTERNAL,
     )
 
     await router.generate_for_run(route, request)
@@ -819,8 +833,8 @@ async def test_tool_call_run_bound_counts_across_responses():
                 ),
             )
 
-        async def execute_all(self, run, calls):
-            del run
+        async def execute_all(self, run, calls, *, sensitivity):
+            del run, sensitivity
             self.calls.extend(calls)
             return ToolBatchOutcome(
                 tuple(
@@ -869,6 +883,7 @@ async def test_runtime_binds_classification_and_provenance_to_every_success():
                 arguments={"query": "value"},
             ),
         ),
+        sensitivity=ModelSensitivity.INTERNAL,
     )
 
     result = outcome.ordered_results[0]
@@ -898,7 +913,11 @@ async def test_read_concurrency_and_per_source_pressure_are_bounded():
         for index in range(4)
     )
 
-    outcome = await runtime.execute_all(_run("run-read-pressure"), calls)
+    outcome = await runtime.execute_all(
+        _run("run-read-pressure"),
+        calls,
+        sensitivity=ModelSensitivity.INTERNAL,
+    )
 
     assert all(not result.is_error for result in outcome.ordered_results)
     assert executor.maximum_active == 1
@@ -938,6 +957,7 @@ async def test_tool_result_bytes_and_depth_fail_with_structured_bounds(
                 arguments={"query": "value"},
             ),
         ),
+        sensitivity=ModelSensitivity.INTERNAL,
     )
 
     assert outcome.ordered_results[0].is_error
@@ -958,6 +978,7 @@ async def test_unexpected_executor_failure_is_normalized_and_redacted():
                 arguments={"query": "value"},
             ),
         ),
+        sensitivity=ModelSensitivity.INTERNAL,
     )
 
     assert _error(outcome.ordered_results[0])["code"] == "tool_execution_failed"

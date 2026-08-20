@@ -30,7 +30,7 @@ from daita.domains.data.sql import (
     PostgreSQLUpdateIntent,
     ResourceSchema,
 )
-from daita.llm.models import ToolCall
+from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite import DatabaseWriteOutcome, SQLiteStateStore
@@ -521,7 +521,11 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         conversation_id="conversation-runtime-update",
     )
     call = ToolCall(id="call-runtime-update", name="test_update", arguments={})
-    outcome = await runtime.execute_all(run, (call,))
+    outcome = await runtime.execute_all(
+        run,
+        (call,),
+        sensitivity=ModelSensitivity.INTERNAL,
+    )
     (result,) = outcome.ordered_results
 
     assert not result.is_error

@@ -28,6 +28,20 @@ from .local_files import (
     LocalDirectorySource,
     LocalDirectorySourceError,
 )
+from .mcp import (
+    MCPAdmissionError,
+    MCPAuthentication,
+    MCPAuthenticationMode,
+    MCPBindingState,
+    MCPBindingStatus,
+    MCPError,
+    MCPInspectedTool,
+    MCPServerBinding,
+    MCPServerInspection,
+    MCPToolBinding,
+    MCPToolSelection,
+    MCP_SUPPORTED_PROTOCOL_VERSIONS,
+)
 from .sqlite import SQLiteResourceAdapter, SQLiteSource, SQLiteSourceError
 from .sqlite_query import SQLiteQueryBackend, SQLiteQueryError
 from .postgresql import (
@@ -49,6 +63,18 @@ __all__ = [
     "LocalDirectoryResourceAdapter",
     "LocalDirectorySource",
     "LocalDirectorySourceError",
+    "MCPAdmissionError",
+    "MCPAuthentication",
+    "MCPAuthenticationMode",
+    "MCPBindingState",
+    "MCPBindingStatus",
+    "MCPError",
+    "MCPInspectedTool",
+    "MCPServerBinding",
+    "MCPServerInspection",
+    "MCPToolBinding",
+    "MCPToolSelection",
+    "MCP_SUPPORTED_PROTOCOL_VERSIONS",
     "ResourceAdapter",
     "ResourceAdapterError",
     "ResourceNotFoundError",

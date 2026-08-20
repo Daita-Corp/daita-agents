@@ -14,7 +14,7 @@ from ..sqlite_codecs.common import (
     record,
     record_fields,
 )
-from ..sqlite_schema import CURRENT_TABLES, SCOPED_PERMISSION_TABLES
+from ..sqlite_schema import GENERALIZED_UPDATE_TABLES, SCOPED_PERMISSION_TABLES
 from .models import SQLiteMigration
 from .scoped_source_permissions import validate_target as validate_scopes
 
@@ -172,7 +172,7 @@ MIGRATION = SQLiteMigration(
     migration_id=MIGRATION_ID,
     definition=DEFINITION,
     source_schema=SCOPED_PERMISSION_TABLES,
-    target_schema=CURRENT_TABLES,
+    target_schema=GENERALIZED_UPDATE_TABLES,
     apply=apply,
     validate_target=validate_target,
 )

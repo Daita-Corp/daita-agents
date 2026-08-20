@@ -40,6 +40,7 @@ from .screens.catalog import CatalogScreen
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
+from .screens.mcp import MCPManagementScreen, MCPSetupScreen
 from .screens.onboarding import (
     AgentCreateScreen,
     CatalogRepairScreen,
@@ -556,6 +557,14 @@ class DaitaApp(App[int]):
         if screen_name == "permissions":
             await self._await_modal(PermissionsScreen())
             return
+        if screen_name == "mcp_management":
+            result = await self._await_modal(MCPManagementScreen())
+            await self._complete_mcp_screen(result)
+            return
+        if screen_name == "mcp_setup":
+            result = await self._await_modal(MCPSetupScreen())
+            await self._complete_mcp_screen(result)
+            return
         if screen_name == "catalog":
             sources = tuple(
                 source
@@ -583,6 +592,7 @@ class DaitaApp(App[int]):
                 )
             )
             return
+
         if screen_name == "catalog_repair":
             await self._await_modal(CatalogRepairScreen())
             return
@@ -632,6 +642,17 @@ class DaitaApp(App[int]):
                 await self._replace_conversation_transcript()
             await self._refresh_status()
             return
+        if screen_name == "confirm_revoke_mcp":
+            accepted = await self._await_modal(ConfirmScreen(message))
+            if accepted:
+                notice = await self.controller.revoke_mcp_server(
+                    str(payload["binding_id"])
+                )
+                chat = self.chat()
+                if chat is not None:
+                    chat.show_notice(notice)
+            await self._refresh_status()
+            return
         if screen_name == "confirm_delete_skill":
             accepted = await self._await_modal(ConfirmScreen(message))
             if accepted:
@@ -657,6 +678,30 @@ class DaitaApp(App[int]):
                         f"{'deleted' if deleted else 'not found'}."
                     )
             return
+
+    async def _complete_mcp_screen(self, result: str | None) -> None:
+        chat = self.chat()
+        if result == "reopen":
+            await self.controller.reopen_agent(
+                observer=self._observer,
+                approval_handler=self.handle_approval,
+            )
+            self._reset_context_usage()
+            if chat is not None:
+                statuses = await self.controller.list_mcp_servers()
+                if any(status.reopen_required for status in statuses):
+                    chat.show_notice(
+                        "The agent runtime restarted, but some MCP tools could not "
+                        "be activated. Open /mcp to review their status."
+                    )
+                else:
+                    chat.show_notice("MCP tools activated.")
+        elif result == "restart_required" and chat is not None:
+            chat.show_notice(
+                "MCP changes saved. Restart the agent runtime from /mcp before "
+                "using the changed tools."
+            )
+        await self._refresh_status()
 
     def _edit_document(self, seed: str) -> str:
         """Give the configured external editor temporary control of the terminal."""

@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Protocol, TypeVar
 
-from .._json import FrozenJsonObject
+from .._json import FrozenJsonObject, canonical_json
 from ..artifacts.models import (
     ArtifactDeliveryReceipt,
     ArtifactRef,
@@ -21,6 +21,7 @@ from ..llm.errors import (
     ModelProviderError,
     ProviderErrorCode,
     RequestSensitivityUnavailable,
+    ToolSurfaceLimitExceeded,
 )
 from ..llm.models import (
     CanonicalMessage,
@@ -28,6 +29,7 @@ from ..llm.models import (
     MessageRole,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     ModelStreamCompleted,
     ModelTextDelta,
     ModelToolCallDelta,
@@ -96,6 +98,8 @@ class ToolRuntime(Protocol):
         self,
         run: RunInput,
         calls: tuple[ToolCall, ...],
+        *,
+        sensitivity: ModelSensitivity,
     ) -> ToolBatchOutcome:
         """Return one ordered, cancellation-safe outcome for the whole batch."""
 
@@ -244,7 +248,10 @@ class AgentLoop:
             messages = (*messages, user)
             started = asyncio.get_running_loop().time()
             deadline = started + self._limits.max_wall_time_seconds
-            definitions = await _before(deadline, self._tools.definitions(run))
+            definitions = _bounded_tool_definitions(
+                await _before(deadline, self._tools.definitions(run)),
+                self._limits,
+            )
             context_snapshot = await _before(
                 deadline,
                 self._context_builder.prepare(run, messages, definitions),
@@ -395,7 +402,11 @@ class AgentLoop:
 
                 outcome, cancellation_requested = await _tool_batch_before(
                     deadline,
-                    self._tools.execute_all(run, response.tool_calls),
+                    self._tools.execute_all(
+                        run,
+                        response.tool_calls,
+                        sensitivity=request.sensitivity,
+                    ),
                     response.tool_calls,
                     recovery_timeout_seconds=(
                         self._limits.side_effect_recovery_timeout_seconds + 0.25
@@ -534,6 +545,17 @@ class AgentLoop:
                 run,
                 LoopExitKind.FAILED,
                 "context_evidence_limit_exceeded",
+                _completed_steps(messages[current_start:]),
+                usage,
+                run_started,
+                artifacts=tuple(artifacts),
+                artifact_deliveries=tuple(artifact_deliveries),
+            )
+        except ToolSurfaceLimitExceeded:
+            return await self._finish(
+                run,
+                LoopExitKind.FAILED,
+                "tool_surface_limit_exceeded",
                 _completed_steps(messages[current_start:]),
                 usage,
                 run_started,
@@ -964,6 +986,38 @@ class AgentLoop:
             if estimate.amount_usd >= cost_limit:
                 return "cost_limit_reached"
         return None
+
+
+def _bounded_tool_definitions(
+    definitions: tuple[ToolDefinition, ...],
+    limits: LoopLimits,
+) -> tuple[ToolDefinition, ...]:
+    definitions = tuple(definitions)
+    if any(not isinstance(item, ToolDefinition) for item in definitions):
+        raise TypeError("tool runtime definitions must contain ToolDefinition records")
+    definition_bytes = len(
+        canonical_json(
+            [
+                {
+                    "name": item.name,
+                    "description": item.description,
+                    "input_schema": item.input_schema,
+                }
+                for item in definitions
+            ]
+        ).encode("utf-8")
+    )
+    if (
+        len(definitions) > limits.max_projected_tools
+        or definition_bytes > limits.max_projected_tool_definition_bytes
+    ):
+        raise ToolSurfaceLimitExceeded(
+            observed_tools=len(definitions),
+            maximum_tools=limits.max_projected_tools,
+            observed_definition_bytes=definition_bytes,
+            maximum_definition_bytes=limits.max_projected_tool_definition_bytes,
+        )
+    return definitions
 
 
 def _assistant_message(response: ModelResponse) -> CanonicalMessage:

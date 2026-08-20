@@ -269,6 +269,7 @@ async def test_validated_capability_classification_reaches_result_envelope():
                 arguments={"query": "untrusted value"},
             ),
         ),
+        sensitivity=ModelSensitivity.INTERNAL,
     )
     (result,) = outcome.ordered_results
 

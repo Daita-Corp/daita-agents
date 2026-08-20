@@ -561,6 +561,19 @@ def _validate(
         _validate_rule(name, item, rule, error_type)
 
 
+def validate_tool_schema_value(
+    schema: Mapping[str, object],
+    value: Mapping[str, object],
+) -> FrozenJsonObject:
+    """Validate one object against the registry's bounded tool-schema contract."""
+
+    frozen_schema = FrozenJsonObject.from_mapping(schema)
+    frozen_value = FrozenJsonObject.from_mapping(value)
+    _check_schema(frozen_schema)
+    _validate(frozen_schema, frozen_value, ToolOutputValidationError)
+    return frozen_value
+
+
 def _validate_rule(
     name: str,
     item: object,
@@ -680,4 +693,5 @@ __all__ = [
     "ToolOutputValidationError",
     "ToolView",
     "render_approval_arguments",
+    "validate_tool_schema_value",
 ]

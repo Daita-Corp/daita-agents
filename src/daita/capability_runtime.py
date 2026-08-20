@@ -34,7 +34,7 @@ from .capabilities import (
     ToolView,
 )
 from .errors import DaitaError
-from .llm.models import ToolCall, ToolDefinition, ToolResultBlock
+from .llm.models import ModelSensitivity, ToolCall, ToolDefinition, ToolResultBlock
 from .loop.models import (
     LoopLimits,
     RunInput,
@@ -110,6 +110,8 @@ class CapabilityDomain(Protocol):
         call: ToolCall,
         capability: Capability,
         arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject: ...
 
     async def side_effect_plan(
@@ -128,6 +130,8 @@ class CapabilityDomain(Protocol):
         capability: Capability,
         arguments: FrozenJsonObject,
         output: ToolOutput,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> ToolOutput: ...
 
     def normalize_error(
@@ -236,9 +240,13 @@ class CapabilityRuntime:
         self,
         run: RunInput,
         calls: tuple[ToolCall, ...],
+        *,
+        sensitivity: ModelSensitivity,
     ) -> ToolBatchOutcome:
         if not isinstance(run, RunInput):
             raise TypeError("run must be RunInput")
+        if not isinstance(sensitivity, ModelSensitivity):
+            raise TypeError("tool batch sensitivity must be ModelSensitivity")
         calls = tuple(calls)
         if any(not isinstance(call, ToolCall) for call in calls):
             raise TypeError("calls must contain ToolCall records")
@@ -260,7 +268,12 @@ class CapabilityRuntime:
             async with read_gate:
                 async with source_gate:
                     started[index] = True
-                    return await self._execute_one(run, call, projected)
+                    return await self._execute_one(
+                        run,
+                        call,
+                        projected,
+                        sensitivity=sensitivity,
+                    )
 
         async def finish_reads() -> ToolBatchInterruption | None:
             if not reads:
@@ -318,10 +331,16 @@ class CapabilityRuntime:
                         started,
                         read_interruption,
                         ToolBatchCertainty.DEFINITE,
+                        self._limits,
                     )
                 started[index] = True
                 try:
-                    results[index] = await self._execute_one(run, call, projected)
+                    results[index] = await self._execute_one(
+                        run,
+                        call,
+                        projected,
+                        sensitivity=sensitivity,
+                    )
                 except _ToolExecutionInterrupted as interrupted:
                     results[index] = interrupted.result
                     return _interrupted_batch(
@@ -330,6 +349,7 @@ class CapabilityRuntime:
                         started,
                         interrupted.kind,
                         interrupted.certainty,
+                        self._limits,
                     )
                 except asyncio.CancelledError as error:
                     interruption = _cancel_interruption(error)
@@ -345,6 +365,7 @@ class CapabilityRuntime:
                         started,
                         interruption,
                         ToolBatchCertainty.DEFINITE,
+                        self._limits,
                     )
             else:
                 reads.append((index, call))
@@ -356,6 +377,7 @@ class CapabilityRuntime:
                 started,
                 read_interruption,
                 ToolBatchCertainty.DEFINITE,
+                self._limits,
             )
         if any(result is None for result in results):
             raise RuntimeError("tool result scheduling left an incomplete call")
@@ -381,6 +403,8 @@ class CapabilityRuntime:
         run: RunInput,
         call: ToolCall,
         projected: Mapping[str, _ProjectedTool],
+        *,
+        sensitivity: ModelSensitivity,
     ) -> ToolResultBlock:
         started = (
             asyncio.get_running_loop().time() if self._observer is not None else None
@@ -399,6 +423,7 @@ class CapabilityRuntime:
                     "The requested tool is not available for the current execution scope.",
                     {"tool_name": call.name},
                 )
+                result = _bounded_tool_result(call, result, self._limits)
                 self._emit_tool_completed(run, call, result, started)
                 return result
             view, resolved, owner_id = self._registry.resolve_tool_owner(call.name)
@@ -420,6 +445,7 @@ class CapabilityRuntime:
                 call,
                 capability,
                 arguments,
+                request_sensitivity=sensitivity,
             )
             resolved_capability, executor = self._registry.resolve_execution(
                 capability.id
@@ -450,6 +476,7 @@ class CapabilityRuntime:
                     execution,
                     arguments,
                     domain,
+                    sensitivity=sensitivity,
                 )
             else:
                 candidate = await executor.execute(execution)
@@ -464,6 +491,7 @@ class CapabilityRuntime:
                     capability,
                     arguments,
                     output,
+                    request_sensitivity=sensitivity,
                 )
                 output = self._registry.validate_output(capability.id, output)
                 artifact_ref = await self._commit_artifact_output(
@@ -479,11 +507,7 @@ class CapabilityRuntime:
             raise
         except BaseException as error:
             result = self._exception_result(call, error, domain)
-        if not result.is_error:
-            bound_issue = _tool_result_bound_issue(result, self._limits)
-            if bound_issue is not None:
-                code, message, details = bound_issue
-                result = _error(call, code, message, details)
+        result = _bounded_tool_result(call, result, self._limits)
         self._emit_tool_completed(run, call, result, started)
         if interruption_kind is not None:
             raise _ToolExecutionInterrupted(
@@ -502,6 +526,8 @@ class CapabilityRuntime:
         execution: ToolExecution,
         arguments: FrozenJsonObject,
         domain: CapabilityDomain,
+        *,
+        sensitivity: ModelSensitivity,
     ) -> tuple[
         ToolResultBlock,
         ToolBatchInterruption | None,
@@ -598,6 +624,7 @@ class CapabilityRuntime:
             fingerprint,
             plan,
             domain,
+            sensitivity=sensitivity,
         )
 
     async def _execute_preflighted_side_effect(
@@ -611,6 +638,8 @@ class CapabilityRuntime:
         fingerprint: FrozenJsonObject,
         plan: SideEffectPlan,
         domain: CapabilityDomain,
+        *,
+        sensitivity: ModelSensitivity,
     ) -> tuple[
         ToolResultBlock,
         ToolBatchInterruption | None,
@@ -683,6 +712,7 @@ class CapabilityRuntime:
                 capability,
                 arguments,
                 output,
+                request_sensitivity=sensitivity,
             )
             output = self._registry.validate_output(capability.id, output)
             if output.artifact is not None or capability.artifact_policy is not None:
@@ -1035,6 +1065,7 @@ def _interrupted_batch(
     started: list[bool],
     interruption: ToolBatchInterruption,
     certainty: ToolBatchCertainty,
+    limits: LoopLimits | None = None,
 ) -> ToolBatchOutcome:
     ordered = tuple(
         (
@@ -1049,8 +1080,16 @@ def _interrupted_batch(
         )
         for index, (call, result) in enumerate(zip(calls, results, strict=True))
     )
+    bounded = (
+        ordered
+        if limits is None
+        else tuple(
+            _bounded_tool_result(call, result, limits)
+            for call, result in zip(calls, ordered, strict=True)
+        )
+    )
     return ToolBatchOutcome(
-        ordered_results=ordered,
+        ordered_results=bounded,
         interruption_kind=interruption,
         outcome_certainty=certainty,
     )
@@ -1105,6 +1144,24 @@ def _tool_result_bound_issue(
             },
         )
     return None
+
+
+def _bounded_tool_result(
+    call: ToolCall,
+    result: ToolResultBlock,
+    limits: LoopLimits,
+) -> ToolResultBlock:
+    issue = _tool_result_bound_issue(result, limits)
+    if issue is None:
+        return result
+    code, message, details = issue
+    bounded = _error(call, code, message, details)
+    if _tool_result_bound_issue(bounded, limits) is None:
+        return bounded
+    fallback = _error(call, code, "The tool result exceeded its fixed bound.")
+    if _tool_result_bound_issue(fallback, limits) is not None:
+        raise ValueError("loop limits cannot represent the bounded tool error")
+    return fallback
 
 
 def _json_depth(value: object) -> int:

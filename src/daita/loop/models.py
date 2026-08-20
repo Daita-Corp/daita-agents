@@ -17,6 +17,9 @@ from ..llm.models import (
     ToolResultBlock,
 )
 
+_MIN_TOOL_RESULT_BYTES = 128
+_MIN_TOOL_RESULT_DEPTH = 3
+
 
 def _required_text(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
@@ -70,6 +73,8 @@ class LoopLimits:
     max_estimated_cost_usd: Decimal | None = None
     max_tool_calls_per_response: int = 16
     max_tool_calls_per_run: int = 64
+    max_projected_tools: int = 64
+    max_projected_tool_definition_bytes: int = 128 * 1_024
     max_tool_result_bytes: int = 256 * 1_024
     max_tool_result_depth: int = 16
     max_parallel_reads: int = 8
@@ -83,6 +88,11 @@ class LoopLimits:
             (self.max_total_tokens, "max_total_tokens"),
             (self.max_tool_calls_per_response, "max_tool_calls_per_response"),
             (self.max_tool_calls_per_run, "max_tool_calls_per_run"),
+            (self.max_projected_tools, "max_projected_tools"),
+            (
+                self.max_projected_tool_definition_bytes,
+                "max_projected_tool_definition_bytes",
+            ),
             (self.max_tool_result_bytes, "max_tool_result_bytes"),
             (self.max_tool_result_depth, "max_tool_result_depth"),
             (self.max_parallel_reads, "max_parallel_reads"),
@@ -116,6 +126,14 @@ class LoopLimits:
         if self.max_parallel_reads_per_source > self.max_parallel_reads:
             raise ValueError(
                 "max_parallel_reads_per_source cannot exceed max_parallel_reads"
+            )
+        if self.max_tool_result_bytes < _MIN_TOOL_RESULT_BYTES:
+            raise ValueError(
+                f"max_tool_result_bytes must be at least {_MIN_TOOL_RESULT_BYTES}"
+            )
+        if self.max_tool_result_depth < _MIN_TOOL_RESULT_DEPTH:
+            raise ValueError(
+                f"max_tool_result_depth must be at least {_MIN_TOOL_RESULT_DEPTH}"
             )
         if (
             not isinstance(self.side_effect_recovery_timeout_seconds, (int, float))

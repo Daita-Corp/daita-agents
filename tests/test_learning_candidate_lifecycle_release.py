@@ -559,8 +559,8 @@ class _NoTools:
         del run
         return ()
 
-    async def execute_all(self, run, calls):
-        del run, calls
+    async def execute_all(self, run, calls, *, sensitivity):
+        del run, calls, sensitivity
         raise AssertionError("the custom tool runtime must not execute")
 
 

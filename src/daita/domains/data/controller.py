@@ -247,7 +247,10 @@ class DataCapabilityDomain:
         call: ToolCall,
         capability: Capability,
         arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
+        del request_sensitivity
         if capability.side_effecting:
             self._learning.validate_side_effect(run.id, call)
         arguments = self._apply_source_scope(run, capability, arguments)
@@ -340,7 +343,10 @@ class DataCapabilityDomain:
         capability: Capability,
         arguments: FrozenJsonObject,
         output: ToolOutput,
+        *,
+        request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
+        del request_sensitivity
         if capability.side_effecting:
             self._learning.mark_side_effect_succeeded(run.id)
         return await self._classify(run, call, capability, output)

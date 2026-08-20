@@ -126,6 +126,15 @@ terminal results live in a small SQLite database inside the agent home.
 Conversation continuity projects a bounded tail of completed runs: at most 8
 runs, 40 messages, and 24,000 UTF-8 bytes.
 
+Explicitly admitted remote MCP servers can contribute read-only tools through
+the same registry, runtime, ordered result, transcript, and context path.
+Bindings use remote Streamable HTTP, exact allowlists, secret references,
+call-time identity/schema rechecks, and per-binding revocation; remote metadata
+never authorizes or instructs the agent. In the TUI, `/mcp` opens a grouped
+server manager and `/mcp add` guides endpoint inspection, multi-tool selection,
+read-only attestation, and controlled activation. See
+[Remote MCP read connectivity](docs/MCP_CONNECTIVITY.md).
+
 Memory and skills are bounded, advisory Markdown. They are not source truth,
 authorization, or evidence. Agent proposed changes occur only in the
 foreground through an in process approve once callback. The optional observer
@@ -229,7 +238,8 @@ the operation can be retried.
 ## Python and examples
 
 The public async API supports creating and opening agents, attaching sources,
-running questions, continuing conversations, and inspecting transcripts.
+administering explicit remote MCP read bindings, running questions, continuing
+conversations, and inspecting transcripts.
 Start with the deterministic offline
 [SQLite quickstart](examples/00_quickstart_sqlite_from_db.py), then explore
 the [examples guide](examples/README.md).
@@ -260,8 +270,9 @@ normal application update.
 The upgrade preserves identity, configuration and secret references, settings,
 sources and catalogs, active-source selection, exact permissions, complete
 conversations and results, artifacts, approved memory and user profile, skills,
-semantics, learning state, and database-write receipts. Before activation Daita
-retains the verified prior database as one bounded `state.db.rollback-*`
+semantics, learning state, database-write receipts, and MCP binding aggregates
+with their secret references. Before activation Daita retains the verified
+prior database as one bounded `state.db.rollback-*`
 recovery point. Failure or cancellation before activation removes the staging
 files and will leave the prior database unchanged.
 

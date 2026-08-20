@@ -102,7 +102,8 @@ def _make_three_migration_state(
         separators=(",", ":"),
     )
     with sqlite3.connect(path) as connection:
-        connection.execute("DELETE FROM state_migrations WHERE ordinal = 4")
+        connection.execute("DROP TABLE mcp_server_bindings")
+        connection.execute("DELETE FROM state_migrations WHERE ordinal >= 4")
         connection.execute(
             """INSERT INTO database_write_receipts
                (agent_id, id, run_id, call_id, data)
@@ -141,7 +142,7 @@ async def test_fresh_state_is_created_directly_at_current_append_only_revision(
     with sqlite3.connect(path) as connection:
         assert table_names(connection) == set(CURRENT_TABLES)
     assert _journal(path) == migration_rows()
-    assert len(migration_rows()) == 4
+    assert len(migration_rows()) == 5
     assert migration_rows()[-1][1] == CURRENT_REVISION
 
 
