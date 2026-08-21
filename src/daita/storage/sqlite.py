@@ -14,7 +14,7 @@ import re
 import sqlite3
 import tempfile
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -22,7 +22,15 @@ from pathlib import Path
 from typing import TypeVar
 
 from .._json import FrozenJsonObject
-from ..adapters.mcp import MCP_MAX_BINDINGS_PER_AGENT, MCPServerBinding
+from ..adapters.mcp import (
+    MCP_MAX_ACTIVE_TOOLS_PER_AGENT,
+    MCP_MAX_AGENT_CATALOG_BYTES,
+    MCP_MAX_BINDING_CANONICAL_BYTES,
+    MCP_MAX_BINDINGS_PER_AGENT,
+    MCPAdmissionError,
+    MCPBindingState,
+    MCPServerBinding,
+)
 from ..adapters.models import SourceRegistration
 from ..artifacts.models import (
     ArtifactRef,
@@ -117,14 +125,6 @@ from .sqlite_migrations import (
     inspect_journal,
     upgrade_journaled,
 )
-from .sqlite_migrations.preledger import (
-    PreledgerAdmissionError,
-    PreledgerLegacyError,
-    PreledgerNewerError,
-    PreledgerShape,
-    bridge as bridge_preledger,
-    identify as identify_preledger,
-)
 from .sqlite_records import (
     DatabaseWriteOutcome,
     DatabaseWriteReceipt,
@@ -150,6 +150,14 @@ _CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH = 64
 _ACTIVE_SOURCE_KEY_PREFIX = "active_source:"
 _LEARNING_REVIEW_STAMPS_KEY_PREFIX = "learning_review_stamps:"
 _T = TypeVar("_T")
+
+
+def _active_mcp_tool_count(bindings: Iterable[MCPServerBinding]) -> int:
+    return sum(
+        len(binding.tools)
+        for binding in bindings
+        if binding.state is MCPBindingState.ACTIVE
+    )
 
 
 def _active_source_key(agent_id: str) -> str:
@@ -447,7 +455,12 @@ class SQLiteStateStore:
                 )
             if len(rows) > MCP_MAX_BINDINGS_PER_AGENT:
                 raise RuntimeError("stored MCP binding count exceeds its fixed bound")
-            return tuple(
+            encoded_sizes = tuple(len(data.encode("utf-8")) for _, data in rows)
+            if any(size > MCP_MAX_BINDING_CANONICAL_BYTES for size in encoded_sizes):
+                raise RuntimeError("stored MCP binding exceeds its byte bound")
+            if sum(encoded_sizes) > MCP_MAX_AGENT_CATALOG_BYTES:
+                raise RuntimeError("stored MCP agent catalog exceeds its byte bound")
+            bindings = tuple(
                 decode_mcp_binding(
                     data,
                     agent_id=agent_id,
@@ -455,6 +468,11 @@ class SQLiteStateStore:
                 )
                 for binding_id, data in rows
             )
+            if _active_mcp_tool_count(bindings) > MCP_MAX_ACTIVE_TOOLS_PER_AGENT:
+                raise RuntimeError(
+                    "stored active MCP tool catalog exceeds its fixed bound"
+                )
+            return bindings
 
         return await asyncio.to_thread(read)
 
@@ -472,6 +490,9 @@ class SQLiteStateStore:
             or expected_revision < 1
         ):
             raise ValueError("expected_revision must be positive or None")
+        encoded = encode_mcp_binding(binding)
+        if len(encoded.encode("utf-8")) > MCP_MAX_BINDING_CANONICAL_BYTES:
+            raise ValueError("MCP binding exceeds its byte bound")
 
         def write(connection: sqlite3.Connection) -> MCPServerBinding:
             row = connection.execute(
@@ -482,6 +503,49 @@ class SQLiteStateStore:
             if row is None:
                 if expected_revision is not None or binding.revision != 1:
                     raise ValueError("MCP binding revision precondition failed")
+            else:
+                current = decode_mcp_binding(
+                    row[0],
+                    agent_id=binding.agent_id,
+                    binding_id=binding.binding_id,
+                )
+                if (
+                    expected_revision is None
+                    or current.revision != expected_revision
+                    or binding.revision != expected_revision + 1
+                ):
+                    raise ValueError("MCP binding revision precondition failed")
+            other_rows = tuple(
+                connection.execute(
+                    """SELECT binding_id, data FROM mcp_server_bindings
+                       WHERE agent_id = ? AND binding_id <> ?""",
+                    (binding.agent_id, binding.binding_id),
+                )
+            )
+            total_bytes = len(encoded.encode("utf-8")) + sum(
+                len(data.encode("utf-8")) for _, data in other_rows
+            )
+            if total_bytes > MCP_MAX_AGENT_CATALOG_BYTES:
+                raise ValueError("MCP agent catalog exceeds its byte bound")
+            other_bindings = tuple(
+                decode_mcp_binding(
+                    data,
+                    agent_id=binding.agent_id,
+                    binding_id=other_binding_id,
+                )
+                for other_binding_id, data in other_rows
+            )
+            active_tool_count = _active_mcp_tool_count((*other_bindings, binding))
+            if active_tool_count > MCP_MAX_ACTIVE_TOOLS_PER_AGENT:
+                raise MCPAdmissionError(
+                    "mcp_agent_tool_limit_exceeded",
+                    "The active MCP tool catalog exceeds its fixed per-agent bound.",
+                    {
+                        "observed_tools": active_tool_count,
+                        "maximum_tools": MCP_MAX_ACTIVE_TOOLS_PER_AGENT,
+                    },
+                )
+            if row is None:
                 count = connection.execute(
                     "SELECT COUNT(*) FROM mcp_server_bindings WHERE agent_id = ?",
                     (binding.agent_id,),
@@ -494,26 +558,15 @@ class SQLiteStateStore:
                     (
                         binding.agent_id,
                         binding.binding_id,
-                        encode_mcp_binding(binding),
+                        encoded,
                     ),
                 )
                 return binding
-            current = decode_mcp_binding(
-                row[0],
-                agent_id=binding.agent_id,
-                binding_id=binding.binding_id,
-            )
-            if (
-                expected_revision is None
-                or current.revision != expected_revision
-                or binding.revision != expected_revision + 1
-            ):
-                raise ValueError("MCP binding revision precondition failed")
             result = connection.execute(
                 """UPDATE mcp_server_bindings SET data = ?
                    WHERE agent_id = ? AND binding_id = ? AND data = ?""",
                 (
-                    encode_mcp_binding(binding),
+                    encoded,
                     binding.agent_id,
                     binding.binding_id,
                     row[0],
@@ -3240,7 +3293,39 @@ async def _run_cancellation_safe_transaction(
     return result
 
 
+def _validate_current_mcp_binding_bounds(connection: sqlite3.Connection) -> None:
+    totals: dict[str, int] = {}
+    binding_counts: dict[str, int] = {}
+    active_tool_counts: dict[str, int] = {}
+    for agent_id, binding_id, data in connection.execute(
+        "SELECT agent_id, binding_id, data FROM mcp_server_bindings"
+    ):
+        binding_counts[agent_id] = binding_counts.get(agent_id, 0) + 1
+        if binding_counts[agent_id] > MCP_MAX_BINDINGS_PER_AGENT:
+            raise ValueError("stored MCP binding count exceeds its fixed bound")
+        encoded_bytes = len(data.encode("utf-8"))
+        if encoded_bytes > MCP_MAX_BINDING_CANONICAL_BYTES:
+            raise ValueError("stored MCP binding exceeds its byte bound")
+        totals[agent_id] = totals.get(agent_id, 0) + encoded_bytes
+        if totals[agent_id] > MCP_MAX_AGENT_CATALOG_BYTES:
+            raise ValueError("stored MCP agent catalog exceeds its byte bound")
+        binding = decode_mcp_binding(
+            data,
+            agent_id=agent_id,
+            binding_id=binding_id,
+        )
+        if binding.state is MCPBindingState.ACTIVE:
+            active_tool_counts[agent_id] = active_tool_counts.get(agent_id, 0) + len(
+                binding.tools
+            )
+            if active_tool_counts[agent_id] > MCP_MAX_ACTIVE_TOOLS_PER_AGENT:
+                raise ValueError(
+                    "stored active MCP tool catalog exceeds its fixed bound"
+                )
+
+
 def _validate_current_records(connection: sqlite3.Connection) -> None:
+    _validate_current_mcp_binding_bounds(connection)
     identity: AgentIdentity | None = None
     active_sources: dict[str, str] = {}
     for key, data in connection.execute("SELECT key, data FROM metadata"):
@@ -3292,6 +3377,47 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
         active_registration = sources.get((agent_id, source_id))
         if active_registration is None or not active_registration.active:
             raise ValueError("stored active source selection is invalid")
+
+    read_scopes: dict[tuple[str, str], SourceReadScope] = {}
+    for agent_id, source_id, data in connection.execute(
+        "SELECT agent_id, source_id, data FROM source_read_scopes"
+    ):
+        key = (agent_id, source_id)
+        if key in read_scopes:
+            raise ValueError("stored source read scope identity is duplicated")
+        read_scopes[key] = decode_source_read_scope(
+            data,
+            agent_id=agent_id,
+            source_id=source_id,
+        )
+    for key, registration in sources.items():
+        scope = read_scopes.pop(key, None)
+        if registration.active and scope is None:
+            raise ValueError("active source is missing its read scope")
+        if not registration.active and scope is not None:
+            raise ValueError("detached source retains a read scope")
+    if read_scopes:
+        raise ValueError("stored source read scope is foreign")
+
+    for agent_id, source_id, resource_id, fingerprint, data in connection.execute(
+        """SELECT agent_id, source_id, resource_id,
+                  authorization_fingerprint, data
+           FROM postgresql_update_scopes"""
+    ):
+        scope_registration = sources.get((agent_id, source_id))
+        if (
+            scope_registration is None
+            or scope_registration.adapter_id != "postgresql"
+            or not scope_registration.active
+        ):
+            raise ValueError("stored PostgreSQL update scope is foreign")
+        decode_postgresql_update_scope(
+            data,
+            agent_id=agent_id,
+            source_id=source_id,
+            resource_id=resource_id,
+            authorization_fingerprint=fingerprint,
+        )
 
     syncs: dict[tuple[str, str], CatalogSync] = {}
     for agent_id, sync_id, source_id, data in connection.execute(
@@ -3368,6 +3494,21 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
         for positions in message_positions.values()
     ):
         raise ValueError("stored transcript message positions are not contiguous")
+
+    for agent_id, receipt_id, run_id, call_id, data in connection.execute(
+        """SELECT agent_id, id, run_id, call_id, data
+           FROM database_write_receipts"""
+    ):
+        receipt = decode_receipt(data)
+        if (
+            receipt.agent_id != agent_id
+            or receipt.receipt_id != receipt_id
+            or receipt.run_id != run_id
+            or receipt.call_id != call_id
+        ):
+            raise ValueError("stored database write receipt ownership is invalid")
+        if identity is not None and receipt.agent_id != identity.id:
+            raise ValueError("stored database write receipt belongs to another agent")
 
     for agent_id, annotation_id, data in connection.execute(
         "SELECT agent_id, id, data FROM semantic_annotations"
@@ -3469,8 +3610,7 @@ def _prune_older_rollback_points(path: Path, retained: Path) -> None:
 def _upgrade_staged_state(
     path: Path,
     *,
-    applied: int | None,
-    expected_preledger: PreledgerShape | None,
+    applied: int,
     source_fingerprint: str,
     found_revision: str,
     upgrade_gate: _UpgradeCommitGate | None,
@@ -3502,17 +3642,9 @@ def _upgrade_staged_state(
                 connection.execute("BEGIN IMMEDIATE")
             elif not upgrade_gate.start(connection):
                 return False
-            if applied is None:
-                assert expected_preledger is not None
-                bridge_preledger(connection, expected_preledger)
-                bridged = inspect_journal(connection)
-                if bridged >= len(MIGRATIONS):
-                    raise RuntimeError("pre-ledger bridge unexpectedly reached current")
-                upgrade_journaled(connection, bridged)
-            else:
-                if inspect_journal(connection) != applied:
-                    raise RuntimeError("migration journal changed during admission")
-                upgrade_journaled(connection, applied)
+            if inspect_journal(connection) != applied:
+                raise RuntimeError("migration journal changed during admission")
+            upgrade_journaled(connection, applied)
             require_schema(connection, CURRENT_TABLES)
             require_healthy(connection)
             if upgrade_gate is None:
@@ -3596,18 +3728,13 @@ def _admit_existing_state(
 ) -> bool:
     try:
         with _connect_read_only(path) as connection:
-            if "state_migrations" in table_names(connection):
-                applied = inspect_journal(connection)
-                if applied == len(MIGRATIONS):
-                    return True
-                expected_preledger = None
-                found_revision = MIGRATIONS[applied - 1].migration_id
-            else:
-                applied = None
-                expected_preledger = identify_preledger(connection)
-                found_revision = expected_preledger.value
+            applied = inspect_journal(connection)
+            if applied == len(MIGRATIONS):
+                _validate_current_mcp_binding_bounds(connection)
+                return True
+            found_revision = MIGRATIONS[applied - 1].migration_id
             source_fingerprint = _logical_state_fingerprint(connection)
-    except (MigrationJournalNewerError, PreledgerNewerError) as error:
+    except MigrationJournalNewerError as error:
         raise StateCompatibilityError(
             StateCompatibilityCode.NEWER_REVISION,
             path,
@@ -3616,23 +3743,7 @@ def _admit_existing_state(
                 "the same or a newer package. No state was changed."
             ),
             current_revision=CURRENT_REVISION,
-            found_revision=(
-                error.found_revision
-                if isinstance(error, MigrationJournalNewerError)
-                else "newer-preledger-state"
-            ),
-        ) from None
-    except PreledgerLegacyError:
-        raise StateCompatibilityError(
-            StateCompatibilityCode.LEGACY,
-            path,
-            (
-                "This agent home belongs to the unsupported pre-1.0 Daita "
-                "framework. Keep it intact and use a current agent home; this "
-                "release will not overwrite or partially import it."
-            ),
-            current_revision=CURRENT_REVISION,
-            found_revision="pre-1.0-framework",
+            found_revision=error.found_revision,
         ) from None
     except MigrationJournalError as error:
         raise StateCompatibilityError(
@@ -3646,8 +3757,6 @@ def _admit_existing_state(
             current_revision=CURRENT_REVISION,
             found_revision=error.found_revision or "invalid-journal",
         ) from None
-    except PreledgerAdmissionError:
-        raise _damaged_state_error(path, "unsupported-preledger-state") from None
     except StateCompatibilityError:
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError):
@@ -3657,7 +3766,6 @@ def _admit_existing_state(
         return _upgrade_staged_state(
             path,
             applied=applied,
-            expected_preledger=expected_preledger,
             source_fingerprint=source_fingerprint,
             found_revision=found_revision,
             upgrade_gate=upgrade_gate,

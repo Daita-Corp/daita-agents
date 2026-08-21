@@ -27,6 +27,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.loop.models import LoopLimits, ToolProjectionMode
 from daita.semantics import (
     SEMANTIC_MAINTENANCE_MAX_NOTICES,
     SEMANTIC_MAX_ANNOTATIONS,
@@ -38,6 +39,8 @@ from daita.semantics import (
     render_semantic_recall,
     semantic_duplicate_identity,
 )
+
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 from daita.skills import SKILL_MAX_COUNT
 from daita.storage.sqlite import SQLiteStateStore
 
@@ -514,6 +517,7 @@ async def test_related_foreground_run_can_inspect_stale_record_without_using_it(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         clock=lambda: NOW,
     )
     try:

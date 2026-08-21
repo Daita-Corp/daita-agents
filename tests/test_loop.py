@@ -6,7 +6,11 @@ import pytest
 
 from daita._json import canonical_json
 from daita.agent import Agent
-from daita.llm.errors import ModelProviderError, ProviderErrorCode
+from daita.llm.errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ToolSurfaceLimitExceeded,
+)
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -32,14 +36,18 @@ from daita.loop import (
     ToolBatchOutcome,
 )
 from daita.observation import AgentEvent, AgentEventKind
+from _capability_runtime_support import (
+    context_step_projection,
+    context_tool_catalog,
+)
 
 NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 class TranscriptContext:
-    async def prepare(self, run, messages, tools):
+    async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tools
+        return messages[:-1], tool_context.provider_definitions
 
     def project(
         self,
@@ -47,10 +55,11 @@ class TranscriptContext:
         messages,
         *,
         step,
+        tool_context,
         final=False,
         previous_request_input_tokens=None,
     ):
-        del step, previous_request_input_tokens
+        del step, previous_request_input_tokens, tool_context
         sensitivity = ModelSensitivity.INTERNAL
         for message in messages:
             for block in message.content:
@@ -73,32 +82,66 @@ class ScriptedTools:
         self.outputs = outputs
         self.calls = []
 
-    async def definitions(self, run):
-        del run
-        return (
-            ToolDefinition(
-                name="lookup",
-                description="look something up",
-                input_schema={"type": "object", "properties": {}},
+    async def prepare_run(self, run):
+        return context_tool_catalog(
+            run,
+            (
+                ToolDefinition(
+                    name="lookup",
+                    description="look something up",
+                    input_schema={"type": "object", "properties": {}},
+                ),
             ),
         )
 
-    async def execute_all(self, run, calls, *, sensitivity):
-        del run, sensitivity
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
         self.calls.extend(calls)
         return ToolBatchOutcome(tuple(self.outputs[call.id] for call in calls))
 
 
 class StaticDefinitionTools:
-    def __init__(self, definitions):
+    def __init__(self, definitions, limits=LoopLimits()):
         self._definitions = tuple(definitions)
+        self._limits = limits
 
-    async def definitions(self, run):
-        del run
-        return self._definitions
+    async def prepare_run(self, run):
+        definition_bytes = len(
+            canonical_json(
+                [
+                    {
+                        "name": item.name,
+                        "description": item.description,
+                        "input_schema": item.input_schema,
+                    }
+                    for item in self._definitions
+                ]
+            ).encode("utf-8")
+        )
+        if (
+            len(self._definitions) > self._limits.max_direct_tools
+            or definition_bytes > self._limits.max_direct_tool_definition_bytes
+        ):
+            raise ToolSurfaceLimitExceeded(
+                observed_tools=len(self._definitions),
+                maximum_tools=self._limits.max_direct_tools,
+                observed_definition_bytes=definition_bytes,
+                maximum_definition_bytes=(
+                    self._limits.max_direct_tool_definition_bytes
+                ),
+            )
+        return context_tool_catalog(run, self._definitions)
 
-    async def execute_all(self, run, calls, *, sensitivity):
-        del run, calls, sensitivity
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, calls, projection, sensitivity
         raise AssertionError("an over-limit tool surface must never execute")
 
 
@@ -125,14 +168,17 @@ async def test_projected_tool_surface_limits_fail_before_context_or_model(limit_
     )
 
     class ContextMustNotPrepare(TranscriptContext):
-        async def prepare(self, run, messages, tools):
-            del run, messages, tools
+        async def prepare(self, run, messages, tool_context):
+            del run, messages, tool_context
             raise AssertionError("tool bounds must precede context preparation")
 
     limits = (
-        LoopLimits(max_projected_tools=1)
+        LoopLimits(max_direct_tools=1, max_eager_tools=1)
         if limit_kind == "count"
-        else LoopLimits(max_projected_tool_definition_bytes=64)
+        else LoopLimits(
+            max_direct_tool_definition_bytes=64,
+            max_eager_tool_definition_bytes=64,
+        )
     )
     provider = MockModelProvider(
         (ModelResponse(finish_reason=FinishReason.STOP, text="must not execute"),)
@@ -140,7 +186,7 @@ async def test_projected_tool_surface_limits_fail_before_context_or_model(limit_
     loop = AgentLoop(
         model=provider,
         context_builder=ContextMustNotPrepare(),
-        tools=StaticDefinitionTools(definitions),
+        tools=StaticDefinitionTools(definitions, limits),
         limits=limits,
         clock=lambda: NOW,
     )
@@ -186,10 +232,20 @@ async def test_projected_tool_surface_limits_are_inclusive():
     loop = AgentLoop(
         model=provider,
         context_builder=TranscriptContext(),
-        tools=StaticDefinitionTools(definitions),
+        tools=StaticDefinitionTools(
+            definitions,
+            LoopLimits(
+                max_direct_tools=len(definitions),
+                max_direct_tool_definition_bytes=definition_bytes,
+                max_eager_tools=len(definitions),
+                max_eager_tool_definition_bytes=definition_bytes,
+            ),
+        ),
         limits=LoopLimits(
-            max_projected_tools=len(definitions),
-            max_projected_tool_definition_bytes=definition_bytes,
+            max_direct_tools=len(definitions),
+            max_direct_tool_definition_bytes=definition_bytes,
+            max_eager_tools=len(definitions),
+            max_eager_tool_definition_bytes=definition_bytes,
         ),
         clock=lambda: NOW,
     )
@@ -210,14 +266,14 @@ async def test_projected_tool_surface_limits_are_inclusive():
 def test_projected_tool_surface_limits_must_be_positive():
     with pytest.raises(
         ValueError,
-        match="max_projected_tools must be a positive integer",
+        match="max_direct_tools must be a positive integer",
     ):
-        LoopLimits(max_projected_tools=0)
+        LoopLimits(max_direct_tools=0)
     with pytest.raises(
         ValueError,
-        match="max_projected_tool_definition_bytes must be a positive integer",
+        match="max_direct_tool_definition_bytes must be a positive integer",
     ):
-        LoopLimits(max_projected_tool_definition_bytes=0)
+        LoopLimits(max_direct_tool_definition_bytes=0)
 
 
 async def test_direct_loop_records_every_parallel_result_in_order():
@@ -396,16 +452,21 @@ async def test_unexpected_loop_failures_best_effort_terminalize_started_run(
     failure_site: str,
 ):
     class BrokenContext(TranscriptContext):
-        async def prepare(self, run, messages, tools):
+        async def prepare(self, run, messages, tool_context):
             if failure_site == "context":
                 raise RuntimeError("context exploded")
-            return await super().prepare(run, messages, tools)
+            return await super().prepare(run, messages, tool_context)
 
     class BrokenTools(ScriptedTools):
-        async def execute_all(self, run, calls, *, sensitivity):
+        async def execute_all(self, run, calls, *, projection, sensitivity):
             if failure_site == "tool_contract":
                 return ()
-            return await super().execute_all(run, calls, sensitivity=sensitivity)
+            return await super().execute_all(
+                run,
+                calls,
+                projection=projection,
+                sensitivity=sensitivity,
+            )
 
     provider = MockModelProvider((response_with_calls("one"),))
     transcripts = InMemoryTranscriptStore()

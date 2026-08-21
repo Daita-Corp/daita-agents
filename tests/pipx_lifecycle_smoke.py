@@ -1,4 +1,4 @@
-"""Isolated local release and cross-version upgrade smoke.
+"""Isolated local candidate-wheel lifecycle smoke.
 
 Run from the repository root:
 
@@ -12,20 +12,10 @@ once-built artifact through ``pipx install``, ``pipx reinstall``, and
         --candidate-wheel /path/to/candidate.whl
 
 With no arguments, the developer convenience path still builds one local
-artifact with the equivalent of ``python -m build``. For every later release,
-pass the immediately preceding wheel and the candidate wheel:
-
-    .venv/bin/python tests/pipx_lifecycle_smoke.py \
-        --baseline-wheel /path/to/previous.whl \
-        --candidate-wheel /path/to/candidate.whl
-
-The two-wheel procedure installs an actual prior build, creates real agent
-state, then force-installs the candidate into the same isolated pipx
-environment and opens the prior-build state with it. The wheels may have the
-same package version when certifying a durable state revision made during release
-development; they must still be distinct artifacts. Pip may read a configured
+artifact with the equivalent of ``python -m build``. Pip may read a configured
 package index to resolve declared dependencies; the procedure never changes an
-index or uploads an artifact.
+index or uploads an artifact. Cross-version state compatibility is intentionally
+outside the pre-production contract.
 """
 
 from __future__ import annotations
@@ -48,12 +38,8 @@ EXPECTED_ENTRY_POINT = "daita.cli:main"
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--baseline-wheel", type=Path)
     parser.add_argument("--candidate-wheel", type=Path)
-    arguments = parser.parse_args()
-    if arguments.baseline_wheel is not None and arguments.candidate_wheel is None:
-        parser.error("--baseline-wheel requires --candidate-wheel")
-    return arguments
+    return parser.parse_args()
 
 
 def _run(
@@ -190,20 +176,9 @@ def main() -> int:
                 cwd=ROOT,
             )
             candidate_wheel = _single_artifact(distribution, ".whl")
-            baseline_wheel = candidate_wheel
             sdist: Path | None = _single_artifact(distribution, ".tar.gz")
-        elif arguments.baseline_wheel is None:
-            candidate_wheel = arguments.candidate_wheel.resolve(strict=True)
-            baseline_wheel = candidate_wheel
-            sdist = None
         else:
-            baseline_wheel = arguments.baseline_wheel.resolve(strict=True)
             candidate_wheel = arguments.candidate_wheel.resolve(strict=True)
-            if baseline_wheel == candidate_wheel:
-                raise ValueError(
-                    "cross-version smoke requires distinct baseline and "
-                    "candidate wheels"
-                )
             sdist = None
 
         environment = os.environ.copy()
@@ -223,7 +198,7 @@ def main() -> int:
                 pipx,
                 "install",
                 "--skip-maintenance",
-                str(baseline_wheel),
+                str(candidate_wheel),
             ],
             cwd=outside_checkout,
             env=environment,
@@ -242,7 +217,7 @@ def main() -> int:
             cwd=outside_checkout,
             env=environment,
         )
-        expected_version_output = f"daita {_wheel_version(baseline_wheel)}\n"
+        expected_version_output = f"daita {_wheel_version(candidate_wheel)}\n"
         if version_result.stdout != expected_version_output:
             raise AssertionError("installed daita --version did not match the wheel")
         _run(
@@ -764,30 +739,17 @@ assert any(item.startswith("XlsxWriter") for item in requirements)
                 "-I",
                 "-c",
                 metadata_check,
-                _wheel_version(baseline_wheel),
+                _wheel_version(candidate_wheel),
             ],
             cwd=outside_checkout,
             env=environment,
         )
 
-        if baseline_wheel == candidate_wheel:
-            _run(
-                [pipx, "reinstall", "--skip-maintenance", "daita-agents"],
-                cwd=outside_checkout,
-                env=environment,
-            )
-        else:
-            _run(
-                [
-                    pipx,
-                    "install",
-                    "--force",
-                    "--skip-maintenance",
-                    str(candidate_wheel),
-                ],
-                cwd=outside_checkout,
-                env=environment,
-            )
+        _run(
+            [pipx, "reinstall", "--skip-maintenance", "daita-agents"],
+            cwd=outside_checkout,
+            env=environment,
+        )
         _run(
             [str(command), "--help"],
             cwd=outside_checkout,
@@ -963,7 +925,6 @@ asyncio.run(main())
         if _sha256(preserved_paths[-1]) != preserved_export_hash:
             raise AssertionError("pipx uninstall changed the delivered artifact")
 
-        print(f"baseline wheel: {baseline_wheel.name}")
         print(f"candidate wheel: {candidate_wheel.name}")
         if sdist is not None:
             print(f"sdist: {sdist.name}")

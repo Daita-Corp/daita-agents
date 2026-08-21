@@ -195,6 +195,7 @@ def _mcp_status_mapping(status: MCPBindingStatus) -> dict[str, object]:
         "protocol_version": binding.protocol_version,
         "server_name": binding.server_name,
         "server_version": binding.server_version,
+        "local_label": binding.local_label,
         "maximum_outbound_sensitivity": (binding.maximum_outbound_sensitivity.value),
         "state": binding.state.value,
         "revision": binding.revision,

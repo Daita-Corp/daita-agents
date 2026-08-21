@@ -397,19 +397,18 @@ def test_source_permission_codecs_reject_unknown_versions_and_noncanonical_sets(
         )
 
 
-def test_additive_defaults_decode_without_a_database_migration() -> None:
+def test_current_record_shape_rejects_missing_fields() -> None:
     run = RunInput("run-codec", "agent-codec", "Question?", NOW)
     payload = json.loads(encode_run_input(run))
     del payload["fields"]["conversation_source_id"]
-    del payload["fields"]["source_id"]
-    decoded = decode_run_input(json.dumps(payload))
-    assert decoded.conversation_source_id is None
-    assert decoded.source_id is None
+    with pytest.raises(ValueError, match="missing fields"):
+        decode_run_input(json.dumps(payload))
 
     candidate, _stamp = _candidate()
     candidate_payload = json.loads(encode_learning_candidate(candidate))
     del candidate_payload["fields"]["candidate_identity_sha256"]
-    assert decode_learning_candidate(json.dumps(candidate_payload)) == candidate
+    with pytest.raises(ValueError, match="missing fields"):
+        decode_learning_candidate(json.dumps(candidate_payload))
 
 
 def test_unknown_fields_and_stored_class_names_are_rejected_explicitly() -> None:

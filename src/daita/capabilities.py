@@ -8,6 +8,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from hashlib import sha256
 from types import MappingProxyType
 from typing import Protocol, TypeVar
 
@@ -18,6 +19,12 @@ from .llm.models import ModelSensitivity, ToolDefinition
 _T = TypeVar("_T")
 
 MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
+MAX_TOOL_DISCOVERY_SUMMARY_CHARACTERS = 256
+MAX_TOOL_DISCOVERY_GUIDANCE_CHARACTERS = 512
+MAX_TOOL_DISCOVERY_KEYWORDS = 16
+MAX_TOOL_DISCOVERY_KEYWORD_CHARACTERS = 64
+MAX_TOOL_EAGER_PRIORITY = 1_000
+RESERVED_TOOL_NAMES = frozenset({"tool_search", "tool_describe", "tool_call"})
 
 
 def _text(value: str, name: str) -> None:
@@ -28,6 +35,65 @@ def _text(value: str, name: str) -> None:
 class AccessMode(str, Enum):
     READ = "read"
     WRITE = "write"
+
+
+class ToolExposureClass(str, Enum):
+    CORE = "core"
+    STANDARD = "standard"
+    DEFERRED = "deferred"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDiscoveryMetadata:
+    """Bounded trusted text used only to present an admitted tool."""
+
+    summary: str
+    when_to_use: str
+    keywords: tuple[str, ...]
+    exposure_class: ToolExposureClass
+    eager_priority: int
+
+    def __post_init__(self) -> None:
+        for value, name, maximum in (
+            (
+                self.summary,
+                "tool discovery summary",
+                MAX_TOOL_DISCOVERY_SUMMARY_CHARACTERS,
+            ),
+            (
+                self.when_to_use,
+                "tool discovery when_to_use",
+                MAX_TOOL_DISCOVERY_GUIDANCE_CHARACTERS,
+            ),
+        ):
+            _text(value, name)
+            if len(value) > maximum:
+                raise ValueError(f"{name} exceeds its character bound")
+        keywords = tuple(self.keywords)
+        if len(keywords) > MAX_TOOL_DISCOVERY_KEYWORDS:
+            raise ValueError("tool discovery has too many keywords")
+        if len(keywords) != len(set(keywords)):
+            raise ValueError("tool discovery keywords must be distinct")
+        for keyword in keywords:
+            if (
+                not isinstance(keyword, str)
+                or not keyword
+                or keyword != keyword.strip().lower()
+                or len(keyword) > MAX_TOOL_DISCOVERY_KEYWORD_CHARACTERS
+                or re.fullmatch(r"[a-z0-9][a-z0-9 _.-]*", keyword) is None
+            ):
+                raise ValueError(
+                    "tool discovery keywords must be bounded normalized text"
+                )
+        if not isinstance(self.exposure_class, ToolExposureClass):
+            raise TypeError("tool discovery exposure_class must be ToolExposureClass")
+        if (
+            not isinstance(self.eager_priority, int)
+            or isinstance(self.eager_priority, bool)
+            or not 0 <= self.eager_priority <= MAX_TOOL_EAGER_PRIORITY
+        ):
+            raise ValueError("tool discovery eager_priority is outside its bound")
+        object.__setattr__(self, "keywords", keywords)
 
 
 class ApprovalDecision(str, Enum):
@@ -200,6 +266,8 @@ class ToolView:
     name: str
     capability_id: str
     description: str
+    discovery: ToolDiscoveryMetadata
+    origin_revision_digest: str | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -208,6 +276,16 @@ class ToolView:
             (self.description, "tool description"),
         ):
             _text(value, name)
+        if self.name in RESERVED_TOOL_NAMES:
+            raise ValueError(f"reserved runtime control tool name: {self.name}")
+        if not isinstance(self.discovery, ToolDiscoveryMetadata):
+            raise TypeError("tool discovery metadata is required")
+        if (
+            self.origin_revision_digest is not None
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", self.origin_revision_digest)
+            is None
+        ):
+            raise ValueError("tool origin revision digest must use sha256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +432,82 @@ class CapabilityRegistry:
                 "registered executors must match static declarations: "
                 f"missing={missing}, unexpected={unexpected}"
             )
+        self._digest = (
+            "sha256:"
+            + sha256(
+                canonical_json(
+                    [
+                        {
+                            "domain_owner_id": declaration.domain_owner_id,
+                            "capabilities": [
+                                {
+                                    "id": capability.id,
+                                    "description": capability.description,
+                                    "input_schema": capability.input_schema,
+                                    "output_kind": capability.output_kind,
+                                    "output_schema": capability.output_schema,
+                                    "executor_id": capability.executor_id,
+                                    "access_mode": capability.access_mode.value,
+                                    "side_effecting": capability.side_effecting,
+                                    "artifact_policy": (
+                                        None
+                                        if capability.artifact_policy is None
+                                        else {
+                                            "allowed_media_types": sorted(
+                                                capability.artifact_policy.allowed_media_types
+                                            ),
+                                            "allowed_extensions": (
+                                                capability.artifact_policy.allowed_extensions
+                                            ),
+                                            "artifact_required": (
+                                                capability.artifact_policy.artifact_required
+                                            ),
+                                            "max_artifact_count": (
+                                                capability.artifact_policy.max_artifact_count
+                                            ),
+                                            "max_bytes_per_artifact": (
+                                                capability.artifact_policy.max_bytes_per_artifact
+                                            ),
+                                            "max_total_bytes_per_call": (
+                                                capability.artifact_policy.max_total_bytes_per_call
+                                            ),
+                                        }
+                                    ),
+                                }
+                                for capability in sorted(
+                                    declaration.capabilities, key=lambda item: item.id
+                                )
+                            ],
+                            "tool_views": [
+                                {
+                                    "name": view.name,
+                                    "capability_id": view.capability_id,
+                                    "description": view.description,
+                                    "discovery": {
+                                        "summary": view.discovery.summary,
+                                        "when_to_use": view.discovery.when_to_use,
+                                        "keywords": view.discovery.keywords,
+                                        "exposure_class": (
+                                            view.discovery.exposure_class.value
+                                        ),
+                                        "eager_priority": view.discovery.eager_priority,
+                                    },
+                                    "origin_revision_digest": (
+                                        view.origin_revision_digest
+                                    ),
+                                }
+                                for view in sorted(
+                                    declaration.tool_views, key=lambda item: item.name
+                                )
+                            ],
+                        }
+                        for declaration in sorted(
+                            declared.values(), key=lambda item: item.domain_owner_id
+                        )
+                    ]
+                ).encode("utf-8")
+            ).hexdigest()
+        )
 
     @property
     def tool_names(self) -> frozenset[str]:
@@ -362,6 +516,10 @@ class CapabilityRegistry:
     @property
     def domain_owner_ids(self) -> frozenset[str]:
         return frozenset(self._declarations)
+
+    @property
+    def digest(self) -> str:
+        return self._digest
 
     def resolve_tool(self, name: str) -> tuple[ToolView, Capability]:
         try:
@@ -689,9 +847,12 @@ __all__ = [
     "MAX_APPROVAL_DOCUMENT_CHARACTERS",
     "SideEffectExecutor",
     "ToolExecution",
+    "ToolDiscoveryMetadata",
+    "ToolExposureClass",
     "ToolOutput",
     "ToolOutputValidationError",
     "ToolView",
+    "RESERVED_TOOL_NAMES",
     "render_approval_arguments",
     "validate_tool_schema_value",
 ]

@@ -94,8 +94,55 @@ def test_stage_m1_has_one_common_runtime_and_no_legacy_compatibility_surface():
         for node in ast.walk(runtime_tree)
         if isinstance(node, ast.Name) and node.id.endswith("_CAPABILITY_ID")
     }
+    string_literals = {
+        node.value
+        for node in ast.walk(runtime_tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
     for prefix in ("artifact.", "catalog.", "data.", "memory.", "semantic.", "skill."):
-        assert prefix not in runtime
+        assert not any(value.startswith(prefix) for value in string_literals)
+
+
+def test_stage_m3_has_one_run_catalog_and_deletes_complete_surface_recomputation():
+    runtime_path = PACKAGE / "capability_runtime.py"
+    loop_path = PACKAGE / "loop" / "driver.py"
+    runtime = runtime_path.read_text(encoding="utf-8")
+    loop = loop_path.read_text(encoding="utf-8")
+    production = _python_text(PACKAGE)
+
+    assert _class_owners("ToolDiscoveryMetadata") == {"capabilities.py"}
+    assert _class_owners("ToolExposureClass") == {"capabilities.py"}
+    assert _class_owners("RunToolCatalog") == {"capability_runtime.py"}
+    assert _class_owners("StepToolProjection") == {"capability_runtime.py"}
+    assert _class_owners("ToolProjectionMode") == {"loop/models.py"}
+    assert "definitions" not in _class_methods(loop_path, "ToolRuntime")
+    assert "definitions" not in _class_methods(runtime_path, "CapabilityRuntime")
+    assert "await domain.project(run)" in runtime
+    assert runtime.count("await domain.project(run)") == 1
+    assert "definitions(run)" not in production
+    assert "max_projected_tools" not in production
+    assert "max_projected_tool_definition_bytes" not in production
+    assert "tool_search" not in _python_text(PACKAGE / "llm" / "providers")
+    assert "RunToolCatalog" not in _python_text(PACKAGE / "storage")
+    assert "StepToolProjection" not in _python_text(PACKAGE / "storage")
+
+    mcp = (PACKAGE / "domains" / "mcp.py").read_text(encoding="utf-8")
+    activation = mcp.split("async def activate_mcp_domain(", 1)[1].split(
+        "def _binding_revision_is_active(", 1
+    )[0]
+    assert ".inspect(" not in activation
+    assert "client_factory.create(" not in activation
+    for forbidden in (
+        "ToolSearchIndex",
+        "DeferredToolRuntime",
+        "ToolDispatcher",
+        "LoadedToolSession",
+        "tool_catalog_cache",
+        "descriptor_cache",
+        "embedding",
+        "dynamic_registration",
+    ):
+        assert forbidden not in production
 
 
 def test_stage_m1_keeps_loop_context_and_composition_owners_exact():
@@ -249,6 +296,7 @@ def test_public_surface_is_focused():
         "LoopExit",
         "LoopExitKind",
         "LoopLimits",
+        "ToolProjectionMode",
         "MCPAdmissionError",
         "MCPAuthentication",
         "MCPAuthenticationMode",
@@ -786,7 +834,7 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
         assert later_phase not in production
 
 
-def test_phase_c_removes_legacy_permission_runtime_but_retains_migration_evidence():
+def test_phase_c_removes_legacy_permission_runtime_and_unreleased_history():
     repository_text = (
         "\n".join(
             path.read_text(encoding="utf-8")
@@ -813,12 +861,7 @@ def test_phase_c_removes_legacy_permission_runtime_but_retains_migration_evidenc
         for path in PACKAGE.rglob("*.py")
         if any(term in path.read_text(encoding="utf-8") for term in historical_terms)
     }
-    assert matched == {
-        "storage/sqlite_codecs/sources.py",
-        "storage/sqlite_migrations/postgresql_write_admission.py",
-        "storage/sqlite_migrations/scoped_source_permissions.py",
-        "storage/sqlite_schema.py",
-    }
+    assert matched == {"storage/sqlite_codecs/sources.py"}
 
 
 def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
@@ -1398,21 +1441,15 @@ def test_sqlite_journal_and_codecs_have_one_append_only_storage_owner():
         for path in PACKAGE.rglob("*.py")
         if "PRAGMA user_version" in path.read_text(encoding="utf-8")
     }
-    assert pragma_owners == {"storage/sqlite_migrations/preledger.py"}
+    assert pragma_owners == set()
     migration_files = {
         path.name for path in (PACKAGE / "storage" / "sqlite_migrations").glob("*.py")
     }
     assert migration_files == {
         "__init__.py",
         "baseline.py",
-        "database_write_receipts.py",
-        "generalized_postgresql_updates.py",
-        "mcp_server_bindings.py",
         "models.py",
-        "postgresql_write_admission.py",
-        "preledger.py",
         "runner.py",
-        "scoped_source_permissions.py",
     }
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
 

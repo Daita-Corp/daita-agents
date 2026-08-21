@@ -20,7 +20,9 @@ from .capabilities import (
     CapabilityInputError,
     Executor,
     SideEffectExecutor,
+    ToolDiscoveryMetadata,
     ToolExecution,
+    ToolExposureClass,
     ToolOutput,
     ToolView,
 )
@@ -1486,8 +1488,9 @@ def semantic_declarations(
                 name=name,
                 capability_id=capability.id,
                 description=capability.description,
+                discovery=discovery,
             )
-            for name, capability in zip(
+            for name, capability, discovery in zip(
                 (
                     SEMANTIC_LIST_TOOL_NAME,
                     SEMANTIC_VIEW_TOOL_NAME,
@@ -1495,6 +1498,36 @@ def semantic_declarations(
                     SEMANTIC_DELETE_TOOL_NAME,
                 ),
                 capabilities,
+                (
+                    ToolDiscoveryMetadata(
+                        summary="List bounded active semantic annotations.",
+                        when_to_use="Use to inspect current stored business meaning.",
+                        keywords=("semantic", "meaning", "annotation", "list"),
+                        exposure_class=ToolExposureClass.STANDARD,
+                        eager_priority=620,
+                    ),
+                    ToolDiscoveryMetadata(
+                        summary="View one exact semantic annotation and its evidence.",
+                        when_to_use="Use before correcting or deleting an exact annotation.",
+                        keywords=("semantic", "meaning", "annotation", "view"),
+                        exposure_class=ToolExposureClass.STANDARD,
+                        eager_priority=610,
+                    ),
+                    ToolDiscoveryMetadata(
+                        summary="Create or supersede one evidence-bound semantic annotation.",
+                        when_to_use="Use only for validated current resource or field meaning.",
+                        keywords=("semantic", "meaning", "annotation", "save"),
+                        exposure_class=ToolExposureClass.DEFERRED,
+                        eager_priority=160,
+                    ),
+                    ToolDiscoveryMetadata(
+                        summary="Delete one exact semantic annotation after validation.",
+                        when_to_use="Use only for an explicit exact semantic deletion.",
+                        keywords=("semantic", "meaning", "annotation", "delete"),
+                        exposure_class=ToolExposureClass.DEFERRED,
+                        eager_priority=150,
+                    ),
+                ),
                 strict=True,
             )
         ),

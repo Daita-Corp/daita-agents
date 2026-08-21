@@ -18,6 +18,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.loop.models import LoopLimits, ToolProjectionMode
 from daita.memory import (
     MEMORY_MAX_CHARACTERS,
     MEMORY_MAX_UTF8_BYTES,
@@ -30,6 +31,7 @@ from daita.memory import (
 from daita.storage.sqlite_migrations import migration_rows
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -298,6 +300,7 @@ async def test_injected_memory_cannot_create_a_tool_or_bypass_runtime_validation
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
     )
     try:
         await agent.set_memory(

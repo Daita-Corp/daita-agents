@@ -9,6 +9,11 @@ from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject, canonical_json
 from ...artifacts.models import ArtifactDestination, artifact_destination_to_mapping
+from ...capability_runtime import (
+    RunToolCatalog,
+    StepToolProjection,
+    ToolInvocationMode,
+)
 from ...catalog.capabilities import (
     CATALOG_INSPECT_EVIDENCE_KIND,
     CATALOG_SCHEMA_EVIDENCE_KIND,
@@ -23,6 +28,7 @@ from ...llm.errors import (
     ContextEvidencePressureExceeded,
     ContextWindowExceeded,
     RequestSensitivityUnavailable,
+    ToolManifestLimitExceeded,
 )
 from ...llm.models import (
     CanonicalMessage,
@@ -41,6 +47,7 @@ from ...semantics import (
     SEMANTIC_DELETE_OUTPUT_KIND,
     SEMANTIC_DELETE_TOOL_NAME,
     SEMANTIC_SAVE_OUTPUT_KIND,
+    SEMANTIC_SAVE_CAPABILITY_ID,
     SEMANTIC_SAVE_TOOL_NAME,
     SemanticAnnotation,
     SemanticAnnotationView,
@@ -63,18 +70,22 @@ from .controller import (
     POSTGRESQL_QUERY_EVIDENCE_KIND,
     POSTGRESQL_UPDATE_EVIDENCE_KIND,
     POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
+    POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+    POSTGRESQL_UPDATE_CAPABILITY_ID,
     SQLITE_QUERY_EVIDENCE_KIND,
 )
 from .export_capabilities import (
-    ARTIFACT_CONVERT_TOOL_NAME,
-    ARTIFACT_LIST_TOOL_NAME,
-    ARTIFACT_READ_TOOL_NAME,
+    ARTIFACT_CONVERT_CAPABILITY_ID,
+    ARTIFACT_LIST_CAPABILITY_ID,
+    ARTIFACT_READ_CAPABILITY_ID,
+    ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+    ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
-    DOCUMENT_CREATE_TOOL_NAME,
-    LOCAL_FILE_COPY_TOOL_NAME,
-    POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
-    SQLITE_TABULAR_EXPORT_TOOL_NAME,
+    DOCUMENT_CREATE_CAPABILITY_ID,
+    LOCAL_FILE_COPY_CAPABILITY_ID,
+    POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+    SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
 )
 from .file_capabilities import (
     LOCAL_FILE_READ_EVIDENCE_KIND,
@@ -195,7 +206,8 @@ class RunContextSnapshot:
 
     run_id: str
     profile: ModelProfile
-    tools: tuple[ToolDefinition, ...]
+    catalog_digest: str
+    provider_definitions: tuple[ToolDefinition, ...]
     static_messages: tuple[CanonicalMessage, ...]
     final_static_messages: tuple[CanonicalMessage, ...]
     initial_sensitivity: ModelSensitivity
@@ -208,11 +220,17 @@ class RunContextSnapshot:
             raise ValueError("run context snapshot requires run_id")
         if not isinstance(self.profile, ModelProfile):
             raise TypeError("run context snapshot requires a model profile")
-        tools = tuple(self.tools)
+        provider_definitions = tuple(self.provider_definitions)
         static_messages = tuple(self.static_messages)
         final_static_messages = tuple(self.final_static_messages)
-        if any(not isinstance(item, ToolDefinition) for item in tools):
-            raise TypeError("run context snapshot tools are invalid")
+        if any(not isinstance(item, ToolDefinition) for item in provider_definitions):
+            raise TypeError("run context provider definitions are invalid")
+        if (
+            not isinstance(self.catalog_digest, str)
+            or not self.catalog_digest.startswith("sha256:")
+            or len(self.catalog_digest) != 71
+        ):
+            raise ValueError("run context snapshot requires a catalog digest")
         if any(
             not isinstance(item, CanonicalMessage)
             for item in (*static_messages, *final_static_messages)
@@ -236,7 +254,7 @@ class RunContextSnapshot:
             or self.max_context_evidence_bytes < 1
         ):
             raise ValueError("run context evidence bound must be positive")
-        object.__setattr__(self, "tools", tools)
+        object.__setattr__(self, "provider_definitions", provider_definitions)
         object.__setattr__(self, "static_messages", static_messages)
         object.__setattr__(self, "final_static_messages", final_static_messages)
 
@@ -349,14 +367,29 @@ class DataContextBuilder:
         self,
         run: RunInput,
         messages: tuple[CanonicalMessage, ...],
-        tools: tuple[ToolDefinition, ...],
+        tool_context: object,
     ) -> RunContextSnapshot:
         """Read and freeze all static run context exactly once."""
 
         if not isinstance(run, RunInput):
             raise TypeError("run must be RunInput")
         messages = tuple(messages)
-        tools = tuple(tools)
+        if not isinstance(tool_context, RunToolCatalog):
+            raise TypeError("tool_context must be RunToolCatalog")
+        tools = tool_context.provider_definitions
+        capability_ids = tool_context.capability_ids
+        manifest_payload = tool_context.manifest_payload
+        manifest_bytes = len(canonical_json(manifest_payload).encode("utf-8"))
+        manifest_tokens = (manifest_bytes + 3) // 4
+        if manifest_tokens > min(
+            tool_context.manifest_token_limit,
+            max(1, self._profile.maximum_input_tokens // 20),
+        ):
+            raise ToolManifestLimitExceeded()
+        has_deferred_tools = any(
+            entry.invocation_mode is ToolInvocationMode.DEFERRED
+            for entry in tool_context.entries
+        )
         if any(not isinstance(message, CanonicalMessage) for message in messages):
             raise TypeError("messages must contain CanonicalMessage records")
         if any(not isinstance(tool, ToolDefinition) for tool in tools):
@@ -421,19 +454,18 @@ class DataContextBuilder:
         selected_candidate = self._selected_learning_candidates.get(run.id)
         if selected_candidate is not None:
             _selected_candidate_id, candidate_text = selected_candidate
-        artifact_tools_projected = any(
-            tool.name
-            in {
-                DOCUMENT_CREATE_TOOL_NAME,
-                SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
-                ARTIFACT_LIST_TOOL_NAME,
-                ARTIFACT_READ_TOOL_NAME,
-                ARTIFACT_CONVERT_TOOL_NAME,
-                ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-                ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
+        artifact_tools_projected = bool(
+            capability_ids
+            & {
+                DOCUMENT_CREATE_CAPABILITY_ID,
+                SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+                POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+                ARTIFACT_LIST_CAPABILITY_ID,
+                ARTIFACT_READ_CAPABILITY_ID,
+                ARTIFACT_CONVERT_CAPABILITY_ID,
+                ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+                ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
             }
-            for tool in tools
         )
         artifact_destinations = (
             ()
@@ -452,6 +484,9 @@ class DataContextBuilder:
             catalog_payload,
             current_messages,
             tools,
+            capability_ids=capability_ids,
+            tool_manifest=manifest_payload,
+            has_deferred_tools=has_deferred_tools,
             memory_text=memory_text,
             user_profile=user_profile,
             skill_index=skill_index,
@@ -491,6 +526,9 @@ class DataContextBuilder:
                     *current_messages,
                 ),
                 tools,
+                capability_ids=capability_ids,
+                tool_manifest=manifest_payload,
+                has_deferred_tools=has_deferred_tools,
                 memory_text=memory_text,
                 user_profile=user_profile,
                 skill_index=skill_index,
@@ -526,6 +564,9 @@ class DataContextBuilder:
                     *current_messages,
                 ),
                 tools,
+                capability_ids=capability_ids,
+                tool_manifest=manifest_payload,
+                has_deferred_tools=has_deferred_tools,
                 memory_text=memory_text,
                 user_profile=user_profile,
                 skill_index=skill_index,
@@ -556,6 +597,9 @@ class DataContextBuilder:
             catalog_payload,
             selected_messages,
             tools,
+            capability_ids=capability_ids,
+            tool_manifest=manifest_payload,
+            has_deferred_tools=has_deferred_tools,
             memory_text=memory_text,
             user_profile=user_profile,
             skill_index=skill_index,
@@ -571,6 +615,9 @@ class DataContextBuilder:
             catalog_payload,
             selected_messages,
             (),
+            capability_ids=capability_ids,
+            tool_manifest=manifest_payload,
+            has_deferred_tools=has_deferred_tools,
             memory_text=memory_text,
             user_profile=user_profile,
             skill_index=skill_index,
@@ -596,11 +643,13 @@ class DataContextBuilder:
         static_material = {
             "run_id": run.id,
             "profile_id": self._profile.id,
+            "tool_catalog_digest": tool_context.catalog_digest,
+            "tool_domain_manifest": manifest_payload,
             "messages": [_neutral_message(item) for item in static_messages],
             "final_messages": [
                 _neutral_message(item) for item in final_static_messages
             ],
-            "tools": [
+            "provider_definitions": [
                 {
                     "name": tool.name,
                     "description": tool.description,
@@ -622,7 +671,8 @@ class DataContextBuilder:
         return RunContextSnapshot(
             run_id=run.id,
             profile=self._profile,
-            tools=tools,
+            catalog_digest=tool_context.catalog_digest,
+            provider_definitions=tools,
             static_messages=static_messages,
             final_static_messages=final_static_messages,
             initial_sensitivity=sensitivity,
@@ -637,6 +687,7 @@ class DataContextBuilder:
         messages: tuple[CanonicalMessage, ...],
         *,
         step: int,
+        tool_context: object,
         final: bool = False,
         previous_request_input_tokens: int | None = None,
     ) -> ModelRequest:
@@ -644,6 +695,14 @@ class DataContextBuilder:
 
         if not isinstance(snapshot, RunContextSnapshot):
             raise TypeError("snapshot must be RunContextSnapshot")
+        if not isinstance(tool_context, StepToolProjection):
+            raise TypeError("tool_context must be StepToolProjection")
+        if (
+            tool_context.run_id != snapshot.run_id
+            or tool_context.catalog_digest != snapshot.catalog_digest
+            or tool_context.provider_definitions != snapshot.provider_definitions
+        ):
+            raise ValueError("step tool projection differs from the prepared run")
         if not isinstance(step, int) or isinstance(step, bool) or step < 1:
             raise ValueError("step must be positive")
         messages = tuple(messages)
@@ -694,7 +753,7 @@ class DataContextBuilder:
                 "classified_results": classified_results,
             }
         )
-        tools = () if final else snapshot.tools
+        tools = () if final else tool_context.provider_definitions
         static_messages = (
             snapshot.final_static_messages if final else snapshot.static_messages
         )
@@ -719,6 +778,9 @@ class DataContextBuilder:
         current_messages: tuple[CanonicalMessage, ...],
         tools: tuple[ToolDefinition, ...],
         *,
+        capability_ids: frozenset[str],
+        tool_manifest: tuple[FrozenJsonObject, ...],
+        has_deferred_tools: bool,
         memory_text: str,
         user_profile: str,
         skill_index: str | None,
@@ -758,6 +820,9 @@ class DataContextBuilder:
                 payload,
                 current_messages,
                 tools,
+                capability_ids=capability_ids,
+                tool_manifest=tool_manifest,
+                has_deferred_tools=has_deferred_tools,
                 memory_text=memory_text,
                 user_profile=user_profile,
                 skill_index=skill_index,
@@ -1534,6 +1599,9 @@ def _request(
     messages: tuple[CanonicalMessage, ...],
     tools: tuple[ToolDefinition, ...],
     *,
+    capability_ids: frozenset[str],
+    tool_manifest: tuple[FrozenJsonObject, ...],
+    has_deferred_tools: bool,
     memory_text: str,
     user_profile: str,
     skill_index: str | None,
@@ -1551,40 +1619,15 @@ def _request(
             TextBlock(
                 _system_prompt(
                     catalog,
+                    capability_ids=capability_ids,
+                    tool_manifest=tool_manifest,
+                    has_deferred_tools=has_deferred_tools,
                     memory_text=memory_text,
                     user_profile=user_profile,
                     skill_index=skill_index,
                     semantic_text=semantic_text,
                     candidate_text=candidate_text,
                     artifact_destinations=artifact_destinations,
-                    artifact_tools_available=any(
-                        tool.name
-                        in {
-                            DOCUMENT_CREATE_TOOL_NAME,
-                            LOCAL_FILE_COPY_TOOL_NAME,
-                            SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                            POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
-                            ARTIFACT_LIST_TOOL_NAME,
-                            ARTIFACT_READ_TOOL_NAME,
-                            ARTIFACT_CONVERT_TOOL_NAME,
-                            ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-                        }
-                        for tool in tools
-                    ),
-                    artifact_default_tool_available=any(
-                        tool.name == ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME
-                        for tool in tools
-                    ),
-                    semantic_tools_available=any(
-                        tool.name == "semantic_save" for tool in tools
-                    ),
-                    postgresql_update_preview_available=any(
-                        tool.name == POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME
-                        for tool in tools
-                    ),
-                    postgresql_update_available=any(
-                        tool.name == POSTGRESQL_UPDATE_TOOL_NAME for tool in tools
-                    ),
                     final=final,
                 )
             ),
@@ -1613,19 +1656,38 @@ def _request(
 def _system_prompt(
     catalog: dict[str, object],
     *,
+    capability_ids: frozenset[str],
+    tool_manifest: tuple[FrozenJsonObject, ...],
+    has_deferred_tools: bool,
     memory_text: str,
     user_profile: str,
     skill_index: str | None,
     semantic_text: str,
     candidate_text: str,
     artifact_destinations: tuple[ArtifactDestination, ...],
-    artifact_tools_available: bool,
-    artifact_default_tool_available: bool,
-    semantic_tools_available: bool,
-    postgresql_update_preview_available: bool,
-    postgresql_update_available: bool,
     final: bool,
 ) -> str:
+    artifact_tools_available = bool(
+        capability_ids
+        & {
+            DOCUMENT_CREATE_CAPABILITY_ID,
+            LOCAL_FILE_COPY_CAPABILITY_ID,
+            SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+            POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+            ARTIFACT_LIST_CAPABILITY_ID,
+            ARTIFACT_READ_CAPABILITY_ID,
+            ARTIFACT_CONVERT_CAPABILITY_ID,
+            ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+        }
+    )
+    artifact_default_tool_available = (
+        ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID in capability_ids
+    )
+    semantic_tools_available = SEMANTIC_SAVE_CAPABILITY_ID in capability_ids
+    postgresql_update_preview_available = (
+        POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID in capability_ids
+    )
+    postgresql_update_available = POSTGRESQL_UPDATE_CAPABILITY_ID in capability_ids
     instructions = [
         "You are Daita, a data agent.",
         (
@@ -1702,6 +1764,20 @@ def _system_prompt(
             "and ask if evidence remains ambiguous."
         ),
     ]
+    if not final and has_deferred_tools:
+        instructions.extend(
+            (
+                "Tool availability has two presentation modes. Call a direct tool by "
+                "its exact provider-visible name. For a deferred tool, use tool_search "
+                "when needed, call tool_describe for the exact name, then on a later "
+                "assistant step pass the returned run-bound tool_ref and arguments to "
+                "tool_call. Search, description, and references grant no authority; "
+                "ordinary current validation and governance still apply.",
+                "Trusted applicable tool-domain manifest (counts and summaries only; "
+                "deferred schemas are intentionally omitted):\n"
+                + canonical_json(tool_manifest),
+            )
+        )
     if postgresql_update_available:
         instructions.append(
             "For PostgreSQL changes, call the typed read-only preview first. When "

@@ -30,7 +30,12 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import RunInput, ToolBatchInterruption
+from daita.loop.models import (
+    LoopLimits,
+    RunInput,
+    ToolBatchInterruption,
+    ToolProjectionMode,
+)
 from daita.memory import MEMORY_MAX_CHARACTERS, USER_MAX_CHARACTERS
 from daita.memory.capabilities import (
     MEMORY_SET_CAPABILITY_ID,
@@ -51,6 +56,7 @@ from daita.skills.capabilities import (
 )
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -135,9 +141,13 @@ def _runtime(agent: Agent) -> CapabilityRuntime:
 
 
 async def _execute(agent: Agent, *calls: ToolCall):
-    return await _runtime(agent).execute_all(
-        _run(agent),
+    runtime = _runtime(agent)
+    run = _run(agent)
+    catalog = await runtime.prepare_run(run)
+    return await runtime.execute_all(
+        run,
         calls,
+        projection=runtime.project(catalog, ()),
         sensitivity=ModelSensitivity.INTERNAL,
     )
 
@@ -204,6 +214,7 @@ async def _agent(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approval_handler,
         observer=observer,
         clock=lambda: NOW,
@@ -285,15 +296,17 @@ async def test_memory_set_identity_projection_and_read_tools_never_ask_approval(
             True,
         )
         assert resolved == capability
-        definitions = await _runtime(agent).definitions(_run(agent))
-        assert tuple(item.name for item in definitions) == (
+        catalog = await _runtime(agent).prepare_run(_run(agent))
+        names = tuple(item.view.name for item in catalog.entries)
+        assert len(names) == len(set(names))
+        assert {
             "artifact_create_document",
             "artifact_set_export_location",
             "memory_set",
             "skill_delete",
             "skill_save",
             "skill_view",
-        )
+        } <= set(names)
 
         read = ToolCall(id="read", name="skill_view", arguments={"name": "absent"})
         result = (await _execute(agent, read))[0]
@@ -411,6 +424,7 @@ async def test_callback_exception_is_an_ordinary_tool_error_and_loop_continues(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=broken,
     )
     try:
@@ -489,12 +503,21 @@ async def test_tool_and_approval_event_sequences_are_exact_and_content_free(tmp_
         "call_id": "write",
         "tool_name": MEMORY_SET_TOOL_NAME,
         "capability_id": MEMORY_SET_CAPABILITY_ID,
+        "invocation_mode": "direct",
     }
     assert events[1].data == events[0].data
-    assert dict(events[2].data) == {"call_id": "write", "outcome": "approved"}
+    assert dict(events[2].data) == {
+        "call_id": "write",
+        "tool_name": MEMORY_SET_TOOL_NAME,
+        "capability_id": MEMORY_SET_CAPABILITY_ID,
+        "invocation_mode": "direct",
+        "outcome": "approved",
+    }
     completed = events[3].data
     assert completed["call_id"] == "write"
     assert completed["tool_name"] == MEMORY_SET_TOOL_NAME
+    assert completed["capability_id"] == MEMORY_SET_CAPABILITY_ID
+    assert completed["invocation_mode"] == "direct"
     assert completed["success"] is True
     assert completed["error_code"] is None
     duration_ms = completed["duration_ms"]
@@ -864,6 +887,7 @@ async def test_approval_state_is_not_persisted_across_restart(tmp_path):
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
     )
     try:
         result = (await _execute(reopened, _memory_call(content="not-approved")))[0]
@@ -889,6 +913,7 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
     )
     try:
@@ -933,6 +958,7 @@ async def test_explicit_reusable_workflow_is_one_approved_foreground_skill(tmp_p
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
     )
     try:
@@ -972,6 +998,7 @@ async def test_weak_learning_signal_stays_in_transcript_without_a_write(tmp_path
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
     )
     try:
@@ -995,9 +1022,11 @@ async def test_learning_tool_descriptions_route_documents_and_require_write_firs
 ):
     agent = await _agent(tmp_path, "learning-tool-routing")
     try:
+        runtime = _runtime(agent)
+        catalog = await runtime.prepare_run(_run(agent))
         definitions = {
-            definition.name: definition
-            for definition in await _runtime(agent).definitions(_run(agent))
+            entry.view.name: runtime._registry.tool_definition(entry.view.name)
+            for entry in catalog.entries
         }
         memory_description = definitions[MEMORY_SET_TOOL_NAME].description
         skill_view_description = definitions["skill_view"].description
@@ -1067,6 +1096,7 @@ async def test_loaded_skill_is_replaced_instead_of_duplicated(tmp_path):
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
     )
     try:
@@ -1692,6 +1722,7 @@ async def test_reopen_starts_no_learning_work_and_persists_no_skill_approval(tmp
         root=tmp_path,
         model=first_provider,
         model_profile=_profile(first_provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
     )
     try:
@@ -1708,6 +1739,7 @@ async def test_reopen_starts_no_learning_work_and_persists_no_skill_approval(tmp
         root=tmp_path,
         model=reopened_provider,
         model_profile=_profile(reopened_provider),
+        limits=EAGER_LIMITS,
     )
     try:
         assert reopened_provider.requests == ()

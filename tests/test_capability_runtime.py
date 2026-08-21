@@ -18,7 +18,12 @@ from daita.capabilities import (
 from daita.capability_runtime import CapabilityRuntime
 from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import LoopLimits, RunInput, ToolBatchOutcome
-from _capability_runtime_support import StaticTestDomain, static_registry
+from _capability_runtime_support import (
+    StaticTestDomain,
+    discovery_metadata,
+    execute_projected,
+    static_registry,
+)
 
 
 class _CountingExecutor:
@@ -101,6 +106,7 @@ def _declaration() -> tuple[Capability, ToolView]:
         name="test_stage_m1",
         capability_id=capability.id,
         description=capability.description,
+        discovery=discovery_metadata(),
     )
 
 
@@ -127,10 +133,10 @@ async def test_unprojected_capability_is_rejected_before_executor_io() -> None:
     domain = _UnavailableDomain((capability,), (view,))
     runtime = CapabilityRuntime(static_registry(domain, (executor,)), (domain,))
 
-    outcome = await runtime.execute_all(
+    outcome = await execute_projected(
+        runtime,
         _run(),
         (ToolCall(id="call-unavailable", name=view.name, arguments={"value": "x"}),),
-        sensitivity=ModelSensitivity.INTERNAL,
     )
 
     assert _error_code(outcome) == "tool_not_available"
@@ -143,19 +149,19 @@ async def test_schema_and_domain_current_admission_precede_executor_io() -> None
     domain = _CurrentAdmissionDomain((capability,), (view,))
     runtime = CapabilityRuntime(static_registry(domain, (executor,)), (domain,))
 
-    invalid_schema = await runtime.execute_all(
+    invalid_schema = await execute_projected(
+        runtime,
         _run(),
         (ToolCall(id="call-schema", name=view.name),),
-        sensitivity=ModelSensitivity.INTERNAL,
     )
     assert _error_code(invalid_schema) == "missing_arguments"
     assert domain.prepare_calls == 0
     assert executor.calls == 0
 
-    denied = await runtime.execute_all(
+    denied = await execute_projected(
+        runtime,
         _run(),
         (ToolCall(id="call-current", name=view.name, arguments={"value": "x"}),),
-        sensitivity=ModelSensitivity.INTERNAL,
     )
     assert _error_code(denied) == "current_admission_denied"
     assert domain.prepare_calls == 1
@@ -195,10 +201,10 @@ async def test_generic_result_bounds_cover_typed_failures_and_redact_payload() -
         limits=LoopLimits(max_tool_result_bytes=128),
     )
 
-    outcome = await runtime.execute_all(
+    outcome = await execute_projected(
+        runtime,
         _run(),
         (ToolCall(id="call-bounded", name=view.name, arguments={"value": "x"}),),
-        sensitivity=ModelSensitivity.INTERNAL,
     )
 
     assert _error_code(outcome) == "tool_result_too_large"

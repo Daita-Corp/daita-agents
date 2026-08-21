@@ -13,7 +13,9 @@ from ..capabilities import (
     CapabilityInputError,
     Executor,
     SideEffectExecutor,
+    ToolDiscoveryMetadata,
     ToolExecution,
+    ToolExposureClass,
     ToolOutput,
     ToolView,
 )
@@ -297,14 +299,38 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 name=name,
                 capability_id=capability.id,
                 description=capability.description,
+                discovery=discovery,
             )
-            for name, capability in zip(
+            for name, capability, discovery in zip(
                 (
                     SKILL_VIEW_TOOL_NAME,
                     SKILL_SAVE_TOOL_NAME,
                     SKILL_DELETE_TOOL_NAME,
                 ),
                 capabilities,
+                (
+                    ToolDiscoveryMetadata(
+                        summary="Load one complete user-authorized procedural skill.",
+                        when_to_use="Use when an indexed procedure is relevant to the request.",
+                        keywords=("skill", "procedure", "guidance", "view"),
+                        exposure_class=ToolExposureClass.STANDARD,
+                        eager_priority=650,
+                    ),
+                    ToolDiscoveryMetadata(
+                        summary="Create or replace one bounded procedural skill.",
+                        when_to_use="Use only for an explicit validated reusable procedure.",
+                        keywords=("skill", "procedure", "save", "learn"),
+                        exposure_class=ToolExposureClass.DEFERRED,
+                        eager_priority=180,
+                    ),
+                    ToolDiscoveryMetadata(
+                        summary="Delete one exact existing procedural skill.",
+                        when_to_use="Use only for an explicit exact skill deletion.",
+                        keywords=("skill", "procedure", "delete"),
+                        exposure_class=ToolExposureClass.DEFERRED,
+                        eager_priority=170,
+                    ),
+                ),
                 strict=True,
             )
         ),

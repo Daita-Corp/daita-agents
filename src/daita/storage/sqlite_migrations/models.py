@@ -1,4 +1,4 @@
-"""Immutable definitions for SQLite-owned durable migrations."""
+"""Definitions for the SQLite-owned staged-copy migration engine."""
 
 from __future__ import annotations
 

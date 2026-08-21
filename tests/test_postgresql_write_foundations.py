@@ -19,6 +19,8 @@ from daita.catalog.models import (
     TabularFacet,
 )
 from daita.domains.data.capabilities import (
+    POSTGRESQL_UPDATE_CAPABILITY_ID,
+    POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
     postgresql_update_capability_declarations,
     postgresql_update_preview_capability_declarations,
 )
@@ -43,17 +45,20 @@ def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> No
 
     prompt = _system_prompt(
         {},
+        capability_ids=frozenset(
+            {
+                POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+                POSTGRESQL_UPDATE_CAPABILITY_ID,
+            }
+        ),
+        tool_manifest=(),
+        has_deferred_tools=False,
         memory_text="",
         user_profile="",
         skill_index=None,
         semantic_text="",
         candidate_text="",
         artifact_destinations=(),
-        artifact_tools_available=False,
-        artifact_default_tool_available=False,
-        semantic_tools_available=False,
-        postgresql_update_preview_available=True,
-        postgresql_update_available=True,
         final=False,
     )
     assert "a successful preview is not a terminal answer" in prompt

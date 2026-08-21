@@ -29,12 +29,14 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import RunInput
+from daita.loop.models import LoopLimits, RunInput, ToolProjectionMode
 from daita.semantics import semantic_annotation_sha256
 from daita.tui.commands import SLASH_COMMAND_COMPLETIONS, learning_invocation_message
 from daita.tui.controller import PresentationController
+from _capability_runtime_support import execute_projected
 
 NOW = datetime(2026, 7, 28, 16, tzinfo=UTC)
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -213,6 +215,7 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
@@ -295,6 +298,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         clock=lambda: NOW,
     )
     try:
@@ -381,7 +385,8 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         )
         semantic_domain.select_explicit_learning_run(read_run.id)
         listed = (
-            await runtime.execute_all(
+            await execute_projected(
+                runtime,
                 read_run,
                 (
                     ToolCall(
@@ -390,7 +395,6 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
                         arguments={"limit": 1},
                     ),
                 ),
-                sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
         listed_data = listed.output["data"]
@@ -399,7 +403,8 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         assert isinstance(listed_annotations, tuple)
         assert tuple(item["id"] for item in listed_annotations) == ("active-time",)
         conflict_view = (
-            await runtime.execute_all(
+            await execute_projected(
+                runtime,
                 read_run,
                 (
                     ToolCall(
@@ -408,7 +413,6 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
                         arguments={"id": "conflict-a"},
                     ),
                 ),
-                sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
         assert not conflict_view.is_error

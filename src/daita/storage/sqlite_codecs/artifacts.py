@@ -77,16 +77,16 @@ def decode_artifact_provenance(value: JsonValue) -> ArtifactProvenance:
     fields = record_fields(
         value,
         "ArtifactProvenance",
-        ("authorship",),
-        optional={
-            "evidence_call_ids": [],
-            "derived_from_artifact_id": None,
-            "resource_bindings": [],
-            "sql_fingerprint": None,
-            "parameters_sha256": None,
-            "columns": [],
-            "row_count": None,
-        },
+        (
+            "authorship",
+            "evidence_call_ids",
+            "derived_from_artifact_id",
+            "resource_bindings",
+            "sql_fingerprint",
+            "parameters_sha256",
+            "columns",
+            "row_count",
+        ),
     )
     return ArtifactProvenance(
         authorship=enum_decode(

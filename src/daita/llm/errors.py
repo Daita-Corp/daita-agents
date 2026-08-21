@@ -39,7 +39,7 @@ class ContextEvidencePressureExceeded(LLMError):
 
 
 class ToolSurfaceLimitExceeded(LLMError):
-    """The complete model-visible tool surface exceeds an outer run bound."""
+    """The fixed provider-facing direct/control surface exceeds its run bound."""
 
     def __init__(
         self,
@@ -57,6 +57,40 @@ class ToolSurfaceLimitExceeded(LLMError):
             "The projected model tool surface exceeds its configured count or "
             "definition-byte bound.",
             error_code="tool_surface_limit_exceeded",
+            retryability=ErrorRetryability.PERMANENT,
+        )
+
+
+class ToolCatalogLimitExceeded(LLMError):
+    """The complete applicable run catalog exceeds its independent bound."""
+
+    def __init__(
+        self,
+        *,
+        observed_tools: int,
+        maximum_tools: int,
+        observed_catalog_bytes: int,
+        maximum_catalog_bytes: int,
+    ) -> None:
+        self.observed_tools = observed_tools
+        self.maximum_tools = maximum_tools
+        self.observed_catalog_bytes = observed_catalog_bytes
+        self.maximum_catalog_bytes = maximum_catalog_bytes
+        super().__init__(
+            "The applicable run tool catalog exceeds its configured count or "
+            "canonical-byte bound.",
+            error_code="tool_catalog_limit_exceeded",
+            retryability=ErrorRetryability.PERMANENT,
+        )
+
+
+class ToolManifestLimitExceeded(LLMError):
+    """The trusted compact domain manifest exceeds its independent bound."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The tool domain manifest exceeds its configured count, byte, or token bound.",
+            error_code="tool_manifest_limit_exceeded",
             retryability=ErrorRetryability.PERMANENT,
         )
 

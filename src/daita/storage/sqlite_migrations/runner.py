@@ -5,26 +5,34 @@ from __future__ import annotations
 import re
 import sqlite3
 
-from ..sqlite_schema import require_healthy, require_schema
-from .database_write_receipts import MIGRATION as RECEIPT_MIGRATION
-from .generalized_postgresql_updates import MIGRATION as GENERALIZED_UPDATE_MIGRATION
-from .mcp_server_bindings import MIGRATION as MCP_BINDING_MIGRATION
+from ..sqlite_schema import CURRENT_TABLES, require_healthy, require_schema
 from .models import SQLiteMigration
-from .postgresql_write_admission import MIGRATION as ADMISSION_MIGRATION
-from .scoped_source_permissions import MIGRATION as SCOPED_PERMISSION_MIGRATION
 
-MIGRATIONS: tuple[SQLiteMigration, ...] = (
-    RECEIPT_MIGRATION,
-    ADMISSION_MIGRATION,
-    SCOPED_PERMISSION_MIGRATION,
-    GENERALIZED_UPDATE_MIGRATION,
-    MCP_BINDING_MIGRATION,
+DEVELOPMENT_BASELINE_ID = "development_baseline"
+DEVELOPMENT_BASELINE_DEFINITION = """development_baseline
+current pre-production SQLite state shape;
+mutable until the first production state baseline is explicitly frozen
+"""
+
+
+def _baseline_noop(connection: sqlite3.Connection) -> None:
+    connection.execute("SELECT 1")
+
+
+DEVELOPMENT_BASELINE = SQLiteMigration(
+    ordinal=1,
+    migration_id=DEVELOPMENT_BASELINE_ID,
+    definition=DEVELOPMENT_BASELINE_DEFINITION,
+    source_schema=CURRENT_TABLES,
+    target_schema=CURRENT_TABLES,
+    apply=_baseline_noop,
 )
+MIGRATIONS: tuple[SQLiteMigration, ...] = (DEVELOPMENT_BASELINE,)
 CURRENT_REVISION = MIGRATIONS[-1].migration_id
 
 
 class MigrationJournalError(ValueError):
-    """The stored journal is not an exact prefix of this immutable ledger."""
+    """The stored journal is not an exact prefix of the declared ledger."""
 
     def __init__(self, reason: str, found_revision: str | None = None) -> None:
         self.reason = reason
@@ -67,7 +75,7 @@ def inspect_journal(connection: sqlite3.Connection) -> int:
             )
         if checksum != expected.checksum:
             raise MigrationJournalError(
-                "migration journal checksum does not match immutable history",
+                "migration journal checksum does not match the declared baseline",
                 str(migration_id),
             )
     if len(rows) > len(MIGRATIONS):

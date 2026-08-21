@@ -4,7 +4,9 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
+from hashlib import sha256
 
 import httpx
 import pytest
@@ -18,7 +20,15 @@ from daita import (
     MCPBindingState,
     MCPToolSelection,
 )
-from daita.adapters.mcp import StreamableHTTPMCPClientFactory
+from daita._json import FrozenJsonObject, canonical_json
+from daita.adapters.mcp import (
+    MCP_MAX_ACTIVE_TOOLS_PER_AGENT,
+    MCPServerBinding,
+    MCPToolBinding,
+    StreamableHTTPMCPClientFactory,
+)
+from daita.capabilities import ToolDiscoveryMetadata, ToolExposureClass
+from daita.errors import StateCompatibilityCode, StateCompatibilityError
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -29,7 +39,10 @@ from daita.llm.models import (
     ToolResultBlock,
     ModelSensitivity,
 )
+from daita.loop.models import LoopLimits, ToolProjectionMode
 from daita.security import SecretReference
+from daita.storage.sqlite import SQLiteStateStore
+from daita.storage.sqlite_codecs import encode_mcp_binding
 from daita.tui.commands import SLASH_COMMAND_COMPLETIONS
 from daita.tui.app import DaitaApp
 from daita.tui.controller import PresentationController
@@ -52,6 +65,7 @@ from _mcp_fixtures import (
 )
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 class _MCPBatchProvider:
@@ -133,7 +147,9 @@ class _BlockingCallTimeInspection:
         payload = json.loads(request.content)
         if payload.get("method") == "tools/list":
             self._list_count += 1
-            if self._list_count == 3:
+            # Attach inspects once; M3 open is network-free, so the second list
+            # request is the exact call-time inspection.
+            if self._list_count == 2:
                 self.started.set()
                 await self.release.wait()
         return await self._transport(request)
@@ -145,6 +161,63 @@ def _error_code(result: ToolResultBlock) -> str:
     code = error["code"]
     assert isinstance(code, str)
     return code
+
+
+def _mcp_limit_binding(
+    template: MCPServerBinding,
+    *,
+    identity: int,
+    tool_count: int,
+    binding_id: str | None = None,
+    revision: int = 1,
+) -> MCPServerBinding:
+    resolved_binding_id = binding_id or f"mcp-binding-{identity:032x}"
+    template_tool = template.tools[0]
+    tools = tuple(
+        replace(
+            template_tool,
+            capability_id=(
+                "mcp.read:sha256:"
+                + sha256(
+                    f"{resolved_binding_id}\x00{index}".encode("utf-8")
+                ).hexdigest()
+            ),
+            executor_id=f"mcp.executor:{resolved_binding_id}",
+            local_name=f"mcp_limit_{identity}_{index}",
+            remote_name=f"limit/{identity}/{index}",
+        )
+        for index in range(tool_count)
+    )
+    return replace(
+        template,
+        binding_id=resolved_binding_id,
+        tools=tools,
+        revision=revision,
+    )
+
+
+async def _mcp_limit_agent(tmp_path, name: str):
+    alpha, _beta = conformance_identities()
+    factory = StreamableHTTPMCPClientFactory(
+        http_transport=httpx.MockTransport(MCPConformanceTransport(alpha))
+    )
+    agent = await Agent.create(
+        name,
+        root=tmp_path,
+        clock=lambda: NOW,
+        mcp_client_factory=factory,
+    )
+    status = await agent.attach_mcp_server(
+        endpoint=alpha.endpoint,
+        selections=(
+            MCPToolSelection(
+                remote_name="lookup",
+                local_alias="lookup",
+                description="Read the admitted alpha fixture value.",
+            ),
+        ),
+    )
+    return agent, status.binding
 
 
 async def _attach_two_bindings(tmp_path):
@@ -229,6 +302,7 @@ async def test_multi_binding_reopen_executes_through_normal_runtime_and_transcri
         clock=lambda: NOW,
         model=provider,
         model_profile=provider.model_profile,
+        limits=EAGER_LIMITS,
         secret_provider=secrets,
         mcp_client_factory=factory,
     )
@@ -262,6 +336,313 @@ async def test_multi_binding_reopen_executes_through_normal_runtime_and_transcri
         assert "untrusted" in repr(second_request.messages).lower()
     finally:
         await reopened.close()
+
+
+async def test_m3_open_status_and_close_are_network_free_until_exact_call(tmp_path):
+    alpha, _beta = conformance_identities()
+    factory = StreamableHTTPMCPClientFactory(
+        http_transport=httpx.MockTransport(MCPConformanceTransport(alpha))
+    )
+    agent = await Agent.create(
+        "mcp-lazy-open",
+        root=tmp_path,
+        clock=lambda: NOW,
+        mcp_client_factory=factory,
+    )
+    status = await agent.attach_mcp_server(
+        endpoint=alpha.endpoint,
+        local_label="Alpha fixture",
+        selections=(
+            MCPToolSelection(
+                remote_name="lookup",
+                local_alias="lookup",
+                description="Read the explicitly admitted fixture value.",
+                summary="Look up an admitted Alpha fixture value.",
+                when_to_use="Use only for the approved Alpha fixture lookup.",
+                keywords=("alpha", "fixture", "lookup"),
+                exposure_class=ToolExposureClass.STANDARD,
+                eager_priority=321,
+            ),
+        ),
+    )
+    await agent.close()
+    requests_after_attach = tuple(alpha.request_methods)
+
+    reopened = await Agent.open(
+        "mcp-lazy-open",
+        root=tmp_path,
+        clock=lambda: NOW,
+        mcp_client_factory=factory,
+    )
+    try:
+        assert tuple(alpha.request_methods) == requests_after_attach
+        (current,) = await reopened.list_mcp_servers()
+        assert current.binding.binding_id == status.binding.binding_id
+        assert current.binding.local_label == "Alpha fixture"
+        assert current.binding.tools[0].discovery.summary.startswith("Look up")
+        assert (
+            current.binding.tools[0].discovery.exposure_class
+            is ToolExposureClass.STANDARD
+        )
+        assert current.binding.tools[0].discovery.eager_priority == 321
+        assert current.active_in_runtime
+        (activated,) = tuple(reopened._embedded._mcp_activated_bindings.values())
+        assert activated.executor.client is None
+        assert tuple(alpha.request_methods) == requests_after_attach
+    finally:
+        await reopened.close()
+    assert tuple(alpha.request_methods) == requests_after_attach
+
+
+async def test_mcp_storage_caps_active_tools_per_agent_and_excludes_inactive(
+    tmp_path,
+):
+    agent, template = await _mcp_limit_agent(tmp_path, "mcp-active-tool-limit")
+    store = agent._embedded._store
+    try:
+        first = _mcp_limit_binding(
+            template,
+            identity=1,
+            tool_count=128,
+            binding_id=template.binding_id,
+            revision=2,
+        )
+        first = await store.store_mcp_binding(first, expected_revision=1)
+        second = await store.store_mcp_binding(
+            _mcp_limit_binding(template, identity=2, tool_count=128),
+            expected_revision=None,
+        )
+        third = await store.store_mcp_binding(
+            _mcp_limit_binding(template, identity=3, tool_count=128),
+            expected_revision=None,
+        )
+        assert (
+            sum(
+                len(binding.tools)
+                for binding in await store.list_mcp_bindings(agent.id)
+                if binding.state is MCPBindingState.ACTIVE
+            )
+            == MCP_MAX_ACTIVE_TOOLS_PER_AGENT
+        )
+
+        fourth = _mcp_limit_binding(template, identity=4, tool_count=1)
+        with pytest.raises(MCPAdmissionError) as raised:
+            await store.store_mcp_binding(fourth, expected_revision=None)
+        assert raised.value.code == "mcp_agent_tool_limit_exceeded"
+        assert dict(raised.value.details) == {
+            "observed_tools": MCP_MAX_ACTIVE_TOOLS_PER_AGENT + 1,
+            "maximum_tools": MCP_MAX_ACTIVE_TOOLS_PER_AGENT,
+        }
+        assert await store.load_mcp_binding(agent.id, fourth.binding_id) is None
+
+        revoked_third = third.revoke(revoked_at=NOW)
+        await store.store_mcp_binding(
+            revoked_third,
+            expected_revision=third.revision,
+        )
+        fourth = await store.store_mcp_binding(
+            _mcp_limit_binding(template, identity=4, tool_count=128),
+            expected_revision=None,
+        )
+
+        reactivated_third = replace(
+            revoked_third,
+            state=MCPBindingState.ACTIVE,
+            revision=revoked_third.revision + 1,
+            revoked_at=None,
+        )
+        with pytest.raises(MCPAdmissionError):
+            await store.store_mcp_binding(
+                reactivated_third,
+                expected_revision=revoked_third.revision,
+            )
+        assert (
+            await store.load_mcp_binding(agent.id, third.binding_id)
+        ) == revoked_third
+
+        stale_second = second.checked(observed_at=NOW, stale_reason="test drift")
+        await store.store_mcp_binding(stale_second, expected_revision=second.revision)
+        await store.store_mcp_binding(
+            reactivated_third,
+            expected_revision=revoked_third.revision,
+        )
+        bindings = await store.list_mcp_bindings(agent.id)
+        assert (
+            sum(
+                len(binding.tools)
+                for binding in bindings
+                if binding.state is MCPBindingState.ACTIVE
+            )
+            == MCP_MAX_ACTIVE_TOOLS_PER_AGENT
+        )
+        assert fourth in bindings
+        assert stale_second in bindings
+    finally:
+        await agent.close()
+
+
+async def test_concurrent_mcp_admission_cannot_cross_the_agent_tool_limit(tmp_path):
+    agent, template = await _mcp_limit_agent(tmp_path, "mcp-concurrent-tool-limit")
+    store = agent._embedded._store
+    try:
+        await store.store_mcp_binding(
+            _mcp_limit_binding(
+                template,
+                identity=1,
+                tool_count=127,
+                binding_id=template.binding_id,
+                revision=2,
+            ),
+            expected_revision=1,
+        )
+        for identity in (2, 3):
+            await store.store_mcp_binding(
+                _mcp_limit_binding(template, identity=identity, tool_count=128),
+                expected_revision=None,
+            )
+        candidates = tuple(
+            _mcp_limit_binding(template, identity=identity, tool_count=1)
+            for identity in (4, 5)
+        )
+
+        results = await asyncio.gather(
+            *(
+                store.store_mcp_binding(candidate, expected_revision=None)
+                for candidate in candidates
+            ),
+            return_exceptions=True,
+        )
+
+        assert sum(isinstance(result, MCPServerBinding) for result in results) == 1
+        errors = tuple(
+            result for result in results if isinstance(result, MCPAdmissionError)
+        )
+        assert len(errors) == 1
+        assert errors[0].code == "mcp_agent_tool_limit_exceeded"
+        bindings = await store.list_mcp_bindings(agent.id)
+        assert (
+            sum(
+                len(binding.tools)
+                for binding in bindings
+                if binding.state is MCPBindingState.ACTIVE
+            )
+            == MCP_MAX_ACTIVE_TOOLS_PER_AGENT
+        )
+    finally:
+        await agent.close()
+
+
+async def test_mcp_storage_enforces_per_binding_and_agent_aggregate_bounds(tmp_path):
+    alpha, _beta = conformance_identities()
+    factory = StreamableHTTPMCPClientFactory(
+        http_transport=httpx.MockTransport(MCPConformanceTransport(alpha))
+    )
+    agent = await Agent.create(
+        "mcp-m3-storage-byte-bounds",
+        root=tmp_path,
+        clock=lambda: NOW,
+        mcp_client_factory=factory,
+    )
+    status = await agent.attach_mcp_server(
+        endpoint=alpha.endpoint,
+        selections=(
+            MCPToolSelection(
+                remote_name="lookup",
+                local_alias="lookup",
+                description="Read the admitted alpha fixture value.",
+            ),
+        ),
+    )
+    state_path = agent.home / "state.db"
+    agent_id = agent.id
+    await agent.close()
+
+    discovery = ToolDiscoveryMetadata(
+        summary="Bounded storage pressure tool.",
+        when_to_use="Use only to validate the persisted aggregate byte gates.",
+        keywords=("bounded", "storage", "pressure"),
+        exposure_class=ToolExposureClass.DEFERRED,
+        eager_priority=0,
+    )
+
+    def encoded_binding(filler_characters: int) -> str:
+        tools = []
+        for index in range(128):
+            schema = FrozenJsonObject.from_mapping(
+                {
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "type": "string",
+                            "description": "x" * filler_characters,
+                        }
+                    },
+                    "additionalProperties": False,
+                }
+            )
+            digest = (
+                "sha256:" + sha256(canonical_json(schema).encode("utf-8")).hexdigest()
+            )
+            tools.append(
+                MCPToolBinding(
+                    capability_id=f"mcp.pressure.capability.{index}",
+                    executor_id="mcp.pressure.executor",
+                    local_name=f"pressure_{index}",
+                    remote_name=f"pressure/{index}",
+                    description="One bounded persisted storage pressure tool.",
+                    discovery=discovery,
+                    input_schema=schema,
+                    input_schema_digest=digest,
+                    output_schema=None,
+                    output_schema_digest=None,
+                    result_sensitivity=ModelSensitivity.INTERNAL,
+                )
+            )
+        return encode_mcp_binding(replace(status.binding, tools=tuple(tools)))
+
+    encoded = next(
+        candidate
+        for filler in range(6_000, 8_001, 100)
+        if 950 * 1_024
+        <= len(candidate := encoded_binding(filler).encode("utf-8"))
+        <= 1 * 1_024 * 1_024
+    ).decode("utf-8")
+    encoded_bytes = len(encoded.encode("utf-8"))
+    assert encoded_bytes <= 1 * 1_024 * 1_024
+    assert encoded_bytes * 9 > 8 * 1_024 * 1_024
+
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("DELETE FROM mcp_server_bindings")
+        oversized = encoded + " " * (1 * 1_024 * 1_024 - encoded_bytes + 1)
+        connection.execute(
+            "INSERT INTO mcp_server_bindings(agent_id, binding_id, data) VALUES (?, ?, ?)",
+            (agent_id, "mcp-binding-" + "a" * 32, oversized),
+        )
+    with pytest.raises(StateCompatibilityError) as per_binding:
+        await SQLiteStateStore.open(state_path, clock=lambda: NOW)
+    assert per_binding.value.code is StateCompatibilityCode.DAMAGED
+
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("DELETE FROM mcp_server_bindings")
+        for index in range(4):
+            connection.execute(
+                "INSERT INTO mcp_server_bindings(agent_id, binding_id, data) VALUES (?, ?, ?)",
+                (agent_id, f"mcp-binding-{index + 1:032x}", encoded),
+            )
+    with pytest.raises(StateCompatibilityError) as active_tools:
+        await SQLiteStateStore.open(state_path, clock=lambda: NOW)
+    assert active_tools.value.code is StateCompatibilityCode.DAMAGED
+
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("DELETE FROM mcp_server_bindings")
+        for index in range(9):
+            connection.execute(
+                "INSERT INTO mcp_server_bindings(agent_id, binding_id, data) VALUES (?, ?, ?)",
+                (agent_id, f"mcp-binding-{index + 1:032x}", encoded),
+            )
+    with pytest.raises(StateCompatibilityError) as aggregate:
+        await SQLiteStateStore.open(state_path, clock=lambda: NOW)
+    assert aggregate.value.code is StateCompatibilityCode.DAMAGED
 
 
 async def test_existing_binding_identity_cannot_be_redirected_to_another_server(
@@ -447,6 +828,7 @@ async def test_mcp_management_groups_legacy_bindings_by_server(tmp_path):
     )
     first = await agent.attach_mcp_server(
         endpoint=identity.endpoint,
+        local_label="Context Docs",
         selections=(
             MCPToolSelection(
                 remote_name="query-docs",
@@ -457,6 +839,7 @@ async def test_mcp_management_groups_legacy_bindings_by_server(tmp_path):
     )
     second = await agent.attach_mcp_server(
         endpoint=identity.endpoint,
+        local_label="Context Docs",
         selections=(
             MCPToolSelection(
                 remote_name="resolve-library-id",
@@ -485,7 +868,7 @@ async def test_mcp_management_groups_legacy_bindings_by_server(tmp_path):
         summary = str(app.screen.query_one("#mcp-summary", Static).content)
         body = str(app.screen.query_one("#mcp-body", Static).content)
         assert summary == "1 server  ·  2 tools"
-        assert "Context Fixture 4.0.1  ·  Ready" in body
+        assert "Context Docs 4.0.1  ·  Accepted (validated at call)" in body
         assert "query-docs" in body
         assert "resolve-library-id" in body
         assert first.binding.binding_id not in body
@@ -633,7 +1016,7 @@ async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_pa
         assert isinstance(picker, SelectionScreen)
         listing = picker.query_one("#picker-options", OptionList)
         prompt = str(listing.get_option_at_index(0).prompt)
-        assert "Context Fixture" in prompt
+        assert "MCP guided-mcp.fixture.test" in prompt
         assert "query-docs" in prompt
         assert attached.binding.binding_id not in prompt
         listing.highlighted = 0
@@ -658,7 +1041,7 @@ async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_pa
         confirmation = app.screen
         assert isinstance(confirmation, ConfirmScreen)
         message = str(confirmation.query_one("#confirm-message", Static).content)
-        assert "Context Fixture" in message
+        assert "MCP guided-mcp.fixture.test" in message
         assert "query-docs" in message
         assert attached.binding.binding_id not in message
         await pilot.press("y")
@@ -744,6 +1127,7 @@ async def test_revocation_after_frozen_context_blocks_io_and_is_binding_isolated
         clock=lambda: NOW,
         model=provider,
         model_profile=provider.model_profile,
+        limits=EAGER_LIMITS,
         secret_provider=secrets,
         mcp_client_factory=factory,
     )
@@ -764,7 +1148,7 @@ async def test_revocation_after_frozen_context_blocks_io_and_is_binding_isolated
             if isinstance(block, ToolResultBlock)
         )
         assert [block.call_id for block in blocks] == ["revoked-call", "sibling-call"]
-        assert _error_code(blocks[0]) == "tool_not_available"
+        assert _error_code(blocks[0]) == "mcp_binding_unavailable"
         assert not blocks[1].is_error
         assert len(alpha.calls) == before_alpha_calls
         assert beta.calls[-1] == ("lookup", {"id": 9})
@@ -814,6 +1198,7 @@ async def test_revocation_serializes_with_call_time_inspection(tmp_path):
         clock=lambda: NOW,
         model=provider,
         model_profile=provider.model_profile,
+        limits=EAGER_LIMITS,
         mcp_client_factory=factory,
     )
     try:
@@ -870,7 +1255,9 @@ async def test_schema_drift_is_unavailable_until_explicit_refresh_and_reopen(tmp
             status.binding.binding_id: status
             for status in await drifted.list_mcp_servers()
         }
-        assert not by_id[beta_status.binding.binding_id].active_in_runtime
+        # M3 composes the accepted revision without network I/O at open. Drift
+        # is detected by explicit refresh below and by exact call-time checks.
+        assert by_id[beta_status.binding.binding_id].active_in_runtime
         refreshed = await drifted.refresh_mcp_server(beta_status.binding.binding_id)
         assert refreshed.binding.state is MCPBindingState.STALE
         assert refreshed.binding.stale_reason == "tool_schema_changed:lookup"
@@ -955,6 +1342,7 @@ async def test_public_outbound_and_call_time_auth_use_current_admission(tmp_path
         clock=lambda: NOW,
         model=provider,
         model_profile=provider.model_profile,
+        limits=EAGER_LIMITS,
         secret_provider=secrets,
         mcp_client_factory=factory,
     )
@@ -1035,6 +1423,7 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
         clock=lambda: NOW,
         model=provider,
         model_profile=provider.model_profile,
+        limits=EAGER_LIMITS,
         mcp_client_factory=factory,
     )
     try:
@@ -1096,6 +1485,7 @@ async def test_host_close_waits_for_remote_call_then_closes_mcp_client(tmp_path)
         clock=lambda: NOW,
         model=provider,
         model_profile=provider.model_profile,
+        limits=EAGER_LIMITS,
         mcp_client_factory=factory,
     )
     activated = tuple(reopened._embedded._mcp_activated_bindings.values())
@@ -1150,6 +1540,7 @@ async def test_oversized_remote_result_becomes_one_bounded_transcript_error(tmp_
         clock=lambda: NOW,
         model=provider,
         model_profile=provider.model_profile,
+        limits=EAGER_LIMITS,
         mcp_client_factory=factory,
     )
     try:

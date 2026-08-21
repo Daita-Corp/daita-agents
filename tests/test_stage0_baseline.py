@@ -32,7 +32,14 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
 from daita.loop import LoopExitKind
 from daita.loop.models import RunInput
-from _capability_runtime_support import StaticTestDomain, static_registry
+from _capability_runtime_support import (
+    StaticTestDomain,
+    context_step_projection,
+    context_tool_catalog,
+    execute_projected,
+    static_registry,
+    discovery_metadata,
+)
 
 NOW = datetime(2026, 8, 18, tzinfo=UTC)
 
@@ -45,8 +52,14 @@ async def _prepared_request(
     *,
     step: int,
 ) -> ModelRequest:
-    snapshot = await builder.prepare(run, messages, tools)
-    return builder.project(snapshot, messages, step=step)
+    catalog = context_tool_catalog(run, tools)
+    snapshot = await builder.prepare(run, messages, catalog)
+    return builder.project(
+        snapshot,
+        messages,
+        step=step,
+        tool_context=context_step_projection(catalog),
+    )
 
 
 class _ClassifiedExecutor:
@@ -247,6 +260,7 @@ async def test_validated_capability_classification_reaches_result_envelope():
         name="stage0_classified",
         capability_id=capability.id,
         description="Return one classified value.",
+        discovery=discovery_metadata(),
     )
     domain = StaticTestDomain((capability,), (view,))
     runtime = CapabilityRuntime(
@@ -260,7 +274,8 @@ async def test_validated_capability_classification_reaches_result_envelope():
         created_at=NOW,
     )
 
-    outcome = await runtime.execute_all(
+    outcome = await execute_projected(
+        runtime,
         run,
         (
             ToolCall(

@@ -27,11 +27,7 @@ from .source_permissions import (
     encode_postgresql_update_scope,
     encode_source_read_scope,
 )
-from .sources import (
-    decode_preledger_source,
-    decode_source,
-    encode_source,
-)
+from .sources import decode_source, encode_source
 from .transcripts import (
     decode_loop_exit,
     decode_message,
@@ -50,7 +46,6 @@ __all__ = [
     "decode_loop_exit",
     "decode_mcp_binding",
     "decode_message",
-    "decode_preledger_source",
     "decode_postgresql_update_scope",
     "decode_receipt",
     "decode_review_stamps",

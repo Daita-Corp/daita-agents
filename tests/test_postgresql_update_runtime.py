@@ -34,7 +34,12 @@ from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite import DatabaseWriteOutcome, SQLiteStateStore
-from _capability_runtime_support import StaticTestDomain, static_registry
+from _capability_runtime_support import (
+    StaticTestDomain,
+    discovery_metadata,
+    execute_projected,
+    static_registry,
+)
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 SOURCE_ID = source_registration_id(
@@ -502,6 +507,7 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         name="test_update",
         capability_id=capability.id,
         description=capability.description,
+        discovery=discovery_metadata(),
     )
     domain = StaticTestDomain(
         (capability,),
@@ -521,10 +527,10 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         conversation_id="conversation-runtime-update",
     )
     call = ToolCall(id="call-runtime-update", name="test_update", arguments={})
-    outcome = await runtime.execute_all(
+    outcome = await execute_projected(
+        runtime,
         run,
         (call,),
-        sensitivity=ModelSensitivity.INTERNAL,
     )
     (result,) = outcome.ordered_results
 

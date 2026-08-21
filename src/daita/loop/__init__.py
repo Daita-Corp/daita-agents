@@ -16,6 +16,7 @@ from .models import (
     ToolBatchCertainty,
     ToolBatchInterruption,
     ToolBatchOutcome,
+    ToolProjectionMode,
     Transcript,
 )
 
@@ -31,6 +32,7 @@ __all__ = [
     "ToolBatchCertainty",
     "ToolBatchInterruption",
     "ToolBatchOutcome",
+    "ToolProjectionMode",
     "ToolRuntime",
     "Transcript",
     "TranscriptStore",

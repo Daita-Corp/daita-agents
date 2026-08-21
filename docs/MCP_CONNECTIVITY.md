@@ -20,13 +20,22 @@ results are untrusted data and never create authorization.
   projection. Other or nested `$schema` declarations, unsupported keywords,
   and `$ref` are rejected.
 - Text content and optional structured JSON-object results only.
-- At most 32 independently keyed bindings per agent, 64 discovered tools per
-  server, four discovery pages, and fixed request, response, nesting, and
-  result limits.
-- By default, one run may project at most 64 tools and 128 KiB of aggregate
-  model-visible tool names, local descriptions, and input schemas across all
-  native and MCP domains. The run fails before context construction or model
-  egress when either configured outer limit is exceeded.
+- At most 32 independently keyed bindings per agent, 256 inspected tools per
+  server, 128 admitted tools per binding, and 384 active admitted MCP tools in
+  aggregate per agent. Stale and revoked bindings do not consume the active-tool
+  allowance. Four discovery pages, 1 MiB per binding aggregate, 8 MiB of binding
+  aggregates per agent, and fixed request, response, nesting, and result limits
+  remain independently enforced.
+- One run catalog admits at most 512 applicable tools and 2 MiB of canonical
+  catalog material. Its compact domain manifest is separately bounded to 64
+  entries, 16 KiB, 4,000 estimated tokens, and five percent of the model's
+  maximum input.
+- One provider request admits at most 64 direct/control definitions and 128
+  KiB of canonical definition material. `AUTO` is the default: core tools are
+  direct, standard tools fill a 48-tool/96-KiB soft budget, and deferred tools
+  are reached through fixed `tool_search`, `tool_describe`, and `tool_call`
+  controls. Every applicable tool remains present exactly once in the run
+  catalog.
 
 Stdio, OAuth, dynamic client registration, sampling, roots, prompts,
 resources, subscriptions, server-initiated requests, binary content, arbitrary
@@ -52,18 +61,23 @@ for tool in inspection.tools:
 ```
 
 Attach only exact tools that an operator has independently established are
-read only. The local alias and description are code-owned admission data; a
-remote description is not copied into the model's tool definition.
+read only. The local server label, alias, description, summary, use guidance,
+keywords, exposure, and priority are trusted admission data; a remote server
+name or description is not copied into the trusted search corpus.
 
 ```python
 status = await agent.attach_mcp_server(
     endpoint=inspection.endpoint,
+    local_label="Reference service",
     authentication=MCPAuthentication.no_auth(),
     selections=(
         MCPToolSelection(
             remote_name="lookup",
             local_alias="reference_lookup",
             description="Look up a reference record by its exact identifier.",
+            summary="Look up one admitted reference record.",
+            when_to_use="Use for an exact identifier lookup in the reference service.",
+            keywords=("reference", "identifier", "lookup"),
         ),
     ),
 )
@@ -72,9 +86,11 @@ print(status.binding.binding_id, status.reopen_required)
 ```
 
 An attached or refreshed binding becomes a static capability only on the next
-controlled `Agent.open`. This preserves one immutable registry for each open
-agent. Local tool names include a binding-derived namespace, so identical
-remote names on different servers cannot collide.
+controlled `Agent.open`. Open reconstructs declarations entirely from the
+accepted aggregate without network I/O or secret resolution; the remote client
+is created lazily at the first exact call. This preserves one immutable
+registry for each open agent. Local tool names include a binding-derived
+namespace, so identical remote names on different servers cannot collide.
 
 For bearer authentication, persist only a reference to an environment or
 keychain secret:
@@ -104,10 +120,11 @@ daita mcp revoke <agent> <binding-id> --yes
 ```
 
 In the TUI, `/mcp` opens the server-oriented MCP manager. It groups independently
-keyed bindings with the same server identity and endpoint for presentation, so
+keyed bindings with the same trusted local label and endpoint for presentation, so
 older one-tool bindings appear as one server without being merged or rewritten.
-The primary statuses are `Ready`, `Restart required`, `Needs refresh`, and
-`Revoked`; internal binding IDs and protocol details are not part of the normal
+The primary statuses are `Accepted (validated at call)`, `Restart required`,
+`Needs refresh`, and `Revoked`; accepted does not claim a network check happened
+at open. Internal binding IDs and protocol details are not part of the normal
 management flow.
 
 Choose **Add server** (or run `/mcp add`) for the guided no-auth path:
@@ -155,7 +172,8 @@ retry the remote call.
 Refresh records a new active or stale revision and requires another controlled
 open before execution. Revocation is binding-local and immediately removes
 that revision's authority while sibling bindings remain usable. Agent close
-waits for in-flight binding work and closes every activated remote client.
+waits for in-flight binding work and closes only clients that were actually
+initialized; a never-used binding owns no transport resource.
 
 All successful remote results receive code-owned provenance containing the
 binding and revision, exact remote tool identity, schema digests, call

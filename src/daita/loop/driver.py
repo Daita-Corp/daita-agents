@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Protocol, TypeVar
 
-from .._json import FrozenJsonObject, canonical_json
+from .._json import FrozenJsonObject
 from ..artifacts.models import (
     ArtifactDeliveryReceipt,
     ArtifactRef,
@@ -21,6 +21,8 @@ from ..llm.errors import (
     ModelProviderError,
     ProviderErrorCode,
     RequestSensitivityUnavailable,
+    ToolCatalogLimitExceeded,
+    ToolManifestLimitExceeded,
     ToolSurfaceLimitExceeded,
 )
 from ..llm.models import (
@@ -36,7 +38,6 @@ from ..llm.models import (
     ModelUsage,
     TextBlock,
     ToolCall,
-    ToolDefinition,
     ToolResultBlock,
 )
 from ..llm.pricing import (
@@ -77,7 +78,7 @@ class ContextBuilder(Protocol):
         self,
         run: RunInput,
         messages: tuple[CanonicalMessage, ...],
-        tools: tuple[ToolDefinition, ...],
+        tool_context: object,
     ) -> object: ...
 
     def project(
@@ -86,19 +87,27 @@ class ContextBuilder(Protocol):
         messages: tuple[CanonicalMessage, ...],
         *,
         step: int,
+        tool_context: object,
         final: bool = False,
         previous_request_input_tokens: int | None = None,
     ) -> ModelRequest: ...
 
 
 class ToolRuntime(Protocol):
-    async def definitions(self, run: RunInput) -> tuple[ToolDefinition, ...]: ...
+    async def prepare_run(self, run: RunInput) -> object: ...
+
+    def project(
+        self,
+        catalog: object,
+        messages: tuple[CanonicalMessage, ...],
+    ) -> object: ...
 
     async def execute_all(
         self,
         run: RunInput,
         calls: tuple[ToolCall, ...],
         *,
+        projection: object,
         sensitivity: ModelSensitivity,
     ) -> ToolBatchOutcome:
         """Return one ordered, cancellation-safe outcome for the whole batch."""
@@ -248,13 +257,10 @@ class AgentLoop:
             messages = (*messages, user)
             started = asyncio.get_running_loop().time()
             deadline = started + self._limits.max_wall_time_seconds
-            definitions = _bounded_tool_definitions(
-                await _before(deadline, self._tools.definitions(run)),
-                self._limits,
-            )
+            tool_catalog = await _before(deadline, self._tools.prepare_run(run))
             context_snapshot = await _before(
                 deadline,
-                self._context_builder.prepare(run, messages, definitions),
+                self._context_builder.prepare(run, messages, tool_catalog),
             )
             for step in range(1, self._limits.max_steps + 1):
                 if self._wall_time_exhausted(started):
@@ -268,10 +274,15 @@ class AgentLoop:
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
                     )
+                step_tool_projection = self._tools.project(
+                    tool_catalog,
+                    messages[current_start:],
+                )
                 request = self._context_builder.project(
                     context_snapshot,
                     messages[current_start:],
                     step=step,
+                    tool_context=step_tool_projection,
                     previous_request_input_tokens=previous_request_input_tokens,
                 )
                 if run_route is None:
@@ -405,6 +416,7 @@ class AgentLoop:
                     self._tools.execute_all(
                         run,
                         response.tool_calls,
+                        projection=step_tool_projection,
                         sensitivity=request.sensitivity,
                     ),
                     response.tool_calls,
@@ -486,6 +498,7 @@ class AgentLoop:
                         deadline,
                         run_started,
                         context_snapshot,
+                        step_tool_projection,
                         previous_request_input_tokens,
                         run_route,
                         artifacts=tuple(artifacts),
@@ -501,6 +514,7 @@ class AgentLoop:
                 deadline,
                 run_started,
                 context_snapshot,
+                step_tool_projection,
                 previous_request_input_tokens,
                 run_route,
                 artifacts=tuple(artifacts),
@@ -562,6 +576,28 @@ class AgentLoop:
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
             )
+        except ToolCatalogLimitExceeded:
+            return await self._finish(
+                run,
+                LoopExitKind.FAILED,
+                "tool_catalog_limit_exceeded",
+                _completed_steps(messages[current_start:]),
+                usage,
+                run_started,
+                artifacts=tuple(artifacts),
+                artifact_deliveries=tuple(artifact_deliveries),
+            )
+        except ToolManifestLimitExceeded:
+            return await self._finish(
+                run,
+                LoopExitKind.FAILED,
+                "tool_manifest_limit_exceeded",
+                _completed_steps(messages[current_start:]),
+                usage,
+                run_started,
+                artifacts=tuple(artifacts),
+                artifact_deliveries=tuple(artifact_deliveries),
+            )
         except RequestSensitivityUnavailable:
             return await self._finish(
                 run,
@@ -608,6 +644,7 @@ class AgentLoop:
         deadline: float,
         run_started: float,
         context_snapshot: object,
+        tool_context: object,
         previous_request_input_tokens: int | None,
         run_route: object | None,
         *,
@@ -629,6 +666,7 @@ class AgentLoop:
             context_snapshot,
             messages,
             step=steps + 1,
+            tool_context=tool_context,
             final=True,
             previous_request_input_tokens=previous_request_input_tokens,
         )
@@ -986,38 +1024,6 @@ class AgentLoop:
             if estimate.amount_usd >= cost_limit:
                 return "cost_limit_reached"
         return None
-
-
-def _bounded_tool_definitions(
-    definitions: tuple[ToolDefinition, ...],
-    limits: LoopLimits,
-) -> tuple[ToolDefinition, ...]:
-    definitions = tuple(definitions)
-    if any(not isinstance(item, ToolDefinition) for item in definitions):
-        raise TypeError("tool runtime definitions must contain ToolDefinition records")
-    definition_bytes = len(
-        canonical_json(
-            [
-                {
-                    "name": item.name,
-                    "description": item.description,
-                    "input_schema": item.input_schema,
-                }
-                for item in definitions
-            ]
-        ).encode("utf-8")
-    )
-    if (
-        len(definitions) > limits.max_projected_tools
-        or definition_bytes > limits.max_projected_tool_definition_bytes
-    ):
-        raise ToolSurfaceLimitExceeded(
-            observed_tools=len(definitions),
-            maximum_tools=limits.max_projected_tools,
-            observed_definition_bytes=definition_bytes,
-            maximum_definition_bytes=limits.max_projected_tool_definition_bytes,
-        )
-    return definitions
 
 
 def _assistant_message(response: ModelResponse) -> CanonicalMessage:

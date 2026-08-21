@@ -7,16 +7,32 @@ from dataclasses import replace
 
 from daita._json import FrozenJsonObject
 from daita.capabilities import (
+    AccessMode,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
     ToolExecution,
+    ToolDiscoveryMetadata,
+    ToolExposureClass,
     ToolOutput,
     ToolView,
 )
-from daita.capability_runtime import CapabilityFailure, SideEffectPlan
-from daita.llm.models import ModelSensitivity, ToolCall
+from daita.capability_runtime import (
+    CapabilityFailure,
+    DomainToolManifestEntry,
+    RunToolCatalog,
+    RunToolCatalogEntry,
+    SideEffectPlan,
+    StepToolProjection,
+    ToolInvocationMode,
+)
+from daita.llm.models import (
+    CanonicalMessage,
+    ModelSensitivity,
+    ToolCall,
+    ToolDefinition,
+)
 from daita.loop.models import RunInput
 
 
@@ -115,4 +131,113 @@ def static_registry(
     return CapabilityRegistry(
         declarations=(domain.declarations,),
         executors=executors,
+    )
+
+
+def discovery_metadata(
+    *,
+    exposure_class: ToolExposureClass = ToolExposureClass.CORE,
+    priority: int = 500,
+) -> ToolDiscoveryMetadata:
+    return ToolDiscoveryMetadata(
+        summary="Trusted test capability.",
+        when_to_use="Use to exercise the declared test contract.",
+        keywords=("test",),
+        exposure_class=exposure_class,
+        eager_priority=priority,
+    )
+
+
+async def execute_projected(
+    runtime,
+    run: RunInput,
+    calls: tuple[ToolCall, ...],
+    *,
+    sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
+):
+    catalog = await runtime.prepare_run(run)
+    projection = runtime.project(catalog, ())
+    return await runtime.execute_all(
+        run,
+        calls,
+        projection=projection,
+        sensitivity=sensitivity,
+    )
+
+
+def context_tool_catalog(
+    run: RunInput,
+    definitions: tuple[ToolDefinition, ...],
+    *,
+    capability_ids: tuple[str, ...] | None = None,
+) -> RunToolCatalog:
+    definitions = tuple(definitions)
+    ids = capability_ids or tuple(f"test.{item.name}" for item in definitions)
+    if len(ids) != len(definitions):
+        raise ValueError("capability_ids must match definitions")
+    entries = tuple(
+        RunToolCatalogEntry(
+            view=ToolView(
+                name=definition.name,
+                capability_id=capability_id,
+                description=definition.description,
+                discovery=discovery_metadata(),
+            ),
+            capability=Capability(
+                id=capability_id,
+                description=definition.description,
+                input_schema=definition.input_schema,
+                output_kind="test.output",
+                output_schema={"type": "object", "properties": {}},
+                executor_id=f"{capability_id}.executor",
+                access_mode=AccessMode.READ,
+                side_effecting=False,
+            ),
+            domain_owner_id="test",
+            executor_id=f"{capability_id}.executor",
+            input_schema_digest="sha256:" + "1" * 64,
+            origin_revision_digest="sha256:" + "2" * 64,
+            invocation_mode=ToolInvocationMode.DIRECT,
+        )
+        for definition, capability_id in zip(definitions, ids, strict=True)
+    )
+    manifest = (
+        ()
+        if not entries
+        else (
+            DomainToolManifestEntry(
+                domain_owner_id="test",
+                summary="Applicable trusted test capabilities.",
+                direct_count=len(entries),
+                deferred_count=0,
+            ),
+        )
+    )
+    return RunToolCatalog(
+        run_id=run.id,
+        agent_id=run.agent_id,
+        execution_scope_digest="sha256:" + "3" * 64,
+        registry_digest="sha256:" + "4" * 64,
+        catalog_digest="sha256:" + "5" * 64,
+        entries=entries,
+        domain_manifest=manifest,
+        provider_definitions=definitions,
+        aggregate_bytes=1,
+        manifest_bytes=1,
+        manifest_token_limit=4_000,
+    )
+
+
+def context_step_projection(
+    catalog: RunToolCatalog,
+) -> StepToolProjection:
+    return StepToolProjection(
+        run_id=catalog.run_id,
+        catalog_digest=catalog.catalog_digest,
+        projection_digest="sha256:" + "6" * 64,
+        provider_definitions=catalog.provider_definitions,
+        catalog_entries=catalog.entries,
+        direct_resolution_entries=catalog.entries,
+        described_deferred_references=(),
+        described_schema_bytes=0,
     )

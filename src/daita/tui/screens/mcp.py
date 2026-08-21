@@ -28,7 +28,7 @@ from .selection import SelectionScreen
 class MCPServerGroup:
     """One presentation-only server group over independently keyed bindings."""
 
-    server_name: str
+    local_label: str
     server_version: str
     endpoint: str
     status_label: str
@@ -47,7 +47,7 @@ def mcp_binding_status_label(status: MCPBindingStatus) -> str:
     if status.reopen_required:
         return "Restart required"
     if status.active_in_runtime:
-        return "Ready"
+        return "Accepted (validated at call)"
     return "Unavailable"
 
 
@@ -58,25 +58,25 @@ def group_mcp_servers(
 
     grouped: dict[tuple[str, str], list[MCPBindingStatus]] = {}
     for status in statuses:
-        key = (status.binding.server_name, status.binding.endpoint)
+        key = (status.binding.local_label, status.binding.endpoint)
         grouped.setdefault(key, []).append(status)
 
     presentations: list[MCPServerGroup] = []
-    for (server_name, endpoint), members in grouped.items():
+    for (local_label, endpoint), members in grouped.items():
         ordered = tuple(sorted(members, key=lambda item: item.binding.binding_id))
         if any(member.binding.state is MCPBindingState.STALE for member in ordered):
             label = "Needs refresh"
         elif any(member.reopen_required for member in ordered):
             label = "Restart required"
         elif any(member.active_in_runtime for member in ordered):
-            label = "Ready"
+            label = "Accepted (validated at call)"
         elif all(member.binding.state is MCPBindingState.REVOKED for member in ordered):
             label = "Revoked"
         else:
             label = "Unavailable"
         presentations.append(
             MCPServerGroup(
-                server_name=server_name,
+                local_label=local_label,
                 server_version=ordered[0].binding.server_version,
                 endpoint=endpoint,
                 status_label=label,
@@ -106,7 +106,7 @@ def group_mcp_servers(
         sorted(
             presentations,
             key=lambda item: (
-                item.server_name.casefold(),
+                item.local_label.casefold(),
                 item.endpoint.casefold(),
             ),
         )
@@ -129,7 +129,7 @@ def render_mcp_servers(statuses: tuple[MCPBindingStatus, ...]) -> tuple[str, str
     summary = f"{len(groups)} {server_noun}  ·  {tool_count} {tool_noun}"
     blocks: list[str] = []
     for group in groups:
-        name = safe_display(group.server_name, fallback="Unknown server", maximum=256)
+        name = safe_display(group.local_label, fallback="MCP server", maximum=256)
         version = safe_display(group.server_version, fallback="", maximum=256)
         heading = name + (f" {version}" if version else "")
         lines = [
@@ -332,7 +332,7 @@ class MCPManagementScreen(ModalScreen[str | None]):
         accepted = await self.app._await_modal(  # type: ignore[attr-defined]
             ConfirmScreen(
                 "Revoke MCP access for "
-                + safe_display(binding.server_name, fallback="this server", maximum=256)
+                + safe_display(binding.local_label, fallback="this server", maximum=256)
                 + "?\n"
                 + safe_display(
                     binding.endpoint, fallback="endpoint unavailable", maximum=2_048
@@ -372,7 +372,7 @@ class MCPManagementScreen(ModalScreen[str | None]):
             PickerOption(
                 identity=status.binding.binding_id,
                 label=safe_display(
-                    status.binding.server_name,
+                    status.binding.local_label,
                     fallback="MCP server",
                     maximum=256,
                 )

@@ -15,6 +15,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .._installation import repair_guidance
 from .._json import FrozenJsonObject, canonical_json
+from ..capabilities import (
+    ToolDiscoveryMetadata,
+    ToolExposureClass,
+)
 from ..errors import DaitaError, ErrorRetryability
 from ..llm.models import ModelSensitivity
 from ..security import SecretProvider, SecretReference, SecretResolutionError
@@ -22,9 +26,13 @@ from ..security import SecretProvider, SecretReference, SecretResolutionError
 MCP_SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18")
 MCP_MAX_SCHEMA_BYTES = 64 * 1_024
 MCP_MAX_SCHEMA_DEPTH = 12
-MCP_MAX_DISCOVERED_TOOLS = 64
+MCP_MAX_DISCOVERED_TOOLS = 256
 MCP_MAX_DISCOVERY_PAGES = 4
+MCP_MAX_ADMITTED_TOOLS_PER_BINDING = 128
+MCP_MAX_BINDING_CANONICAL_BYTES = 1 * 1_024 * 1_024
+MCP_MAX_AGENT_CATALOG_BYTES = 8 * 1_024 * 1_024
 MCP_MAX_BINDINGS_PER_AGENT = 32
+MCP_MAX_ACTIVE_TOOLS_PER_AGENT = 384
 MCP_MAX_REQUEST_BYTES = 256 * 1_024
 MCP_MAX_RESPONSE_BYTES = 512 * 1_024
 MCP_MAX_RESULT_CONTENT_ITEMS = 32
@@ -151,6 +159,11 @@ class MCPToolSelection:
     remote_name: str
     local_alias: str
     description: str
+    summary: str | None = None
+    when_to_use: str | None = None
+    keywords: tuple[str, ...] = ()
+    exposure_class: ToolExposureClass = ToolExposureClass.DEFERRED
+    eager_priority: int = 0
     result_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
     read_only: bool = True
 
@@ -164,6 +177,18 @@ class MCPToolSelection:
                 "MCP local_alias must use lowercase letters, digits, and underscores"
             )
         _bounded_text(self.description, "MCP tool description", maximum=1_024)
+        summary = self.description if self.summary is None else self.summary
+        when_to_use = self.description if self.when_to_use is None else self.when_to_use
+        discovery = ToolDiscoveryMetadata(
+            summary=summary,
+            when_to_use=when_to_use,
+            keywords=self.keywords,
+            exposure_class=self.exposure_class,
+            eager_priority=self.eager_priority,
+        )
+        object.__setattr__(self, "summary", discovery.summary)
+        object.__setattr__(self, "when_to_use", discovery.when_to_use)
+        object.__setattr__(self, "keywords", discovery.keywords)
         if not isinstance(self.result_sensitivity, ModelSensitivity):
             raise TypeError("MCP result_sensitivity is invalid")
         if self.read_only is not True:
@@ -252,6 +277,7 @@ class MCPToolBinding:
     local_name: str
     remote_name: str
     description: str
+    discovery: ToolDiscoveryMetadata
     input_schema: FrozenJsonObject
     input_schema_digest: str
     output_schema: FrozenJsonObject | None
@@ -268,6 +294,8 @@ class MCPToolBinding:
             _bounded_text(value, label, maximum=maximum)
         if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", self.local_name) is None:
             raise ValueError("MCP local tool name is not provider-safe")
+        if not isinstance(self.discovery, ToolDiscoveryMetadata):
+            raise TypeError("MCP tool discovery metadata is required")
         _remote_tool_name(self.remote_name)
         if not isinstance(self.input_schema, FrozenJsonObject):
             object.__setattr__(
@@ -293,6 +321,7 @@ class MCPServerBinding:
     protocol_version: str
     server_name: str
     server_version: str
+    local_label: str
     maximum_outbound_sensitivity: ModelSensitivity
     tools: tuple[MCPToolBinding, ...]
     state: MCPBindingState
@@ -316,10 +345,11 @@ class MCPServerBinding:
             raise ValueError("MCP binding protocol version is unsupported")
         _server_identity(self.server_name, "MCP server name")
         _server_identity(self.server_version, "MCP server version")
+        _bounded_text(self.local_label, "MCP local server label", maximum=128)
         if not isinstance(self.maximum_outbound_sensitivity, ModelSensitivity):
             raise TypeError("MCP outbound sensitivity ceiling is invalid")
         tools = tuple(self.tools)
-        if not tools or len(tools) > MCP_MAX_DISCOVERED_TOOLS:
+        if not tools or len(tools) > MCP_MAX_ADMITTED_TOOLS_PER_BINDING:
             raise ValueError("MCP binding requires a bounded admitted tool set")
         for values, label in (
             ((tool.capability_id for tool in tools), "capability"),
@@ -1003,6 +1033,7 @@ def mcp_binding_from_inspection(
     maximum_outbound_sensitivity: ModelSensitivity,
     selections: tuple[MCPToolSelection, ...],
     inspection: MCPServerInspection,
+    local_label: str | None = None,
     prior: MCPServerBinding | None = None,
 ) -> MCPServerBinding:
     if prior is not None:
@@ -1028,6 +1059,16 @@ def mcp_binding_from_inspection(
                 },
             )
     selections = tuple(selections)
+    resolved_local_label = (
+        prior.local_label
+        if local_label is None and prior is not None
+        else (
+            _default_mcp_local_label(inspection.endpoint)
+            if local_label is None
+            else local_label
+        )
+    )
+    _bounded_text(resolved_local_label, "MCP local server label", maximum=128)
     if not selections:
         raise MCPAdmissionError(
             "mcp_allowlist_empty",
@@ -1077,6 +1118,13 @@ def mcp_binding_from_inspection(
                 local_name=local_name,
                 remote_name=selection.remote_name,
                 description=selection.description,
+                discovery=ToolDiscoveryMetadata(
+                    summary=cast(str, selection.summary),
+                    when_to_use=cast(str, selection.when_to_use),
+                    keywords=selection.keywords,
+                    exposure_class=selection.exposure_class,
+                    eager_priority=selection.eager_priority,
+                ),
                 input_schema=inspected.input_schema,
                 input_schema_digest=inspected.input_schema_digest,
                 output_schema=inspected.output_schema,
@@ -1094,6 +1142,7 @@ def mcp_binding_from_inspection(
         protocol_version=inspection.protocol_version,
         server_name=inspection.server_name,
         server_version=inspection.server_version,
+        local_label=resolved_local_label,
         maximum_outbound_sensitivity=maximum_outbound_sensitivity,
         tools=tuple(tools),
         state=MCPBindingState.ACTIVE,
@@ -1101,6 +1150,13 @@ def mcp_binding_from_inspection(
         admitted_at=admitted_at,
         last_checked_at=inspection.observed_at,
     )
+
+
+def _default_mcp_local_label(endpoint: str) -> str:
+    hostname = urlsplit(endpoint).hostname
+    if not hostname:
+        raise ValueError("MCP endpoint must have a hostname")
+    return f"MCP {hostname}"[:128]
 
 
 def mcp_binding_drift_reason(
@@ -1389,6 +1445,7 @@ __all__ = [
     "MCPTransportError",
     "MCPTransportKind",
     "MCP_SUPPORTED_PROTOCOL_VERSIONS",
+    "MCP_MAX_ACTIVE_TOOLS_PER_AGENT",
     "MCP_MAX_BINDINGS_PER_AGENT",
     "MCP_MAX_REQUEST_BYTES",
     "StreamableHTTPMCPClient",

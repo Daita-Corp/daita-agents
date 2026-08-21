@@ -24,6 +24,7 @@ from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
 from daita.storage.sqlite_codecs import encode_source_read_scope
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
+from _capability_runtime_support import execute_projected
 
 
 def _database(path: Path, *, future: bool = False) -> None:
@@ -296,10 +297,10 @@ async def test_runtime_denies_guessed_and_multi_resource_reads_before_io(
                 },
             ),
         )
-        results = await runtime.execute_all(
+        results = await execute_projected(
+            runtime,
             run,
             calls,
-            sensitivity=ModelSensitivity.INTERNAL,
         )
         errors = tuple(
             cast(Mapping[str, object], result.output["error"]) for result in results

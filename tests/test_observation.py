@@ -41,14 +41,15 @@ from daita.loop import (
     ToolBatchOutcome,
 )
 from daita.observation import AgentEvent, AgentEventKind
+from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 class TranscriptContext:
-    async def prepare(self, run, messages, tools):
+    async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tools
+        return messages[:-1], tool_context.provider_definitions
 
     def project(
         self,
@@ -56,10 +57,11 @@ class TranscriptContext:
         messages,
         *,
         step,
+        tool_context,
         final=False,
         previous_request_input_tokens=None,
     ):
-        del step, previous_request_input_tokens
+        del step, previous_request_input_tokens, tool_context
         static, tools = snapshot
         return ModelRequest(
             messages=(*static, *messages),
@@ -68,8 +70,8 @@ class TranscriptContext:
 
 
 class OverflowContext:
-    async def prepare(self, run, messages, tools):
-        del run, messages, tools
+    async def prepare(self, run, messages, tool_context):
+        del run, messages, tool_context
         raise ContextWindowExceeded
 
     def project(self, snapshot, messages, **kwargs):
@@ -80,18 +82,24 @@ class ScriptedTools:
     def __init__(self, outputs=None):
         self.outputs = outputs or {}
 
-    async def definitions(self, run):
-        del run
-        return (
-            ToolDefinition(
-                name="lookup",
-                description="read data",
-                input_schema={"type": "object", "properties": {}},
+    async def prepare_run(self, run):
+        return context_tool_catalog(
+            run,
+            (
+                ToolDefinition(
+                    name="lookup",
+                    description="read data",
+                    input_schema={"type": "object", "properties": {}},
+                ),
             ),
         )
 
-    async def execute_all(self, run, calls, *, sensitivity):
-        del run, sensitivity
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
         return ToolBatchOutcome(tuple(self.outputs[call.id] for call in calls))
 
 

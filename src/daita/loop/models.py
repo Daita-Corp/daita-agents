@@ -63,6 +63,12 @@ class RunInput:
             )
 
 
+class ToolProjectionMode(str, Enum):
+    AUTO = "auto"
+    EAGER = "eager"
+    DEFERRED = "deferred"
+
+
 @dataclass(frozen=True, slots=True)
 class LoopLimits:
     """Outer safety limits; normal tool recovery uses ordinary loop steps."""
@@ -73,8 +79,22 @@ class LoopLimits:
     max_estimated_cost_usd: Decimal | None = None
     max_tool_calls_per_response: int = 16
     max_tool_calls_per_run: int = 64
-    max_projected_tools: int = 64
-    max_projected_tool_definition_bytes: int = 128 * 1_024
+    tool_projection_mode: ToolProjectionMode = ToolProjectionMode.AUTO
+    max_run_tool_catalog_entries: int = 512
+    max_run_tool_catalog_bytes: int = 2 * 1_024 * 1_024
+    max_domain_manifest_entries: int = 64
+    max_domain_manifest_bytes: int = 16 * 1_024
+    max_domain_manifest_tokens: int = 4_000
+    max_direct_tools: int = 64
+    max_direct_tool_definition_bytes: int = 128 * 1_024
+    max_eager_tools: int = 48
+    max_eager_tool_definition_bytes: int = 96 * 1_024
+    max_tool_search_query_characters: int = 512
+    max_tool_search_results: int = 20
+    max_tool_search_result_bytes: int = 32 * 1_024
+    max_tool_description_bytes: int = 128 * 1_024
+    max_tool_description_bytes_per_run: int = 512 * 1_024
+    max_tool_references_per_run: int = 64
     max_tool_result_bytes: int = 256 * 1_024
     max_tool_result_depth: int = 16
     max_parallel_reads: int = 8
@@ -88,11 +108,36 @@ class LoopLimits:
             (self.max_total_tokens, "max_total_tokens"),
             (self.max_tool_calls_per_response, "max_tool_calls_per_response"),
             (self.max_tool_calls_per_run, "max_tool_calls_per_run"),
-            (self.max_projected_tools, "max_projected_tools"),
+            (self.max_run_tool_catalog_entries, "max_run_tool_catalog_entries"),
             (
-                self.max_projected_tool_definition_bytes,
-                "max_projected_tool_definition_bytes",
+                self.max_run_tool_catalog_bytes,
+                "max_run_tool_catalog_bytes",
             ),
+            (self.max_domain_manifest_entries, "max_domain_manifest_entries"),
+            (self.max_domain_manifest_bytes, "max_domain_manifest_bytes"),
+            (self.max_domain_manifest_tokens, "max_domain_manifest_tokens"),
+            (self.max_direct_tools, "max_direct_tools"),
+            (
+                self.max_direct_tool_definition_bytes,
+                "max_direct_tool_definition_bytes",
+            ),
+            (self.max_eager_tools, "max_eager_tools"),
+            (
+                self.max_eager_tool_definition_bytes,
+                "max_eager_tool_definition_bytes",
+            ),
+            (
+                self.max_tool_search_query_characters,
+                "max_tool_search_query_characters",
+            ),
+            (self.max_tool_search_results, "max_tool_search_results"),
+            (self.max_tool_search_result_bytes, "max_tool_search_result_bytes"),
+            (self.max_tool_description_bytes, "max_tool_description_bytes"),
+            (
+                self.max_tool_description_bytes_per_run,
+                "max_tool_description_bytes_per_run",
+            ),
+            (self.max_tool_references_per_run, "max_tool_references_per_run"),
             (self.max_tool_result_bytes, "max_tool_result_bytes"),
             (self.max_tool_result_depth, "max_tool_result_depth"),
             (self.max_parallel_reads, "max_parallel_reads"),
@@ -101,6 +146,20 @@ class LoopLimits:
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{field_name} must be a positive integer")
+        if not isinstance(self.tool_projection_mode, ToolProjectionMode):
+            raise TypeError("tool_projection_mode must be ToolProjectionMode")
+        if self.max_eager_tools > self.max_direct_tools:
+            raise ValueError("max_eager_tools cannot exceed max_direct_tools")
+        if self.max_eager_tool_definition_bytes > self.max_direct_tool_definition_bytes:
+            raise ValueError(
+                "max_eager_tool_definition_bytes cannot exceed the direct bound"
+            )
+        if self.max_tool_search_results > 20:
+            raise ValueError("max_tool_search_results cannot exceed 20")
+        if self.max_tool_description_bytes > self.max_tool_description_bytes_per_run:
+            raise ValueError(
+                "one tool description cannot exceed the cumulative run bound"
+            )
         if (
             not isinstance(self.max_wall_time_seconds, (int, float))
             or isinstance(self.max_wall_time_seconds, bool)

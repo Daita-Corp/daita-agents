@@ -23,6 +23,9 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.loop.models import LoopLimits, ToolProjectionMode
+
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -105,6 +108,7 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         observer=events.append,
     )

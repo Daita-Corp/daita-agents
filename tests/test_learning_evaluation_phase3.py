@@ -31,9 +31,11 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.loop.models import LoopLimits, ToolProjectionMode
 from daita.observation import AgentEvent, AgentEventKind
 
 NOW = datetime(2026, 7, 28, 12, tzinfo=UTC)
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +307,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         root=tmp_path,
         model=baseline_provider,
         model_profile=baseline_provider.model_profile,
+        limits=EAGER_LIMITS,
         observer=events.append,
         approval_handler=approve,
         clock=lambda: NOW,
@@ -395,6 +398,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         root=tmp_path,
         model=teaching_provider,
         model_profile=teaching_provider.model_profile,
+        limits=EAGER_LIMITS,
         observer=events.append,
         approval_handler=approve,
         clock=lambda: NOW,
@@ -469,6 +473,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         root=tmp_path,
         model=learned_provider,
         model_profile=learned_provider.model_profile,
+        limits=EAGER_LIMITS,
         observer=events.append,
         clock=lambda: NOW,
     )
@@ -511,6 +516,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         root=tmp_path,
         model=denied_provider,
         model_profile=denied_provider.model_profile,
+        limits=EAGER_LIMITS,
         observer=events.append,
         approval_handler=deny,
         clock=lambda: NOW,
@@ -575,6 +581,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         root=tmp_path,
         model=denied_reopen_provider,
         model_profile=denied_reopen_provider.model_profile,
+        limits=EAGER_LIMITS,
         observer=events.append,
         clock=lambda: NOW,
     )

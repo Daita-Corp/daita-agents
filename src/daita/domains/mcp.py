@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from .._json import FrozenJsonObject
+from hashlib import sha256
+
+from .._json import FrozenJsonObject, canonical_json
 from ..adapters.mcp import (
     MCPBindingState,
     MCPClient,
@@ -91,9 +93,12 @@ class MCPBindingStore(Protocol):
 @dataclass(frozen=True, slots=True)
 class MCPActivatedBinding:
     binding: MCPServerBinding
-    client: MCPClient
     lock: asyncio.Lock
     executor: MCPToolExecutor
+
+    @property
+    def client(self) -> MCPClient | None:
+        return self.executor.client
 
 
 class MCPToolExecutor:
@@ -103,18 +108,25 @@ class MCPToolExecutor:
         self,
         *,
         binding: MCPServerBinding,
-        client: MCPClient,
+        client_factory: MCPClientFactory,
+        secrets: SecretProvider,
         store: MCPBindingStore,
         clock: Callable[[], datetime],
         lock: asyncio.Lock,
     ) -> None:
         self.executor_id = binding.tools[0].executor_id
         self._binding = binding
-        self._client = client
+        self._client_factory = client_factory
+        self._secrets = secrets
+        self._client: MCPClient | None = None
         self._store = store
         self._clock = clock
         self._lock = lock
         self._tools = {tool.capability_id: tool for tool in binding.tools}
+
+    @property
+    def client(self) -> MCPClient | None:
+        return self._client
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         tool = self._tools.get(request.capability_id)
@@ -129,6 +141,12 @@ class MCPToolExecutor:
                 self._binding.binding_id,
             )
             _require_current_binding(current, self._binding, tool)
+            if self._client is None:
+                self._client = self._client_factory.create(
+                    endpoint=self._binding.endpoint,
+                    authentication=self._binding.authentication,
+                    secrets=self._secrets,
+                )
             observed_at = self._clock()
             inspection = await self._client.inspect(observed_at=observed_at)
             drift = mcp_binding_drift_reason(self._binding, inspection)
@@ -196,7 +214,8 @@ class MCPToolExecutor:
 
     async def close(self) -> None:
         async with self._lock:
-            await self._client.close()
+            if self._client is not None:
+                await self._client.close()
 
 
 class MCPCapabilityDomain:
@@ -381,43 +400,28 @@ async def activate_mcp_domain(
     tuple[MCPActivatedBinding, ...],
     tuple[Executor, ...],
 ]:
-    """Inspect persisted bindings and freeze exact declarations for this open."""
+    """Compose accepted persisted bindings without network activity."""
 
     activated: list[MCPActivatedBinding] = []
     for binding in await store.list_mcp_bindings(agent_id):
         if binding.state is not MCPBindingState.ACTIVE:
             continue
-        client = client_factory.create(
-            endpoint=binding.endpoint,
-            authentication=binding.authentication,
+        lock = asyncio.Lock()
+        executor = MCPToolExecutor(
+            binding=binding,
+            client_factory=client_factory,
             secrets=secrets,
+            store=store,
+            clock=clock,
+            lock=lock,
         )
-        try:
-            inspection = await client.inspect(observed_at=clock())
-            if mcp_binding_drift_reason(binding, inspection) is not None:
-                await client.close()
-                continue
-            lock = asyncio.Lock()
-            executor = MCPToolExecutor(
+        activated.append(
+            MCPActivatedBinding(
                 binding=binding,
-                client=client,
-                store=store,
-                clock=clock,
                 lock=lock,
+                executor=executor,
             )
-            activated.append(
-                MCPActivatedBinding(
-                    binding=binding,
-                    client=client,
-                    lock=lock,
-                    executor=executor,
-                )
-            )
-        except asyncio.CancelledError:
-            await client.close()
-            raise
-        except MCPError:
-            await client.close()
+        )
     if not activated:
         return None, (), ()
     capabilities = tuple(
@@ -443,6 +447,27 @@ async def activate_mcp_domain(
                 name=tool.local_name,
                 capability_id=tool.capability_id,
                 description=tool.description,
+                discovery=tool.discovery,
+                origin_revision_digest="sha256:"
+                + sha256(
+                    canonical_json(
+                        {
+                            "binding_id": item.binding.binding_id,
+                            "binding_revision": item.binding.revision,
+                            "capability_id": tool.capability_id,
+                            "executor_id": tool.executor_id,
+                            "input_schema_digest": tool.input_schema_digest,
+                            "output_schema_digest": tool.output_schema_digest,
+                            "discovery": {
+                                "summary": tool.discovery.summary,
+                                "when_to_use": tool.discovery.when_to_use,
+                                "keywords": tool.discovery.keywords,
+                                "exposure_class": tool.discovery.exposure_class.value,
+                                "eager_priority": tool.discovery.eager_priority,
+                            },
+                        }
+                    ).encode("utf-8")
+                ).hexdigest(),
             )
             for item in activated
             for tool in item.binding.tools

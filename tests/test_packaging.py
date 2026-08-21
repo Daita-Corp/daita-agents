@@ -65,14 +65,12 @@ def test_customer_and_fixture_documentation_use_the_complete_pipx_install():
     assert "pipx upgrade daita-agents" in readme
     assert PIPX_REPAIR in readme
     assert "pipx uninstall daita-agents" in readme
-    assert "Local state has its own immutable, checksummed migration journal" in readme
-    assert "automatically applies its known missing suffix" in readme
-    assert "supported journal prefix" in readme
-    assert "separate state command, import, restore, or backup step" in readme
-    assert "leave the prior database unchanged" in readme
-    assert "supported downgrade path" in readme
-    assert "optional disaster recovery, not a compatibility mechanism" in readme
-    assert "cp -a ~/.daita ~/.daita-backup-before-upgrade" in readme
+    assert "first production state format has not been frozen" in readme
+    assert "no backward-compatibility guarantee" in readme
+    assert "one mutable checksummed" in readme
+    assert "development baseline" in readme
+    assert "does not migrate between unreleased formats" in readme
+    assert "first immutable baseline" in readme
     assert "\ndaita\n" in readme
     assert "## Advanced/headless CLI" in readme
     assert "pipx install daita-agents" in fixture
@@ -111,11 +109,10 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     assert "pipx install" in smoke
     assert "pipx reinstall" in smoke
     assert "pipx uninstall" in smoke
-    assert "--baseline-wheel" in smoke
     assert "--candidate-wheel" in smoke
-    assert "cross-version smoke requires distinct baseline" in smoke
-    assert "candidate wheels" in smoke
-    assert "force-installs the candidate" in smoke
+    assert "--baseline-wheel" not in smoke
+    assert "Cross-version state compatibility" in smoke
+    assert "outside the pre-production contract" in smoke
     assert '"pip", "check"' in smoke
     assert "import xlsxwriter" in smoke
     assert "Workbook(" in smoke
@@ -152,13 +149,12 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     assert "$HOME" not in smoke
     assert "~/" not in smoke
 
-    assert 'parser.add_argument("--baseline-wheel"' in managed
-    assert "_database_rows" in managed
-    assert "20260811_postgresql_write_admission" in managed
-    assert "state_migrations" in managed
+    assert 'parser.add_argument("--baseline-wheel"' not in managed
+    assert "_database_rows" not in managed
+    assert "20260811_postgresql_write_admission" not in managed
+    assert "cross-version state compatibility" in managed
     assert "PRAGMA user_version" not in managed
     assert '"sources"' in managed
-    assert "baseline_version == candidate_version" not in managed
 
 
 def test_ci_requires_clean_pipx_wheel_smoke_on_each_supported_python():

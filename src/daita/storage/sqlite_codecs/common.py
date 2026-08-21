@@ -51,8 +51,6 @@ def record_fields(
     value: JsonValue,
     name: str,
     required: tuple[str, ...],
-    *,
-    optional: Mapping[str, JsonValue] | None = None,
 ) -> dict[str, JsonValue]:
     if not isinstance(value, dict) or set(value) != {"__record__", "fields"}:
         raise ValueError(f"stored {name} record envelope is invalid")
@@ -61,17 +59,13 @@ def record_fields(
     fields = value["fields"]
     if not isinstance(fields, dict):
         raise ValueError(f"stored {name} fields are invalid")
-    defaults = dict(optional or {})
-    allowed = set(required) | set(defaults)
-    unknown = set(fields) - allowed
+    unknown = set(fields) - set(required)
     missing = set(required) - set(fields)
     if unknown:
         raise ValueError(f"stored {name} has unknown fields: {sorted(unknown)!r}")
     if missing:
         raise ValueError(f"stored {name} is missing fields: {sorted(missing)!r}")
-    return {key: fields.get(key, default) for key, default in defaults.items()} | {
-        key: fields[key] for key in required
-    }
+    return {key: fields[key] for key in required}
 
 
 def enum_encode(value: Enum, name: str) -> dict[str, JsonValue]:

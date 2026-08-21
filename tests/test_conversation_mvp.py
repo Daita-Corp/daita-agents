@@ -44,6 +44,7 @@ from daita.loop import (
     Transcript,
 )
 from daita.storage.sqlite import SQLiteStateStore
+from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
@@ -62,15 +63,17 @@ async def _prepared_request(
         for index, message in enumerate(messages)
         if message.role is MessageRole.USER
     )
+    catalog = context_tool_catalog(run, tools)
     snapshot = await builder.prepare(
         run,
         messages[: current_start + 1],
-        tools,
+        catalog,
     )
     return builder.project(
         snapshot,
         messages[current_start:],
         step=step,
+        tool_context=context_step_projection(catalog),
         final=final,
     )
 
@@ -80,9 +83,9 @@ def test_context_builder_exposes_only_fixed_absolute_history_bounds():
 
 
 class TranscriptContext:
-    async def prepare(self, run, messages, tools):
+    async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tools
+        return messages[:-1], tool_context.provider_definitions
 
     def project(
         self,
@@ -90,10 +93,11 @@ class TranscriptContext:
         messages,
         *,
         step,
+        tool_context,
         final=False,
         previous_request_input_tokens=None,
     ):
-        del step, previous_request_input_tokens
+        del step, previous_request_input_tokens, tool_context
         static, tools = snapshot
         return ModelRequest(
             messages=(*static, *messages),
@@ -102,30 +106,39 @@ class TranscriptContext:
 
 
 class NoTools:
-    async def definitions(self, run):
-        del run
-        return ()
+    async def prepare_run(self, run):
+        return context_tool_catalog(run, ())
 
-    async def execute_all(self, run, calls, *, sensitivity):
-        del run, sensitivity
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
         assert calls == ()
         return ToolBatchOutcome(())
 
 
 class ReplayTools:
-    async def definitions(self, run):
-        del run
-        return tuple(
-            ToolDefinition(
-                name=name,
-                description=name,
-                input_schema={"type": "object"},
-            )
-            for name in ("memory_set", "skill_save", "skill_delete", "skill_view")
+    async def prepare_run(self, run):
+        return context_tool_catalog(
+            run,
+            tuple(
+                ToolDefinition(
+                    name=name,
+                    description=name,
+                    input_schema={"type": "object"},
+                )
+                for name in ("memory_set", "skill_save", "skill_delete", "skill_view")
+            ),
         )
 
-    async def execute_all(self, run, calls, *, sensitivity):
-        del run, sensitivity
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
         return ToolBatchOutcome(
             tuple(
                 ToolResultBlock(
@@ -158,18 +171,24 @@ class FreshQueryTools:
     def __init__(self):
         self.calls = []
 
-    async def definitions(self, run):
-        del run
-        return (
-            ToolDefinition(
-                name="data_query_postgresql",
-                description="Run a fresh read-only PostgreSQL query.",
-                input_schema={"type": "object"},
+    async def prepare_run(self, run):
+        return context_tool_catalog(
+            run,
+            (
+                ToolDefinition(
+                    name="data_query_postgresql",
+                    description="Run a fresh read-only PostgreSQL query.",
+                    input_schema={"type": "object"},
+                ),
             ),
         )
 
-    async def execute_all(self, run, calls, *, sensitivity):
-        del run, sensitivity
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
         self.calls.extend(calls)
         return ToolBatchOutcome(
             tuple(
@@ -1404,7 +1423,7 @@ async def test_context_overflow_fails_before_provider_and_is_not_replayed(tmp_pa
     provider = MockModelProvider((_stop("must not run"),))
     tiny_profile = ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=2_000,
+        context_window_tokens=20_000,
         max_output_tokens=500,
         supports_tools=True,
     )
@@ -1415,7 +1434,7 @@ async def test_context_overflow_fails_before_provider_and_is_not_replayed(tmp_pa
         model_profile=tiny_profile,
     )
     try:
-        failed = await agent.run("overflow sentinel " + ("x" * 2_000))
+        failed = await agent.run("overflow sentinel " + ("x" * 80_000))
         assert failed.kind is LoopExitKind.FAILED
         assert failed.reason == "context_window_exceeded"
         assert provider.requests == ()

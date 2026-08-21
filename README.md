@@ -130,7 +130,12 @@ Explicitly admitted remote MCP servers can contribute read-only tools through
 the same registry, runtime, ordered result, transcript, and context path.
 Bindings use remote Streamable HTTP, exact allowlists, secret references,
 call-time identity/schema rechecks, and per-binding revocation; remote metadata
-never authorizes or instructs the agent. In the TUI, `/mcp` opens a grouped
+never authorizes or instructs the agent. Agent open is network-free: accepted
+metadata composes immutable declarations locally, while clients initialize and
+recheck exact remote identity only at an admitted call. Large surfaces use a
+bounded per-run catalog with stable direct definitions and transcript-bound
+`tool_search` → `tool_describe` → `tool_call` deferred invocation. In the TUI,
+`/mcp` opens a grouped
 server manager and `/mcp add` guides endpoint inspection, multi-tool selection,
 read-only attestation, and controlled activation. See
 [Remote MCP read connectivity](docs/MCP_CONNECTIVITY.md).
@@ -258,40 +263,16 @@ pipx reinstall daita-agents
 pipx uninstall daita-agents
 ```
 
-Local state has its own immutable, checksummed migration journal, independent
-of the package version. On the first normal launch after an upgrade, Daita
-validates a supported journal prefix under the existing per-agent writer lock
-and automatically applies its known missing suffix to a verified staged copy.
-It validates the complete result and atomically activates it only after every
-check succeeds. No separate state command, import, restore, or backup step is
-part of a routine upgrade, and existing agent homes should never be reset for a
-normal application update.
+The first production state format has not been frozen. During active North Star
+development, local agent homes have no backward-compatibility guarantee and may
+need to be recreated after a state-shape change. Daita keeps one current schema,
+one current shape per persisted record family, and one mutable checksummed
+development baseline; it does not migrate between unreleased formats.
 
-The upgrade preserves identity, configuration and secret references, settings,
-sources and catalogs, active-source selection, exact permissions, complete
-conversations and results, artifacts, approved memory and user profile, skills,
-semantics, learning state, database-write receipts, and MCP binding aggregates
-with their secret references. Before activation Daita retains the verified
-prior database as one bounded `state.db.rollback-*`
-recovery point. Failure or cancellation before activation removes the staging
-files and will leave the prior database unchanged.
-
-Unknown, reordered, gapped, or checksum-mismatched journals, newer state from
-an attempted package downgrade, recognizable pre-1.0 homes, and damaged schemas
-fail closed without moving, replacing, emptying, or recreating the home. Install
-the same or a newer Daita release for newer state; opening an upgraded home with
-an older package is not a supported downgrade path. See the
-[local state upgrade contract](docs/LOCAL_STATE_UPGRADES.md).
-
-No manual backup is required for compatibility. A complete copy made while
-Daita is closed is optional disaster recovery, not a compatibility mechanism:
-
-```bash
-cp -a ~/.daita ~/.daita-backup-before-upgrade
-```
-
-Secret values stored in the OS keychain are referenced by the copied
-configuration but are not duplicated into the agent home.
+At the explicitly approved first production release, that complete state shape
+will become the first immutable baseline. Subsequent package upgrades will use
+the existing staged-copy migration engine automatically on first open. See
+[local state during development](docs/LOCAL_STATE_UPGRADES.md).
 
 Use `pipx reinstall daita-agents` to repair missing or damaged application
 dependencies. Uninstalling the application does not delete existing agent

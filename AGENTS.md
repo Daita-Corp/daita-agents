@@ -71,9 +71,9 @@ src/daita/
   catalog/             # normalized current source/resource truth
   adapters/            # bounded source admission, discovery, and read I/O
   storage/sqlite.py    # sole durable state operation/admission boundary
-  storage/sqlite_schema.py     # exact current and supported historical schemas
+  storage/sqlite_schema.py     # exact current physical schema
   storage/sqlite_codecs/       # explicit persisted-record family codecs
-  storage/sqlite_migrations/   # immutable journal, baseline, and preledger bridge
+  storage/sqlite_migrations/   # development baseline and migration engine
   security/            # secret references and lazy secret resolution
   config.py            # immutable runtime/model configuration records
   cli.py               # thin local CLI over the public embedded API
@@ -89,6 +89,28 @@ module only when a working vertical slice needs a clear owner.
 Keep development-stage status, implementation ledgers, and North Star phase
 closure in the authoritative North Star architecture document rather than
 adding internal development records under `docs/`.
+
+## Pre-production state policy
+
+Until the user explicitly declares the first production release after the
+North Star work is complete, persisted development state has no backward-
+compatibility guarantee. During this pre-production period:
+
+- keep exactly one current physical schema and one current shape per persisted
+  record family;
+- keep a codec discriminator at version `1` where the current codec uses one,
+  but do not add historical decoders or multi-version branches;
+- change the current schema, codecs, and single development baseline in place;
+- do not add migrations, pre-ledger bridges, compatibility fixtures, aliases,
+  or fallbacks for shapes produced only by unreleased code; and
+- treat development agent homes as disposable when the current state shape
+  changes.
+
+The existing checksummed journal and staged-copy migration engine remain the
+sole future production upgrade mechanism. At the explicitly approved first
+production release, freeze the then-current schema and codec-v1 shapes as the
+first immutable baseline. Only durable changes after that freeze add immutable
+owner-local migrations or additional supported codec versions.
 
 ## Ownership and dependency direction
 
@@ -220,16 +242,15 @@ identity, sources, current catalog snapshots, run transcripts and terminal
 results, semantic annotations, learning review state, immutable database-write
 receipts, explicit source read scopes, exact PostgreSQL update scopes, and
 independently keyed MCP server binding aggregates. It is the sole owner of the
-immutable checksummed `state_migrations` journal,
-explicit persisted-record codecs, exact current/historical schemas, and the
-bounded preledger bridge. Migrations run only on a verified staged copy under
-the existing agent-home writer boundary, validate their source and target
-schemas, and atomically replace the active database only after complete target
-validation. Put each durable change in one owner-local migration file; never
-edit an existing ID/checksum or create migration ownership in hosting, the
-loop, or a new runtime. The isolated preledger unit is the only code allowed to
-read the historical numeric marker, and only until its documented
-minimum-release removal gate is met.
+checksummed `state_migrations` journal, explicit persisted-record codecs, and
+the exact current schema. Before the first production freeze, the journal
+contains one mutable development baseline and no compatibility path for older
+development state. After that freeze, migrations run only on a verified staged
+copy under the existing agent-home writer boundary, validate their source and
+target schemas, and atomically replace the active database only after complete
+target validation. Put each post-freeze durable change in one owner-local
+migration file; never edit a released ID/checksum or create migration ownership
+in hosting, the loop, or a new runtime.
 
 Source read access is owned only by `source_read_scopes`, and PostgreSQL update
 access is owned only by `postgresql_update_scopes`, never by source connection
@@ -455,7 +476,7 @@ specific agent loop.
 | `src/daita/storage/sqlite.py` | sole durable state operation/admission boundary |
 | `src/daita/storage/sqlite_schema.py` | exact physical schemas and validators |
 | `src/daita/storage/sqlite_codecs/` | explicit durable record-family codecs |
-| `src/daita/storage/sqlite_migrations/` | checksummed journal, baseline, and bounded bridge |
+| `src/daita/storage/sqlite_migrations/` | development baseline and staged-copy migration engine |
 | `src/daita/llm/routing.py` | normalized model retry/fallback ownership |
 | `tests/test_architecture.py` | prohibited-system and public-surface checks |
 

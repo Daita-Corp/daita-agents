@@ -41,6 +41,7 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop import AgentLoop, InMemoryTranscriptStore, ToolBatchOutcome
 from daita.loop.models import LoopExitKind, RunInput
+from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 NOW = datetime(2026, 8, 1, 12, tzinfo=UTC)
 RUN_ID = "run-00000000000000000000000000000001"
@@ -652,9 +653,9 @@ async def test_clear_conversations_cancellation_never_leaves_a_persisted_danglin
 
 
 class _LoopContext:
-    async def prepare(self, run, messages, tools):
+    async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tools
+        return messages[:-1], tool_context.provider_definitions
 
     def project(
         self,
@@ -662,10 +663,11 @@ class _LoopContext:
         messages,
         *,
         step,
+        tool_context,
         final=False,
         previous_request_input_tokens=None,
     ):
-        del step, previous_request_input_tokens
+        del step, previous_request_input_tokens, tool_context
         static, tools = snapshot
         return ModelRequest(
             messages=(*static, *messages),
@@ -677,18 +679,24 @@ class _LoopTools:
     def __init__(self, results: dict[str, ToolResultBlock]) -> None:
         self.results = results
 
-    async def definitions(self, run):
-        del run
-        return (
-            ToolDefinition(
-                name="artifact",
-                description="artifact test",
-                input_schema={"type": "object", "properties": {}},
+    async def prepare_run(self, run):
+        return context_tool_catalog(
+            run,
+            (
+                ToolDefinition(
+                    name="artifact",
+                    description="artifact test",
+                    input_schema={"type": "object", "properties": {}},
+                ),
             ),
         )
 
-    async def execute_all(self, run, calls, *, sensitivity):
-        del run, sensitivity
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
         return ToolBatchOutcome(tuple(self.results[call.id] for call in calls))
 
 

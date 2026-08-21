@@ -13,7 +13,9 @@ from ..capabilities import (
     CapabilityInputError,
     Executor,
     SideEffectExecutor,
+    ToolDiscoveryMetadata,
     ToolExecution,
+    ToolExposureClass,
     ToolOutput,
     ToolView,
 )
@@ -137,6 +139,13 @@ def memory_set_declarations(store: MemoryStore) -> MemoryDeclarations:
                 name=MEMORY_SET_TOOL_NAME,
                 capability_id=capability.id,
                 description=capability.description,
+                discovery=ToolDiscoveryMetadata(
+                    summary="Replace one bounded advisory memory or user-profile document.",
+                    when_to_use="Use only for explicit durable definitions or preferences.",
+                    keywords=("memory", "user", "preference", "remember"),
+                    exposure_class=ToolExposureClass.DEFERRED,
+                    eager_priority=200,
+                ),
             ),
         ),
     )

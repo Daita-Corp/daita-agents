@@ -101,12 +101,15 @@ def _decode_run_input(value: JsonValue) -> RunInput:
     fields = record_fields(
         value,
         "RunInput",
-        ("id", "agent_id", "message", "created_at"),
-        optional={
-            "conversation_id": None,
-            "source_id": None,
-            "conversation_source_id": None,
-        },
+        (
+            "id",
+            "agent_id",
+            "message",
+            "created_at",
+            "conversation_id",
+            "source_id",
+            "conversation_source_id",
+        ),
     )
     return RunInput(
         id=text(fields["id"], "run id"),
@@ -146,8 +149,7 @@ def _decode_tool_call(value: JsonValue) -> ToolCall:
     fields = record_fields(
         value,
         "ToolCall",
-        ("id", "name"),
-        optional={"arguments": {}, "provider_call_id": None},
+        ("id", "name", "arguments", "provider_call_id"),
     )
     arguments = plain_decode(mapping(fields["arguments"], "tool-call arguments"))
     if not isinstance(arguments, dict):
@@ -181,13 +183,13 @@ def _decode_tool_result(value: JsonValue) -> ToolResultBlock:
     fields = record_fields(
         value,
         "ToolResultBlock",
-        ("call_id",),
-        optional={
-            "output": {},
-            "is_error": False,
-            "sensitivity": None,
-            "sensitivity_provenance": {},
-        },
+        (
+            "call_id",
+            "output",
+            "is_error",
+            "sensitivity",
+            "sensitivity_provenance",
+        ),
     )
     output = plain_decode(mapping(fields["output"], "tool-result output"))
     if not isinstance(output, dict):
@@ -237,13 +239,7 @@ def _decode_message(value: JsonValue) -> CanonicalMessage:
     fields = record_fields(
         value,
         "CanonicalMessage",
-        ("role",),
-        optional={
-            "content": [],
-            "tool_calls": [],
-            "provider_id": None,
-            "provider_metadata": {},
-        },
+        ("role", "content", "tool_calls", "provider_id", "provider_metadata"),
     )
     content: list[TextBlock | ToolResultBlock] = []
     for item in sequence(fields["content"], "message content"):
@@ -285,8 +281,7 @@ def _decode_usage_range(value: JsonValue) -> PricingUsageRange:
     fields = record_fields(
         value,
         "PricingUsageRange",
-        ("metric",),
-        optional={"minimum_inclusive": None, "maximum_inclusive": None},
+        ("metric", "minimum_inclusive", "maximum_inclusive"),
     )
     return PricingUsageRange(
         metric=text(fields["metric"], "pricing usage metric"),
@@ -343,18 +338,19 @@ def _decode_cost_component(value: JsonValue) -> CostComponent:
     fields = record_fields(
         value,
         "CostComponent",
-        ("name", "amount_usd"),
-        optional={
-            "basis": None,
-            "rate_schedule_id": None,
-            "metric": None,
-            "quantity": None,
-            "unit": None,
-            "unit_size": None,
-            "rate_usd": None,
-            "usage_range": None,
-            "modifiers": [],
-        },
+        (
+            "name",
+            "amount_usd",
+            "basis",
+            "rate_schedule_id",
+            "metric",
+            "quantity",
+            "unit",
+            "unit_size",
+            "rate_usd",
+            "usage_range",
+            "modifiers",
+        ),
     )
     return CostComponent(
         name=text(fields["name"], "cost component name"),
@@ -404,13 +400,14 @@ def _decode_cost_estimate(value: JsonValue) -> CostEstimate:
     fields = record_fields(
         value,
         "CostEstimate",
-        ("amount_usd", "status"),
-        optional={
-            "basis": None,
-            "rate_schedule_id": None,
-            "components": [],
-            "code": None,
-        },
+        (
+            "amount_usd",
+            "status",
+            "basis",
+            "rate_schedule_id",
+            "components",
+            "code",
+        ),
     )
     return CostEstimate(
         amount_usd=optional_decimal_decode(fields["amount_usd"]),
@@ -449,15 +446,14 @@ def _decode_model_usage(value: JsonValue) -> ModelUsage:
     fields = record_fields(
         value,
         "ModelUsage",
-        (),
-        optional={
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "reasoning_tokens": 0,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-            "cost_estimate": _encode_cost_estimate(CostEstimate.unavailable()),
-        },
+        (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "cost_estimate",
+        ),
     )
     return ModelUsage(
         input_tokens=integer(fields["input_tokens"], "input tokens"),
@@ -493,14 +489,18 @@ def _decode_loop_exit(value: JsonValue) -> LoopExit:
     fields = record_fields(
         value,
         "LoopExit",
-        ("run_id", "conversation_id", "kind", "reason", "created_at"),
-        optional={
-            "final_text": None,
-            "steps": 0,
-            "usage": _encode_model_usage(ModelUsage()),
-            "artifacts": [],
-            "artifact_deliveries": [],
-        },
+        (
+            "run_id",
+            "conversation_id",
+            "kind",
+            "reason",
+            "created_at",
+            "final_text",
+            "steps",
+            "usage",
+            "artifacts",
+            "artifact_deliveries",
+        ),
     )
     return LoopExit(
         run_id=text(fields["run_id"], "loop-exit run_id"),

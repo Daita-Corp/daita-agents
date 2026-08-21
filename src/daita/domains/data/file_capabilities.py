@@ -11,7 +11,9 @@ from ...capabilities import (
     Capability,
     Executor,
     CapabilityDeclarations,
+    ToolDiscoveryMetadata,
     ToolExecution,
+    ToolExposureClass,
     ToolOutput,
     ToolView,
 )
@@ -239,6 +241,13 @@ def local_file_read_capability_declarations() -> CapabilityDeclarations:
         name=LOCAL_FILE_READ_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
+        discovery=ToolDiscoveryMetadata(
+            summary="Read bounded rows from one attached CSV or JSON resource.",
+            when_to_use="Use for validated values from an attached local data file.",
+            keywords=("data", "file", "csv", "json", "read"),
+            exposure_class=ToolExposureClass.CORE,
+            eager_priority=900,
+        ),
     )
     return CapabilityDeclarations(
         domain_owner_id="data",

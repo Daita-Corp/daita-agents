@@ -10,6 +10,7 @@ from ...adapters.mcp import (
     MCPServerBinding,
     MCPToolBinding,
 )
+from ...capabilities import ToolDiscoveryMetadata, ToolExposureClass
 from ...llm.models import ModelSensitivity
 from ...security import SecretReference
 from .common import (
@@ -51,6 +52,7 @@ def encode_mcp_binding(value: MCPServerBinding) -> str:
                 "protocol_version": value.protocol_version,
                 "server_name": value.server_name,
                 "server_version": value.server_version,
+                "local_label": value.local_label,
                 "maximum_outbound_sensitivity": (
                     value.maximum_outbound_sensitivity.value
                 ),
@@ -83,6 +85,7 @@ def decode_mcp_binding(
             "protocol_version",
             "server_name",
             "server_version",
+            "local_label",
             "maximum_outbound_sensitivity",
             "tools",
             "state",
@@ -124,6 +127,7 @@ def decode_mcp_binding(
         protocol_version=text(fields["protocol_version"], "MCP protocol version"),
         server_name=text(fields["server_name"], "MCP server name"),
         server_version=text(fields["server_version"], "MCP server version"),
+        local_label=text(fields["local_label"], "MCP local server label"),
         maximum_outbound_sensitivity=maximum_outbound,
         tools=tools,
         state=state,
@@ -144,6 +148,11 @@ def _encode_tool(value: MCPToolBinding):
             "local_name": value.local_name,
             "remote_name": value.remote_name,
             "description": value.description,
+            "discovery_summary": value.discovery.summary,
+            "discovery_when_to_use": value.discovery.when_to_use,
+            "discovery_keywords": list(value.discovery.keywords),
+            "discovery_exposure_class": value.discovery.exposure_class.value,
+            "discovery_eager_priority": value.discovery.eager_priority,
             "input_schema": plain_encode(value.input_schema),
             "input_schema_digest": value.input_schema_digest,
             "output_schema": (
@@ -167,6 +176,11 @@ def _decode_tool(value) -> MCPToolBinding:
             "local_name",
             "remote_name",
             "description",
+            "discovery_summary",
+            "discovery_when_to_use",
+            "discovery_keywords",
+            "discovery_exposure_class",
+            "discovery_eager_priority",
             "input_schema",
             "input_schema_digest",
             "output_schema",
@@ -185,14 +199,36 @@ def _decode_tool(value) -> MCPToolBinding:
         sensitivity = ModelSensitivity(
             text(fields["result_sensitivity"], "MCP result sensitivity")
         )
+        exposure_class = ToolExposureClass(
+            text(fields["discovery_exposure_class"], "MCP exposure class")
+        )
     except ValueError:
-        raise ValueError("stored MCP result sensitivity is invalid") from None
+        raise ValueError("stored MCP tool enum is invalid") from None
     return MCPToolBinding(
         capability_id=text(fields["capability_id"], "MCP capability id"),
         executor_id=text(fields["executor_id"], "MCP executor id"),
         local_name=text(fields["local_name"], "MCP local name"),
         remote_name=text(fields["remote_name"], "MCP remote name"),
         description=text(fields["description"], "MCP tool description"),
+        discovery=ToolDiscoveryMetadata(
+            summary=text(fields["discovery_summary"], "MCP discovery summary"),
+            when_to_use=text(
+                fields["discovery_when_to_use"],
+                "MCP discovery when_to_use",
+            ),
+            keywords=tuple(
+                text(item, "MCP discovery keyword")
+                for item in sequence(
+                    fields["discovery_keywords"],
+                    "MCP discovery keywords",
+                )
+            ),
+            exposure_class=exposure_class,
+            eager_priority=integer(
+                fields["discovery_eager_priority"],
+                "MCP discovery eager priority",
+            ),
+        ),
         input_schema=FrozenJsonObject.from_mapping(input_schema),
         input_schema_digest=text(
             fields["input_schema_digest"], "MCP input schema digest"

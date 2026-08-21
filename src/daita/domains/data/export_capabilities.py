@@ -48,7 +48,9 @@ from ...capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
+    ToolDiscoveryMetadata,
     ToolExecution,
+    ToolExposureClass,
     ToolOutput,
     ToolOutputValidationError,
     ToolView,
@@ -1159,46 +1161,109 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
             name=DOCUMENT_CREATE_TOOL_NAME,
             capability_id=document.id,
             description=document.description,
+            discovery=ToolDiscoveryMetadata(
+                summary="Create a bounded Markdown or text document artifact.",
+                when_to_use="Use when the requested deliverable is a document.",
+                keywords=("artifact", "document", "markdown", "text"),
+                exposure_class=ToolExposureClass.STANDARD,
+                eager_priority=800,
+            ),
         ),
         ToolView(
             name=LOCAL_FILE_COPY_TOOL_NAME,
             capability_id=local_file_copy.id,
             description=local_file_copy.description,
+            discovery=ToolDiscoveryMetadata(
+                summary="Copy one attached CSV or JSON file into an artifact.",
+                when_to_use="Use for byte-identical export of an attached data file.",
+                keywords=("artifact", "export", "file", "copy"),
+                exposure_class=ToolExposureClass.STANDARD,
+                eager_priority=770,
+            ),
         ),
         ToolView(
             name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
             capability_id=sqlite_tabular.id,
             description=sqlite_tabular.description,
+            discovery=ToolDiscoveryMetadata(
+                summary="Export an exact SQLite query result as CSV or XLSX.",
+                when_to_use="Use for a downloadable tabular SQLite result.",
+                keywords=("artifact", "export", "sqlite", "csv", "xlsx"),
+                exposure_class=ToolExposureClass.STANDARD,
+                eager_priority=790,
+            ),
         ),
         ToolView(
             name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
             capability_id=postgresql_tabular.id,
             description=postgresql_tabular.description,
+            discovery=ToolDiscoveryMetadata(
+                summary="Export an exact PostgreSQL query result as CSV or XLSX.",
+                when_to_use="Use for a downloadable tabular PostgreSQL result.",
+                keywords=("artifact", "export", "postgresql", "csv", "xlsx"),
+                exposure_class=ToolExposureClass.STANDARD,
+                eager_priority=790,
+            ),
         ),
         ToolView(
             name=ARTIFACT_LIST_TOOL_NAME,
             capability_id=artifact_list.id,
             description=artifact_list.description,
+            discovery=ToolDiscoveryMetadata(
+                summary="List bounded safe metadata for current-conversation artifacts.",
+                when_to_use="Use to identify an artifact created earlier in the conversation.",
+                keywords=("artifact", "list", "conversation", "file"),
+                exposure_class=ToolExposureClass.CORE,
+                eager_priority=920,
+            ),
         ),
         ToolView(
             name=ARTIFACT_READ_TOOL_NAME,
             capability_id=artifact_read.id,
             description=artifact_read.description,
+            discovery=ToolDiscoveryMetadata(
+                summary="Read a bounded safe preview of one conversation artifact.",
+                when_to_use="Use after artifact_list when artifact contents are needed.",
+                keywords=("artifact", "read", "preview", "file"),
+                exposure_class=ToolExposureClass.CORE,
+                eager_priority=910,
+            ),
         ),
         ToolView(
             name=ARTIFACT_CONVERT_TOOL_NAME,
             capability_id=artifact_convert.id,
             description=artifact_convert.description,
+            discovery=ToolDiscoveryMetadata(
+                summary="Convert a verified Daita XLSX Data snapshot to CSV.",
+                when_to_use="Use for exact supported conversion of an existing artifact.",
+                keywords=("artifact", "convert", "xlsx", "csv"),
+                exposure_class=ToolExposureClass.CORE,
+                eager_priority=900,
+            ),
         ),
         ToolView(
             name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
             capability_id=save.id,
             description=save.description,
+            discovery=ToolDiscoveryMetadata(
+                summary="Deliver one committed artifact to an authorized local destination.",
+                when_to_use="Use after artifact creation when local delivery is required.",
+                keywords=("artifact", "save", "deliver", "local"),
+                exposure_class=ToolExposureClass.CORE,
+                eager_priority=890,
+            ),
         ),
         ToolView(
             name=ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
             capability_id=set_location.id,
             description=set_location.description,
+            discovery=ToolDiscoveryMetadata(
+                summary="Set an authorized destination as the future export default.",
+                when_to_use="Use only when the user explicitly changes the persistent default.",
+                keywords=("artifact", "destination", "export", "default"),
+                exposure_class=ToolExposureClass.STANDARD,
+                eager_priority=500,
+            ),
         ),
     )
     return CapabilityDeclarations(
@@ -1216,6 +1281,15 @@ _CONVERSATION_ARTIFACT_CAPABILITIES = frozenset(
     {
         ARTIFACT_LIST_CAPABILITY_ID,
         ARTIFACT_READ_CAPABILITY_ID,
+        ARTIFACT_CONVERT_CAPABILITY_ID,
+    }
+)
+_ARTIFACT_PRODUCER_CAPABILITIES = frozenset(
+    {
+        DOCUMENT_CREATE_CAPABILITY_ID,
+        LOCAL_FILE_COPY_CAPABILITY_ID,
+        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
     }
 )
@@ -1330,7 +1404,7 @@ class ArtifactCapabilityDomain:
         )
         has_current = any(item.run_id == run.id for item in refs)
         has_prior = any(item.run_id != run.id for item in refs)
-        names: list[str] = []
+        candidates: list[ToolView] = []
         for view in self._views:
             capability = self._capabilities[view.capability_id]
             if not self._learning.allows(
@@ -1349,10 +1423,27 @@ class ArtifactCapabilityDomain:
             )
             if required_adapter is not None and required_adapter not in adapters:
                 continue
-            if capability.id in _CONVERSATION_ARTIFACT_CAPABILITIES and not has_prior:
+            candidates.append(view)
+        may_have_artifact = (
+            has_current
+            or has_prior
+            or any(
+                self._capabilities[view.capability_id].id
+                in _ARTIFACT_PRODUCER_CAPABILITIES
+                for view in candidates
+            )
+        )
+        names: list[str] = []
+        for view in candidates:
+            capability = self._capabilities[view.capability_id]
+            if (
+                capability.id in _CONVERSATION_ARTIFACT_CAPABILITIES
+                and not may_have_artifact
+            ):
                 continue
-            if capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID and not (
-                has_current or has_prior
+            if (
+                capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
+                and not may_have_artifact
             ):
                 continue
             names.append(view.name)

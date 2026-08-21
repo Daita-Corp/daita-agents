@@ -530,6 +530,7 @@ class Agent:
         selections: tuple[MCPToolSelection, ...],
         authentication: MCPAuthentication | None = None,
         maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
+        local_label: str | None = None,
         binding_id: str | None = None,
     ) -> MCPBindingStatus:
         return await self._embedded.attach_mcp_server(
@@ -537,6 +538,7 @@ class Agent:
             selections=selections,
             authentication=authentication,
             maximum_outbound_sensitivity=maximum_outbound_sensitivity,
+            local_label=local_label,
             binding_id=binding_id,
         )
 

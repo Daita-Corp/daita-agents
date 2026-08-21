@@ -36,6 +36,10 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
+from _capability_runtime_support import (
+    context_step_projection,
+    context_tool_catalog,
+)
 
 
 async def _prepared_request(
@@ -46,8 +50,14 @@ async def _prepared_request(
     *,
     step: int,
 ) -> ModelRequest:
-    snapshot = await builder.prepare(run, messages, tools)
-    return builder.project(snapshot, messages, step=step)
+    catalog = context_tool_catalog(run, tools)
+    snapshot = await builder.prepare(run, messages, catalog)
+    return builder.project(
+        snapshot,
+        messages,
+        step=step,
+        tool_context=context_step_projection(catalog),
+    )
 
 
 def _ids():
@@ -329,8 +339,11 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
             created_at=agent._embedded.identity.created_at,
             conversation_id=created.conversation_id,
         )
+        runtime = agent._embedded._capability_runtime
+        catalog = await runtime.prepare_run(run)
+        projection = runtime.project(catalog, ())
         result = (
-            await agent._embedded._capability_runtime.execute_all(
+            await runtime.execute_all(
                 run,
                 (
                     ToolCall(
@@ -342,6 +355,7 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
                         },
                     ),
                 ),
+                projection=projection,
                 sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
@@ -557,7 +571,7 @@ async def test_model_artifact_tools_are_projected_without_prompt_classification(
             ARTIFACT_READ_TOOL_NAME,
             ARTIFACT_CONVERT_TOOL_NAME,
             ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-        }.isdisjoint(projected)
+        } <= projected
         assert not tuple(downloads.iterdir())
     finally:
         await agent.close()
@@ -584,7 +598,7 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
         request = provider.requests[0]
         projected = {tool.name for tool in request.tools}
         assert ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME in projected
-        assert ARTIFACT_SAVE_LOCAL_TOOL_NAME not in projected
+        assert ARTIFACT_SAVE_LOCAL_TOOL_NAME in projected
         assert DOCUMENT_CREATE_TOOL_NAME in projected
         system = "\n".join(
             block.text

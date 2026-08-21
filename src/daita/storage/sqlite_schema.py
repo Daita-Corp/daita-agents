@@ -1,4 +1,4 @@
-"""Current and historical physical schemas owned by ``SQLiteStateStore``."""
+"""Current physical schema owned by ``SQLiteStateStore``."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from collections.abc import Mapping
 
 TableSchema = Mapping[str, tuple[tuple[object, ...], ...]]
 
-INITIAL_TABLES: dict[str, tuple[tuple[object, ...], ...]] = {
+CORE_TABLES: dict[str, tuple[tuple[object, ...], ...]] = {
     "learning_candidates": (
         ("agent_id", "TEXT", 1, None, 1),
         ("id", "TEXT", 1, None, 2),
@@ -66,10 +66,6 @@ JOURNAL_TABLE = (
     ("migration_id", "TEXT", 1, None, 1),
     ("checksum", "TEXT", 1, None, 0),
 )
-ADMISSION_TABLE = (
-    ("agent_id", "TEXT", 1, None, 1),
-    ("source_id", "TEXT", 1, None, 2),
-)
 READ_SCOPE_TABLE = (
     ("agent_id", "TEXT", 1, None, 1),
     ("source_id", "TEXT", 1, None, 2),
@@ -88,30 +84,20 @@ MCP_BINDING_TABLE = (
     ("data", "TEXT", 1, None, 0),
 )
 
-RECEIPT_TABLES = {**INITIAL_TABLES, "database_write_receipts": RECEIPT_TABLE}
-JOURNAL_INITIAL_TABLES = {**INITIAL_TABLES, "state_migrations": JOURNAL_TABLE}
-JOURNAL_RECEIPT_TABLES = {**RECEIPT_TABLES, "state_migrations": JOURNAL_TABLE}
-WRITE_ADMISSION_TABLES = {
-    **JOURNAL_RECEIPT_TABLES,
-    "postgresql_write_admissions": ADMISSION_TABLE,
-}
-SCOPED_PERMISSION_TABLES = {
-    **JOURNAL_RECEIPT_TABLES,
+CURRENT_TABLES = {
+    **CORE_TABLES,
+    "database_write_receipts": RECEIPT_TABLE,
+    "state_migrations": JOURNAL_TABLE,
     "source_read_scopes": READ_SCOPE_TABLE,
     "postgresql_update_scopes": UPDATE_SCOPE_TABLE,
-}
-GENERALIZED_UPDATE_TABLES = SCOPED_PERMISSION_TABLES
-CURRENT_TABLES = {
-    **GENERALIZED_UPDATE_TABLES,
     "mcp_server_bindings": MCP_BINDING_TABLE,
 }
 
 MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
-ADMISSION_FOREIGN_KEYS = (
+SOURCE_SCOPE_FOREIGN_KEYS = (
     ("sources", "agent_id", "agent_id", "NO ACTION", "CASCADE", "NONE"),
     ("sources", "source_id", "id", "NO ACTION", "CASCADE", "NONE"),
 )
-SOURCE_SCOPE_FOREIGN_KEYS = ADMISSION_FOREIGN_KEYS
 NAMED_INDEXES = {
     "runs_conversation_turn": (
         "runs",
@@ -199,17 +185,6 @@ CREATE TABLE state_migrations (
 )
 """
 
-ADMISSION_TABLE_SQL = """
-CREATE TABLE postgresql_write_admissions (
-    agent_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    PRIMARY KEY (agent_id, source_id),
-    FOREIGN KEY (agent_id, source_id)
-        REFERENCES sources(agent_id, id)
-        ON DELETE CASCADE
-)
-"""
-
 SOURCE_READ_SCOPE_TABLE_SQL = """
 CREATE TABLE source_read_scopes (
     agent_id TEXT NOT NULL,
@@ -284,11 +259,6 @@ def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> 
     }
     expected_foreign_keys: dict[str, tuple[tuple[object, ...], ...]] = {
         "messages": MESSAGES_FOREIGN_KEYS,
-        **(
-            {"postgresql_write_admissions": ADMISSION_FOREIGN_KEYS}
-            if "postgresql_write_admissions" in definitions
-            else {}
-        ),
         **(
             {"source_read_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
             if "source_read_scopes" in definitions

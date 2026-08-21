@@ -1936,6 +1936,7 @@ class EmbeddedAgent:
         selections: tuple[MCPToolSelection, ...],
         authentication: MCPAuthentication | None = None,
         maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
+        local_label: str | None = None,
         binding_id: str | None = None,
     ) -> MCPBindingStatus:
         """Persist one exact binding; declarations activate only after reopen."""
@@ -1962,6 +1963,7 @@ class EmbeddedAgent:
                     maximum_outbound_sensitivity=maximum_outbound_sensitivity,
                     selections=tuple(selections),
                     inspection=inspection,
+                    local_label=local_label,
                     prior=current,
                 )
                 stored = await self._store.store_mcp_binding(
@@ -2054,7 +2056,9 @@ class EmbeddedAgent:
                         expected_revision=current.revision,
                     )
                 )
-                await activated.client.close()
+                client = activated.executor.client
+                if client is not None:
+                    await client.close()
             self._mcp_activated_bindings.pop(binding_id, None)
             return MCPBindingStatus(stored, None)
 

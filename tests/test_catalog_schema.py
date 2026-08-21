@@ -70,6 +70,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import RunInput
+from _capability_runtime_support import execute_projected
 
 _OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
 
@@ -1589,7 +1590,8 @@ async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
             conversation_id="catalog-invalid-input-conversation",
             source_id=source.id,
         )
-        results = await runtime.execute_all(
+        results = await execute_projected(
+            runtime,
             run,
             (
                 ToolCall(
@@ -1606,7 +1608,6 @@ async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
                     },
                 ),
             ),
-            sensitivity=ModelSensitivity.INTERNAL,
         )
 
         error_codes = tuple(

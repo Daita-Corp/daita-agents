@@ -22,7 +22,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import RunInput
+from daita.loop.models import LoopLimits, RunInput, ToolProjectionMode
 from daita.semantics import (
     SEMANTIC_DELETE_CAPABILITY_ID,
     SEMANTIC_DELETE_TOOL_NAME,
@@ -39,6 +39,7 @@ from daita.tui.commands import (
 )
 
 NOW = datetime(2026, 7, 28, 14, tzinfo=UTC)
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -157,6 +158,7 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         id_factory=_ids(),
         clock=lambda: NOW,
     )
@@ -172,7 +174,11 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             source_id=source.id,
         )
         semantic_domain.select_explicit_learning_run(projection_run.id)
-        definitions = await runtime.definitions(projection_run)
+        catalog = await runtime.prepare_run(projection_run)
+        definitions = tuple(
+            runtime._registry.tool_definition(entry.view.name)
+            for entry in catalog.entries
+        )
         semantic_domain.clear_explicit_learning_run(projection_run.id)
         names = {item.name for item in definitions}
         assert {
@@ -208,7 +214,7 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
         assert isinstance(evidence_properties, Mapping)
         assert "run_id" not in evidence_properties
         assert "message_position" not in evidence_properties
-        ordinary = await runtime.definitions(
+        ordinary = await runtime.prepare_run(
             RunInput(
                 id="ordinary-run",
                 agent_id=agent.id,
@@ -223,8 +229,8 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             SEMANTIC_VIEW_TOOL_NAME,
             SEMANTIC_SAVE_TOOL_NAME,
             SEMANTIC_DELETE_TOOL_NAME,
-        }.intersection(item.name for item in ordinary)
-        incidental = await runtime.definitions(
+        }.intersection(item.view.name for item in ordinary.entries)
+        incidental = await runtime.prepare_run(
             RunInput(
                 id="incidental-run",
                 agent_id=agent.id,
@@ -239,7 +245,7 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             SEMANTIC_VIEW_TOOL_NAME,
             SEMANTIC_SAVE_TOOL_NAME,
             SEMANTIC_DELETE_TOOL_NAME,
-        }.intersection(item.name for item in incidental)
+        }.intersection(item.view.name for item in incidental.entries)
     finally:
         await agent.close()
 
@@ -256,6 +262,7 @@ async def test_missing_approval_and_denial_bind_current_evidence_without_state(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         id_factory=_ids(),
         clock=lambda: NOW,
     )
@@ -296,6 +303,7 @@ async def test_missing_approval_and_denial_bind_current_evidence_without_state(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=deny,
         id_factory=_ids("denied"),
         clock=lambda: NOW,
@@ -367,6 +375,7 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
@@ -447,6 +456,7 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
@@ -485,6 +495,7 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
         runtime = agent._embedded._capability_runtime
         semantic_domain = agent._embedded._semantic_domain
         semantic_domain.select_explicit_learning_run(delete_run.id)
+        catalog = await runtime.prepare_run(delete_run)
         deleted = (
             await runtime.execute_all(
                 delete_run,
@@ -498,6 +509,7 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
                         },
                     ),
                 ),
+                projection=runtime.project(catalog, ()),
                 sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
@@ -536,6 +548,7 @@ async def test_state_change_during_semantic_approval_returns_state_changed(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
@@ -600,6 +613,7 @@ async def test_tool_result_evidence_is_valid_and_save_is_recalled_after_reopen(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
@@ -679,6 +693,7 @@ async def test_natural_language_and_learn_route_to_semantics_without_new_command
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,

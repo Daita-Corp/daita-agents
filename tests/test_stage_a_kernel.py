@@ -50,7 +50,14 @@ from daita.loop import (
 from daita.loop.models import validate_completed_transcript
 from daita.memory.capabilities import MEMORY_SET_CAPABILITY_ID
 from daita.storage.sqlite import SQLiteStateStore
-from _capability_runtime_support import StaticTestDomain, static_registry
+from _capability_runtime_support import (
+    StaticTestDomain,
+    context_step_projection,
+    context_tool_catalog,
+    execute_projected,
+    static_registry,
+    discovery_metadata,
+)
 
 NOW = datetime(2026, 8, 18, tzinfo=UTC)
 
@@ -60,9 +67,9 @@ def _error(result: ToolResultBlock) -> Mapping[str, object]:
 
 
 class _Context:
-    async def prepare(self, run, messages, tools):
+    async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tools
+        return messages[:-1], tool_context.provider_definitions
 
     def project(
         self,
@@ -70,10 +77,11 @@ class _Context:
         messages,
         *,
         step,
+        tool_context,
         final=False,
         previous_request_input_tokens=None,
     ):
-        del step, previous_request_input_tokens
+        del step, previous_request_input_tokens, tool_context
         static, tools = snapshot
         return ModelRequest(
             messages=(*static, *messages),
@@ -82,12 +90,15 @@ class _Context:
 
 
 class _NoTools:
-    async def definitions(self, run):
-        del run
-        return ()
+    async def prepare_run(self, run):
+        return context_tool_catalog(run, ())
 
-    async def execute_all(self, run, calls, *, sensitivity):
-        del run, sensitivity
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
         assert calls == ()
         return ToolBatchOutcome(())
 
@@ -260,11 +271,13 @@ def _runtime(
             name="stage_a_read",
             capability_id=read.id,
             description=read.description,
+            discovery=discovery_metadata(),
         ),
         ToolView(
             name="stage_a_write",
             capability_id=write.id,
             description=write.description,
+            discovery=discovery_metadata(),
         ),
     )
     domain = StaticTestDomain((read, write), views)
@@ -432,7 +445,8 @@ async def test_cancelled_batch_keeps_known_side_effect_and_marks_later_call_unst
         ToolCall(id="later-read", name="stage_a_read"),
     )
     task = asyncio.create_task(
-        runtime.execute_all(
+        execute_projected(
+            runtime,
             _run("run-batch-known"),
             calls,
             sensitivity=ModelSensitivity.INTERNAL,
@@ -463,7 +477,8 @@ async def test_uncertain_side_effect_wait_is_bounded_and_records_outcome_unknown
         ToolCall(id="later-read", name="stage_a_read"),
     )
     task = asyncio.create_task(
-        runtime.execute_all(
+        execute_projected(
+            runtime,
             _run("run-batch-unknown"),
             calls,
             sensitivity=ModelSensitivity.INTERNAL,
@@ -490,7 +505,8 @@ async def test_cancellation_resistant_read_has_a_bounded_settlement_wait():
         recovery_timeout=0.01,
     )
     task = asyncio.create_task(
-        runtime.execute_all(
+        execute_projected(
+            runtime,
             _run("run-bounded-read-cancellation"),
             (ToolCall(id="read", name="stage_a_read", arguments={"query": "x"}),),
             sensitivity=ModelSensitivity.INTERNAL,
@@ -584,9 +600,16 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
         input_schema={"type": "object", "properties": {}},
     )
 
-    snapshot = await builder.prepare(run, (user,), (tool,))
+    tool_catalog = context_tool_catalog(run, (tool,))
+    step_projection = context_step_projection(tool_catalog)
+    snapshot = await builder.prepare(run, (user,), tool_catalog)
     assert not hasattr(builder, "build")
-    first = builder.project(snapshot, (user,), step=1)
+    first = builder.project(
+        snapshot,
+        (user,),
+        step=1,
+        tool_context=step_projection,
+    )
     catalog.revision = "changed-after-prepare"
     call = ToolCall(id="classified", name="lookup")
     current = (
@@ -607,7 +630,12 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
             ),
         ),
     )
-    second = builder.project(snapshot, current, step=2)
+    second = builder.project(
+        snapshot,
+        current,
+        step=2,
+        tool_context=step_projection,
+    )
 
     assert catalog.context_reads == 1
     assert catalog.sensitivity_reads == 1
@@ -631,7 +659,13 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
         second.sensitivity_provenance["classified_results"],
     )
     assert classified_results[0]["call_id"] == "classified"
-    final = builder.project(snapshot, current, step=3, final=True)
+    final = builder.project(
+        snapshot,
+        current,
+        step=3,
+        tool_context=step_projection,
+        final=True,
+    )
     assert final.tools == ()
     assert final.messages[0] == snapshot.final_static_messages[0]
     assert "execution step limit has been reached" in repr(final.messages[0])
@@ -651,7 +685,9 @@ async def test_context_owner_rejects_cumulative_evidence_pressure_explicitly():
     )
     run = _run("run-context-pressure")
     user = CanonicalMessage(role=MessageRole.USER, content=(TextBlock("question"),))
-    snapshot = await builder.prepare(run, (user,), ())
+    tool_catalog = context_tool_catalog(run, ())
+    step_projection = context_step_projection(tool_catalog)
+    snapshot = await builder.prepare(run, (user,), tool_catalog)
     result = ToolResultBlock(
         call_id="large",
         output={"rows": "x" * 200},
@@ -671,6 +707,7 @@ async def test_context_owner_rejects_cumulative_evidence_pressure_explicitly():
                 CanonicalMessage(role=MessageRole.TOOL, content=(result,)),
             ),
             step=2,
+            tool_context=step_projection,
         )
 
 
@@ -823,18 +860,24 @@ async def test_tool_call_run_bound_counts_across_responses():
         def __init__(self) -> None:
             self.calls: list[ToolCall] = []
 
-        async def definitions(self, run):
-            del run
-            return (
-                ToolDefinition(
-                    name="lookup",
-                    description="Lookup.",
-                    input_schema={"type": "object", "properties": {}},
+        async def prepare_run(self, run):
+            return context_tool_catalog(
+                run,
+                (
+                    ToolDefinition(
+                        name="lookup",
+                        description="Lookup.",
+                        input_schema={"type": "object", "properties": {}},
+                    ),
                 ),
             )
 
-        async def execute_all(self, run, calls, *, sensitivity):
-            del run, sensitivity
+        def project(self, catalog, messages):
+            del messages
+            return context_step_projection(catalog)
+
+        async def execute_all(self, run, calls, *, projection, sensitivity):
+            del run, projection, sensitivity
             self.calls.extend(calls)
             return ToolBatchOutcome(
                 tuple(
@@ -874,7 +917,8 @@ async def test_tool_call_run_bound_counts_across_responses():
 
 
 async def test_runtime_binds_classification_and_provenance_to_every_success():
-    outcome = await _runtime(_InterruptibleSideEffect()).execute_all(
+    outcome = await execute_projected(
+        _runtime(_InterruptibleSideEffect()),
         _run("run-runtime-classification"),
         (
             ToolCall(
@@ -913,7 +957,8 @@ async def test_read_concurrency_and_per_source_pressure_are_bounded():
         for index in range(4)
     )
 
-    outcome = await runtime.execute_all(
+    outcome = await execute_projected(
+        runtime,
         _run("run-read-pressure"),
         calls,
         sensitivity=ModelSensitivity.INTERNAL,
@@ -948,7 +993,8 @@ async def test_tool_result_bytes_and_depth_fail_with_structured_bounds(
         read_executor=_PayloadReadExecutor(payload),
         limits=limits,
     )
-    outcome = await runtime.execute_all(
+    outcome = await execute_projected(
+        runtime,
         _run(f"run-{expected_code}"),
         (
             ToolCall(
@@ -969,7 +1015,8 @@ async def test_unexpected_executor_failure_is_normalized_and_redacted():
         _InterruptibleSideEffect(),
         read_executor=_FailingReadExecutor(),
     )
-    outcome = await runtime.execute_all(
+    outcome = await execute_projected(
+        runtime,
         _run("run-redacted-executor-failure"),
         (
             ToolCall(

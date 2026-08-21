@@ -15,7 +15,12 @@ from daita.domains.data.sql import ResourceSchema
 from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
-from _capability_runtime_support import StaticTestDomain, static_registry
+from _capability_runtime_support import (
+    StaticTestDomain,
+    discovery_metadata,
+    execute_projected,
+    static_registry,
+)
 
 
 class _SourceStore:
@@ -212,13 +217,15 @@ async def _failure_result(error: BaseException):
         name="test_postgresql_failure",
         capability_id=capability.id,
         description=capability.description,
+        discovery=discovery_metadata(),
     )
     domain = StaticTestDomain((capability,), (view,))
     runtime = CapabilityRuntime(
         static_registry(domain, (_FailingExecutor(error),)),
         (domain,),
     )
-    outcome = await runtime.execute_all(
+    outcome = await execute_projected(
+        runtime,
         RunInput(
             id="run-postgresql-failure",
             agent_id="agent-postgresql-failure",
@@ -226,7 +233,6 @@ async def _failure_result(error: BaseException):
             created_at=datetime(2026, 8, 19, tzinfo=UTC),
         ),
         (ToolCall(id="call-postgresql", name=view.name),),
-        sensitivity=ModelSensitivity.INTERNAL,
     )
     return outcome.ordered_results[0]
 

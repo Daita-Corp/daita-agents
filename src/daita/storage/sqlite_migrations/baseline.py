@@ -15,7 +15,6 @@ from ..sqlite_schema import (
     require_healthy,
     require_schema,
 )
-from .generalized_postgresql_updates import validate_target
 from .runner import MIGRATIONS, insert_journal_row
 
 
@@ -37,6 +36,5 @@ def create_current(connection: sqlite3.Connection) -> None:
     for migration in MIGRATIONS:
         insert_journal_row(connection, migration)
     require_schema(connection, CURRENT_TABLES)
-    validate_target(connection)
     require_healthy(connection)
     connection.commit()

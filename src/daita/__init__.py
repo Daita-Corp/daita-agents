@@ -48,7 +48,14 @@ from .llm import (
     RetryPolicy,
     create_llm_provider,
 )
-from .loop import ConversationRun, LoopExit, LoopExitKind, LoopLimits, Transcript
+from .loop import (
+    ConversationRun,
+    LoopExit,
+    LoopExitKind,
+    LoopLimits,
+    ToolProjectionMode,
+    Transcript,
+)
 from .observation import AgentEvent, AgentEventKind, AgentObserver
 from .semantics import (
     ResourceRevisionBinding,
@@ -97,6 +104,7 @@ __all__ = [
     "LoopExit",
     "LoopExitKind",
     "LoopLimits",
+    "ToolProjectionMode",
     "MCPAdmissionError",
     "MCPAuthentication",
     "MCPAuthenticationMode",

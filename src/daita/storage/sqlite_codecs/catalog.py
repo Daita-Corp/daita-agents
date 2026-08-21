@@ -152,8 +152,9 @@ def _decode_relationship(value: JsonValue) -> CatalogRelationship:
             "confidence",
             "sync_id",
             "observed_at",
+            "field_pairs",
+            "attributes",
         ),
-        optional={"field_pairs": [], "attributes": {}},
     )
     attributes = plain_decode(mapping(fields["attributes"], "relationship attributes"))
     if not isinstance(attributes, dict):
@@ -202,12 +203,15 @@ def _decode_revision(value: JsonValue) -> CatalogResourceRevision:
     fields = record_fields(
         value,
         "CatalogResourceRevision",
-        ("resource_id", "revision", "sync_id", "observed_at"),
-        optional={
-            "facet_revisions": [],
-            "relationship_revisions": [],
-            "source_revision": None,
-        },
+        (
+            "resource_id",
+            "revision",
+            "sync_id",
+            "observed_at",
+            "facet_revisions",
+            "relationship_revisions",
+            "source_revision",
+        ),
     )
     return CatalogResourceRevision(
         resource_id=text(fields["resource_id"], "catalog revision resource_id"),
@@ -314,14 +318,19 @@ def _decode_catalog_sync(value: JsonValue) -> CatalogSync:
     fields = record_fields(
         value,
         "CatalogSync",
-        ("id", "agent_id", "source_id", "adapter_id", "status", "started_at"),
-        optional={
-            "completed_at": None,
-            "source_revision": None,
-            "resource_count": 0,
-            "relationship_count": 0,
-            "error_code": None,
-        },
+        (
+            "id",
+            "agent_id",
+            "source_id",
+            "adapter_id",
+            "status",
+            "started_at",
+            "completed_at",
+            "source_revision",
+            "resource_count",
+            "relationship_count",
+            "error_code",
+        ),
     )
     return CatalogSync(
         id=text(fields["id"], "catalog sync id"),
@@ -361,8 +370,7 @@ def _decode_catalog_snapshot(value: JsonValue) -> SourceCatalogSnapshot:
     fields = record_fields(
         value,
         "SourceCatalogSnapshot",
-        ("sync", "resources", "revisions"),
-        optional={"facets": [], "relationships": []},
+        ("sync", "resources", "revisions", "facets", "relationships"),
     )
     return SourceCatalogSnapshot(
         sync=_decode_catalog_sync(fields["sync"]),
