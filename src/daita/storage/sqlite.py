@@ -16,10 +16,10 @@ import tempfile
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import TypeVar
+from typing import TypeVar, cast
 
 from .._json import FrozenJsonObject
 from ..adapters.mcp import (
@@ -63,6 +63,27 @@ from ..learning_candidates import (
     LearningCandidateStatus,
     LearningReviewRunTail,
 )
+from ..jobs.models import (
+    ExternalIntent,
+    ExternalIntentDisposition,
+    ExternalIntentKind,
+    ExternalObservation,
+    JobAttempt,
+    JobAttemptStatus,
+    JobDesiredState,
+    JobExecutionMode,
+    JobResult,
+    JobRun,
+    JobStatus,
+    MAX_ACTIVE_JOBS_PER_AGENT,
+    MAX_JOB_ATTEMPTS,
+    MAX_JOB_LIST_PAGE_SIZE,
+    MAX_JOBS_PER_AGENT,
+    MAX_QUEUED_JOBS_PER_AGENT,
+    MAX_RUNNING_JOBS_PER_AGENT,
+    MAX_RUNNING_JOBS_PER_SOURCE,
+    TERMINAL_JOB_STATUSES,
+)
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -90,6 +111,7 @@ from .sqlite_codecs import (
     decode_identifier,
     decode_identity,
     decode_learning_candidate,
+    decode_job_run,
     decode_loop_exit,
     decode_mcp_binding,
     decode_message,
@@ -105,6 +127,7 @@ from .sqlite_codecs import (
     encode_identifier,
     encode_identity,
     encode_learning_candidate,
+    encode_job_run,
     encode_loop_exit,
     encode_mcp_binding,
     encode_message,
@@ -166,6 +189,62 @@ def _active_source_key(agent_id: str) -> str:
 
 def _learning_review_stamps_key(agent_id: str) -> str:
     return f"{_LEARNING_REVIEW_STAMPS_KEY_PREFIX}{agent_id}"
+
+
+def _decode_job_rows(
+    rows: Iterable[tuple[object, object]],
+    *,
+    agent_id: str,
+) -> tuple[JobRun, ...]:
+    material = tuple(rows)
+    if len(material) > MAX_JOBS_PER_AGENT:
+        raise RuntimeError("stored job count exceeds its fixed bound")
+    jobs: list[JobRun] = []
+    for job_id, data in material:
+        if not isinstance(job_id, str) or not isinstance(data, str):
+            raise RuntimeError("stored job identity is invalid")
+        jobs.append(decode_job_run(data, agent_id=agent_id, job_id=job_id))
+    return tuple(jobs)
+
+
+def _load_job_row(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    job_id: str,
+) -> tuple[JobRun, str] | None:
+    row = connection.execute(
+        "SELECT data FROM job_runs WHERE agent_id = ? AND job_id = ?",
+        (agent_id, job_id),
+    ).fetchone()
+    if row is None:
+        return None
+    if not isinstance(row[0], str):
+        raise RuntimeError("stored job payload is invalid")
+    return decode_job_run(row[0], agent_id=agent_id, job_id=job_id), row[0]
+
+
+def _replace_job_row(
+    connection: sqlite3.Connection,
+    current_data: str,
+    job: JobRun,
+) -> None:
+    result = connection.execute(
+        """UPDATE job_runs SET data = ?
+           WHERE agent_id = ? AND job_id = ? AND data = ?""",
+        (encode_job_run(job), job.agent_id, job.job_id, current_data),
+    )
+    if result.rowcount != 1:
+        raise RuntimeError("job changed during its conditional transition")
+
+
+def _model_sensitivity_rank(value) -> int:
+    order = {
+        "public": 0,
+        "internal": 1,
+        "confidential": 2,
+        "restricted": 3,
+    }
+    return order[value.value]
 
 
 def _decode_owned_read_scope(
@@ -575,6 +654,567 @@ class SQLiteStateStore:
             if result.rowcount != 1:
                 raise RuntimeError("MCP binding changed during its transition")
             return binding
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def admit_job(self, job: JobRun) -> JobRun:
+        if not isinstance(job, JobRun):
+            raise TypeError("job must be JobRun")
+        if (
+            job.status is not JobStatus.QUEUED
+            or job.desired_state is not JobDesiredState.RUN
+            or job.revision != 1
+            or job.attempts
+        ):
+            raise ValueError("new job must be one pristine queued aggregate")
+        encoded = encode_job_run(job)
+
+        def write(connection: sqlite3.Connection) -> JobRun:
+            rows = tuple(
+                connection.execute(
+                    "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
+                    (job.agent_id,),
+                )
+            )
+            jobs = _decode_job_rows(rows, agent_id=job.agent_id)
+            if any(item.job_id == job.job_id for item in jobs):
+                raise ValueError("job identity already exists")
+            if len(jobs) >= MAX_JOBS_PER_AGENT:
+                raise ValueError("job_retention_limit_exceeded")
+            active = sum(not item.terminal for item in jobs)
+            queued = sum(item.status is JobStatus.QUEUED for item in jobs)
+            if active >= MAX_ACTIVE_JOBS_PER_AGENT:
+                raise ValueError("job_active_limit_exceeded")
+            if queued >= MAX_QUEUED_JOBS_PER_AGENT:
+                raise ValueError("job_queue_limit_exceeded")
+            connection.execute(
+                "INSERT INTO job_runs(agent_id, job_id, data) VALUES (?, ?, ?)",
+                (job.agent_id, job.job_id, encoded),
+            )
+            return job
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def load_job(self, agent_id: str, job_id: str) -> JobRun | None:
+        def read() -> JobRun | None:
+            with _connect(self.path) as connection:
+                loaded = _load_job_row(connection, agent_id, job_id)
+            return None if loaded is None else loaded[0]
+
+        return await asyncio.to_thread(read)
+
+    async def list_jobs(
+        self,
+        agent_id: str,
+        *,
+        conversation_id: str | None = None,
+        statuses: frozenset[JobStatus] = frozenset(),
+        limit: int = MAX_JOB_LIST_PAGE_SIZE,
+    ) -> tuple[JobRun, ...]:
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= MAX_JOB_LIST_PAGE_SIZE
+        ):
+            raise ValueError("job list limit is outside its bound")
+        statuses = frozenset(statuses)
+        if any(not isinstance(item, JobStatus) for item in statuses):
+            raise TypeError("job statuses must contain JobStatus values")
+
+        def read() -> tuple[JobRun, ...]:
+            with _connect(self.path) as connection:
+                jobs = _decode_job_rows(
+                    tuple(
+                        connection.execute(
+                            "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
+                            (agent_id,),
+                        )
+                    ),
+                    agent_id=agent_id,
+                )
+            selected = tuple(
+                item
+                for item in jobs
+                if (conversation_id is None or item.conversation_id == conversation_id)
+                and (not statuses or item.status in statuses)
+            )
+            return tuple(
+                sorted(
+                    selected,
+                    key=lambda item: (item.created_at, item.job_id),
+                    reverse=True,
+                )[:limit]
+            )
+
+        return await asyncio.to_thread(read)
+
+    async def claim_next_job(
+        self,
+        agent_id: str,
+        *,
+        claim_token: str,
+        execution_run_id: str,
+        reserved_artifact_id: str,
+        claimed_at: datetime,
+        lease_seconds: float,
+    ) -> JobRun | None:
+        if (
+            not isinstance(lease_seconds, (int, float))
+            or isinstance(lease_seconds, bool)
+            or not 0 < float(lease_seconds) <= 300
+        ):
+            raise ValueError("job lease_seconds is outside its bound")
+
+        def write(connection: sqlite3.Connection) -> JobRun | None:
+            rows = tuple(
+                connection.execute(
+                    "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
+                    (agent_id,),
+                )
+            )
+            jobs = _decode_job_rows(rows, agent_id=agent_id)
+            running = tuple(
+                item
+                for item in jobs
+                if item.status in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}
+            )
+            if len(running) >= MAX_RUNNING_JOBS_PER_AGENT:
+                return None
+            per_source: dict[str, int] = {}
+            for item in running:
+                for source_id in item.source_ids:
+                    per_source[source_id] = per_source.get(source_id, 0) + 1
+            eligible = tuple(
+                item
+                for item in sorted(
+                    jobs, key=lambda value: (value.created_at, value.job_id)
+                )
+                if item.status is JobStatus.QUEUED
+                and item.desired_state is JobDesiredState.RUN
+                and item.specification.deadline_at > claimed_at
+                and len(item.attempts) < MAX_JOB_ATTEMPTS
+                and all(
+                    per_source.get(source_id, 0) < MAX_RUNNING_JOBS_PER_SOURCE
+                    for source_id in item.source_ids
+                )
+            )
+            if not eligible:
+                return None
+            current = eligible[0]
+            loaded = _load_job_row(connection, agent_id, current.job_id)
+            if loaded is None or loaded[0] != current:
+                raise RuntimeError("job changed during claim selection")
+            epoch = current.fencing_epoch + 1
+            attempt = JobAttempt(
+                number=len(current.attempts) + 1,
+                fencing_epoch=epoch,
+                claim_token=claim_token,
+                execution_run_id=execution_run_id,
+                reserved_artifact_id=reserved_artifact_id,
+                status=JobAttemptStatus.CLAIMED,
+                claimed_at=claimed_at,
+                lease_expires_at=claimed_at + timedelta(seconds=float(lease_seconds)),
+            )
+            claimed = replace(
+                current,
+                status=JobStatus.RUNNING,
+                updated_at=claimed_at,
+                revision=current.revision + 1,
+                fencing_epoch=epoch,
+                attempts=(*current.attempts, attempt),
+            )
+            _replace_job_row(connection, loaded[1], claimed)
+            return claimed
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def request_job_cancel(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        requested_at: datetime,
+    ) -> JobRun | None:
+        def write(connection: sqlite3.Connection) -> JobRun | None:
+            loaded = _load_job_row(connection, agent_id, job_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            if current.terminal or current.desired_state is JobDesiredState.CANCEL:
+                return current
+            if current.status is JobStatus.QUEUED:
+                updated = replace(
+                    current,
+                    desired_state=JobDesiredState.CANCEL,
+                    cancel_requested_at=requested_at,
+                    updated_at=requested_at,
+                    revision=current.revision + 1,
+                    status=JobStatus.CANCELLED,
+                    terminal_at=requested_at,
+                )
+            else:
+                updated = replace(
+                    current,
+                    desired_state=JobDesiredState.CANCEL,
+                    cancel_requested_at=requested_at,
+                    updated_at=requested_at,
+                    revision=current.revision + 1,
+                    status=JobStatus.CANCEL_REQUESTED,
+                )
+            _replace_job_row(connection, encoded, updated)
+            return updated
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def finalize_job_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        attempt_status: JobAttemptStatus,
+        completed_at: datetime,
+        result: JobResult | None = None,
+        failure_code: str | None = None,
+    ) -> JobRun | None:
+        if attempt_status is JobAttemptStatus.CLAIMED:
+            raise ValueError("job finalization requires a settled attempt status")
+
+        def write(connection: sqlite3.Connection) -> JobRun | None:
+            loaded = _load_job_row(connection, agent_id, job_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            attempt = current.current_attempt
+            if (
+                current.status not in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}
+                or attempt is None
+                or attempt.status is not JobAttemptStatus.CLAIMED
+                or attempt.claim_token != claim_token
+                or attempt.fencing_epoch != fencing_epoch
+                or current.fencing_epoch != fencing_epoch
+            ):
+                return None
+            if attempt_status is JobAttemptStatus.SUCCEEDED:
+                if not isinstance(result, JobResult):
+                    raise ValueError("successful job finalization requires JobResult")
+                if _model_sensitivity_rank(
+                    result.sensitivity
+                ) < _model_sensitivity_rank(current.specification.sensitivity):
+                    raise ValueError("job result cannot lower sensitivity")
+                if any(
+                    ref.run_id != attempt.execution_run_id
+                    or ref.conversation_id != current.conversation_id
+                    or ref.capability_id
+                    != current.specification.execution_capability_id
+                    for ref in result.artifact_refs
+                ):
+                    raise ValueError("job artifact result identity is invalid")
+                status = JobStatus.SUCCEEDED
+            elif attempt_status is JobAttemptStatus.CANCELLED:
+                if result is not None:
+                    raise ValueError("cancelled job cannot retain a result")
+                status = JobStatus.CANCELLED
+            elif attempt_status is JobAttemptStatus.NEEDS_ATTENTION:
+                if result is not None:
+                    raise ValueError("needs-attention job cannot retain a result")
+                status = JobStatus.NEEDS_ATTENTION
+            else:
+                if result is not None:
+                    raise ValueError("failed job cannot retain a result")
+                status = JobStatus.FAILED
+            settled_attempt = replace(
+                attempt,
+                status=attempt_status,
+                completed_at=completed_at,
+                error_code=failure_code,
+            )
+            updated = replace(
+                current,
+                status=status,
+                updated_at=completed_at,
+                revision=current.revision + 1,
+                attempts=(*current.attempts[:-1], settled_attempt),
+                terminal_at=completed_at,
+                result=result,
+                failure_code=failure_code,
+            )
+            _replace_job_row(connection, encoded, updated)
+            return updated
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def recover_stale_job(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        recovered_at: datetime,
+        restart_safe: bool,
+    ) -> JobRun | None:
+        def write(connection: sqlite3.Connection) -> JobRun | None:
+            loaded = _load_job_row(connection, agent_id, job_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            attempt = current.current_attempt
+            if (
+                current.status not in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}
+                or attempt is None
+                or attempt.status is not JobAttemptStatus.CLAIMED
+            ):
+                return current
+            if current.desired_state is JobDesiredState.CANCEL:
+                attempt_status = JobAttemptStatus.CANCELLED
+                status = JobStatus.CANCELLED
+                terminal_at = recovered_at
+                failure_code = None
+            elif restart_safe and len(current.attempts) < MAX_JOB_ATTEMPTS:
+                attempt_status = JobAttemptStatus.FENCED
+                status = JobStatus.QUEUED
+                terminal_at = None
+                failure_code = None
+            else:
+                attempt_status = JobAttemptStatus.NEEDS_ATTENTION
+                status = JobStatus.NEEDS_ATTENTION
+                terminal_at = recovered_at
+                failure_code = "job_recovery_unsafe"
+            settled_attempt = replace(
+                attempt,
+                status=attempt_status,
+                completed_at=recovered_at,
+                error_code=failure_code,
+            )
+            updated = replace(
+                current,
+                status=status,
+                updated_at=recovered_at,
+                revision=current.revision + 1,
+                fencing_epoch=current.fencing_epoch + 1,
+                attempts=(*current.attempts[:-1], settled_attempt),
+                terminal_at=terminal_at,
+                failure_code=failure_code,
+            )
+            _replace_job_row(connection, encoded, updated)
+            return updated
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def expire_due_jobs(
+        self,
+        agent_id: str,
+        *,
+        expired_at: datetime,
+    ) -> tuple[JobRun, ...]:
+        def write(connection: sqlite3.Connection) -> tuple[JobRun, ...]:
+            rows = tuple(
+                connection.execute(
+                    "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
+                    (agent_id,),
+                )
+            )
+            jobs = _decode_job_rows(rows, agent_id=agent_id)
+            expired: list[JobRun] = []
+            row_data = {str(job_id): str(data) for job_id, data in rows}
+            for current in jobs:
+                if (
+                    current.status is not JobStatus.QUEUED
+                    or current.specification.deadline_at > expired_at
+                ):
+                    continue
+                updated = replace(
+                    current,
+                    status=JobStatus.FAILED,
+                    updated_at=expired_at,
+                    revision=current.revision + 1,
+                    terminal_at=expired_at,
+                    failure_code="job_deadline_exceeded",
+                )
+                _replace_job_row(connection, row_data[current.job_id], updated)
+                expired.append(updated)
+            return tuple(expired)
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def record_external_intent(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        intent: ExternalIntent,
+    ) -> JobRun | None:
+        if not isinstance(intent, ExternalIntent):
+            raise TypeError("intent must be ExternalIntent")
+
+        def write(connection: sqlite3.Connection) -> JobRun | None:
+            loaded = _load_job_row(connection, agent_id, job_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            attempt = current.current_attempt
+            if (
+                attempt is None
+                or attempt.status is not JobAttemptStatus.CLAIMED
+                or attempt.claim_token != claim_token
+                or attempt.fencing_epoch != fencing_epoch
+                or current.fencing_epoch != fencing_epoch
+            ):
+                return None
+            by_kind = {item.kind: item for item in attempt.external_intents}
+            existing = by_kind.get(intent.kind)
+            if existing is not None:
+                return current if existing == intent else None
+            updated_attempt = replace(
+                attempt,
+                external_intents=(*attempt.external_intents, intent),
+            )
+            updated = replace(
+                current,
+                updated_at=intent.requested_at,
+                revision=current.revision + 1,
+                attempts=(*current.attempts[:-1], updated_attempt),
+            )
+            _replace_job_row(connection, encoded, updated)
+            return updated
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def settle_external_intent(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        kind: ExternalIntentKind,
+        disposition: ExternalIntentDisposition,
+        completed_at: datetime,
+        external_job_id: str | None = None,
+        reason_code: str | None = None,
+    ) -> JobRun | None:
+        if disposition is ExternalIntentDisposition.PENDING:
+            raise ValueError("external intent settlement cannot remain pending")
+
+        def write(connection: sqlite3.Connection) -> JobRun | None:
+            loaded = _load_job_row(connection, agent_id, job_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            attempt = current.current_attempt
+            if (
+                attempt is None
+                or attempt.status is not JobAttemptStatus.CLAIMED
+                or attempt.claim_token != claim_token
+                or attempt.fencing_epoch != fencing_epoch
+                or current.fencing_epoch != fencing_epoch
+            ):
+                return None
+            index = next(
+                (
+                    position
+                    for position, item in enumerate(attempt.external_intents)
+                    if item.kind is kind
+                ),
+                None,
+            )
+            if index is None:
+                return None
+            pending = attempt.external_intents[index]
+            if pending.disposition is not ExternalIntentDisposition.PENDING:
+                return current
+            settled = replace(
+                pending,
+                disposition=disposition,
+                completed_at=completed_at,
+                external_job_id=external_job_id,
+                reason_code=reason_code,
+            )
+            intents = list(attempt.external_intents)
+            intents[index] = settled
+            updated_attempt = replace(attempt, external_intents=tuple(intents))
+            updated = replace(
+                current,
+                updated_at=completed_at,
+                revision=current.revision + 1,
+                attempts=(*current.attempts[:-1], updated_attempt),
+            )
+            _replace_job_row(connection, encoded, updated)
+            return updated
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def record_external_observation(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        observation: ExternalObservation,
+    ) -> JobRun | None:
+        if not isinstance(observation, ExternalObservation):
+            raise TypeError("observation must be ExternalObservation")
+
+        def write(connection: sqlite3.Connection) -> JobRun | None:
+            loaded = _load_job_row(connection, agent_id, job_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            attempt = current.current_attempt
+            if (
+                attempt is None
+                or attempt.status is not JobAttemptStatus.CLAIMED
+                or attempt.claim_token != claim_token
+                or attempt.fencing_epoch != fencing_epoch
+                or current.fencing_epoch != fencing_epoch
+                or observation.sequence != len(attempt.external_observations) + 1
+            ):
+                return None
+            updated_attempt = replace(
+                attempt,
+                external_observations=(
+                    *attempt.external_observations,
+                    observation,
+                ),
+            )
+            updated = replace(
+                current,
+                updated_at=observation.observed_at,
+                revision=current.revision + 1,
+                attempts=(*current.attempts[:-1], updated_attempt),
+            )
+            _replace_job_row(connection, encoded, updated)
+            return updated
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def mark_job_terminal_observed(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        observed_at: datetime,
+    ) -> JobRun | None:
+        def write(connection: sqlite3.Connection) -> JobRun | None:
+            loaded = _load_job_row(connection, agent_id, job_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            if not current.terminal:
+                raise ValueError("only a terminal job can be observed terminal")
+            if current.terminal_observed_at is not None:
+                return current
+            updated = replace(
+                current,
+                terminal_observed_at=observed_at,
+                updated_at=observed_at,
+                revision=current.revision + 1,
+            )
+            _replace_job_row(connection, encoded, updated)
+            return updated
 
         return await _run_cancellation_safe_transaction(self.path, write)
 
@@ -2610,7 +3250,7 @@ class SQLiteStateStore:
         run_id: str | None = None,
         conversation_id: str | None = None,
     ) -> tuple[ArtifactRef, ...]:
-        """Derive current reachable refs from persisted agent-scoped tool messages."""
+        """Derive reachable refs from persisted runs and successful jobs."""
 
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("agent_id must be non-empty text")
@@ -2640,6 +3280,12 @@ class SQLiteStateStore:
                         ORDER BY r.id, m.position""",
                     tuple(values),
                 ).fetchall()
+                job_rows = tuple(
+                    connection.execute(
+                        "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
+                        (agent_id,),
+                    )
+                )
             refs: dict[str, ArtifactRef] = {}
             for stored_run_id, stored_conversation_id, data in rows:
                 message = decode_message(data)
@@ -2669,10 +3315,57 @@ class SQLiteStateStore:
                     if existing is not None and existing != ref:
                         raise RuntimeError("stored artifact identity is ambiguous")
                     refs[ref.artifact_id] = ref
+            jobs = _decode_job_rows(job_rows, agent_id=agent_id)
+            for job in jobs:
+                if job.result is None:
+                    continue
+                if (
+                    conversation_id is not None
+                    and job.conversation_id != conversation_id
+                ):
+                    continue
+                for ref in job.result.artifact_refs:
+                    if run_id is not None and ref.run_id != run_id:
+                        continue
+                    if ref.conversation_id != job.conversation_id:
+                        raise RuntimeError(
+                            "stored job artifact reference identity is invalid"
+                        )
+                    existing = refs.get(ref.artifact_id)
+                    if existing is not None and existing != ref:
+                        raise RuntimeError("stored artifact identity is ambiguous")
+                    refs[ref.artifact_id] = ref
             return tuple(
                 sorted(
                     refs.values(), key=lambda item: (item.created_at, item.artifact_id)
                 )
+            )
+
+        return await asyncio.to_thread(read)
+
+    async def list_reserved_artifact_ids(
+        self,
+        agent_id: str,
+    ) -> frozenset[tuple[str, str]]:
+        """Return exact live job artifact reservations for admission recovery."""
+
+        def read() -> frozenset[tuple[str, str]]:
+            with _connect_read_only(self.path) as connection:
+                jobs = _decode_job_rows(
+                    tuple(
+                        connection.execute(
+                            "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
+                            (agent_id,),
+                        )
+                    ),
+                    agent_id=agent_id,
+                )
+            return frozenset(
+                (attempt.execution_run_id, attempt.reserved_artifact_id)
+                for job in jobs
+                if job.status in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}
+                for attempt in (job.current_attempt,)
+                if attempt is not None and attempt.status is JobAttemptStatus.CLAIMED
             )
 
         return await asyncio.to_thread(read)
@@ -3257,12 +3950,13 @@ async def _run_cancellation_safe_transaction(
     callback: Callable[[sqlite3.Connection], _T],
 ) -> _T:
     gate = _CatalogCommitGate()
+    cancelled_sentinel = object()
 
-    def write() -> _T | None:
+    def write() -> _T | object:
         connection = _connect(path)
         try:
             if not gate.start(connection):
-                return None
+                return cancelled_sentinel
             result = callback(connection)
             connection.commit()
             return result
@@ -3283,14 +3977,12 @@ async def _run_cancellation_safe_transaction(
             )
     result = worker.result()
     if cancelled_before_start:
-        if result is not None:
-            raise AssertionError("cancelled learning candidate transaction committed")
+        if result is not cancelled_sentinel:
+            raise AssertionError("cancelled state transaction committed")
         raise asyncio.CancelledError
-    if result is None:
-        raise AssertionError(
-            "learning candidate transaction stopped without cancellation"
-        )
-    return result
+    if result is cancelled_sentinel:
+        raise AssertionError("state transaction stopped without cancellation")
+    return cast(_T, result)
 
 
 def _validate_current_mcp_binding_bounds(connection: sqlite3.Connection) -> None:

@@ -14,6 +14,7 @@ from daita.capabilities import (
     ApprovalDecision,
     ApprovalRequest,
     Capability,
+    OperationalEffect,
     SideEffectExecutor,
     ToolExecution,
 )
@@ -242,28 +243,18 @@ def test_approval_records_and_write_invariants_are_exact_and_frozen():
     with pytest.raises(TypeError):
         request.arguments["content"] = "changed"  # type: ignore[index]
 
-    with pytest.raises(ValueError, match="write tools must be side-effecting"):
-        Capability(
-            id="test.capability",
-            description="test",
-            input_schema={"type": "object", "properties": {}},
-            output_kind="test.output",
-            output_schema={"type": "object", "properties": {}},
-            executor_id="test.executor",
-            access_mode=AccessMode.WRITE,
-            side_effecting=False,
-        )
-    with pytest.raises(ValueError, match="read tools cannot be"):
-        Capability(
-            id="test.capability",
-            description="test",
-            input_schema={"type": "object", "properties": {}},
-            output_kind="test.output",
-            output_schema={"type": "object", "properties": {}},
-            executor_id="test.executor",
-            access_mode=AccessMode.READ,
-            side_effecting=True,
-        )
+    independent = Capability(
+        id="test.capability",
+        description="test",
+        input_schema={"type": "object", "properties": {}},
+        output_kind="test.output",
+        output_schema={"type": "object", "properties": {}},
+        executor_id="test.executor",
+        access_mode=AccessMode.NONE,
+        operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
+    )
+    assert independent.access_mode is AccessMode.NONE
+    assert independent.operational_effect is OperationalEffect.CHANGE_ADVISORY_CONTEXT
 
 
 async def test_memory_set_identity_projection_and_read_tools_never_ask_approval(
@@ -286,14 +277,14 @@ async def test_memory_set_identity_projection_and_read_tools_never_ask_approval(
             executor.executor_id,
             capability.output_kind,
             capability.access_mode,
-            capability.side_effecting,
+            capability.operational_effect,
         ) == (
             MEMORY_SET_TOOL_NAME,
             MEMORY_SET_CAPABILITY_ID,
             MEMORY_SET_EXECUTOR_ID,
             MEMORY_SET_OUTPUT_KIND,
-            AccessMode.WRITE,
-            True,
+            AccessMode.NONE,
+            OperationalEffect.CHANGE_ADVISORY_CONTEXT,
         )
         assert resolved == capability
         catalog = await _runtime(agent).prepare_run(_run(agent))
@@ -1148,8 +1139,11 @@ async def test_skill_write_identities_use_the_existing_registry_and_runtime(tmp_
                 executor.executor_id,
                 capability.output_kind,
             ) == identity
-            assert capability.access_mode is AccessMode.WRITE
-            assert capability.side_effecting is True
+            assert capability.access_mode is AccessMode.NONE
+            assert (
+                capability.operational_effect
+                is OperationalEffect.CHANGE_ADVISORY_CONTEXT
+            )
             assert callable(getattr(executor, "preflight", None))
     finally:
         await agent.close()

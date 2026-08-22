@@ -12,6 +12,7 @@ from daita.capabilities import (
     AccessMode,
     ApprovalDecision,
     Capability,
+    OperationalEffect,
     ToolExecution,
     ToolOutput,
     ToolView,
@@ -259,8 +260,8 @@ def _runtime(
             "required": ["call"],
         },
         executor_id=side_effect.executor_id,
-        access_mode=AccessMode.WRITE,
-        side_effecting=True,
+        access_mode=AccessMode.NONE,
+        operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
     )
 
     async def approve(_request):

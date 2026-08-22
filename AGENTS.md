@@ -211,13 +211,16 @@ and recovery; approval alone is not such a design.
 Artifact continuity is model-led through the existing capability/runtime path.
 `artifact_list` exposes only bounded safe metadata for the current conversation;
 it is not a public Python, CLI, TUI, or browser inventory. `artifact_read`
-returns only bounded previews, and `artifact_convert` currently supports only a
-verified Daita-generated XLSX `Data` snapshot to CSV. Conversion reads committed
-artifact bytes at the artifact-store boundary, inherits runtime-bound
-provenance and sensitivity, records its parent artifact ID, and commits through
-the normal artifact policy. Do not add prompt-intent classifiers, historical
-artifact-reference projections, a current-file pointer, raw model paths/bytes,
-or a second execution path to improve file reference continuity.
+returns only bounded previews for an exact known artifact ID owned by the
+current agent home, including an ID returned by `job_read_results`; it never
+provides an agent-wide inventory. `artifact_convert` remains scoped to the
+current conversation and currently supports only a verified Daita-generated
+XLSX `Data` snapshot to CSV. Conversion reads committed artifact bytes at the
+artifact-store boundary, inherits runtime-bound provenance and sensitivity,
+records its parent artifact ID, and commits through the normal artifact policy.
+Do not add prompt-intent classifiers, historical artifact-reference
+projections, a current-file pointer, raw model paths/bytes, or a second
+execution path to improve file reference continuity.
 
 ### Catalog and adapters
 
@@ -271,6 +274,61 @@ normalized failures; the generic loop does not retry a whole run or understand
 provider-specific failures.
 
 ## Architecture exclusions
+
+### Accepted Phase B durable-job slice
+
+North Star Phase B is accepted for implementation, but only through these
+existing owners and one concrete job kind:
+
+- one bounded, feature-owned `JobRun` aggregate may represent each independent
+  durable job lifecycle, with attempts, claims, fencing, cancellation intent,
+  receipts, external observations, validated result/artifact references, and
+  terminal-observation state embedded in its current codec-v1 shape;
+- one Stage B job owner may admit frozen jobs and own bounded list, inspect,
+  result, cancel, and conditional lifecycle transitions;
+- one bounded Daita job supervisor may run under the existing open
+  `EmbeddedAgent` and single-writer boundary, claim independent jobs within
+  exact global/per-agent/per-source limits, fence stale claims, and recover
+  safely on reopen;
+- `CapabilityRuntime` may expose one trusted typed internal request for that
+  supervisor, reusing the ordinary registry resolution, validation,
+  governance, execution, artifact, sensitivity, provenance, result-bound, and
+  observation path without a model envelope or recursive runtime call; and
+- the data domain may own only the first job-kind-specific
+  `start_data_profile` capability and internal-only `data_profile` execution
+  capability. The start capability freezes the exact non-secret job
+  specification and persists the exact execution capability ID and immutable
+  registry contract digest before returning its bounded receipt.
+
+The agent identity is the job authorization boundary. Model and public
+lifecycle reads and cancellation may address that agent's jobs from any of its
+conversations; `JobRun.conversation_id` and `origin_run_id` are immutable origin
+provenance, not access gates. `job_list` is a direct core capability even when
+the agent owns no jobs. Once jobs exist, `job_inspect` and `job_read_results`
+are direct core capabilities; `job_cancel` remains deferred, effect-governed,
+and projected only while cancelable work exists. Known-ID result recovery uses
+`job_read_results` directly, while `job_inspect` is reserved for lifecycle,
+attempt, execution, and failure details. Cross-agent lookup fails without
+exposing job metadata.
+
+`Capability` metadata now separates data access from operational effect.
+Starting or cancelling durable work is an operational effect even when the
+job's data access is read-only; this distinction remains immutable registry
+metadata and does not authorize a policy registry or DSL.
+
+Daita execution is the default. Phase B connected-executor work is limited to
+deterministic offline conformance for an exact explicitly selected profile,
+including revocation/drift, uncertain start/cancel responses, reconciliation,
+result bounds, and no fallback. Production exposes no placeholder external
+profile and does not claim support for a real external executor until a later
+separately accepted connector slice is certified.
+
+Phase B does not authorize a generic scheduler, arbitrary job dispatcher,
+workflow or execution graph, universal task/work abstraction, job-kind switch
+or handler registry, dynamic registration, plugin executor, completion router,
+recovery service, event bus, resident daemon, client/server split, competing
+writer, multi-host queue, resumable model state, or Phase C/D/E scaffolding.
+Work pauses whenever no admitted `EmbeddedAgent` host is open.
 
 Do not add or restore these mechanisms in order to implement an MVP feature:
 

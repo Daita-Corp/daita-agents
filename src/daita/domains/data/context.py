@@ -42,6 +42,12 @@ from ...llm.models import (
     ToolResultBlock,
 )
 from ...loop.models import ConversationRun, LoopExitKind, RunInput
+from ...jobs.capabilities import (
+    JOB_CANCEL_CAPABILITY_ID,
+    JOB_INSPECT_CAPABILITY_ID,
+    JOB_LIST_CAPABILITY_ID,
+    JOB_READ_RESULTS_CAPABILITY_ID,
+)
 from ...memory.capabilities import MEMORY_SET_OUTPUT_KIND, MEMORY_SET_TOOL_NAME
 from ...semantics import (
     SEMANTIC_DELETE_OUTPUT_KIND,
@@ -1688,6 +1694,15 @@ def _system_prompt(
         POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID in capability_ids
     )
     postgresql_update_available = POSTGRESQL_UPDATE_CAPABILITY_ID in capability_ids
+    job_tools_available = bool(
+        capability_ids
+        & {
+            JOB_LIST_CAPABILITY_ID,
+            JOB_INSPECT_CAPABILITY_ID,
+            JOB_READ_RESULTS_CAPABILITY_ID,
+            JOB_CANCEL_CAPABILITY_ID,
+        }
+    )
     instructions = [
         "You are Daita, a data agent.",
         (
@@ -1778,6 +1793,21 @@ def _system_prompt(
                 + canonical_json(tool_manifest),
             )
         )
+    if JOB_READ_RESULTS_CAPABILITY_ID in capability_ids:
+        instructions.append(
+            "Durable jobs are owned by this agent across conversations; an "
+            "origin_conversation_id is provenance, not an access boundary. For a "
+            "known job ID, call job_read_results first and then artifact_read for an "
+            "exact returned artifact ID. If the job ID is unknown, call job_list "
+            "before job_read_results. Use job_inspect only for lifecycle status, "
+            "attempt, execution, or failure details, and job_cancel only for an "
+            "explicit cancellation request."
+        )
+    elif job_tools_available:
+        instructions.append(
+            "job_list is agent-scoped across conversations; origin_conversation_id "
+            "is provenance."
+        )
     if postgresql_update_available:
         instructions.append(
             "For PostgreSQL changes, call the typed read-only preview first. When "
@@ -1814,8 +1844,11 @@ def _system_prompt(
                     "File tools: artifact_create_document for Markdown/TXT; "
                     "data_export_sqlite or data_export_postgresql for exact CSV/XLSX; "
                     "data_export_file for byte-identical attached CSV/JSON, never "
-                    "data_read_file. For earlier conversation files use artifact_list, "
-                    "then artifact_read only if needed; artifact_convert only converts a "
+                    "data_read_file. For earlier files in the current conversation use "
+                    "artifact_list, then artifact_read only if needed. An exact artifact "
+                    "ID returned by job_read_results may be read directly across this "
+                    "agent's conversations; there is no agent-wide artifact inventory. "
+                    "artifact_convert only converts a "
                     "verified Daita XLSX Data snapshot to CSV. Never put source rows or "
                     "artifact bytes in arguments or rerun a source for conversion; ask "
                     "if the artifact choice remains ambiguous. "

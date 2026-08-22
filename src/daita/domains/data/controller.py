@@ -12,6 +12,7 @@ from ...capabilities import (
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
+    OperationalEffect,
     ToolExecution,
     ToolOutput,
 )
@@ -212,7 +213,7 @@ class DataCapabilityDomain:
             if not self._learning.allows(
                 run.id,
                 name,
-                side_effecting=capability.side_effecting,
+                effectful=capability.operational_effect is not OperationalEffect.NONE,
             ):
                 continue
             if capability.id in _CATALOG_CAPABILITIES:
@@ -251,14 +252,14 @@ class DataCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
         del request_sensitivity
-        if capability.side_effecting:
-            self._learning.validate_side_effect(run.id, call)
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.validate_effect(run.id, call)
         arguments = self._apply_source_scope(run, capability, arguments)
         await self._validate_source_scope(run, capability, arguments)
         await self._validate_resource_read_scope(run, capability, arguments)
         if capability.access_mode is AccessMode.WRITE and (
             capability.id != POSTGRESQL_UPDATE_CAPABILITY_ID
-            or not capability.side_effecting
+            or capability.operational_effect is not OperationalEffect.MUTATE_DATA
         ):
             raise CapabilityInputError(
                 "write_not_enabled",
@@ -332,7 +333,10 @@ class DataCapabilityDomain:
         execution: ToolExecution,
         fingerprint: FrozenJsonObject,
     ) -> SideEffectPlan:
-        if capability.id not in _UPDATE_CAPABILITIES or not capability.side_effecting:
+        if (
+            capability.id not in _UPDATE_CAPABILITIES
+            or capability.operational_effect is not OperationalEffect.MUTATE_DATA
+        ):
             raise ValueError("data domain received an unsupported side effect")
         return SideEffectPlan(recheck_after_approval=False)
 
@@ -347,8 +351,8 @@ class DataCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
         del request_sensitivity
-        if capability.side_effecting:
-            self._learning.mark_side_effect_succeeded(run.id)
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.mark_effect_succeeded(run.id)
         return await self._classify(run, call, capability, output)
 
     def normalize_error(

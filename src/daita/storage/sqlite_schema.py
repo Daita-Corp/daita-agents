@@ -83,6 +83,11 @@ MCP_BINDING_TABLE = (
     ("binding_id", "TEXT", 1, None, 2),
     ("data", "TEXT", 1, None, 0),
 )
+JOB_RUN_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("job_id", "TEXT", 1, None, 2),
+    ("data", "TEXT", 1, None, 0),
+)
 
 CURRENT_TABLES = {
     **CORE_TABLES,
@@ -91,6 +96,7 @@ CURRENT_TABLES = {
     "source_read_scopes": READ_SCOPE_TABLE,
     "postgresql_update_scopes": UPDATE_SCOPE_TABLE,
     "mcp_server_bindings": MCP_BINDING_TABLE,
+    "job_runs": JOB_RUN_TABLE,
 }
 
 MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
@@ -217,6 +223,15 @@ CREATE TABLE mcp_server_bindings (
     binding_id TEXT NOT NULL,
     data TEXT NOT NULL,
     PRIMARY KEY (agent_id, binding_id)
+)
+"""
+
+JOB_RUN_TABLE_SQL = """
+CREATE TABLE job_runs (
+    agent_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, job_id)
 )
 """
 

@@ -11,6 +11,7 @@ from typing import Self
 
 from ._json import FrozenJsonObject
 from .adapters.models import SourceRegistration
+from .adapters.job_profiles import ConnectedJobProfile
 from .adapters.mcp import (
     MCPAuthentication,
     MCPBindingStatus,
@@ -67,6 +68,13 @@ from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
+from .jobs.models import (
+    JobExecutionMode,
+    JobInspection,
+    JobResultView,
+    JobStatus,
+    JobSummary,
+)
 from .observation import AgentObserver
 from .security import KeychainStore, SecretProvider, SecretReference
 from .semantics import (
@@ -133,6 +141,7 @@ class Agent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
+        connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
         _validate_downloads_directory(downloads_directory)
         return cls(
@@ -155,6 +164,7 @@ class Agent:
                 observer=observer,
                 approval_handler=approval_handler,
                 downloads_directory=downloads_directory,
+                connected_job_profiles=connected_job_profiles,
             )
         )
 
@@ -180,6 +190,7 @@ class Agent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
+        connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
         _validate_downloads_directory(downloads_directory)
         return cls(
@@ -202,6 +213,7 @@ class Agent:
                 observer=observer,
                 approval_handler=approval_handler,
                 downloads_directory=downloads_directory,
+                connected_job_profiles=connected_job_profiles,
             )
         )
 
@@ -285,11 +297,13 @@ class Agent:
         *,
         conversation_id: str | None = None,
         source_id: str | None = None,
+        job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         return await self._embedded.run(
             message,
             conversation_id=conversation_id,
             source_id=source_id,
+            job_executor_profile_id=job_executor_profile_id,
         )
 
     async def learn(
@@ -320,6 +334,23 @@ class Agent:
         """Return whether one conversation ID belongs to this agent."""
 
         return await self._embedded.conversation_exists(conversation_id)
+
+    async def list_jobs(
+        self,
+        *,
+        statuses: frozenset[JobStatus] = frozenset(),
+        limit: int = 50,
+    ) -> tuple[JobSummary, ...]:
+        return await self._embedded.list_jobs(statuses=statuses, limit=limit)
+
+    async def inspect_job(self, job_id: str) -> JobInspection | None:
+        return await self._embedded.inspect_job(job_id)
+
+    async def read_job_result(self, job_id: str) -> JobResultView | None:
+        return await self._embedded.read_job_result(job_id)
+
+    async def cancel_job(self, job_id: str) -> JobInspection | None:
+        return await self._embedded.cancel_job(job_id)
 
     async def clear_conversations(self) -> int:
         """Delete transcripts and candidate records, not approved knowledge."""
@@ -884,6 +915,11 @@ __all__ = [
     "AgentNotConfiguredError",
     "AgentNotFoundError",
     "HostActiveError",
+    "JobExecutionMode",
+    "JobInspection",
+    "JobResultView",
+    "JobStatus",
+    "JobSummary",
     "PostgreSQLProbeResult",
     "PostgreSQLSourceError",
     "SourceRefreshError",

@@ -509,6 +509,7 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
             "artifact_read",
             "artifact_save_local",
             "artifact_set_export_location",
+            "job_list",
             "memory_set",
             "skill_delete",
             "skill_save",
@@ -726,6 +727,7 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
             "artifact_read",
             "artifact_save_local",
             "artifact_set_export_location",
+            "job_list",
             "memory_set",
             "skill_delete",
             "skill_save",
@@ -984,6 +986,7 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
         assert tables == {
             "database_write_receipts",
             "learning_candidates",
+            "job_runs",
             "mcp_server_bindings",
             "messages",
             "metadata",

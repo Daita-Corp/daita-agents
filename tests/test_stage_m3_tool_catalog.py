@@ -15,6 +15,7 @@ from daita.capabilities import (
     Capability,
     CapabilityInputError,
     CapabilityRegistry,
+    OperationalEffect,
     ToolDiscoveryMetadata,
     ToolExecution,
     ToolExposureClass,
@@ -57,10 +58,10 @@ NOW = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
 
 
 class _CountingExecutor:
-    def __init__(self, name: str, *, side_effecting: bool = False) -> None:
+    def __init__(self, name: str, *, effectful: bool = False) -> None:
         self.executor_id = f"test.m3.{name}.executor"
         self.name = name
-        self.side_effecting = side_effecting
+        self.effectful = effectful
         self.preflight_calls = 0
         self.execute_calls = 0
         self.block = False
@@ -68,7 +69,7 @@ class _CountingExecutor:
         self.release = asyncio.Event()
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        assert self.side_effecting
+        assert self.effectful
         self.preflight_calls += 1
         return FrozenJsonObject.from_mapping(
             {"call_id": request.call_id, "name": self.name}
@@ -138,8 +139,8 @@ def _runtime(
     capabilities = []
     views = []
     executors = []
-    for name, exposure, priority, side_effecting in specs:
-        executor = _CountingExecutor(name, side_effecting=side_effecting)
+    for name, exposure, priority, effectful in specs:
+        executor = _CountingExecutor(name, effectful=effectful)
         capability = Capability(
             id=f"test.m3.{name}",
             description=f"Execute trusted {name}.",
@@ -157,8 +158,12 @@ def _runtime(
                 "additionalProperties": False,
             },
             executor_id=executor.executor_id,
-            access_mode=AccessMode.WRITE if side_effecting else AccessMode.READ,
-            side_effecting=side_effecting,
+            access_mode=AccessMode.READ,
+            operational_effect=(
+                OperationalEffect.CHANGE_ADVISORY_CONTEXT
+                if effectful
+                else OperationalEffect.NONE
+            ),
         )
         capabilities.append(capability)
         views.append(
@@ -275,6 +280,11 @@ def test_native_inventory_has_one_trusted_declaration_per_production_tool(tmp_pa
         "skill_delete",
         "skill_save",
         "skill_view",
+        "job_cancel",
+        "job_inspect",
+        "job_list",
+        "job_read_results",
+        "start_data_profile",
     }
 
     async def inspect() -> None:
@@ -295,6 +305,8 @@ def test_native_inventory_has_one_trusted_declaration_per_production_tool(tmp_pa
                     "catalog",
                     "data",
                     "memory",
+                    "jobs",
+                    "data_profile_jobs",
                     "semantics",
                     "skills",
                 }

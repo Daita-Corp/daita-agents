@@ -33,8 +33,21 @@ def _text(value: str, name: str) -> None:
 
 
 class AccessMode(str, Enum):
+    NONE = "none"
     READ = "read"
     WRITE = "write"
+
+
+class OperationalEffect(str, Enum):
+    NONE = "none"
+    CHANGE_ADVISORY_CONTEXT = "change_advisory_context"
+    START_JOB = "start_job"
+    SUBMIT_EXECUTION_GRAPH = "submit_execution_graph"
+    EXTEND_EXECUTION_GRAPH = "extend_execution_graph"
+    CANCEL_JOB = "cancel_job"
+    CANCEL_EXECUTION_GRAPH = "cancel_execution_graph"
+    MUTATE_DATA = "mutate_data"
+    CHANGE_INFRASTRUCTURE = "change_infrastructure"
 
 
 class ToolExposureClass(str, Enum):
@@ -229,8 +242,8 @@ class Capability:
     output_kind: str
     output_schema: Mapping[str, object]
     executor_id: str
-    access_mode: AccessMode = AccessMode.READ
-    side_effecting: bool = False
+    access_mode: AccessMode = AccessMode.NONE
+    operational_effect: OperationalEffect = OperationalEffect.NONE
     artifact_policy: ArtifactPolicy | None = None
 
     def __post_init__(self) -> None:
@@ -243,22 +256,60 @@ class Capability:
             _text(value, name)
         if not isinstance(self.access_mode, AccessMode):
             raise TypeError("access_mode must be AccessMode")
-        if not isinstance(self.side_effecting, bool):
-            raise TypeError("side_effecting must be a boolean")
+        if not isinstance(self.operational_effect, OperationalEffect):
+            raise TypeError("operational_effect must be OperationalEffect")
         if self.artifact_policy is not None and not isinstance(
             self.artifact_policy, ArtifactPolicy
         ):
             raise TypeError("artifact_policy must be ArtifactPolicy or None")
-        if (self.access_mode is AccessMode.WRITE) is not self.side_effecting:
-            raise ValueError(
-                "write tools must be side-effecting and read tools cannot be"
-            )
         input_schema = FrozenJsonObject.from_mapping(self.input_schema)
         output_schema = FrozenJsonObject.from_mapping(self.output_schema)
         _check_schema(input_schema)
         _check_schema(output_schema)
         object.__setattr__(self, "input_schema", input_schema)
         object.__setattr__(self, "output_schema", output_schema)
+
+
+def capability_contract_digest(
+    capability: Capability,
+    *,
+    domain_owner_id: str,
+) -> str:
+    """Return the exact immutable execution contract identity for a capability."""
+
+    if not isinstance(capability, Capability):
+        raise TypeError("capability contract requires Capability")
+    _text(domain_owner_id, "capability contract domain owner")
+    material = {
+        "domain_owner_id": domain_owner_id,
+        "capability_id": capability.id,
+        "description": capability.description,
+        "input_schema": capability.input_schema,
+        "output_kind": capability.output_kind,
+        "output_schema": capability.output_schema,
+        "executor_id": capability.executor_id,
+        "access_mode": capability.access_mode.value,
+        "operational_effect": capability.operational_effect.value,
+        "artifact_policy": (
+            None
+            if capability.artifact_policy is None
+            else {
+                "allowed_media_types": sorted(
+                    capability.artifact_policy.allowed_media_types
+                ),
+                "allowed_extensions": capability.artifact_policy.allowed_extensions,
+                "artifact_required": capability.artifact_policy.artifact_required,
+                "max_artifact_count": capability.artifact_policy.max_artifact_count,
+                "max_bytes_per_artifact": (
+                    capability.artifact_policy.max_bytes_per_artifact
+                ),
+                "max_total_bytes_per_call": (
+                    capability.artifact_policy.max_total_bytes_per_call
+                ),
+            }
+        ),
+    }
+    return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,7 +499,9 @@ class CapabilityRegistry:
                                     "output_schema": capability.output_schema,
                                     "executor_id": capability.executor_id,
                                     "access_mode": capability.access_mode.value,
-                                    "side_effecting": capability.side_effecting,
+                                    "operational_effect": (
+                                        capability.operational_effect.value
+                                    ),
                                     "artifact_policy": (
                                         None
                                         if capability.artifact_policy is None
@@ -508,6 +561,15 @@ class CapabilityRegistry:
                 ).encode("utf-8")
             ).hexdigest()
         )
+        self._contract_digests = MappingProxyType(
+            {
+                capability.id: capability_contract_digest(
+                    capability,
+                    domain_owner_id=self._domain_owners[capability.id],
+                )
+                for capability in self._capabilities.values()
+            }
+        )
 
     @property
     def tool_names(self) -> frozenset[str]:
@@ -560,6 +622,27 @@ class CapabilityRegistry:
         if executor.executor_id != capability.executor_id:
             raise ValueError(f"executor identity changed: {capability.executor_id}")
         return capability, executor
+
+    def contract_digest(self, capability_id: str) -> str:
+        try:
+            return self._contract_digests[capability_id]
+        except KeyError as error:
+            raise KeyError(f"unknown capability: {capability_id}") from error
+
+    def resolve_internal_execution(
+        self,
+        capability_id: str,
+        contract_digest: str,
+    ) -> tuple[Capability, Executor, str]:
+        capability, executor = self.resolve_execution(capability_id)
+        if any(view.capability_id == capability_id for view in self._views.values()):
+            raise ValueError(
+                "trusted internal execution requires an internal-only capability"
+            )
+        expected = self.contract_digest(capability_id)
+        if contract_digest != expected:
+            raise ValueError("internal execution capability contract changed")
+        return capability, executor, self.resolve_domain_owner(capability_id)
 
     def validate_output(self, capability_id: str, output: object) -> ToolOutput:
         capability = self._capabilities[capability_id]
@@ -842,7 +925,9 @@ __all__ = [
     "Capability",
     "CapabilityInputError",
     "CapabilityRegistry",
+    "capability_contract_digest",
     "Executor",
+    "OperationalEffect",
     "CapabilityDeclarations",
     "MAX_APPROVAL_DOCUMENT_CHARACTERS",
     "SideEffectExecutor",

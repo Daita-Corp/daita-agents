@@ -12,6 +12,7 @@ from ..capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
+    OperationalEffect,
     SideEffectExecutor,
     ToolDiscoveryMetadata,
     ToolExecution,
@@ -217,8 +218,7 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 "additionalProperties": False,
             },
             executor_id=view.executor_id,
-            access_mode=AccessMode.READ,
-            side_effecting=False,
+            access_mode=AccessMode.NONE,
         ),
         Capability(
             id=SKILL_SAVE_CAPABILITY_ID,
@@ -269,8 +269,8 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 "additionalProperties": False,
             },
             executor_id=save.executor_id,
-            access_mode=AccessMode.WRITE,
-            side_effecting=True,
+            access_mode=AccessMode.NONE,
+            operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
         ),
         Capability(
             id=SKILL_DELETE_CAPABILITY_ID,
@@ -287,8 +287,8 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 "additionalProperties": False,
             },
             executor_id=delete.executor_id,
-            access_mode=AccessMode.WRITE,
-            side_effecting=True,
+            access_mode=AccessMode.NONE,
+            operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
         ),
     )
     return SkillDeclarations(
@@ -371,7 +371,10 @@ class SkillCapabilityDomain:
             if self._learning.allows(
                 run.id,
                 view.name,
-                side_effecting=self._capabilities[view.capability_id].side_effecting,
+                effectful=(
+                    self._capabilities[view.capability_id].operational_effect
+                    is not OperationalEffect.NONE
+                ),
             )
         )
 
@@ -392,8 +395,8 @@ class SkillCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
         del request_sensitivity
-        if capability.side_effecting:
-            self._learning.validate_side_effect(run.id, call)
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.validate_effect(run.id, call)
         if capability.id == SKILL_VIEW_CAPABILITY_ID:
             name = arguments.get("name")
             try:
@@ -428,8 +431,8 @@ class SkillCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
         del request_sensitivity
-        if capability.side_effecting:
-            self._learning.mark_side_effect_succeeded(run.id)
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
         return replace(

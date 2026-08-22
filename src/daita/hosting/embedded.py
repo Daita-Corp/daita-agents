@@ -23,6 +23,7 @@ from uuid import uuid4
 
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySource
+from ..adapters.job_profiles import ConnectedJobProfile
 from ..adapters.mcp import (
     MCPAuthentication,
     MCPBindingState,
@@ -88,6 +89,11 @@ from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
 from ..domains.learning import LearningCandidateGuard
 from ..domains.mcp import MCPActivatedBinding, activate_mcp_domain
 from ..domains.data.context import _project_completed_history
+from ..domains.data.profile_jobs import (
+    DATA_PROFILE_DOMAIN_OWNER_ID,
+    DataProfileCapabilityDomain,
+    data_profile_declarations,
+)
 from ..domains.data.sql import (
     validate_postgresql_update_scope,
 )
@@ -131,6 +137,14 @@ from ..loop.driver import (
     ToolRuntime,
 )
 from ..loop.models import ConversationRun, LoopExit, LoopLimits, RunInput, Transcript
+from ..jobs.capabilities import (
+    JOB_DOMAIN_OWNER_ID,
+    JobCapabilityDomain,
+    job_capability_declarations,
+)
+from ..jobs.models import JobInspection, JobResultView, JobStatus, JobSummary
+from ..jobs.owner import JobOwner
+from ..jobs.supervisor import JobSupervisor
 from ..memory import MemoryStore
 from ..memory.capabilities import (
     MEMORY_DOMAIN_OWNER_ID,
@@ -386,6 +400,9 @@ class EmbeddedAgent:
         catalog_service: CatalogService,
         data_view: CatalogDataView,
         capability_runtime: CapabilityRuntime,
+        job_owner: JobOwner,
+        job_supervisor: JobSupervisor,
+        data_profile_job_domain: DataProfileCapabilityDomain,
         learning_candidate_guard: LearningCandidateGuard,
         semantic_domain: SemanticCapabilityDomain,
         postgresql_update_backend: PostgreSQLUpdatePreviewBackend,
@@ -430,6 +447,9 @@ class EmbeddedAgent:
         self._catalog_service = catalog_service
         self._data_view = data_view
         self._capability_runtime = capability_runtime
+        self._job_owner = job_owner
+        self._job_supervisor = job_supervisor
+        self._data_profile_job_domain = data_profile_job_domain
         self._learning_candidate_guard = learning_candidate_guard
         self._semantic_domain = semantic_domain
         self._postgresql_update_backend = postgresql_update_backend
@@ -570,6 +590,7 @@ class EmbeddedAgent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
+        connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
         if downloads_directory is not None and not isinstance(
             downloads_directory, Path
@@ -651,6 +672,7 @@ class EmbeddedAgent:
                 approval_handler=approval_handler,
                 artifact_store=artifact_store,
                 artifact_delivery=artifact_delivery,
+                connected_job_profiles=connected_job_profiles,
             )
             _, cancelled = await _await_sync_completion(
                 lambda: _write_manifest(home, identity)
@@ -693,6 +715,7 @@ class EmbeddedAgent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
+        connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
         if downloads_directory is not None and not isinstance(
             downloads_directory, Path
@@ -807,6 +830,7 @@ class EmbeddedAgent:
                 approval_handler=approval_handler,
                 artifact_store=artifact_store,
                 artifact_delivery=artifact_delivery,
+                connected_job_profiles=connected_job_profiles,
             )
         except BaseException:
             if store is not None:
@@ -842,6 +866,7 @@ class EmbeddedAgent:
         approval_handler: ApprovalHandler | None,
         artifact_store: AgentHomeArtifactStore,
         artifact_delivery: LocalArtifactDelivery,
+        connected_job_profiles: tuple[ConnectedJobProfile, ...],
     ) -> Self:
         catalog_service = CatalogService(store, store)
         data_view = CatalogDataView(store, catalog_service, store)
@@ -921,6 +946,23 @@ class EmbeddedAgent:
             if artifact_store.available
             else None
         )
+        job_owner = JobOwner(
+            agent_id=identity.id,
+            store=store,
+            connected_profiles=connected_job_profiles,
+            clock=clock,
+            id_factory=id_factory,
+        )
+        job_lifecycle = job_capability_declarations(job_owner)
+        data_profile_jobs, data_profile_admission = data_profile_declarations(
+            agent_id=identity.id,
+            catalog=data_view,
+            owner=job_owner,
+            sqlite_backend=sqlite_backend,
+            postgresql_backend=postgresql_backend,
+            local_file_backend=local_file_backend,
+            clock=clock,
+        )
         learning_candidate_guard = LearningCandidateGuard()
         data_declarations = CapabilityDeclarations(
             domain_owner_id=DATA_DOMAIN_OWNER_ID,
@@ -980,6 +1022,20 @@ class EmbeddedAgent:
                 tool_views=artifacts.tool_views,
             )
         )
+        job_declaration_bundle = CapabilityDeclarations(
+            domain_owner_id=JOB_DOMAIN_OWNER_ID,
+            capabilities=job_lifecycle.capabilities,
+            executor_ids=tuple(item.executor_id for item in job_lifecycle.capabilities),
+            tool_views=job_lifecycle.tool_views,
+        )
+        data_profile_declaration_bundle = CapabilityDeclarations(
+            domain_owner_id=DATA_PROFILE_DOMAIN_OWNER_ID,
+            capabilities=data_profile_jobs.capabilities,
+            executor_ids=tuple(
+                item.executor_id for item in data_profile_jobs.capabilities
+            ),
+            tool_views=data_profile_jobs.tool_views,
+        )
         data_domain = DataCapabilityDomain(
             data_declarations,
             data_view,
@@ -1011,6 +1067,13 @@ class EmbeddedAgent:
                 learning_candidate_guard,
             )
         )
+        job_domain = JobCapabilityDomain(job_declaration_bundle, job_owner)
+        data_profile_job_domain = DataProfileCapabilityDomain(
+            data_profile_declaration_bundle,
+            catalog=data_view,
+            admission=data_profile_admission,
+            learning=learning_candidate_guard,
+        )
         if model is not None and context_builder is None:
             assert model_profile is not None
             if not model_profile.supports_tools:
@@ -1032,6 +1095,8 @@ class EmbeddedAgent:
             memory_domain,
             skill_domain,
             semantic_domain,
+            job_domain,
+            data_profile_job_domain,
             *((artifact_domain,) if artifact_domain is not None else ()),
             *((mcp_domain,) if mcp_domain is not None else ()),
         )
@@ -1047,6 +1112,8 @@ class EmbeddedAgent:
                 *memory.executors,
                 *skills.executors,
                 *semantics.executors,
+                *job_lifecycle.executors,
+                *data_profile_jobs.executors,
                 *(artifacts.executors if artifacts is not None else ()),
                 *mcp_executors,
             ),
@@ -1061,6 +1128,17 @@ class EmbeddedAgent:
             artifacts=artifact_store,
             limits=limits,
         )
+        job_supervisor = JobSupervisor(
+            agent_id=identity.id,
+            store=store,
+            owner=job_owner,
+            runtime=capability_runtime,
+            revalidate_external=data_profile_admission.revalidate_external,
+            artifacts=artifact_store,
+            clock=clock,
+            id_factory=id_factory,
+        )
+        job_owner.bind_wake(job_supervisor.wake)
         resolved_context = context_builder
         resolved_tools = tools
         if model is not None and resolved_context is None:
@@ -1096,7 +1174,7 @@ class EmbeddedAgent:
                 ),
             )
         )
-        return cls(
+        embedded = cls(
             identity=identity,
             home=home,
             writer_lock=writer_lock,
@@ -1107,6 +1185,9 @@ class EmbeddedAgent:
             catalog_service=catalog_service,
             data_view=data_view,
             capability_runtime=capability_runtime,
+            job_owner=job_owner,
+            job_supervisor=job_supervisor,
+            data_profile_job_domain=data_profile_job_domain,
             learning_candidate_guard=learning_candidate_guard,
             semantic_domain=semantic_domain,
             postgresql_update_backend=postgresql_preview_backend,
@@ -1137,6 +1218,8 @@ class EmbeddedAgent:
             clock=clock,
             id_factory=id_factory,
         )
+        await job_supervisor.start()
+        return embedded
 
     def model_requires_explicit_limits(self, *, provider: str, model: str) -> bool:
         """Project exact release-reviewed profile admission through the facade."""
@@ -1301,11 +1384,13 @@ class EmbeddedAgent:
         *,
         conversation_id: str | None = None,
         source_id: str | None = None,
+        job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         return await self._run(
             message,
             conversation_id=conversation_id,
             source_id=source_id,
+            job_executor_profile_id=job_executor_profile_id,
         )
 
     async def learn(
@@ -1334,6 +1419,7 @@ class EmbeddedAgent:
         learning_candidate_text: str | None = None,
         learning_candidate: LearningCandidate | None = None,
         explicit_learning: bool = False,
+        job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
@@ -1341,6 +1427,13 @@ class EmbeddedAgent:
             not isinstance(source_id, str) or not source_id.strip()
         ):
             raise ValueError("source_id must be a non-empty string or None")
+        if job_executor_profile_id is not None and (
+            not isinstance(job_executor_profile_id, str)
+            or not job_executor_profile_id.strip()
+        ):
+            raise ValueError(
+                "job_executor_profile_id must be a non-empty string or None"
+            )
         if learning_candidate_id is not None and (
             not isinstance(learning_candidate_id, str)
             or not learning_candidate_id.strip()
@@ -1369,6 +1462,7 @@ class EmbeddedAgent:
                 learning_candidate_text=learning_candidate_text,
                 learning_candidate=learning_candidate,
                 explicit_learning=explicit_learning,
+                job_executor_profile_id=job_executor_profile_id,
             )
 
     async def _run_locked(
@@ -1383,6 +1477,7 @@ class EmbeddedAgent:
         learning_candidate: LearningCandidate | None,
         explicit_learning: bool = False,
         run_id: str | None = None,
+        job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         """Run once while the caller owns the foreground lifecycle lock."""
 
@@ -1463,6 +1558,11 @@ class EmbeddedAgent:
             source_id=effective_source_id,
             conversation_source_id=conversation_source_id,
         )
+        if job_executor_profile_id is not None:
+            self._data_profile_job_domain.select_connected_executor(
+                run_input.id,
+                job_executor_profile_id.strip(),
+            )
         if learning_candidate_id is not None:
             if self._data_context_builder is None:
                 raise AgentHomeError(
@@ -1492,6 +1592,8 @@ class EmbeddedAgent:
                 self._learning_candidate_guard.clear(run_input.id)
             if explicit_learning:
                 self._semantic_domain.clear_explicit_learning_run(run_input.id)
+            if job_executor_profile_id is not None:
+                self._data_profile_job_domain.clear_connected_executor(run_input.id)
 
     async def transcript(self, run_id: str) -> Transcript:
         self._require_open()
@@ -1520,6 +1622,29 @@ class EmbeddedAgent:
             self.identity.id,
             conversation_id,
         )
+
+    async def list_jobs(
+        self,
+        *,
+        statuses: frozenset[JobStatus] = frozenset(),
+        limit: int = 50,
+    ) -> tuple[JobSummary, ...]:
+        """Return the bounded current projection of this agent's durable jobs."""
+
+        self._require_open()
+        return await self._job_owner.list(statuses=statuses, limit=limit)
+
+    async def inspect_job(self, job_id: str) -> JobInspection | None:
+        self._require_open()
+        return await self._job_owner.inspect(job_id)
+
+    async def read_job_result(self, job_id: str) -> JobResultView | None:
+        self._require_open()
+        return await self._job_owner.read_result(job_id)
+
+    async def cancel_job(self, job_id: str) -> JobInspection | None:
+        self._require_open()
+        return await self._job_owner.cancel(job_id)
 
     async def clear_conversations(self) -> int:
         """Delete transcripts and candidate records, not approved knowledge."""
@@ -2987,10 +3112,14 @@ class EmbeddedAgent:
             raise asyncio.CancelledError
 
     async def _finish_close(self) -> None:
+        first_error: BaseException | None = None
+        try:
+            await self._job_supervisor.close()
+        except BaseException as error:
+            first_error = error
         async with self._run_lock:
             async with self._mutation_lock:
                 pass
-        first_error: BaseException | None = None
         activated_bindings = tuple(self._mcp_activated_bindings.values())
         self._mcp_activated_bindings.clear()
         for activated in activated_bindings:

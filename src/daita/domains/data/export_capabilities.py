@@ -48,6 +48,7 @@ from ...capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
+    OperationalEffect,
     ToolDiscoveryMetadata,
     ToolExecution,
     ToolExposureClass,
@@ -592,11 +593,7 @@ class ArtifactReadExecutor:
     async def execute(self, request: ToolExecution) -> ToolOutput:
         artifact_id = request.arguments["artifact_id"]
         assert isinstance(artifact_id, str)
-        payload = await _read_conversation_artifact(
-            self._artifacts,
-            request.conversation_id or request.run_id,
-            artifact_id,
-        )
+        payload = await self._artifacts.read(artifact_id)
         summary = _model_artifact_summary(payload.ref)
         if payload.ref.media_type == XLSX_MEDIA_TYPE:
             data = await asyncio.to_thread(read_exact_xlsx_data, payload.content)
@@ -998,8 +995,9 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
     artifact_read = Capability(
         id=ARTIFACT_READ_CAPABILITY_ID,
         description=(
-            "Read one bounded truthful preview of a current-conversation artifact, "
-            "including the fixed Data sheet of a Daita-generated XLSX workbook."
+            "Read one bounded truthful preview of an exact known artifact owned by "
+            "the current agent, including the fixed Data sheet of a Daita-generated "
+            "XLSX workbook."
         ),
         input_schema={
             "type": "object",
@@ -1118,8 +1116,8 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
         output_kind=ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND,
         output_schema=_receipt_schema(),
         executor_id=ARTIFACT_SAVE_LOCAL_EXECUTOR_ID,
-        access_mode=AccessMode.WRITE,
-        side_effecting=True,
+        access_mode=AccessMode.NONE,
+        operational_effect=OperationalEffect.CHANGE_INFRASTRUCTURE,
     )
     set_location = Capability(
         id=ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
@@ -1142,8 +1140,8 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
         output_kind=ARTIFACT_EXPORT_LOCATION_OUTPUT_KIND,
         output_schema=_destination_schema(),
         executor_id=ARTIFACT_SET_EXPORT_LOCATION_EXECUTOR_ID,
-        access_mode=AccessMode.WRITE,
-        side_effecting=True,
+        access_mode=AccessMode.NONE,
+        operational_effect=OperationalEffect.CHANGE_INFRASTRUCTURE,
     )
     capabilities = (
         document,
@@ -1222,8 +1220,11 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
             capability_id=artifact_read.id,
             description=artifact_read.description,
             discovery=ToolDiscoveryMetadata(
-                summary="Read a bounded safe preview of one conversation artifact.",
-                when_to_use="Use after artifact_list when artifact contents are needed.",
+                summary="Read a bounded safe preview of one exact agent-owned artifact.",
+                when_to_use=(
+                    "Use with an exact known artifact ID, including one returned by "
+                    "job_read_results."
+                ),
                 keywords=("artifact", "read", "preview", "file"),
                 exposure_class=ToolExposureClass.CORE,
                 eager_priority=910,
@@ -1280,7 +1281,6 @@ _EXACT_TABULAR_CAPABILITIES = frozenset(
 _CONVERSATION_ARTIFACT_CAPABILITIES = frozenset(
     {
         ARTIFACT_LIST_CAPABILITY_ID,
-        ARTIFACT_READ_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
     }
 )
@@ -1399,8 +1399,10 @@ class ArtifactCapabilityDomain:
             for fact in facts
             if isinstance((adapter_id := fact.get("adapter_id")), str)
         }
-        refs = await self._artifacts.list_refs(
-            conversation_id=run.conversation_id or run.id
+        all_refs = await self._artifacts.list_refs()
+        conversation_id = run.conversation_id or run.id
+        refs = tuple(
+            item for item in all_refs if item.conversation_id == conversation_id
         )
         has_current = any(item.run_id == run.id for item in refs)
         has_prior = any(item.run_id != run.id for item in refs)
@@ -1410,7 +1412,7 @@ class ArtifactCapabilityDomain:
             if not self._learning.allows(
                 run.id,
                 view.name,
-                side_effecting=capability.side_effecting,
+                effectful=capability.operational_effect is not OperationalEffect.NONE,
             ):
                 continue
             required_adapter = next(
@@ -1424,7 +1426,7 @@ class ArtifactCapabilityDomain:
             if required_adapter is not None and required_adapter not in adapters:
                 continue
             candidates.append(view)
-        may_have_artifact = (
+        may_have_current_artifact = (
             has_current
             or has_prior
             or any(
@@ -1433,17 +1435,23 @@ class ArtifactCapabilityDomain:
                 for view in candidates
             )
         )
+        may_have_agent_artifact = bool(all_refs) or may_have_current_artifact
         names: list[str] = []
         for view in candidates:
             capability = self._capabilities[view.capability_id]
             if (
                 capability.id in _CONVERSATION_ARTIFACT_CAPABILITIES
-                and not may_have_artifact
+                and not may_have_current_artifact
+            ):
+                continue
+            if (
+                capability.id == ARTIFACT_READ_CAPABILITY_ID
+                and not may_have_agent_artifact
             ):
                 continue
             if (
                 capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
-                and not may_have_artifact
+                and not may_have_agent_artifact
             ):
                 continue
             names.append(view.name)
@@ -1466,8 +1474,8 @@ class ArtifactCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
         del request_sensitivity
-        if capability.side_effecting:
-            self._learning.validate_side_effect(run.id, call)
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.validate_effect(run.id, call)
         supplied_source_id = arguments.get("source_id")
         if (
             run.source_id is not None
@@ -1487,16 +1495,21 @@ class ArtifactCapabilityDomain:
             ARTIFACT_CONVERT_CAPABILITY_ID,
         }:
             artifact_id = arguments.get("artifact_id")
-            ref = (
-                await self._current_ref(run, artifact_id)
-                if isinstance(artifact_id, str)
-                else None
-            )
+            ref = None
+            if isinstance(artifact_id, str):
+                ref = (
+                    await self._artifacts.find_ref(artifact_id)
+                    if capability.id == ARTIFACT_READ_CAPABILITY_ID
+                    else await self._current_ref(run, artifact_id)
+                )
             if ref is None:
                 raise CapabilityInputError(
                     "artifact_missing",
-                    "The requested artifact is not available in the current "
-                    "conversation.",
+                    (
+                        "The requested artifact is not owned by this agent."
+                        if capability.id == ARTIFACT_READ_CAPABILITY_ID
+                        else "The requested artifact is not available in the current conversation."
+                    ),
                     {"artifact_id": artifact_id},
                 )
             if capability.id == ARTIFACT_READ_CAPABILITY_ID and ref.media_type not in {
@@ -1586,8 +1599,8 @@ class ArtifactCapabilityDomain:
                     output.artifact,
                 ),
             )
-        if capability.side_effecting:
-            self._learning.mark_side_effect_succeeded(run.id)
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
         source_id = arguments.get("source_id")

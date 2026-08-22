@@ -11,6 +11,7 @@ from ...capabilities import (
     Capability,
     CapabilityInputError,
     Executor,
+    OperationalEffect,
     CapabilityDeclarations,
     ToolDiscoveryMetadata,
     ToolExecution,
@@ -830,7 +831,7 @@ def postgresql_update_capability_declarations() -> CapabilityDeclarations:
         output_schema=_postgresql_update_output_schema(),
         executor_id=POSTGRESQL_UPDATE_EXECUTOR_ID,
         access_mode=AccessMode.WRITE,
-        side_effecting=True,
+        operational_effect=OperationalEffect.MUTATE_DATA,
     )
     view = ToolView(
         name=POSTGRESQL_UPDATE_TOOL_NAME,

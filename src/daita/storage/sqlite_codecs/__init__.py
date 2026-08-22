@@ -18,6 +18,7 @@ from .learning import (
     encode_learning_candidate,
     encode_review_stamps,
 )
+from .jobs import decode_job_run, encode_job_run
 from .mcp_bindings import decode_mcp_binding, encode_mcp_binding
 from .receipts import decode_receipt, encode_receipt
 from .semantics import decode_semantic_annotation, encode_semantic_annotation
@@ -43,6 +44,7 @@ __all__ = [
     "decode_identifier",
     "decode_identity",
     "decode_learning_candidate",
+    "decode_job_run",
     "decode_loop_exit",
     "decode_mcp_binding",
     "decode_message",
@@ -58,6 +60,7 @@ __all__ = [
     "encode_identifier",
     "encode_identity",
     "encode_learning_candidate",
+    "encode_job_run",
     "encode_loop_exit",
     "encode_mcp_binding",
     "encode_message",

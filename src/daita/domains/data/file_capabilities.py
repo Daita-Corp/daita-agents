@@ -235,7 +235,6 @@ def local_file_read_capability_declarations() -> CapabilityDeclarations:
         output_schema=_file_read_output_schema(),
         executor_id=LOCAL_FILE_READ_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        side_effecting=False,
     )
     view = ToolView(
         name=LOCAL_FILE_READ_TOOL_NAME,

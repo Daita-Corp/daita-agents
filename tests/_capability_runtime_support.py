@@ -191,7 +191,6 @@ def context_tool_catalog(
                 output_schema={"type": "object", "properties": {}},
                 executor_id=f"{capability_id}.executor",
                 access_mode=AccessMode.READ,
-                side_effecting=False,
             ),
             domain_owner_id="test",
             executor_id=f"{capability_id}.executor",

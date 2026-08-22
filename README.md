@@ -116,15 +116,34 @@ model like any other result, so it can correct the call on the next step. The
 loop has bounded steps, wall time, tokens, and estimated cost; it does not add
 a verifier pass or a session runtime.
 
-Data access is read first. All current data tools are non-side-effecting reads
-except the explicitly scoped PostgreSQL update. SQL and local paths are
-checked against the current catalog before source I/O, and every requested tool
-call receives one ordered result even if another call fails.
+Data access is read first. Capability metadata records data access separately
+from operational effect: ordinary queries read data without an operational
+effect, the durable-profile start reads current catalog scope and starts one
+job, and the explicitly scoped PostgreSQL update is the only current data
+mutation. SQL and local paths are checked against the current catalog before
+source I/O, and every requested tool call receives one ordered result even if
+another call fails.
 
 Agent identity, source registrations, catalog snapshots, transcripts, and
 terminal results live in a small SQLite database inside the agent home.
 Conversation continuity projects a bounded tail of completed runs: at most 8
 runs, 40 messages, and 24,000 UTF-8 bytes.
+
+The `start_data_profile` capability can freeze one exact read-only profile job
+over current admitted resources. Its `JobRun` is persisted before background
+work, continues under the currently open agent host after the originating
+model run finishes, and produces a bounded result plus one verified JSON
+artifact. `Agent.list_jobs`, `inspect_job`, `read_job_result`, and `cancel_job`
+provide bounded lifecycle access. The model-facing lifecycle tools use the same
+agent ownership boundary, so a new conversation can list the agent's jobs,
+inspect one, read its result, or cancel it. The originating conversation remains
+visible as provenance rather than acting as an access gate. Work pauses while no
+agent host is open and safe stale attempts are fenced on reopen; Daita does not
+run a resident daemon.
+
+The external-executor contract currently has deterministic offline conformance
+coverage only. No real external job profile ships, and no connected service is
+selected automatically or used as a fallback.
 
 Explicitly admitted remote MCP servers can contribute read-only tools through
 the same registry, runtime, ordered result, transcript, and context path.
@@ -156,10 +175,12 @@ File requests use the same direct loop. Exact SQL results can become CSV or
 XLSX artifacts, while attached cataloged CSV and JSON resources can be copied
 byte-for-byte without passing source bytes through the model. A later turn can
 use a bounded model-only `artifact_list` for the current conversation,
-`artifact_read` for a bounded preview, and `artifact_convert` for the supported
-Daita XLSX `Data` snapshot to CSV conversion. There is no public artifact
-inventory, CLI list command, hidden current-file pointer, or prompt keyword
-router.
+`artifact_read` for a bounded preview of an exact known ID owned by the agent,
+and `artifact_convert` for the supported current-conversation Daita XLSX `Data`
+snapshot to CSV conversion. This lets a new conversation read an exact artifact
+reference returned by a durable job without creating an agent-wide inventory.
+There is no public artifact inventory, CLI list command, hidden current-file
+pointer, or prompt keyword router.
 
 Local files are normally delivered automatically to the authorized default
 destination and reported with the verified saved path. Public recovery remains

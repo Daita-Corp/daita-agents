@@ -165,11 +165,12 @@ async def test_artifact_store_open_cancellation_finishes_admission_cleanup(
     def blocked_cleanup(
         store: AgentHomeArtifactStore,
         refs: tuple[ArtifactRef, ...],
+        reservations: frozenset[tuple[str, str]],
     ) -> None:
         started.set()
         assert release.wait(2)
         try:
-            original(store, refs)
+            original(store, refs, reservations)
         finally:
             finished.set()
 
@@ -204,8 +205,9 @@ async def test_artifact_store_open_preserves_admission_failure_as_unavailable(
     def fail_cleanup(
         store: AgentHomeArtifactStore,
         refs: tuple[ArtifactRef, ...],
+        reservations: frozenset[tuple[str, str]],
     ) -> None:
-        del store, refs
+        del store, refs, reservations
         raise ArtifactError(
             "artifact_storage_failed",
             "Injected admission failure.",

@@ -12,6 +12,7 @@ from daita import (
     ApprovalRequest,
     SemanticEvidenceKind,
 )
+from daita.capabilities import OperationalEffect
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -198,8 +199,10 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             view, capability = registry.resolve_tool(name)
             assert view.capability_id == capability_id
             assert capability.id == capability_id
-            assert capability.side_effecting is (
-                name in {SEMANTIC_SAVE_TOOL_NAME, SEMANTIC_DELETE_TOOL_NAME}
+            assert capability.operational_effect is (
+                OperationalEffect.CHANGE_ADVISORY_CONTEXT
+                if name in {SEMANTIC_SAVE_TOOL_NAME, SEMANTIC_DELETE_TOOL_NAME}
+                else OperationalEffect.NONE
             )
         save_definition = next(
             item for item in definitions if item.name == SEMANTIC_SAVE_TOOL_NAME

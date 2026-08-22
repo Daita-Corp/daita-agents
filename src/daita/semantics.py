@@ -19,6 +19,7 @@ from .capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
+    OperationalEffect,
     SideEffectExecutor,
     ToolDiscoveryMetadata,
     ToolExecution,
@@ -1447,8 +1448,8 @@ def semantic_declarations(
                 "additionalProperties": False,
             },
             executor_id=save.executor_id,
-            access_mode=AccessMode.WRITE,
-            side_effecting=True,
+            access_mode=AccessMode.NONE,
+            operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
         ),
         Capability(
             id=SEMANTIC_DELETE_CAPABILITY_ID,
@@ -1476,8 +1477,8 @@ def semantic_declarations(
                 "additionalProperties": False,
             },
             executor_id=delete.executor_id,
-            access_mode=AccessMode.WRITE,
-            side_effecting=True,
+            access_mode=AccessMode.NONE,
+            operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
         ),
     )
     return SemanticDeclarations(
@@ -1644,7 +1645,10 @@ class SemanticCapabilityDomain:
             and self._learning.allows(
                 run.id,
                 view.name,
-                side_effecting=self._capabilities[view.capability_id].side_effecting,
+                effectful=(
+                    self._capabilities[view.capability_id].operational_effect
+                    is not OperationalEffect.NONE
+                ),
             )
         )
 
@@ -1683,8 +1687,8 @@ class SemanticCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
         del request_sensitivity
-        if capability.side_effecting:
-            self._learning.validate_side_effect(run.id, call)
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.validate_effect(run.id, call)
         if (
             run.source_id is not None
             and capability.id == SEMANTIC_LIST_CAPABILITY_ID
@@ -1732,8 +1736,8 @@ class SemanticCapabilityDomain:
             output = await self._decorate_view(run, arguments, output)
         elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:
             output = await self._filter_list(run, arguments, output)
-        if capability.side_effecting:
-            self._learning.mark_side_effect_succeeded(run.id)
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
         source_id = arguments.get("source_id")

@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import daita
-from daita.capabilities import AccessMode
+from daita.capabilities import AccessMode, OperationalEffect
 from daita.storage.sqlite import SQLiteStateStore
 
 PACKAGE = Path(daita.__file__).parent
@@ -221,7 +221,15 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
     try:
         registry = agent._embedded._capabilities
         runtime = agent._embedded._capability_runtime
-        expected_owners = {"artifacts", "data", "memory", "semantics", "skills"}
+        expected_owners = {
+            "artifacts",
+            "data",
+            "data_profile_jobs",
+            "jobs",
+            "memory",
+            "semantics",
+            "skills",
+        }
         assert registry.domain_owner_ids == expected_owners
         assert set(runtime._domains) == expected_owners
 
@@ -242,6 +250,8 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["skill_view"] == "skills"
         assert resolved["semantic_list"] == "semantics"
         assert resolved["artifact_create_document"] == "artifacts"
+        assert resolved["start_data_profile"] == "data_profile_jobs"
+        assert resolved["job_list"] == "jobs"
     finally:
         await agent.close()
 
@@ -292,6 +302,11 @@ def test_public_surface_is_focused():
         "LearningCandidateView",
         "LearningReviewResult",
         "LearningReviewStatus",
+        "JobExecutionMode",
+        "JobInspection",
+        "JobResultView",
+        "JobStatus",
+        "JobSummary",
         "LocalDirectorySource",
         "LoopExit",
         "LoopExitKind",
@@ -333,6 +348,50 @@ def test_public_surface_is_focused():
         "__version__",
         "create_llm_provider",
     }
+
+
+def test_stage_b_has_one_job_aggregate_and_no_parallel_execution_system():
+    assert _class_owners("JobRun") == {"jobs/models.py"}
+    assert _class_owners("JobOwner") == {"jobs/owner.py"}
+    assert _class_owners("JobSupervisor") == {"jobs/supervisor.py"}
+    assert _class_owners("InternalCapabilityRequest") == {"capability_runtime.py"}
+
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
+    assert schema.count("CREATE TABLE job_runs") == 1
+    for parallel_table in (
+        "job_attempts",
+        "job_results",
+        "job_workers",
+        "job_queue",
+        "job_events",
+        "job_schedules",
+    ):
+        assert f"CREATE TABLE {parallel_table}" not in schema
+
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
+    supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop")
+    providers = _python_text(PACKAGE / "llm" / "providers")
+    assert "data_profile" not in runtime
+    assert "JobRun" not in runtime
+    assert "JobRun" not in loop
+    assert "JobRun" not in providers
+    assert "execute_internal(" in supervisor
+    assert "executor.execute(" not in supervisor
+    assert "execute_read(" not in supervisor
+
+    production = _python_text(PACKAGE)
+    for forbidden in (
+        "class JobRegistry",
+        "class JobHandler",
+        "class Scheduler",
+        "class Workflow",
+        "class ExecutionGraph",
+        "class RecoveryService",
+        "class CompletionRouter",
+        "class ResidentDaemon",
+    ):
+        assert forbidden not in production
 
 
 def test_stage_seven_exports_records_without_exporting_their_owners():
@@ -661,30 +720,31 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
         assert forbidden not in package_text
 
 
-async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branch(
+async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_branch(
     tmp_path,
 ):
     agent = await daita.Agent.create("write-architecture", root=tmp_path)
     try:
         registry = agent._embedded._capabilities
-        write_tools = set()
+        effect_tools = set()
         for name in registry.tool_names:
             _, capability = registry.resolve_tool(name)
-            if capability.access_mode is not AccessMode.WRITE:
+            if capability.operational_effect is OperationalEffect.NONE:
                 continue
-            write_tools.add(name)
+            effect_tools.add(name)
             _, executor = registry.resolve_execution(capability.id)
-            assert capability.side_effecting is True
             assert callable(getattr(executor, "preflight", None))
-        assert write_tools == {
+        assert effect_tools == {
             "artifact_save_local",
             "artifact_set_export_location",
             "data_update_postgresql",
+            "job_cancel",
             "memory_set",
             "semantic_delete",
             "semantic_save",
             "skill_save",
             "skill_delete",
+            "start_data_profile",
         }
     finally:
         await agent.close()
@@ -716,12 +776,12 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         preview = registry.resolve_tool(preview_tool)[1]
         assert preview.id == preview_capability
         assert preview.access_mode is AccessMode.READ
-        assert preview.side_effecting is False
+        assert preview.operational_effect is OperationalEffect.NONE
         assert update_tool in registry.tool_names
         update = registry.resolve_tool(update_tool)[1]
         assert update.id == update_capability
         assert update.access_mode is AccessMode.WRITE
-        assert update.side_effecting is True
+        assert update.operational_effect is OperationalEffect.MUTATE_DATA
         _, update_executor = registry.resolve_execution(update.id)
         assert callable(getattr(update_executor, "preflight", None))
         assert forbidden_tools.isdisjoint(registry.tool_names)
@@ -895,6 +955,47 @@ def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
         encoding="utf-8"
     )
     assert "artifact_list" not in (PACKAGE / "cli.py").read_text(encoding="utf-8")
+
+
+def test_stage_b_job_scope_has_one_agent_owner_and_no_conversation_gate():
+    capabilities = (PACKAGE / "jobs" / "capabilities.py").read_text(encoding="utf-8")
+    owner = (PACKAGE / "jobs" / "owner.py").read_text(encoding="utf-8")
+    models = (PACKAGE / "jobs" / "models.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+
+    for obsolete in (
+        "def _conversation(",
+        "_load_scoped",
+        "job_owner_conversation_scope",
+        "not available in this conversation scope",
+    ):
+        assert obsolete not in capabilities + owner
+    assert "job_owner_agent_scope" in capabilities
+    assert "origin_conversation_id" in capabilities
+    assert "origin_conversation_id" in models
+    assert (
+        "conversation_id: str | None = None"
+        not in owner.split("async def inspect", 1)[1]
+    )
+    assert "JobCapabilityDomain(job_declaration_bundle, job_owner)" in embedded
+    assert "ToolExposureClass.CORE" in capabilities
+    assert "item.id == JOB_CANCEL_CAPABILITY_ID" in capabilities
+
+
+def test_exact_artifact_read_is_agent_owned_while_list_and_convert_stay_conversation_scoped():
+    exports = (PACKAGE / "domains" / "data" / "export_capabilities.py").read_text(
+        encoding="utf-8"
+    )
+    assert "payload = await self._artifacts.read(artifact_id)" in exports
+    assert "exact known artifact owned by" in exports
+    conversation_capabilities = exports.split(
+        "_CONVERSATION_ARTIFACT_CAPABILITIES =", 1
+    )[1].split("_ARTIFACT_PRODUCER_CAPABILITIES", 1)[0]
+    assert "ARTIFACT_LIST_CAPABILITY_ID" in conversation_capabilities
+    assert "ARTIFACT_CONVERT_CAPABILITY_ID" in conversation_capabilities
+    assert "ARTIFACT_READ_CAPABILITY_ID" not in conversation_capabilities
+    assert "await self._artifacts.find_ref(artifact_id)" in exports
+    assert "else await self._current_ref(run, artifact_id)" in exports
 
 
 def test_observation_owners_keep_tool_events_out_of_loop_and_storage():
@@ -1536,6 +1637,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
         assert tables == {
             "database_write_receipts",
             "learning_candidates",
+            "job_runs",
             "mcp_server_bindings",
             "messages",
             "metadata",
@@ -1557,6 +1659,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
                 "data",
             ),
             "learning_candidates": ("agent_id", "id", "data"),
+            "job_runs": ("agent_id", "job_id", "data"),
             "messages": ("run_id", "position", "data"),
             "metadata": ("key", "data"),
             "mcp_server_bindings": ("agent_id", "binding_id", "data"),

@@ -16,6 +16,7 @@ from daita.capabilities import (
     ApprovalDecision,
     ApprovalRequest,
     Capability,
+    OperationalEffect,
     ToolExecution,
     ToolOutput,
     ToolView,
@@ -495,7 +496,7 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         },
         executor_id=executor.executor_id,
         access_mode=AccessMode.WRITE,
-        side_effecting=True,
+        operational_effect=OperationalEffect.MUTATE_DATA,
     )
     approvals: list[ApprovalRequest] = []
 

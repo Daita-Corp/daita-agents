@@ -45,11 +45,11 @@ class LearningCandidateGuard:
     def clear_outcome(self, run_id: str) -> None:
         self._successful.discard(run_id)
 
-    def allows(self, run_id: str, tool_name: str, *, side_effecting: bool) -> bool:
+    def allows(self, run_id: str, tool_name: str, *, effectful: bool) -> bool:
         selected = self._selected.get(run_id)
         return (
             selected is None
-            or not side_effecting
+            or not effectful
             or tool_name == _candidate_mutation_tool(selected)
         )
 
@@ -57,7 +57,7 @@ class LearningCandidateGuard:
         selected = self._selected.get(run_id)
         return None if selected is None else _candidate_mutation_tool(selected)
 
-    def validate_side_effect(self, run_id: str, call: ToolCall) -> None:
+    def validate_effect(self, run_id: str, call: ToolCall) -> None:
         from ..learning_candidates import candidate_matches_mutation_call
 
         selected = self._selected.get(run_id)
@@ -69,7 +69,7 @@ class LearningCandidateGuard:
                 {"candidate_id": selected.id},
             )
 
-    def mark_side_effect_succeeded(self, run_id: str) -> None:
+    def mark_effect_succeeded(self, run_id: str) -> None:
         if run_id in self._selected:
             self._successful.add(run_id)
 

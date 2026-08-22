@@ -30,6 +30,7 @@ from .capabilities import (
     CapabilityInputError,
     CapabilityRegistry,
     Executor,
+    OperationalEffect,
     SideEffectExecutor,
     ToolExecution,
     ToolExposureClass,
@@ -103,6 +104,58 @@ class SideEffectPlan:
             raise ValueError("approval_reason must be non-empty text")
         if not isinstance(self.recheck_after_approval, bool):
             raise TypeError("recheck_after_approval must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class InternalCapabilityRequest:
+    """Trusted code-owned execution request for one internal-only capability."""
+
+    run: RunInput
+    call_id: str
+    capability_id: str
+    contract_digest: str
+    arguments: Mapping[str, object]
+    sensitivity: ModelSensitivity
+    reserved_artifact_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.run, RunInput):
+            raise TypeError("internal request run must be RunInput")
+        for value, name in (
+            (self.call_id, "internal call_id"),
+            (self.capability_id, "internal capability_id"),
+            (self.contract_digest, "internal contract_digest"),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be non-empty text")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", self.contract_digest) is None:
+            raise ValueError("internal contract_digest must use sha256")
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("internal request sensitivity must be ModelSensitivity")
+        if self.reserved_artifact_id is not None and (
+            not isinstance(self.reserved_artifact_id, str)
+            or not self.reserved_artifact_id.strip()
+        ):
+            raise ValueError("reserved_artifact_id must be non-empty text or None")
+        object.__setattr__(
+            self,
+            "arguments",
+            FrozenJsonObject.from_mapping(self.arguments),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class InternalCapabilityOutcome:
+    output: ToolOutput
+    artifact_ref: ArtifactRef | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.output, ToolOutput):
+            raise TypeError("internal outcome output must be ToolOutput")
+        if self.artifact_ref is not None and not isinstance(
+            self.artifact_ref, ArtifactRef
+        ):
+            raise TypeError("internal outcome artifact_ref must be ArtifactRef or None")
 
 
 class CapabilityDomain(Protocol):
@@ -291,15 +344,23 @@ def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
                     },
                     "domains": {
                         "type": "array",
+                        "description": "Optional owner filter; omit when uncertain.",
                         "items": {"type": "string", "minLength": 1, "maxLength": 128},
                         "maxItems": limits.max_domain_manifest_entries,
                         "uniqueItems": True,
                     },
                     "data_access": {
                         "type": "string",
-                        "enum": ["read", "write"],
+                        "description": (
+                            "External/source-data filter; lifecycle reads use none. "
+                            "Omit when uncertain."
+                        ),
+                        "enum": [item.value for item in AccessMode],
                     },
-                    "side_effecting": {"type": "boolean"},
+                    "operational_effect": {
+                        "type": "string",
+                        "enum": [item.value for item in OperationalEffect],
+                    },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
@@ -418,6 +479,105 @@ class CapabilityRuntime:
         self._artifacts = artifacts
         self._limits = limits
         self._side_effect_recovery_timeout_seconds = float(recovery_timeout)
+
+    async def execute_internal(
+        self,
+        request: InternalCapabilityRequest,
+    ) -> InternalCapabilityOutcome:
+        """Execute one exact internal-only capability through ordinary owners."""
+
+        if not isinstance(request, InternalCapabilityRequest):
+            raise TypeError("request must be InternalCapabilityRequest")
+        capability, executor, owner_id = self._registry.resolve_internal_execution(
+            request.capability_id,
+            request.contract_digest,
+        )
+        if capability.operational_effect is not OperationalEffect.NONE:
+            raise ValueError(
+                "Phase B internal execution cannot bypass operational-effect governance"
+            )
+        domain = self._domains[owner_id]
+        call = ToolCall(
+            id=request.call_id,
+            name=f"internal:{capability.id}",
+            arguments=request.arguments,
+        )
+        started = (
+            asyncio.get_running_loop().time() if self._observer is not None else None
+        )
+        self._emit_tool_started(
+            request.run,
+            call,
+            capability,
+            invocation_mode=None,
+        )
+        try:
+            normalized = domain.normalize_arguments(capability, request.arguments)
+            arguments = self._registry.validate_arguments(capability.id, normalized)
+            arguments = await domain.prepare_call(
+                request.run,
+                call,
+                capability,
+                arguments,
+                request_sensitivity=request.sensitivity,
+            )
+            current, current_executor, current_owner = (
+                self._registry.resolve_internal_execution(
+                    request.capability_id,
+                    request.contract_digest,
+                )
+            )
+            if (
+                current != capability
+                or current_executor is not executor
+                or current_owner != owner_id
+            ):
+                raise ValueError("internal execution identity changed")
+            output, artifact_ref = await self._execute_no_effect(
+                request.run,
+                call,
+                capability,
+                executor,
+                arguments,
+                domain,
+                sensitivity=request.sensitivity,
+                reserved_artifact_id=request.reserved_artifact_id,
+            )
+            result = _bounded_tool_result(
+                call,
+                _classified_success(call, output, artifact_ref=artifact_ref),
+                self._limits,
+            )
+            if result.is_error:
+                raise ToolOutputValidationError(
+                    "internal capability output exceeded the ordinary runtime result contract"
+                )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            result = _bounded_tool_result(
+                call,
+                self._exception_result(call, error, domain),
+                self._limits,
+            )
+            self._emit_tool_completed(
+                request.run,
+                call,
+                result,
+                started,
+                capability=capability,
+                invocation_mode=None,
+            )
+            raise
+        self._emit_tool_completed(
+            request.run,
+            call,
+            result,
+            started,
+            capability=capability,
+            invocation_mode=None,
+        )
+        return InternalCapabilityOutcome(output=output, artifact_ref=artifact_ref)
 
     async def prepare_run(self, run: RunInput) -> RunToolCatalog:
         """Prepare the complete immutable applicable catalog exactly once."""
@@ -665,7 +825,7 @@ class CapabilityRuntime:
 
         for index, resolved in enumerate(resolved_calls):
             call = resolved.outer_call
-            if self._is_side_effecting(resolved):
+            if self._is_effectful(resolved):
                 read_interruption = await finish_reads()
                 if read_interruption is not None:
                     return _interrupted_batch(
@@ -1026,7 +1186,7 @@ class CapabilityRuntime:
         query = call.arguments.get("query")
         domains_value = call.arguments.get("domains", ())
         access_value = call.arguments.get("data_access")
-        side_effecting = call.arguments.get("side_effecting")
+        operational_effect = call.arguments.get("operational_effect")
         limit_value = call.arguments.get(
             "limit", min(5, self._limits.max_tool_search_results)
         )
@@ -1052,8 +1212,8 @@ class CapabilityRuntime:
             ):
                 continue
             if (
-                side_effecting is not None
-                and entry.capability.side_effecting is not side_effecting
+                operational_effect is not None
+                and entry.capability.operational_effect.value != operational_effect
             ):
                 continue
             score = _tool_search_score(query, entry)
@@ -1132,7 +1292,7 @@ class CapabilityRuntime:
             "input_schema": entry.capability.input_schema,
             "output_kind": entry.capability.output_kind,
             "data_access": entry.capability.access_mode.value,
-            "side_effecting": entry.capability.side_effecting,
+            "operational_effect": entry.capability.operational_effect.value,
             "invocation_mode": entry.invocation_mode.value,
             "input_schema_digest": entry.input_schema_digest,
             "origin_revision_digest": entry.origin_revision_digest,
@@ -1246,7 +1406,7 @@ class CapabilityRuntime:
                 arguments=arguments,
                 conversation_id=run.conversation_id or run.id,
             )
-            if capability.side_effecting:
+            if capability.operational_effect is not OperationalEffect.NONE:
                 (
                     result,
                     interruption_kind,
@@ -1263,26 +1423,14 @@ class CapabilityRuntime:
                     invocation_mode=entry.invocation_mode,
                 )
             else:
-                candidate = await executor.execute(execution)
-                if not isinstance(candidate, ToolOutput):
-                    raise ToolOutputValidationError(
-                        "executor did not return ToolOutput"
-                    )
-                output = candidate
-                output = await domain.finalize_output(
+                output, artifact_ref = await self._execute_no_effect(
                     run,
                     call,
                     capability,
+                    executor,
                     arguments,
-                    output,
-                    request_sensitivity=sensitivity,
-                )
-                output = self._registry.validate_output(capability.id, output)
-                artifact_ref = await self._commit_artifact_output(
-                    run,
-                    call,
-                    capability,
-                    output,
+                    domain,
+                    sensitivity=sensitivity,
                 )
                 result = _classified_success(call, output, artifact_ref=artifact_ref)
         except _ToolExecutionInterrupted:
@@ -1308,6 +1456,48 @@ class CapabilityRuntime:
             )
         return result
 
+    async def _execute_no_effect(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        executor: Executor,
+        arguments: FrozenJsonObject,
+        domain: CapabilityDomain,
+        *,
+        sensitivity: ModelSensitivity,
+        reserved_artifact_id: str | None = None,
+    ) -> tuple[ToolOutput, ArtifactRef | None]:
+        if capability.operational_effect is not OperationalEffect.NONE:
+            raise ValueError("non-effect execution requires operational effect none")
+        execution = ToolExecution(
+            run_id=run.id,
+            call_id=call.id,
+            capability_id=capability.id,
+            arguments=arguments,
+            conversation_id=run.conversation_id or run.id,
+        )
+        candidate = await executor.execute(execution)
+        if not isinstance(candidate, ToolOutput):
+            raise ToolOutputValidationError("executor did not return ToolOutput")
+        output = await domain.finalize_output(
+            run,
+            call,
+            capability,
+            arguments,
+            candidate,
+            request_sensitivity=sensitivity,
+        )
+        output = self._registry.validate_output(capability.id, output)
+        artifact_ref = await self._commit_artifact_output(
+            run,
+            call,
+            capability,
+            output,
+            reserved_artifact_id=reserved_artifact_id,
+        )
+        return output, artifact_ref
+
     async def _execute_side_effect(
         self,
         run: RunInput,
@@ -1325,11 +1515,8 @@ class CapabilityRuntime:
         ToolBatchInterruption | None,
         ToolBatchCertainty,
     ]:
-        if (
-            capability.access_mode is not AccessMode.WRITE
-            or not capability.side_effecting
-        ):
-            raise ValueError("side-effect execution requires a write capability")
+        if capability.operational_effect is OperationalEffect.NONE:
+            raise ValueError("effect execution requires an operational effect")
         preflight = getattr(executor, "preflight", None)
         if not callable(preflight):
             raise ValueError("side-effecting executor must provide preflight")
@@ -1552,6 +1739,8 @@ class CapabilityRuntime:
         call: ToolCall,
         capability: Capability,
         output: ToolOutput,
+        *,
+        reserved_artifact_id: str | None = None,
     ) -> ArtifactRef | None:
         policy = capability.artifact_policy
         draft = output.artifact
@@ -1605,6 +1794,7 @@ class CapabilityRuntime:
             conversation_id=run.conversation_id or run.id,
             call_id=call.id,
             capability_id=capability.id,
+            reserved_artifact_id=reserved_artifact_id,
         )
 
     def _exception_result(
@@ -1653,14 +1843,15 @@ class CapabilityRuntime:
             "The tool could not complete because of an unexpected internal error.",
         )
 
-    def _is_side_effecting(
+    def _is_effectful(
         self,
         resolved: _ResolvedCall,
     ) -> bool:
         return (
             resolved.failure is None
             and resolved.entry is not None
-            and resolved.entry.capability.side_effecting
+            and resolved.entry.capability.operational_effect
+            is not OperationalEffect.NONE
         )
 
     def _emit_tool_started(
@@ -1869,7 +2060,7 @@ def _catalog_entry_material(entry: RunToolCatalogEntry) -> dict[str, object]:
         "input_schema_digest": entry.input_schema_digest,
         "output_kind": entry.capability.output_kind,
         "data_access": entry.capability.access_mode.value,
-        "side_effecting": entry.capability.side_effecting,
+        "operational_effect": entry.capability.operational_effect.value,
         "discovery": {
             "summary": entry.view.discovery.summary,
             "when_to_use": entry.view.discovery.when_to_use,
@@ -1889,7 +2080,7 @@ def _domain_manifest(
     return tuple(
         DomainToolManifestEntry(
             domain_owner_id=owner,
-            summary=f"Applicable capabilities owned by the trusted {owner} domain.",
+            summary=f"Trusted {owner} capability counts.",
             direct_count=sum(
                 entry.domain_owner_id == owner
                 and entry.invocation_mode is ToolInvocationMode.DIRECT
@@ -2036,7 +2227,7 @@ def _descriptor_matches(
             data.get("input_schema") == entry.capability.input_schema,
             data.get("output_kind") == entry.capability.output_kind,
             data.get("data_access") == entry.capability.access_mode.value,
-            data.get("side_effecting") is entry.capability.side_effecting,
+            data.get("operational_effect") == entry.capability.operational_effect.value,
             data.get("invocation_mode") == entry.invocation_mode.value,
             data.get("input_schema_digest") == entry.input_schema_digest,
             data.get("origin_revision_digest") == entry.origin_revision_digest,
@@ -2079,7 +2270,7 @@ def _tool_search_match(
         "summary": entry.view.discovery.summary,
         "invocation_mode": entry.invocation_mode.value,
         "data_access": entry.capability.access_mode.value,
-        "side_effecting": entry.capability.side_effecting,
+        "operational_effect": entry.capability.operational_effect.value,
         "parameter_names": entry.parameter_names,
         "input_schema_digest": entry.input_schema_digest,
         "score": score,
@@ -2427,6 +2618,8 @@ __all__ = [
     "CapabilityRuntime",
     "DeferredToolReference",
     "DomainToolManifestEntry",
+    "InternalCapabilityOutcome",
+    "InternalCapabilityRequest",
     "RunToolCatalog",
     "RunToolCatalogEntry",
     "SideEffectPlan",

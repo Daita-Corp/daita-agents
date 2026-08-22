@@ -284,7 +284,6 @@ def catalog_declarations(
         output_schema=_search_output_schema(),
         executor_id=search_executor.executor_id,
         access_mode=AccessMode.READ,
-        side_effecting=False,
     )
     schema = Capability(
         id=CATALOG_SCHEMA_CAPABILITY_ID,
@@ -339,7 +338,6 @@ def catalog_declarations(
         output_schema=_schema_output_schema(),
         executor_id=schema_executor.executor_id,
         access_mode=AccessMode.READ,
-        side_effecting=False,
     )
     inspect = Capability(
         id=CATALOG_INSPECT_CAPABILITY_ID,
@@ -381,7 +379,6 @@ def catalog_declarations(
         },
         executor_id=inspect_executor.executor_id,
         access_mode=AccessMode.READ,
-        side_effecting=False,
     )
     traverse = Capability(
         id=CATALOG_TRAVERSE_CAPABILITY_ID,
@@ -456,7 +453,6 @@ def catalog_declarations(
         output_schema=_traverse_output_schema(),
         executor_id=traverse_executor.executor_id,
         access_mode=AccessMode.READ,
-        side_effecting=False,
     )
     return CatalogDeclarations(
         capabilities=(search, schema, inspect, traverse),

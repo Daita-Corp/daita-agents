@@ -12,6 +12,7 @@ from ..capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
+    OperationalEffect,
     SideEffectExecutor,
     ToolDiscoveryMetadata,
     ToolExecution,
@@ -128,8 +129,8 @@ def memory_set_declarations(store: MemoryStore) -> MemoryDeclarations:
             "additionalProperties": False,
         },
         executor_id=executor.executor_id,
-        access_mode=AccessMode.WRITE,
-        side_effecting=True,
+        access_mode=AccessMode.NONE,
+        operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
     )
     return MemoryDeclarations(
         capabilities=(capability,),
@@ -183,7 +184,10 @@ class MemoryCapabilityDomain:
             if self._learning.allows(
                 run.id,
                 view.name,
-                side_effecting=self._capabilities[view.capability_id].side_effecting,
+                effectful=(
+                    self._capabilities[view.capability_id].operational_effect
+                    is not OperationalEffect.NONE
+                ),
             )
         )
 
@@ -204,7 +208,7 @@ class MemoryCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
         del request_sensitivity
-        self._learning.validate_side_effect(run.id, call)
+        self._learning.validate_effect(run.id, call)
         return arguments
 
     async def side_effect_plan(
@@ -228,7 +232,7 @@ class MemoryCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
         del request_sensitivity
-        self._learning.mark_side_effect_succeeded(run.id)
+        self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
         return replace(

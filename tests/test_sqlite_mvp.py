@@ -286,7 +286,7 @@ async def test_public_agent_queries_sqlite_and_reopens_exact_transcript(tmp_path
     provider = MockModelProvider(())
     profile = ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=20_000,
+        context_window_tokens=21_000,
         max_output_tokens=1_000,
         supports_tools=True,
         supports_parallel_tools=True,
@@ -322,7 +322,7 @@ async def test_public_agent_queries_sqlite_and_reopens_exact_transcript(tmp_path
     transcript = await agent.transcript(result.run_id)
     await agent.close()
 
-    assert result.kind is LoopExitKind.COMPLETED
+    assert result.kind is LoopExitKind.COMPLETED, result.reason
     assert result.final_text == "beta has the highest revenue."
     tool_result = transcript.messages[2].content[0]
     assert isinstance(tool_result, ToolResultBlock)

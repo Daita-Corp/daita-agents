@@ -42,6 +42,13 @@ from .learning_candidates import (
     SemanticCandidateContent,
     SkillCandidateContent,
 )
+from .jobs import (
+    JobExecutionMode,
+    JobInspection,
+    JobResultView,
+    JobStatus,
+    JobSummary,
+)
 from .llm import (
     ModelRoute,
     ModelRouteCandidate,
@@ -101,6 +108,11 @@ __all__ = [
     "LearningCandidateView",
     "LearningReviewResult",
     "LearningReviewStatus",
+    "JobExecutionMode",
+    "JobInspection",
+    "JobResultView",
+    "JobStatus",
+    "JobSummary",
     "LoopExit",
     "LoopExitKind",
     "LoopLimits",
