@@ -126,21 +126,35 @@ class _SnapshotCatalog:
         agent_id,
         query,
         *,
+        prior_query=None,
         limit,
         source_ids=(),
         resource_ids=(),
     ):
-        del agent_id, query, limit, source_ids, resource_ids
+        del agent_id, query, prior_query, limit, source_ids, resource_ids
         self.context_reads += 1
         return FrozenJsonObject.from_mapping(
             {
                 "resources": (
                     {
+                        "kind": "table",
+                        "match_reasons": ("resource_name_exact_mention",),
+                        "name": "snapshot",
                         "resource_id": "resource-snapshot",
                         "revision": self.revision,
+                        "sensitivity": "public",
+                        "source_id": "source-snapshot",
+                    },
+                ),
+                "sources": (
+                    {
+                        "source_id": "source-snapshot",
+                        "source_revision": "catalog:one",
+                        "sync_id": "sync-one",
                     },
                 ),
                 "total_matches": 1,
+                "returned_count": 1,
                 "truncated": False,
                 "trust_classification": "untrusted_external_data",
             }

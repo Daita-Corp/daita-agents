@@ -1398,6 +1398,34 @@ async def test_schema_capability_validates_output_and_is_smaller_than_inspection
         await agent.close()
 
 
+async def test_catalog_search_capability_exposes_correct_returned_and_scoped_counts(
+    tmp_path: Path,
+):
+    database = tmp_path / "search-capability-counts.sqlite"
+    _fixture_database(database)
+    agent = await Agent.create("catalog-search-capability-counts", root=tmp_path)
+    try:
+        await agent.attach(SQLiteSource(database))
+        registry: CapabilityRegistry = agent._embedded._capabilities
+        _view, capability = registry.resolve_tool("catalog_search")
+        _capability, executor = registry.resolve_execution(capability.id)
+        output = await executor.execute(
+            ToolExecution(
+                run_id="search-capability-counts",
+                call_id="search-capability-counts-call",
+                capability_id=capability.id,
+                arguments={"query": "table", "limit": 1},
+            )
+        )
+
+        assert output.data["returned_count"] == 1
+        assert output.data["total_matches"] == 8
+        assert output.data["truncated"] is True
+        assert registry.validate_output(capability.id, output) == output
+    finally:
+        await agent.close()
+
+
 async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_explicit(
     tmp_path: Path,
 ):
@@ -1405,6 +1433,7 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
     try:
         registry: CapabilityRegistry = agent._embedded._capabilities
         search_definition = registry.tool_definition("catalog_search")
+        _search_view, search_capability = registry.resolve_tool("catalog_search")
         schema_definition = registry.tool_definition("catalog_schema")
         inspect_definition = registry.tool_definition("catalog_inspect")
 
@@ -1414,6 +1443,14 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
         assert isinstance(search_properties, Mapping)
         assert isinstance(schema_properties, Mapping)
         assert isinstance(inspect_properties, Mapping)
+        search_output_properties = search_capability.output_schema["properties"]
+        search_output_required = search_capability.output_schema["required"]
+        assert isinstance(search_output_properties, Mapping)
+        assert isinstance(search_output_required, (tuple, list))
+        assert canonical_json(
+            search_output_properties["returned_count"]
+        ) == canonical_json({"type": "integer"})
+        assert "returned_count" in search_output_required
 
         query_rule = {
             "type": "string",

@@ -20,6 +20,7 @@ from daita.catalog import (
 )
 from daita.catalog.capabilities import CatalogProjection, catalog_declarations
 from daita.catalog.models import CatalogResource
+from daita.catalog.protocols import CatalogResourceNotFoundError
 from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
 from daita.storage.sqlite_codecs import encode_source_read_scope
@@ -173,7 +174,9 @@ async def test_model_catalog_surfaces_filter_before_limits_totals_and_graphs(
             source_ids=(source_id,),
         )
         context_resources = cast(tuple[FrozenJsonObject, ...], context["resources"])
-        assert context["total_matches"] == 1
+        assert context["total_matches"] == 2
+        assert context["returned_count"] == 1
+        assert context["truncated"] is True
         assert context_resources[0]["resource_id"] in {
             resources["parent"].id,
             resources["public_tail"].id,
@@ -183,8 +186,17 @@ async def test_model_catalog_surfaces_filter_before_limits_totals_and_graphs(
             CatalogSearchRequest(agent_id=agent.id, query="table", limit=1)
         )
         assert search.total_matches == 2
+        assert search.returned_count == 1
         assert search.truncated is True
         assert len(search.hits) == 1
+
+        with pytest.raises(CatalogResourceNotFoundError):
+            await view.catalog_context(
+                agent.id,
+                "parent",
+                resource_ids=(resources["child"].id,),
+                limit=12,
+            )
 
         schema = await view.schema_slice(
             CatalogSchemaRequest(

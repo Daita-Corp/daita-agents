@@ -97,20 +97,34 @@ class _StaticContextCatalog:
         agent_id,
         query,
         *,
+        prior_query=None,
         limit,
         source_ids=(),
         resource_ids=(),
     ):
-        del agent_id, query, limit, source_ids, resource_ids
+        del agent_id, query, prior_query, limit, source_ids, resource_ids
         return FrozenJsonObject.from_mapping(
             {
                 "resources": (
                     {
+                        "kind": "table",
+                        "match_reasons": ("resource_name_exact_mention",),
+                        "name": "untrusted-resource",
                         "resource_id": "untrusted-resource",
+                        "revision": "sha256:" + ("a" * 64),
                         "sensitivity": "restricted",
+                        "source_id": "source-static",
+                    },
+                ),
+                "sources": (
+                    {
+                        "source_id": "source-static",
+                        "source_revision": "catalog:static",
+                        "sync_id": "sync-static",
                     },
                 ),
                 "total_matches": 1,
+                "returned_count": 1,
                 "truncated": False,
                 "trust_classification": "untrusted_external_data",
             }

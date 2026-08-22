@@ -625,7 +625,9 @@ class _Catalog:
         return FrozenJsonObject.from_mapping(
             {
                 "resources": [],
+                "sources": [],
                 "total_matches": 0,
+                "returned_count": 0,
                 "truncated": False,
                 "trust_classification": "untrusted_external_data",
             }

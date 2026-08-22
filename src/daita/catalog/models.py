@@ -1236,6 +1236,7 @@ class CatalogSearchResult:
     request: CatalogSearchRequest
     hits: tuple[CatalogSearchHit, ...]
     total_matches: int
+    returned_count: int
     truncated: bool
 
     def __post_init__(self) -> None:
@@ -1245,13 +1246,16 @@ class CatalogSearchResult:
             )
         hits = _record_tuple(self.hits, CatalogSearchHit, "catalog search hits")
         _non_negative_int(self.total_matches, "catalog search total_matches")
+        _non_negative_int(self.returned_count, "catalog search returned_count")
         if not isinstance(self.truncated, bool):
             raise TypeError("catalog search truncated must be a boolean")
         if len(hits) > self.request.limit:
             raise ValueError("catalog search result exceeds request limit")
         if self.total_matches < len(hits):
             raise ValueError("catalog search total_matches cannot be below hit count")
-        if self.truncated != (self.total_matches > len(hits)):
+        if self.returned_count != len(hits):
+            raise ValueError("catalog search returned_count disagrees with hit count")
+        if self.truncated != (self.total_matches > self.returned_count):
             raise ValueError("catalog search truncated disagrees with total_matches")
         resource_ids = [hit.resource_id for hit in hits]
         if len(resource_ids) != len(set(resource_ids)):

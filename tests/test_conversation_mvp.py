@@ -219,9 +219,10 @@ class FreshQueryTools:
 
 
 class CatalogSpy:
-    def __init__(self, resources=()):
+    def __init__(self, resources=(), sources=()):
         self.queries = []
         self.resources = resources
+        self.sources = sources
 
     async def admitted_model_sensitivity(
         self, agent_id: str, source_ids: tuple[str, ...] = ()
@@ -234,6 +235,7 @@ class CatalogSpy:
         agent_id,
         query,
         *,
+        prior_query=None,
         limit,
         source_ids=(),
         resource_ids=(),
@@ -241,11 +243,13 @@ class CatalogSpy:
         del agent_id, limit, source_ids, resource_ids
         from daita._json import FrozenJsonObject
 
-        self.queries.append(query)
+        self.queries.append((query, prior_query))
         return FrozenJsonObject.from_mapping(
             {
                 "resources": self.resources,
+                "sources": self.sources,
                 "total_matches": len(self.resources),
+                "returned_count": len(self.resources),
                 "truncated": False,
                 "trust_classification": "untrusted_external_data",
             }
@@ -1375,7 +1379,7 @@ async def test_final_budget_omits_oldest_turns_and_preserves_current_exchange():
     assert roles[-3:] == [MessageRole.USER, MessageRole.ASSISTANT, MessageRole.TOOL]
 
 
-async def test_catalog_query_uses_current_and_most_recent_prior_user_message():
+async def test_catalog_queries_keep_current_and_most_recent_prior_user_separate():
     catalog = CatalogSpy()
     builder = DataContextBuilder(
         catalog,
@@ -1411,12 +1415,93 @@ async def test_catalog_query_uses_current_and_most_recent_prior_user_message():
         (),
         step=1,
     )
-    assert catalog.queries == ["Now only EMEA\n\nPrior user message:\nhistory user 1"]
+    assert catalog.queries == [("Now only EMEA", "history user 1")]
     system_text = request.messages[0].content[0]
     assert isinstance(system_text, TextBlock)
     assert (
         "fresh source/tool evidence outrank stale historical claims" in system_text.text
     )
+    assert (
+        "use its resource_id directly. Use catalog_search only when the target is "
+        "missing or ambiguous" in system_text.text
+    )
+
+
+async def test_context_fitting_retains_exact_current_anchor_and_updates_counts():
+    source_id = "source:exact-current"
+    resources = (
+        {
+            "kind": "table",
+            "match_reasons": ("resource_name_exact_mention",),
+            "name": "exact_current_target",
+            "resource_id": "resource:exact-current",
+            "revision": "sha256:" + ("a" * 64),
+            "sensitivity": "internal",
+            "source_id": source_id,
+        },
+        {
+            "kind": "table",
+            "match_reasons": ("resource_name_exact_mention",),
+            "name": "prior_target_" + ("p" * 30_000),
+            "resource_id": "resource:prior",
+            "revision": "sha256:" + ("b" * 64),
+            "sensitivity": "internal",
+            "source_id": source_id,
+        },
+        {
+            "kind": "table",
+            "match_reasons": ("resource_name_contains",),
+            "name": "broad_candidate_" + ("b" * 30_000),
+            "resource_id": "resource:broad",
+            "revision": "sha256:" + ("c" * 64),
+            "sensitivity": "internal",
+            "source_id": source_id,
+        },
+    )
+    sources = (
+        {
+            "source_id": source_id,
+            "source_revision": "catalog:sha256:" + ("d" * 64),
+            "sync_id": "catalog-sync-current",
+        },
+    )
+    catalog = CatalogSpy(resources, sources)
+    builder = DataContextBuilder(
+        catalog,
+        profile=ModelProfile(
+            id="mock:catalog-fitting",
+            context_window_tokens=20_000,
+            max_output_tokens=1_000,
+            supports_tools=True,
+        ),
+    )
+    run = RunInput(
+        id="catalog-fitting-run",
+        agent_id="agent-history",
+        message="Profile exact_current_target",
+        created_at=NOW,
+        conversation_id="catalog-fitting-conversation",
+    )
+    request = await _prepared_request(
+        builder,
+        run,
+        (
+            CanonicalMessage(
+                role=MessageRole.USER,
+                content=(TextBlock(run.message),),
+            ),
+        ),
+        (),
+        step=1,
+    )
+    system = request.messages[0].content[0]
+    assert isinstance(system, TextBlock)
+    assert "exact_current_target" in system.text
+    assert "prior_target_" not in system.text
+    assert "broad_candidate_" not in system.text
+    assert '"returned_count":1' in system.text
+    assert '"total_matches":3' in system.text
+    assert '"truncated":true' in system.text
 
 
 async def test_context_overflow_fails_before_provider_and_is_not_replayed(tmp_path):
@@ -1654,6 +1739,9 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
         "revision": revision,
         "sensitivity": "internal",
         "source_id": source_id,
+    }
+    current_source = {
+        "source_id": source_id,
         "source_revision": source_revision,
         "sync_id": sync_id,
     }
@@ -1677,7 +1765,7 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
 
     unchanged = await _prepared_request(
         DataContextBuilder(
-            CatalogSpy((current_resource,)),
+            CatalogSpy((current_resource,), (current_source,)),
             profile=profile,
         ),
         run,
@@ -1692,12 +1780,15 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
     changed_resource = {
         **current_resource,
         "revision": "sha256:" + ("e" * 64),
+    }
+    changed_source = {
+        **current_source,
         "sync_id": "catalog-sync-refreshed",
         "source_revision": "catalog:sha256:" + ("f" * 64),
     }
     changed = await _prepared_request(
         DataContextBuilder(
-            CatalogSpy((changed_resource,)),
+            CatalogSpy((changed_resource,), (changed_source,)),
             profile=profile,
         ),
         run,
@@ -1709,3 +1800,17 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
     assert "catalog.schema_slice" not in changed_text
     assert "'name', 'paid_revenue'" not in changed_text
     assert _HISTORY_OMISSION_MARKER in changed_text
+
+    missing_source = await _prepared_request(
+        DataContextBuilder(
+            CatalogSpy((current_resource,), ()),
+            profile=profile,
+        ),
+        run,
+        (*prior, current_user),
+        (),
+        step=1,
+    )
+    missing_source_text = repr(missing_source.messages)
+    assert "catalog.schema_slice" not in missing_source_text
+    assert _HISTORY_OMISSION_MARKER in missing_source_text

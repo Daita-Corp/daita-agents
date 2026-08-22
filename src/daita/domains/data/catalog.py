@@ -469,18 +469,26 @@ class CatalogDataView:
         agent_id: str,
         query: str,
         *,
+        prior_query: str | None = None,
         limit: int,
         source_ids: tuple[str, ...] = (),
         resource_ids: tuple[str, ...] = (),
     ) -> FrozenJsonObject:
         readable = await self.readable_resource_ids(agent_id, source_ids)
-        if resource_ids and any(
-            resource_id not in readable for resource_id in resource_ids
-        ):
-            raise CatalogResourceNotFoundError(agent_id, resource_ids[0])
+        unreadable_resource_id = next(
+            (
+                resource_id
+                for resource_id in resource_ids
+                if resource_id not in readable
+            ),
+            None,
+        )
+        if unreadable_resource_id is not None:
+            raise CatalogResourceNotFoundError(agent_id, unreadable_resource_id)
         return await self._service.catalog_context(
             agent_id,
             query,
+            prior_query=prior_query,
             limit=limit,
             source_ids=source_ids,
             resource_ids=resource_ids,
