@@ -40,10 +40,10 @@ from .screens.catalog import CatalogScreen
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
+from .screens.jobs import JobsScreen
 from .screens.mcp import MCPManagementScreen, MCPSetupScreen
 from .screens.onboarding import (
     AgentCreateScreen,
-    CatalogRepairScreen,
     ModelSetupScreen,
     SourceSetupScreen,
 )
@@ -263,34 +263,31 @@ class DaitaApp(App[int]):
         )
 
     async def _ensure_ready(self) -> None:
+        await self._show_chat()
+        await self._show_home_guidance()
+
+    async def _show_home_guidance(self) -> None:
+        chat = self.chat()
+        if chat is None or self.controller.agent is None:
+            return
+        guidance: list[str] = []
         agent = self.controller.require_agent()
         if agent.model_profile is None:
-            configured = await self._await_modal(ModelSetupScreen())
-            if not configured:
-                self.exit(0)
-                return
-            await self.controller.reopen_agent(
-                observer=self._observer,
-                approval_handler=self.handle_approval,
-            )
+            guidance.append("no model · use /model")
         sources = tuple(
             source for source in await self.controller.list_sources() if source.active
         )
         if not sources:
-            attached = await self._await_modal(SourceSetupScreen())
-            if not attached:
-                self.exit(0)
-                return
-        elif len(sources) > 1 and await agent.active_source() is None:
-            await self._pick_source()
-        summary = await self.controller.catalog_summary()
-        while summary.is_empty:
-            action = await self._await_modal(CatalogRepairScreen())
-            if action != "added":
-                self.exit(0)
-                return
-            summary = await self.controller.catalog_summary()
-        await self._show_chat()
+            guidance.append("no source · use /source add")
+        else:
+            if len(sources) > 1 and await self.controller.active_source() is None:
+                guidance.append("choose a source · use /source")
+            if (await self.controller.catalog_summary()).is_empty:
+                guidance.append("catalog has 0 resources · use /source edit")
+        if guidance:
+            chat.show_notice("Setup  " + "  ·  ".join(guidance))
+        else:
+            chat.clear_notice()
 
     async def _pick_source(self) -> None:
         sources = await self.controller.list_sources()
@@ -489,7 +486,11 @@ class DaitaApp(App[int]):
             return
         if outcome.kind == "screen":
             try:
-                await self._open_command_screen(outcome.screen, outcome.payload)
+                await self._open_command_screen(
+                    outcome.screen,
+                    outcome.payload,
+                    message=outcome.message,
+                )
             except (UserInputError, ValueError, RuntimeError, OSError) as error:
                 screen.show_notice(
                     sanitize_terminal_text(
@@ -526,10 +527,12 @@ class DaitaApp(App[int]):
         if screen_name == "source_picker":
             await self._pick_source()
             await self._refresh_status()
+            await self._show_home_guidance()
             return
         if screen_name == "source_setup":
             await self._await_modal(SourceSetupScreen())
             await self._refresh_status()
+            await self._show_home_guidance()
             return
         if screen_name == "source_edit":
             changed = await self._await_modal(SourceEditScreen())
@@ -539,9 +542,13 @@ class DaitaApp(App[int]):
                 await self._replace_conversation_transcript()
                 chat = self.chat()
                 if chat is not None:
-                    chat.show_notice(
-                        "Source connection updated. Started a new conversation."
-                    )
+                    summary = await self.controller.catalog_summary()
+                    notice = "Source connection updated. Started a new conversation."
+                    if summary.is_empty:
+                        notice += " Catalog contains 0 resources; use /source edit to correct its scope."
+                    chat.show_notice(notice)
+            else:
+                await self._show_home_guidance()
             await self._refresh_status()
             return
         if screen_name == "model_setup":
@@ -553,6 +560,7 @@ class DaitaApp(App[int]):
                 )
                 self._reset_context_usage()
             await self._refresh_status()
+            await self._show_home_guidance()
             return
         if screen_name == "permissions":
             await self._await_modal(PermissionsScreen())
@@ -564,6 +572,18 @@ class DaitaApp(App[int]):
         if screen_name == "mcp_setup":
             result = await self._await_modal(MCPSetupScreen())
             await self._complete_mcp_screen(result)
+            return
+        if screen_name == "jobs":
+            await self._await_modal(
+                JobsScreen(
+                    job_id=(
+                        str(payload["job_id"])
+                        if isinstance(payload.get("job_id"), str)
+                        else None
+                    ),
+                    initial_view=str(payload.get("view", "details")),
+                )
+            )
             return
         if screen_name == "catalog":
             sources = tuple(
@@ -589,13 +609,16 @@ class DaitaApp(App[int]):
                     sources=sources,
                     resources=resources,
                     current_source_id=None if current is None else current.id,
+                    notice=message,
+                    notice_warning=bool(payload.get("catalog_notice_warning", False)),
                 )
             )
+            if message:
+                chat = self.chat()
+                if chat is not None:
+                    chat.show_notice(message)
             return
 
-        if screen_name == "catalog_repair":
-            await self._await_modal(CatalogRepairScreen())
-            return
         if screen_name == "skill_create":
             await self._create_skill(str(payload.get("name", "")))
             return
@@ -632,6 +655,34 @@ class DaitaApp(App[int]):
             if accepted:
                 await self.controller.delete_open_agent()
                 self.exit(0)
+            return
+        if screen_name == "confirm_cancel_job":
+            job_id = str(payload.get("job_id", ""))
+            accepted = await self._await_modal(ConfirmScreen(message))
+            if not accepted:
+                return
+            inspection = await self.controller.cancel_job(job_id)
+            if inspection is None:
+                raise UserInputError(
+                    "The job no longer exists within this agent boundary."
+                )
+            status = inspection.summary.status.value
+            if status in {"cancel_requested", "cancelled"}:
+                notice = "Cancellation requested · " + job_id + " · " + status
+            else:
+                notice = (
+                    "Job became "
+                    + status
+                    + " before cancellation was applied · "
+                    + job_id
+                )
+            await self._await_modal(
+                JobsScreen(
+                    job_id=job_id,
+                    initial_view="details",
+                    notice=notice,
+                )
+            )
             return
         if screen_name == "confirm_detach_source":
             accepted = await self._await_modal(ConfirmScreen(message))

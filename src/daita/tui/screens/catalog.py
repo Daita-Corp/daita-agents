@@ -13,7 +13,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Footer, Label, Static, Tree
 
 from ..models import SOURCE_TYPE_LABELS
-from ..sanitization import safe_display
+from ..sanitization import safe_display, sanitize_terminal_text
 
 
 class CatalogScreen(ModalScreen[None]):
@@ -33,17 +33,33 @@ class CatalogScreen(ModalScreen[None]):
         sources: tuple[Any, ...],
         resources: tuple[Any, ...],
         current_source_id: str | None,
+        notice: str = "",
+        notice_warning: bool = False,
     ) -> None:
         super().__init__()
         self._summary = summary
         self._sources = sources
         self._resources = resources
         self._current_source_id = current_source_id
+        self._notice = notice
+        self._notice_warning = notice_warning
 
     def compose(self) -> ComposeResult:
         with Vertical(id="catalog-browser"):
             yield Label("Catalog", id="catalog-title", markup=False)
             yield Static(self._summary_text(), id="catalog-summary", markup=False)
+            if self._notice:
+                yield Static(
+                    sanitize_terminal_text(
+                        self._notice,
+                        maximum=512,
+                        preserve_lines=False,
+                        fallback="Catalog refresh succeeded.",
+                    ),
+                    id="catalog-notice",
+                    classes="-warning" if self._notice_warning else "",
+                    markup=False,
+                )
             tree: Tree[str] = Tree("Sources", id="catalog-tree")
             tree.show_root = False
             yield tree

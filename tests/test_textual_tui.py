@@ -21,6 +21,7 @@ from textual.widgets import (
     Footer,
     Input,
     OptionList,
+    Select,
     Static,
     Tree,
 )
@@ -32,6 +33,7 @@ from daita import (
     AgentEventKind,
     ApprovalDecision,
     ApprovalRequest,
+    JobStatus,
     LoopExit,
     LoopExitKind,
     SQLiteSource,
@@ -55,6 +57,7 @@ from daita.tui.clipboard import (
     osc52_sequence,
 )
 from daita.tui.commands import (
+    SLASH_COMMAND_COMPLETIONS,
     learning_invocation_message,
     parse_postgresql_connection_url,
     parse_source_override,
@@ -67,6 +70,7 @@ from daita.tui.models import (
     ToolCardDetails,
     ToolCardState,
     TranscriptBlock,
+    UserInputError,
 )
 from daita.tui.observer import ObserverEvent
 from daita.tui.projection import (
@@ -79,7 +83,12 @@ from daita.tui.screens.catalog import CatalogScreen
 from daita.tui.screens.chat import ChatScreen
 from daita.tui.screens.confirm import ConfirmScreen
 from daita.tui.screens.editing import ReviewCostScreen
-from daita.tui.screens.onboarding import AgentCreateScreen, ModelSetupScreen
+from daita.tui.screens.jobs import JobsScreen
+from daita.tui.screens.onboarding import (
+    AgentCreateScreen,
+    ModelSetupScreen,
+    SourceSetupScreen,
+)
 from daita.tui.screens.permissions import PermissionsScreen
 from daita.tui.screens.selection import SelectionScreen
 from daita.tui.screens.source_edit import SourceEditScreen
@@ -240,6 +249,24 @@ async def test_app_resize_and_too_small_screen(tmp_path: Path):
         await pilot.pause()
         assert app.size.width == MIN_USABLE_COLUMNS - 1
         app.exit(0)
+
+
+async def test_agent_home_is_available_without_model_source_or_catalog(tmp_path: Path):
+    opened = await Agent.create("home-without-setup", root=tmp_path)
+    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app.controller.agent = opened
+    try:
+        async with app.run_test(size=(100, 30)) as pilot:
+            await app._ensure_ready()
+            await pilot.pause()
+            assert isinstance(app.screen, ChatScreen)
+            notice = str(app.screen.query_one("#notice-bar", Static).content)
+            assert "no model · use /model" in notice
+            assert "no source · use /source add" in notice
+            assert app.screen.query_one(Composer).disabled is False
+            app.exit(0)
+    finally:
+        await opened.close()
 
 
 def test_daita_theme_uses_the_official_terminal_palette():
@@ -437,7 +464,14 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
             await pilot.press("/")
             await pilot.pause()
             assert popup.display is True
-            assert popup.styles.border_left[0] == "round"
+            assert popup.styles.border_left[0] == "solid"
+            assert popup.styles.background.hex == "#111111"
+            assert (
+                listing.get_component_styles(
+                    "option-list--option-highlighted"
+                ).background.hex
+                == "#343434"
+            )
             assert listing.highlighted == 0
             assert popup.selected_insertion() == "/model"
 
@@ -566,6 +600,340 @@ async def test_selection_screen_filters_without_reordering():
     assert app.return_value == ("b",)
 
 
+async def test_multi_selection_shows_literal_marks_and_continue_button():
+    class Harness(App[tuple[str, ...] | None]):
+        def compose(self) -> ComposeResult:
+            yield Static("host")
+
+        def on_mount(self) -> None:
+            self.run_worker(self._present(), exclusive=True)
+
+        async def _present(self) -> None:
+            result = await self.push_screen_wait(
+                SelectionScreen(
+                    title="Select PostgreSQL schemas",
+                    options=(
+                        PickerOption("core", "core", "contains tables"),
+                        PickerOption("public", "public", "empty"),
+                    ),
+                    multi=True,
+                    initial_selected=("core",),
+                )
+            )
+            self.exit(result)
+
+    app = Harness()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        picker = app.screen
+        assert isinstance(picker, SelectionScreen)
+        listing = picker.query_one("#picker-options", OptionList)
+        selected = listing.get_option_at_index(0)
+        unselected = listing.get_option_at_index(1)
+        assert isinstance(selected.prompt, Text)
+        assert selected.prompt.plain == "[x] core — contains tables"
+        assert isinstance(unselected.prompt, Text)
+        assert unselected.prompt.plain == "[ ] public — empty"
+        button = picker.query_one("#picker-confirm", Button)
+        assert str(button.label) == "Continue"
+        assert await pilot.click(button) is True
+        await pilot.pause()
+    assert app.return_value == ("core",)
+
+
+def _tui_job_summary(
+    job_id: str,
+    status: JobStatus,
+    *,
+    result_available: bool,
+) -> SimpleNamespace:
+    observed = datetime(2026, 8, 23, 14, 0, tzinfo=UTC)
+    return SimpleNamespace(
+        job_id=job_id,
+        origin_conversation_id="conversation-jobs",
+        job_kind="data_profile",
+        status=status,
+        execution_mode=SimpleNamespace(value="daita"),
+        source_ids=("source-one",),
+        resource_ids=("resource-one",),
+        sensitivity=SimpleNamespace(value="internal"),
+        created_at=observed,
+        updated_at=observed,
+        result_available=result_available,
+    )
+
+
+def _tui_job_inspection(summary: SimpleNamespace) -> SimpleNamespace:
+    observed = datetime(2026, 8, 23, 14, 0, tzinfo=UTC)
+    return SimpleNamespace(
+        summary=summary,
+        origin_run_id="run-jobs",
+        specification_digest="sha256:" + "1" * 64,
+        execution_capability_id="jobs.data_profile.execute",
+        execution_contract_digest="sha256:" + "2" * 64,
+        desired_state=SimpleNamespace(
+            value=(
+                "cancel"
+                if summary.status in {JobStatus.CANCEL_REQUESTED, JobStatus.CANCELLED}
+                else "run"
+            )
+        ),
+        deadline_at=observed,
+        attempts=(
+            SimpleNamespace(
+                number=1,
+                fencing_epoch=1,
+                status=SimpleNamespace(value="claimed"),
+                claimed_at=observed,
+                completed_at=None,
+                error_code=None,
+                external_intents=(),
+                external_observations=(),
+            ),
+        ),
+        cancel_requested_at=(
+            observed
+            if summary.status in {JobStatus.CANCEL_REQUESTED, JobStatus.CANCELLED}
+            else None
+        ),
+        terminal_at=(observed if summary.status is JobStatus.CANCELLED else None),
+        failure_code=None,
+        external_executor=None,
+    )
+
+
+async def test_jobs_commands_route_without_model_calls(monkeypatch):
+    app = DaitaApp(start_bootstrap=False)
+    running = _tui_job_summary("job-running", JobStatus.RUNNING, result_available=False)
+    succeeded = _tui_job_summary(
+        "job-succeeded", JobStatus.SUCCEEDED, result_available=True
+    )
+
+    async def inspect_job(job_id: str) -> object | None:
+        if job_id == running.job_id:
+            return _tui_job_inspection(running)
+        if job_id == succeeded.job_id:
+            return _tui_job_inspection(succeeded)
+        return None
+
+    monkeypatch.setattr(app.controller, "inspect_job", inspect_job)
+
+    assert {
+        insertion
+        for insertion, _display, _description in SLASH_COMMAND_COMPLETIONS
+        if insertion.startswith("/jobs")
+    } == {"/jobs", "/jobs inspect ", "/jobs results ", "/jobs cancel "}
+
+    listed = await app.controller.dispatch_command("/jobs")
+    assert listed.kind == "screen"
+    assert listed.screen == "jobs"
+
+    inspected = await app.controller.dispatch_command("/jobs inspect job-running")
+    assert inspected.screen == "jobs"
+    assert inspected.payload == {"job_id": "job-running", "view": "inspect"}
+
+    results = await app.controller.dispatch_command("/jobs results job-succeeded")
+    assert results.screen == "jobs"
+    assert results.payload == {"job_id": "job-succeeded", "view": "results"}
+
+    cancellation = await app.controller.dispatch_command("/jobs cancel job-running")
+    assert cancellation.kind == "confirm"
+    assert cancellation.screen == "confirm_cancel_job"
+    assert cancellation.payload == {"job_id": "job-running"}
+    assert "data_profile · running" in cancellation.message
+
+    terminal = await app.controller.dispatch_command("/jobs cancel job-succeeded")
+    assert terminal.kind == "notice"
+    assert "succeeded and cannot be cancelled" in terminal.message
+
+    malformed = await app.controller.dispatch_command("/jobs retry job-running")
+    assert malformed.kind == "notice"
+    assert malformed.message.startswith("Usage: /jobs")
+
+    with pytest.raises(UserInputError, match="belongs to this agent"):
+        await app.controller.dispatch_command("/jobs cancel job-missing")
+
+
+async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypatch):
+    app = DaitaApp(start_bootstrap=False)
+    running = _tui_job_summary(
+        "job-running-0123456789", JobStatus.RUNNING, result_available=False
+    )
+    succeeded = _tui_job_summary(
+        "job-succeeded-0123456789", JobStatus.SUCCEEDED, result_available=True
+    )
+    jobs = [running, succeeded]
+    list_calls = 0
+    cancel_calls: list[str] = []
+
+    async def list_jobs() -> tuple[object, ...]:
+        nonlocal list_calls
+        list_calls += 1
+        return tuple(jobs)
+
+    async def inspect_job(job_id: str) -> object | None:
+        return next(
+            (
+                _tui_job_inspection(summary)
+                for summary in jobs
+                if summary.job_id == job_id
+            ),
+            None,
+        )
+
+    async def read_job_result(job_id: str) -> object | None:
+        if job_id != succeeded.job_id:
+            return None
+        observed = datetime(2026, 8, 23, 14, 1, tzinfo=UTC)
+        return SimpleNamespace(
+            job_id=job_id,
+            result_id="result-profile",
+            summary=FrozenJsonObject.from_mapping({"profiled_resources": 1}),
+            sensitivity=SimpleNamespace(value="internal"),
+            provenance=FrozenJsonObject.from_mapping(
+                {"authority": "job_owner_agent_scope"}
+            ),
+            artifact_refs=(),
+            completed_at=observed,
+        )
+
+    async def cancel_job(job_id: str) -> object | None:
+        cancel_calls.append(job_id)
+        if job_id != running.job_id:
+            return None
+        cancelled = _tui_job_summary(
+            running.job_id, JobStatus.CANCEL_REQUESTED, result_available=False
+        )
+        jobs[0] = cancelled
+        return _tui_job_inspection(cancelled)
+
+    monkeypatch.setattr(app.controller, "list_jobs", list_jobs)
+    monkeypatch.setattr(app.controller, "inspect_job", inspect_job)
+    monkeypatch.setattr(app.controller, "read_job_result", read_job_result)
+    monkeypatch.setattr(app.controller, "cancel_job", cancel_job)
+
+    async with app.run_test(size=(110, 36)) as pilot:
+        await app.push_screen(JobsScreen())
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if "2 jobs" in str(app.screen.query_one("#jobs-summary", Static).content):
+                break
+        manager = app.screen
+        assert isinstance(manager, JobsScreen)
+        panel = manager.query_one("#jobs-manager")
+        assert panel.styles.border_left[0] == "solid"
+        assert panel.styles.background.hex == "#111111"
+        listing = manager.query_one("#jobs-list", OptionList)
+        assert listing.option_count == 2
+        assert listing.has_focus is True
+        first_prompt = listing.get_option_at_index(0).prompt
+        assert isinstance(first_prompt, Text)
+        assert "RUNNING" in first_prompt.plain
+        assert manager.query_one("#jobs-cancel", Button).disabled is False
+        assert manager.query_one("#jobs-results", Button).disabled is True
+
+        assert await pilot.click("#jobs-details") is True
+        await pilot.pause()
+        assert "Lifecycle" in str(manager.query_one("#jobs-detail", Static).content)
+
+        assert await pilot.click("#jobs-cancel") is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, ConfirmScreen):
+                break
+        assert isinstance(app.screen, ConfirmScreen)
+        await pilot.press("y")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if app.screen is manager and cancel_calls:
+                break
+        assert app.screen is manager
+        assert cancel_calls == [running.job_id]
+        assert "Cancellation requested" in str(
+            manager.query_one("#jobs-notice", Static).content
+        )
+        assert manager.query_one("#jobs-cancel", Button).disabled is True
+
+        listing.highlighted = 1
+        await pilot.pause()
+        assert manager.query_one("#jobs-results", Button).disabled is False
+        assert await pilot.click("#jobs-results") is True
+        await pilot.pause()
+        result_text = str(manager.query_one("#jobs-detail", Static).content)
+        assert "profiled_resources" in result_text
+        assert "Artifacts (0)" in result_text
+
+        assert await pilot.click("#jobs-refresh") is True
+        await pilot.pause()
+        assert list_calls >= 3
+        assert "Job statuses refreshed" in str(
+            manager.query_one("#jobs-notice", Static).content
+        )
+        assert await pilot.click("#jobs-close") is True
+        app.exit(0)
+
+
+async def test_direct_jobs_cancel_command_confirms_and_opens_updated_manager(
+    monkeypatch,
+):
+    app = DaitaApp(start_bootstrap=False)
+    running = _tui_job_summary(
+        "job-direct-cancel", JobStatus.RUNNING, result_available=False
+    )
+    current = running
+    cancel_calls: list[str] = []
+
+    async def list_jobs() -> tuple[object, ...]:
+        return (current,)
+
+    async def inspect_job(job_id: str) -> object | None:
+        return _tui_job_inspection(current) if job_id == current.job_id else None
+
+    async def cancel_job(job_id: str) -> object | None:
+        nonlocal current
+        cancel_calls.append(job_id)
+        current = _tui_job_summary(
+            job_id, JobStatus.CANCEL_REQUESTED, result_available=False
+        )
+        return _tui_job_inspection(current)
+
+    async def skill_invocation_message(_message: str) -> None:
+        return None
+
+    monkeypatch.setattr(app.controller, "list_jobs", list_jobs)
+    monkeypatch.setattr(app.controller, "inspect_job", inspect_job)
+    monkeypatch.setattr(app.controller, "cancel_job", cancel_job)
+    monkeypatch.setattr(
+        app.controller, "skill_invocation_message", skill_invocation_message
+    )
+
+    async with app.run_test(size=(110, 36)) as pilot:
+        await app.push_screen(ChatScreen())
+        composer = app.screen.query_one(Composer)
+        composer.load_text(f"/jobs cancel {running.job_id}")
+        composer.action_submit()
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, ConfirmScreen):
+                break
+        assert isinstance(app.screen, ConfirmScreen)
+        assert "data_profile · running" in str(
+            app.screen.query_one("#confirm-message").render()
+        )
+        await pilot.press("y")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, JobsScreen):
+                break
+        manager = app.screen
+        assert isinstance(manager, JobsScreen)
+        assert cancel_calls == [running.job_id]
+        assert "Cancellation requested" in str(
+            manager.query_one("#jobs-notice", Static).content
+        )
+        app.exit(0)
+
+
 async def test_source_permissions_picker_remains_interactive_after_command_submit(
     tmp_path: Path,
 ):
@@ -590,13 +958,23 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
 
             picker = app.screen
             assert isinstance(picker, SelectionScreen)
-            assert picker.query_one("#picker").styles.border_left[0] == "round"
-            assert (
-                picker.query_one("#picker-filter", Input).styles.border_left[0]
-                == "round"
-            )
+            panel = picker.query_one("#picker")
+            assert panel.styles.border_left[0] == "solid"
+            assert panel.styles.background.hex == "#111111"
+            picker_filter = picker.query_one("#picker-filter", Input)
+            assert picker_filter.styles.border_left[0] == ""
+            assert picker_filter.styles.border_bottom[0] == "solid"
+            assert picker.query_one("#picker-title").styles.color.hex == "#FFFFFF"
             listing = picker.query_one("#picker-options", OptionList)
-            assert await pilot.click(listing, offset=(2, 1)) is True
+            assert listing.styles.border_left[0] == ""
+            assert listing.styles.background.hex == "#111111"
+            assert (
+                listing.get_component_styles(
+                    "option-list--option-highlighted"
+                ).background.hex
+                == "#343434"
+            )
+            assert await pilot.click(listing, offset=(2, 0)) is True
             await pilot.pause()
 
             assert app.screen is permissions
@@ -1298,14 +1676,16 @@ async def test_source_edit_screen_reviews_and_switches_atomically(tmp_path: Path
             await pilot.pause()
             assert isinstance(app.screen, SourceEditScreen)
             app.screen.query_one("#edit-source-path", Input).value = str(edited_path)
-            apply_task = asyncio.create_task(app.screen._apply())
+            apply_button = app.screen.query_one("#edit-source-apply", Button)
+            apply_button.scroll_visible(animate=False)
+            await pilot.pause()
+            assert await pilot.click(apply_button, offset=(2, 1)) is True
             for _ in range(20):
                 await pilot.pause(0.05)
                 if isinstance(app.screen, ConfirmScreen):
                     break
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("y")
-            await apply_task
             await command_task
             active = await opened.active_source()
             assert active is not None
@@ -1313,6 +1693,104 @@ async def test_source_edit_screen_reviews_and_switches_atomically(tmp_path: Path
             app.exit(0)
     finally:
         await opened.close()
+
+
+async def test_postgresql_source_edit_probes_and_selects_schemas(monkeypatch):
+    app = DaitaApp(start_bootstrap=False)
+    source = SimpleNamespace(
+        id="source-postgresql",
+        adapter_id="postgresql",
+        display_name="Warehouse",
+        configuration={
+            "host": "127.0.0.1",
+            "port": 5432,
+            "database": "fixture",
+            "username": "reader",
+            "schemas": ["public"],
+            "ssl_mode": "disable",
+            "credential_ref": "keychain:test-postgresql-edit",
+        },
+    )
+    edited: dict[str, object] = {}
+
+    async def active_source() -> object:
+        return source
+
+    async def probe_postgresql_source(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            schemas=(
+                SimpleNamespace(name="public", has_base_tables=False),
+                SimpleNamespace(name="core", has_base_tables=True),
+                SimpleNamespace(name="sales", has_base_tables=True),
+            ),
+            truncated=False,
+        )
+
+    async def edit_source_connection(*_args: object, **kwargs: object) -> object:
+        edited.update(kwargs)
+        return SimpleNamespace(source=source)
+
+    monkeypatch.setattr(app.controller, "active_source", active_source)
+    monkeypatch.setattr(
+        app.controller, "probe_postgresql_source", probe_postgresql_source
+    )
+    monkeypatch.setattr(
+        app.controller, "edit_source_connection", edit_source_connection
+    )
+
+    async with app.run_test(size=(100, 34)) as pilot:
+        modal_task = asyncio.create_task(app._await_modal(SourceEditScreen()))
+        await pilot.pause()
+        edit = app.screen
+        assert isinstance(edit, SourceEditScreen)
+        apply_button = edit.query_one("#edit-source-apply", Button)
+        apply_button.scroll_visible(animate=False)
+        await pilot.pause()
+        assert await pilot.click(apply_button, offset=(2, 1)) is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SelectionScreen):
+                break
+        picker = app.screen
+        assert isinstance(picker, SelectionScreen)
+        assert picker._selected == {"core", "sales"}
+        picker.action_confirm()
+
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if modal_task.done():
+                break
+        assert await modal_task is True
+        assert edited["schemas"] == ("core", "sales")
+        app.exit(0)
+
+
+async def test_source_edit_rejects_a_zero_resource_preview_without_confirmation(
+    monkeypatch,
+):
+    app = DaitaApp(start_bootstrap=False)
+
+    async def active_source() -> None:
+        return None
+
+    async def list_sources() -> tuple[object, ...]:
+        return ()
+
+    monkeypatch.setattr(app.controller, "active_source", active_source)
+    monkeypatch.setattr(app.controller, "list_sources", list_sources)
+
+    async with app.run_test(size=(100, 34)) as pilot:
+        await app.push_screen(SourceEditScreen())
+        await pilot.pause()
+        edit = app.screen
+        assert isinstance(edit, SourceEditScreen)
+        accepted = await edit._confirm_preview(SimpleNamespace(resource_count=0))
+        assert accepted is False
+        assert app.screen is edit
+        assert "no catalogable tables" in str(
+            edit.query_one("#source-edit-error").render()
+        )
+        app.exit(0)
 
 
 async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path):
@@ -1342,8 +1820,13 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
             )
             tree = app.screen.query_one("#catalog-tree", Tree)
             browser = app.screen.query_one("#catalog-browser")
-            assert browser.styles.border_left[0] == "round"
-            assert tree.styles.border_left[0] == "round"
+            assert browser.styles.border_left[0] == "solid"
+            assert browser.styles.background.hex == "#111111"
+            assert tree.styles.border_left[0] == ""
+            assert tree.styles.border_top[0] == "solid"
+            assert tree.styles.background.hex == "#111111"
+            assert tree.get_component_styles("tree--cursor").background.hex == "#343434"
+            assert app.screen.query_one("#catalog-title").styles.color.hex == "#FFFFFF"
             assert tree.has_focus is True
             assert tree.cursor_line == 0
             source_labels = tuple(str(node.label) for node in tree.root.children)
@@ -1386,6 +1869,60 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
             assert await pilot.click("FooterKey") is True
             await pilot.pause()
             assert isinstance(app.screen, ChatScreen)
+
+            composer = app.screen.query_one(Composer)
+            composer.load_text(f"/source refresh {first.id}")
+            composer.action_submit()
+            await pilot.pause()
+            assert isinstance(app.screen, CatalogScreen)
+            refresh_notice = app.screen.query_one("#catalog-notice", Static)
+            assert str(refresh_notice.content) == (
+                "Catalog refresh succeeded · Sales · 1 resource"
+            )
+            assert refresh_notice.has_class("-warning") is False
+            app.exit(0)
+    finally:
+        await opened.close()
+
+
+async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
+    tmp_path: Path,
+):
+    database = tmp_path / "empty.sqlite"
+    sqlite3.connect(database).close()
+    opened = await Agent.create("empty-catalog-browser", root=tmp_path)
+    source = await opened.attach(SQLiteSource(database, name="Empty source"))
+    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app.controller.agent = opened
+    try:
+        async with app.run_test(size=(100, 34)) as pilot:
+            await app._show_chat()
+            await pilot.pause()
+            composer = app.screen.query_one(Composer)
+            composer.load_text(f"/source refresh {source.id}")
+            composer.action_submit()
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, CatalogScreen):
+                    break
+
+            assert isinstance(app.screen, CatalogScreen)
+            refresh_notice = app.screen.query_one("#catalog-notice", Static)
+            assert str(refresh_notice.content) == (
+                "Catalog refresh completed, but found no resources · Empty source · "
+                "use /source edit to review its schemas or path"
+            )
+            assert refresh_notice.has_class("-warning") is True
+            tree = app.screen.query_one("#catalog-tree", Tree)
+            source_node = tree.root.children[0]
+            assert "0 resources" in str(source_node.label)
+            assert str(source_node.children[0].label) == "No current resources"
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, ChatScreen)
+            assert "Catalog refresh completed, but found no resources" in str(
+                app.screen.query_one("#notice-bar", Static).content
+            )
             app.exit(0)
     finally:
         await opened.close()
@@ -1395,6 +1932,8 @@ async def test_model_setup_uses_codex_device_login_without_api_key():
     app = DaitaApp(start_bootstrap=False)
     configured: dict[str, object] = {}
     verification: list[tuple[str, str]] = []
+    authentication_started = asyncio.Event()
+    authorization_release = asyncio.Event()
 
     app.controller.model_requires_explicit_limits = (  # type: ignore[method-assign]
         lambda **_kwargs: False
@@ -1402,13 +1941,18 @@ async def test_model_setup_uses_codex_device_login_without_api_key():
 
     async def authenticate(**kwargs: object) -> str:
         on_verification = kwargs["on_verification"]
+        on_progress = kwargs["on_progress"]
         assert callable(on_verification)
+        assert callable(on_progress)
         prompt = SimpleNamespace(
             verification_url="https://auth.openai.com/codex/device",
             user_code="ABCD-EFGH",
         )
         on_verification(prompt)
         verification.append((prompt.verification_url, prompt.user_code))
+        on_progress("Waiting for ChatGPT authorization")
+        authentication_started.set()
+        await authorization_release.wait()
         return "opaque-subscription-credential"
 
     async def configure(**kwargs: object) -> None:
@@ -1422,14 +1966,32 @@ async def test_model_setup_uses_codex_device_login_without_api_key():
         await pilot.pause()
         screen = app.screen
         assert isinstance(screen, ModelSetupScreen)
+        panel = screen.query_one("#onboard")
+        assert panel.styles.border_left[0] == "solid"
+        assert panel.styles.background.hex == "#111111"
+        assert screen.query_one("#onboard-title").styles.color.hex == "#FFFFFF"
+        assert screen.query_one("#model-help").styles.color.hex == "#FFFFFF99"
+        model_id = screen.query_one("#model-id", Input)
+        assert model_id.styles.border_left[0] == ""
+        assert model_id.styles.border_bottom[0] == "solid"
+        assert model_id.styles.background.hex == "#111111"
+        choose_provider = screen.query_one("#choose-provider", Button)
+        assert choose_provider.styles.border_left[0] == "solid"
+        assert choose_provider.styles.background.hex in {"#181818", "#303030"}
+        assert screen.query_one(Footer).styles.background.hex == "#111111"
         screen._provider = "codex"
         screen._model = "gpt-5.6-sol"
         screen.query_one("#model-id", Input).value = "gpt-5.6-sol"
         screen.query_one("#model-secret", Input).value = "must-not-be-used"
-        await screen.on_button_pressed(
-            Button.Pressed(screen.query_one("#save-model", Button))
-        )
-        assert await modal_task is True
+        assert await pilot.click("#save-model") is True
+        await asyncio.wait_for(authentication_started.wait(), timeout=5)
+        await asyncio.wait_for(pilot.pause(), timeout=5)
+        auth_help = str(screen.query_one("#model-help", Static).content)
+        assert "Waiting for ChatGPT authorization" in auth_help
+        assert "https://auth.openai.com/codex/device" in auth_help
+        assert "ABCD-EFGH" in auth_help
+        authorization_release.set()
+        assert await asyncio.wait_for(modal_task, timeout=5) is True
         app.exit(0)
 
     assert configured["provider"] == "codex"
@@ -1437,6 +1999,224 @@ async def test_model_setup_uses_codex_device_login_without_api_key():
     assert configured["api_key"] is None
     assert configured["subscription_credential"] == "opaque-subscription-credential"
     assert verification == [("https://auth.openai.com/codex/device", "ABCD-EFGH")]
+
+
+async def test_model_setup_provider_and_model_pickers_do_not_block_each_other():
+    app = DaitaApp(start_bootstrap=False)
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        await app.push_screen(ModelSetupScreen())
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, ModelSetupScreen)
+
+        assert await pilot.click("#choose-provider") is True
+        await asyncio.wait_for(pilot.pause(), timeout=5)
+        provider_picker = app.screen
+        assert isinstance(provider_picker, SelectionScreen)
+        provider_options = provider_picker.query_one("#picker-options", OptionList)
+        assert await pilot.click(provider_options, offset=(2, 0)) is True
+
+        await asyncio.wait_for(pilot.pause(), timeout=5)
+        model_picker = app.screen
+        assert isinstance(model_picker, SelectionScreen)
+        model_options = model_picker.query_one("#picker-options", OptionList)
+        assert await pilot.click(model_options, offset=(2, 0)) is True
+
+        await asyncio.wait_for(pilot.pause(), timeout=5)
+        assert app.screen is setup
+        assert isinstance(setup, ModelSetupScreen)
+        assert setup._provider == "openai"
+        assert setup._model == "gpt-5.6-sol"
+        assert setup.query_one("#model-id", Input).value == "gpt-5.6-sol"
+        app.exit(0)
+
+
+async def test_source_setup_matches_the_muted_onboarding_treatment():
+    app = DaitaApp(start_bootstrap=False)
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        await app.push_screen(SourceSetupScreen())
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SourceSetupScreen)
+
+        panel = screen.query_one("#onboard")
+        assert panel.styles.border_left[0] == "solid"
+        assert panel.styles.background.hex == "#111111"
+        assert screen.query_one("#onboard-title").styles.color.hex == "#FFFFFF"
+
+        source_name = screen.query_one("#source-name", Input)
+        assert source_name.styles.border_left[0] == ""
+        assert source_name.styles.border_bottom[0] == "solid"
+        assert source_name.styles.background.hex == "#111111"
+
+        source_type = screen.query_one("#source-type", Select)
+        select_current = source_type.query_one("SelectCurrent")
+        assert select_current.styles.border_left[0] == ""
+        assert select_current.styles.border_bottom[0] == "solid"
+        assert select_current.styles.background.hex == "#111111"
+        await pilot.click("#source-type")
+        await pilot.pause()
+        assert source_type.expanded is True
+        select_overlay = source_type.query_one("SelectOverlay")
+        assert select_overlay.styles.border_left[0] == "solid"
+        assert select_overlay.styles.background.hex == "#111111"
+        assert (
+            select_overlay.get_component_styles(
+                "option-list--option-highlighted"
+            ).background.hex
+            == "#343434"
+        )
+
+        attach = screen.query_one("#attach-source", Button)
+        assert attach.styles.border_left[0] == "solid"
+        assert attach.styles.background.hex in {"#181818", "#303030"}
+        footer = screen.query_one(Footer)
+        assert footer.styles.background.hex == "#111111"
+        assert attach.region.bottom <= footer.region.y
+        app.exit(0)
+
+
+async def test_remaining_control_screens_share_the_muted_minimal_treatment():
+    create_app = DaitaApp(start_bootstrap=False)
+    async with create_app.run_test(size=(100, 32)) as pilot:
+        await create_app.push_screen(AgentCreateScreen())
+        await pilot.pause()
+        panel = create_app.screen.query_one("#onboard")
+        assert panel.styles.border_left[0] == "solid"
+        assert panel.styles.background.hex == "#111111"
+        assert panel.region.height < create_app.size.height
+        name = create_app.screen.query_one("#agent-name", Input)
+        assert name.styles.border_left[0] == ""
+        assert name.styles.border_bottom[0] == "solid"
+        create = create_app.screen.query_one("#create-agent", Button)
+        assert create.styles.background.hex in {"#181818", "#303030"}
+        create_app.exit(0)
+
+    permissions_app = DaitaApp(start_bootstrap=False)
+    async with permissions_app.run_test(size=(100, 32)) as pilot:
+        await permissions_app.push_screen(PermissionsScreen())
+        await pilot.pause()
+        panel = permissions_app.screen.query_one("#permissions")
+        assert panel.styles.border_left[0] == "solid"
+        assert panel.styles.background.hex == "#111111"
+        assert (
+            permissions_app.screen.query_one("#perm-help").styles.color.hex
+            == "#FFFFFF99"
+        )
+        apply = permissions_app.screen.query_one("#perm-apply", Button)
+        assert apply.styles.background.hex in {"#181818", "#303030"}
+        permissions_app.exit(0)
+
+    confirm_app = DaitaApp(start_bootstrap=False)
+    async with confirm_app.run_test(size=(100, 32)) as pilot:
+        await confirm_app.push_screen(ConfirmScreen("Apply this change?"))
+        await pilot.pause()
+        panel = confirm_app.screen.query_one("#confirm")
+        actions = confirm_app.screen.query_one("#confirm-actions")
+        assert panel.styles.border_left[0] == "solid"
+        assert panel.styles.background.hex == "#111111"
+        assert panel.region.width <= 88
+        assert panel.region.height <= 10
+        assert actions.region.height == 3
+        confirm_app.exit(0)
+
+
+async def test_source_setup_accepts_a_successfully_attached_empty_catalog(monkeypatch):
+    app = DaitaApp(start_bootstrap=False)
+    attach_count = 0
+
+    async def attach_sqlite(_path: Path, *, name: str | None) -> object:
+        nonlocal attach_count
+        attach_count += 1
+        assert name == "Fixture"
+        return SimpleNamespace(id=f"source-{attach_count}")
+
+    monkeypatch.setattr(app.controller, "attach_sqlite", attach_sqlite)
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        modal_task = asyncio.create_task(app._await_modal(SourceSetupScreen()))
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, SourceSetupScreen)
+        screen.query_one("#source-type", Select).value = "sqlite"
+        screen.query_one("#source-name", Input).value = "Fixture"
+        screen.query_one("#source-path", Input).value = "/fixture.sqlite"
+
+        assert await pilot.click("#attach-source", offset=(2, 1)) is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if modal_task.done():
+                break
+        assert attach_count == 1
+        assert modal_task.done() is True
+        assert await modal_task is True
+        app.exit(0)
+
+
+async def test_postgresql_setup_probes_and_preselects_schemas_with_tables(monkeypatch):
+    app = DaitaApp(start_bootstrap=False)
+    credential = SecretReference.keychain("test-postgresql-probe")
+    attached: dict[str, object] = {}
+    deleted: list[SecretReference] = []
+
+    async def store_password(_password: str) -> SecretReference:
+        return credential
+
+    async def probe_postgresql(**_kwargs: object) -> object:
+        return SimpleNamespace(
+            schemas=(
+                SimpleNamespace(name="public", has_base_tables=False),
+                SimpleNamespace(name="core", has_base_tables=True),
+                SimpleNamespace(name="sales", has_base_tables=True),
+            ),
+            truncated=False,
+        )
+
+    async def attach_postgresql(**kwargs: object) -> object:
+        attached.update(kwargs)
+        return SimpleNamespace(id="source-postgresql")
+
+    async def delete_password(reference: SecretReference) -> None:
+        deleted.append(reference)
+
+    monkeypatch.setattr(app.controller, "store_postgresql_password", store_password)
+    monkeypatch.setattr(app.controller, "probe_postgresql", probe_postgresql)
+    monkeypatch.setattr(app.controller, "attach_postgresql", attach_postgresql)
+    monkeypatch.setattr(app.controller, "delete_postgresql_password", delete_password)
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        modal_task = asyncio.create_task(app._await_modal(SourceSetupScreen()))
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, SourceSetupScreen)
+        setup.query_one("#source-type", Select).value = "postgresql"
+        setup.query_one("#pg-host", Input).value = "127.0.0.1"
+        setup.query_one("#pg-database", Input).value = "fixture"
+        setup.query_one("#pg-username", Input).value = "reader"
+        setup.query_one("#pg-password", Input).value = "secret"
+        setup.query_one("#pg-ssl", Select).value = "disable"
+
+        assert await pilot.click("#attach-source", offset=(2, 1)) is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SelectionScreen):
+                break
+        picker = app.screen
+        assert isinstance(picker, SelectionScreen)
+        assert picker._selected == {"core", "sales"}
+        picker.action_confirm()
+
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if modal_task.done():
+                break
+        assert modal_task.done() is True
+        assert await modal_task is True
+        assert attached["schemas"] == ("core", "sales")
+        assert deleted == []
+        app.exit(0)
 
 
 async def test_copy_uses_native_wrap_independent_text_selection(monkeypatch):

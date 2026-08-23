@@ -16,9 +16,13 @@ from daita import (
     Agent,
     ApprovalHandler,
     ConversationRun,
+    JobInspection,
+    JobResultView,
+    JobSummary,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningReviewStatus,
+    JobStatus,
     LoopExit,
     MCPAdmissionError,
     MCPBindingState,
@@ -430,8 +434,55 @@ class PresentationController:
     async def store_postgresql_password(self, password: str) -> SecretReference:
         return await self.require_agent().store_postgresql_password(password)
 
+    async def delete_postgresql_password(self, reference: SecretReference) -> None:
+        await self.require_agent().delete_postgresql_password(reference)
+
     async def probe_postgresql(self, **kwargs: Any) -> Any:
         return await self.require_agent().probe_postgresql(**kwargs)
+
+    async def probe_postgresql_source(
+        self,
+        source: Any,
+        *,
+        host: str,
+        port: int,
+        database: str,
+        username: str,
+        password: str | None,
+        ssl_mode: str,
+    ) -> Any:
+        """Probe edited PostgreSQL fields without changing the saved source."""
+
+        if source.adapter_id != "postgresql":
+            raise UserInputError("Only PostgreSQL sources expose schema discovery.")
+        agent = self.require_agent()
+        reference_text = source.configuration.get("credential_ref")
+        credential = (
+            SecretReference.parse(reference_text)
+            if isinstance(reference_text, str)
+            else None
+        )
+        temporary_credential: SecretReference | None = None
+        try:
+            if password:
+                temporary_credential = await agent.store_postgresql_password(password)
+                credential = temporary_credential
+            if credential is None:
+                raise UserInputError(
+                    "This PostgreSQL source has no saved password; enter a new password."
+                )
+            return await agent.probe_postgresql(
+                host=host,
+                port=port,
+                database=database,
+                username=username,
+                credential=credential,
+                ssl_mode=ssl_mode,
+            )
+        finally:
+            password = None
+            if temporary_credential is not None:
+                await agent.delete_postgresql_password(temporary_credential)
 
     async def attach_postgresql(self, **kwargs: Any) -> Any:
         return await self.require_agent().attach_postgresql(**kwargs)
@@ -592,6 +643,18 @@ class PresentationController:
     async def list_sources(self) -> tuple[Any, ...]:
         return await self.require_agent().list_sources()
 
+    async def list_jobs(self) -> tuple[JobSummary, ...]:
+        return await self.require_agent().list_jobs(limit=50)
+
+    async def inspect_job(self, job_id: str) -> JobInspection | None:
+        return await self.require_agent().inspect_job(job_id)
+
+    async def read_job_result(self, job_id: str) -> JobResultView | None:
+        return await self.require_agent().read_job_result(job_id)
+
+    async def cancel_job(self, job_id: str) -> JobInspection | None:
+        return await self.require_agent().cancel_job(job_id)
+
     async def select_source(self, selector: str) -> Any:
         try:
             return await self.require_agent().select_source(selector)
@@ -708,6 +771,8 @@ class PresentationController:
             )
         if name == "/mcp":
             return await self._mcp_command(parts)
+        if name == "/jobs":
+            return await self._jobs_command(parts)
         if name == "/catalog" and len(parts) == 1:
             return CommandOutcome(
                 "screen",
@@ -779,18 +844,27 @@ class PresentationController:
                 payload={"source_id": source.id, "display_name": source.display_name},
             )
         if name == "/source" and len(parts) == 3 and parts[1] == "refresh":
-            await self.refresh_source(parts[2])
-            summary = await self.catalog_summary()
-            if summary.is_empty:
-                return CommandOutcome(
-                    "screen",
-                    screen="catalog_repair",
-                    conversation_id=conversation_id,
+            refreshed = await self.refresh_source(parts[2])
+            resources = await self.list_catalog_resources(source_id=refreshed.id)
+            noun = "resource" if len(resources) == 1 else "resources"
+            if resources:
+                message = (
+                    "Catalog refresh succeeded · "
+                    + safe_display(refreshed.display_name, fallback="source")
+                    + f" · {len(resources)} {noun}"
+                )
+            else:
+                message = (
+                    "Catalog refresh completed, but found no resources · "
+                    + safe_display(refreshed.display_name, fallback="source")
+                    + " · use /source edit to review its schemas or path"
                 )
             return CommandOutcome(
                 "screen",
+                message,
                 screen="catalog",
                 conversation_id=conversation_id,
+                payload={"catalog_notice_warning": not resources},
             )
         if name == "/source" and parts[1:] == ["permissions"]:
             return CommandOutcome(
@@ -835,6 +909,56 @@ class PresentationController:
         if name in BUILTIN_SLASH_COMMANDS:
             return CommandOutcome("notice", f"Usage: {name}")
         return CommandOutcome("notice", "Unknown command. Type / to browse commands.")
+
+    async def _jobs_command(self, parts: list[str]) -> CommandOutcome:
+        conversation_id = self.conversation_id
+        usage = (
+            "Usage: /jobs | /jobs inspect <id> | /jobs results <id> | "
+            "/jobs cancel <id>"
+        )
+        if len(parts) == 1:
+            return CommandOutcome(
+                "screen",
+                screen="jobs",
+                conversation_id=conversation_id,
+            )
+        if len(parts) != 3 or parts[1] not in {"inspect", "results", "cancel"}:
+            return CommandOutcome("notice", usage, conversation_id=conversation_id)
+        action, job_id = parts[1], parts[2]
+        if action != "cancel":
+            return CommandOutcome(
+                "screen",
+                screen="jobs",
+                conversation_id=conversation_id,
+                payload={"job_id": job_id, "view": action},
+            )
+        inspection = await self.inspect_job(job_id)
+        if inspection is None:
+            raise UserInputError("No durable job with that ID belongs to this agent.")
+        status = inspection.summary.status
+        if status not in {JobStatus.QUEUED, JobStatus.RUNNING}:
+            return CommandOutcome(
+                "notice",
+                "Job "
+                + safe_display(job_id, fallback="job", maximum=256)
+                + f" is {status.value} and cannot be cancelled.",
+                conversation_id=conversation_id,
+            )
+        return CommandOutcome(
+            "confirm",
+            "Cancel durable job "
+            + safe_display(job_id, fallback="job", maximum=256)
+            + "?\n"
+            + safe_display(
+                inspection.summary.job_kind,
+                fallback="job",
+                maximum=128,
+            )
+            + f" · {status.value}\n\nCancellation is requested immediately and cannot be undone.",
+            conversation_id=conversation_id,
+            screen="confirm_cancel_job",
+            payload={"job_id": job_id},
+        )
 
     async def _mcp_command(self, parts: list[str]) -> CommandOutcome:
         agent = self.require_agent()

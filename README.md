@@ -215,17 +215,28 @@ daita memory --help
 daita skills --help
 ```
 
-## Manage local data
+## Manage jobs and local data
 
 The terminal provides confirmed lifecycle commands:
 
 ```text
+/jobs
+/jobs inspect <id>
+/jobs results <id>
+/jobs cancel <id>
 /source edit
 /source permissions
 /source detach <source>
 /conversation clear
 /agent delete
 ```
+
+`/jobs` opens the bounded durable-job manager. It lists up to 50 current jobs
+owned by the agent and provides direct refresh, lifecycle details, validated
+results, exact artifact references, and confirmed cancellation without using a
+model turn. The inspect, results, and cancel forms are equivalent power-user
+commands for a known job ID. Jobs still run only while that agent host is open;
+the manager does not add a daemon, scheduler, retry path, or generic job starter.
 
 `/source edit` changes the active source connection without dropping the
 working connection first. Daita validates and catalogs the edited connection,

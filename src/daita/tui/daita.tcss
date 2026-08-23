@@ -142,15 +142,16 @@ ToolCard CollapsibleTitle:focus {
     height: auto;
     max-height: 12;
     background: $panel;
-    border: round $primary;
+    border: solid #343434;
     display: none;
 }
 
 #completion-title {
-    height: 1;
+    height: 2;
     padding: 0 1;
-    color: $primary;
+    color: $text-muted;
     background: $panel;
+    border-bottom: solid #2A2A2A;
     text-style: bold;
 }
 
@@ -163,21 +164,30 @@ ToolCard CollapsibleTitle:focus {
 }
 
 #completion-list > .option-list--option-highlighted {
-    color: #000000;
-    background: $primary;
+    color: $foreground;
+    background: #343434;
     text-style: bold;
 }
 
 ModalScreen {
     align: center middle;
-    background: $background 82%;
+    background: $background 88%;
 }
 
-#picker,
-#confirm,
+AgentCreateScreen,
+ModelSetupScreen,
+SourceSetupScreen,
+SourceEditScreen,
+PermissionsScreen {
+    align: center middle;
+    background: $background;
+}
+
+.modal-panel,
 #editor-prompt,
 #review-cost,
 #catalog-browser,
+#jobs-manager,
 #mcp-management,
 #mcp-setup {
     width: 88%;
@@ -185,40 +195,201 @@ ModalScreen {
     height: auto;
     max-height: 90%;
     padding: 1 2;
-    background: $surface;
-    border: tall $border;
+    background: $panel;
+    border: solid #343434;
 }
 
-#picker {
-    border: round $border;
+#confirm {
+    width: 76%;
+    max-width: 88;
 }
 
-#picker-filter {
-    border: round $border-blurred;
-}
-
-#picker-filter:focus {
-    border: round $border;
-}
-
-#onboard,
-#permissions,
-#source-edit {
+.control-panel {
+    width: 88%;
+    max-width: 100;
+    height: 88%;
     padding: 1 2;
-    background: $background;
+    background: $panel;
+    border: solid #343434;
+}
+
+.control-panel.compact-panel {
+    height: auto;
+    max-height: 90%;
+}
+
+.control-panel.source-panel,
+SourceEditScreen .control-panel {
+    height: 94%;
+    padding: 0 2;
+}
+
+ModalScreen Input,
+.control-panel Input {
+    height: 2;
+    padding: 0 1;
+    color: $foreground;
+    background: $panel;
+    border: none;
+    border-bottom: solid #343434;
+}
+
+ModalScreen Input:focus,
+.control-panel Input:focus {
+    background: $panel;
+    background-tint: $foreground 3%;
+    border: none;
+    border-bottom: solid #5A5A5A;
+}
+
+ModalScreen Button,
+ModalScreen Button.-primary,
+ModalScreen Button.-success,
+ModalScreen Button.-warning,
+ModalScreen Button.-error,
+.control-panel Button,
+.control-panel Button.-primary,
+.control-panel Button.-success,
+.control-panel Button.-warning,
+.control-panel Button.-error {
+    min-width: 10;
+    color: $text-muted;
+    background: #181818;
+    border: solid #343434;
+    text-style: none;
+}
+
+ModalScreen Button:hover,
+ModalScreen Button:focus,
+ModalScreen Button.-primary:hover,
+ModalScreen Button.-primary:focus,
+ModalScreen Button.-success:hover,
+ModalScreen Button.-success:focus,
+ModalScreen Button.-warning:hover,
+ModalScreen Button.-warning:focus,
+ModalScreen Button.-error:hover,
+ModalScreen Button.-error:focus,
+.control-panel Button:hover,
+.control-panel Button:focus,
+.control-panel Button.-primary:hover,
+.control-panel Button.-primary:focus,
+.control-panel Button.-success:hover,
+.control-panel Button.-success:focus,
+.control-panel Button.-warning:hover,
+.control-panel Button.-warning:focus,
+.control-panel Button.-error:hover,
+.control-panel Button.-error:focus {
+    color: $foreground;
+    background: #303030;
+    border: solid #505050;
+    text-style: none;
+}
+
+ModalScreen Button.-active,
+ModalScreen Button.-primary.-active,
+ModalScreen Button.-success.-active,
+ModalScreen Button.-warning.-active,
+ModalScreen Button.-error.-active,
+.control-panel Button.-active,
+.control-panel Button.-primary.-active,
+.control-panel Button.-success.-active,
+.control-panel Button.-warning.-active,
+.control-panel Button.-error.-active {
+    color: $foreground;
+    background: #3A3A3A;
+    border: solid #5A5A5A;
+}
+
+ModalScreen Button:disabled,
+.control-panel Button:disabled {
+    color: #666666;
+    background: $panel;
+    border: solid #292929;
+}
+
+#confirm-yes {
+    color: #D87979;
+}
+
+ModalScreen Footer,
+.control-panel Footer {
+    height: 1;
+    margin-top: 1;
+    color: $text-muted;
+    background: $panel;
+}
+
+ModalScreen FooterKey,
+ModalScreen FooterKey > .footer-key--key,
+ModalScreen FooterKey > .footer-key--description,
+.control-panel FooterKey,
+.control-panel FooterKey > .footer-key--key,
+.control-panel FooterKey > .footer-key--description {
+    background: $panel;
+}
+
+ModalScreen FooterKey > .footer-key--key,
+.control-panel FooterKey > .footer-key--key {
+    color: $foreground;
+}
+
+ModalScreen FooterKey > .footer-key--description,
+.control-panel FooterKey > .footer-key--description {
+    color: $text-muted;
+}
+
+.control-panel Select {
+    height: 2;
+    color: $foreground;
+    background: $panel;
+}
+
+.control-panel Select > SelectCurrent {
+    height: 2;
+    padding: 0 1;
+    background: $panel;
+    border: none;
+    border-bottom: solid #343434;
+}
+
+.control-panel Select:focus > SelectCurrent {
+    background: $panel;
+    background-tint: $foreground 3%;
+    border: none;
+    border-bottom: solid #5A5A5A;
+}
+
+.control-panel Select > SelectOverlay {
+    padding: 0;
+    color: $foreground;
+    background: $panel;
+    border: solid #343434;
+}
+
+.control-panel Select > SelectOverlay > .option-list--option-highlighted {
+    color: $foreground;
+    background: #343434;
+    text-style: bold;
+}
+
+ModelSetupScreen #model-help {
+    height: auto;
+    padding-bottom: 1;
+    color: $text-muted;
 }
 
 #picker-title,
 #onboard-title,
 #confirm-message,
-#catalog-title {
-    color: $primary;
+#catalog-title,
+#jobs-title {
+    color: $foreground;
     text-style: bold;
     padding-bottom: 1;
 }
 
 #mcp-title {
-    color: $primary;
+    color: $foreground;
     text-style: bold;
     padding-bottom: 1;
 }
@@ -226,7 +397,6 @@ ModalScreen {
 #mcp-management,
 #mcp-setup {
     height: 88%;
-    border: round $border;
 }
 
 #mcp-summary,
@@ -239,18 +409,14 @@ ModalScreen {
 #mcp-list,
 #mcp-inspection {
     height: 1fr;
-    padding: 1;
-    background: $background;
-    border: round $border;
+    padding: 1 0;
+    background: $panel;
+    border: none;
+    border-top: solid #2A2A2A;
 }
 
 #mcp-endpoint {
     margin-bottom: 1;
-    border: round $border-blurred;
-}
-
-#mcp-endpoint:focus {
-    border: round $border;
 }
 
 #mcp-help {
@@ -279,7 +445,24 @@ ModalScreen {
 
 #picker-options {
     height: 1fr;
-    background: $surface;
+    padding: 0;
+    background: $panel;
+    border: none;
+}
+
+#picker-options > .option-list--option-highlighted {
+    color: $foreground;
+    background: #343434;
+    text-style: bold;
+}
+
+#picker-options > .option-list--option-hover {
+    background: #242424;
+}
+
+#picker-confirm {
+    width: auto;
+    margin-top: 1;
 }
 
 #catalog-summary {
@@ -288,20 +471,47 @@ ModalScreen {
     color: $text-muted;
 }
 
+#catalog-notice {
+    height: auto;
+    padding: 0 1 1 1;
+    color: $foreground;
+    border-left: solid #505050;
+}
+
+#catalog-notice.-warning {
+    color: $warning;
+    border-left: solid $warning 60%;
+}
+
 #catalog-browser {
     height: 88%;
-    border: round $border;
 }
 
 #catalog-tree {
     height: 1fr;
     padding: 0 1;
-    background: $background;
-    border: round $border;
+    background: $panel;
+    border: none;
+    border-top: solid #2A2A2A;
 }
 
 #catalog-tree:focus {
-    border: round $primary;
+    background: $panel;
+    background-tint: $foreground 2%;
+    border: none;
+    border-top: solid #343434;
+}
+
+#catalog-tree > .tree--cursor,
+#catalog-tree:focus > .tree--cursor {
+    color: $foreground;
+    background: #343434;
+    text-style: bold;
+}
+
+#catalog-tree > .tree--guides-selected,
+#catalog-tree:focus > .tree--guides-selected {
+    color: #6A6A6A;
 }
 
 #catalog-help {
@@ -310,10 +520,107 @@ ModalScreen {
     color: $text-muted;
 }
 
+#jobs-manager {
+    height: 88%;
+}
+
+#jobs-summary,
+#jobs-notice {
+    height: auto;
+    padding-bottom: 1;
+    color: $text-muted;
+}
+
+#jobs-notice {
+    color: $foreground;
+}
+
+#jobs-list {
+    height: 9;
+    min-height: 4;
+    padding: 0;
+    background: $panel;
+    border: none;
+    border-top: solid #2A2A2A;
+}
+
+#jobs-list > .option-list--option-highlighted {
+    color: $foreground;
+    background: #343434;
+    text-style: bold;
+}
+
+#jobs-list > .option-list--option-hover {
+    background: #242424;
+}
+
+#jobs-detail-scroll {
+    height: 1fr;
+    min-height: 5;
+    padding: 1 0;
+    background: $panel;
+    border: none;
+    border-top: solid #2A2A2A;
+}
+
+#jobs-detail {
+    height: auto;
+    color: $foreground;
+}
+
+#jobs-help {
+    height: auto;
+    padding-top: 1;
+    color: $text-muted;
+}
+
+#jobs-actions {
+    height: auto;
+    margin-top: 1;
+}
+
+#jobs-actions Button {
+    width: auto;
+    min-width: 10;
+    margin-right: 1;
+}
+
+#jobs-error {
+    height: auto;
+    color: $error;
+}
+
 #onboard-error,
 #picker-error,
 #editor-prompt-error,
-#review-cost-error {
+#review-cost-error,
+#source-edit-error {
+    color: $error;
+}
+
+#source-edit-help,
+#perm-help {
+    height: auto;
+    padding-bottom: 1;
+    color: $text-muted;
+}
+
+#perm-preview {
+    height: 1fr;
+    padding: 1 0;
+    background: $panel;
+    border: none;
+    border-top: solid #2A2A2A;
+}
+
+SourceSetupScreen #onboard-error {
+    width: 1fr;
+    height: 1;
+    color: $text-muted;
+    text-overflow: ellipsis;
+}
+
+SourceSetupScreen #onboard-error.-error {
     color: $error;
 }
 
@@ -370,7 +677,13 @@ ModalScreen {
 }
 
 #confirm-actions {
+    height: 3;
     margin-top: 1;
+}
+
+#confirm-actions Button {
+    width: auto;
+    margin-right: 1;
 }
 
 Input,

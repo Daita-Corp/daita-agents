@@ -27,7 +27,7 @@ class ConfirmScreen(ModalScreen[bool]):
         self._decided = False
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="confirm"):
+        with Vertical(id="confirm", classes="modal-panel"):
             yield Label(
                 sanitize_terminal_text(
                     self._message,
