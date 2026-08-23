@@ -1,4 +1,4 @@
-"""Best-effort observation records for direct agent execution."""
+"""Define bounded execution events and deliver them to observers best-effort."""
 
 from __future__ import annotations
 

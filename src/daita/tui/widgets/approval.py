@@ -1,4 +1,4 @@
-"""Inline exact once-only side-effect approval for the chat view."""
+"""Display once-only side-effect approvals and return the user's exact decision."""
 
 from __future__ import annotations
 

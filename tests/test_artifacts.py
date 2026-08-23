@@ -4,7 +4,7 @@ import asyncio
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import pytest
 

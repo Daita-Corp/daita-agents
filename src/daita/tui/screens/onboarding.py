@@ -1,4 +1,4 @@
-"""Agent, model, and source onboarding screens over the public Agent API."""
+"""Collect agent identity, model configuration, and initial source setup."""
 
 from __future__ import annotations
 

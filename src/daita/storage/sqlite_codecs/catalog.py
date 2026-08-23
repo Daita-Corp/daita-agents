@@ -1,4 +1,4 @@
-"""Explicit SQLite codecs for catalog sync and snapshot record families."""
+"""Encode and decode catalog synchronizations, snapshots, facets, and revisions."""
 
 from __future__ import annotations
 

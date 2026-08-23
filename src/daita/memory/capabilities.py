@@ -1,4 +1,4 @@
-"""Fixed declaration for one approval-gated memory replacement."""
+"""Declare and execute approval-gated replacement of agent memory documents."""
 
 from __future__ import annotations
 

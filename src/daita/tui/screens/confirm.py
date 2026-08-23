@@ -1,4 +1,4 @@
-"""Destructive local confirmations."""
+"""Provide reusable confirmation modals for destructive local actions."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Explicit nested codecs for artifact records persisted in loop exits."""
+"""Encode and decode artifact bindings, provenance, references, and receipts."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Portable resource-adapter contracts and built-in sources."""
+"""Export source adapter contracts, records, and built-in implementations."""
 
 # Import order is intentional: the shared records initialize catalog models before
 # source modules import the capability registry, avoiding a package-init cycle.

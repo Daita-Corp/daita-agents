@@ -1,4 +1,4 @@
-"""Static data-domain projection and current-state validation."""
+"""Project data tools and revalidate their catalog and permission bindings."""
 
 from __future__ import annotations
 

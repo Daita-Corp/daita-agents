@@ -1,4 +1,4 @@
-"""Explicit record-family codecs used only by :mod:`daita.storage.sqlite`."""
+"""Collect explicit codec-v1 serializers used by the SQLite state store."""
 
 from .catalog import (
     decode_catalog_snapshot,

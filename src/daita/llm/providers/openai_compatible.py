@@ -1,4 +1,4 @@
-"""Scoped OpenAI-compatible Chat Completions model adapter."""
+"""Translate canonical requests for scoped OpenAI-compatible chat endpoints."""
 
 from __future__ import annotations
 

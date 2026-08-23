@@ -1,4 +1,4 @@
-"""Exact durable codec for independently keyed MCP binding aggregates."""
+"""Encode and decode independently keyed MCP binding aggregates and tools."""
 
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ from .common import (
     dump_payload,
     integer,
     load_payload,
-    mapping,
     optional_datetime_decode,
     optional_datetime_encode,
     optional_text,

@@ -1,4 +1,4 @@
-"""Focused public API for the MVP data agent."""
+"""Expose the public facade for configuring and running a persistent data agent."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Exact current codec-v1 shape for the one bounded JobRun aggregate."""
+"""Encode and decode the current codec-v1 durable JobRun aggregate."""
 
 from __future__ import annotations
 
@@ -27,7 +27,6 @@ from .common import (
     dump_payload,
     integer,
     load_payload,
-    mapping,
     number,
     optional_datetime_decode,
     optional_datetime_encode,

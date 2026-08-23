@@ -1,4 +1,4 @@
-"""Atomic source-connection editing inside the Textual lifecycle."""
+"""Edit source connections and apply replacements atomically through the public API."""
 
 from __future__ import annotations
 

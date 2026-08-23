@@ -1,4 +1,4 @@
-"""Read-only SQLite source discovery and inspection adapter."""
+"""Discover and inspect read-only SQLite resources."""
 
 from __future__ import annotations
 

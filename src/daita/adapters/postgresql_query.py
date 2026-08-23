@@ -1,4 +1,4 @@
-"""Guarded PostgreSQL read backend invoked only by the runtime executor."""
+"""Execute catalog-validated, bounded read queries against PostgreSQL."""
 
 from __future__ import annotations
 

@@ -21,7 +21,7 @@ from daita.catalog import (
 from daita.catalog.capabilities import CatalogProjection, catalog_declarations
 from daita.catalog.models import CatalogResource
 from daita.catalog.protocols import CatalogResourceNotFoundError
-from daita.llm.models import ModelSensitivity, ToolCall
+from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
 from daita.storage.sqlite_codecs import encode_source_read_scope
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope

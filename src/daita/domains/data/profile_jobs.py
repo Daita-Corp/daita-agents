@@ -1,9 +1,9 @@
-"""Domain-owned admission and execution for the first durable data-profile job."""
+"""Admit and execute durable data-profile jobs through the data capability domain."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
@@ -22,7 +22,6 @@ from ...capabilities import (
     CapabilityInputError,
     Executor,
     OperationalEffect,
-    SideEffectExecutor,
     ToolDiscoveryMetadata,
     ToolExecution,
     ToolExposureClass,

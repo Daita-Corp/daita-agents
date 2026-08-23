@@ -1,4 +1,4 @@
-"""Thin lazy entry point for Daita's one Textual application."""
+"""Lazily load and launch the Textual terminal application."""
 
 from __future__ import annotations
 

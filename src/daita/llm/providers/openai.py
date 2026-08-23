@@ -1,4 +1,4 @@
-"""OpenAI Responses adapter for the provider-neutral model boundary."""
+"""Translate canonical requests and streaming responses for OpenAI Responses."""
 
 from __future__ import annotations
 

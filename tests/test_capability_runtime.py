@@ -10,7 +10,6 @@ from daita._json import FrozenJsonObject
 from daita.capabilities import (
     Capability,
     CapabilityInputError,
-    CapabilityRegistry,
     ToolExecution,
     ToolOutput,
     ToolView,

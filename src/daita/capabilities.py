@@ -1,4 +1,4 @@
-"""Small tool declaration and execution contracts."""
+"""Define capability metadata, tool schemas, executors, and registry contracts."""
 
 from __future__ import annotations
 

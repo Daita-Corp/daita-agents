@@ -1,4 +1,4 @@
-"""One domain-neutral model-to-capability execution boundary."""
+"""Validate, govern, execute, and normalize capabilities across static domains."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from typing import Protocol, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from .artifacts.models import (
-    ArtifactDraft,
     ArtifactError,
     ArtifactRef,
     artifact_ref_to_mapping,

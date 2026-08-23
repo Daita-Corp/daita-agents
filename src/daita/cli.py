@@ -1,4 +1,4 @@
-"""Small CLI that calls the same public Agent API as Python users."""
+"""Implement headless command-line workflows through the public Agent API."""
 
 from __future__ import annotations
 

@@ -1,12 +1,12 @@
-"""A direct model -> tools -> model agent loop."""
+"""Run the direct model-to-tools transcript loop and enforce outer run budgets."""
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, cast
 
 from .._json import FrozenJsonObject
 from ..artifacts.models import (
@@ -33,6 +33,7 @@ from ..llm.models import (
     ModelResponse,
     ModelSensitivity,
     ModelStreamCompleted,
+    ModelStreamEvent,
     ModelTextDelta,
     ModelToolCallDelta,
     ModelUsage,
@@ -68,9 +69,22 @@ from .models import (
 
 _T = TypeVar("_T")
 
+_EXPECTED_LOOP_FAILURE_REASONS: dict[type[Exception], str] = {
+    ContextWindowExceeded: "context_window_exceeded",
+    ContextEvidencePressureExceeded: "context_evidence_limit_exceeded",
+    ToolSurfaceLimitExceeded: "tool_surface_limit_exceeded",
+    ToolCatalogLimitExceeded: "tool_catalog_limit_exceeded",
+    ToolManifestLimitExceeded: "tool_manifest_limit_exceeded",
+    RequestSensitivityUnavailable: "request_sensitivity_unavailable",
+}
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _expected_loop_failure_reason(error: Exception) -> str:
+    return _EXPECTED_LOOP_FAILURE_REASONS[type(error)]
 
 
 class ContextBuilder(Protocol):
@@ -543,66 +557,18 @@ class AgentLoop:
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
             )
-        except ContextWindowExceeded:
+        except (
+            ContextWindowExceeded,
+            ContextEvidencePressureExceeded,
+            ToolSurfaceLimitExceeded,
+            ToolCatalogLimitExceeded,
+            ToolManifestLimitExceeded,
+            RequestSensitivityUnavailable,
+        ) as error:
             return await self._finish(
                 run,
                 LoopExitKind.FAILED,
-                "context_window_exceeded",
-                _completed_steps(messages[current_start:]),
-                usage,
-                run_started,
-                artifacts=tuple(artifacts),
-                artifact_deliveries=tuple(artifact_deliveries),
-            )
-        except ContextEvidencePressureExceeded:
-            return await self._finish(
-                run,
-                LoopExitKind.FAILED,
-                "context_evidence_limit_exceeded",
-                _completed_steps(messages[current_start:]),
-                usage,
-                run_started,
-                artifacts=tuple(artifacts),
-                artifact_deliveries=tuple(artifact_deliveries),
-            )
-        except ToolSurfaceLimitExceeded:
-            return await self._finish(
-                run,
-                LoopExitKind.FAILED,
-                "tool_surface_limit_exceeded",
-                _completed_steps(messages[current_start:]),
-                usage,
-                run_started,
-                artifacts=tuple(artifacts),
-                artifact_deliveries=tuple(artifact_deliveries),
-            )
-        except ToolCatalogLimitExceeded:
-            return await self._finish(
-                run,
-                LoopExitKind.FAILED,
-                "tool_catalog_limit_exceeded",
-                _completed_steps(messages[current_start:]),
-                usage,
-                run_started,
-                artifacts=tuple(artifacts),
-                artifact_deliveries=tuple(artifact_deliveries),
-            )
-        except ToolManifestLimitExceeded:
-            return await self._finish(
-                run,
-                LoopExitKind.FAILED,
-                "tool_manifest_limit_exceeded",
-                _completed_steps(messages[current_start:]),
-                usage,
-                run_started,
-                artifacts=tuple(artifacts),
-                artifact_deliveries=tuple(artifact_deliveries),
-            )
-        except RequestSensitivityUnavailable:
-            return await self._finish(
-                run,
-                LoopExitKind.FAILED,
-                "request_sensitivity_unavailable",
+                _expected_loop_failure_reason(error),
                 _completed_steps(messages[current_start:]),
                 usage,
                 run_started,
@@ -901,21 +867,27 @@ class AgentLoop:
             model, StreamingModelProvider
         ):
             generate_for_run = getattr(model, "generate_for_run", None)
-            awaitable = (
-                generate_for_run(run_route, request)
-                if run_route is not None and callable(generate_for_run)
-                else model.generate(request)
-            )
+            if run_route is not None and callable(generate_for_run):
+                routed_generate = cast(
+                    Callable[[object, ModelRequest], Awaitable[ModelResponse]],
+                    generate_for_run,
+                )
+                awaitable = routed_generate(run_route, request)
+            else:
+                awaitable = model.generate(request)
             return await _before(deadline, awaitable)
 
         async def consume() -> ModelResponse:
             completed: ModelResponse | None = None
             stream_for_run = getattr(model, "stream_for_run", None)
-            events = (
-                stream_for_run(run_route, request)
-                if run_route is not None and callable(stream_for_run)
-                else model.stream(request)
-            )
+            if run_route is not None and callable(stream_for_run):
+                routed_stream = cast(
+                    Callable[[object, ModelRequest], AsyncIterator[ModelStreamEvent]],
+                    stream_for_run,
+                )
+                events = routed_stream(run_route, request)
+            else:
+                events = model.stream(request)
             async for event in events:
                 if completed is not None:
                     raise ModelProviderError(

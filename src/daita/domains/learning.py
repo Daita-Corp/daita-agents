@@ -1,4 +1,4 @@
-"""Transient exact-candidate admission for ordinary foreground mutations."""
+"""Admit only the selected transient learning candidate for foreground mutation."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Model provider boundaries used by the agent loop."""
+"""Define model-provider protocols and request-policy capability checks."""
 
 from __future__ import annotations
 

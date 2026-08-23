@@ -1,4 +1,4 @@
-"""Checksummed ordered traversal for the SQLite-owned migration journal."""
+"""Validate and traverse the ordered checksummed SQLite migration journal."""
 
 from __future__ import annotations
 

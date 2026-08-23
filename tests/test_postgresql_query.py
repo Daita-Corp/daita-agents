@@ -12,7 +12,7 @@ from daita.adapters.postgresql import PostgreSQLSourceError
 from daita.capabilities import Capability, ToolExecution, ToolOutput, ToolView
 from daita.capability_runtime import CapabilityRuntime
 from daita.domains.data.sql import ResourceSchema
-from daita.llm.models import ModelSensitivity, ToolCall
+from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
 from _capability_runtime_support import (

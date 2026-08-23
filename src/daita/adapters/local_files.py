@@ -1,4 +1,4 @@
-"""Sandboxed local-directory discovery and inspection adapter."""
+"""Discover and read admitted CSV and JSON files within a local directory."""
 
 from __future__ import annotations
 

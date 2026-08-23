@@ -1,4 +1,4 @@
-"""Built-in model-provider adapters."""
+"""Export the built-in model-provider adapters."""
 
 from .anthropic import AnthropicMessagesProvider, AnthropicProvider
 from .codex import CodexSubscriptionProvider

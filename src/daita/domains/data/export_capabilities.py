@@ -1,4 +1,4 @@
-"""Fixed document, exact-tabular, and local-delivery capabilities."""
+"""Declare and execute artifact creation, conversion, continuity, and delivery tools."""
 
 from __future__ import annotations
 
@@ -1990,6 +1990,8 @@ class ArtifactCapabilityDomain:
         )
         if (
             schema is None
+            or schema.revision is None
+            or schema.source_revision is None
             or schema.revision != binding.resource_revision
             or schema.source_revision != binding.source_revision
             or binding.source_id != source_id

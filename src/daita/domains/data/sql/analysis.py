@@ -1,4 +1,4 @@
-"""Provider-neutral SQLite and PostgreSQL SQL semantic analysis."""
+"""Parse SQLite and PostgreSQL statements into provider-neutral analysis records."""
 
 from __future__ import annotations
 

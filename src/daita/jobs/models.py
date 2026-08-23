@@ -1,12 +1,12 @@
-"""Bounded records for the one Stage B durable-job lifecycle."""
+"""Define validated records for durable jobs, attempts, claims, and external state."""
 
 from __future__ import annotations
 
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 

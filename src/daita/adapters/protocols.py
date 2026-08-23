@@ -1,4 +1,4 @@
-"""Small source lifecycle and adapter contracts."""
+"""Define source lifecycle, resource adapter, and source-store protocols."""
 
 from __future__ import annotations
 

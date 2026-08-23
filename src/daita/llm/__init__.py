@@ -1,4 +1,4 @@
-"""Provider-neutral model contracts."""
+"""Export provider-neutral model records, errors, routing, and protocols."""
 
 from .errors import ModelProviderError, ProviderErrorCode
 from .factory import create_llm_provider, create_model_route_provider

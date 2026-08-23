@@ -214,6 +214,12 @@ def _error_code(result: ToolResultBlock) -> str:
     return code
 
 
+def _invocation(result: ToolResultBlock) -> Mapping[str, object]:
+    invocation = result.output["invocation"]
+    assert isinstance(invocation, Mapping)
+    return invocation
+
+
 async def _execute(
     runtime: CapabilityRuntime,
     run: RunInput,
@@ -878,7 +884,7 @@ async def test_deferred_identity_survives_denial_malformed_input_and_cancellatio
         )
     )[0]
     assert _error_code(denied) == "approval_denied"
-    assert denied.output["invocation"]["tool_name"] == "deferred_write"
+    assert _invocation(denied)["tool_name"] == "deferred_write"
     assert denied_executors[0].execute_calls == 0
     assert {
         event.data.get("invocation_mode")
@@ -910,7 +916,7 @@ async def test_deferred_identity_survives_denial_malformed_input_and_cancellatio
         )
     )[0]
     assert malformed.is_error
-    assert malformed.output["invocation"]["tool_name"] == "deferred_read"
+    assert _invocation(malformed)["tool_name"] == "deferred_read"
     assert malformed_executors[2].execute_calls == 0
 
     cancellation_events: list[AgentEvent] = []
@@ -945,7 +951,7 @@ async def test_deferred_identity_survives_denial_malformed_input_and_cancellatio
     task.cancel(ToolBatchInterruption.CANCELLED.value)
     (cancelled,) = await task
     assert _error_code(cancelled) == "tool_call_interrupted"
-    assert cancelled.output["invocation"]["tool_name"] == "deferred_read"
+    assert _invocation(cancelled)["tool_name"] == "deferred_read"
     target_events = [
         event
         for event in cancellation_events

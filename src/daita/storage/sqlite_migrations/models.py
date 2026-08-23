@@ -1,4 +1,4 @@
-"""Definitions for the SQLite-owned staged-copy migration engine."""
+"""Define migration records and checksums for the staged-copy SQLite engine."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Bounded server-neutral remote Streamable HTTP MCP connectivity."""
+"""Connect to Streamable HTTP MCP servers and discover or call remote tools."""
 
 from __future__ import annotations
 
@@ -6,11 +6,11 @@ import asyncio
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from .._installation import repair_guidance
@@ -22,6 +22,9 @@ from ..capabilities import (
 from ..errors import DaitaError, ErrorRetryability
 from ..llm.models import ModelSensitivity
 from ..security import SecretProvider, SecretReference, SecretResolutionError
+
+if TYPE_CHECKING:
+    import httpx
 
 MCP_SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18")
 MCP_MAX_SCHEMA_BYTES = 64 * 1_024
@@ -549,7 +552,7 @@ class StreamableHTTPMCPClient:
         self._secrets = secrets
         self._http_transport = http_transport
         self._timeout_seconds = timeout_seconds
-        self._http_client: object | None = None
+        self._http_client: httpx.AsyncClient | None = None
         self._protocol_version: str | None = None
         self._server_name: str | None = None
         self._server_version: str | None = None
@@ -681,9 +684,7 @@ class StreamableHTTPMCPClient:
         client = self._http_client
         self._http_client = None
         if client is not None:
-            close = getattr(client, "aclose", None)
-            if callable(close):
-                await close()
+            await client.aclose()
 
     async def _initialize(self) -> None:
         if self._protocol_version is not None:
@@ -980,7 +981,7 @@ class StreamableHTTPMCPClient:
             )
         return decoded, response_headers
 
-    def _client(self):
+    def _client(self) -> httpx.AsyncClient:
         if self._http_client is None:
             try:
                 import httpx

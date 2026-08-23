@@ -1,4 +1,4 @@
-"""Create one fresh SQLite database at the current journal baseline."""
+"""Create a fresh SQLite database at the current development baseline."""
 
 from __future__ import annotations
 

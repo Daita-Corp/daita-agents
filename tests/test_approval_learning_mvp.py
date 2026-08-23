@@ -795,10 +795,7 @@ async def test_cancellation_during_approval_propagates_without_decision_or_write
         task.cancel()
         outcome = await task
         assert outcome.interruption_kind is ToolBatchInterruption.CANCELLED
-        assert (
-            outcome.ordered_results[0].output["error"]["code"]
-            == "tool_call_interrupted"
-        )
+        assert _error_code(outcome.ordered_results[0]) == "tool_call_interrupted"
         assert await agent.read_memory() == ""
     finally:
         await agent.close()
@@ -1659,10 +1656,7 @@ async def test_skill_save_cancellation_before_mutation_never_writes(tmp_path):
         task.cancel()
         outcome = await task
         assert outcome.interruption_kind is ToolBatchInterruption.CANCELLED
-        assert (
-            outcome.ordered_results[0].output["error"]["code"]
-            == "tool_call_interrupted"
-        )
+        assert _error_code(outcome.ordered_results[0]) == "tool_call_interrupted"
         assert await agent.read_skill("never") is None
     finally:
         await agent.close()

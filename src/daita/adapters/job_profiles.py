@@ -1,4 +1,4 @@
-"""Exact connected-executor boundary used by Stage B offline conformance."""
+"""Define connected job-executor contracts and the offline conformance profile."""
 
 from __future__ import annotations
 

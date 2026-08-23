@@ -1,4 +1,4 @@
-"""Provider-neutral model context for the data agent."""
+"""Build model requests from transcripts, catalog context, memory, skills, and tools."""
 
 from __future__ import annotations
 

@@ -86,6 +86,7 @@ from daita.llm.models import (
     FinishReason,
     ModelResponse,
     ModelSensitivity,
+    TextBlock,
     ToolCall,
     ToolResultBlock,
 )
@@ -176,7 +177,7 @@ def _job_id_at(provider: MockModelProvider, request_index: int) -> str:
     assert len(results) == 1
     assert results[0].is_error is False
     data = results[0].output["data"]
-    assert isinstance(data, dict) or hasattr(data, "__getitem__")
+    assert isinstance(data, Mapping)
     job_id = data["job_id"]
     assert isinstance(job_id, str)
     return job_id
@@ -507,7 +508,7 @@ async def test_job_context_is_agent_scoped_and_result_first(tmp_path: Path) -> N
         )
         await agent.run("What jobs are running?")
         system = provider.requests[0].messages[0].content[0]
-        assert hasattr(system, "text")
+        assert isinstance(system, TextBlock)
         assert "owned by this agent across conversations" in system.text
         assert "origin_conversation_id is provenance" in system.text
         assert "known job ID, call job_read_results first" in system.text

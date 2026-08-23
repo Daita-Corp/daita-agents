@@ -1,4 +1,4 @@
-"""Daita agent."""
+"""Export the public APIs for configuring and running a Daita agent."""
 
 from .adapters import (
     LocalDirectorySource,

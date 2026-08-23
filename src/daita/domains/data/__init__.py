@@ -1,4 +1,4 @@
-"""Data-agent context, read tools, and deterministic SQL validation."""
+"""Group data context, capabilities, result projection, and SQL validation."""
 
 from .capabilities import (
     POSTGRESQL_QUERY_EXECUTOR_ID,

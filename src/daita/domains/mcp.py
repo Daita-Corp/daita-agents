@@ -1,4 +1,4 @@
-"""Static MCP capability owner composed from admitted binding aggregates."""
+"""Project admitted MCP tools and revalidate bindings before remote execution."""
 
 from __future__ import annotations
 

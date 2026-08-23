@@ -1,9 +1,4 @@
-"""Provider- and adapter-neutral catalog records.
-
-The catalog owns resource identity and structural truth.  These records keep
-mutable discovery timing separate from stable identities and revisions so a
-refresh cannot silently turn an observation into a different resource.
-"""
+"""Define normalized catalog identity, schema, relationship, and freshness records."""
 
 from __future__ import annotations
 

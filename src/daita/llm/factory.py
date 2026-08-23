@@ -1,4 +1,4 @@
-"""Construct built-in providers and simple provider routes."""
+"""Build lazy model providers and ordered provider routes from configuration."""
 
 from __future__ import annotations
 

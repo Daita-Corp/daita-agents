@@ -1,4 +1,4 @@
-"""Current physical schema owned by ``SQLiteStateStore``."""
+"""Define, inspect, and validate the current physical SQLite schema."""
 
 from __future__ import annotations
 

@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -154,7 +155,7 @@ def _nested(depth: int) -> dict[str, object]:
     for _ in range(depth):
         value = {"value": value}
     assert isinstance(value, dict)
-    return value
+    return cast(dict[str, object], value)
 
 
 def _artifact_ref(index: int) -> ArtifactRef:

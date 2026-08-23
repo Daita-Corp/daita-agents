@@ -1,4 +1,4 @@
-"""Shared picker used by agent, model, source, and permission flows."""
+"""Provide a searchable picker for agent, model, source, and permission choices."""
 
 from __future__ import annotations
 

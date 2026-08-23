@@ -1,4 +1,4 @@
-"""Immutable control-plane records shared by resource adapters."""
+"""Define immutable source registration, discovery, resource, and health records."""
 
 from __future__ import annotations
 

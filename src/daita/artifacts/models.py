@@ -1,4 +1,4 @@
-"""Immutable records and validation for the bounded artifact lifecycle."""
+"""Define and validate artifact drafts, references, provenance, and delivery records."""
 
 from __future__ import annotations
 

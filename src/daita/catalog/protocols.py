@@ -1,4 +1,4 @@
-"""Lifecycle-specific portable catalog persistence contract."""
+"""Define the catalog persistence protocol and its lifecycle-specific errors."""
 
 from __future__ import annotations
 

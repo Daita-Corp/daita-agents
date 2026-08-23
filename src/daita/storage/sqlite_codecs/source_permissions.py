@@ -1,4 +1,4 @@
-"""Versioned codecs for SQLite-owned source permission records."""
+"""Encode and decode source read scopes and PostgreSQL update scopes."""
 
 from __future__ import annotations
 

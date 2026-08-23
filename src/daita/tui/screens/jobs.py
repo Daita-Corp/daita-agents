@@ -1,4 +1,4 @@
-"""Bounded direct durable-job lifecycle management."""
+"""List, inspect, cancel, and render durable jobs in the terminal UI."""
 
 from __future__ import annotations
 

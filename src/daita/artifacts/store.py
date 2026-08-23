@@ -1,4 +1,4 @@
-"""One concrete, bounded artifact store inside an admitted agent home."""
+"""Commit, read, list, and clean bounded artifacts within an admitted agent home."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ import os
 import re
 import stat
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import NoReturn, Protocol
+from typing import NoReturn, Protocol, cast
 from uuid import uuid4
 
 from .._json import canonical_json
@@ -134,11 +134,15 @@ class AgentHomeArtifactStore:
                 "list_reserved_artifact_ids",
                 None,
             )
-            reservations = (
-                await reservation_loader(agent_id)
-                if callable(reservation_loader)
-                else frozenset()
-            )
+            reservations: frozenset[tuple[str, str]]
+            if callable(reservation_loader):
+                load_reservations = cast(
+                    Callable[[str], Awaitable[frozenset[tuple[str, str]]]],
+                    reservation_loader,
+                )
+                reservations = await load_reservations(agent_id)
+            else:
+                reservations = frozenset()
         except asyncio.CancelledError:
             raise
         except ArtifactError as error:

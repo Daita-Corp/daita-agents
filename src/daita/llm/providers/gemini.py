@@ -1,4 +1,4 @@
-"""Native google-genai adapter for the provider-neutral model boundary."""
+"""Translate canonical requests and streaming responses for Google Gemini."""
 
 from __future__ import annotations
 

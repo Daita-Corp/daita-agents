@@ -1,4 +1,4 @@
-"""Transcript-driven agent loop."""
+"""Export the transcript-driven agent loop, records, and runtime interfaces."""
 
 from .driver import (
     AgentLoop,

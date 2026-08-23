@@ -1,4 +1,4 @@
-"""One bounded single-host supervisor for durable Stage B job attempts."""
+"""Claim, execute, fence, recover, and reconcile durable job attempts within limits."""
 
 from __future__ import annotations
 

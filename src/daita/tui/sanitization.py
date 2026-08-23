@@ -1,4 +1,4 @@
-"""Untrusted-text sanitization and display bounds for the terminal UI."""
+"""Sanitize, bound, and safely render untrusted text and Markdown in the terminal."""
 
 from __future__ import annotations
 

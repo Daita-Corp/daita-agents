@@ -1,4 +1,4 @@
-"""Fixed declarations for progressive skill reads and approved skill writes."""
+"""Project progressive skill reads and execute approved skill saves or deletions."""
 
 from __future__ import annotations
 

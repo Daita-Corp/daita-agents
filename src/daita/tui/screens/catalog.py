@@ -1,4 +1,4 @@
-"""Browsable current-catalog presentation."""
+"""Display searchable and browsable views of the current catalog."""
 
 from __future__ import annotations
 

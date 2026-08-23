@@ -1,4 +1,4 @@
-"""Common bounded lifecycle capabilities over the one Stage B job owner."""
+"""Declare and execute bounded job list, inspection, result, and cancellation tools."""
 
 from __future__ import annotations
 

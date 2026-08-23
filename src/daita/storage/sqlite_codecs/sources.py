@@ -1,4 +1,4 @@
-"""Explicit SQLite codecs for source registration records."""
+"""Encode and decode current source registration records."""
 
 from __future__ import annotations
 

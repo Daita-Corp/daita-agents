@@ -1,4 +1,4 @@
-"""Catalog capability declarations and runtime executors."""
+"""Declare and execute catalog search, inspection, schema, and traversal tools."""
 
 from __future__ import annotations
 

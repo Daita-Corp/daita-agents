@@ -1,4 +1,4 @@
-"""Fixed-endpoint xAI Grok specialization of the compatible chat adapter."""
+"""Configure the OpenAI-compatible chat adapter for xAI Grok's fixed endpoint."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Concrete persistence for embedded agent state."""
+"""Export the concrete SQLite persistence APIs for embedded agent state."""
 
 from .sqlite import SQLiteStateStore
 

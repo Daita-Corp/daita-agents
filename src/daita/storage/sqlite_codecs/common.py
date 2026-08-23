@@ -1,4 +1,4 @@
-"""Strict primitives for explicit SQLite record-family codecs."""
+"""Provide strict JSON payload and primitive codecs for persisted record families."""
 
 from __future__ import annotations
 

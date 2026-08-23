@@ -1,4 +1,4 @@
-"""Bounded business-semantic records, rendering, recall, and tool declarations."""
+"""Define, validate, render, recall, and expose business-semantic annotations."""
 
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ from .capabilities import (
 )
 from .capability_runtime import CapabilityFailure, SideEffectPlan
 from .catalog.models import CATALOG_CONTEXT_DEFAULT_LIMIT
-from .catalog.models import Sensitivity as CatalogSensitivity
 from .domains.learning import LearningCandidateGuard
 from .llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
 from .loop.models import RunInput, Transcript

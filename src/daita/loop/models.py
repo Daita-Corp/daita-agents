@@ -1,4 +1,4 @@
-"""Small records used by the transcript-driven agent loop."""
+"""Define validated run inputs, transcripts, limits, exits, and tool-batch outcomes."""
 
 from __future__ import annotations
 

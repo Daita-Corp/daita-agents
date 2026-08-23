@@ -1,4 +1,4 @@
-"""Stable provider-neutral model failure contracts."""
+"""Define normalized model failures and request-limit errors for routing and loops."""
 
 from __future__ import annotations
 

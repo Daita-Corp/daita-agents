@@ -65,7 +65,6 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
-    ModelSensitivity,
     ToolCall,
     ToolResultBlock,
 )

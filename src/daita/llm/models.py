@@ -1,4 +1,4 @@
-"""Canonical provider-neutral model records."""
+"""Define canonical messages, tool calls, requests, responses, usage, and profiles."""
 
 from __future__ import annotations
 

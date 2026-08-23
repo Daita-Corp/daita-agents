@@ -1,4 +1,4 @@
-"""Transcript blocks, follow/review scrolling, and wrap-stable copy text."""
+"""Render transcript blocks with follow scrolling and wrap-stable copy text."""
 
 from __future__ import annotations
 

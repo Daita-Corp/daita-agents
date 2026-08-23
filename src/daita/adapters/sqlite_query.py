@@ -1,4 +1,4 @@
-"""Guarded SQLite read backend invoked only by the runtime query executor."""
+"""Execute catalog-validated, bounded reads against admitted SQLite files."""
 
 from __future__ import annotations
 

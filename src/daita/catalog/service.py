@@ -1,4 +1,4 @@
-"""Catalog-owned projections consumed by tools and the data domain."""
+"""Synchronize, index, search, inspect, and traverse canonical catalog state."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Presentation adapter over the public Agent API."""
+"""Adapt the public Agent API into presentation-safe operations for Textual screens."""
 
 from __future__ import annotations
 

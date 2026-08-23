@@ -1235,7 +1235,9 @@ async def test_schema_drift_is_unavailable_until_explicit_refresh_and_reopen(tmp
         _alpha_status,
         beta_status,
     ) = await _attach_two_bindings(tmp_path)
-    original_schema = dict(beta.tool("lookup")["inputSchema"])
+    input_schema = beta.tool("lookup")["inputSchema"]
+    assert isinstance(input_schema, Mapping)
+    original_schema = dict(input_schema)
     await agent.close()
     beta.tool("lookup")["inputSchema"] = {
         "type": "object",

@@ -1,4 +1,4 @@
-"""Anthropic Messages adapter for the provider-neutral model boundary."""
+"""Translate canonical requests and streaming responses for Anthropic Messages."""
 
 from __future__ import annotations
 

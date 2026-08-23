@@ -36,7 +36,11 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.profiles import reviewed_model_profile
-from daita.llm.protocols import ModelProvider, provider_has_complete_pricing
+from daita.llm.protocols import (
+    ModelProvider,
+    StreamingModelProvider,
+    provider_has_complete_pricing,
+)
 from daita.loop.models import (
     LoopExit,
     LoopExitKind,
@@ -106,11 +110,10 @@ class _RecordingProvider:
         return response
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        stream = getattr(self._delegate, "stream", None)
-        if not callable(stream):
+        if not isinstance(self._delegate, StreamingModelProvider):
             raise TypeError("the live delegate must support canonical streaming")
         self.requests.append(request)
-        async for event in stream(request):
+        async for event in self._delegate.stream(request):
             if isinstance(event, ModelStreamCompleted):
                 self.responses.append(event.response)
             yield event

@@ -1,4 +1,4 @@
-"""One bounded owner for Stage B admission and public job projections."""
+"""Admit durable jobs and own their lifecycle transitions and public projections."""
 
 from __future__ import annotations
 

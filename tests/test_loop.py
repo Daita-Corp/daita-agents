@@ -1,6 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import cast
 
 import pytest
 
@@ -34,6 +35,7 @@ from daita.loop import (
     LoopLimits,
     RunInput,
     ToolBatchOutcome,
+    ToolRuntime,
 )
 from daita.observation import AgentEvent, AgentEventKind
 from _capability_runtime_support import (
@@ -473,7 +475,10 @@ async def test_unexpected_loop_failures_best_effort_terminalize_started_run(
     loop = AgentLoop(
         model=provider,
         context_builder=BrokenContext(),
-        tools=BrokenTools({"one": ToolResultBlock(call_id="one", output={"value": 1})}),
+        tools=cast(
+            ToolRuntime,
+            BrokenTools({"one": ToolResultBlock(call_id="one", output={"value": 1})}),
+        ),
         transcripts=transcripts,
         clock=lambda: NOW,
     )

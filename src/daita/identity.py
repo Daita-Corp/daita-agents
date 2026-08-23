@@ -1,4 +1,4 @@
-"""Canonical persistent-agent identity records."""
+"""Define and validate persistent agent identity records."""
 
 from __future__ import annotations
 

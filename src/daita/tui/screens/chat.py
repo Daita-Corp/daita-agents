@@ -1,4 +1,4 @@
-"""Ready-agent chat surface."""
+"""Implement the ready-agent chat screen and interactive run flow."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Structured PostgreSQL update preview and transactional execution boundary."""
+"""Preview and transactionally execute approved structured PostgreSQL updates."""
 
 from __future__ import annotations
 

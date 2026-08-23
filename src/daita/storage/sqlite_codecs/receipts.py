@@ -1,4 +1,4 @@
-"""Explicit SQLite codec for database-write receipt records."""
+"""Encode and decode immutable database-write receipts."""
 
 from __future__ import annotations
 

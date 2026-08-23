@@ -278,7 +278,8 @@ def _runtime(
         operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
     )
 
-    async def approve(_request):
+    async def approve(request) -> ApprovalDecision:
+        del request
         return ApprovalDecision.APPROVE
 
     views = (

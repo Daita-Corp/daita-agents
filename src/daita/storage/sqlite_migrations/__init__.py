@@ -1,4 +1,4 @@
-"""Private SQLite migration journal owned by ``SQLiteStateStore``."""
+"""Export the private checksummed migration journal owned by the SQLite store."""
 
 from .baseline import create_current
 from .runner import (

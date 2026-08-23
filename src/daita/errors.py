@@ -1,9 +1,4 @@
-"""Stable public error categories for the replacement runtime.
-
-The hierarchy is intentionally small.  Concrete services may expose narrower
-subclasses, but callers can make retry and subsystem decisions without parsing
-messages or depending on provider/adapter exceptions.
-"""
+"""Define stable public error categories and safe exception normalization."""
 
 from __future__ import annotations
 

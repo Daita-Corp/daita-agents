@@ -1,4 +1,4 @@
-"""Explicit SQLite codecs for learning-candidate and review-stamp records."""
+"""Encode and decode learning candidates, review stamps, and candidate content."""
 
 from __future__ import annotations
 

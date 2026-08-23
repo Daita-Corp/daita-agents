@@ -1,4 +1,4 @@
-"""Slash-command parsing, completions, and one-run source selectors."""
+"""Parse slash commands, completions, source overrides, and editor documents."""
 
 from __future__ import annotations
 

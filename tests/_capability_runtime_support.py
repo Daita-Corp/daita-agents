@@ -10,7 +10,6 @@ from daita.capabilities import (
     AccessMode,
     Capability,
     CapabilityDeclarations,
-    CapabilityInputError,
     Executor,
     ToolExecution,
     ToolDiscoveryMetadata,
@@ -28,7 +27,6 @@ from daita.capability_runtime import (
     ToolInvocationMode,
 )
 from daita.llm.models import (
-    CanonicalMessage,
     ModelSensitivity,
     ToolCall,
     ToolDefinition,

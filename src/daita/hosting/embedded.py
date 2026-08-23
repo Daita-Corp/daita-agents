@@ -1,4 +1,4 @@
-"""Small in-process composition for one persistent data agent."""
+"""Compose and own the in-process runtime for one persistent agent home."""
 
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ from ..adapters.mcp import (
     MCPBindingState,
     MCPBindingStatus,
     MCPClientFactory,
-    MCPServerBinding,
     MCPServerInspection,
     MCPToolSelection,
     StreamableHTTPMCPClientFactory,

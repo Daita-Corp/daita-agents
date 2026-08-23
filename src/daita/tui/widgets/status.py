@@ -1,4 +1,4 @@
-"""Compact identity, context-window, and live execution status."""
+"""Display compact identity, context-window, execution, and notification status."""
 
 from __future__ import annotations
 

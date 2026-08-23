@@ -1,4 +1,4 @@
-"""Fixed document and exact-tabular renderers; deliberately no registry."""
+"""Render and verify model documents, CSV data, and provenance-bearing XLSX files."""
 
 from __future__ import annotations
 

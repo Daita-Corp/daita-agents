@@ -23,7 +23,6 @@ from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelResponse,
-    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,

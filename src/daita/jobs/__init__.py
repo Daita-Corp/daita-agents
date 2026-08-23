@@ -1,4 +1,4 @@
-"""Bounded durable-job owner records and host supervisor."""
+"""Export durable job records, capabilities, lifecycle ownership, and supervision."""
 
 from .models import (
     ConnectedExecutorBinding,

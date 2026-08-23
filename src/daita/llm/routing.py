@@ -1,4 +1,4 @@
-"""Small ordered provider fallback with transport-only retries."""
+"""Select ordered model providers and apply transport-only retries and fallbacks."""
 
 from __future__ import annotations
 

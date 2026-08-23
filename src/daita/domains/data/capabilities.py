@@ -1,4 +1,4 @@
-"""SQL reads and structured PostgreSQL update declarations."""
+"""Declare and execute SQL reads and structured PostgreSQL updates."""
 
 from __future__ import annotations
 

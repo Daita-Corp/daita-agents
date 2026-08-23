@@ -1,3 +1,5 @@
+/* Style the Daita terminal application's layout, widgets, and visual states. */
+
 Screen {
     background: $background;
     color: $foreground;

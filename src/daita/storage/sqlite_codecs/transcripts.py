@@ -1,4 +1,4 @@
-"""Explicit SQLite codecs for transcript, message, usage, and result records."""
+"""Encode and decode run inputs, messages, usage, loop exits, and outcomes."""
 
 from __future__ import annotations
 

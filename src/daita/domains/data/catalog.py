@@ -1,4 +1,4 @@
-"""Data-domain projections over catalog-owned structural truth."""
+"""Project catalog resources and relationships into data-domain lookup views."""
 
 from __future__ import annotations
 

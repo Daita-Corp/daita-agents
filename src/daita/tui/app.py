@@ -1,4 +1,4 @@
-"""Daita Textual application: one interactive lifecycle, one Agent.run() path."""
+"""Coordinate the Textual application lifecycle, navigation, and Agent.run path."""
 
 from __future__ import annotations
 

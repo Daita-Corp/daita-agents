@@ -1,4 +1,4 @@
-"""Structured, catalog-scoped PostgreSQL update planning and rendering."""
+"""Validate catalog-scoped PostgreSQL update intents and render executable SQL."""
 
 from __future__ import annotations
 

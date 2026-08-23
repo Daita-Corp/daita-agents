@@ -1,9 +1,4 @@
-"""Small SQLite state store for one embedded agent.
-
-The database persists only product state the MVP actually uses: identity,
-attached sources, current catalog snapshots, exact run transcripts, and the
-minimal receipt needed to classify an external database-write attempt.
-"""
+"""Persist all durable agent state through the sole SQLite storage boundary."""
 
 from __future__ import annotations
 
@@ -71,7 +66,6 @@ from ..jobs.models import (
     JobAttempt,
     JobAttemptStatus,
     JobDesiredState,
-    JobExecutionMode,
     JobResult,
     JobRun,
     JobStatus,
@@ -82,7 +76,6 @@ from ..jobs.models import (
     MAX_QUEUED_JOBS_PER_AGENT,
     MAX_RUNNING_JOBS_PER_AGENT,
     MAX_RUNNING_JOBS_PER_SOURCE,
-    TERMINAL_JOB_STATUSES,
 )
 from ..llm.models import (
     CanonicalMessage,

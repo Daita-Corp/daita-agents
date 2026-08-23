@@ -1,12 +1,4 @@
-"""Subscription adapters using authenticated official model clients.
-
-The official clients own subscription authentication only. Daita still owns
-the canonical transcript, tool selection, tool execution, and terminal answer.
-These adapters do not read, import, refresh, or persist OAuth credentials.
-
-Codex subscription access is implemented independently in ``providers.codex``
-through Daita-owned OAuth and does not use this CLI transport.
-"""
+"""Run official subscription-authenticated model clients through bounded subprocesses."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Explicit SQLite codecs for semantic annotation records."""
+"""Encode and decode semantic annotations, evidence, subjects, and bindings."""
 
 from __future__ import annotations
 

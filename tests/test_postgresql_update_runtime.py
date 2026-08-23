@@ -31,7 +31,7 @@ from daita.domains.data.sql import (
     PostgreSQLUpdateIntent,
     ResourceSchema,
 )
-from daita.llm.models import ModelSensitivity, ToolCall
+from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite import DatabaseWriteOutcome, SQLiteStateStore

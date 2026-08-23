@@ -1,4 +1,4 @@
-"""ChatGPT-subscription Codex transport owned by Daita."""
+"""Implement Daita-owned ChatGPT subscription transport for Codex models."""
 
 from __future__ import annotations
 

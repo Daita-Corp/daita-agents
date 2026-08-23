@@ -1,4 +1,4 @@
-"""Read and PostgreSQL update scope review."""
+"""Review and edit source read scopes and PostgreSQL update permissions."""
 
 from __future__ import annotations
 

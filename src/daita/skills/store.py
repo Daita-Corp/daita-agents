@@ -1,4 +1,4 @@
-"""Safe fixed-layout storage for bounded procedural skill documents."""
+"""Validate and manage bounded SKILL.md documents in a fixed directory layout."""
 
 from __future__ import annotations
 

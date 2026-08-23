@@ -1,4 +1,4 @@
-"""Read-only PostgreSQL source discovery and inspection adapter."""
+"""Discover and inspect read-admitted PostgreSQL schemas and tables."""
 
 from __future__ import annotations
 

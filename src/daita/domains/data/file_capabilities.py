@@ -1,4 +1,4 @@
-"""Bounded local-file read capability over an injected source backend."""
+"""Declare and execute bounded reads of catalog-admitted local data files."""
 
 from __future__ import annotations
 

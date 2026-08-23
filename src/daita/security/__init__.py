@@ -1,4 +1,4 @@
-"""Explicit secret references and runtime-only secret resolution."""
+"""Export secret references and lazy runtime resolution APIs."""
 
 from .secrets import (
     CompositeSecretProvider,

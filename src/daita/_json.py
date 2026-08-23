@@ -1,4 +1,4 @@
-"""Strict immutable JSON values used at runtime trust boundaries."""
+"""Validate, freeze, thaw, and canonically encode trust-boundary JSON values."""
 
 from __future__ import annotations
 

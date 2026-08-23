@@ -1,4 +1,4 @@
-"""Explicit SQLite codecs for agent identity records."""
+"""Encode and decode persistent agent identities and identifiers."""
 
 from __future__ import annotations
 

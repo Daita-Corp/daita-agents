@@ -1,4 +1,4 @@
-"""Human-readable MCP management and guided read-tool admission."""
+"""List MCP servers and guide transport, authentication, and tool admission."""
 
 from __future__ import annotations
 

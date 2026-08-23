@@ -1,9 +1,4 @@
-"""Pure SQL analysis and catalog-validation contracts for the data domain.
-
-The package facade preserves the established ``daita.domains.data.sql`` import
-surface while keeping analysis, read validation, and typed update validation
-in cohesive internal modules.
-"""
+"""Export SQL analysis and catalog-validation APIs for the data domain."""
 
 from .analysis import (
     _load_sqlglot as _load_sqlglot,
