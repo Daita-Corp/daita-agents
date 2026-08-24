@@ -13,7 +13,13 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json
-from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
+from ..errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+    detached_provider_error,
+)
 from ..models import (
     CanonicalMessage,
     FinishReason,
@@ -165,10 +171,14 @@ class AnthropicMessagesProvider:
             failure = ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "Anthropic provider boundary failed",
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
+                    code="unexpected_provider_boundary_failure",
+                ),
             )
         if failure is None:
             raise AssertionError("Anthropic provider failed without an error")
-        raise detached_provider_error(failure)
+        raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
@@ -194,6 +204,14 @@ class AnthropicMessagesProvider:
             raise ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "Anthropic returned a malformed response",
+                provider_id=self.provider_id,
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.RESPONSE_DECODE,
+                    code="response_decode_failed",
+                    terminal_status=_safe_structural_token(
+                        _safe_field(response, "stop_reason")
+                    ),
+                ),
             ) from error
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
@@ -214,10 +232,14 @@ class AnthropicMessagesProvider:
             failure = ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "Anthropic provider boundary failed",
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
+                    code="unexpected_provider_boundary_failure",
+                ),
             )
         if failure is None:
             raise AssertionError("Anthropic provider failed without an error")
-        raise detached_provider_error(failure)
+        raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _stream(
         self,
@@ -236,12 +258,20 @@ class AnthropicMessagesProvider:
             manager = self.client.messages.stream(**arguments)
             async with manager as native_stream:
                 async for native_event in native_stream:
+                    event_type = _safe_structural_token(
+                        _safe_field(native_event, "type")
+                    )
                     try:
                         canonical_events = decoder.consume(native_event)
                     except ModelProviderError:
                         raise
                     except (KeyError, TypeError, ValueError) as error:
-                        raise _malformed_stream(error) from error
+                        raise _malformed_stream(
+                            phase=ProviderFailurePhase.STREAM_EVENT,
+                            code="event_decode_failed",
+                            provider_id=self.provider_id,
+                            event_type=event_type,
+                        ) from error
                     for canonical_event in canonical_events:
                         yield canonical_event
             try:
@@ -255,7 +285,11 @@ class AnthropicMessagesProvider:
             except ModelProviderError:
                 raise
             except (KeyError, TypeError, ValueError) as error:
-                raise _malformed_stream(error) from error
+                raise _malformed_stream(
+                    phase=ProviderFailurePhase.STREAM_TERMINAL,
+                    code="terminal_completion_missing",
+                    provider_id=self.provider_id,
+                ) from error
             yield ModelStreamCompleted(response)
         except asyncio.CancelledError:
             raise
@@ -1321,10 +1355,22 @@ def _anthropic_inference_geo(value: object) -> str:
     return normalized
 
 
-def _malformed_stream(error: Exception) -> ModelProviderError:
+def _malformed_stream(
+    *,
+    phase: ProviderFailurePhase,
+    code: str,
+    provider_id: str,
+    event_type: str | None = None,
+) -> ModelProviderError:
     return ModelProviderError(
         ProviderErrorCode.MALFORMED_RESPONSE,
         "Anthropic returned a malformed stream",
+        provider_id=provider_id,
+        diagnostic=ProviderFailureDiagnostic(
+            phase=phase,
+            code=code,
+            event_type=event_type,
+        ),
     )
 
 
@@ -1433,6 +1479,28 @@ def _provider_error_type(error: Exception) -> str | None:
     if isinstance(value, str) and value.strip():
         return value
     return None
+
+
+def _safe_field(value: object, name: str) -> object | None:
+    try:
+        return _field(value, name, None)
+    except Exception:
+        return None
+
+
+def _safe_structural_token(value: object) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 96:
+        return None
+    if (
+        not value[0].isascii()
+        or not value[0].isalnum()
+        or any(
+            not character.isascii() or not (character.isalnum() or character in "._:-")
+            for character in value
+        )
+    ):
+        return None
+    return value
 
 
 _MISSING = object()

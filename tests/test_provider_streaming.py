@@ -5,7 +5,12 @@ from typing import Any, cast
 
 import pytest
 
-from daita.llm.errors import ModelProviderError, ProviderErrorCode
+from daita.llm.errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+)
 from daita.llm.factory import create_llm_provider
 from daita.llm.models import (
     CanonicalMessage,
@@ -277,6 +282,259 @@ async def test_openai_native_stream_still_rejects_non_text_delta():
         await _events(provider, _request())
 
     assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
+    assert caught.value.provider_id == "openai:test-model"
+    assert caught.value.diagnostic == ProviderFailureDiagnostic(
+        phase=ProviderFailurePhase.STREAM_EVENT,
+        code="event_decode_failed",
+        event_type="response.output_text.delta",
+    )
+
+
+async def test_openai_stream_reconstructs_official_completed_item_when_terminal_output_is_empty():
+    response_id = "resp-official-stream"
+    provider = OpenAIResponsesProvider(
+        "test-model",
+        client=cast(
+            Any,
+            _OpenAIClient(
+                (
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "id": "message-official-stream",
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "completed text",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": response_id,
+                            "status": "completed",
+                            "model": "test-model",
+                            "output": [],
+                            "usage": None,
+                        },
+                    },
+                )
+            ),
+        ),
+    )
+
+    events = await _events(provider, _request())
+
+    completed = cast(ModelStreamCompleted, events[-1])
+    assert completed.response.text == "completed text"
+    assert completed.response.provider_response_id == response_id
+
+
+async def test_openai_stream_prefers_official_completed_item_over_terminal_placeholder():
+    response_id = "resp-terminal-placeholder"
+    provider = OpenAIResponsesProvider(
+        "test-model",
+        client=cast(
+            Any,
+            _OpenAIClient(
+                (
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "id": "message-completed",
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "completed text",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": response_id,
+                            "status": "completed",
+                            "model": "test-model",
+                            "output": [
+                                {
+                                    "id": "message-placeholder",
+                                    "type": "message",
+                                    "status": "in_progress",
+                                    "role": "assistant",
+                                    "content": [],
+                                }
+                            ],
+                            "usage": None,
+                        },
+                    },
+                )
+            ),
+        ),
+    )
+
+    events = await _events(provider, _request())
+
+    completed = cast(ModelStreamCompleted, events[-1])
+    assert completed.response.text == "completed text"
+    assert completed.response.provider_response_id == response_id
+
+
+async def test_openai_malformed_terminal_retains_only_bounded_structure():
+    provider = OpenAIResponsesProvider(
+        "test-model",
+        client=cast(
+            Any,
+            _OpenAIClient(
+                (
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp-reasoning-only",
+                            "status": "completed",
+                            "model": "test-model",
+                            "output": [
+                                {
+                                    "id": "reasoning-1",
+                                    "type": "reasoning",
+                                    "summary": [],
+                                }
+                            ],
+                            "usage": None,
+                        },
+                    },
+                )
+            ),
+        ),
+    )
+
+    with pytest.raises(ModelProviderError) as caught:
+        await _events(provider, _request())
+
+    assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
+    assert caught.value.diagnostic == ProviderFailureDiagnostic(
+        phase=ProviderFailurePhase.STREAM_TERMINAL,
+        code="terminal_content_missing",
+        event_type="response.completed",
+        terminal_status="completed",
+        output_item_types=("reasoning",),
+        response_id_digest=(
+            "sha256:9a6af422fc70773bc86cae3a1e4b86793d8a3c26656b2ded26c0ee7087e6c13a"
+        ),
+    )
+
+
+async def test_openai_empty_completed_message_reports_missing_terminal_content():
+    provider = OpenAIResponsesProvider(
+        "test-model",
+        client=cast(
+            Any,
+            _OpenAIClient(
+                (
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp-empty-message",
+                            "status": "completed",
+                            "model": "test-model",
+                            "output": [
+                                {
+                                    "id": "message-empty",
+                                    "type": "message",
+                                    "status": "completed",
+                                    "role": "assistant",
+                                    "content": [],
+                                }
+                            ],
+                            "usage": None,
+                        },
+                    },
+                )
+            ),
+        ),
+    )
+
+    with pytest.raises(ModelProviderError) as caught:
+        await _events(provider, _request())
+
+    diagnostic = caught.value.diagnostic
+    assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
+    assert diagnostic is not None
+    assert diagnostic.phase is ProviderFailurePhase.STREAM_TERMINAL
+    assert diagnostic.code == "terminal_content_missing"
+    assert diagnostic.event_type == "response.completed"
+    assert diagnostic.terminal_status == "completed"
+    assert diagnostic.output_item_types == ("message",)
+    assert diagnostic.response_id_digest is not None
+
+
+@pytest.mark.parametrize(
+    ("response_patch", "diagnostic_code"),
+    (
+        ({"model": None}, "response_metadata_invalid"),
+        (
+            {
+                "usage": {
+                    "input_tokens": None,
+                    "output_tokens": 1,
+                }
+            },
+            "usage_invalid",
+        ),
+    ),
+)
+async def test_openai_terminal_decode_reports_exact_bounded_checkpoint(
+    response_patch: dict[str, object],
+    diagnostic_code: str,
+):
+    response: dict[str, object] = {
+        "id": "resp-invalid-checkpoint",
+        "status": "completed",
+        "model": "test-model",
+        "output": [
+            {
+                "id": "message-valid",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}],
+            }
+        ],
+        "usage": None,
+    }
+    response.update(response_patch)
+    provider = OpenAIResponsesProvider(
+        "test-model",
+        client=cast(
+            Any,
+            _OpenAIClient(
+                (
+                    {
+                        "type": "response.completed",
+                        "response": response,
+                    },
+                )
+            ),
+        ),
+    )
+
+    with pytest.raises(ModelProviderError) as caught:
+        await _events(provider, _request())
+
+    assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.code == diagnostic_code
+    assert caught.value.diagnostic.output_item_types == ("message",)
 
 
 def _anthropic_message_start() -> dict[str, object]:
@@ -539,35 +797,53 @@ async def test_compatible_native_no_argument_tool_call_finishes_as_empty_object(
 
 
 @pytest.mark.parametrize(
-    "provider_factory",
+    ("provider_factory", "provider_id"),
     (
-        lambda: OpenAIResponsesProvider(
-            "test-model",
-            client=cast(Any, _OpenAIClient(())),
+        (
+            lambda: OpenAIResponsesProvider(
+                "test-model",
+                client=cast(Any, _OpenAIClient(())),
+            ),
+            "openai:test-model",
         ),
-        lambda: AnthropicMessagesProvider(
-            "test-model",
-            client=cast(Any, _AnthropicClient(())),
+        (
+            lambda: AnthropicMessagesProvider(
+                "test-model",
+                client=cast(Any, _AnthropicClient(())),
+            ),
+            "anthropic:test-model",
         ),
-        lambda: GeminiProvider(
-            "test-model",
-            client=cast(Any, _GeminiClient(())),
+        (
+            lambda: GeminiProvider(
+                "test-model",
+                client=cast(Any, _GeminiClient(())),
+            ),
+            "gemini:test-model",
         ),
-        lambda: OpenAICompatibleProvider(
-            "test-model",
-            provider="custom",
-            base_url="https://models.example.test/v1",
-            client=cast(Any, _CompatibleClient(())),
+        (
+            lambda: OpenAICompatibleProvider(
+                "test-model",
+                provider="custom",
+                base_url="https://models.example.test/v1",
+                client=cast(Any, _CompatibleClient(())),
+            ),
+            "custom:test-model",
         ),
     ),
 )
 async def test_native_streams_require_canonical_terminal_completion(
     provider_factory: Callable[[], object],
+    provider_id: str,
 ):
     with pytest.raises(ModelProviderError) as caught:
         await _events(provider_factory(), _request())
 
     assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
+    assert caught.value.provider_id == provider_id
+    assert caught.value.diagnostic == ProviderFailureDiagnostic(
+        phase=ProviderFailurePhase.STREAM_TERMINAL,
+        code="terminal_completion_missing",
+    )
 
 
 @pytest.mark.parametrize(

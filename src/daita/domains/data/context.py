@@ -41,7 +41,7 @@ from ...llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from ...loop.models import ConversationRun, LoopExitKind, RunInput
+from ...loop.models import ConversationRun, LoopExitKind, RunInput, RunOrigin
 from ...jobs.capabilities import (
     JOB_CANCEL_CAPABILITY_ID,
     JOB_INSPECT_CAPABILITY_ID,
@@ -97,6 +97,7 @@ from .file_capabilities import (
     LOCAL_FILE_READ_EVIDENCE_KIND,
     LOCAL_FILE_READ_TOOL_NAME,
 )
+from .profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
 
 _MAXIMUM_PRIOR_COMPLETED_RUNS = 8
 _MAXIMUM_PRIOR_MESSAGES = 40
@@ -212,6 +213,7 @@ class RunContextSnapshot:
     """Immutable static context prepared once for one direct loop run."""
 
     run_id: str
+    start_message: CanonicalMessage
     profile: ModelProfile
     catalog_digest: str
     provider_definitions: tuple[ToolDefinition, ...]
@@ -225,6 +227,10 @@ class RunContextSnapshot:
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not self.run_id:
             raise ValueError("run context snapshot requires run_id")
+        if not isinstance(self.start_message, CanonicalMessage):
+            raise TypeError("run context snapshot requires its normalized start")
+        if self.start_message.role not in {MessageRole.USER, MessageRole.SYSTEM}:
+            raise ValueError("run context snapshot start role is invalid")
         if not isinstance(self.profile, ModelProfile):
             raise TypeError("run context snapshot requires a model profile")
         provider_definitions = tuple(self.provider_definitions)
@@ -264,6 +270,35 @@ class RunContextSnapshot:
         object.__setattr__(self, "provider_definitions", provider_definitions)
         object.__setattr__(self, "static_messages", static_messages)
         object.__setattr__(self, "final_static_messages", final_static_messages)
+
+    def audit_context(self) -> FrozenJsonObject:
+        """Return bounded reconstructible provider-visible preflight material."""
+
+        return FrozenJsonObject.from_mapping(
+            {
+                "run_id": self.run_id,
+                "model_profile_id": self.profile.id,
+                "catalog_digest": self.catalog_digest,
+                "static_context_sha256": self.static_context_sha256,
+                "initial_sensitivity": self.initial_sensitivity.value,
+                "initial_sensitivity_provenance": (self.initial_sensitivity_provenance),
+                "start_message": _neutral_message(self.start_message),
+                "static_messages": [
+                    _neutral_message(message) for message in self.static_messages
+                ],
+                "final_static_messages": [
+                    _neutral_message(message) for message in self.final_static_messages
+                ],
+                "provider_definitions": [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.input_schema,
+                    }
+                    for tool in self.provider_definitions
+                ],
+            }
+        )
 
 
 class DataContextBuilder:
@@ -402,25 +437,33 @@ class DataContextBuilder:
         if any(not isinstance(tool, ToolDefinition) for tool in tools):
             raise TypeError("tools must contain ToolDefinition records")
 
-        current_user = CanonicalMessage(
-            role=MessageRole.USER,
-            content=(TextBlock(run.message),),
-        )
+        current_start = run.start_message()
         prior_turns, current_messages, upstream_omitted = _split_working_messages(
-            messages
+            messages,
+            current_start=current_start,
         )
-        if current_messages != (current_user,):
+        if current_messages != (current_start,):
             raise ValueError("context must be prepared before the first model response")
 
         sensitivity = ModelSensitivity.PUBLIC
-        if run.source_id is not None:
+        execution_scope = run.execution_scope
+        sensitivity_source_ids = (
+            execution_scope.allowed_source_ids
+            if execution_scope is not None
+            else (() if run.source_id is None else (run.source_id,))
+        )
+        if sensitivity_source_ids:
             classified = await self._catalog.admitted_model_sensitivity(
                 run.agent_id,
-                (run.source_id,),
+                sensitivity_source_ids,
             )
             if not isinstance(classified, ModelSensitivity):
                 raise RequestSensitivityUnavailable()
             sensitivity = classified
+        if execution_scope is not None and (
+            sensitivity.routing_rank > execution_scope.sensitivity_ceiling.routing_rank
+        ):
+            raise RequestSensitivityUnavailable()
 
         memory_text = ""
         user_profile = ""
@@ -452,6 +495,15 @@ class DataContextBuilder:
                 annotation
                 for annotation in annotations
                 if set(annotation.subject.resource_ids) <= readable_fact_ids
+                and (
+                    execution_scope is None
+                    or (
+                        set(annotation.subject.source_ids)
+                        <= set(execution_scope.allowed_source_ids)
+                        and set(annotation.subject.resource_ids)
+                        <= set(execution_scope.allowed_resource_ids)
+                    )
+                )
             )
             semantic_views = inspect_semantic_annotations(
                 readable_annotations,
@@ -486,7 +538,14 @@ class DataContextBuilder:
             catalog_query,
             prior_query=prior_catalog_query,
             limit=self._catalog_limit,
-            source_ids=(() if run.source_id is None else (run.source_id,)),
+            source_ids=(
+                execution_scope.allowed_source_ids
+                if execution_scope is not None
+                else (() if run.source_id is None else (run.source_id,))
+            ),
+            resource_ids=(
+                () if execution_scope is None else execution_scope.allowed_resource_ids
+            ),
         )
         catalog_payload = catalog.to_dict()
         catalog_payload, semantic_text = self._fit_mandatory_request(
@@ -651,6 +710,10 @@ class DataContextBuilder:
         final_static_messages = final_request.messages[:-1]
         static_material = {
             "run_id": run.id,
+            "run_origin": run.origin.value,
+            "execution_scope_digest": (
+                None if execution_scope is None else execution_scope.digest
+            ),
             "profile_id": self._profile.id,
             "tool_catalog_digest": tool_context.catalog_digest,
             "tool_domain_manifest": manifest_payload,
@@ -673,12 +736,20 @@ class DataContextBuilder:
             {
                 "authority": "run_context_snapshot",
                 "run_id": run.id,
-                "source_ids": (() if run.source_id is None else (run.source_id,)),
+                "source_ids": (
+                    execution_scope.allowed_source_ids
+                    if execution_scope is not None
+                    else (() if run.source_id is None else (run.source_id,))
+                ),
+                "execution_scope_digest": (
+                    None if execution_scope is None else execution_scope.digest
+                ),
                 "static_context_sha256": digest,
             }
         )
         return RunContextSnapshot(
             run_id=run.id,
+            start_message=current_start,
             profile=self._profile,
             catalog_digest=tool_context.catalog_digest,
             provider_definitions=tools,
@@ -715,8 +786,10 @@ class DataContextBuilder:
         if not isinstance(step, int) or isinstance(step, bool) or step < 1:
             raise ValueError("step must be positive")
         messages = tuple(messages)
-        if not messages or messages[0].role is not MessageRole.USER:
-            raise ValueError("current run transcript must begin with its user message")
+        if not messages or messages[0] != snapshot.start_message:
+            raise ValueError(
+                "current run transcript must begin with its normalized start"
+            )
         if any(not isinstance(item, CanonicalMessage) for item in messages):
             raise TypeError("messages must contain CanonicalMessage records")
         if previous_request_input_tokens is not None and (
@@ -989,6 +1062,8 @@ def _history_utf8_bytes(messages: tuple[CanonicalMessage, ...]) -> int:
 
 def _eligible_completed_run(item: ConversationRun) -> bool:
     if item.result is None or item.result.kind is not LoopExitKind.COMPLETED:
+        return False
+    if item.transcript.run.origin is not RunOrigin.USER:
         return False
     messages = item.transcript.messages
     if not messages or messages[0].role is not MessageRole.USER:
@@ -1596,6 +1671,8 @@ def _redacted_arguments(call: ToolCall) -> Mapping[str, object]:
 
 def _split_working_messages(
     messages: tuple[CanonicalMessage, ...],
+    *,
+    current_start: CanonicalMessage,
 ) -> tuple[
     tuple[tuple[CanonicalMessage, ...], ...],
     tuple[CanonicalMessage, ...],
@@ -1609,6 +1686,26 @@ def _split_working_messages(
         and messages[0].content[0].text == _HISTORY_OMISSION_MARKER
     )
     working = messages[1:] if upstream_omitted else messages
+    if not working or working[-1] != current_start:
+        raise ValueError("working messages must end with the normalized run start")
+    if current_start.role is MessageRole.SYSTEM:
+        prior_working = working[:-1]
+        prior_user_positions = [
+            index
+            for index, message in enumerate(prior_working)
+            if message.role is MessageRole.USER
+        ]
+        prior_turns_list: list[tuple[CanonicalMessage, ...]] = []
+        for index, start in enumerate(prior_user_positions):
+            end = (
+                prior_user_positions[index + 1]
+                if index + 1 < len(prior_user_positions)
+                else len(prior_working)
+            )
+            prior_turns_list.append(prior_working[start:end])
+        if not prior_user_positions and prior_working:
+            raise ValueError("machine run history contains no user-authored turn")
+        return tuple(prior_turns_list), (current_start,), upstream_omitted
     user_positions = [
         index
         for index, message in enumerate(working)
@@ -1616,12 +1713,16 @@ def _split_working_messages(
     ]
     if not user_positions:
         raise ValueError("working messages must contain the current user message")
-    current_start = user_positions[-1]
-    prior: list[tuple[CanonicalMessage, ...]] = []
+    current_user_position = user_positions[-1]
+    prior_turns_list = []
     for index, start in enumerate(user_positions[:-1]):
         end = user_positions[index + 1]
-        prior.append(working[start:end])
-    return tuple(prior), working[current_start:], upstream_omitted
+        prior_turns_list.append(working[start:end])
+    return (
+        tuple(prior_turns_list),
+        working[current_user_position:],
+        upstream_omitted,
+    )
 
 
 def _latest_prior_user_query(
@@ -1758,6 +1859,12 @@ def _system_prompt(
     instructions = [
         "You are Daita, a data agent.",
         (
+            "Successful completion requires a bounded, non-empty final assistant "
+            "response with no tool calls. After required work or tools, report the "
+            "supported outcome; never finish silently or invent completion for a "
+            "failed or incomplete run."
+        ),
+        (
             "Catalog: use context IDs; catalog_schema first for SQL (bounded bridges "
             "and paths). Only then use catalog_traverse for reported unresolved paths; "
             "never call both together. catalog_inspect gives full facets and freshness."
@@ -1865,6 +1972,15 @@ def _system_prompt(
         instructions.append(
             "job_list is agent-scoped across conversations; origin_conversation_id "
             "is provenance."
+        )
+    if START_DATA_PROFILE_CAPABILITY_ID in capability_ids:
+        instructions.append(
+            "A durable-job start receipt is a handoff, not completion. In that run, "
+            "do not poll, list, inspect, read, or cancel the newly started job or "
+            "claim its outcome. Complete only unrelated explicitly requested work, "
+            "then report the receipt status and job_id. Later user-originated or "
+            "code-owned terminal-job runs may use admitted lifecycle tools for "
+            "existing jobs."
         )
     if postgresql_update_available:
         instructions.append(

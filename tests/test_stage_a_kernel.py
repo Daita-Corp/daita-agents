@@ -20,6 +20,7 @@ from daita.capabilities import (
 from daita.catalog.capabilities import CATALOG_SEARCH_CAPABILITY_ID
 from daita.capability_runtime import CapabilityRuntime
 from daita.domains.data.context import DataContextBuilder, _estimate_input_tokens
+from daita.domains.data.profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
 from daita.llm.errors import ContextEvidencePressureExceeded
 from daita.llm.models import (
     CanonicalMessage,
@@ -660,6 +661,10 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
     )
     assert first.messages[0] == second.messages[0]
     assert "changed-after-prepare" not in repr(second.messages[0])
+    assert "Successful completion requires a bounded, non-empty" in repr(
+        first.messages[0]
+    )
+    assert "durable-job start receipt is a handoff" not in repr(first.messages[0])
     assert second.sensitivity is ModelSensitivity.CONFIDENTIAL
     initial_provenance = cast(
         Mapping[str, object],
@@ -686,6 +691,49 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
     assert final.messages[0] == snapshot.final_static_messages[0]
     assert "execution step limit has been reached" in repr(final.messages[0])
     assert "execution step limit has been reached" not in repr(first.messages[0])
+
+
+async def test_context_owns_durable_job_handoff_guidance() -> None:
+    builder = DataContextBuilder(
+        _SnapshotCatalog(),
+        profile=ModelProfile(
+            id="mock:durable-handoff-context",
+            context_window_tokens=32_000,
+            max_output_tokens=2_000,
+            supports_tools=True,
+        ),
+    )
+    run = RunInput(
+        id="run-durable-handoff-context",
+        agent_id="agent-stage-a",
+        message="Profile the current table in the background.",
+        created_at=NOW,
+        conversation_id="conversation-durable-handoff-context",
+        source_id="source-stage-a",
+    )
+    user = run.start_message()
+    start_tool = ToolDefinition(
+        name="start_data_profile",
+        description="Start one durable data profile.",
+        input_schema={"type": "object", "properties": {}},
+    )
+    catalog = context_tool_catalog(
+        run,
+        (start_tool,),
+        capability_ids=(START_DATA_PROFILE_CAPABILITY_ID,),
+    )
+    request = builder.project(
+        await builder.prepare(run, (user,), catalog),
+        (user,),
+        step=1,
+        tool_context=context_step_projection(catalog),
+    )
+
+    system = request.messages[0].content[0]
+    assert isinstance(system, TextBlock)
+    assert "durable-job start receipt is a handoff" in system.text
+    assert "do not poll, list, inspect, read, or cancel" in system.text
+    assert "code-owned terminal-job run" in system.text
 
 
 async def test_context_owner_rejects_cumulative_evidence_pressure_explicitly():

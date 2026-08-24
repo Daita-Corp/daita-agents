@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol, TypeVar, cast
 
@@ -20,6 +20,7 @@ from ..llm.errors import (
     ContextWindowExceeded,
     ModelProviderError,
     ProviderErrorCode,
+    ProviderFailureDiagnostic,
     RequestSensitivityUnavailable,
     ToolCatalogLimitExceeded,
     ToolManifestLimitExceeded,
@@ -201,6 +202,43 @@ class InMemoryTranscriptStore:
         return self._results.get(run_id)
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedLoopRun:
+    """One transient preflight; it creates no transcript or resumable state."""
+
+    run: RunInput
+    prior_messages: tuple[CanonicalMessage, ...]
+    tool_catalog: object
+    context_snapshot: object
+    run_route: object | None
+    limits: LoopLimits
+
+
+class LoopPreparationError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _effective_run_limits(configured: LoopLimits, run: RunInput) -> LoopLimits:
+    """Narrow ordinary loop budgets to one immutable machine-run ceiling."""
+
+    scope = run.execution_scope
+    if scope is None:
+        return configured
+    configured_cost = configured.max_estimated_cost_usd
+    scoped_cost = scope.per_run_max_cost_usd
+    return replace(
+        configured,
+        max_total_tokens=min(configured.max_total_tokens, scope.per_run_max_tokens),
+        max_estimated_cost_usd=(
+            scoped_cost
+            if configured_cost is None
+            else min(configured_cost, scoped_cost)
+        ),
+    )
+
+
 class AgentLoop:
     """Own only cognitive progression; tools and persistence keep their own data."""
 
@@ -233,11 +271,63 @@ class AgentLoop:
         self._observer = observer
         self._stream_model_calls = stream_model_calls
 
+    async def prepare(
+        self,
+        run: RunInput,
+        *,
+        prior_messages: tuple[CanonicalMessage, ...] = (),
+    ) -> PreparedLoopRun:
+        """Validate the first request and route before durable run creation."""
+
+        if run.conversation_id is None:
+            run = replace(run, conversation_id=run.id)
+        start_message = run.start_message()
+        messages = (*prior_messages, start_message)
+        try:
+            limits = _effective_run_limits(self._limits, run)
+            tool_catalog = await self._tools.prepare_run(run)
+            snapshot = await self._context_builder.prepare(run, messages, tool_catalog)
+            projection = self._tools.project(tool_catalog, (start_message,))
+            request = self._context_builder.project(
+                snapshot,
+                (start_message,),
+                step=1,
+                tool_context=projection,
+            )
+            run_route = _begin_run_route(self._model, request)
+            if not _provider_supports_run_request(self._model, run_route, request):
+                raise LoopPreparationError("model_route_ineligible")
+            scope = run.execution_scope
+            if scope is not None and not set(
+                _run_route_provider_ids(self._model, run_route)
+            ) <= set(scope.eligible_model_routes):
+                raise LoopPreparationError("model_route_outside_execution_scope")
+            if not self._cost_limit_allows_request(request, run_route, limits):
+                raise LoopPreparationError("cost_limit_unpriced_route")
+        except LoopPreparationError:
+            raise
+        except ModelProviderError as error:
+            raise LoopPreparationError("model_route_ineligible") from error
+        except Exception as error:
+            code = _EXPECTED_LOOP_FAILURE_REASONS.get(type(error))
+            if code is not None:
+                raise LoopPreparationError(code) from error
+            raise
+        return PreparedLoopRun(
+            run=run,
+            prior_messages=prior_messages,
+            tool_catalog=tool_catalog,
+            context_snapshot=snapshot,
+            run_route=run_route,
+            limits=limits,
+        )
+
     async def run(
         self,
         run: RunInput,
         *,
         prior_messages: tuple[CanonicalMessage, ...] = (),
+        prepared: PreparedLoopRun | None = None,
     ) -> LoopExit:
         if not isinstance(run, RunInput):
             raise TypeError("run must be RunInput")
@@ -245,6 +335,10 @@ class AgentLoop:
             raise TypeError("prior_messages must contain CanonicalMessage records")
         if run.conversation_id is None:
             run = replace(run, conversation_id=run.id)
+        if prepared is not None and (
+            prepared.run != run or prepared.prior_messages != prior_messages
+        ):
+            raise ValueError("prepared loop run differs from its execution input")
         transcript = await self._transcripts.start(run)
         run_started = asyncio.get_running_loop().time()
         if self._observer is not None:
@@ -260,24 +354,30 @@ class AgentLoop:
         artifact_deliveries: list[ArtifactDeliveryReceipt] = []
         previous_request_input_tokens: int | None = None
         tool_call_count = 0
-        run_route: object | None = None
+        run_route: object | None = None if prepared is None else prepared.run_route
+        limits = (
+            _effective_run_limits(self._limits, run)
+            if prepared is None
+            else prepared.limits
+        )
 
         try:
-            user = CanonicalMessage(
-                role=MessageRole.USER,
-                content=(TextBlock(run.message),),
-            )
-            await self._transcripts.append(run.id, user)
-            messages = (*messages, user)
+            start_message = run.start_message()
+            await self._transcripts.append(run.id, start_message)
+            messages = (*messages, start_message)
             started = asyncio.get_running_loop().time()
-            deadline = started + self._limits.max_wall_time_seconds
-            tool_catalog = await _before(deadline, self._tools.prepare_run(run))
-            context_snapshot = await _before(
-                deadline,
-                self._context_builder.prepare(run, messages, tool_catalog),
-            )
-            for step in range(1, self._limits.max_steps + 1):
-                if self._wall_time_exhausted(started):
+            deadline = started + limits.max_wall_time_seconds
+            if prepared is None:
+                tool_catalog = await _before(deadline, self._tools.prepare_run(run))
+                context_snapshot = await _before(
+                    deadline,
+                    self._context_builder.prepare(run, messages, tool_catalog),
+                )
+            else:
+                tool_catalog = prepared.tool_catalog
+                context_snapshot = prepared.context_snapshot
+            for step in range(1, limits.max_steps + 1):
+                if self._wall_time_exhausted(started, limits):
                     return await self._finish(
                         run,
                         LoopExitKind.FAILED,
@@ -328,7 +428,7 @@ class AgentLoop:
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
                     )
-                if not self._cost_limit_allows_request(request, run_route):
+                if not self._cost_limit_allows_request(request, run_route, limits):
                     return await self._finish(
                         run,
                         LoopExitKind.FAILED,
@@ -396,7 +496,7 @@ class AgentLoop:
                     )
 
                 assert response.tool_calls
-                if len(response.tool_calls) > self._limits.max_tool_calls_per_response:
+                if len(response.tool_calls) > limits.max_tool_calls_per_response:
                     return await self._finish(
                         run,
                         LoopExitKind.FAILED,
@@ -409,7 +509,7 @@ class AgentLoop:
                     )
                 if (
                     tool_call_count + len(response.tool_calls)
-                    > self._limits.max_tool_calls_per_run
+                    > limits.max_tool_calls_per_run
                 ):
                     return await self._finish(
                         run,
@@ -435,7 +535,7 @@ class AgentLoop:
                     ),
                     response.tool_calls,
                     recovery_timeout_seconds=(
-                        self._limits.side_effect_recovery_timeout_seconds + 0.25
+                        limits.side_effect_recovery_timeout_seconds + 0.25
                     ),
                 )
                 results = outcome.ordered_results
@@ -490,7 +590,7 @@ class AgentLoop:
                         artifact_deliveries=tuple(artifact_deliveries),
                     )
 
-                budget_reason = self._usage_limit_reason(usage)
+                budget_reason = self._usage_limit_reason(usage, limits)
                 if budget_reason is not None:
                     if budget_reason.startswith("cost_limit_"):
                         return await self._finish(
@@ -515,6 +615,7 @@ class AgentLoop:
                         step_tool_projection,
                         previous_request_input_tokens,
                         run_route,
+                        limits,
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
                     )
@@ -522,7 +623,7 @@ class AgentLoop:
             return await self._wrap_up(
                 run,
                 messages[current_start:],
-                self._limits.max_steps,
+                limits.max_steps,
                 usage,
                 "step_limit_reached",
                 deadline,
@@ -531,6 +632,7 @@ class AgentLoop:
                 step_tool_projection,
                 previous_request_input_tokens,
                 run_route,
+                limits,
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
             )
@@ -584,6 +686,8 @@ class AgentLoop:
                 _completed_steps(messages[current_start:]),
                 usage,
                 run_started,
+                provider_id=error.provider_id,
+                provider_failure=error.diagnostic,
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
             )
@@ -613,6 +717,7 @@ class AgentLoop:
         tool_context: object,
         previous_request_input_tokens: int | None,
         run_route: object | None,
+        limits: LoopLimits,
         *,
         artifacts: tuple[ArtifactRef, ...],
         artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...],
@@ -647,7 +752,7 @@ class AgentLoop:
                 artifacts=artifacts,
                 artifact_deliveries=artifact_deliveries,
             )
-        if not self._cost_limit_allows_request(request, run_route):
+        if not self._cost_limit_allows_request(request, run_route, limits):
             return await self._finish(
                 run,
                 LoopExitKind.FAILED,
@@ -744,6 +849,8 @@ class AgentLoop:
         *,
         final_text: str | None = None,
         final_message: CanonicalMessage | None = None,
+        provider_id: str | None = None,
+        provider_failure: ProviderFailureDiagnostic | None = None,
         artifacts: tuple[ArtifactRef, ...] = (),
         artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...] = (),
     ) -> LoopExit:
@@ -755,6 +862,8 @@ class AgentLoop:
             final_text=final_text,
             steps=steps,
             usage=usage,
+            provider_id=provider_id,
+            provider_failure=provider_failure,
             artifacts=artifacts,
             artifact_deliveries=artifact_deliveries,
             created_at=self._clock(),
@@ -965,18 +1074,18 @@ class AgentLoop:
             event,
         )
 
-    def _wall_time_exhausted(self, started: float) -> bool:
+    def _wall_time_exhausted(self, started: float, limits: LoopLimits) -> bool:
         return (
-            asyncio.get_running_loop().time() - started
-            >= self._limits.max_wall_time_seconds
+            asyncio.get_running_loop().time() - started >= limits.max_wall_time_seconds
         )
 
     def _cost_limit_allows_request(
         self,
         request: ModelRequest,
         run_route: object | None,
+        limits: LoopLimits,
     ) -> bool:
-        if self._limits.max_estimated_cost_usd is None:
+        if limits.max_estimated_cost_usd is None:
             return True
         return _provider_has_complete_run_pricing(
             self._model,
@@ -984,10 +1093,14 @@ class AgentLoop:
             request,
         )
 
-    def _usage_limit_reason(self, usage: ModelUsage) -> str | None:
-        if usage.total_tokens >= self._limits.max_total_tokens:
+    def _usage_limit_reason(
+        self,
+        usage: ModelUsage,
+        limits: LoopLimits,
+    ) -> str | None:
+        if usage.total_tokens >= limits.max_total_tokens:
             return "token_limit_reached"
-        cost_limit = self._limits.max_estimated_cost_usd
+        cost_limit = limits.max_estimated_cost_usd
         if cost_limit is not None:
             estimate = usage.cost_estimate
             if estimate.status is not CostEstimateStatus.COMPLETE:
@@ -1028,6 +1141,21 @@ def _begin_run_route(provider: object, request: ModelRequest) -> object | None:
     if not callable(begin):
         return None
     return begin(request.sensitivity)
+
+
+def _run_route_provider_ids(
+    provider: object,
+    run_route: object | None,
+) -> tuple[str, ...]:
+    candidates = getattr(run_route, "candidate_provider_ids", None)
+    if isinstance(candidates, tuple) and all(
+        isinstance(item, str) and item for item in candidates
+    ):
+        return candidates
+    provider_id = getattr(provider, "provider_id", None)
+    if not isinstance(provider_id, str) or not provider_id:
+        raise LoopPreparationError("model_route_identity_unavailable")
+    return (provider_id,)
 
 
 def _provider_supports_run_request(
@@ -1245,6 +1373,8 @@ __all__ = [
     "AgentLoop",
     "ContextBuilder",
     "InMemoryTranscriptStore",
+    "LoopPreparationError",
+    "PreparedLoopRun",
     "ToolRuntime",
     "TranscriptStore",
 ]

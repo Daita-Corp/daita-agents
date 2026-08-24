@@ -594,6 +594,10 @@ class CapabilityRuntime:
                 )
                 if resolved_owner != owner_id:
                     raise ValueError(f"tool projected by the wrong domain: {name}")
+                if run.execution_scope is not None and not run.execution_scope.allows(
+                    capability
+                ):
+                    continue
                 schema_digest = _sha256_digest(capability.input_schema)
                 origin_digest = view.origin_revision_digest or _sha256_digest(
                     {
@@ -625,13 +629,17 @@ class CapabilityRuntime:
             or (manifest_bytes + 3) // 4 > self._limits.max_domain_manifest_tokens
         ):
             raise ToolManifestLimitExceeded()
-        execution_scope_digest = _sha256_digest(
-            {
-                "run_id": run.id,
-                "agent_id": run.agent_id,
-                "source_id": run.source_id,
-                "conversation_source_id": run.conversation_source_id,
-            }
+        execution_scope_digest = (
+            run.execution_scope.digest
+            if run.execution_scope is not None
+            else _sha256_digest(
+                {
+                    "run_id": run.id,
+                    "agent_id": run.agent_id,
+                    "source_id": run.source_id,
+                    "conversation_source_id": run.conversation_source_id,
+                }
+            )
         )
         catalog_material = {
             "run_id": run.id,
@@ -1373,6 +1381,7 @@ class CapabilityRuntime:
             ):
                 raise ValueError("tool catalog execution identity changed")
             capability = resolved
+            _validate_run_execution_scope(run, capability, sensitivity)
             domain = self._domains[owner_id]
             if validated_arguments is None:
                 raw_arguments = domain.normalize_arguments(capability, call.arguments)
@@ -1438,6 +1447,7 @@ class CapabilityRuntime:
             raise
         except BaseException as error:
             result = self._exception_result(call, error, domain)
+        result = _with_execution_lineage(result, capability)
         result = _bounded_tool_result(call, result, self._limits)
         self._emit_tool_completed(
             run,
@@ -1488,6 +1498,7 @@ class CapabilityRuntime:
             request_sensitivity=sensitivity,
         )
         output = self._registry.validate_output(capability.id, output)
+        _validate_output_execution_scope(run, capability, output)
         artifact_ref = await self._commit_artifact_output(
             run,
             call,
@@ -1722,6 +1733,7 @@ class CapabilityRuntime:
                 request_sensitivity=sensitivity,
             )
             output = self._registry.validate_output(capability.id, output)
+            _validate_output_execution_scope(run, capability, output)
             if output.artifact is not None or capability.artifact_policy is not None:
                 raise ToolOutputValidationError(
                     "side-effect capability cannot produce an artifact draft"
@@ -2505,6 +2517,48 @@ def _duration_ms(started: float) -> int:
     return max(0, int(elapsed * 1_000))
 
 
+def _validate_run_execution_scope(
+    run: RunInput,
+    capability: Capability,
+    sensitivity: ModelSensitivity,
+) -> None:
+    scope = run.execution_scope
+    if scope is None:
+        return
+    if (
+        scope.agent_id != run.agent_id
+        or run.source_id not in scope.allowed_source_ids
+        or not scope.allows(capability)
+    ):
+        raise CapabilityInputError(
+            "execution_scope_violation",
+            "The requested capability is outside this run's immutable execution scope.",
+            {"capability_id": capability.id},
+        )
+    if sensitivity.routing_rank > scope.sensitivity_ceiling.routing_rank:
+        raise CapabilityInputError(
+            "execution_scope_sensitivity_exceeded",
+            "The current request sensitivity exceeds this run's immutable ceiling.",
+            {"capability_id": capability.id},
+        )
+
+
+def _validate_output_execution_scope(
+    run: RunInput,
+    capability: Capability,
+    output: ToolOutput,
+) -> None:
+    scope = run.execution_scope
+    if scope is None or output.sensitivity is None:
+        return
+    if output.sensitivity.routing_rank > scope.sensitivity_ceiling.routing_rank:
+        raise CapabilityInputError(
+            "execution_scope_sensitivity_exceeded",
+            "The validated result exceeds this run's immutable sensitivity ceiling.",
+            {"capability_id": capability.id},
+        )
+
+
 def _source_pressure_key(run: RunInput, call: ToolCall) -> str:
     source_id = call.arguments.get("source_id")
     if isinstance(source_id, str):
@@ -2589,6 +2643,19 @@ def _classified_success(
         output=result,
         sensitivity=output.sensitivity,
         sensitivity_provenance=output.sensitivity_provenance,
+    )
+
+
+def _with_execution_lineage(
+    result: ToolResultBlock,
+    capability: Capability,
+) -> ToolResultBlock:
+    """Persist stable code-owned capability lineage with every executed result."""
+
+    return replace(
+        result,
+        capability_id=capability.id,
+        executor_id=capability.executor_id,
     )
 
 

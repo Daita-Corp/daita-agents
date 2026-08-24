@@ -16,7 +16,13 @@ from typing import Protocol
 from uuid import uuid4
 
 from ..._json import canonical_json
-from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
+from ..errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+    detached_provider_error,
+)
 from ..models import (
     CanonicalMessage,
     FinishReason,
@@ -1050,6 +1056,10 @@ class ClaudeCodeSubscriptionProvider:
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "Claude Code subscription client returned a malformed response",
                 provider_id=self.provider_id,
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.SUBSCRIPTION_OUTPUT,
+                    code="response_decode_failed",
+                ),
             )
         except Exception:
             failure = ModelProviderError(
@@ -1058,7 +1068,7 @@ class ClaudeCodeSubscriptionProvider:
                 provider_id=self.provider_id,
             )
         assert failure is not None
-        raise detached_provider_error(failure)
+        raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _generate(self, request: ModelRequest) -> ModelResponse:
         if not self.supports_request_policy(request):
@@ -1204,6 +1214,10 @@ class GrokBuildSubscriptionProvider:
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "Grok Build subscription client returned a malformed response",
                 provider_id=self.provider_id,
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.SUBSCRIPTION_OUTPUT,
+                    code="response_decode_failed",
+                ),
             )
         except Exception:
             failure = ModelProviderError(
@@ -1212,7 +1226,7 @@ class GrokBuildSubscriptionProvider:
                 provider_id=self.provider_id,
             )
         assert failure is not None
-        raise detached_provider_error(failure)
+        raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _generate(self, request: ModelRequest) -> ModelResponse:
         if not self.supports_request_policy(request):

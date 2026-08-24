@@ -256,6 +256,7 @@ class DataCapabilityDomain:
             self._learning.validate_effect(run.id, call)
         arguments = self._apply_source_scope(run, capability, arguments)
         await self._validate_source_scope(run, capability, arguments)
+        self._validate_execution_resource_scope(run, capability, arguments)
         await self._validate_resource_read_scope(run, capability, arguments)
         if capability.access_mode is AccessMode.WRITE and (
             capability.id != POSTGRESQL_UPDATE_CAPABILITY_ID
@@ -462,6 +463,8 @@ class DataCapabilityDomain:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from error
+        if run.execution_scope is not None:
+            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         if any(resource_id not in readable for resource_id in requested):
             raise CapabilityInputError(
                 "resource_read_not_allowed",
@@ -518,6 +521,8 @@ class DataCapabilityDomain:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from error
+        if run.execution_scope is not None:
+            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         validator = (
             validate_postgresql_read
             if expected_adapter == "postgresql"
@@ -555,6 +560,44 @@ class DataCapabilityDomain:
                 "source_id": source_id,
             },
         )
+
+    def _validate_execution_resource_scope(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> None:
+        scope = run.execution_scope
+        if scope is None:
+            return
+        if capability.id in {
+            CATALOG_SEARCH_CAPABILITY_ID,
+            CATALOG_TRAVERSE_CAPABILITY_ID,
+        }:
+            raise CapabilityInputError(
+                "execution_scope_resource_violation",
+                "This autonomous run cannot perform open-ended catalog discovery.",
+            )
+        resource_ids: tuple[object, ...] = ()
+        if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
+            resource_ids = (arguments.get("resource_id"),)
+        elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
+            raw = arguments.get("resource_ids", ())
+            resource_ids = raw if isinstance(raw, tuple) else ()
+            if not resource_ids:
+                raise CapabilityInputError(
+                    "execution_scope_resource_violation",
+                    "This autonomous run requires exact catalog resource IDs.",
+                )
+        allowed = frozenset(scope.allowed_resource_ids)
+        if any(
+            not isinstance(resource_id, str) or resource_id not in allowed
+            for resource_id in resource_ids
+        ):
+            raise CapabilityInputError(
+                "execution_scope_resource_violation",
+                "The requested resource is outside this run's immutable scope.",
+            )
 
     async def _validate_postgresql_update_call(
         self,
@@ -648,6 +691,8 @@ class DataCapabilityDomain:
             run.agent_id,
             source_ids,
         )
+        if run.execution_scope is not None:
+            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         return replace(
             output,
             sensitivity=sensitivity,

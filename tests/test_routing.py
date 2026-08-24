@@ -1,6 +1,13 @@
 from decimal import Decimal
 
-from daita.llm.errors import ModelProviderError, ProviderErrorCode
+import pytest
+
+from daita.llm.errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+)
 from daita.llm.factory import create_model_route_provider
 from daita.llm.models import (
     CanonicalMessage,
@@ -281,6 +288,34 @@ async def test_router_preserves_unavailable_estimate_when_all_attempts_fail():
         assert error.usage.cost_estimate.amount_usd is None
     else:
         raise AssertionError("router should preserve the final provider failure")
+
+
+async def test_router_preserves_final_bounded_provider_diagnostic():
+    diagnostic = ProviderFailureDiagnostic(
+        phase=ProviderFailurePhase.RESPONSE_DECODE,
+        code="response_decode_failed",
+        terminal_status="completed",
+    )
+    provider = MockModelProvider(
+        (
+            ModelProviderError(
+                ProviderErrorCode.MALFORMED_RESPONSE,
+                provider_id="mock:diagnostic",
+                diagnostic=diagnostic,
+            ),
+        ),
+        provider_id="mock:diagnostic",
+    )
+    router = ModelRouter(
+        (registration(provider),),
+        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+    )
+
+    with pytest.raises(ModelProviderError) as caught:
+        await router.generate(request())
+
+    assert caught.value.provider_id == "mock:diagnostic"
+    assert caught.value.diagnostic == diagnostic
 
 
 async def test_router_retries_stream_before_progress_and_aggregates_completion():

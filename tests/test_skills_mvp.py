@@ -984,6 +984,8 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
             )
         }
         assert tables == {
+            "autonomous_followups",
+            "conversation_inbox",
             "database_write_receipts",
             "learning_candidates",
             "job_runs",

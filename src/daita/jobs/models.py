@@ -150,6 +150,25 @@ class ExternalObservedStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class JobCompletionOwnerKind(str, Enum):
+    STANDALONE_FOLLOWUP = "standalone_followup"
+
+
+@dataclass(frozen=True, slots=True)
+class JobCompletionBinding:
+    owner_kind: JobCompletionOwnerKind
+    owner_id: str
+    terminal_event_id: str
+    bound_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.owner_kind, JobCompletionOwnerKind):
+            raise TypeError("job completion owner kind is invalid")
+        _text(self.owner_id, "job completion owner_id", maximum=256)
+        _text(self.terminal_event_id, "job completion event_id", maximum=512)
+        _utc(self.bound_at, "job completion bound_at")
+
+
 @dataclass(frozen=True, slots=True)
 class JobResourceBinding:
     source_id: str
@@ -500,6 +519,7 @@ class JobRun:
     cancel_requested_at: datetime | None = None
     terminal_at: datetime | None = None
     terminal_observed_at: datetime | None = None
+    completion_binding: JobCompletionBinding | None = None
     result: JobResult | None = None
     failure_code: str | None = None
 
@@ -559,6 +579,15 @@ class JobRun:
             raise ValueError("job terminal state must agree with terminal_at")
         if self.terminal_observed_at is not None and not terminal:
             raise ValueError("only a terminal job can be observed terminal")
+        if (self.terminal_observed_at is None) != (self.completion_binding is None):
+            raise ValueError(
+                "job terminal observation and completion binding must agree"
+            )
+        if self.completion_binding is not None:
+            if not terminal:
+                raise ValueError("only a terminal job can bind completion")
+            if self.completion_binding.bound_at != self.terminal_observed_at:
+                raise ValueError("job completion binding time must match observation")
         if self.status is JobStatus.SUCCEEDED:
             if not isinstance(self.result, JobResult):
                 raise ValueError("successful job requires its exact result")
@@ -589,6 +618,12 @@ class JobRun:
     def source_ids(self) -> tuple[str, ...]:
         return tuple(
             sorted({item.source_id for item in self.specification.resource_bindings})
+        )
+
+    @property
+    def resource_ids(self) -> tuple[str, ...]:
+        return tuple(
+            sorted({item.resource_id for item in self.specification.resource_bindings})
         )
 
     @property
@@ -722,6 +757,8 @@ __all__ = [
     "JobAttempt",
     "JobAttemptStatus",
     "JobAttemptView",
+    "JobCompletionBinding",
+    "JobCompletionOwnerKind",
     "JobDesiredState",
     "JobExecutionMode",
     "JobInspection",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ...llm.errors import ProviderFailureDiagnostic, ProviderFailurePhase
 from ...llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -19,7 +20,13 @@ from ...llm.pricing import (
     PricingModifier,
     PricingUsageRange,
 )
-from ...loop.models import LoopExit, LoopExitKind, RunInput
+from ...loop.models import (
+    LoopExit,
+    LoopExitKind,
+    RunInput,
+    RunOrigin,
+    RunStartEnvelope,
+)
 from .artifacts import (
     decode_artifact_ref,
     decode_delivery_receipt,
@@ -50,6 +57,7 @@ from .common import (
     sequence,
     text,
 )
+from .execution_scope import decode_execution_scope, encode_execution_scope
 
 
 def encode_run_input(value: RunInput) -> str:
@@ -93,6 +101,7 @@ def _encode_run_input(value: RunInput) -> dict[str, JsonValue]:
             "conversation_id": value.conversation_id,
             "source_id": value.source_id,
             "conversation_source_id": value.conversation_source_id,
+            "start": _encode_run_start(value.start),
         },
     )
 
@@ -109,6 +118,7 @@ def _decode_run_input(value: JsonValue) -> RunInput:
             "conversation_id",
             "source_id",
             "conversation_source_id",
+            "start",
         ),
     )
     return RunInput(
@@ -121,6 +131,76 @@ def _decode_run_input(value: JsonValue) -> RunInput:
         conversation_source_id=optional_text(
             fields["conversation_source_id"], "conversation source_id"
         ),
+        start=_decode_run_start(fields["start"]),
+    )
+
+
+def _encode_run_start(value: RunStartEnvelope | None):
+    if not isinstance(value, RunStartEnvelope):
+        raise TypeError("normalized run input requires RunStartEnvelope")
+    return record(
+        "RunStartEnvelope",
+        {
+            "origin": value.origin.value,
+            "user_message": value.user_message,
+            "trusted_instruction_id": value.trusted_instruction_id,
+            "trusted_instruction": value.trusted_instruction,
+            "instruction_digest": value.instruction_digest,
+            "untrusted_payload": plain_encode(value.untrusted_payload),
+            "payload_digest": value.payload_digest,
+            "execution_scope": (
+                None
+                if value.execution_scope is None
+                else encode_execution_scope(value.execution_scope)
+            ),
+        },
+    )
+
+
+def _decode_run_start(value) -> RunStartEnvelope:
+    fields = record_fields(
+        value,
+        "RunStartEnvelope",
+        (
+            "origin",
+            "user_message",
+            "trusted_instruction_id",
+            "trusted_instruction",
+            "instruction_digest",
+            "untrusted_payload",
+            "payload_digest",
+            "execution_scope",
+        ),
+    )
+    try:
+        origin = RunOrigin(text(fields["origin"], "run start origin"))
+    except ValueError:
+        raise ValueError("stored run start origin is invalid") from None
+    payload = plain_decode(fields["untrusted_payload"])
+    if not isinstance(payload, dict):
+        raise ValueError("stored run start payload must be an object")
+    scope = fields["execution_scope"]
+    return RunStartEnvelope(
+        origin=origin,
+        user_message=optional_text(fields["user_message"], "run start user message"),
+        trusted_instruction_id=optional_text(
+            fields["trusted_instruction_id"],
+            "run start trusted instruction id",
+        ),
+        trusted_instruction=optional_text(
+            fields["trusted_instruction"],
+            "run start trusted instruction",
+        ),
+        instruction_digest=optional_text(
+            fields["instruction_digest"],
+            "run start instruction digest",
+        ),
+        untrusted_payload=payload,
+        payload_digest=optional_text(
+            fields["payload_digest"],
+            "run start payload digest",
+        ),
+        execution_scope=None if scope is None else decode_execution_scope(scope),
     )
 
 
@@ -175,6 +255,8 @@ def _encode_tool_result(value: ToolResultBlock) -> dict[str, JsonValue]:
                 else enum_encode(value.sensitivity, "ModelSensitivity")
             ),
             "sensitivity_provenance": plain_encode(value.sensitivity_provenance),
+            "capability_id": value.capability_id,
+            "executor_id": value.executor_id,
         },
     )
 
@@ -189,6 +271,8 @@ def _decode_tool_result(value: JsonValue) -> ToolResultBlock:
             "is_error",
             "sensitivity",
             "sensitivity_provenance",
+            "capability_id",
+            "executor_id",
         ),
     )
     output = plain_decode(mapping(fields["output"], "tool-result output"))
@@ -211,6 +295,14 @@ def _decode_tool_result(value: JsonValue) -> ToolResultBlock:
             )
         ),
         sensitivity_provenance=provenance,
+        capability_id=optional_text(
+            fields["capability_id"],
+            "tool-result capability id",
+        ),
+        executor_id=optional_text(
+            fields["executor_id"],
+            "tool-result executor id",
+        ),
     )
 
 
@@ -477,6 +569,12 @@ def _encode_loop_exit(value: LoopExit) -> dict[str, JsonValue]:
             "final_text": value.final_text,
             "steps": value.steps,
             "usage": _encode_model_usage(value.usage),
+            "provider_id": value.provider_id,
+            "provider_failure": (
+                None
+                if value.provider_failure is None
+                else _encode_provider_failure(value.provider_failure)
+            ),
             "artifacts": [encode_artifact_ref(item) for item in value.artifacts],
             "artifact_deliveries": [
                 encode_delivery_receipt(item) for item in value.artifact_deliveries
@@ -498,6 +596,8 @@ def _decode_loop_exit(value: JsonValue) -> LoopExit:
             "final_text",
             "steps",
             "usage",
+            "provider_id",
+            "provider_failure",
             "artifacts",
             "artifact_deliveries",
         ),
@@ -511,6 +611,12 @@ def _decode_loop_exit(value: JsonValue) -> LoopExit:
         final_text=optional_text(fields["final_text"], "loop-exit final text"),
         steps=integer(fields["steps"], "loop-exit steps"),
         usage=_decode_model_usage(fields["usage"]),
+        provider_id=optional_text(fields["provider_id"], "loop-exit provider id"),
+        provider_failure=(
+            None
+            if fields["provider_failure"] is None
+            else _decode_provider_failure(fields["provider_failure"])
+        ),
         artifacts=tuple(
             decode_artifact_ref(item)
             for item in sequence(fields["artifacts"], "loop-exit artifacts")
@@ -520,5 +626,59 @@ def _decode_loop_exit(value: JsonValue) -> LoopExit:
             for item in sequence(
                 fields["artifact_deliveries"], "loop-exit artifact deliveries"
             )
+        ),
+    )
+
+
+def _encode_provider_failure(
+    value: ProviderFailureDiagnostic,
+) -> dict[str, JsonValue]:
+    return record(
+        "ProviderFailureDiagnostic",
+        {
+            "phase": enum_encode(value.phase, "ProviderFailurePhase"),
+            "code": value.code,
+            "event_type": value.event_type,
+            "terminal_status": value.terminal_status,
+            "output_item_types": list(value.output_item_types),
+            "response_id_digest": value.response_id_digest,
+        },
+    )
+
+
+def _decode_provider_failure(value: JsonValue) -> ProviderFailureDiagnostic:
+    fields = record_fields(
+        value,
+        "ProviderFailureDiagnostic",
+        (
+            "phase",
+            "code",
+            "event_type",
+            "terminal_status",
+            "output_item_types",
+            "response_id_digest",
+        ),
+    )
+    return ProviderFailureDiagnostic(
+        phase=enum_decode(
+            fields["phase"],
+            ProviderFailurePhase,
+            "ProviderFailurePhase",
+        ),
+        code=text(fields["code"], "provider failure code"),
+        event_type=optional_text(fields["event_type"], "provider failure event type"),
+        terminal_status=optional_text(
+            fields["terminal_status"], "provider failure terminal status"
+        ),
+        output_item_types=tuple(
+            text(item, "provider failure output item type")
+            for item in sequence(
+                fields["output_item_types"],
+                "provider failure output item types",
+            )
+        ),
+        response_id_digest=optional_text(
+            fields["response_id_digest"],
+            "provider failure response ID digest",
         ),
     )

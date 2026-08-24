@@ -52,13 +52,29 @@ from ..artifacts.models import (
     ArtifactPayload,
 )
 from ..artifacts.store import AgentHomeArtifactStore
+from ..autonomy import (
+    DeliveryState,
+    FOLLOWUP_INSTRUCTION,
+    FOLLOWUP_INSTRUCTION_DIGEST,
+    FOLLOWUP_INSTRUCTION_ID,
+    FOLLOWUP_LEASE_SECONDS,
+    FollowupDisposition,
+    InboxItem,
+    create_terminal_job_followup,
+)
 from ..capabilities import (
+    AccessMode,
     ApprovalHandler,
     CapabilityDeclarations,
     CapabilityRegistry,
+    OperationalEffect,
 )
 from ..capability_runtime import CapabilityRuntime
-from ..catalog.capabilities import catalog_declarations
+from ..catalog.capabilities import (
+    CATALOG_INSPECT_CAPABILITY_ID,
+    CATALOG_SCHEMA_CAPABILITY_ID,
+    catalog_declarations,
+)
 from ..catalog.models import (
     CatalogResource,
     CatalogSearchRequest,
@@ -83,6 +99,9 @@ from ..domains.data import (
     postgresql_update_declarations,
     postgresql_update_preview_declarations,
     sqlite_query_declarations,
+    LOCAL_FILE_READ_CAPABILITY_ID,
+    POSTGRESQL_QUERY_CAPABILITY_ID,
+    SQLITE_QUERY_CAPABILITY_ID,
 )
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
 from ..domains.learning import LearningCandidateGuard
@@ -90,6 +109,7 @@ from ..domains.mcp import MCPActivatedBinding, activate_mcp_domain
 from ..domains.data.context import _project_completed_history
 from ..domains.data.profile_jobs import (
     DATA_PROFILE_DOMAIN_OWNER_ID,
+    DataProfileAdmission,
     DataProfileCapabilityDomain,
     data_profile_declarations,
 )
@@ -133,15 +153,34 @@ from ..llm.subscription_auth import CodexDevicePrompt, login_codex_subscription
 from ..loop.driver import (
     AgentLoop,
     ContextBuilder,
+    LoopPreparationError,
     ToolRuntime,
 )
-from ..loop.models import ConversationRun, LoopExit, LoopLimits, RunInput, Transcript
+from ..loop.models import (
+    ConversationRun,
+    LoopExit,
+    LoopLimits,
+    RunInput,
+    RunOrigin,
+    RunStartEnvelope,
+    Transcript,
+)
 from ..jobs.capabilities import (
     JOB_DOMAIN_OWNER_ID,
+    JOB_INSPECT_CAPABILITY_ID,
+    JOB_READ_RESULTS_CAPABILITY_ID,
     JobCapabilityDomain,
     job_capability_declarations,
 )
-from ..jobs.models import JobInspection, JobResultView, JobStatus, JobSummary
+from ..jobs.models import (
+    JobCompletionOwnerKind,
+    JobExecutionMode,
+    JobInspection,
+    JobResultView,
+    JobStatus,
+    JobSummary,
+    TERMINAL_JOB_STATUSES,
+)
 from ..jobs.owner import JobOwner
 from ..jobs.supervisor import JobSupervisor
 from ..memory import MemoryStore
@@ -213,6 +252,16 @@ _BUILTIN_PROVIDERS = frozenset(
     {"openai", "anthropic", "gemini", "grok", "ollama", *_SUBSCRIPTION_PROVIDERS}
 )
 _T = TypeVar("_T")
+_STAGE_C_ALLOWED_CAPABILITY_IDS = (
+    CATALOG_INSPECT_CAPABILITY_ID,
+    CATALOG_SCHEMA_CAPABILITY_ID,
+    LOCAL_FILE_READ_CAPABILITY_ID,
+    POSTGRESQL_QUERY_CAPABILITY_ID,
+    SQLITE_QUERY_CAPABILITY_ID,
+    JOB_INSPECT_CAPABILITY_ID,
+    JOB_READ_RESULTS_CAPABILITY_ID,
+)
+_STAGE_C_SAFETY_WAKE_SECONDS = 5.0
 
 
 def _utc_now() -> datetime:
@@ -221,6 +270,37 @@ def _utc_now() -> datetime:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
+
+
+def _stage_c_capability_ids(registry: CapabilityRegistry) -> tuple[str, ...]:
+    return registry.validate_execution_scope_grant(
+        _STAGE_C_ALLOWED_CAPABILITY_IDS,
+        allowed_access_modes=frozenset({AccessMode.NONE, AccessMode.READ}),
+        allowed_operational_effects=frozenset({OperationalEffect.NONE}),
+    )
+
+
+def _stage_c_model_routes(
+    model: ModelProvider | None,
+    model_route: ModelRoute | None,
+) -> tuple[str, ...]:
+    if model_route is not None:
+        return tuple(candidate.provider_id for candidate in model_route.candidates)
+    if isinstance(model, ModelRouter):
+        return tuple(
+            registration.provider.provider_id for registration in model.candidates
+        )
+    if model is None:
+        return ()
+    return (model.provider_id,)
+
+
+def _safe_followup_failure_code(error: Exception) -> str:
+    candidate = getattr(error, "code", None)
+    if not isinstance(candidate, str):
+        candidate = type(error).__name__
+    normalized = re.sub(r"[^a-z0-9_]+", "_", candidate.casefold()).strip("_")
+    return f"followup_{normalized[:96] or 'revalidation_failed'}"
 
 
 def _validate_conversation_id(value: str) -> None:
@@ -401,6 +481,9 @@ class EmbeddedAgent:
         capability_runtime: CapabilityRuntime,
         job_owner: JobOwner,
         job_supervisor: JobSupervisor,
+        data_profile_admission: DataProfileAdmission,
+        followup_wake: asyncio.Event,
+        followup_model_routes: tuple[str, ...],
         data_profile_job_domain: DataProfileCapabilityDomain,
         learning_candidate_guard: LearningCandidateGuard,
         semantic_domain: SemanticCapabilityDomain,
@@ -448,6 +531,10 @@ class EmbeddedAgent:
         self._capability_runtime = capability_runtime
         self._job_owner = job_owner
         self._job_supervisor = job_supervisor
+        self._data_profile_admission = data_profile_admission
+        self._followup_wake = followup_wake
+        self._followup_model_routes = followup_model_routes
+        self._followup_driver: asyncio.Task[None] | None = None
         self._data_profile_job_domain = data_profile_job_domain
         self._learning_candidate_guard = learning_candidate_guard
         self._semantic_domain = semantic_domain
@@ -1127,6 +1214,7 @@ class EmbeddedAgent:
             artifacts=artifact_store,
             limits=limits,
         )
+        followup_wake = asyncio.Event()
         job_supervisor = JobSupervisor(
             agent_id=identity.id,
             store=store,
@@ -1136,6 +1224,11 @@ class EmbeddedAgent:
             artifacts=artifact_store,
             clock=clock,
             id_factory=id_factory,
+            on_terminal=lambda job: (
+                followup_wake.set()
+                if job.specification.execution_mode is JobExecutionMode.DAITA
+                else None
+            ),
         )
         job_owner.bind_wake(job_supervisor.wake)
         resolved_context = context_builder
@@ -1186,6 +1279,9 @@ class EmbeddedAgent:
             capability_runtime=capability_runtime,
             job_owner=job_owner,
             job_supervisor=job_supervisor,
+            data_profile_admission=data_profile_admission,
+            followup_wake=followup_wake,
+            followup_model_routes=_stage_c_model_routes(model, model_route),
             data_profile_job_domain=data_profile_job_domain,
             learning_candidate_guard=learning_candidate_guard,
             semantic_domain=semantic_domain,
@@ -1218,6 +1314,7 @@ class EmbeddedAgent:
             id_factory=id_factory,
         )
         await job_supervisor.start()
+        embedded._start_followup_driver()
         return embedded
 
     def model_requires_explicit_limits(self, *, provider: str, model: str) -> bool:
@@ -1597,6 +1694,360 @@ class EmbeddedAgent:
     async def transcript(self, run_id: str) -> Transcript:
         self._require_open()
         return await self._transcripts.load(run_id)
+
+    def _start_followup_driver(self) -> None:
+        if (
+            self._loop is None
+            or self._data_context_builder is None
+            or self._limits.max_estimated_cost_usd is None
+            or not self._followup_model_routes
+        ):
+            return
+        if self._followup_driver is not None:
+            raise RuntimeError("autonomous follow-up driver is already started")
+        self._followup_driver = asyncio.create_task(
+            self._drive_followups(),
+            name=f"daita-followups:{self.identity.id}",
+        )
+
+    async def _drive_followups(self) -> None:
+        try:
+            while not self._closed:
+                self._followup_wake.clear()
+                try:
+                    await self._store.recover_stale_autonomous_followups(
+                        self.identity.id,
+                        recovered_at=self._clock(),
+                    )
+                    await self._admit_terminal_followups()
+                    await self._reconcile_terminal_followups()
+                    claimed = await self._store.claim_next_autonomous_followup(
+                        self.identity.id,
+                        claim_token=self._id_factory("followup-claim"),
+                        reserved_run_id=self._id_factory("run"),
+                        claimed_at=self._clock(),
+                        lease_seconds=FOLLOWUP_LEASE_SECONDS,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    claimed = None
+                if claimed is not None:
+                    try:
+                        await self._execute_followup(claimed.followup_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # The durable claim or terminal run remains recoverable. One
+                        # item must not stop unrelated Stage C progress.
+                        pass
+                    continue
+                timeout = _STAGE_C_SAFETY_WAKE_SECONDS
+                try:
+                    deadline = await self._store.next_autonomous_followup_deadline(
+                        self.identity.id
+                    )
+                    if deadline is not None:
+                        timeout = min(
+                            timeout,
+                            max(0.25, (deadline - self._clock()).total_seconds()),
+                        )
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(
+                        self._followup_wake.wait(),
+                        timeout=timeout,
+                    )
+                except TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            return
+
+    async def _admit_terminal_followups(self) -> None:
+        if self._loop is None or self._limits.max_estimated_cost_usd is None:
+            return
+        routes = self._followup_model_routes
+        capability_ids = _stage_c_capability_ids(self._capabilities)
+        jobs = await self._store.list_unbound_terminal_daita_jobs(self.identity.id)
+        for job in jobs:
+            try:
+                followup = create_terminal_job_followup(
+                    job,
+                    followup_id=self._id_factory("followup"),
+                    grant_id=self._id_factory("grant"),
+                    scope_id=self._id_factory("scope"),
+                    received_at=self._clock(),
+                    allowed_capability_ids=capability_ids,
+                    eligible_model_routes=routes,
+                    limits=self._limits,
+                )
+                await self._store.admit_autonomous_followup(followup)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+
+    async def _reconcile_terminal_followups(self) -> None:
+        active = await self._store.list_autonomous_followups(
+            self.identity.id,
+            dispositions=frozenset(
+                {
+                    FollowupDisposition.RUNNING,
+                    FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
+                }
+            ),
+        )
+        for followup in active:
+            try:
+                if followup.disposition is FollowupDisposition.RUNNING:
+                    assert followup.reserved_run_id is not None
+                    try:
+                        result = await self._store.result(followup.reserved_run_id)
+                    except KeyError:
+                        continue
+                    if result is None:
+                        continue
+                    followup = (
+                        await self._store.mark_autonomous_followup_run_terminal(
+                            self.identity.id,
+                            followup.followup_id,
+                            run_id=followup.reserved_run_id,
+                            terminal_at=result.created_at,
+                        )
+                        or followup
+                    )
+                if (
+                    followup.disposition
+                    is FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+                ):
+                    await self._store.finalize_autonomous_followup(
+                        self.identity.id,
+                        followup.followup_id,
+                        delivery_id=self._id_factory("delivery"),
+                        finalized_at=self._clock(),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                continue
+
+    async def _execute_followup(self, followup_id: str) -> None:
+        loop = self._require_loop()
+        async with self._run_lock:
+            followup = await self._store.load_autonomous_followup(
+                self.identity.id,
+                followup_id,
+            )
+            if (
+                followup is None
+                or followup.disposition is not FollowupDisposition.CLAIMED
+                or followup.claim_token is None
+                or followup.reserved_run_id is None
+            ):
+                return
+            try:
+                job = await self._revalidate_followup(followup)
+                _conversation_exists, conversation, older_history_exists = (
+                    await self._store.completed_conversation_tail(
+                        self.identity.id,
+                        followup.conversation_id,
+                    )
+                )
+                scoped_conversation = tuple(
+                    item
+                    for item in conversation
+                    if item.transcript.run.source_id
+                    in followup.execution_scope.allowed_source_ids
+                )
+                prior_messages = _project_completed_history(
+                    scoped_conversation,
+                    older_history_exists=(
+                        older_history_exists
+                        or len(scoped_conversation) < len(conversation)
+                    ),
+                )
+                run_input = RunInput(
+                    id=followup.reserved_run_id,
+                    agent_id=self.identity.id,
+                    message=FOLLOWUP_INSTRUCTION,
+                    created_at=self._clock(),
+                    conversation_id=followup.conversation_id,
+                    source_id=(job.source_ids[0] if len(job.source_ids) == 1 else None),
+                    conversation_source_id=(
+                        job.source_ids[0] if len(job.source_ids) == 1 else None
+                    ),
+                    start=RunStartEnvelope(
+                        origin=RunOrigin.JOB_EVENT,
+                        trusted_instruction_id=FOLLOWUP_INSTRUCTION_ID,
+                        trusted_instruction=FOLLOWUP_INSTRUCTION,
+                        instruction_digest=FOLLOWUP_INSTRUCTION_DIGEST,
+                        untrusted_payload=followup.event_payload,
+                        payload_digest=followup.payload_digest,
+                        execution_scope=followup.execution_scope,
+                    ),
+                )
+                prepared = await loop.prepare(
+                    run_input,
+                    prior_messages=prior_messages,
+                )
+                snapshot = prepared.context_snapshot
+                audit_method = getattr(snapshot, "audit_context", None)
+                if not callable(audit_method):
+                    raise ValueError("followup_audit_context_unavailable")
+                audit = FrozenJsonObject.from_mapping(
+                    {
+                        "job_id": job.job_id,
+                        "job_terminal_revision": followup.job_terminal_revision,
+                        "job_current_revision": job.revision,
+                        "event_id": followup.event_id,
+                        "payload_digest": followup.payload_digest,
+                        "grant_id": followup.grant.grant_id,
+                        "execution_scope_digest": followup.execution_scope.digest,
+                        "capability_registry_digest": self._capabilities.digest,
+                        "prepared_context": audit_method(),
+                    }
+                )
+                bound = await self._store.bind_autonomous_followup_run(
+                    self.identity.id,
+                    followup.followup_id,
+                    claim_token=followup.claim_token,
+                    run_id=run_input.id,
+                    bound_at=self._clock(),
+                    audit_context=audit,
+                )
+                if bound is None:
+                    return
+            except LoopPreparationError as error:
+                await self._store.fail_autonomous_followup_claim(
+                    self.identity.id,
+                    followup.followup_id,
+                    claim_token=followup.claim_token,
+                    failed_at=self._clock(),
+                    failure_code=error.code,
+                )
+                return
+            except Exception as error:
+                await self._store.fail_autonomous_followup_claim(
+                    self.identity.id,
+                    followup.followup_id,
+                    claim_token=followup.claim_token,
+                    failed_at=self._clock(),
+                    failure_code=_safe_followup_failure_code(error),
+                )
+                return
+            try:
+                result = await loop.run(
+                    run_input,
+                    prior_messages=prior_messages,
+                    prepared=prepared,
+                )
+                await self._store.mark_autonomous_followup_run_terminal(
+                    self.identity.id,
+                    followup.followup_id,
+                    run_id=run_input.id,
+                    terminal_at=result.created_at,
+                )
+                await self._store.finalize_autonomous_followup(
+                    self.identity.id,
+                    followup.followup_id,
+                    delivery_id=self._id_factory("delivery"),
+                    finalized_at=self._clock(),
+                )
+            finally:
+                self._artifact_delivery.end_run(run_input.id)
+
+    async def _revalidate_followup(self, followup):
+        if await self._store.load_identity() != self.identity:
+            raise ValueError("followup_agent_identity_changed")
+        current_time = self._clock()
+        if followup.grant.expires_at <= current_time:
+            raise ValueError("followup_grant_expired")
+        if (
+            followup.lease_expires_at is None
+            or followup.lease_expires_at <= current_time
+        ):
+            raise ValueError("followup_claim_expired")
+        current_capability_ceiling = frozenset(
+            _stage_c_capability_ids(self._capabilities)
+        )
+        grant_capabilities = frozenset(followup.grant.allowed_capability_ids)
+        validated_grant = self._capabilities.validate_execution_scope_grant(
+            followup.grant.allowed_capability_ids,
+            allowed_access_modes=followup.grant.allowed_access_modes,
+            allowed_operational_effects=(followup.grant.allowed_operational_effects),
+        )
+        if (
+            followup.grant.instruction_id != FOLLOWUP_INSTRUCTION_ID
+            or followup.grant.instruction_digest != FOLLOWUP_INSTRUCTION_DIGEST
+            or grant_capabilities != frozenset(validated_grant)
+            or not grant_capabilities <= current_capability_ceiling
+            or not followup.grant.allowed_access_modes
+            <= frozenset({AccessMode.NONE, AccessMode.READ})
+            or not followup.grant.allowed_operational_effects
+            <= frozenset({OperationalEffect.NONE})
+            or followup.execution_scope.job_id != followup.job_id
+            or followup.execution_scope.job_revision != followup.job_terminal_revision
+        ):
+            raise ValueError("followup_grant_not_current")
+        job = await self._store.load_job(self.identity.id, followup.job_id)
+        if (
+            job is None
+            or not job.terminal
+            or job.specification.execution_mode is not JobExecutionMode.DAITA
+            or job.completion_binding is None
+            or job.completion_binding.owner_kind
+            is not JobCompletionOwnerKind.STANDALONE_FOLLOWUP
+            or job.completion_binding.owner_id != followup.followup_id
+            or job.completion_binding.terminal_event_id != followup.event_id
+            or job.revision != followup.job_terminal_revision + 1
+            or job.source_ids != followup.execution_scope.allowed_source_ids
+            or job.resource_ids != followup.execution_scope.allowed_resource_ids
+        ):
+            raise ValueError("followup_job_binding_not_current")
+        current_sensitivity = (
+            job.specification.sensitivity
+            if job.result is None
+            else job.result.sensitivity
+        )
+        if (
+            current_sensitivity.routing_rank
+            > followup.execution_scope.sensitivity_ceiling.routing_rank
+        ):
+            raise ValueError("followup_sensitivity_scope_changed")
+        await self._data_profile_admission.revalidate_job(job)
+        return job
+
+    async def inbox(
+        self,
+        *,
+        conversation_id: str | None = None,
+        include_acknowledged: bool = False,
+        limit: int = 50,
+    ) -> tuple[InboxItem, ...]:
+        """Inspect a bounded agent-owned durable conversation inbox."""
+
+        self._require_open()
+        if conversation_id is not None:
+            _validate_conversation_id(conversation_id)
+        return await self._store.list_inbox(
+            self.identity.id,
+            conversation_id=conversation_id,
+            include_acknowledged=include_acknowledged,
+            limit=limit,
+        )
+
+    async def acknowledge_inbox(self, delivery_id: str) -> InboxItem | None:
+        """Idempotently acknowledge one exact agent-owned inbox result."""
+
+        self._require_open()
+        if not isinstance(delivery_id, str) or not delivery_id.strip():
+            raise ValueError("delivery_id must be non-empty text")
+        return await self._store.acknowledge_inbox(
+            self.identity.id,
+            delivery_id.strip(),
+            acknowledged_at=self._clock(),
+        )
 
     async def conversation_runs(
         self,
@@ -3112,6 +3563,17 @@ class EmbeddedAgent:
 
     async def _finish_close(self) -> None:
         first_error: BaseException | None = None
+        followup_driver = self._followup_driver
+        self._followup_driver = None
+        if followup_driver is not None:
+            self._followup_wake.set()
+            followup_driver.cancel("host_closing")
+            try:
+                await followup_driver
+            except asyncio.CancelledError:
+                pass
+            except BaseException as error:
+                first_error = error
         try:
             await self._job_supervisor.close()
         except BaseException as error:

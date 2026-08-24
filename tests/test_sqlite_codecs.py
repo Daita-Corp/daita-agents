@@ -30,6 +30,7 @@ from daita.learning_candidates import (
     LearningCandidateStatus,
     LearningCandidateTarget,
 )
+from daita.llm.errors import ProviderFailureDiagnostic, ProviderFailurePhase
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -343,6 +344,27 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         == update_scope
     )
     assert encode_postgresql_update_scope(update_scope) == encoded_update_scope
+
+
+def test_failed_loop_exit_round_trips_bounded_provider_diagnostic() -> None:
+    value = LoopExit(
+        run_id="run-provider-failure",
+        conversation_id="conversation-provider-failure",
+        kind=LoopExitKind.FAILED,
+        reason="malformed_response",
+        created_at=NOW,
+        provider_id="openai:test-model",
+        provider_failure=ProviderFailureDiagnostic(
+            phase=ProviderFailurePhase.STREAM_TERMINAL,
+            code="terminal_response_decode_failed",
+            event_type="response.completed",
+            terminal_status="completed",
+            output_item_types=("reasoning",),
+            response_id_digest="sha256:" + "a" * 64,
+        ),
+    )
+
+    _assert_round_trip(value, encode_loop_exit, decode_loop_exit)
 
 
 def test_classified_tool_result_provenance_round_trips_without_entering_output() -> (

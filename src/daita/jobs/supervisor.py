@@ -83,6 +83,7 @@ class JobSupervisor:
         artifacts: AgentHomeArtifactStore,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
+        on_terminal: Callable[[JobRun], None] | None = None,
         poll_seconds: float = _DEFAULT_POLL_SECONDS,
     ) -> None:
         if not isinstance(agent_id, str) or not agent_id:
@@ -99,6 +100,9 @@ class JobSupervisor:
         self._artifacts = artifacts
         self._clock = clock
         self._id_factory = id_factory
+        if on_terminal is not None and not callable(on_terminal):
+            raise TypeError("terminal observer must be callable or None")
+        self._on_terminal = on_terminal
         self._poll_seconds = float(poll_seconds)
         self._wake = asyncio.Event()
         self._workers: dict[str, asyncio.Task[None]] = {}
@@ -192,10 +196,12 @@ class JobSupervisor:
     async def _drive(self) -> None:
         try:
             while not self._closing:
-                await self._store.expire_due_jobs(
+                expired = await self._store.expire_due_jobs(
                     self._agent_id,
                     expired_at=self._clock(),
                 )
+                for job in expired:
+                    self._notify_terminal(job)
                 await self._adopt_external_claims()
                 await self._claim_available()
                 self._wake.clear()
@@ -741,7 +747,7 @@ class JobSupervisor:
         failure_code: str | None = None,
     ) -> JobRun | None:
         attempt = _claimed_attempt(job)
-        return await self._store.finalize_job_attempt(
+        finalized = await self._store.finalize_job_attempt(
             self._agent_id,
             job.job_id,
             claim_token=attempt.claim_token,
@@ -751,6 +757,17 @@ class JobSupervisor:
             result=result,
             failure_code=failure_code,
         )
+        if finalized is not None and finalized.terminal:
+            self._notify_terminal(finalized)
+        return finalized
+
+    def _notify_terminal(self, job: JobRun) -> None:
+        if self._on_terminal is None:
+            return
+        try:
+            self._on_terminal(job)
+        except Exception:
+            return
 
 
 def _claimed_attempt(job: JobRun) -> JobAttempt:

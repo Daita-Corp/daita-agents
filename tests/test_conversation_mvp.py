@@ -1219,7 +1219,7 @@ async def test_whole_request_budget_downgrades_full_turn_before_dropping_it():
         CatalogSpy(),
         profile=ModelProfile(
             id="mock:full-downgrade",
-            context_window_tokens=9_500,
+            context_window_tokens=10_000,
             max_output_tokens=1_000,
             supports_tools=True,
         ),

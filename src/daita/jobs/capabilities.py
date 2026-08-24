@@ -241,12 +241,25 @@ class JobCapabilityDomain:
         *,
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
-        del call, capability, request_sensitivity
+        del call, request_sensitivity
         if run.agent_id != self._owner.agent_id:
             raise CapabilityInputError(
                 "job_owner_mismatch",
                 "The job lifecycle owner does not match this agent.",
             )
+        scope = run.execution_scope
+        if scope is not None and capability.id in {
+            JOB_INSPECT_CAPABILITY_ID,
+            JOB_READ_RESULTS_CAPABILITY_ID,
+            JOB_CANCEL_CAPABILITY_ID,
+        }:
+            requested_job_id = arguments.get("job_id")
+            if scope.job_id is None or requested_job_id != scope.job_id:
+                raise CapabilityInputError(
+                    "execution_scope_job_violation",
+                    "This run may inspect only its exact bound job.",
+                    {"requested_job_id": requested_job_id},
+                )
         return arguments
 
     async def side_effect_plan(

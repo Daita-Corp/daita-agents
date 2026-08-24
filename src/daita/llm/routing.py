@@ -8,7 +8,12 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from ..security import SecretReference
-from .errors import ModelProviderError, ProviderErrorCode
+from .errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+)
 from .models import (
     ModelProfile,
     ModelRequest,
@@ -314,6 +319,7 @@ class ModelRouter:
                 provider_id=last_error.provider_id,
                 retry_after_seconds=last_error.retry_after_seconds,
                 usage=_aggregate_usage(attempt_usage),
+                diagnostic=last_error.diagnostic,
             )
         raise ModelProviderError(
             ProviderErrorCode.INVALID_REQUEST,
@@ -361,6 +367,10 @@ class ModelRouter:
                                 ProviderErrorCode.MALFORMED_RESPONSE,
                                 "provider stream continued after completion",
                                 provider_id=registration.provider.provider_id,
+                                diagnostic=ProviderFailureDiagnostic(
+                                    phase=ProviderFailurePhase.STREAM_TERMINAL,
+                                    code="stream_continued_after_completion",
+                                ),
                             )
                         if isinstance(event, ModelStreamCompleted):
                             completed = True
@@ -384,6 +394,10 @@ class ModelRouter:
                             ProviderErrorCode.MALFORMED_RESPONSE,
                             "provider stream ended without a canonical completion",
                             provider_id=registration.provider.provider_id,
+                            diagnostic=ProviderFailureDiagnostic(
+                                phase=ProviderFailurePhase.STREAM_TERMINAL,
+                                code="canonical_completion_missing",
+                            ),
                         )
                     return
                 except asyncio.CancelledError:
@@ -398,6 +412,7 @@ class ModelRouter:
                             provider_id=error.provider_id,
                             retry_after_seconds=error.retry_after_seconds,
                             usage=_aggregate_usage(attempt_usage),
+                            diagnostic=error.diagnostic,
                         ) from None
                     if error.code not in _TRANSIENT:
                         break
@@ -416,6 +431,7 @@ class ModelRouter:
                 provider_id=last_error.provider_id,
                 retry_after_seconds=last_error.retry_after_seconds,
                 usage=_aggregate_usage(attempt_usage),
+                diagnostic=last_error.diagnostic,
             )
         raise ModelProviderError(
             ProviderErrorCode.INVALID_REQUEST,

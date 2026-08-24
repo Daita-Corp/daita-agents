@@ -1,15 +1,19 @@
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
+from hashlib import sha256
 from typing import cast
 
 import pytest
 
 from daita._json import canonical_json
 from daita.agent import Agent
+from daita.capabilities import AccessMode, ExecutionScope, OperationalEffect
 from daita.llm.errors import (
     ModelProviderError,
     ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
     ToolSurfaceLimitExceeded,
 )
 from daita.llm.models import (
@@ -33,7 +37,9 @@ from daita.loop import (
     InMemoryTranscriptStore,
     LoopExitKind,
     LoopLimits,
+    RunOrigin,
     RunInput,
+    RunStartEnvelope,
     ToolBatchOutcome,
     ToolRuntime,
 )
@@ -145,6 +151,71 @@ class StaticDefinitionTools:
     async def execute_all(self, run, calls, *, projection, sensitivity):
         del run, calls, projection, sensitivity
         raise AssertionError("an over-limit tool surface must never execute")
+
+
+async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
+    provider = MockModelProvider(
+        (ModelResponse(finish_reason=FinishReason.STOP, text="done"),),
+        complete_pricing=True,
+    )
+    configured = LoopLimits(
+        max_total_tokens=10_000,
+        max_estimated_cost_usd=Decimal("2.00"),
+    )
+    instruction = "Inspect the bounded job result."
+    payload_digest = "sha256:" + sha256(b"{}").hexdigest()
+    scope = ExecutionScope(
+        scope_id="scope-1",
+        revision=1,
+        agent_id="agent-1",
+        principal_id="agent:agent-1",
+        grant_id="grant-1",
+        job_id="job-1",
+        job_revision=3,
+        allowed_source_ids=("source-1",),
+        allowed_resource_ids=("resource-1",),
+        allowed_capability_ids=("catalog.inspect",),
+        allowed_access_modes=frozenset({AccessMode.NONE, AccessMode.READ}),
+        allowed_operational_effects=frozenset({OperationalEffect.NONE}),
+        sensitivity_ceiling=ModelSensitivity.INTERNAL,
+        eligible_model_routes=(provider.provider_id,),
+        per_run_max_cost_usd=Decimal("0.25"),
+        per_run_max_tokens=123,
+        delivery_destination="conversation_inbox:conversation-1",
+    )
+    run = RunInput(
+        id="run-scoped-budget",
+        agent_id="agent-1",
+        message=instruction,
+        created_at=NOW,
+        conversation_id="conversation-1",
+        source_id="source-1",
+        start=RunStartEnvelope(
+            origin=RunOrigin.JOB_EVENT,
+            trusted_instruction_id="followup-v1",
+            trusted_instruction=instruction,
+            instruction_digest=(
+                "sha256:" + sha256(instruction.encode("utf-8")).hexdigest()
+            ),
+            untrusted_payload={},
+            payload_digest=payload_digest,
+            execution_scope=scope,
+        ),
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools({}),
+        limits=configured,
+        clock=lambda: NOW,
+    )
+
+    prepared = await loop.prepare(run)
+
+    assert prepared.limits.max_total_tokens == 123
+    assert prepared.limits.max_estimated_cost_usd == Decimal("0.25")
+    assert configured.max_total_tokens == 10_000
+    assert configured.max_estimated_cost_usd == Decimal("2.00")
 
 
 def response_with_calls(*ids):
@@ -821,11 +892,19 @@ async def test_streaming_calls_persist_only_finalized_messages_and_context():
 
 
 async def test_stream_failure_and_cancellation_never_persist_partial_text():
+    diagnostic = ProviderFailureDiagnostic(
+        phase=ProviderFailurePhase.STREAM_TERMINAL,
+        code="terminal_completion_missing",
+    )
     failure_provider = MockStreamingModelProvider(
         (
             (
                 ModelTextDelta("unrecorded failure draft"),
-                ModelProviderError(ProviderErrorCode.PROVIDER_UNAVAILABLE),
+                ModelProviderError(
+                    ProviderErrorCode.PROVIDER_UNAVAILABLE,
+                    provider_id="mock:streaming",
+                    diagnostic=diagnostic,
+                ),
             ),
         )
     )
@@ -851,6 +930,8 @@ async def test_stream_failure_and_cancellation_never_persist_partial_text():
 
     assert failed.kind is LoopExitKind.FAILED
     assert failed.final_text is None
+    assert failed.provider_id == "mock:streaming"
+    assert failed.provider_failure == diagnostic
     failed_transcript = await failure_store.load("run-stream-failed")
     assert tuple(message.role for message in failed_transcript.messages) == (
         MessageRole.USER,

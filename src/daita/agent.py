@@ -33,6 +33,7 @@ from .artifacts.models import (
     ArtifactDestination,
     ArtifactPayload,
 )
+from .autonomy import DeliverySubject, DeliverySubjectKind, InboxItem
 from .capabilities import ApprovalHandler
 from .catalog.models import (
     CatalogResource,
@@ -323,6 +324,26 @@ class Agent:
 
     async def transcript(self, run_id: str) -> Transcript:
         return await self._embedded.transcript(run_id)
+
+    async def inbox(
+        self,
+        *,
+        conversation_id: str | None = None,
+        include_acknowledged: bool = False,
+        limit: int = 50,
+    ) -> tuple[InboxItem, ...]:
+        """Inspect bounded durable autonomous results for this agent."""
+
+        return await self._embedded.inbox(
+            conversation_id=conversation_id,
+            include_acknowledged=include_acknowledged,
+            limit=limit,
+        )
+
+    async def acknowledge_inbox(self, delivery_id: str) -> InboxItem | None:
+        """Idempotently acknowledge one exact inbox result."""
+
+        return await self._embedded.acknowledge_inbox(delivery_id)
 
     async def conversation_runs(
         self,
@@ -915,6 +936,9 @@ __all__ = [
     "AgentNotConfiguredError",
     "AgentNotFoundError",
     "HostActiveError",
+    "DeliverySubject",
+    "DeliverySubjectKind",
+    "InboxItem",
     "JobExecutionMode",
     "JobInspection",
     "JobResultView",

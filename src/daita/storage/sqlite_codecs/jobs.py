@@ -12,6 +12,8 @@ from ...jobs.models import (
     ExternalObservedStatus,
     JobAttempt,
     JobAttemptStatus,
+    JobCompletionBinding,
+    JobCompletionOwnerKind,
     JobDesiredState,
     JobExecutionMode,
     JobResourceBinding,
@@ -69,6 +71,11 @@ def encode_job_run(value: JobRun) -> str:
                 "terminal_observed_at": optional_datetime_encode(
                     value.terminal_observed_at
                 ),
+                "completion_binding": (
+                    None
+                    if value.completion_binding is None
+                    else _encode_completion_binding(value.completion_binding)
+                ),
                 "result": (
                     None if value.result is None else _encode_result(value.result)
                 ),
@@ -99,6 +106,7 @@ def decode_job_run(value: str, *, agent_id: str, job_id: str) -> JobRun:
             "cancel_requested_at",
             "terminal_at",
             "terminal_observed_at",
+            "completion_binding",
             "result",
             "failure_code",
         ),
@@ -134,8 +142,48 @@ def decode_job_run(value: str, *, agent_id: str, job_id: str) -> JobRun:
         cancel_requested_at=optional_datetime_decode(fields["cancel_requested_at"]),
         terminal_at=optional_datetime_decode(fields["terminal_at"]),
         terminal_observed_at=optional_datetime_decode(fields["terminal_observed_at"]),
+        completion_binding=(
+            None
+            if fields["completion_binding"] is None
+            else _decode_completion_binding(fields["completion_binding"])
+        ),
         result=None if result_value is None else _decode_result(result_value),
         failure_code=optional_text(fields["failure_code"], "job failure code"),
+    )
+
+
+def _encode_completion_binding(value: JobCompletionBinding):
+    return record(
+        "JobCompletionBinding",
+        {
+            "owner_kind": value.owner_kind.value,
+            "owner_id": value.owner_id,
+            "terminal_event_id": value.terminal_event_id,
+            "bound_at": datetime_encode(value.bound_at),
+        },
+    )
+
+
+def _decode_completion_binding(value) -> JobCompletionBinding:
+    fields = record_fields(
+        value,
+        "JobCompletionBinding",
+        ("owner_kind", "owner_id", "terminal_event_id", "bound_at"),
+    )
+    try:
+        owner_kind = JobCompletionOwnerKind(
+            text(fields["owner_kind"], "job completion owner kind")
+        )
+    except ValueError:
+        raise ValueError("stored job completion owner kind is invalid") from None
+    return JobCompletionBinding(
+        owner_kind=owner_kind,
+        owner_id=text(fields["owner_id"], "job completion owner id"),
+        terminal_event_id=text(
+            fields["terminal_event_id"],
+            "job completion event id",
+        ),
+        bound_at=datetime_decode(fields["bound_at"]),
     )
 
 

@@ -25,6 +25,12 @@ from .artifacts import (
     ArtifactPayload,
     ArtifactRef,
 )
+from .autonomy import (
+    DeliveryState,
+    DeliverySubject,
+    DeliverySubjectKind,
+    InboxItem,
+)
 from .capabilities import ApprovalDecision, ApprovalHandler, ApprovalRequest
 from .catalog import CatalogSummary
 from .config import AgentConfig
@@ -99,6 +105,9 @@ __all__ = [
     "CatalogSummary",
     "LocalDirectorySource",
     "DocumentCandidateContent",
+    "DeliveryState",
+    "DeliverySubject",
+    "DeliverySubjectKind",
     "LearningCandidate",
     "LearningCandidateAction",
     "LearningCandidateError",
@@ -109,6 +118,7 @@ __all__ = [
     "LearningReviewResult",
     "LearningReviewStatus",
     "JobExecutionMode",
+    "InboxItem",
     "JobInspection",
     "JobResultView",
     "JobStatus",

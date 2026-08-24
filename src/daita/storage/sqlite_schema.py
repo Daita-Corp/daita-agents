@@ -88,6 +88,22 @@ JOB_RUN_TABLE = (
     ("job_id", "TEXT", 1, None, 2),
     ("data", "TEXT", 1, None, 0),
 )
+AUTONOMOUS_FOLLOWUP_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("followup_id", "TEXT", 1, None, 2),
+    ("job_id", "TEXT", 1, None, 0),
+    ("event_id", "TEXT", 1, None, 0),
+    ("data", "TEXT", 1, None, 0),
+)
+CONVERSATION_INBOX_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("delivery_id", "TEXT", 1, None, 2),
+    ("conversation_id", "TEXT", 1, None, 0),
+    ("subject_kind", "TEXT", 1, None, 0),
+    ("subject_id", "TEXT", 1, None, 0),
+    ("logical_key", "TEXT", 1, None, 0),
+    ("data", "TEXT", 1, None, 0),
+)
 
 CURRENT_TABLES = {
     **CORE_TABLES,
@@ -97,6 +113,8 @@ CURRENT_TABLES = {
     "postgresql_update_scopes": UPDATE_SCOPE_TABLE,
     "mcp_server_bindings": MCP_BINDING_TABLE,
     "job_runs": JOB_RUN_TABLE,
+    "autonomous_followups": AUTONOMOUS_FOLLOWUP_TABLE,
+    "conversation_inbox": CONVERSATION_INBOX_TABLE,
 }
 
 MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
@@ -114,6 +132,15 @@ NAMED_INDEXES = {
 UNIQUE_CONSTRAINTS = {
     "database_write_receipts": frozenset({("agent_id", "run_id", "call_id")}),
     "state_migrations": frozenset({("ordinal",)}),
+    "autonomous_followups": frozenset(
+        {("agent_id", "event_id"), ("agent_id", "job_id")}
+    ),
+    "conversation_inbox": frozenset(
+        {
+            ("agent_id", "logical_key"),
+            ("agent_id", "subject_kind", "subject_id"),
+        }
+    ),
 }
 
 BASE_TABLE_SQL = """
@@ -232,6 +259,34 @@ CREATE TABLE job_runs (
     job_id TEXT NOT NULL,
     data TEXT NOT NULL,
     PRIMARY KEY (agent_id, job_id)
+)
+"""
+
+AUTONOMOUS_FOLLOWUP_TABLE_SQL = """
+CREATE TABLE autonomous_followups (
+    agent_id TEXT NOT NULL,
+    followup_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, followup_id),
+    UNIQUE (agent_id, event_id),
+    UNIQUE (agent_id, job_id)
+)
+"""
+
+CONVERSATION_INBOX_TABLE_SQL = """
+CREATE TABLE conversation_inbox (
+    agent_id TEXT NOT NULL,
+    delivery_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    logical_key TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, delivery_id),
+    UNIQUE (agent_id, logical_key),
+    UNIQUE (agent_id, subject_kind, subject_id)
 )
 """
 

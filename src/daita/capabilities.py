@@ -7,6 +7,7 @@ import math
 import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
 from types import MappingProxyType
@@ -25,6 +26,8 @@ MAX_TOOL_DISCOVERY_KEYWORDS = 16
 MAX_TOOL_DISCOVERY_KEYWORD_CHARACTERS = 64
 MAX_TOOL_EAGER_PRIORITY = 1_000
 RESERVED_TOOL_NAMES = frozenset({"tool_search", "tool_describe", "tool_call"})
+MAX_EXECUTION_SCOPE_IDENTITIES = 256
+MAX_EXECUTION_SCOPE_IDENTITY_CHARACTERS = 2_048
 
 
 def _text(value: str, name: str) -> None:
@@ -48,6 +51,174 @@ class OperationalEffect(str, Enum):
     CANCEL_EXECUTION_GRAPH = "cancel_execution_graph"
     MUTATE_DATA = "mutate_data"
     CHANGE_INFRASTRUCTURE = "change_infrastructure"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionScope:
+    """One immutable, digestible ceiling carried by a bounded reasoning run."""
+
+    scope_id: str
+    revision: int
+    agent_id: str
+    principal_id: str
+    grant_id: str
+    job_id: str | None
+    job_revision: int | None
+    allowed_source_ids: tuple[str, ...]
+    allowed_resource_ids: tuple[str, ...]
+    allowed_capability_ids: tuple[str, ...]
+    allowed_access_modes: frozenset[AccessMode]
+    allowed_operational_effects: frozenset[OperationalEffect]
+    sensitivity_ceiling: ModelSensitivity
+    eligible_model_routes: tuple[str, ...]
+    per_run_max_cost_usd: Decimal
+    per_run_max_tokens: int
+    delivery_destination: str
+
+    def __post_init__(self) -> None:
+        for identity_value, identity_name in (
+            (self.scope_id, "execution scope_id"),
+            (self.agent_id, "execution scope agent_id"),
+            (self.principal_id, "execution scope principal_id"),
+            (self.grant_id, "execution scope grant_id"),
+            (self.delivery_destination, "execution scope delivery_destination"),
+        ):
+            _text(identity_value, identity_name)
+            if len(identity_value) > 512 or any(
+                character in "\r\n\x00" for character in identity_value
+            ):
+                raise ValueError(f"{identity_name} must be bounded single-line text")
+        if self.job_id is not None:
+            _text(self.job_id, "execution scope job_id")
+            if len(self.job_id) > 512 or any(
+                character in "\r\n\x00" for character in self.job_id
+            ):
+                raise ValueError(
+                    "execution scope job_id must be bounded single-line text"
+                )
+        if (self.job_id is None) != (self.job_revision is None):
+            raise ValueError(
+                "execution scope job identity and revision must be present together"
+            )
+        revision_values = [(self.revision, "execution scope revision")]
+        if self.job_revision is not None:
+            revision_values.append((self.job_revision, "execution scope job_revision"))
+        for revision_value, revision_name in revision_values:
+            if (
+                not isinstance(revision_value, int)
+                or isinstance(revision_value, bool)
+                or revision_value < 1
+            ):
+                raise ValueError(f"{revision_name} must be positive")
+        sources = _scope_identities(self.allowed_source_ids, "allowed_source_ids")
+        resources = _scope_identities(
+            self.allowed_resource_ids,
+            "allowed_resource_ids",
+        )
+        capabilities = _scope_identities(
+            self.allowed_capability_ids,
+            "allowed_capability_ids",
+        )
+        routes = _scope_identities(
+            self.eligible_model_routes,
+            "eligible_model_routes",
+        )
+        if not sources or not resources or not capabilities or not routes:
+            raise ValueError("execution scope identity ceilings cannot be empty")
+        access_modes = frozenset(self.allowed_access_modes)
+        effects = frozenset(self.allowed_operational_effects)
+        if not access_modes or any(
+            not isinstance(item, AccessMode) for item in access_modes
+        ):
+            raise ValueError("execution scope requires allowed access modes")
+        if not effects or any(
+            not isinstance(item, OperationalEffect) for item in effects
+        ):
+            raise ValueError("execution scope requires allowed operational effects")
+        if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
+            raise TypeError("execution scope sensitivity ceiling is invalid")
+        if (
+            not isinstance(self.per_run_max_cost_usd, Decimal)
+            or not self.per_run_max_cost_usd.is_finite()
+            or self.per_run_max_cost_usd < 0
+        ):
+            raise ValueError(
+                "execution scope per-run cost must be a finite non-negative Decimal"
+            )
+        if (
+            not isinstance(self.per_run_max_tokens, int)
+            or isinstance(self.per_run_max_tokens, bool)
+            or self.per_run_max_tokens < 1
+        ):
+            raise ValueError("execution scope per-run tokens must be positive")
+        object.__setattr__(self, "allowed_source_ids", sources)
+        object.__setattr__(self, "allowed_resource_ids", resources)
+        object.__setattr__(self, "allowed_capability_ids", capabilities)
+        object.__setattr__(self, "eligible_model_routes", routes)
+        object.__setattr__(self, "allowed_access_modes", access_modes)
+        object.__setattr__(self, "allowed_operational_effects", effects)
+
+    @property
+    def digest(self) -> str:
+        return (
+            "sha256:"
+            + sha256(
+                canonical_json(
+                    {
+                        "scope_id": self.scope_id,
+                        "revision": self.revision,
+                        "agent_id": self.agent_id,
+                        "principal_id": self.principal_id,
+                        "grant_id": self.grant_id,
+                        "job_id": self.job_id,
+                        "job_revision": self.job_revision,
+                        "allowed_source_ids": self.allowed_source_ids,
+                        "allowed_resource_ids": self.allowed_resource_ids,
+                        "allowed_capability_ids": self.allowed_capability_ids,
+                        "allowed_access_modes": tuple(
+                            sorted(item.value for item in self.allowed_access_modes)
+                        ),
+                        "allowed_operational_effects": tuple(
+                            sorted(
+                                item.value for item in self.allowed_operational_effects
+                            )
+                        ),
+                        "sensitivity_ceiling": self.sensitivity_ceiling.value,
+                        "eligible_model_routes": self.eligible_model_routes,
+                        "per_run_max_cost_usd": str(self.per_run_max_cost_usd),
+                        "per_run_max_tokens": self.per_run_max_tokens,
+                        "delivery_destination": self.delivery_destination,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+
+    def allows(self, capability: "Capability") -> bool:
+        return (
+            capability.id in self.allowed_capability_ids
+            and capability.access_mode in self.allowed_access_modes
+            and capability.operational_effect in self.allowed_operational_effects
+        )
+
+
+def _scope_identities(values: Iterable[str], name: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"execution scope {name} must be a sequence")
+    items = tuple(values)
+    if len(items) > MAX_EXECUTION_SCOPE_IDENTITIES:
+        raise ValueError(f"execution scope {name} exceeds its bound")
+    if any(
+        not isinstance(item, str)
+        or not item
+        or item != item.strip()
+        or len(item) > MAX_EXECUTION_SCOPE_IDENTITY_CHARACTERS
+        or any(character in "\r\n\x00" for character in item)
+        for item in items
+    ):
+        raise ValueError(f"execution scope {name} contains invalid text")
+    if len(items) != len(set(items)):
+        raise ValueError(f"execution scope {name} cannot contain duplicates")
+    return tuple(sorted(items))
 
 
 class ToolExposureClass(str, Enum):
@@ -615,6 +786,37 @@ class CapabilityRegistry:
         value = FrozenJsonObject.from_mapping(arguments)
         _validate(capability.input_schema, value, CapabilityInputError)
         return value
+
+    def validate_execution_scope_grant(
+        self,
+        capability_ids: Iterable[str],
+        *,
+        allowed_access_modes: frozenset[AccessMode],
+        allowed_operational_effects: frozenset[OperationalEffect],
+    ) -> tuple[str, ...]:
+        """Validate immutable grant metadata without creating an execution path."""
+
+        material = tuple(capability_ids)
+        if not material or len(material) != len(set(material)):
+            raise ValueError("execution scope grant requires distinct capabilities")
+        public_capability_ids = {view.capability_id for view in self._views.values()}
+        for capability_id in material:
+            try:
+                capability = self._capabilities[capability_id]
+            except KeyError as error:
+                raise KeyError(f"unknown capability: {capability_id}") from error
+            if capability_id not in public_capability_ids:
+                raise ValueError(
+                    f"execution scope capability is not model-visible: {capability_id}"
+                )
+            if (
+                capability.access_mode not in allowed_access_modes
+                or capability.operational_effect not in allowed_operational_effects
+            ):
+                raise ValueError(
+                    f"execution scope capability metadata is not admitted: {capability_id}"
+                )
+        return tuple(sorted(material))
 
     def resolve_execution(self, capability_id: str) -> tuple[Capability, Executor]:
         capability = self._capabilities[capability_id]

@@ -293,6 +293,9 @@ def test_public_surface_is_focused():
         "ConversationRun",
         "CatalogSummary",
         "DocumentCandidateContent",
+        "DeliverySubject",
+        "DeliverySubjectKind",
+        "DeliveryState",
         "LearningCandidate",
         "LearningCandidateAction",
         "LearningCandidateError",
@@ -303,6 +306,7 @@ def test_public_surface_is_focused():
         "LearningReviewResult",
         "LearningReviewStatus",
         "JobExecutionMode",
+        "InboxItem",
         "JobInspection",
         "JobResultView",
         "JobStatus",
@@ -367,6 +371,27 @@ def test_stage_b_has_one_job_aggregate_and_no_parallel_execution_system():
         "job_schedules",
     ):
         assert f"CREATE TABLE {parallel_table}" not in schema
+
+
+def test_stage_c_has_one_followup_aggregate_and_one_inbox_without_parallel_runtime():
+    assert _class_owners("AutonomousFollowup") == {"autonomy.py"}
+    assert _class_owners("InboxItem") == {"autonomy.py"}
+    assert _class_owners("RunStartEnvelope") == {"loop/models.py"}
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
+    assert schema.count("CREATE TABLE autonomous_followups") == 1
+    assert schema.count("CREATE TABLE conversation_inbox") == 1
+    production = _python_text(PACKAGE)
+    assert "allowed_read_capabilities" not in production
+    assert "mark_job_terminal_observed" not in production
+    for table in (
+        "completion_events",
+        "followup_attempts",
+        "followup_claims",
+        "followup_budgets",
+        "delivery_attempts",
+        "completion_routes",
+    ):
+        assert f"CREATE TABLE {table}" not in schema
 
     runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
     supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
@@ -1638,6 +1663,8 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "database_write_receipts",
             "learning_candidates",
             "job_runs",
+            "autonomous_followups",
+            "conversation_inbox",
             "mcp_server_bindings",
             "messages",
             "metadata",
@@ -1660,6 +1687,22 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             ),
             "learning_candidates": ("agent_id", "id", "data"),
             "job_runs": ("agent_id", "job_id", "data"),
+            "autonomous_followups": (
+                "agent_id",
+                "followup_id",
+                "job_id",
+                "event_id",
+                "data",
+            ),
+            "conversation_inbox": (
+                "agent_id",
+                "delivery_id",
+                "conversation_id",
+                "subject_kind",
+                "subject_id",
+                "logical_key",
+                "data",
+            ),
             "messages": ("run_id", "position", "data"),
             "metadata": ("key", "data"),
             "mcp_server_bindings": ("agent_id", "binding_id", "data"),

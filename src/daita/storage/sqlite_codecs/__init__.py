@@ -1,5 +1,11 @@
 """Collect explicit codec-v1 serializers used by the SQLite state store."""
 
+from .autonomy import (
+    decode_autonomous_followup,
+    decode_inbox_item,
+    encode_autonomous_followup,
+    encode_inbox_item,
+)
 from .catalog import (
     decode_catalog_snapshot,
     decode_catalog_sync,
@@ -39,10 +45,12 @@ from .transcripts import (
 )
 
 __all__ = [
+    "decode_autonomous_followup",
     "decode_catalog_snapshot",
     "decode_catalog_sync",
     "decode_identifier",
     "decode_identity",
+    "decode_inbox_item",
     "decode_learning_candidate",
     "decode_job_run",
     "decode_loop_exit",
@@ -55,10 +63,12 @@ __all__ = [
     "decode_semantic_annotation",
     "decode_source",
     "decode_source_read_scope",
+    "encode_autonomous_followup",
     "encode_catalog_snapshot",
     "encode_catalog_sync",
     "encode_identifier",
     "encode_identity",
+    "encode_inbox_item",
     "encode_learning_candidate",
     "encode_job_run",
     "encode_loop_exit",

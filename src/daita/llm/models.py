@@ -162,6 +162,8 @@ class ToolResultBlock:
     is_error: bool = False
     sensitivity: ModelSensitivity | None = None
     sensitivity_provenance: Mapping[str, object] = field(default_factory=dict)
+    capability_id: str | None = None
+    executor_id: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.call_id, "tool-result call_id")
@@ -178,6 +180,14 @@ class ToolResultBlock:
             )
         if self.is_error and self.sensitivity is not None:
             raise ValueError("error tool results cannot establish sensitivity")
+        if (self.capability_id is None) != (self.executor_id is None):
+            raise ValueError(
+                "tool-result capability and executor lineage must be present together"
+            )
+        if self.capability_id is not None:
+            _required_text(self.capability_id, "tool-result capability_id")
+            assert self.executor_id is not None
+            _required_text(self.executor_id, "tool-result executor_id")
         object.__setattr__(self, "output", FrozenJsonObject.from_mapping(self.output))
         object.__setattr__(self, "sensitivity_provenance", provenance)
 

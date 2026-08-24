@@ -208,10 +208,19 @@ class DataProfileAdmission:
     async def revalidate_external(self, job: JobRun) -> None:
         """Recheck the concrete data-profile authority immediately before I/O."""
 
+        if job.specification.execution_mode is not JobExecutionMode.CONNECTED_EXECUTOR:
+            raise CapabilityInputError(
+                "job_contract_revalidation_failed",
+                "The external data-profile execution mode is no longer current.",
+            )
+        await self.revalidate_job(job)
+
+    async def revalidate_job(self, job: JobRun) -> None:
+        """Recheck the exact data-profile contract and current read scope."""
+
         specification = job.specification
         if (
             specification.job_kind != "data_profile"
-            or specification.execution_mode is not JobExecutionMode.CONNECTED_EXECUTOR
             or specification.execution_capability_id != self._execution_capability.id
             or specification.execution_contract_digest
             != self._execution_contract_digest
