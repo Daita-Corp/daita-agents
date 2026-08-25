@@ -16,27 +16,28 @@ from daita import (
     DeliveryState,
     JobStatus,
     ResourceRevisionBinding,
-    SQLiteSource,
     SemanticAnnotation,
     SemanticEvidence,
     SemanticEvidenceKind,
     SemanticFieldReference,
     SemanticKind,
     SemanticSubject,
+    SQLiteSource,
 )
 from daita._json import FrozenJsonObject, canonical_json
 from daita.autonomy import (
     FOLLOWUP_INSTRUCTION,
+    MAX_FOLLOWUP_EVENT_BYTES,
+    MAX_INBOX_REPORT_PREVIEW_BYTES,
     FollowupCompletionConflictError,
     FollowupDisposition,
     FollowupIdentityConflictError,
-    MAX_FOLLOWUP_EVENT_BYTES,
-    MAX_INBOX_REPORT_PREVIEW_BYTES,
     create_terminal_job_followup,
     terminal_job_event_payload,
 )
 from daita.capabilities import AccessMode, OperationalEffect
 from daita.domains.data.profile_jobs import DATA_PROFILE_EXECUTION_CAPABILITY_ID
+from daita.jobs.models import MAX_JOB_RESOURCE_BINDINGS
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
@@ -48,10 +49,9 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.llm.pricing import CostEstimate
+from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
-from daita.jobs.models import MAX_JOB_RESOURCE_BINDINGS
 from daita.loop.models import LoopLimits, RunOrigin, ToolProjectionMode
 from daita.storage.sqlite import SQLiteStateStore
 

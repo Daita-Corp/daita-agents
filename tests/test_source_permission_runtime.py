@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _capability_runtime_support import execute_projected
 
 from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject
@@ -25,7 +26,6 @@ from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
 from daita.storage.sqlite_codecs import encode_source_read_scope
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
-from _capability_runtime_support import execute_projected
 
 
 def _database(path: Path, *, future: bool = False) -> None:

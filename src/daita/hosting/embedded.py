@@ -22,8 +22,8 @@ from typing import Self, TypeVar, cast
 from uuid import uuid4
 
 from .._json import FrozenJsonObject, canonical_json
-from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySource
 from ..adapters.job_profiles import ConnectedJobProfile
+from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySource
 from ..adapters.mcp import (
     MCPAuthentication,
     MCPBindingState,
@@ -88,24 +88,22 @@ from ..catalog.service import CatalogService
 from ..config import AgentConfig
 from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
+    LOCAL_FILE_READ_CAPABILITY_ID,
+    POSTGRESQL_QUERY_CAPABILITY_ID,
+    SQLITE_QUERY_CAPABILITY_ID,
+    ArtifactCapabilityDomain,
     CatalogDataView,
     DataCapabilityDomain,
     DataContextBuilder,
-    ArtifactCapabilityDomain,
     artifact_declarations,
     local_file_read_declarations,
     postgresql_query_declarations,
     postgresql_update_declarations,
     postgresql_update_preview_declarations,
     sqlite_query_declarations,
-    LOCAL_FILE_READ_CAPABILITY_ID,
-    POSTGRESQL_QUERY_CAPABILITY_ID,
-    SQLITE_QUERY_CAPABILITY_ID,
 )
-from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
-from ..domains.learning import LearningCandidateGuard
-from ..domains.mcp import MCPActivatedBinding, activate_mcp_domain
 from ..domains.data.context import _project_completed_history
+from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
 from ..domains.data.profile_jobs import (
     DATA_PROFILE_DOMAIN_OWNER_ID,
     DataProfileAdmission,
@@ -115,8 +113,27 @@ from ..domains.data.profile_jobs import (
 from ..domains.data.sql import (
     validate_postgresql_update_scope,
 )
+from ..domains.learning import LearningCandidateGuard
+from ..domains.mcp import MCPActivatedBinding, activate_mcp_domain
 from ..errors import AgentError, StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity
+from ..jobs.capabilities import (
+    JOB_DOMAIN_OWNER_ID,
+    JOB_INSPECT_CAPABILITY_ID,
+    JOB_READ_RESULTS_CAPABILITY_ID,
+    JobCapabilityDomain,
+    job_capability_declarations,
+)
+from ..jobs.models import (
+    JobCompletionOwnerKind,
+    JobExecutionMode,
+    JobInspection,
+    JobResultView,
+    JobStatus,
+    JobSummary,
+)
+from ..jobs.owner import JobOwner
+from ..jobs.supervisor import JobSupervisor
 from ..learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
     LearningCandidate,
@@ -164,23 +181,6 @@ from ..loop.models import (
     RunStartEnvelope,
     Transcript,
 )
-from ..jobs.capabilities import (
-    JOB_DOMAIN_OWNER_ID,
-    JOB_INSPECT_CAPABILITY_ID,
-    JOB_READ_RESULTS_CAPABILITY_ID,
-    JobCapabilityDomain,
-    job_capability_declarations,
-)
-from ..jobs.models import (
-    JobCompletionOwnerKind,
-    JobExecutionMode,
-    JobInspection,
-    JobResultView,
-    JobStatus,
-    JobSummary,
-)
-from ..jobs.owner import JobOwner
-from ..jobs.supervisor import JobSupervisor
 from ..memory import MemoryStore
 from ..memory.capabilities import (
     MEMORY_DOMAIN_OWNER_ID,
@@ -197,12 +197,12 @@ from ..security import (
     default_secret_provider,
 )
 from ..semantics import (
+    SEMANTIC_DOMAIN_OWNER_ID,
     SemanticAnnotation,
     SemanticAnnotationState,
     SemanticAnnotationView,
-    SemanticKind,
     SemanticCapabilityDomain,
-    SEMANTIC_DOMAIN_OWNER_ID,
+    SemanticKind,
     inspect_semantic_annotations,
     semantic_declarations,
 )

@@ -5,6 +5,10 @@ from hashlib import sha256
 from typing import cast
 
 import pytest
+from _capability_runtime_support import (
+    context_step_projection,
+    context_tool_catalog,
+)
 
 from daita._json import canonical_json
 from daita.agent import Agent
@@ -37,17 +41,13 @@ from daita.loop import (
     InMemoryTranscriptStore,
     LoopExitKind,
     LoopLimits,
-    RunOrigin,
     RunInput,
+    RunOrigin,
     RunStartEnvelope,
     ToolBatchOutcome,
     ToolRuntime,
 )
 from daita.observation import AgentEvent, AgentEventKind
-from _capability_runtime_support import (
-    context_step_projection,
-    context_tool_catalog,
-)
 
 NOW = datetime(2026, 7, 21, tzinfo=UTC)
 

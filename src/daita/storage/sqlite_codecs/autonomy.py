@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from ...autonomy import (
     AutonomousFollowup,
+    DeliveryState,
     DeliverySubject,
     DeliverySubjectKind,
-    DeliveryState,
     FollowupConclusionEvidence,
     FollowupDisposition,
     FollowupGrant,

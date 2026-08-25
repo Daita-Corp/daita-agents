@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
+from _capability_runtime_support import StaticTestDomain
 
 from daita import Agent
 from daita._json import FrozenJsonObject, canonical_json
@@ -52,7 +53,6 @@ from daita.loop.models import (
     ToolProjectionMode,
 )
 from daita.observation import AgentEvent, AgentEventKind
-from _capability_runtime_support import StaticTestDomain
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
 

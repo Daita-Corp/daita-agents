@@ -9,10 +9,10 @@ from ..._json import FrozenJsonObject, canonical_json
 from ...capabilities import (
     AccessMode,
     Capability,
+    CapabilityDeclarations,
     CapabilityInputError,
     Executor,
     OperationalEffect,
-    CapabilityDeclarations,
     ToolDiscoveryMetadata,
     ToolExecution,
     ToolExposureClass,

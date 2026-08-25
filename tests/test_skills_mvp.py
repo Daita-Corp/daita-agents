@@ -8,6 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from _capability_runtime_support import execute_projected
 
 import daita.skills.store as skill_module
 from daita import Agent, SQLiteSource
@@ -51,7 +52,6 @@ from daita.skills.capabilities import (
     SKILL_VIEW_TOOL_NAME,
 )
 from daita.storage.sqlite_migrations import migration_rows
-from _capability_runtime_support import execute_projected
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
 EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)

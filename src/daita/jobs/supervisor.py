@@ -25,6 +25,8 @@ from ..llm.models import ModelSensitivity
 from ..loop.models import RunInput
 from ..storage.sqlite import SQLiteStateStore
 from .models import (
+    MAX_JOB_EXTERNAL_OBSERVATIONS,
+    MAX_RUNNING_JOBS_GLOBAL,
     ExternalIntent,
     ExternalIntentDisposition,
     ExternalIntentKind,
@@ -37,8 +39,6 @@ from .models import (
     JobResult,
     JobRun,
     JobStatus,
-    MAX_JOB_EXTERNAL_OBSERVATIONS,
-    MAX_RUNNING_JOBS_GLOBAL,
 )
 from .owner import JobError, JobOwner
 

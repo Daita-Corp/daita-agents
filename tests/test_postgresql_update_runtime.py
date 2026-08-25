@@ -4,6 +4,12 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 
 import pytest
+from _capability_runtime_support import (
+    StaticTestDomain,
+    discovery_metadata,
+    execute_projected,
+    static_registry,
+)
 
 from daita._json import FrozenJsonObject
 from daita.adapters import (
@@ -35,12 +41,6 @@ from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite import DatabaseWriteOutcome, SQLiteStateStore
-from _capability_runtime_support import (
-    StaticTestDomain,
-    discovery_metadata,
-    execute_projected,
-    static_registry,
-)
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 SOURCE_ID = source_registration_id(

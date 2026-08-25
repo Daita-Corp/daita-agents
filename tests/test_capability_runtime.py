@@ -5,6 +5,12 @@ from datetime import UTC, datetime
 from typing import cast
 
 import pytest
+from _capability_runtime_support import (
+    StaticTestDomain,
+    discovery_metadata,
+    execute_projected,
+    static_registry,
+)
 
 from daita._json import FrozenJsonObject
 from daita.capabilities import (
@@ -17,12 +23,6 @@ from daita.capabilities import (
 from daita.capability_runtime import CapabilityRuntime
 from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import LoopLimits, RunInput, ToolBatchOutcome
-from _capability_runtime_support import (
-    StaticTestDomain,
-    discovery_metadata,
-    execute_projected,
-    static_registry,
-)
 
 
 class _CountingExecutor:

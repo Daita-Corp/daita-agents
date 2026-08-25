@@ -6,24 +6,24 @@ from datetime import UTC, datetime
 from hashlib import sha256
 
 import pytest
+from _mcp_fixtures import (
+    MappingSecretProvider,
+    MCPFixtureIdentity,
+    conformance_identities,
+    mock_transport,
+)
 
 from daita._json import canonical_json
 from daita.adapters.mcp import (
-    MCPAuthentication,
     MCP_MAX_REQUEST_BYTES,
     MCP_MAX_RESPONSE_BYTES,
+    MCPAuthentication,
     MCPProtocolError,
     MCPTransportError,
     StreamableHTTPMCPClient,
     StreamableHTTPMCPClientFactory,
 )
 from daita.security import EmptySecretProvider, SecretReference
-from _mcp_fixtures import (
-    MCPFixtureIdentity,
-    MappingSecretProvider,
-    conformance_identities,
-    mock_transport,
-)
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
 

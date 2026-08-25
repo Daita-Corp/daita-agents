@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 from daita._json import FrozenJsonObject
 from daita.agent import Agent
@@ -41,7 +42,6 @@ from daita.loop import (
     ToolBatchOutcome,
 )
 from daita.observation import AgentEvent, AgentEventKind
-from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 NOW = datetime(2026, 7, 21, tzinfo=UTC)
 

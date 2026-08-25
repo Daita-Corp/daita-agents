@@ -6,9 +6,8 @@ import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
-
 from hashlib import sha256
+from typing import Protocol
 
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.mcp import (

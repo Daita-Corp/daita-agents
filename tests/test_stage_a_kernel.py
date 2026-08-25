@@ -6,6 +6,14 @@ from datetime import UTC, datetime
 from typing import cast
 
 import pytest
+from _capability_runtime_support import (
+    StaticTestDomain,
+    context_step_projection,
+    context_tool_catalog,
+    discovery_metadata,
+    execute_projected,
+    static_registry,
+)
 
 from daita._json import FrozenJsonObject
 from daita.capabilities import (
@@ -17,8 +25,8 @@ from daita.capabilities import (
     ToolOutput,
     ToolView,
 )
-from daita.catalog.capabilities import CATALOG_SEARCH_CAPABILITY_ID
 from daita.capability_runtime import CapabilityRuntime
+from daita.catalog.capabilities import CATALOG_SEARCH_CAPABILITY_ID
 from daita.domains.data.context import DataContextBuilder, _estimate_input_tokens
 from daita.domains.data.profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
 from daita.llm.errors import ContextEvidencePressureExceeded
@@ -26,8 +34,8 @@ from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
     MessageRole,
-    ModelRequest,
     ModelProfile,
+    ModelRequest,
     ModelResponse,
     ModelSensitivity,
     TextBlock,
@@ -52,14 +60,6 @@ from daita.loop import (
 from daita.loop.models import validate_completed_transcript
 from daita.memory.capabilities import MEMORY_SET_CAPABILITY_ID
 from daita.storage.sqlite import SQLiteStateStore
-from _capability_runtime_support import (
-    StaticTestDomain,
-    context_step_projection,
-    context_tool_catalog,
-    execute_projected,
-    static_registry,
-    discovery_metadata,
-)
 
 NOW = datetime(2026, 8, 18, tzinfo=UTC)
 

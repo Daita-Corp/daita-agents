@@ -34,6 +34,13 @@ from .autonomy import (
 from .capabilities import ApprovalDecision, ApprovalHandler, ApprovalRequest
 from .catalog import CatalogSummary
 from .config import AgentConfig
+from .jobs import (
+    JobExecutionMode,
+    JobInspection,
+    JobResultView,
+    JobStatus,
+    JobSummary,
+)
 from .learning_candidates import (
     DocumentCandidateContent,
     LearningCandidate,
@@ -47,13 +54,6 @@ from .learning_candidates import (
     LearningReviewStatus,
     SemanticCandidateContent,
     SkillCandidateContent,
-)
-from .jobs import (
-    JobExecutionMode,
-    JobInspection,
-    JobResultView,
-    JobStatus,
-    JobSummary,
 )
 from .llm import (
     ModelRoute,

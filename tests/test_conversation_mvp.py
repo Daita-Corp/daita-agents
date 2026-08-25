@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 import daita
 from daita import Agent
@@ -44,7 +45,6 @@ from daita.loop import (
     Transcript,
 )
 from daita.storage.sqlite import SQLiteStateStore
-from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 NOW = datetime(2026, 7, 21, tzinfo=UTC)
 

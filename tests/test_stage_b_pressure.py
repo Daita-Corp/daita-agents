@@ -25,17 +25,6 @@ from daita.artifacts.models import (
 from daita.catalog.models import Sensitivity
 from daita.domains.data.profile_jobs import DATA_PROFILE_EXECUTION_CAPABILITY_ID
 from daita.jobs.models import (
-    ExternalObservation,
-    ExternalObservedStatus,
-    JobAttempt,
-    JobAttemptStatus,
-    JobDesiredState,
-    JobExecutionMode,
-    JobResourceBinding,
-    JobResult,
-    JobRun,
-    JobSpecification,
-    JobStatus,
     MAX_ACTIVE_JOBS_PER_AGENT,
     MAX_EXTERNAL_REQUEST_BYTES,
     MAX_EXTERNAL_RESPONSE_BYTES,
@@ -55,6 +44,17 @@ from daita.jobs.models import (
     MAX_JOBS_PER_AGENT,
     MAX_QUEUED_JOBS_PER_AGENT,
     MAX_RUNNING_JOBS_PER_AGENT,
+    ExternalObservation,
+    ExternalObservedStatus,
+    JobAttempt,
+    JobAttemptStatus,
+    JobDesiredState,
+    JobExecutionMode,
+    JobResourceBinding,
+    JobResult,
+    JobRun,
+    JobSpecification,
+    JobStatus,
 )
 from daita.jobs.owner import JobError, JobOwner
 from daita.llm.models import ModelSensitivity

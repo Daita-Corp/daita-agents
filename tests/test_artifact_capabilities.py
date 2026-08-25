@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _capability_runtime_support import (
+    context_step_projection,
+    context_tool_catalog,
+)
 
 import daita.domains.data.controller as data_controller
 from daita import Agent, ApprovalDecision, ApprovalRequest, ArtifactError
@@ -31,15 +35,11 @@ from daita.llm.models import (
     ModelSensitivity,
     TextBlock,
     ToolCall,
-    ToolResultBlock,
     ToolDefinition,
+    ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
-from _capability_runtime_support import (
-    context_step_projection,
-    context_tool_catalog,
-)
 
 
 async def _prepared_request(

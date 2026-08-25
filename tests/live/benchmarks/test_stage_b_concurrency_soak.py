@@ -16,6 +16,9 @@ from pathlib import Path
 import pytest
 
 from daita.jobs.models import (
+    MAX_QUEUED_JOBS_PER_AGENT,
+    MAX_RUNNING_JOBS_PER_AGENT,
+    MAX_RUNNING_JOBS_PER_SOURCE,
     JobAttemptStatus,
     JobDesiredState,
     JobExecutionMode,
@@ -23,9 +26,6 @@ from daita.jobs.models import (
     JobRun,
     JobSpecification,
     JobStatus,
-    MAX_QUEUED_JOBS_PER_AGENT,
-    MAX_RUNNING_JOBS_PER_AGENT,
-    MAX_RUNNING_JOBS_PER_SOURCE,
 )
 from daita.llm.models import ModelSensitivity
 from daita.storage.sqlite import SQLiteStateStore

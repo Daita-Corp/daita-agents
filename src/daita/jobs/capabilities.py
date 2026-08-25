@@ -24,11 +24,11 @@ from ..capability_runtime import CapabilityFailure, SideEffectPlan
 from ..llm.models import ModelSensitivity, ToolCall
 from ..loop.models import RunInput
 from .models import (
+    MAX_JOB_LIST_PAGE_SIZE,
     JobInspection,
     JobResultView,
     JobStatus,
     JobSummary,
-    MAX_JOB_LIST_PAGE_SIZE,
 )
 from .owner import JobError, JobOwner
 

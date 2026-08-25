@@ -21,9 +21,9 @@ from ..capabilities import (
     ToolView,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
+from ..domains.learning import LearningCandidateGuard
 from ..llm.models import ModelSensitivity, ToolCall
 from ..loop.models import RunInput
-from ..domains.learning import LearningCandidateGuard
 from .store import (
     MEMORY_MAX_CHARACTERS,
     MemoryStore,

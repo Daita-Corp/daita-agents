@@ -5,6 +5,12 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 
 import pytest
+from _capability_runtime_support import (
+    StaticTestDomain,
+    discovery_metadata,
+    execute_projected,
+    static_registry,
+)
 
 from daita.adapters import postgresql_query as postgresql_query_module
 from daita.adapters.models import SourceRegistration
@@ -15,12 +21,6 @@ from daita.domains.data.sql import ResourceSchema
 from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
-from _capability_runtime_support import (
-    StaticTestDomain,
-    discovery_metadata,
-    execute_projected,
-    static_registry,
-)
 
 
 class _SourceStore:

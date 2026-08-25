@@ -5,6 +5,8 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 
+from _capability_runtime_support import execute_projected
+
 from daita import (
     Agent,
     ApprovalDecision,
@@ -32,7 +34,6 @@ from daita.loop.models import LoopLimits, RunInput, ToolProjectionMode
 from daita.semantics import semantic_annotation_sha256
 from daita.tui.commands import SLASH_COMMAND_COMPLETIONS, learning_invocation_message
 from daita.tui.controller import PresentationController
-from _capability_runtime_support import execute_projected
 
 NOW = datetime(2026, 7, 28, 16, tzinfo=UTC)
 EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)

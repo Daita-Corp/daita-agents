@@ -9,12 +9,12 @@ from typing import Protocol
 
 from .._json import FrozenJsonObject, canonical_json
 from ..jobs.models import (
-    ConnectedExecutorBinding,
-    ExternalIntentDisposition,
-    ExternalObservedStatus,
     MAX_EXTERNAL_REQUEST_BYTES,
     MAX_EXTERNAL_RESPONSE_BYTES,
     MAX_JOB_RESULT_DEPTH,
+    ConnectedExecutorBinding,
+    ExternalIntentDisposition,
+    ExternalObservedStatus,
 )
 from ..llm.models import ModelSensitivity
 

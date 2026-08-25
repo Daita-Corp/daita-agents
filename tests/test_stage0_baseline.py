@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime
+
 import pytest
+from _capability_runtime_support import (
+    StaticTestDomain,
+    context_step_projection,
+    context_tool_catalog,
+    discovery_metadata,
+    execute_projected,
+    static_registry,
+)
 
 from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject
@@ -12,8 +21,8 @@ from daita.capabilities import (
     ToolOutput,
     ToolView,
 )
-from daita.catalog.capabilities import CATALOG_SEARCH_CAPABILITY_ID
 from daita.capability_runtime import CapabilityRuntime
+from daita.catalog.capabilities import CATALOG_SEARCH_CAPABILITY_ID
 from daita.domains.data.context import DataContextBuilder
 from daita.llm.errors import RequestSensitivityUnavailable
 from daita.llm.models import (
@@ -32,14 +41,6 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
 from daita.loop import LoopExitKind
 from daita.loop.models import RunInput
-from _capability_runtime_support import (
-    StaticTestDomain,
-    context_step_projection,
-    context_tool_catalog,
-    execute_projected,
-    static_registry,
-    discovery_metadata,
-)
 
 NOW = datetime(2026, 8, 18, tzinfo=UTC)
 

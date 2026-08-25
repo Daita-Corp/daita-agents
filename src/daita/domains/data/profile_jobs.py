@@ -32,13 +32,13 @@ from ...capabilities import (
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
 from ...jobs.models import (
+    MAX_JOB_DEADLINE_SECONDS,
+    MAX_JOB_RESOURCE_BINDINGS,
+    MAX_JOB_WALL_TIME_SECONDS,
     JobExecutionMode,
     JobResourceBinding,
     JobRun,
     JobSpecification,
-    MAX_JOB_DEADLINE_SECONDS,
-    MAX_JOB_RESOURCE_BINDINGS,
-    MAX_JOB_WALL_TIME_SECONDS,
 )
 from ...jobs.owner import JobError, JobOwner
 from ...llm.models import ModelSensitivity, ToolCall

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 import daita.artifacts.store as store_module
 import daita.capabilities as capabilities_module
@@ -24,8 +25,8 @@ from daita.artifacts.models import (
 from daita.artifacts.renderers import DOCUMENT_ALLOWED_EXTENSIONS, render_model_document
 from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import ArtifactPolicy, Capability, ToolOutput
-from daita.catalog.models import Sensitivity
 from daita.capability_runtime import CapabilityRuntime
+from daita.catalog.models import Sensitivity
 from daita.domains.data.export_capabilities import _resolved_sensitivity
 from daita.domains.data.file_capabilities import LocalFileReadExecutor
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
@@ -41,7 +42,6 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop import AgentLoop, InMemoryTranscriptStore, ToolBatchOutcome
 from daita.loop.models import LoopExitKind, RunInput
-from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 NOW = datetime(2026, 8, 1, 12, tzinfo=UTC)
 RUN_ID = "run-00000000000000000000000000000001"

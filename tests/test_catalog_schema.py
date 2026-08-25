@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _capability_runtime_support import execute_projected
 
 import daita.catalog.service as catalog_service
 import daita.storage.sqlite as sqlite_store
@@ -20,6 +21,7 @@ from daita.capabilities import (
     ToolOutput,
     ToolOutputValidationError,
 )
+from daita.capability_runtime import CapabilityRuntime
 from daita.catalog import (
     CatalogFacet,
     CatalogRelationship,
@@ -59,7 +61,6 @@ from daita.catalog.protocols import (
     CatalogResourceNotFoundError,
     CatalogStoreError,
 )
-from daita.capability_runtime import CapabilityRuntime
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -69,7 +70,6 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import RunInput
-from _capability_runtime_support import execute_projected
 
 _OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
 

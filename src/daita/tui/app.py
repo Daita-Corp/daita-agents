@@ -46,8 +46,8 @@ from .screens.catalog import CatalogScreen
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
-from .screens.jobs import JobsScreen
 from .screens.inbox import InboxScreen
+from .screens.jobs import JobsScreen
 from .screens.mcp import MCPManagementScreen, MCPSetupScreen
 from .screens.onboarding import (
     AgentCreateScreen,

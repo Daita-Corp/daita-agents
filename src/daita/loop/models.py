@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
-from collections.abc import Mapping
 
 from .._json import FrozenJsonObject, canonical_json
 from ..artifacts.models import ArtifactDeliveryReceipt, ArtifactRef
 from ..capabilities import ExecutionScope
+from ..llm.errors import ProviderFailureDiagnostic
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -20,7 +21,6 @@ from ..llm.models import (
     TextBlock,
     ToolResultBlock,
 )
-from ..llm.errors import ProviderFailureDiagnostic
 
 _MIN_TOOL_RESULT_BYTES = 128
 _MIN_TOOL_RESULT_DEPTH = 3

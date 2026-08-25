@@ -10,15 +10,22 @@ from hashlib import sha256
 
 import httpx
 import pytest
+from _mcp_fixtures import (
+    MappingSecretProvider,
+    MCPConformanceTransport,
+    MCPFixtureIdentity,
+    conformance_identities,
+    mock_transport,
+)
 from textual.widgets import Button, Input, OptionList, Static
 
-from daita import cli
 from daita import (
     Agent,
     MCPAdmissionError,
     MCPAuthentication,
     MCPBindingState,
     MCPToolSelection,
+    cli,
 )
 from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters.mcp import (
@@ -35,16 +42,16 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     ToolCall,
     ToolResultBlock,
-    ModelSensitivity,
 )
 from daita.loop.models import LoopLimits, ToolProjectionMode
 from daita.security import SecretReference
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_codecs import encode_mcp_binding
-from daita.tui.commands import SLASH_COMMAND_COMPLETIONS
 from daita.tui.app import DaitaApp
+from daita.tui.commands import SLASH_COMMAND_COMPLETIONS
 from daita.tui.controller import PresentationController
 from daita.tui.models import UserInputError
 from daita.tui.screens.chat import ChatScreen
@@ -56,13 +63,6 @@ from daita.tui.screens.mcp import (
 )
 from daita.tui.screens.selection import SelectionScreen
 from daita.tui.widgets.composer import Composer
-from _mcp_fixtures import (
-    MCPConformanceTransport,
-    MCPFixtureIdentity,
-    MappingSecretProvider,
-    conformance_identities,
-    mock_transport,
-)
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
 EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)

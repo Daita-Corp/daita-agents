@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Self
 
 from ._json import FrozenJsonObject
-from .adapters.models import SourceRegistration
 from .adapters.job_profiles import ConnectedJobProfile
 from .adapters.mcp import (
     MCPAuthentication,
@@ -19,6 +18,7 @@ from .adapters.mcp import (
     MCPServerInspection,
     MCPToolSelection,
 )
+from .adapters.models import SourceRegistration
 from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
@@ -57,6 +57,13 @@ from .hosting.embedded import (
     SourceEditResult,
     SourceSelectionError,
 )
+from .jobs.models import (
+    JobExecutionMode,
+    JobInspection,
+    JobResultView,
+    JobStatus,
+    JobSummary,
+)
 from .learning_candidates import (
     LearningCandidateContent,
     LearningCandidateRejectionReason,
@@ -69,13 +76,6 @@ from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
-from .jobs.models import (
-    JobExecutionMode,
-    JobInspection,
-    JobResultView,
-    JobStatus,
-    JobSummary,
-)
 from .observation import AgentObserver
 from .security import KeychainStore, SecretProvider, SecretReference
 from .semantics import (

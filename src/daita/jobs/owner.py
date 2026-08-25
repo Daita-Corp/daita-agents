@@ -11,6 +11,8 @@ from ..errors import DaitaError, ErrorRetryability
 from ..llm.models import ModelSensitivity
 from ..loop.models import RunInput
 from .models import (
+    MAX_JOB_DEADLINE_SECONDS,
+    MAX_JOB_LIST_PAGE_SIZE,
     ConnectedExecutorBinding,
     JobDesiredState,
     JobExecutionMode,
@@ -20,8 +22,6 @@ from .models import (
     JobSpecification,
     JobStatus,
     JobSummary,
-    MAX_JOB_DEADLINE_SECONDS,
-    MAX_JOB_LIST_PAGE_SIZE,
     job_inspection,
     job_result_view,
     job_summary,

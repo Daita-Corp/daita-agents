@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 
 import pytest
+from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 from daita import (
     Agent,
@@ -41,7 +42,6 @@ from daita.semantics import (
     SemanticKind,
     SemanticSubject,
 )
-from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
