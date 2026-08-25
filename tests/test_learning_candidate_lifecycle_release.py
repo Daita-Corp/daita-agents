@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 
 import pytest
+from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 from daita import (
     Agent,
@@ -32,7 +33,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import RunInput
+from daita.loop.models import LoopLimits, RunInput, ToolProjectionMode
 from daita.semantics import (
     ResourceRevisionBinding,
     SemanticAnnotation,
@@ -41,6 +42,8 @@ from daita.semantics import (
     SemanticKind,
     SemanticSubject,
 )
+
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 def _ids():
@@ -103,6 +106,7 @@ async def _memory_candidate_agent(
         root=tmp_path,
         model=foreground,
         model_profile=foreground.model_profile,
+        limits=EAGER_LIMITS,
         reviewer_model=reviewer,
         approval_handler=approval_handler,
         id_factory=_ids(),
@@ -292,13 +296,15 @@ async def test_semantic_acceptance_projects_only_its_exact_write_tool(tmp_path):
             created_at=now,
             source_id=source.id,
         )
-        runtime = agent._embedded._data_tool_runtime
-        runtime.select_learning_candidate(run.id, candidate)
+        runtime = agent._embedded._capability_runtime
+        guard = agent._embedded._learning_candidate_guard
+        guard.select(run.id, candidate)
         try:
-            names = {definition.name for definition in await runtime.definitions(run)}
+            catalog = await runtime.prepare_run(run)
+            names = {entry.view.name for entry in catalog.entries}
         finally:
-            runtime.clear_learning_candidate(run.id)
-            runtime.clear_learning_candidate_outcome(run.id)
+            guard.clear(run.id)
+            guard.clear_outcome(run.id)
 
         write_tools = {
             "memory_set",
@@ -332,6 +338,7 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
         root=tmp_path,
         model=foreground,
         model_profile=foreground.model_profile,
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
     )
@@ -532,18 +539,38 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
 
 
 class _TranscriptContext:
-    async def build(self, run, messages, tools, *, step, final=False):
-        del run, step, final
-        return ModelRequest(messages=messages, tools=tools)
+    async def prepare(self, run, messages, tool_context):
+        del run
+        return messages[:-1], tool_context.provider_definitions
+
+    def project(
+        self,
+        snapshot,
+        messages,
+        *,
+        step,
+        tool_context,
+        final=False,
+        previous_request_input_tokens=None,
+    ):
+        del step, previous_request_input_tokens, tool_context
+        static, tools = snapshot
+        return ModelRequest(
+            messages=(*static, *messages),
+            tools=() if final else tools,
+        )
 
 
 class _NoTools:
-    async def definitions(self, run):
-        del run
-        return ()
+    async def prepare_run(self, run):
+        return context_tool_catalog(run, ())
 
-    async def execute_all(self, run, calls):
-        del run, calls
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, calls, projection, sensitivity
         raise AssertionError("the custom tool runtime must not execute")
 
 

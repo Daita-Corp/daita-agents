@@ -30,7 +30,15 @@ from daita.learning_candidates import (
     LearningCandidateStatus,
     LearningCandidateTarget,
 )
-from daita.llm.models import CanonicalMessage, MessageRole, ModelUsage, TextBlock
+from daita.llm.errors import ProviderFailureDiagnostic, ProviderFailurePhase
+from daita.llm.models import (
+    CanonicalMessage,
+    MessageRole,
+    ModelSensitivity,
+    ModelUsage,
+    TextBlock,
+    ToolResultBlock,
+)
 from daita.llm.pricing import CostBasis, CostComponent, CostEstimate
 from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from daita.semantics import (
@@ -338,6 +346,51 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
     assert encode_postgresql_update_scope(update_scope) == encoded_update_scope
 
 
+def test_failed_loop_exit_round_trips_bounded_provider_diagnostic() -> None:
+    value = LoopExit(
+        run_id="run-provider-failure",
+        conversation_id="conversation-provider-failure",
+        kind=LoopExitKind.FAILED,
+        reason="malformed_response",
+        created_at=NOW,
+        provider_id="openai:test-model",
+        provider_failure=ProviderFailureDiagnostic(
+            phase=ProviderFailurePhase.STREAM_TERMINAL,
+            code="terminal_response_decode_failed",
+            event_type="response.completed",
+            terminal_status="completed",
+            output_item_types=("reasoning",),
+            response_id_digest="sha256:" + "a" * 64,
+        ),
+    )
+
+    _assert_round_trip(value, encode_loop_exit, decode_loop_exit)
+
+
+def test_classified_tool_result_provenance_round_trips_without_entering_output() -> (
+    None
+):
+    result = ToolResultBlock(
+        call_id="classified-call",
+        output={"value": "untrusted"},
+        sensitivity=ModelSensitivity.RESTRICTED,
+        sensitivity_provenance={
+            "authority": "validated_capability_result",
+            "resource_ids": ("resource-1",),
+        },
+    )
+    message = CanonicalMessage(MessageRole.TOOL, content=(result,))
+
+    decoded = decode_message(encode_message(message))
+
+    assert decoded == message
+    block = decoded.content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert "sensitivity" not in block.output
+    assert block.sensitivity is ModelSensitivity.RESTRICTED
+    assert block.sensitivity_provenance["resource_ids"] == ("resource-1",)
+
+
 def test_source_permission_codecs_reject_unknown_versions_and_noncanonical_sets() -> (
     None
 ):
@@ -366,19 +419,18 @@ def test_source_permission_codecs_reject_unknown_versions_and_noncanonical_sets(
         )
 
 
-def test_additive_defaults_decode_without_a_database_migration() -> None:
+def test_current_record_shape_rejects_missing_fields() -> None:
     run = RunInput("run-codec", "agent-codec", "Question?", NOW)
     payload = json.loads(encode_run_input(run))
     del payload["fields"]["conversation_source_id"]
-    del payload["fields"]["source_id"]
-    decoded = decode_run_input(json.dumps(payload))
-    assert decoded.conversation_source_id is None
-    assert decoded.source_id is None
+    with pytest.raises(ValueError, match="missing fields"):
+        decode_run_input(json.dumps(payload))
 
     candidate, _stamp = _candidate()
     candidate_payload = json.loads(encode_learning_candidate(candidate))
     del candidate_payload["fields"]["candidate_identity_sha256"]
-    assert decode_learning_candidate(json.dumps(candidate_payload)) == candidate
+    with pytest.raises(ValueError, match="missing fields"):
+        decode_learning_candidate(json.dumps(candidate_payload))
 
 
 def test_unknown_fields_and_stored_class_names_are_rejected_explicitly() -> None:

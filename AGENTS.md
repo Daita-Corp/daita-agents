@@ -27,7 +27,7 @@ Use this order of authority:
 
 1. explicitly accepted task requirements;
 2. current code under `src/daita/` and executable tests under `tests/`;
-3. `README.md` and current focused design documents under `docs/`;
+3. `README.md` and current user-facing documentation under `docs/`;
 4. legacy code and historical documents, as reference only.
 
 ## What the product is
@@ -46,8 +46,10 @@ step. Normal text from the model completes the run; there is no second
 readiness, repair, verification, or synthesis pass.
 
 The loop has only outer step, wall-time, token, and estimated-cost limits. The
-MVP supports catalog-backed reads from SQLite, PostgreSQL, CSV, and JSON. SQL
-and file access are validated against the current catalog before source I/O.
+MVP supports catalog-backed reads from SQLite, PostgreSQL, CSV, and JSON, plus
+explicitly admitted server-neutral remote MCP read tools. SQL and file access
+are validated against the current catalog before source I/O; each MCP call is
+revalidated against its exact binding revision and remote identity.
 
 Agent identity, source registrations, current catalog snapshots, exact run
 transcripts, and terminal run results are persisted in a small SQLite state
@@ -62,24 +64,53 @@ src/daita/
   loop/                # direct transcript progression and loop records
   llm/                 # canonical model records, routing, provider adapters
   capabilities.py      # tool declarations, registry, schema validation
-  domains/data/        # context building, tool runtime, SQL validation
+  capability_runtime.py # sole domain-neutral model-to-execution boundary
+  domains/             # static capability owners and learning guard state
+  domains/data/        # data context, current validation, SQL, artifacts
+  domains/mcp.py       # admitted remote MCP projection and call-time rechecks
   catalog/             # normalized current source/resource truth
   adapters/            # bounded source admission, discovery, and read I/O
   storage/sqlite.py    # sole durable state operation/admission boundary
-  storage/sqlite_schema.py     # exact current and supported historical schemas
+  storage/sqlite_schema.py     # exact current physical schema
   storage/sqlite_codecs/       # explicit persisted-record family codecs
-  storage/sqlite_migrations/   # immutable journal, baseline, and preledger bridge
+  storage/sqlite_migrations/   # development baseline and migration engine
   security/            # secret references and lazy secret resolution
   config.py            # immutable runtime/model configuration records
   cli.py               # thin local CLI over the public embedded API
 tests/                 # deterministic product tests
 examples/              # offline examples
-docs/                  # focused design documents
+docs/                  # user-facing documentation only
 pyproject.toml         # package dependencies, dev extra, entry point, and tools
 ```
 
 Do not recreate a directory just because the old architecture had one. Add a
 module only when a working vertical slice needs a clear owner.
+
+Keep development-stage status, implementation ledgers, and North Star phase
+closure in the authoritative North Star architecture document rather than
+adding internal development records under `docs/`.
+
+## Pre-production state policy
+
+Until the user explicitly declares the first production release after the
+North Star work is complete, persisted development state has no backward-
+compatibility guarantee. During this pre-production period:
+
+- keep exactly one current physical schema and one current shape per persisted
+  record family;
+- keep a codec discriminator at version `1` where the current codec uses one,
+  but do not add historical decoders or multi-version branches;
+- change the current schema, codecs, and single development baseline in place;
+- do not add migrations, pre-ledger bridges, compatibility fixtures, aliases,
+  or fallbacks for shapes produced only by unreleased code; and
+- treat development agent homes as disposable when the current state shape
+  changes.
+
+The existing checksummed journal and staged-copy migration engine remain the
+sole future production upgrade mechanism. At the explicitly approved first
+production release, freeze the then-current schema and codec-v1 shapes as the
+first immutable baseline. Only durable changes after that freeze add immutable
+owner-local migrations or additional supported codec versions.
 
 ## Ownership and dependency direction
 
@@ -131,23 +162,36 @@ kind of fact.
 
 ### Capabilities and execution
 
-`daita.capabilities.CapabilityRegistry` owns declared capability, executor,
-and model-facing tool-view identity. It projects tool schemas and validates
-arguments and executor output. Tools are a presentation over capabilities, not
-an alternate execution path.
+`daita.capabilities.CapabilityRegistry` owns immutable capability, tool-view,
+executor, and domain-owner identity and exact resolution. It projects tool
+schemas and validates arguments and executor output. Tools are a presentation
+over capabilities, not an alternate execution path.
 
-`daita.domains.data.controller.DataToolRuntime` is the current tool execution
-boundary. Its order is:
+`daita.capability_runtime.CapabilityRuntime` is the sole production
+model-to-execution boundary. It owns only cross-domain execution mechanics:
+ordered bounded batches, exact registry resolution, common schema validation,
+fixed effect governance, exact executor dispatch, artifact commit, result
+bounds, sensitivity/provenance enforcement, error normalization, and
+observation. Its order is:
 
-1. determine which registered tools apply to the attached sources;
+1. ask each statically composed domain to project applicable tools;
 2. reject a call that was not projected;
-3. resolve tool view and capability identity;
-4. validate arguments against the declared schema;
-5. perform capability-specific validation against current catalog facts;
+3. resolve tool view, capability, and domain owner by exact registry identity;
+4. validate model arguments against the declared schema;
+5. ask the owner to bind arguments and revalidate current admission;
 6. resolve the exact registered executor;
-7. execute once;
-8. validate the output contract; and
-9. return one structured success or error result.
+7. apply the fixed side-effect preflight, approval, recheck, and lock branch;
+8. execute exactly once;
+9. ask the owner to finalize capability-specific result semantics;
+10. validate output, artifact, classification, provenance, and bounds; and
+11. return exactly one structured result per requested call in original order.
+
+Static owners are `DataCapabilityDomain` for catalog, query, update, and local
+file behavior; `MemoryCapabilityDomain`; `SkillCapabilityDomain`;
+`SemanticCapabilityDomain`; and `ArtifactCapabilityDomain`.
+`LearningCandidateGuard` owns the bounded transient learning selection and
+mutation-success state shared by those owners. Applicability and current-state
+validation remain with these concrete owners, never the common runtime.
 
 Do not let `AgentLoop`, `Agent`, a tool view, or model-authored text call source
 clients or executors directly. Do not infer capability behavior from tool-name
@@ -167,13 +211,16 @@ and recovery; approval alone is not such a design.
 Artifact continuity is model-led through the existing capability/runtime path.
 `artifact_list` exposes only bounded safe metadata for the current conversation;
 it is not a public Python, CLI, TUI, or browser inventory. `artifact_read`
-returns only bounded previews, and `artifact_convert` currently supports only a
-verified Daita-generated XLSX `Data` snapshot to CSV. Conversion reads committed
-artifact bytes at the artifact-store boundary, inherits runtime-bound
-provenance and sensitivity, records its parent artifact ID, and commits through
-the normal artifact policy. Do not add prompt-intent classifiers, historical
-artifact-reference projections, a current-file pointer, raw model paths/bytes,
-or a second execution path to improve file reference continuity.
+returns only bounded previews for an exact known artifact ID owned by the
+current agent home, including an ID returned by `job_read_results`; it never
+provides an agent-wide inventory. `artifact_convert` remains scoped to the
+current conversation and currently supports only a verified Daita-generated
+XLSX `Data` snapshot to CSV. Conversion reads committed artifact bytes at the
+artifact-store boundary, inherits runtime-bound provenance and sensitivity,
+records its parent artifact ID, and commits through the normal artifact policy.
+Do not add prompt-intent classifiers, historical artifact-reference
+projections, a current-file pointer, raw model paths/bytes, or a second
+execution path to improve file reference continuity.
 
 ### Catalog and adapters
 
@@ -182,9 +229,11 @@ and traversal. Data-domain code consumes catalog contracts rather than building
 a second schema graph or querying source clients for planning facts.
 
 `daita.adapters` owns source-specific admission, containment, discovery,
-freshness checks, and I/O. SQLite and local-file paths must be absolute,
-bounded, and resistant to symlink/path escape. PostgreSQL credentials remain
-secret references and integration SDK use stays behind the execution boundary.
+freshness checks, and I/O, plus the single bounded server-neutral Streamable
+HTTP MCP protocol client. SQLite and local-file paths must be absolute,
+bounded, and resistant to symlink/path escape. PostgreSQL and MCP credentials
+remain secret references and integration SDK use stays behind the execution
+boundary.
 
 SQL validation belongs in `daita.domains.data.sql`; connector guardrails still
 apply at execution. Do not duplicate either system in a generic policy layer.
@@ -194,17 +243,17 @@ apply at execution. Do not duplicate either system in a generic policy layer.
 `daita.storage.sqlite.SQLiteStateStore` persists only state used by the MVP:
 identity, sources, current catalog snapshots, run transcripts and terminal
 results, semantic annotations, learning review state, immutable database-write
-receipts, explicit source read scopes, and exact PostgreSQL update scopes. It is
-the sole owner of the immutable checksummed `state_migrations` journal,
-explicit persisted-record codecs, exact current/historical schemas, and the
-bounded preledger bridge. Migrations run only on a verified staged copy under
-the existing agent-home writer boundary, validate their source and target
-schemas, and atomically replace the active database only after complete target
-validation. Put each durable change in one owner-local migration file; never
-edit an existing ID/checksum or create migration ownership in hosting, the
-loop, or a new runtime. The isolated preledger unit is the only code allowed to
-read the historical numeric marker, and only until its documented
-minimum-release removal gate is met.
+receipts, explicit source read scopes, exact PostgreSQL update scopes, and
+independently keyed MCP server binding aggregates. It is the sole owner of the
+checksummed `state_migrations` journal, explicit persisted-record codecs, and
+the exact current schema. Before the first production freeze, the journal
+contains one mutable development baseline and no compatibility path for older
+development state. After that freeze, migrations run only on a verified staged
+copy under the existing agent-home writer boundary, validate their source and
+target schemas, and atomically replace the active database only after complete
+target validation. Put each post-freeze durable change in one owner-local
+migration file; never edit a released ID/checksum or create migration ownership
+in hosting, the loop, or a new runtime.
 
 Source read access is owned only by `source_read_scopes`, and PostgreSQL update
 access is owned only by `postgresql_update_scopes`, never by source connection
@@ -225,6 +274,61 @@ normalized failures; the generic loop does not retry a whole run or understand
 provider-specific failures.
 
 ## Architecture exclusions
+
+### Accepted Phase B durable-job slice
+
+North Star Phase B is accepted for implementation, but only through these
+existing owners and one concrete job kind:
+
+- one bounded, feature-owned `JobRun` aggregate may represent each independent
+  durable job lifecycle, with attempts, claims, fencing, cancellation intent,
+  receipts, external observations, validated result/artifact references, and
+  terminal-observation state embedded in its current codec-v1 shape;
+- one Stage B job owner may admit frozen jobs and own bounded list, inspect,
+  result, cancel, and conditional lifecycle transitions;
+- one bounded Daita job supervisor may run under the existing open
+  `EmbeddedAgent` and single-writer boundary, claim independent jobs within
+  exact global/per-agent/per-source limits, fence stale claims, and recover
+  safely on reopen;
+- `CapabilityRuntime` may expose one trusted typed internal request for that
+  supervisor, reusing the ordinary registry resolution, validation,
+  governance, execution, artifact, sensitivity, provenance, result-bound, and
+  observation path without a model envelope or recursive runtime call; and
+- the data domain may own only the first job-kind-specific
+  `start_data_profile` capability and internal-only `data_profile` execution
+  capability. The start capability freezes the exact non-secret job
+  specification and persists the exact execution capability ID and immutable
+  registry contract digest before returning its bounded receipt.
+
+The agent identity is the job authorization boundary. Model and public
+lifecycle reads and cancellation may address that agent's jobs from any of its
+conversations; `JobRun.conversation_id` and `origin_run_id` are immutable origin
+provenance, not access gates. `job_list` is a direct core capability even when
+the agent owns no jobs. Once jobs exist, `job_inspect` and `job_read_results`
+are direct core capabilities; `job_cancel` remains deferred, effect-governed,
+and projected only while cancelable work exists. Known-ID result recovery uses
+`job_read_results` directly, while `job_inspect` is reserved for lifecycle,
+attempt, execution, and failure details. Cross-agent lookup fails without
+exposing job metadata.
+
+`Capability` metadata now separates data access from operational effect.
+Starting or cancelling durable work is an operational effect even when the
+job's data access is read-only; this distinction remains immutable registry
+metadata and does not authorize a policy registry or DSL.
+
+Daita execution is the default. Phase B connected-executor work is limited to
+deterministic offline conformance for an exact explicitly selected profile,
+including revocation/drift, uncertain start/cancel responses, reconciliation,
+result bounds, and no fallback. Production exposes no placeholder external
+profile and does not claim support for a real external executor until a later
+separately accepted connector slice is certified.
+
+Phase B does not authorize a generic scheduler, arbitrary job dispatcher,
+workflow or execution graph, universal task/work abstraction, job-kind switch
+or handler registry, dynamic registration, plugin executor, completion router,
+recovery service, event bus, resident daemon, client/server split, competing
+writer, multi-host queue, resumable model state, or Phase C/D/E scaffolding.
+Work pauses whenever no admitted `EmbeddedAgent` host is open.
 
 Do not add or restore these mechanisms in order to implement an MVP feature:
 
@@ -265,15 +369,15 @@ stage in scope, and preserve the direct architecture:
 - learning is the ordinary foreground loop using explicit memory/skill tools,
   not a worker or second model pass;
 - governance is a fixed branch immediately before a side effect at the
-  existing `DataToolRuntime` boundary, not a policy engine;
+  existing `CapabilityRuntime` boundary, not a policy engine;
 - approval is once-only, in-process, and bound to exact frozen arguments; it
   does not create pending state or resume APIs; and
 - observation is one best-effort callback that cannot direct execution and is
   not a durable event or telemetry subsystem.
 
-Extend `CapabilityRegistry`, `DataToolRuntime`, `DataContextBuilder`,
-`EmbeddedAgent`, and `SQLiteStateStore` only for the concerns they already own.
-Do not wrap them in a replacement workflow runtime.
+Extend `CapabilityRegistry`, `CapabilityRuntime`, the appropriate static domain,
+`DataContextBuilder`, `EmbeddedAgent`, and `SQLiteStateStore` only for the
+concerns they already own. Do not wrap them in a replacement workflow runtime.
 
 ## Development setup
 
@@ -328,14 +432,14 @@ pipx install daita-agents
 daita
 ```
 
-`openai`, `anthropic`, `google-genai`, `asyncpg`, `sqlglot`, `keyring`,
+`openai`, `anthropic`, `google-genai`, `asyncpg`, `sqlglot`, `httpx`, `keyring`,
 `textual`, `rich`, and `XlsxWriter` are default production dependencies.
 `dev` is the only optional dependency group; do not restore provider, keychain,
 database, parser, CLI, recommended, complete, aggregate, or other customer
 extras.
 
 Default installation does not authorize eager imports. Import provider SDKs,
-`asyncpg`, `sqlglot`, `keyring`, `textual`, and Rich only inside the
+`asyncpg`, `sqlglot`, `httpx`, `keyring`, `textual`, and Rich only inside the
 provider/client or terminal-selection boundary that first needs them, and
 XlsxWriter only inside the XLSX renderer boundary—never at module import time.
 Importing `daita` or `daita.cli`, and running headless commands, must not load
@@ -397,8 +501,9 @@ Do not add provider branches to `AgentLoop`.
    adapter/backend.
 5. Add concrete validation before executor I/O and retain connector-level
    guardrails.
-6. Return bounded, schema-validated `ToolOutput`; convert expected failures to
-   structured model-visible results at `DataToolRuntime`.
+6. Return bounded, schema-validated `ToolOutput`; let the owning domain
+   normalize expected failures for `CapabilityRuntime` to render as structured
+   model-visible results.
 7. Add focused unit/contract coverage plus one public vertical-slice test.
 
 Do not create a plugin base-class hierarchy, an alternate catalog, or a source-
@@ -414,14 +519,22 @@ specific agent loop.
 | `src/daita/loop/driver.py` | sole direct model/tool progression loop |
 | `src/daita/loop/models.py` | run, transcript, limits, and exit records |
 | `src/daita/capabilities.py` | capability declarations and registry |
+| `src/daita/capability_runtime.py` | sole common model-to-execution runtime |
+| `src/daita/adapters/mcp.py` | bounded server-neutral Streamable HTTP MCP protocol client and records |
+| `src/daita/domains/mcp.py` | static MCP capability owner and call-time binding rechecks |
+| `src/daita/domains/learning.py` | transient learning mutation guard |
 | `src/daita/domains/data/context.py` | current model request construction |
-| `src/daita/domains/data/controller.py` | tool projection and execution boundary |
+| `src/daita/domains/data/controller.py` | data projection and current-state validation |
+| `src/daita/domains/data/export_capabilities.py` | artifact capability owner and executors |
+| `src/daita/memory/capabilities.py` | memory capability owner and executor |
+| `src/daita/skills/capabilities.py` | skill capability owner and executors |
+| `src/daita/semantics.py` | semantic capability owner and records |
 | `src/daita/domains/data/sql/` | catalog-scoped SQL validation |
 | `src/daita/catalog/service.py` | normalized catalog lifecycle |
 | `src/daita/storage/sqlite.py` | sole durable state operation/admission boundary |
 | `src/daita/storage/sqlite_schema.py` | exact physical schemas and validators |
 | `src/daita/storage/sqlite_codecs/` | explicit durable record-family codecs |
-| `src/daita/storage/sqlite_migrations/` | checksummed journal, baseline, and bounded bridge |
+| `src/daita/storage/sqlite_migrations/` | development baseline and staged-copy migration engine |
 | `src/daita/llm/routing.py` | normalized model retry/fallback ownership |
 | `tests/test_architecture.py` | prohibited-system and public-surface checks |
 

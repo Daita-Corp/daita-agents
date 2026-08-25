@@ -14,22 +14,29 @@ from daita.capabilities import (
     ApprovalDecision,
     ApprovalRequest,
     Capability,
+    OperationalEffect,
     SideEffectExecutor,
     ToolExecution,
 )
-from daita.domains.data.controller import DataToolRuntime
+from daita.capability_runtime import CapabilityRuntime
 from daita.llm.models import (
     FinishReason,
     MessageRole,
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import RunInput
+from daita.loop.models import (
+    LoopLimits,
+    RunInput,
+    ToolBatchInterruption,
+    ToolProjectionMode,
+)
 from daita.memory import MEMORY_MAX_CHARACTERS, USER_MAX_CHARACTERS
 from daita.memory.capabilities import (
     MEMORY_SET_CAPABILITY_ID,
@@ -50,6 +57,7 @@ from daita.skills.capabilities import (
 )
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -127,14 +135,22 @@ def _run(agent: Agent, run_id: str = "approval-run") -> RunInput:
     )
 
 
-def _runtime(agent: Agent) -> DataToolRuntime:
+def _runtime(agent: Agent) -> CapabilityRuntime:
     loop = agent._embedded._loop
     assert loop is not None
-    return cast(DataToolRuntime, loop._tools)
+    return cast(CapabilityRuntime, loop._tools)
 
 
 async def _execute(agent: Agent, *calls: ToolCall):
-    return await _runtime(agent).execute_all(_run(agent), calls)
+    runtime = _runtime(agent)
+    run = _run(agent)
+    catalog = await runtime.prepare_run(run)
+    return await runtime.execute_all(
+        run,
+        calls,
+        projection=runtime.project(catalog, ()),
+        sensitivity=ModelSensitivity.INTERNAL,
+    )
 
 
 async def _skill_digest(agent: Agent, name: str) -> str:
@@ -199,6 +215,7 @@ async def _agent(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approval_handler,
         observer=observer,
         clock=lambda: NOW,
@@ -226,28 +243,18 @@ def test_approval_records_and_write_invariants_are_exact_and_frozen():
     with pytest.raises(TypeError):
         request.arguments["content"] = "changed"  # type: ignore[index]
 
-    with pytest.raises(ValueError, match="write tools must be side-effecting"):
-        Capability(
-            id="test.capability",
-            description="test",
-            input_schema={"type": "object", "properties": {}},
-            output_kind="test.output",
-            output_schema={"type": "object", "properties": {}},
-            executor_id="test.executor",
-            access_mode=AccessMode.WRITE,
-            side_effecting=False,
-        )
-    with pytest.raises(ValueError, match="read tools cannot be"):
-        Capability(
-            id="test.capability",
-            description="test",
-            input_schema={"type": "object", "properties": {}},
-            output_kind="test.output",
-            output_schema={"type": "object", "properties": {}},
-            executor_id="test.executor",
-            access_mode=AccessMode.READ,
-            side_effecting=True,
-        )
+    independent = Capability(
+        id="test.capability",
+        description="test",
+        input_schema={"type": "object", "properties": {}},
+        output_kind="test.output",
+        output_schema={"type": "object", "properties": {}},
+        executor_id="test.executor",
+        access_mode=AccessMode.NONE,
+        operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
+    )
+    assert independent.access_mode is AccessMode.NONE
+    assert independent.operational_effect is OperationalEffect.CHANGE_ADVISORY_CONTEXT
 
 
 async def test_memory_set_identity_projection_and_read_tools_never_ask_approval(
@@ -270,25 +277,27 @@ async def test_memory_set_identity_projection_and_read_tools_never_ask_approval(
             executor.executor_id,
             capability.output_kind,
             capability.access_mode,
-            capability.side_effecting,
+            capability.operational_effect,
         ) == (
             MEMORY_SET_TOOL_NAME,
             MEMORY_SET_CAPABILITY_ID,
             MEMORY_SET_EXECUTOR_ID,
             MEMORY_SET_OUTPUT_KIND,
-            AccessMode.WRITE,
-            True,
+            AccessMode.NONE,
+            OperationalEffect.CHANGE_ADVISORY_CONTEXT,
         )
         assert resolved == capability
-        definitions = await _runtime(agent).definitions(_run(agent))
-        assert tuple(item.name for item in definitions) == (
+        catalog = await _runtime(agent).prepare_run(_run(agent))
+        names = tuple(item.view.name for item in catalog.entries)
+        assert len(names) == len(set(names))
+        assert {
             "artifact_create_document",
             "artifact_set_export_location",
             "memory_set",
             "skill_delete",
             "skill_save",
             "skill_view",
-        )
+        } <= set(names)
 
         read = ToolCall(id="read", name="skill_view", arguments={"name": "absent"})
         result = (await _execute(agent, read))[0]
@@ -406,6 +415,7 @@ async def test_callback_exception_is_an_ordinary_tool_error_and_loop_continues(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=broken,
     )
     try:
@@ -484,12 +494,21 @@ async def test_tool_and_approval_event_sequences_are_exact_and_content_free(tmp_
         "call_id": "write",
         "tool_name": MEMORY_SET_TOOL_NAME,
         "capability_id": MEMORY_SET_CAPABILITY_ID,
+        "invocation_mode": "direct",
     }
     assert events[1].data == events[0].data
-    assert dict(events[2].data) == {"call_id": "write", "outcome": "approved"}
+    assert dict(events[2].data) == {
+        "call_id": "write",
+        "tool_name": MEMORY_SET_TOOL_NAME,
+        "capability_id": MEMORY_SET_CAPABILITY_ID,
+        "invocation_mode": "direct",
+        "outcome": "approved",
+    }
     completed = events[3].data
     assert completed["call_id"] == "write"
     assert completed["tool_name"] == MEMORY_SET_TOOL_NAME
+    assert completed["capability_id"] == MEMORY_SET_CAPABILITY_ID
+    assert completed["invocation_mode"] == "direct"
     assert completed["success"] is True
     assert completed["error_code"] is None
     duration_ms = completed["duration_ms"]
@@ -774,8 +793,9 @@ async def test_cancellation_during_approval_propagates_without_decision_or_write
         task = asyncio.create_task(_execute(agent, _memory_call(content="never")))
         await asyncio.wait_for(entered.wait(), timeout=2)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        outcome = await task
+        assert outcome.interruption_kind is ToolBatchInterruption.CANCELLED
+        assert _error_code(outcome.ordered_results[0]) == "tool_call_interrupted"
         assert await agent.read_memory() == ""
     finally:
         await agent.close()
@@ -820,8 +840,9 @@ async def test_cancellation_after_atomic_replacement_starts_waits_for_outcome(
         await asyncio.sleep(0.02)
         assert not task.done()
         release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        outcome = await task
+        assert outcome.interruption_kind is ToolBatchInterruption.CANCELLED
+        assert not outcome.ordered_results[0].is_error
         assert await agent.read_memory() == "definite"
     finally:
         release.set()
@@ -854,6 +875,7 @@ async def test_approval_state_is_not_persisted_across_restart(tmp_path):
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
     )
     try:
         result = (await _execute(reopened, _memory_call(content="not-approved")))[0]
@@ -879,6 +901,7 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
     )
     try:
@@ -890,7 +913,8 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
         assert len(approvals) == 1
         assert approvals[0].arguments["content"] == content
         assert len(provider.requests) == 2
-        assert content in _system_text(provider.requests[1])
+        assert content not in _system_text(provider.requests[1])
+        assert provider.requests[0].messages[0] == provider.requests[1].messages[0]
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"target": "memory", "replaced": True}
@@ -922,6 +946,7 @@ async def test_explicit_reusable_workflow_is_one_approved_foreground_skill(tmp_p
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
     )
     try:
@@ -933,9 +958,10 @@ async def test_explicit_reusable_workflow_is_one_approved_foreground_skill(tmp_p
         assert len(approvals) == 1
         assert dict(approvals[0].arguments) == dict(call.arguments)
         assert len(provider.requests) == 2
-        assert "- monthly-revenue: Calculate monthly revenue consistently.\n" in (
+        assert "- monthly-revenue: Calculate monthly revenue consistently.\n" not in (
             _system_text(provider.requests[1])
         )
+        assert provider.requests[0].messages[0] == provider.requests[1].messages[0]
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"name": "monthly-revenue", "changed": True}
@@ -960,6 +986,7 @@ async def test_weak_learning_signal_stays_in_transcript_without_a_write(tmp_path
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
     )
     try:
@@ -983,9 +1010,11 @@ async def test_learning_tool_descriptions_route_documents_and_require_write_firs
 ):
     agent = await _agent(tmp_path, "learning-tool-routing")
     try:
+        runtime = _runtime(agent)
+        catalog = await runtime.prepare_run(_run(agent))
         definitions = {
-            definition.name: definition
-            for definition in await _runtime(agent).definitions(_run(agent))
+            entry.view.name: runtime._registry.tool_definition(entry.view.name)
+            for entry in catalog.entries
         }
         memory_description = definitions[MEMORY_SET_TOOL_NAME].description
         skill_view_description = definitions["skill_view"].description
@@ -1055,6 +1084,7 @@ async def test_loaded_skill_is_replaced_instead_of_duplicated(tmp_path):
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
     )
     try:
@@ -1106,8 +1136,11 @@ async def test_skill_write_identities_use_the_existing_registry_and_runtime(tmp_
                 executor.executor_id,
                 capability.output_kind,
             ) == identity
-            assert capability.access_mode is AccessMode.WRITE
-            assert capability.side_effecting is True
+            assert capability.access_mode is AccessMode.NONE
+            assert (
+                capability.operational_effect
+                is OperationalEffect.CHANGE_ADVISORY_CONTEXT
+            )
             assert callable(getattr(executor, "preflight", None))
     finally:
         await agent.close()
@@ -1621,8 +1654,9 @@ async def test_skill_save_cancellation_before_mutation_never_writes(tmp_path):
         task = asyncio.create_task(_execute(agent, _skill_save_call(name="never")))
         await asyncio.wait_for(entered.wait(), timeout=2)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        outcome = await task
+        assert outcome.interruption_kind is ToolBatchInterruption.CANCELLED
+        assert _error_code(outcome.ordered_results[0]) == "tool_call_interrupted"
         assert await agent.read_skill("never") is None
     finally:
         await agent.close()
@@ -1654,8 +1688,9 @@ async def test_skill_save_cancellation_after_atomic_mutation_starts_is_definite(
         await asyncio.sleep(0.02)
         assert not task.done()
         release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        outcome = await task
+        assert outcome.interruption_kind is ToolBatchInterruption.CANCELLED
+        assert not outcome.ordered_results[0].is_error
         assert await agent.read_skill("definite") is not None
     finally:
         release.set()
@@ -1675,6 +1710,7 @@ async def test_reopen_starts_no_learning_work_and_persists_no_skill_approval(tmp
         root=tmp_path,
         model=first_provider,
         model_profile=_profile(first_provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
     )
     try:
@@ -1691,6 +1727,7 @@ async def test_reopen_starts_no_learning_work_and_persists_no_skill_approval(tmp
         root=tmp_path,
         model=reopened_provider,
         model_profile=_profile(reopened_provider),
+        limits=EAGER_LIMITS,
     )
     try:
         assert reopened_provider.requests == ()

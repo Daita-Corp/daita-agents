@@ -1,4 +1,4 @@
-"""ChatGPT-subscription Codex transport owned by Daita."""
+"""Implement Daita-owned ChatGPT subscription transport for Codex models."""
 
 from __future__ import annotations
 
@@ -9,7 +9,12 @@ from datetime import datetime
 from typing import cast
 
 from ..._installation import repair_guidance
-from ..errors import ModelProviderError, ProviderErrorCode
+from ..errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+)
 from ..models import ModelRequest, ModelResponse, ModelStreamCompleted
 from ..pricing import CostEstimate
 from ..subscription_auth import (
@@ -113,6 +118,10 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
                         ProviderErrorCode.MALFORMED_RESPONSE,
                         "Codex stream ended without a terminal response",
                         provider_id=self.provider_id,
+                        diagnostic=ProviderFailureDiagnostic(
+                            phase=ProviderFailurePhase.STREAM_TERMINAL,
+                            code="terminal_completion_missing",
+                        ),
                     )
                 return completed
         except TimeoutError as error:

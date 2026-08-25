@@ -15,6 +15,7 @@ import daita.domains.data.export_capabilities as artifact_capabilities
 from daita import Agent, SQLiteSource
 from daita.artifacts.models import (
     ArtifactAuthorship,
+    ArtifactError,
     ArtifactProvenance,
     ArtifactRef,
 )
@@ -30,6 +31,7 @@ from daita.domains.data.export_capabilities import (
     DOCUMENT_CREATE_TOOL_NAME,
     SQLITE_TABULAR_EXPORT_TOOL_NAME,
     ArtifactListExecutor,
+    ArtifactReadExecutor,
 )
 from daita.llm.models import (
     FinishReason,
@@ -226,6 +228,27 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
             )
         ),
         _stop("converted and saved"),
+        _tools(
+            ToolCall(
+                id="cross-list",
+                name=ARTIFACT_LIST_TOOL_NAME,
+                arguments={},
+            ),
+            ToolCall(
+                id="cross-read",
+                name=ARTIFACT_READ_TOOL_NAME,
+                arguments={"artifact_id": xlsx_id},
+            ),
+        ),
+        _stop("read exact prior artifact"),
+        _tools(
+            ToolCall(
+                id="cross-convert",
+                name=ARTIFACT_CONVERT_TOOL_NAME,
+                arguments={"artifact_id": xlsx_id, "format": "csv"},
+            )
+        ),
+        _stop("conversion remained conversation scoped"),
     )
     provider._cursor = 0
     try:
@@ -278,8 +301,73 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
         assert (
             Path(converted.artifact_deliveries[0].saved_path).read_bytes() == expected
         )
+
+        cross_conversation = await agent.run(
+            "Read the exact earlier workbook by its artifact ID."
+        )
+        assert cross_conversation.conversation_id != first.conversation_id
+        cross_list = await _result(agent, cross_conversation.run_id, "cross-list")
+        cross_list_data = cross_list.output["data"]
+        assert isinstance(cross_list_data, Mapping)
+        assert cross_list_data["artifacts"] == ()
+        cross_read = await _result(agent, cross_conversation.run_id, "cross-read")
+        assert cross_read.is_error is False
+        cross_read_data = cross_read.output["data"]
+        assert isinstance(cross_read_data, Mapping)
+        assert cross_read_data["rows"] == (("alpha", 1), ("beta", 2))
+
+        cross_convert = await agent.run(
+            "Convert the earlier workbook from another conversation."
+        )
+        conversion = await _result(agent, cross_convert.run_id, "cross-convert")
+        assert conversion.is_error is True
+        conversion_error = conversion.output["error"]
+        assert isinstance(conversion_error, Mapping)
+        assert conversion_error["code"] == "artifact_missing"
     finally:
         await agent.close()
+
+
+async def test_exact_artifact_read_does_not_cross_agent_homes(tmp_path: Path) -> None:
+    provider = MockModelProvider(
+        (
+            _tools(
+                ToolCall(
+                    id="create",
+                    name=DOCUMENT_CREATE_TOOL_NAME,
+                    arguments={"format": "txt", "content": "private agent artifact"},
+                )
+            ),
+            _stop("created"),
+        ),
+        provider_id="mock:artifact-agent-isolation",
+    )
+    first = await Agent.create(
+        "artifact-agent-one",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        id_factory=_ids(),
+    )
+    second = await Agent.create("artifact-agent-two", root=tmp_path)
+    try:
+        created = await first.run("Create a private artifact.")
+        artifact_id = created.artifacts[0].artifact_id
+        with pytest.raises(ArtifactError, match="not available"):
+            await second.read_artifact(artifact_id)
+        with pytest.raises(ArtifactError, match="not available"):
+            await ArtifactReadExecutor(second._embedded._artifact_store).execute(
+                ToolExecution(
+                    run_id="run-foreign-artifact",
+                    call_id="read-foreign-artifact",
+                    capability_id="artifact.read",
+                    arguments={"artifact_id": artifact_id},
+                    conversation_id=created.conversation_id,
+                )
+            )
+    finally:
+        await first.close()
+        await second.close()
 
 
 async def test_artifact_convert_rejects_non_xlsx_without_creating_a_child(

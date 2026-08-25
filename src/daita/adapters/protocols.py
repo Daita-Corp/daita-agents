@@ -1,4 +1,4 @@
-"""Small source lifecycle and adapter contracts."""
+"""Define source lifecycle, resource adapter, and source-store protocols."""
 
 from __future__ import annotations
 
@@ -6,8 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-from ..capabilities import ExtensionDeclarations
-from ..errors import PluginError
+from ..errors import DaitaError, ErrorRetryability
 from .models import (
     DiscoveryRequest,
     DiscoveryResult,
@@ -23,7 +22,7 @@ def _text(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a non-empty string")
 
 
-class ResourceAdapterError(PluginError):
+class ResourceAdapterError(DaitaError):
     """Normalized resource-adapter failure safe for control-plane handling."""
 
     def __init__(self, source_id: str, code: str, message: str) -> None:
@@ -32,7 +31,11 @@ class ResourceAdapterError(PluginError):
         _text(message, "adapter error message")
         self.source_id = source_id
         self.code = code
-        super().__init__(message, error_code=code)
+        super().__init__(
+            message,
+            error_code=code,
+            retryability=ErrorRetryability.UNKNOWN,
+        )
 
 
 class SourceClosedError(ResourceAdapterError):
@@ -79,8 +82,6 @@ class ResourceAdapter(Protocol):
     async def inspect(self, resource: ResourceRef) -> ResourceSnapshot: ...
 
     async def health(self) -> SourceHealth: ...
-
-    def declarations(self) -> ExtensionDeclarations: ...
 
     async def close(self) -> None: ...
 

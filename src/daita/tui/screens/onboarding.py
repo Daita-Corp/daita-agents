@@ -1,8 +1,9 @@
-"""Agent, model, and source onboarding screens over the public Agent API."""
+"""Collect agent identity, model configuration, and initial source setup."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -29,7 +30,7 @@ class AgentCreateScreen(Screen[str | None]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="onboard"):
+        with Vertical(id="onboard", classes="control-panel compact-panel"):
             yield Label("Create an agent", id="onboard-title", markup=False)
             yield Input(placeholder="Agent name", id="agent-name")
             yield Label("", id="onboard-error", markup=False)
@@ -77,9 +78,10 @@ class ModelSetupScreen(Screen[bool]):
         super().__init__()
         self._provider: str | None = None
         self._model: str | None = None
+        self._subscription_prompt: tuple[str, str] | None = None
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="onboard"):
+        with Vertical(id="onboard", classes="control-panel"):
             yield Label("Configure a model", id="onboard-title", markup=False)
             yield Static(
                 "Choose a provider, then a model.", id="model-help", markup=False
@@ -106,12 +108,24 @@ class ModelSetupScreen(Screen[bool]):
     def action_cancel(self) -> None:
         self.dismiss(False)
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
+    def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "choose-provider":
-            await self._choose_provider()
+            self.run_worker(
+                self._choose_provider(),
+                name="model-provider-selection",
+                group="model-setup-interaction",
+                exclusive=True,
+            )
             return
-        if event.button.id != "save-model":
-            return
+        if event.button.id == "save-model":
+            self.run_worker(
+                self._save_model(),
+                name="model-configuration",
+                group="model-setup-interaction",
+                exclusive=True,
+            )
+
+    async def _save_model(self) -> None:
         if self._provider is None:
             self.query_one("#onboard-error", Label).update("Choose a provider first.")
             return
@@ -150,6 +164,7 @@ class ModelSetupScreen(Screen[bool]):
                 raise ValueError("A custom provider requires a base URL.")
             if provider == "codex":
                 api_key = None
+                self._subscription_prompt = None
                 subscription_credential = await self.app.controller.authenticate_model_subscription(  # type: ignore[attr-defined]
                     provider=provider,
                     on_verification=self._show_subscription_verification,
@@ -188,6 +203,7 @@ class ModelSetupScreen(Screen[bool]):
     def _show_subscription_verification(self, prompt: object) -> None:
         verification_url = getattr(prompt, "verification_url", "")
         user_code = getattr(prompt, "user_code", "")
+        self._subscription_prompt = (verification_url, user_code)
         self.query_one("#model-help", Static).update(
             sanitize_terminal_text(
                 f"Open {verification_url}\nEnter code: {user_code}",
@@ -198,11 +214,15 @@ class ModelSetupScreen(Screen[bool]):
         )
 
     def _show_subscription_progress(self, message: str) -> None:
+        lines = [message]
+        if self._subscription_prompt is not None:
+            verification_url, user_code = self._subscription_prompt
+            lines.extend((f"Open {verification_url}", f"Enter code: {user_code}"))
         self.query_one("#model-help", Static).update(
             sanitize_terminal_text(
-                message,
-                maximum=240,
-                preserve_lines=False,
+                "\n".join(lines),
+                maximum=512,
+                preserve_lines=True,
                 fallback="Connecting subscription.",
             )
         )
@@ -261,8 +281,12 @@ class ModelSetupScreen(Screen[bool]):
 class SourceSetupScreen(Screen[bool]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._busy = False
+
     def compose(self) -> ComposeResult:
-        with Vertical(id="onboard"):
+        with Vertical(id="onboard", classes="control-panel source-panel"):
             yield Label("Attach a source", id="onboard-title", markup=False)
             yield Select(
                 ((label, key) for key, label in SOURCE_TYPES),
@@ -290,46 +314,73 @@ class SourceSetupScreen(Screen[bool]):
             yield Footer()
 
     def action_cancel(self) -> None:
-        self.dismiss(False)
+        if not self._busy:
+            self.dismiss(False)
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id != "attach-source":
-            return
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "attach-source" and not self._busy:
+            self._busy = True
+            event.button.disabled = True
+            self._show_source_message("")
+            self.run_worker(
+                self._attach_source(),
+                name="source-attachment",
+                group="source-setup-interaction",
+            )
+
+    async def _attach_source(self) -> None:
         kind = self.query_one("#source-type", Select).value
         name = self.query_one("#source-name", Input).value.strip() or None
         path_value = self.query_one("#source-path", Input).value.strip()
+        registration = None
+        attached = False
         try:
             if kind == "sqlite":
                 if not path_value:
                     raise ValueError("SQLite requires a path")
-                await self.app.controller.attach_sqlite(  # type: ignore[attr-defined]
+                registration = await self.app.controller.attach_sqlite(  # type: ignore[attr-defined]
                     Path(path_value).expanduser(),
                     name=name,
                 )
             elif kind == "directory":
                 if not path_value:
                     raise ValueError("A local directory requires a path")
-                await self.app.controller.attach_directory(  # type: ignore[attr-defined]
+                registration = await self.app.controller.attach_directory(  # type: ignore[attr-defined]
                     Path(path_value).expanduser(),
                     name=name,
                 )
             elif kind == "postgresql":
-                await self._attach_postgresql(name, path_value)
+                registration = await self._attach_postgresql(name, path_value)
             else:
                 raise ValueError("Choose a source type")
+            if registration is None:
+                return
+            attached = True
         except Exception as error:
-            self.query_one("#onboard-error", Label).update(
+            self._show_source_message(
                 sanitize_terminal_text(
                     str(error),
                     maximum=512,
                     preserve_lines=False,
                     fallback="Source setup failed.",
-                )
+                ),
+                error=True,
             )
-            return
-        self.dismiss(True)
+        finally:
+            self._busy = False
+            if self.is_mounted:
+                button = self.query_one("#attach-source", Button)
+                button.disabled = False
+                button.remove_class("-active")
+        if attached:
+            self.dismiss(True)
 
-    async def _attach_postgresql(self, name: str | None, path_value: str) -> None:
+    def _show_source_message(self, message: str, *, error: bool = False) -> None:
+        label = self.query_one("#onboard-error", Label)
+        label.set_class(error, "-error")
+        label.update(message)
+
+    async def _attach_postgresql(self, name: str | None, path_value: str) -> Any:
         controller = self.app.controller  # type: ignore[attr-defined]
         if path_value:
             try:
@@ -353,46 +404,72 @@ class SourceSetupScreen(Screen[bool]):
                 "PostgreSQL requires host, database, username, and password"
             )
         credential = await controller.store_postgresql_password(password)
-        schemas = tuple(
+        entered_schemas = tuple(
             item.strip()
             for item in self.query_one("#pg-schemas", Input).value.split(",")
             if item.strip()
         ) or ("public",)
-        await controller.attach_postgresql(
-            host=host,
-            database=database,
-            username=username,
-            credential=credential,
-            schemas=schemas,
-            port=port,
-            ssl_mode=ssl_mode,
-            name=name,
-        )
-
-
-class CatalogRepairScreen(Screen[str]):
-    BINDINGS = [Binding("escape", "exit", "Exit")]
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="onboard"):
-            yield Label("Catalog is empty", id="onboard-title", markup=False)
-            yield Static(
-                "Attach a source that Daita can catalog, or exit.",
-                markup=False,
+        registration = None
+        try:
+            self._show_source_message("Testing connection and inspecting schemas…")
+            probe = await controller.probe_postgresql(
+                host=host,
+                database=database,
+                username=username,
+                credential=credential,
+                port=port,
+                ssl_mode=ssl_mode,
             )
-            yield Button("Add a source", id="repair-add", variant="primary")
-            yield Button("Exit", id="repair-exit")
-            yield Footer()
-
-    def action_exit(self) -> None:
-        self.dismiss("exit")
-
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "repair-add":
-            attached = await self.app._await_modal(SourceSetupScreen())  # type: ignore[attr-defined]
-            self.dismiss("added" if attached else "exit")
-            return
-        self.dismiss("exit")
+            if not probe.schemas:
+                raise ValueError(
+                    "Connection succeeded, but no non-system schemas are visible."
+                )
+            available = {item.name for item in probe.schemas}
+            table_schemas = tuple(
+                item.name for item in probe.schemas if item.has_base_tables
+            )
+            entered_visible = tuple(
+                schema for schema in entered_schemas if schema in available
+            )
+            initial = (
+                table_schemas
+                if entered_schemas == ("public",) and table_schemas
+                else entered_visible or table_schemas
+            )
+            selected = await self.app._await_modal(  # type: ignore[attr-defined]
+                SelectionScreen(
+                    title="Select PostgreSQL schemas",
+                    options=tuple(
+                        PickerOption(
+                            item.name,
+                            item.name,
+                            "contains tables" if item.has_base_tables else "empty",
+                        )
+                        for item in probe.schemas
+                    ),
+                    multi=True,
+                    initial_selected=initial,
+                )
+            )
+            if selected is None:
+                return None
+            schemas = tuple(str(item) for item in selected)
+            self.query_one("#pg-schemas", Input).value = ", ".join(schemas)
+            self._show_source_message("Cataloging selected schemas…")
+            registration = await controller.attach_postgresql(
+                host=host,
+                database=database,
+                username=username,
+                credential=credential,
+                schemas=schemas,
+                port=port,
+                ssl_mode=ssl_mode,
+                name=name,
+            )
+            return registration
+        finally:
+            if registration is None:
+                await controller.delete_postgresql_password(credential)
 
 
 def _optional_int(value: str) -> int | None:

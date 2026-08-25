@@ -1,4 +1,4 @@
-"""Guarded SQLite read backend invoked only by the runtime query executor."""
+"""Execute catalog-validated, bounded reads against admitted SQLite files."""
 
 from __future__ import annotations
 
@@ -29,24 +29,24 @@ from ..domains.data.export_capabilities import (
 )
 from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_sqlite_read
-from ..errors import PluginError
+from ..errors import DaitaError
 from ..storage.sqlite_records import SourcePermissionStateError
 from .protocols import SourceStore
 
 
-class SQLiteQueryError(RuntimeError):
+class SQLiteQueryError(DaitaError):
     """Normalized query-boundary failure without connector error leakage."""
 
     def __init__(self, code: str, message: str) -> None:
         self.code = code
-        super().__init__(message)
+        super().__init__(message, error_code=code)
 
 
-class _SQLiteReadPermissionError(PluginError):
+class SQLiteReadPermissionError(DaitaError):
     """Stable model-visible failure for a permission recheck at source I/O."""
 
     def __init__(self, code: str, message: str) -> None:
-        super().__init__(message, plugin_id="sqlite", error_code=code)
+        super().__init__(message, error_code=code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +96,7 @@ class SQLiteQueryBackend:
                 (source_id,),
             )
         except SourcePermissionStateError:
-            raise _SQLiteReadPermissionError(
+            raise SQLiteReadPermissionError(
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from None
@@ -109,7 +109,7 @@ class SQLiteQueryBackend:
         )
         if not validation.valid or validation.analysis is None:
             if "resource_out_of_scope" in validation.issue_codes:
-                raise _SQLiteReadPermissionError(
+                raise SQLiteReadPermissionError(
                     "resource_read_not_allowed",
                     "One or more requested resources are not available for reading.",
                 )
@@ -203,7 +203,7 @@ class SQLiteQueryBackend:
                 (source_id,),
             )
         except SourcePermissionStateError:
-            raise _SQLiteReadPermissionError(
+            raise SQLiteReadPermissionError(
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from None
@@ -216,7 +216,7 @@ class SQLiteQueryBackend:
         )
         if not validation.valid or validation.analysis is None:
             if "resource_out_of_scope" in validation.issue_codes:
-                raise _SQLiteReadPermissionError(
+                raise SQLiteReadPermissionError(
                     "resource_read_not_allowed",
                     "One or more requested resources are not available for reading.",
                 )
@@ -839,4 +839,8 @@ def _json_value(value: object) -> object:
     )
 
 
-__all__ = ["SQLiteQueryBackend", "SQLiteQueryError"]
+__all__ = [
+    "SQLiteQueryBackend",
+    "SQLiteQueryError",
+    "SQLiteReadPermissionError",
+]

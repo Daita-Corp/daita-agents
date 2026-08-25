@@ -1,9 +1,11 @@
-"""Transcript-driven agent loop."""
+"""Export the transcript-driven agent loop, records, and runtime interfaces."""
 
 from .driver import (
     AgentLoop,
     ContextBuilder,
     InMemoryTranscriptStore,
+    LoopPreparationError,
+    PreparedLoopRun,
     ToolRuntime,
     TranscriptStore,
 )
@@ -13,6 +15,12 @@ from .models import (
     LoopExitKind,
     LoopLimits,
     RunInput,
+    RunOrigin,
+    RunStartEnvelope,
+    ToolBatchCertainty,
+    ToolBatchInterruption,
+    ToolBatchOutcome,
+    ToolProjectionMode,
     Transcript,
 )
 
@@ -23,8 +31,16 @@ __all__ = [
     "LoopExit",
     "LoopExitKind",
     "LoopLimits",
+    "LoopPreparationError",
+    "PreparedLoopRun",
     "InMemoryTranscriptStore",
     "RunInput",
+    "RunOrigin",
+    "RunStartEnvelope",
+    "ToolBatchCertainty",
+    "ToolBatchInterruption",
+    "ToolBatchOutcome",
+    "ToolProjectionMode",
     "ToolRuntime",
     "Transcript",
     "TranscriptStore",

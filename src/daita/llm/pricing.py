@@ -1,10 +1,4 @@
-"""Bounded provider pricing schedules and provider-neutral cost semantics.
-
-Provider adapters own native usage interpretation. This module owns the small
-release-reviewed schedule format, strict admission, effective-date selection,
-pure ``Decimal`` arithmetic, and immutable estimates persisted with run
-history. No pricing data is downloaded at runtime.
-"""
+"""Load reviewed pricing schedules and compute provider-neutral cost estimates."""
 
 from __future__ import annotations
 

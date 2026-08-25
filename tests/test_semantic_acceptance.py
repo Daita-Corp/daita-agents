@@ -5,6 +5,8 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 
+from _capability_runtime_support import execute_projected
+
 from daita import (
     Agent,
     ApprovalDecision,
@@ -28,12 +30,13 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import RunInput
+from daita.loop.models import LoopLimits, RunInput, ToolProjectionMode
 from daita.semantics import semantic_annotation_sha256
 from daita.tui.commands import SLASH_COMMAND_COMPLETIONS, learning_invocation_message
 from daita.tui.controller import PresentationController
 
 NOW = datetime(2026, 7, 28, 16, tzinfo=UTC)
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -212,6 +215,7 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
@@ -294,6 +298,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         clock=lambda: NOW,
     )
     try:
@@ -368,7 +373,8 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         )
         await agent._embedded._store.save_semantic_annotation(agent.id, stale)
 
-        runtime = agent._embedded._data_tool_runtime
+        runtime = agent._embedded._capability_runtime
+        semantic_domain = agent._embedded._semantic_domain
         read_run = RunInput(
             id="semantic-read-run",
             agent_id=agent.id,
@@ -377,9 +383,10 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
             conversation_id="semantic-read-conversation",
             source_id=source.id,
         )
-        runtime.select_explicit_learning_run(read_run.id)
+        semantic_domain.select_explicit_learning_run(read_run.id)
         listed = (
-            await runtime.execute_all(
+            await execute_projected(
+                runtime,
                 read_run,
                 (
                     ToolCall(
@@ -396,7 +403,8 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         assert isinstance(listed_annotations, tuple)
         assert tuple(item["id"] for item in listed_annotations) == ("active-time",)
         conflict_view = (
-            await runtime.execute_all(
+            await execute_projected(
+                runtime,
                 read_run,
                 (
                     ToolCall(
@@ -415,7 +423,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         assert conflict_maintenance["state"] == "conflicting"
         assert conflict_maintenance["usable_as_current_meaning"] is False
         assert conflict_maintenance["requires_revalidation"] is True
-        runtime.clear_explicit_learning_run(read_run.id)
+        semantic_domain.clear_explicit_learning_run(read_run.id)
 
         controller = PresentationController(root=None)
         controller.agent = agent

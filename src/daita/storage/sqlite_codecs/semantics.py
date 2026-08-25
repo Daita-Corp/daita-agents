@@ -1,4 +1,4 @@
-"""Explicit SQLite codecs for semantic annotation records."""
+"""Encode and decode semantic annotations, evidence, subjects, and bindings."""
 
 from __future__ import annotations
 
@@ -91,8 +91,7 @@ def decode_subject(value: JsonValue) -> SemanticSubject:
     fields = record_fields(
         value,
         "SemanticSubject",
-        ("source_ids", "resource_ids"),
-        optional={"fields": []},
+        ("source_ids", "resource_ids", "fields"),
     )
     return SemanticSubject(
         source_ids=tuple(
@@ -127,8 +126,7 @@ def _decode_evidence(value: JsonValue) -> SemanticEvidence:
     fields = record_fields(
         value,
         "SemanticEvidence",
-        ("kind", "run_id", "message_position"),
-        optional={"tool_call_id": None, "note": None},
+        ("kind", "run_id", "message_position", "tool_call_id", "note"),
     )
     return SemanticEvidence(
         kind=enum_decode(fields["kind"], SemanticEvidenceKind, "SemanticEvidenceKind"),
@@ -178,8 +176,9 @@ def _decode_annotation(value: JsonValue) -> SemanticAnnotation:
             "catalog_revisions",
             "created_at",
             "confirmed_at",
+            "confirmed_by",
+            "supersedes_id",
         ),
-        optional={"confirmed_by": "local-user", "supersedes_id": None},
     )
     return SemanticAnnotation(
         id=text(fields["id"], "semantic annotation id"),

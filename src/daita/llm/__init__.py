@@ -1,6 +1,11 @@
-"""Provider-neutral model contracts."""
+"""Export provider-neutral model records, errors, routing, and protocols."""
 
-from .errors import ModelProviderError, ProviderErrorCode
+from .errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+)
 from .factory import create_llm_provider, create_model_route_provider
 from .models import (
     CanonicalMessage,
@@ -43,6 +48,8 @@ from .routing import (
     ModelRouteCandidate,
     ModelRouter,
     RetryPolicy,
+    RunRoute,
+    autonomous_request_is_admissible,
 )
 
 __all__ = [
@@ -75,13 +82,17 @@ __all__ = [
     "OpenAICompatibleProvider",
     "OpenAIProvider",
     "ProviderErrorCode",
+    "ProviderFailureDiagnostic",
+    "ProviderFailurePhase",
     "RetryPolicy",
+    "RunRoute",
     "StreamingModelProvider",
     "TextBlock",
     "ToolCall",
     "ToolDefinition",
     "ToolResultBlock",
     "aggregate_cost_estimates",
+    "autonomous_request_is_admissible",
     "create_llm_provider",
     "create_model_route_provider",
     "format_cost_estimate",

@@ -4,6 +4,12 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 
 import pytest
+from _capability_runtime_support import (
+    StaticTestDomain,
+    discovery_metadata,
+    execute_projected,
+    static_registry,
+)
 
 from daita._json import FrozenJsonObject
 from daita.adapters import (
@@ -16,14 +22,15 @@ from daita.capabilities import (
     ApprovalDecision,
     ApprovalRequest,
     Capability,
-    CapabilityRegistry,
+    OperationalEffect,
     ToolExecution,
     ToolOutput,
+    ToolView,
 )
+from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.models import ResourceKind, TabularColumn
 from daita.domains.data.controller import (
     POSTGRESQL_UPDATE_CAPABILITY_ID,
-    DataToolRuntime,
 )
 from daita.domains.data.sql import (
     PostgreSQLUpdateCommand,
@@ -489,7 +496,7 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         },
         executor_id=executor.executor_id,
         access_mode=AccessMode.WRITE,
-        side_effecting=True,
+        operational_effect=OperationalEffect.MUTATE_DATA,
     )
     approvals: list[ApprovalRequest] = []
 
@@ -497,9 +504,20 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         approvals.append(request)
         return ApprovalDecision.APPROVE
 
-    runtime = DataToolRuntime(
-        CapabilityRegistry(capabilities=(capability,), executors=(executor,)),
-        _RuntimeCatalog(),  # type: ignore[arg-type]
+    view = ToolView(
+        name="test_update",
+        capability_id=capability.id,
+        description=capability.description,
+        discovery=discovery_metadata(),
+    )
+    domain = StaticTestDomain(
+        (capability,),
+        (view,),
+        recheck_after_approval=False,
+    )
+    runtime = CapabilityRuntime(
+        static_registry(domain, (executor,)),
+        (domain,),
         approval_handler=approve,
     )
     run = RunInput(
@@ -510,24 +528,16 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         conversation_id="conversation-runtime-update",
     )
     call = ToolCall(id="call-runtime-update", name="test_update", arguments={})
-    execution = ToolExecution(
-        run_id=run.id,
-        call_id=call.id,
-        capability_id=capability.id,
-        arguments={},
-        conversation_id=run.conversation_id,
-    )
-
-    result, cancelled = await runtime._execute_side_effect(
+    outcome = await execute_projected(
+        runtime,
         run,
-        call,
-        capability,
-        executor,
-        execution,
+        (call,),
     )
+    (result,) = outcome.ordered_results
 
     assert not result.is_error
-    assert cancelled is False
+    assert outcome.interruption_kind is None
+    assert outcome.outcome_certainty.value == "definite"
     assert len(approvals) == 1
     assert executor.preflight_count == 1
     assert executor.execute_count == 1

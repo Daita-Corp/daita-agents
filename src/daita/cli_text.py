@@ -1,4 +1,4 @@
-"""Headless CLI text helpers. Must not import the Textual app."""
+"""Format headless CLI output without importing the Textual application."""
 
 from __future__ import annotations
 

@@ -1,11 +1,11 @@
-"""Bounded business-semantic records, rendering, recall, and tool declarations."""
+"""Define, validate, render, recall, and expose business-semantic annotations."""
 
 from __future__ import annotations
 
 import re
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
@@ -16,15 +16,23 @@ from ._json import FrozenJsonObject, canonical_json
 from .capabilities import (
     AccessMode,
     Capability,
+    CapabilityDeclarations,
     CapabilityInputError,
     Executor,
+    OperationalEffect,
     SideEffectExecutor,
-    ToolApplicability,
+    ToolDiscoveryMetadata,
     ToolExecution,
+    ToolExposureClass,
     ToolOutput,
     ToolView,
 )
-from .loop.models import Transcript
+from .capability_runtime import CapabilityFailure, SideEffectPlan
+from .catalog.models import CATALOG_CONTEXT_DEFAULT_LIMIT
+from .domains.learning import LearningCandidateGuard
+from .llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
+from .loop.models import RunInput, Transcript
+from .storage.sqlite_records import SourcePermissionStateError
 
 SEMANTIC_MAX_ANNOTATIONS = 256
 SEMANTIC_STATEMENT_MAX_CHARACTERS = 1_200
@@ -67,6 +75,7 @@ SEMANTIC_DELETE_CAPABILITY_ID = "semantic.delete"
 SEMANTIC_DELETE_EXECUTOR_ID = "semantic.delete.executor"
 SEMANTIC_DELETE_OUTPUT_KIND = "semantic.deleted"
 SEMANTIC_DELETE_TOOL_NAME = "semantic_delete"
+SEMANTIC_DOMAIN_OWNER_ID = "semantics"
 
 _CONFIRMED_BY = "local-user"
 
@@ -1438,8 +1447,8 @@ def semantic_declarations(
                 "additionalProperties": False,
             },
             executor_id=save.executor_id,
-            access_mode=AccessMode.WRITE,
-            side_effecting=True,
+            access_mode=AccessMode.NONE,
+            operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
         ),
         Capability(
             id=SEMANTIC_DELETE_CAPABILITY_ID,
@@ -1467,8 +1476,8 @@ def semantic_declarations(
                 "additionalProperties": False,
             },
             executor_id=delete.executor_id,
-            access_mode=AccessMode.WRITE,
-            side_effecting=True,
+            access_mode=AccessMode.NONE,
+            operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
         ),
     )
     return SemanticDeclarations(
@@ -1479,9 +1488,9 @@ def semantic_declarations(
                 name=name,
                 capability_id=capability.id,
                 description=capability.description,
-                applicability=ToolApplicability(minimum_active_sources=1),
+                discovery=discovery,
             )
-            for name, capability in zip(
+            for name, capability, discovery in zip(
                 (
                     SEMANTIC_LIST_TOOL_NAME,
                     SEMANTIC_VIEW_TOOL_NAME,
@@ -1489,10 +1498,762 @@ def semantic_declarations(
                     SEMANTIC_DELETE_TOOL_NAME,
                 ),
                 capabilities,
+                (
+                    ToolDiscoveryMetadata(
+                        summary="List bounded active semantic annotations.",
+                        when_to_use="Use to inspect current stored business meaning.",
+                        keywords=("semantic", "meaning", "annotation", "list"),
+                        exposure_class=ToolExposureClass.STANDARD,
+                        eager_priority=620,
+                    ),
+                    ToolDiscoveryMetadata(
+                        summary="View one exact semantic annotation and its evidence.",
+                        when_to_use="Use before correcting or deleting an exact annotation.",
+                        keywords=("semantic", "meaning", "annotation", "view"),
+                        exposure_class=ToolExposureClass.STANDARD,
+                        eager_priority=610,
+                    ),
+                    ToolDiscoveryMetadata(
+                        summary="Create or supersede one evidence-bound semantic annotation.",
+                        when_to_use="Use only for validated current resource or field meaning.",
+                        keywords=("semantic", "meaning", "annotation", "save"),
+                        exposure_class=ToolExposureClass.DEFERRED,
+                        eager_priority=160,
+                    ),
+                    ToolDiscoveryMetadata(
+                        summary="Delete one exact semantic annotation after validation.",
+                        when_to_use="Use only for an explicit exact semantic deletion.",
+                        keywords=("semantic", "meaning", "annotation", "delete"),
+                        exposure_class=ToolExposureClass.DEFERRED,
+                        eager_priority=150,
+                    ),
+                ),
                 strict=True,
             )
         ),
     )
+
+
+class SemanticDomainCatalog(Protocol):
+    async def source_routing_facts(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> tuple[Mapping[str, object], ...]: ...
+
+    async def catalog_context(
+        self,
+        agent_id: str,
+        query: str,
+        *,
+        limit: int,
+        source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] = (),
+    ) -> FrozenJsonObject: ...
+
+    async def readable_resource_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> frozenset[str]: ...
+
+    async def semantic_resource_facts(
+        self,
+        agent_id: str,
+        resource_ids: tuple[str, ...],
+    ) -> tuple[SemanticResourceFact, ...]: ...
+
+    async def admitted_model_sensitivity(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> ModelSensitivity | None: ...
+
+
+class SemanticCapabilityDomain:
+    """Own semantic projection, evidence binding, and current-state meaning."""
+
+    domain_owner_id = SEMANTIC_DOMAIN_OWNER_ID
+
+    def __init__(
+        self,
+        declarations: CapabilityDeclarations,
+        catalog: SemanticDomainCatalog,
+        store: SemanticStore,
+        learning: LearningCandidateGuard,
+    ) -> None:
+        if declarations.domain_owner_id != self.domain_owner_id:
+            raise ValueError("semantic declarations have the wrong domain owner")
+        if {item.id for item in declarations.capabilities} != {
+            SEMANTIC_LIST_CAPABILITY_ID,
+            SEMANTIC_VIEW_CAPABILITY_ID,
+            SEMANTIC_SAVE_CAPABILITY_ID,
+            SEMANTIC_DELETE_CAPABILITY_ID,
+        }:
+            raise ValueError("semantic domain requires its exact capabilities")
+        if not isinstance(learning, LearningCandidateGuard):
+            raise TypeError("learning must be LearningCandidateGuard")
+        self._declarations = declarations
+        self._catalog = catalog
+        self._store = store
+        self._learning = learning
+        self._views = tuple(declarations.tool_views)
+        self._capabilities = {item.id: item for item in declarations.capabilities}
+        self._explicit_learning_runs: set[str] = set()
+
+    @property
+    def declarations(self) -> CapabilityDeclarations:
+        return self._declarations
+
+    def select_explicit_learning_run(self, run_id: str) -> None:
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("explicit learning run_id must be non-empty text")
+        if self._explicit_learning_runs:
+            raise RuntimeError("explicit learning guard exceeds its live bound")
+        self._explicit_learning_runs.add(run_id)
+
+    def clear_explicit_learning_run(self, run_id: str) -> None:
+        self._explicit_learning_runs.discard(run_id)
+
+    async def validate_annotation(
+        self,
+        agent_id: str,
+        annotation: SemanticAnnotation,
+    ) -> None:
+        if not isinstance(annotation, SemanticAnnotation):
+            raise TypeError("annotation must be SemanticAnnotation")
+        issue = await self._annotation_issue(agent_id, annotation)
+        if issue is not None:
+            raise SemanticValidationError(issue[1])
+
+    async def project(self, run: RunInput) -> tuple[str, ...]:
+        facts = await self._catalog.source_routing_facts(
+            run.agent_id,
+            (() if run.source_id is None else (run.source_id,)),
+        )
+        if not facts:
+            return ()
+        requested = run.id in self._explicit_learning_runs
+        if not requested:
+            requested = await self._maintenance_requested(run)
+        selected_tool = self._learning.selected_mutation_tool(run.id)
+        return tuple(
+            view.name
+            for view in self._views
+            if (requested or view.name == selected_tool)
+            and self._learning.allows(
+                run.id,
+                view.name,
+                effectful=(
+                    self._capabilities[view.capability_id].operational_effect
+                    is not OperationalEffect.NONE
+                ),
+            )
+        )
+
+    def normalize_arguments(
+        self,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        if capability.id != SEMANTIC_SAVE_CAPABILITY_ID:
+            return arguments
+        raw_evidence = arguments.get("evidence")
+        if not isinstance(raw_evidence, tuple):
+            return arguments
+        normalized = dict(arguments)
+        normalized["evidence"] = [
+            (
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"run_id", "message_position"}
+                }
+                if isinstance(item, Mapping)
+                else item
+            )
+            for item in raw_evidence
+        ]
+        return normalized
+
+    async def prepare_call(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
+    ) -> FrozenJsonObject:
+        del request_sensitivity
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.validate_effect(run.id, call)
+        if (
+            run.source_id is not None
+            and capability.id == SEMANTIC_LIST_CAPABILITY_ID
+            and arguments.get("source_id") is None
+        ):
+            scoped = arguments.to_dict()
+            scoped["source_id"] = run.source_id
+            arguments = FrozenJsonObject.from_mapping(scoped)
+        await self._validate_source_scope(run, capability, arguments)
+        await self._validate_read_scope(run, capability, arguments)
+        if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
+            arguments = await self._bind_current_evidence(run, arguments)
+        return arguments
+
+    async def side_effect_plan(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        execution: ToolExecution,
+        fingerprint: FrozenJsonObject,
+    ) -> SideEffectPlan:
+        if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
+            raw = fingerprint.get("annotation")
+            if not isinstance(raw, Mapping):
+                raise ValueError("semantic preflight omitted its candidate annotation")
+            annotation = semantic_annotation_from_mapping(raw)
+            issue = await self._annotation_issue(run.agent_id, annotation)
+            if issue is not None:
+                raise CapabilityInputError(issue[0], issue[1], issue[2])
+        return SideEffectPlan()
+
+    async def finalize_output(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        output: ToolOutput,
+        *,
+        request_sensitivity: ModelSensitivity,
+    ) -> ToolOutput:
+        del request_sensitivity
+        if capability.id == SEMANTIC_VIEW_CAPABILITY_ID:
+            output = await self._decorate_view(run, arguments, output)
+        elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:
+            output = await self._filter_list(run, arguments, output)
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.mark_effect_succeeded(run.id)
+        if output.sensitivity is not None:
+            return output
+        source_id = arguments.get("source_id")
+        source_ids = (
+            (source_id,)
+            if isinstance(source_id, str)
+            else (() if run.source_id is None else (run.source_id,))
+        )
+        sensitivity = await self._catalog.admitted_model_sensitivity(
+            run.agent_id,
+            source_ids,
+        )
+        if sensitivity is None:
+            raise CapabilityInputError(
+                "result_classification_unavailable",
+                "The current admitted result scope cannot be classified safely.",
+                {"capability_id": capability.id},
+            )
+        readable = await self._catalog.readable_resource_ids(
+            run.agent_id,
+            source_ids,
+        )
+        return replace(
+            output,
+            sensitivity=sensitivity,
+            sensitivity_provenance={
+                "authority": "semantic_current_resource_scope",
+                "capability_id": capability.id,
+                "source_ids": source_ids,
+                "resource_ids": tuple(sorted(readable)),
+            },
+        )
+
+    def normalize_error(
+        self,
+        call: ToolCall,
+        error: BaseException,
+    ) -> CapabilityFailure | None:
+        if isinstance(error, SemanticNotFoundError):
+            return CapabilityFailure(
+                "semantic_not_found",
+                "The requested semantic annotation is not available.",
+                {"id": call.arguments.get("id")},
+            )
+        if isinstance(error, SemanticDigestMismatchError):
+            code = (
+                "semantic_expected_sha256_required"
+                if "requires expected_sha256" in str(error)
+                else "semantic_stale_digest"
+            )
+            return CapabilityFailure(
+                code,
+                str(error),
+                {"id": call.arguments.get("id")},
+            )
+        if isinstance(error, SemanticValidationError):
+            return CapabilityFailure(
+                "semantic_invalid_annotation",
+                str(error),
+                {"id": call.arguments.get("id")},
+            )
+        return None
+
+    async def _bind_current_evidence(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+    ) -> FrozenJsonObject:
+        try:
+            transcript = await self._store.load(run.id)
+        except KeyError as error:
+            raise CapabilityInputError(
+                "semantic_invalid_evidence",
+                "The current semantic write transcript is unavailable.",
+                {"run_id": run.id},
+            ) from error
+        if transcript.run.id != run.id or transcript.run.agent_id != run.agent_id:
+            raise CapabilityInputError(
+                "semantic_invalid_evidence",
+                "The current semantic write transcript identity does not match.",
+                {"run_id": run.id},
+            )
+        raw_evidence = arguments.get("evidence")
+        if not isinstance(raw_evidence, tuple):
+            raise CapabilityInputError(
+                "semantic_invalid_evidence",
+                "Semantic evidence must be a bounded array.",
+            )
+        user_positions = tuple(
+            index
+            for index, message in enumerate(transcript.messages)
+            if message.role is MessageRole.USER
+        )
+        bound: list[dict[str, object]] = []
+        for item in raw_evidence:
+            if not isinstance(item, Mapping):
+                raise CapabilityInputError(
+                    "semantic_invalid_evidence",
+                    "Semantic evidence entries must be objects.",
+                )
+            try:
+                kind = SemanticEvidenceKind(item.get("kind"))
+            except (TypeError, ValueError) as error:
+                raise CapabilityInputError(
+                    "semantic_invalid_evidence",
+                    "Semantic evidence kind is not supported.",
+                ) from error
+            entry: dict[str, object] = {"kind": kind.value, "run_id": run.id}
+            if item.get("note") is not None:
+                entry["note"] = item["note"]
+            if kind in {
+                SemanticEvidenceKind.USER_ASSERTION,
+                SemanticEvidenceKind.USER_CONFIRMATION,
+            }:
+                if len(user_positions) != 1:
+                    raise CapabilityInputError(
+                        "semantic_invalid_evidence",
+                        "Current-run user evidence must resolve to exactly one message.",
+                        {"run_id": run.id},
+                    )
+                entry["message_position"] = user_positions[0]
+            else:
+                call_id = item.get("tool_call_id")
+                if not isinstance(call_id, str):
+                    raise CapabilityInputError(
+                        "semantic_invalid_evidence",
+                        "Tool-result evidence requires a tool_call_id.",
+                    )
+                positions = tuple(
+                    index
+                    for index, message in enumerate(transcript.messages)
+                    if message.role is MessageRole.TOOL
+                    and any(
+                        isinstance(block, ToolResultBlock) and block.call_id == call_id
+                        for block in message.content
+                    )
+                )
+                if len(positions) != 1:
+                    raise CapabilityInputError(
+                        "semantic_invalid_evidence",
+                        "Tool-result evidence must reference exactly one result from "
+                        "an earlier completed tool step in the current run.",
+                        {"run_id": run.id, "tool_call_id": call_id},
+                    )
+                entry["message_position"] = positions[0]
+                entry["tool_call_id"] = call_id
+            bound.append(entry)
+        normalized = (
+            arguments.to_dict()
+            if isinstance(arguments, FrozenJsonObject)
+            else dict(arguments)
+        )
+        normalized["evidence"] = bound
+        return FrozenJsonObject.from_mapping(normalized)
+
+    async def _decorate_view(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        output: ToolOutput,
+    ) -> ToolOutput:
+        annotation_id = arguments.get("id")
+        if not isinstance(annotation_id, str):
+            raise CapabilityInputError(
+                "semantic_invalid_id",
+                "Semantic view requires an annotation id.",
+            )
+        selected = next(
+            (
+                view
+                for view in await self._current_views(run.agent_id)
+                if view.annotation.id == annotation_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise SemanticNotFoundError(annotation_id)
+        if output.data.get("current_sha256") != selected.sha256:
+            raise CapabilityInputError(
+                "semantic_state_changed",
+                "The semantic annotation changed during inspection; view it again.",
+                {"id": annotation_id},
+            )
+        data = dict(output.data)
+        data["maintenance"] = {
+            "state": selected.state.value,
+            "usable_as_current_meaning": selected.usable_as_current_meaning,
+            "requires_revalidation": selected.requires_revalidation,
+            "stale_reasons": selected.stale_reasons,
+            "conflicting_ids": selected.conflicting_ids,
+            "duplicate_ids": selected.duplicate_ids,
+            "duplicate_of_id": selected.duplicate_of_id,
+            "superseded_by_id": selected.superseded_by_id,
+        }
+        return replace(output, data=data)
+
+    async def _filter_list(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        output: ToolOutput,
+    ) -> ToolOutput:
+        source_id = arguments.get("source_id")
+        resource_id = arguments.get("resource_id")
+        kind = arguments.get("kind")
+        limit = arguments.get("limit", 24)
+        assert source_id is None or isinstance(source_id, str)
+        assert resource_id is None or isinstance(resource_id, str)
+        assert kind is None or isinstance(kind, str)
+        assert isinstance(limit, int) and not isinstance(limit, bool)
+        active = tuple(
+            view
+            for view in await self._current_views(run.agent_id)
+            if view.state is SemanticAnnotationState.ACTIVE
+            and (source_id is None or source_id in view.annotation.subject.source_ids)
+            and (
+                resource_id is None
+                or resource_id in view.annotation.subject.resource_ids
+            )
+            and (kind is None or view.annotation.kind.value == kind)
+        )[:limit]
+        annotations = tuple(
+            {
+                "id": view.annotation.id,
+                "kind": view.annotation.kind.value,
+                "resource_ids": view.annotation.subject.resource_ids,
+                "field_count": len(view.annotation.subject.fields),
+                "statement_preview": view.annotation.statement[:240],
+                "current_sha256": view.sha256,
+            }
+            for view in active
+        )
+        return replace(
+            output,
+            data={"annotations": annotations, "count": len(annotations)},
+        )
+
+    async def _current_views(
+        self,
+        agent_id: str,
+    ) -> tuple[SemanticAnnotationView, ...]:
+        annotations = await self._store.list_semantic_annotations(agent_id)
+        resource_ids = tuple(
+            sorted(
+                {
+                    resource_id
+                    for annotation in annotations
+                    for resource_id in annotation.subject.resource_ids
+                }
+            )
+        )
+        facts = await self._catalog.semantic_resource_facts(agent_id, resource_ids)
+        readable_ids = {fact.resource_id for fact in facts}
+        return inspect_semantic_annotations(
+            tuple(
+                annotation
+                for annotation in annotations
+                if set(annotation.subject.resource_ids) <= readable_ids
+            ),
+            facts,
+        )
+
+    async def _annotation_issue(
+        self,
+        agent_id: str,
+        annotation: SemanticAnnotation,
+    ) -> tuple[str, str, Mapping[str, object]] | None:
+        if annotation.agent_id != agent_id:
+            return (
+                "semantic_foreign_agent",
+                "The semantic annotation belongs to another agent.",
+                {"annotation_id": annotation.id},
+            )
+        facts = await self._catalog.semantic_resource_facts(
+            agent_id,
+            annotation.subject.resource_ids,
+        )
+        fact_by_id = {item.resource_id: item for item in facts}
+        for resource_id in annotation.subject.resource_ids:
+            if resource_id not in fact_by_id:
+                return (
+                    "semantic_unknown_resource",
+                    "A semantic subject resource is not current for this agent.",
+                    {"resource_id": resource_id},
+                )
+        actual_sources = tuple(
+            sorted(
+                {fact_by_id[item].source_id for item in annotation.subject.resource_ids}
+            )
+        )
+        if actual_sources != annotation.subject.source_ids:
+            return (
+                "semantic_source_mismatch",
+                "Semantic source scope does not match the current catalog resources.",
+                {
+                    "actual_source_ids": actual_sources,
+                    "subject_source_ids": annotation.subject.source_ids,
+                },
+            )
+        revisions = {
+            item.resource_id: item.revision for item in annotation.catalog_revisions
+        }
+        for resource_id in annotation.subject.resource_ids:
+            current_revision = fact_by_id[resource_id].revision
+            if revisions[resource_id] != current_revision:
+                return (
+                    "semantic_stale_revision",
+                    "A semantic revision binding does not match the current catalog.",
+                    {
+                        "current_revision": current_revision,
+                        "resource_id": resource_id,
+                        "requested_revision": revisions[resource_id],
+                    },
+                )
+        for field in annotation.subject.fields:
+            if field.field_name not in fact_by_id[field.resource_id].field_names:
+                return (
+                    "semantic_unknown_field",
+                    "A semantic subject field is not current for its resource.",
+                    {"field_name": field.field_name, "resource_id": field.resource_id},
+                )
+        return await self._evidence_issue(agent_id, annotation)
+
+    async def _evidence_issue(
+        self,
+        agent_id: str,
+        annotation: SemanticAnnotation,
+    ) -> tuple[str, str, Mapping[str, object]] | None:
+        for evidence in annotation.evidence:
+            position = evidence.message_position
+            assert position is not None
+            try:
+                transcript = await self._store.load(evidence.run_id)
+            except KeyError:
+                return (
+                    "semantic_invalid_evidence",
+                    "Semantic evidence references an unknown run.",
+                    {"run_id": evidence.run_id},
+                )
+            if transcript.run.agent_id != agent_id or position >= len(
+                transcript.messages
+            ):
+                return (
+                    "semantic_invalid_evidence",
+                    "Semantic evidence references an unavailable transcript message.",
+                    {"run_id": evidence.run_id, "message_position": position},
+                )
+            message = transcript.messages[position]
+            if evidence.kind in {
+                SemanticEvidenceKind.USER_ASSERTION,
+                SemanticEvidenceKind.USER_CONFIRMATION,
+            }:
+                if message.role is not MessageRole.USER:
+                    return (
+                        "semantic_invalid_evidence",
+                        "User semantic evidence must reference an exact user message.",
+                        {"run_id": evidence.run_id, "message_position": position},
+                    )
+                continue
+            if message.role is not MessageRole.TOOL:
+                return (
+                    "semantic_invalid_evidence",
+                    "Tool-result evidence must reference an exact tool-result message.",
+                    {"run_id": evidence.run_id, "message_position": position},
+                )
+            result = next(
+                (
+                    block
+                    for block in message.content
+                    if isinstance(block, ToolResultBlock)
+                    and block.call_id == evidence.tool_call_id
+                ),
+                None,
+            )
+            if (
+                result is None
+                or result.is_error
+                or result.output.get("kind")
+                not in {
+                    "data.sqlite.query_result",
+                    "data.postgresql.query_result",
+                    "data.file.read_result",
+                }
+            ):
+                return (
+                    "semantic_invalid_evidence",
+                    "Tool-result evidence must reference a successful validated data "
+                    "read.",
+                    {
+                        "run_id": evidence.run_id,
+                        "tool_call_id": evidence.tool_call_id,
+                    },
+                )
+        return None
+
+    async def _validate_read_scope(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> None:
+        resource_ids: tuple[object, ...] = ()
+        if capability.id == SEMANTIC_LIST_CAPABILITY_ID:
+            resource_ids = (arguments.get("resource_id"),)
+        elif capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
+            subject = arguments.get("subject")
+            raw = subject.get("resource_ids") if isinstance(subject, Mapping) else ()
+            resource_ids = raw if isinstance(raw, tuple) else ()
+        requested = tuple(item for item in resource_ids if isinstance(item, str))
+        if not requested:
+            return
+        source_id = arguments.get("source_id")
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                ((source_id,) if isinstance(source_id, str) else ()),
+            )
+        except SourcePermissionStateError as error:
+            raise CapabilityInputError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from error
+        if any(item not in readable for item in requested):
+            raise CapabilityInputError(
+                "resource_read_not_allowed",
+                "The requested resource is not available for reading.",
+            )
+
+    async def _validate_source_scope(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> None:
+        selected_source_id = run.source_id
+        if selected_source_id is None:
+            return
+        supplied = arguments.get("source_id")
+        if supplied is not None and supplied != selected_source_id:
+            raise CapabilityInputError(
+                "source_scope_violation",
+                "This run can only access the source selected by the user.",
+                {
+                    "selected_source_id": selected_source_id,
+                    "requested_source_id": supplied,
+                },
+            )
+        if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
+            subject = arguments.get("subject")
+            source_ids = (
+                subject.get("source_ids") if isinstance(subject, Mapping) else None
+            )
+            if source_ids != (selected_source_id,):
+                raise CapabilityInputError(
+                    "source_scope_violation",
+                    "A semantic write must stay within the source selected by the user.",
+                    {"selected_source_id": selected_source_id},
+                )
+        referenced: tuple[object, ...] = ()
+        if capability.id in {
+            SEMANTIC_VIEW_CAPABILITY_ID,
+            SEMANTIC_DELETE_CAPABILITY_ID,
+        }:
+            referenced = (arguments.get("id"),)
+        elif capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
+            referenced = (arguments.get("id"), arguments.get("supersedes_id"))
+        ids = tuple(item for item in referenced if isinstance(item, str))
+        if not ids:
+            return
+        current = {
+            item.id: item
+            for item in await self._store.list_semantic_annotations(run.agent_id)
+        }
+        for annotation_id in ids:
+            annotation = current.get(annotation_id)
+            if annotation is not None and annotation.subject.source_ids != (
+                selected_source_id,
+            ):
+                raise CapabilityInputError(
+                    "source_scope_violation",
+                    "This run can only access semantic annotations from the source "
+                    "selected by the user.",
+                    {
+                        "annotation_id": annotation_id,
+                        "selected_source_id": selected_source_id,
+                    },
+                )
+
+    async def _maintenance_requested(self, run: RunInput) -> bool:
+        views = await self._current_views(run.agent_id)
+        if not any(
+            view.requires_revalidation
+            or view.state is SemanticAnnotationState.DUPLICATE
+            or bool(view.duplicate_ids)
+            for view in views
+        ):
+            return False
+        catalog = await self._catalog.catalog_context(
+            run.agent_id,
+            run.message[:4_000],
+            limit=CATALOG_CONTEXT_DEFAULT_LIMIT,
+            source_ids=(() if run.source_id is None else (run.source_id,)),
+        )
+        resources = catalog.get("resources")
+        if not isinstance(resources, tuple):
+            return False
+        selected_ids = tuple(
+            resource_id
+            for resource in resources
+            if isinstance(resource, FrozenJsonObject)
+            and isinstance((resource_id := resource.get("resource_id")), str)
+        )
+        return semantic_maintenance_intersects(
+            views,
+            selected_resource_ids=selected_ids,
+            query=run.message,
+        )
 
 
 def _identifier_schema() -> dict[str, object]:

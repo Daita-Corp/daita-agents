@@ -1,4 +1,4 @@
-"""Best-effort observer adapter that posts bounded Textual messages."""
+"""Convert best-effort agent events into bounded Textual messages."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Current and historical physical schemas owned by ``SQLiteStateStore``."""
+"""Define, inspect, and validate the current physical SQLite schema."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from collections.abc import Mapping
 
 TableSchema = Mapping[str, tuple[tuple[object, ...], ...]]
 
-INITIAL_TABLES: dict[str, tuple[tuple[object, ...], ...]] = {
+CORE_TABLES: dict[str, tuple[tuple[object, ...], ...]] = {
     "learning_candidates": (
         ("agent_id", "TEXT", 1, None, 1),
         ("id", "TEXT", 1, None, 2),
@@ -66,10 +66,6 @@ JOURNAL_TABLE = (
     ("migration_id", "TEXT", 1, None, 1),
     ("checksum", "TEXT", 1, None, 0),
 )
-ADMISSION_TABLE = (
-    ("agent_id", "TEXT", 1, None, 1),
-    ("source_id", "TEXT", 1, None, 2),
-)
 READ_SCOPE_TABLE = (
     ("agent_id", "TEXT", 1, None, 1),
     ("source_id", "TEXT", 1, None, 2),
@@ -82,27 +78,50 @@ UPDATE_SCOPE_TABLE = (
     ("authorization_fingerprint", "TEXT", 1, None, 0),
     ("data", "TEXT", 1, None, 0),
 )
+MCP_BINDING_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("binding_id", "TEXT", 1, None, 2),
+    ("data", "TEXT", 1, None, 0),
+)
+JOB_RUN_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("job_id", "TEXT", 1, None, 2),
+    ("data", "TEXT", 1, None, 0),
+)
+AUTONOMOUS_FOLLOWUP_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("followup_id", "TEXT", 1, None, 2),
+    ("job_id", "TEXT", 1, None, 0),
+    ("event_id", "TEXT", 1, None, 0),
+    ("data", "TEXT", 1, None, 0),
+)
+CONVERSATION_INBOX_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("delivery_id", "TEXT", 1, None, 2),
+    ("conversation_id", "TEXT", 1, None, 0),
+    ("subject_kind", "TEXT", 1, None, 0),
+    ("subject_id", "TEXT", 1, None, 0),
+    ("logical_key", "TEXT", 1, None, 0),
+    ("data", "TEXT", 1, None, 0),
+)
 
-RECEIPT_TABLES = {**INITIAL_TABLES, "database_write_receipts": RECEIPT_TABLE}
-JOURNAL_INITIAL_TABLES = {**INITIAL_TABLES, "state_migrations": JOURNAL_TABLE}
-JOURNAL_RECEIPT_TABLES = {**RECEIPT_TABLES, "state_migrations": JOURNAL_TABLE}
-WRITE_ADMISSION_TABLES = {
-    **JOURNAL_RECEIPT_TABLES,
-    "postgresql_write_admissions": ADMISSION_TABLE,
-}
-SCOPED_PERMISSION_TABLES = {
-    **JOURNAL_RECEIPT_TABLES,
+CURRENT_TABLES = {
+    **CORE_TABLES,
+    "database_write_receipts": RECEIPT_TABLE,
+    "state_migrations": JOURNAL_TABLE,
     "source_read_scopes": READ_SCOPE_TABLE,
     "postgresql_update_scopes": UPDATE_SCOPE_TABLE,
+    "mcp_server_bindings": MCP_BINDING_TABLE,
+    "job_runs": JOB_RUN_TABLE,
+    "autonomous_followups": AUTONOMOUS_FOLLOWUP_TABLE,
+    "conversation_inbox": CONVERSATION_INBOX_TABLE,
 }
-CURRENT_TABLES = SCOPED_PERMISSION_TABLES
 
 MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
-ADMISSION_FOREIGN_KEYS = (
+SOURCE_SCOPE_FOREIGN_KEYS = (
     ("sources", "agent_id", "agent_id", "NO ACTION", "CASCADE", "NONE"),
     ("sources", "source_id", "id", "NO ACTION", "CASCADE", "NONE"),
 )
-SOURCE_SCOPE_FOREIGN_KEYS = ADMISSION_FOREIGN_KEYS
 NAMED_INDEXES = {
     "runs_conversation_turn": (
         "runs",
@@ -113,6 +132,15 @@ NAMED_INDEXES = {
 UNIQUE_CONSTRAINTS = {
     "database_write_receipts": frozenset({("agent_id", "run_id", "call_id")}),
     "state_migrations": frozenset({("ordinal",)}),
+    "autonomous_followups": frozenset(
+        {("agent_id", "event_id"), ("agent_id", "job_id")}
+    ),
+    "conversation_inbox": frozenset(
+        {
+            ("agent_id", "logical_key"),
+            ("agent_id", "subject_kind", "subject_id"),
+        }
+    ),
 }
 
 BASE_TABLE_SQL = """
@@ -190,17 +218,6 @@ CREATE TABLE state_migrations (
 )
 """
 
-ADMISSION_TABLE_SQL = """
-CREATE TABLE postgresql_write_admissions (
-    agent_id TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    PRIMARY KEY (agent_id, source_id),
-    FOREIGN KEY (agent_id, source_id)
-        REFERENCES sources(agent_id, id)
-        ON DELETE CASCADE
-)
-"""
-
 SOURCE_READ_SCOPE_TABLE_SQL = """
 CREATE TABLE source_read_scopes (
     agent_id TEXT NOT NULL,
@@ -224,6 +241,52 @@ CREATE TABLE postgresql_update_scopes (
     FOREIGN KEY (agent_id, source_id)
         REFERENCES sources(agent_id, id)
         ON DELETE CASCADE
+)
+"""
+
+MCP_SERVER_BINDING_TABLE_SQL = """
+CREATE TABLE mcp_server_bindings (
+    agent_id TEXT NOT NULL,
+    binding_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, binding_id)
+)
+"""
+
+JOB_RUN_TABLE_SQL = """
+CREATE TABLE job_runs (
+    agent_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, job_id)
+)
+"""
+
+AUTONOMOUS_FOLLOWUP_TABLE_SQL = """
+CREATE TABLE autonomous_followups (
+    agent_id TEXT NOT NULL,
+    followup_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, followup_id),
+    UNIQUE (agent_id, event_id),
+    UNIQUE (agent_id, job_id)
+)
+"""
+
+CONVERSATION_INBOX_TABLE_SQL = """
+CREATE TABLE conversation_inbox (
+    agent_id TEXT NOT NULL,
+    delivery_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    logical_key TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, delivery_id),
+    UNIQUE (agent_id, logical_key),
+    UNIQUE (agent_id, subject_kind, subject_id)
 )
 """
 
@@ -266,11 +329,6 @@ def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> 
     }
     expected_foreign_keys: dict[str, tuple[tuple[object, ...], ...]] = {
         "messages": MESSAGES_FOREIGN_KEYS,
-        **(
-            {"postgresql_write_admissions": ADMISSION_FOREIGN_KEYS}
-            if "postgresql_write_admissions" in definitions
-            else {}
-        ),
         **(
             {"source_read_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
             if "source_read_scopes" in definitions

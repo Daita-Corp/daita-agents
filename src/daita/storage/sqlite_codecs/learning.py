@@ -1,4 +1,4 @@
-"""Explicit SQLite codecs for learning-candidate and review-stamp records."""
+"""Encode and decode learning candidates, review stamps, and candidate content."""
 
 from __future__ import annotations
 
@@ -158,15 +158,15 @@ def _decode_semantic_content(value: JsonValue) -> SemanticCandidateContent:
     fields = record_fields(
         value,
         "SemanticCandidateContent",
-        ("action",),
-        optional={
-            "subject": None,
-            "kind": None,
-            "statement": None,
-            "catalog_revisions": [],
-            "annotation_id": None,
-            "supersedes_id": None,
-        },
+        (
+            "action",
+            "subject",
+            "kind",
+            "statement",
+            "catalog_revisions",
+            "annotation_id",
+            "supersedes_id",
+        ),
     )
     return SemanticCandidateContent(
         action=enum_decode(
@@ -208,8 +208,7 @@ def _decode_skill_content(value: JsonValue) -> SkillCandidateContent:
     fields = record_fields(
         value,
         "SkillCandidateContent",
-        ("action", "name"),
-        optional={"description": None, "instructions": None},
+        ("action", "name", "description", "instructions"),
     )
     return SkillCandidateContent(
         action=enum_decode(
@@ -298,8 +297,9 @@ def _decode_candidate(value: JsonValue) -> LearningCandidate:
             "status",
             "created_at",
             "updated_at",
+            "rejection_reason",
+            "candidate_identity_sha256",
         ),
-        optional={"rejection_reason": None, "candidate_identity_sha256": ""},
     )
     return LearningCandidate(
         id=text(fields["id"], "learning candidate id"),

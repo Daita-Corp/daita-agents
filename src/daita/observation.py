@@ -1,4 +1,4 @@
-"""Best-effort observation records for direct agent execution."""
+"""Define bounded execution events and deliver them to observers best-effort."""
 
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ class AgentEvent:
     run_id: str
     conversation_id: str
     data: FrozenJsonObject
+    run_origin: str = "user"
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, AgentEventKind):
@@ -46,6 +47,7 @@ class AgentEvent:
             raise ValueError("event occurred_at must be timezone-aware")
         _bounded_identifier(self.run_id, "event run_id")
         _bounded_identifier(self.conversation_id, "event conversation_id")
+        _bounded_identifier(self.run_origin, "event run_origin")
         data = FrozenJsonObject.from_mapping(self.data)
         _validate_data(data)
         object.__setattr__(self, "data", data)

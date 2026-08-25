@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 from daita._json import FrozenJsonObject
 from daita.agent import Agent
@@ -38,6 +39,7 @@ from daita.loop import (
     LoopExitKind,
     LoopLimits,
     RunInput,
+    ToolBatchOutcome,
 )
 from daita.observation import AgentEvent, AgentEventKind
 
@@ -45,34 +47,60 @@ NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 class TranscriptContext:
-    async def build(self, run, messages, tools, *, step, final=False):
-        del run, step, final
-        return ModelRequest(messages=messages, tools=tools)
+    async def prepare(self, run, messages, tool_context):
+        del run
+        return messages[:-1], tool_context.provider_definitions
+
+    def project(
+        self,
+        snapshot,
+        messages,
+        *,
+        step,
+        tool_context,
+        final=False,
+        previous_request_input_tokens=None,
+    ):
+        del step, previous_request_input_tokens, tool_context
+        static, tools = snapshot
+        return ModelRequest(
+            messages=(*static, *messages),
+            tools=() if final else tools,
+        )
 
 
 class OverflowContext:
-    async def build(self, run, messages, tools, *, step, final=False):
-        del run, messages, tools, step, final
+    async def prepare(self, run, messages, tool_context):
+        del run, messages, tool_context
         raise ContextWindowExceeded
+
+    def project(self, snapshot, messages, **kwargs):
+        raise AssertionError("overflow context must fail during prepare")
 
 
 class ScriptedTools:
     def __init__(self, outputs=None):
         self.outputs = outputs or {}
 
-    async def definitions(self, run):
-        del run
-        return (
-            ToolDefinition(
-                name="lookup",
-                description="read data",
-                input_schema={"type": "object", "properties": {}},
+    async def prepare_run(self, run):
+        return context_tool_catalog(
+            run,
+            (
+                ToolDefinition(
+                    name="lookup",
+                    description="read data",
+                    input_schema={"type": "object", "properties": {}},
+                ),
             ),
         )
 
-    async def execute_all(self, run, calls):
-        del run
-        return tuple(self.outputs[call.id] for call in calls)
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
+        return ToolBatchOutcome(tuple(self.outputs[call.id] for call in calls))
 
 
 class OrderingStore(InMemoryTranscriptStore):
@@ -92,6 +120,10 @@ class OrderingStore(InMemoryTranscriptStore):
     async def finish(self, result):
         await super().finish(result)
         self.actions.append(f"persisted:finish:{result.kind.value}")
+
+    async def complete(self, result, final_message):
+        await super().complete(result, final_message)
+        self.actions.append(f"persisted:complete:{result.kind.value}")
 
 
 def _run(run_id="run-observed", conversation_id="conversation-observed"):
@@ -154,6 +186,7 @@ def test_event_contract_is_immutable_bounded_and_deeply_frozen():
         ),
     )
     assert isinstance(event.data["nested"], FrozenJsonObject)
+    assert event.run_origin == "user"
     assert event.data.to_dict() == {
         "duration_ms": 0,
         "nested": {"values": ["safe"]},
@@ -165,6 +198,7 @@ def test_event_contract_is_immutable_bounded_and_deeply_frozen():
         lambda: replace(event, occurred_at=datetime(2026, 7, 21)),
         lambda: replace(event, run_id=""),
         lambda: replace(event, conversation_id="x" * 257),
+        lambda: replace(event, run_origin=""),
         lambda: replace(
             event,
             data=FrozenJsonObject.from_mapping({"value": "x" * 1_025}),
@@ -235,13 +269,13 @@ async def test_text_run_order_payloads_and_durable_boundaries():
         "persisted:start",
         "event:run.started",
         "persisted:user",
-        "persisted:assistant",
         "event:model.completed",
-        "persisted:finish:completed",
+        "persisted:complete:completed",
         "event:run.completed",
     ]
     assert all(event.run_id == "run-observed" for event in events)
     assert all(event.conversation_id == "conversation-observed" for event in events)
+    assert all(event.run_origin == "user" for event in events)
     assert events[0].data.to_dict() == {"agent_id": "agent-observed"}
     model_data = events[1].data.to_dict()
     assert set(model_data) == {

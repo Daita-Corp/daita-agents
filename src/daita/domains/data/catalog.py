@@ -1,4 +1,4 @@
-"""Data-domain projections over catalog-owned structural truth."""
+"""Project catalog resources and relationships into data-domain lookup views."""
 
 from __future__ import annotations
 
@@ -6,15 +6,18 @@ from typing import TYPE_CHECKING, Protocol
 
 from ..._json import FrozenJsonObject
 from ...catalog.models import (
+    CatalogResource,
     CatalogSchemaRequest,
     CatalogSearchRequest,
     CatalogSearchResult,
     CatalogTraversalRequest,
     FacetKind,
     ResourceKind,
+    Sensitivity,
 )
 from ...catalog.protocols import CatalogResourceNotFoundError, CatalogStore
 from ...catalog.service import CatalogService
+from ...llm.models import ModelSensitivity
 from ...semantics import SemanticResourceFact
 from ...storage.sqlite_records import (
     PostgreSQLUpdateScope,
@@ -101,6 +104,36 @@ class CatalogDataView:
     ) -> frozenset[str]:
         """Resolve current readable IDs without changing complete catalog truth."""
 
+        resources = await self._admitted_resources(agent_id, source_ids)
+        return frozenset(resource.id for resource in resources)
+
+    async def admitted_model_sensitivity(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> ModelSensitivity | None:
+        """Classify the exact current readable scope, or fail closed with None."""
+
+        try:
+            resources = await self._admitted_resources(agent_id, source_ids)
+        except SourcePermissionStateError:
+            return None
+        sensitivities: list[ModelSensitivity] = []
+        for resource in resources:
+            if resource.sensitivity is Sensitivity.UNKNOWN:
+                return None
+            sensitivities.append(ModelSensitivity(resource.sensitivity.value))
+        if not sensitivities:
+            return ModelSensitivity.PUBLIC
+        return max(sensitivities, key=lambda item: item.routing_rank)
+
+    async def _admitted_resources(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...],
+    ) -> tuple[CatalogResource, ...]:
+        """Resolve the one exact current resource scope used by reads and routing."""
+
         selected_source_ids = frozenset(source_ids)
         registrations = tuple(
             registration
@@ -109,7 +142,14 @@ class CatalogDataView:
             and registration.active
             and (not selected_source_ids or registration.id in selected_source_ids)
         )
-        readable: set[str] = set()
+        if selected_source_ids and selected_source_ids != {
+            item.id for item in registrations
+        }:
+            raise SourcePermissionStateError(
+                "selected source scope is not active for this agent"
+            )
+
+        admitted: list[CatalogResource] = []
         for registration in registrations:
             scope = await self._sources.load_source_read_scope(
                 agent_id,
@@ -120,8 +160,6 @@ class CatalogDataView:
                     "active source is missing its read scope"
                 )
             self._require_owned_read_scope(registration.id, agent_id, scope)
-            if scope.mode is SourceReadMode.NONE:
-                continue
             current = tuple(
                 resource
                 for resource in await self._store.list_resources(
@@ -131,12 +169,19 @@ class CatalogDataView:
                 if resource.agent_id == agent_id
                 and resource.source_id == registration.id
             )
-            current_ids = {resource.id for resource in current}
-            if scope.mode is SourceReadMode.ALL:
-                readable.update(current_ids)
+            current_by_id = {resource.id: resource for resource in current}
+            if scope.mode is SourceReadMode.NONE:
+                continue
+            elif scope.mode is SourceReadMode.ALL:
+                admitted.extend(current)
             else:
-                readable.update(current_ids & set(scope.resource_ids))
-        return frozenset(readable)
+                if not set(scope.resource_ids) <= set(current_by_id):
+                    raise SourcePermissionStateError(
+                        "active source read scope references a resource outside "
+                        "the current catalog"
+                    )
+                admitted.extend(current_by_id[item] for item in scope.resource_ids)
+        return tuple(admitted)
 
     @staticmethod
     def _require_owned_read_scope(
@@ -424,18 +469,26 @@ class CatalogDataView:
         agent_id: str,
         query: str,
         *,
+        prior_query: str | None = None,
         limit: int,
         source_ids: tuple[str, ...] = (),
         resource_ids: tuple[str, ...] = (),
     ) -> FrozenJsonObject:
         readable = await self.readable_resource_ids(agent_id, source_ids)
-        if resource_ids and any(
-            resource_id not in readable for resource_id in resource_ids
-        ):
-            raise CatalogResourceNotFoundError(agent_id, resource_ids[0])
+        unreadable_resource_id = next(
+            (
+                resource_id
+                for resource_id in resource_ids
+                if resource_id not in readable
+            ),
+            None,
+        )
+        if unreadable_resource_id is not None:
+            raise CatalogResourceNotFoundError(agent_id, unreadable_resource_id)
         return await self._service.catalog_context(
             agent_id,
             query,
+            prior_query=prior_query,
             limit=limit,
             source_ids=source_ids,
             resource_ids=resource_ids,

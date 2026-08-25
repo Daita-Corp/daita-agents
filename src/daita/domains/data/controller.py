@@ -1,119 +1,33 @@
-"""Data tools: projection, validation, execution, and model-visible results."""
+"""Project data tools and revalidate their catalog and permission bindings."""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
-from hashlib import sha256
+from collections.abc import Mapping
+from dataclasses import replace
 from typing import Protocol, cast
 
-from ..._json import FrozenJsonObject, canonical_json
-from ...artifacts.delivery import LocalArtifactDelivery
-from ...artifacts.models import (
-    ArtifactAuthorship,
-    ArtifactDraft,
-    ArtifactError,
-    ArtifactProvenance,
-    ArtifactRef,
-    ArtifactResourceBinding,
-    artifact_ref_to_mapping,
-    canonical_artifact_filename,
-)
-from ...artifacts.renderers import XLSX_MEDIA_TYPE
-from ...artifacts.store import AgentHomeArtifactStore
+from ..._json import FrozenJsonObject
 from ...capabilities import (
     AccessMode,
-    ApprovalDecision,
-    ApprovalHandler,
-    ApprovalRequest,
     Capability,
+    CapabilityDeclarations,
     CapabilityInputError,
-    CapabilityRegistry,
-    Executor,
-    SideEffectExecutor,
-    ToolApplicability,
+    OperationalEffect,
     ToolExecution,
     ToolOutput,
-    ToolOutputValidationError,
 )
+from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.capabilities import (
     CATALOG_INSPECT_CAPABILITY_ID,
     CATALOG_SCHEMA_CAPABILITY_ID,
     CATALOG_SEARCH_CAPABILITY_ID,
     CATALOG_TRAVERSE_CAPABILITY_ID,
 )
-from ...catalog.models import (
-    CATALOG_CONTEXT_DEFAULT_LIMIT,
-    CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
-    Sensitivity,
-)
-from ...errors import PluginError
-from ...learning_candidates import (
-    LearningCandidate,
-    LearningCandidateAction,
-    LearningCandidateTarget,
-    SemanticCandidateContent,
-    SkillCandidateContent,
-    candidate_matches_mutation_call,
-)
-from ...llm.models import MessageRole, ToolCall, ToolDefinition, ToolResultBlock
-from ...loop.models import ClassifiedToolResultsCancelled, RunInput, Transcript
-from ...memory.capabilities import MEMORY_SET_CAPABILITY_ID, MEMORY_SET_TOOL_NAME
-from ...observation import (
-    AgentEvent,
-    AgentEventKind,
-    AgentObserver,
-    _emit_safely,
-)
-from ...semantics import (
-    SEMANTIC_DELETE_CAPABILITY_ID,
-    SEMANTIC_DELETE_TOOL_NAME,
-    SEMANTIC_LIST_CAPABILITY_ID,
-    SEMANTIC_SAVE_CAPABILITY_ID,
-    SEMANTIC_SAVE_TOOL_NAME,
-    SEMANTIC_VIEW_CAPABILITY_ID,
-    SemanticAnnotation,
-    SemanticAnnotationState,
-    SemanticAnnotationView,
-    SemanticDigestMismatchError,
-    SemanticEvidenceKind,
-    SemanticNotFoundError,
-    SemanticResourceFact,
-    SemanticValidationError,
-    inspect_semantic_annotations,
-    semantic_annotation_from_mapping,
-    semantic_maintenance_intersects,
-)
-from ...skills.capabilities import (
-    SKILL_DELETE_CAPABILITY_ID,
-    SKILL_DELETE_TOOL_NAME,
-    SKILL_SAVE_CAPABILITY_ID,
-    SKILL_SAVE_TOOL_NAME,
-    SKILL_VIEW_CAPABILITY_ID,
-)
-from ...skills.store import (
-    SkillNotFoundError,
-    SkillStoreError,
-    SkillValidationError,
-    validate_skill_name,
-)
+from ...llm.models import ModelSensitivity, ToolCall
+from ...loop.models import RunInput
 from ...storage.sqlite_records import SourcePermissionStateError
-from .export_capabilities import (
-    ARTIFACT_CONVERT_CAPABILITY_ID,
-    ARTIFACT_LIST_CAPABILITY_ID,
-    ARTIFACT_READ_CAPABILITY_ID,
-    ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
-    ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
-    DOCUMENT_CREATE_CAPABILITY_ID,
-    LOCAL_FILE_COPY_CAPABILITY_ID,
-    POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-    SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-)
-from .file_capabilities import (
-    LOCAL_FILE_READ_CAPABILITY_ID,
-    LOCAL_FILE_READ_EVIDENCE_KIND,
-)
+from ..learning import LearningCandidateGuard
+from .file_capabilities import LOCAL_FILE_READ_CAPABILITY_ID
 from .sql import (
     PostgreSQLUpdateCommand,
     PostgreSQLUpdateIntent,
@@ -123,6 +37,7 @@ from .sql import (
     validate_sqlite_read,
 )
 
+DATA_DOMAIN_OWNER_ID = "data"
 SQLITE_QUERY_CAPABILITY_ID = "data.sqlite.query"
 SQLITE_QUERY_EVIDENCE_KIND = "data.sqlite.query_result"
 POSTGRESQL_QUERY_CAPABILITY_ID = "data.postgresql.query"
@@ -131,46 +46,43 @@ POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID = "data.postgresql.update_impact"
 POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND = "data.postgresql.update_impact"
 POSTGRESQL_UPDATE_CAPABILITY_ID = "data.postgresql.update"
 POSTGRESQL_UPDATE_EVIDENCE_KIND = "data.postgresql.update_result"
-_MVP_CAPABILITIES = frozenset(
+
+_CATALOG_CAPABILITIES = frozenset(
     {
         CATALOG_SEARCH_CAPABILITY_ID,
         CATALOG_SCHEMA_CAPABILITY_ID,
         CATALOG_INSPECT_CAPABILITY_ID,
         CATALOG_TRAVERSE_CAPABILITY_ID,
-        SQLITE_QUERY_CAPABILITY_ID,
-        POSTGRESQL_QUERY_CAPABILITY_ID,
+    }
+)
+_QUERY_CAPABILITIES = frozenset(
+    {SQLITE_QUERY_CAPABILITY_ID, POSTGRESQL_QUERY_CAPABILITY_ID}
+)
+_UPDATE_CAPABILITIES = frozenset(
+    {POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID, POSTGRESQL_UPDATE_CAPABILITY_ID}
+)
+_RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
+    {
+        CATALOG_INSPECT_CAPABILITY_ID,
+        LOCAL_FILE_READ_CAPABILITY_ID,
         POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
         POSTGRESQL_UPDATE_CAPABILITY_ID,
-        LOCAL_FILE_READ_CAPABILITY_ID,
-        SKILL_VIEW_CAPABILITY_ID,
-        SKILL_SAVE_CAPABILITY_ID,
-        SKILL_DELETE_CAPABILITY_ID,
-        MEMORY_SET_CAPABILITY_ID,
-        SEMANTIC_LIST_CAPABILITY_ID,
-        SEMANTIC_VIEW_CAPABILITY_ID,
-        SEMANTIC_SAVE_CAPABILITY_ID,
-        SEMANTIC_DELETE_CAPABILITY_ID,
-        DOCUMENT_CREATE_CAPABILITY_ID,
-        LOCAL_FILE_COPY_CAPABILITY_ID,
-        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-        ARTIFACT_LIST_CAPABILITY_ID,
-        ARTIFACT_READ_CAPABILITY_ID,
-        ARTIFACT_CONVERT_CAPABILITY_ID,
-        ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
-        ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     }
 )
-_SEMANTIC_CAPABILITIES = frozenset(
-    {
-        SEMANTIC_LIST_CAPABILITY_ID,
-        SEMANTIC_VIEW_CAPABILITY_ID,
-        SEMANTIC_SAVE_CAPABILITY_ID,
-        SEMANTIC_DELETE_CAPABILITY_ID,
-    }
-)
-_EXACT_TABULAR_CAPABILITIES = frozenset(
-    {SQLITE_TABULAR_EXPORT_CAPABILITY_ID, POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}
+_ADAPTER_CAPABILITIES = {
+    "sqlite": frozenset({SQLITE_QUERY_CAPABILITY_ID}),
+    "postgresql": frozenset(
+        {
+            POSTGRESQL_QUERY_CAPABILITY_ID,
+            POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+            POSTGRESQL_UPDATE_CAPABILITY_ID,
+        }
+    ),
+    "local-directory": frozenset({LOCAL_FILE_READ_CAPABILITY_ID}),
+}
+_OWNED_CAPABILITIES = frozenset().union(
+    _CATALOG_CAPABILITIES,
+    *_ADAPTER_CAPABILITIES.values(),
 )
 
 
@@ -200,36 +112,14 @@ class PostgreSQLUpdateCatalogReader(CatalogSchemaReader, Protocol):
     ) -> tuple[str, str] | None: ...
 
 
-class CatalogDataReader(CatalogSchemaReader, Protocol):
-    async def catalog_context(
-        self,
-        agent_id: str,
-        query: str,
-        *,
-        limit: int,
-        source_ids: tuple[str, ...] = (),
-        resource_ids: tuple[str, ...] = (),
-    ) -> FrozenJsonObject: ...
-
+class DataDomainCatalog(
+    ReadScopedCatalogReader, PostgreSQLUpdateCatalogReader, Protocol
+):
     async def source_routing_facts(
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
     ) -> tuple[Mapping[str, object], ...]: ...
-
-    async def readable_resource_ids(
-        self,
-        agent_id: str,
-        source_ids: tuple[str, ...] = (),
-    ) -> frozenset[str]: ...
-
-    async def postgresql_update_scope_issue(
-        self,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-        assignment_columns: tuple[str, ...],
-    ) -> tuple[str, str] | None: ...
 
     async def postgresql_update_applicable_source_ids(
         self,
@@ -252,1909 +142,265 @@ class CatalogDataReader(CatalogSchemaReader, Protocol):
         resource_id: str,
     ) -> bool: ...
 
-    async def semantic_resource_facts(
+    async def admitted_model_sensitivity(
         self,
         agent_id: str,
-        resource_ids: tuple[str, ...],
-    ) -> tuple[SemanticResourceFact, ...]: ...
+        source_ids: tuple[str, ...] = (),
+    ) -> ModelSensitivity | None: ...
 
 
-class TranscriptReader(Protocol):
-    async def load(self, run_id: str) -> Transcript: ...
+class DataCapabilityDomain:
+    """Own native catalog, SQL, update, and local-file call semantics."""
 
-    async def list_semantic_annotations(
-        self,
-        agent_id: str,
-    ) -> tuple[SemanticAnnotation, ...]: ...
-
-
-class DataToolRuntime:
-    """Project, authorize, and execute built-in MVP tools."""
+    domain_owner_id = DATA_DOMAIN_OWNER_ID
 
     def __init__(
         self,
-        registry: CapabilityRegistry,
-        catalog: CatalogDataReader,
-        *,
-        approval_handler: ApprovalHandler | None = None,
-        mutation_lock: asyncio.Lock | None = None,
-        observer: AgentObserver | None = None,
-        clock: Callable[[], datetime] | None = None,
-        transcripts: TranscriptReader | None = None,
-        artifacts: AgentHomeArtifactStore | None = None,
-        artifact_delivery: LocalArtifactDelivery | None = None,
+        declarations: CapabilityDeclarations,
+        catalog: DataDomainCatalog,
+        learning: LearningCandidateGuard,
     ) -> None:
-        if not isinstance(registry, CapabilityRegistry):
-            raise TypeError("registry must be CapabilityRegistry")
-        if not callable(getattr(catalog, "source_routing_facts", None)):
-            raise TypeError("catalog must provide source_routing_facts")
-        if approval_handler is not None and not callable(approval_handler):
-            raise TypeError("approval_handler must be callable or None")
-        if mutation_lock is not None and not isinstance(mutation_lock, asyncio.Lock):
-            raise TypeError("mutation_lock must be an asyncio.Lock or None")
-        if observer is not None and not callable(observer):
-            raise TypeError("observer must be callable or None")
-        if clock is not None and not callable(clock):
-            raise TypeError("clock must be callable or None")
-        if transcripts is not None and not callable(getattr(transcripts, "load", None)):
-            raise TypeError("transcripts must provide load")
-        self._registry = registry
+        if declarations.domain_owner_id != self.domain_owner_id:
+            raise ValueError("data declarations have the wrong domain owner")
+        declared_ids = {item.id for item in declarations.capabilities}
+        if declared_ids != _OWNED_CAPABILITIES:
+            raise ValueError(
+                "data declarations must exactly match supported native capabilities"
+            )
+        for adapter_id, capability_ids in _ADAPTER_CAPABILITIES.items():
+            if not capability_ids <= declared_ids:
+                raise ValueError(
+                    f"data adapter capability admission is incomplete: {adapter_id}"
+                )
+        for method_name in (
+            "source_routing_facts",
+            "resource_schemas",
+            "readable_resource_ids",
+            "source_adapter_id",
+        ):
+            if not callable(getattr(catalog, method_name, None)):
+                raise TypeError(f"data catalog must provide {method_name}")
+        if not isinstance(learning, LearningCandidateGuard):
+            raise TypeError("learning must be LearningCandidateGuard")
+        self._declarations = declarations
         self._catalog = catalog
-        self._approval_handler = approval_handler
-        self._mutation_lock = mutation_lock or asyncio.Lock()
-        self._observer = observer
-        self._clock = clock or (lambda: datetime.now(UTC))
-        self._transcripts = transcripts
-        self._artifacts = artifacts
-        self._artifact_delivery = artifact_delivery
-        self._selected_learning_candidates: dict[str, LearningCandidate] = {}
-        self._successful_learning_candidate_mutations: set[str] = set()
-        self._explicit_learning_runs: set[str] = set()
+        self._learning = learning
+        self._views = {item.name: item for item in declarations.tool_views}
+        self._capabilities = {item.id: item for item in declarations.capabilities}
 
-    def select_explicit_learning_run(self, run_id: str) -> None:
-        if not isinstance(run_id, str) or not run_id:
-            raise ValueError("explicit learning run_id must be non-empty text")
-        if self._explicit_learning_runs:
-            raise RuntimeError("explicit learning guard exceeds its live bound")
-        self._explicit_learning_runs.add(run_id)
+    @property
+    def declarations(self) -> CapabilityDeclarations:
+        return self._declarations
 
-    def clear_explicit_learning_run(self, run_id: str) -> None:
-        self._explicit_learning_runs.discard(run_id)
-
-    def select_learning_candidate(
-        self,
-        run_id: str,
-        candidate: LearningCandidate,
-    ) -> None:
-        """Narrow one acceptance run to its exact candidate mutation."""
-
-        if not isinstance(run_id, str) or not run_id:
-            raise ValueError("candidate guard run_id must be non-empty text")
-        if not isinstance(candidate, LearningCandidate):
-            raise TypeError("candidate guard requires LearningCandidate")
-        if self._selected_learning_candidates:
-            raise RuntimeError("candidate mutation guard exceeds its live bound")
-        self._successful_learning_candidate_mutations.discard(run_id)
-        self._selected_learning_candidates[run_id] = candidate
-
-    def clear_learning_candidate(self, run_id: str) -> None:
-        self._selected_learning_candidates.pop(run_id, None)
-
-    def learning_candidate_mutation_succeeded(self, run_id: str) -> bool:
-        """Return whether this guarded run completed its exact active mutation."""
-
-        return run_id in self._successful_learning_candidate_mutations
-
-    def clear_learning_candidate_outcome(self, run_id: str) -> None:
-        self._successful_learning_candidate_mutations.discard(run_id)
-
-    async def definitions(self, run: RunInput) -> tuple[ToolDefinition, ...]:
-        names = await self._projected_tool_names(run)
-        return tuple(self._registry.tool_definition(name) for name in names)
-
-    async def validate_semantic_annotation(
-        self,
-        agent_id: str,
-        annotation: SemanticAnnotation,
-    ) -> None:
-        """Validate direct public semantic content against current authoritative state."""
-
-        if not isinstance(annotation, SemanticAnnotation):
-            raise TypeError("annotation must be SemanticAnnotation")
-        issue = await self._semantic_annotation_issue(agent_id, annotation)
-        if issue is not None:
-            _code, message, _details = issue
-            raise SemanticValidationError(message)
-
-    async def execute_all(
-        self,
-        run: RunInput,
-        calls: tuple[ToolCall, ...],
-    ) -> tuple[ToolResultBlock, ...]:
-        if not isinstance(run, RunInput):
-            raise TypeError("run must be RunInput")
-        calls = tuple(calls)
-        if any(not isinstance(call, ToolCall) for call in calls):
-            raise TypeError("calls must contain ToolCall records")
-        projected = frozenset(await self._projected_tool_names(run))
-        results: list[ToolResultBlock | None] = [None] * len(calls)
-        reads: list[tuple[int, ToolCall]] = []
-
-        async def finish_reads() -> None:
-            if not reads:
-                return
-            indexes = tuple(index for index, _ in reads)
-            completed = await asyncio.gather(
-                *(self._execute_one(run, call, projected) for _, call in reads)
-            )
-            for index, result in zip(indexes, completed, strict=True):
-                results[index] = result
-            reads.clear()
-
-        for index, call in enumerate(calls):
-            if self._is_side_effecting(call, projected):
-                await finish_reads()
-                try:
-                    results[index] = await self._execute_one(run, call, projected)
-                except ClassifiedToolResultsCancelled as cancelled:
-                    if len(cancelled.results) != 1:
-                        raise RuntimeError(
-                            "one tool execution returned multiple classified results"
-                        ) from cancelled
-                    results[index] = cancelled.results[0]
-                    completed = results[: index + 1]
-                    if any(result is None for result in completed):
-                        raise RuntimeError(
-                            "classified cancellation left an incomplete result prefix"
-                        ) from cancelled
-                    raise ClassifiedToolResultsCancelled(
-                        cast(tuple[ToolResultBlock, ...], tuple(completed))
-                    ) from None
-            else:
-                reads.append((index, call))
-        await finish_reads()
-        if any(result is None for result in results):
-            raise RuntimeError("tool result scheduling left an incomplete call")
-        return cast(tuple[ToolResultBlock, ...], tuple(results))
-
-    async def _execute_one(
-        self,
-        run: RunInput,
-        call: ToolCall,
-        projected: frozenset[str],
-    ) -> ToolResultBlock:
-        started = (
-            asyncio.get_running_loop().time() if self._observer is not None else None
+    async def project(self, run: RunInput) -> tuple[str, ...]:
+        facts = await self._catalog.source_routing_facts(
+            run.agent_id,
+            (() if run.source_id is None else (run.source_id,)),
         )
-        view = None
-        capability = None
-        if call.name in projected:
-            try:
-                view, capability = self._registry.resolve_tool(call.name)
-            except KeyError:
-                pass
-        self._emit_tool_started(run, call, capability)
-        cancelled_after_mutation = False
-        try:
-            if view is None or capability is None:
-                result = _error(
-                    call,
-                    "tool_not_available",
-                    "The requested tool is not available for the attached sources.",
-                    {"tool_name": call.name},
-                )
-                self._emit_tool_completed(run, call, result, started)
-                return result
-            raw_arguments = (
-                _without_runtime_owned_semantic_evidence(call.arguments)
-                if capability.id == SEMANTIC_SAVE_CAPABILITY_ID
-                else call.arguments
-            )
-            arguments = self._registry.validate_arguments(
-                capability.id,
-                raw_arguments,
-            )
-            arguments = self._apply_source_scope(run, capability, arguments)
-            validation_error = await self._validate(run, capability, arguments)
-            if validation_error is not None:
-                code, message, details = validation_error
-                result = _error(call, code, message, details)
-                self._emit_tool_completed(run, call, result, started)
-                return result
-            if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
-                arguments = await self._bind_current_semantic_evidence(
-                    run,
-                    arguments,
-                )
-            resolved_capability, executor = self._registry.resolve_execution(
-                capability.id
-            )
-            if resolved_capability != capability or view.capability_id != capability.id:
-                raise ValueError("tool execution identity changed")
-            execution = ToolExecution(
-                run_id=run.id,
-                call_id=call.id,
-                capability_id=capability.id,
-                arguments=arguments,
-                conversation_id=run.conversation_id or run.id,
-            )
-            if capability.side_effecting:
-                result, cancelled_after_mutation = await self._execute_side_effect(
-                    run,
-                    call,
-                    capability,
-                    executor,
-                    execution,
-                )
-            else:
-                candidate = await executor.execute(execution)
-                if capability.id == SEMANTIC_VIEW_CAPABILITY_ID:
-                    candidate = await self._decorate_semantic_view(
-                        run,
-                        arguments,
-                        candidate,
-                    )
-                elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:
-                    self._registry.validate_output(capability.id, candidate)
-                    candidate = await self._filter_semantic_list(
-                        run,
-                        arguments,
-                        candidate,
-                    )
-                output = self._registry.validate_output(capability.id, candidate)
-                artifact_ref = await self._commit_artifact_output(
-                    run,
-                    call,
-                    capability,
-                    output,
-                    arguments,
-                )
-                result = _success(call, output, artifact_ref=artifact_ref)
-        except CapabilityInputError as error:
-            if (
-                capability is not None
-                and capability.id
-                in {
-                    SKILL_VIEW_CAPABILITY_ID,
-                    SKILL_SAVE_CAPABILITY_ID,
-                    SKILL_DELETE_CAPABILITY_ID,
-                }
-                and "name" in call.arguments
-                and error.details.get("name") == "name"
+        active_adapter_ids = {
+            adapter_id
+            for fact in facts
+            if isinstance((adapter_id := fact.get("adapter_id")), str)
+        }
+        update_source_ids = await self._catalog.postgresql_update_applicable_source_ids(
+            run.agent_id,
+            (() if run.source_id is None else (run.source_id,)),
+        )
+        names: list[str] = []
+        for name in sorted(self._views):
+            view = self._views[name]
+            capability = self._capabilities[view.capability_id]
+            if not self._learning.allows(
+                run.id,
+                name,
+                effectful=capability.operational_effect is not OperationalEffect.NONE,
             ):
-                result = _error(
-                    call,
-                    "skill_invalid_name",
-                    "Skill names must match [a-z][a-z0-9-]{0,63}.",
-                )
-            else:
-                result = _error(call, error.code, str(error), error.details)
-        except ToolOutputValidationError as error:
-            result = _error(call, "invalid_tool_result", str(error))
-        except ArtifactError as error:
-            result = _error(call, error.code, error.message, error.details)
-        except SkillNotFoundError:
-            result = _error(
-                call,
-                "skill_not_found",
-                "The requested skill is not available.",
-                {"name": call.arguments.get("name")},
-            )
-        except SkillStoreError:
-            result = _error(
-                call,
-                "skill_unavailable",
-                "The requested skill document is unavailable or invalid.",
-            )
-        except SemanticNotFoundError:
-            result = _error(
-                call,
-                "semantic_not_found",
-                "The requested semantic annotation is not available.",
-                {"id": call.arguments.get("id")},
-            )
-        except SemanticDigestMismatchError as error:
-            code = (
-                "semantic_expected_sha256_required"
-                if "requires expected_sha256" in str(error)
-                else "semantic_stale_digest"
-            )
-            result = _error(call, code, str(error), {"id": call.arguments.get("id")})
-        except SemanticValidationError as error:
-            result = _error(
-                call,
-                "semantic_invalid_annotation",
-                str(error),
-                {"id": call.arguments.get("id")},
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            result = _exception_result(call, error)
-        self._emit_tool_completed(run, call, result, started)
-        if cancelled_after_mutation:
-            raise ClassifiedToolResultsCancelled((result,))
-        return result
-
-    async def _commit_artifact_output(
-        self,
-        run: RunInput,
-        call: ToolCall,
-        capability: Capability,
-        output: ToolOutput,
-        arguments: Mapping[str, object] | None = None,
-    ) -> ArtifactRef | None:
-        policy = capability.artifact_policy
-        draft = output.artifact
-        if policy is None:
-            if draft is not None:
-                raise ToolOutputValidationError(
-                    "capability without artifact policy returned a draft"
-                )
-            return None
-        if draft is None:
-            if policy.artifact_required:
-                raise ToolOutputValidationError(
-                    "artifact-producing capability omitted its required draft"
-                )
-            return None
-        if draft.provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
-            if capability.id in _EXACT_TABULAR_CAPABILITIES:
-                if (
-                    output.data.get("format") not in {"csv", "xlsx"}
-                    or output.data.get("filename") != draft.suggested_filename
-                    or output.data.get("row_count") != draft.provenance.row_count
-                    or output.data.get("column_count") != len(draft.provenance.columns)
-                ):
-                    raise ToolOutputValidationError(
-                        "exact artifact summary differs from its execution provenance"
-                    )
-            elif capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
-                if (
-                    output.data.get("format") not in {"csv", "json"}
-                    or output.data.get("filename") != draft.suggested_filename
-                    or output.data.get("byte_size") != len(draft.content)
-                ):
-                    raise ToolOutputValidationError(
-                        "exact file-copy summary differs from its source bytes"
-                    )
-            elif capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
-                if (
-                    output.data.get("source_artifact_id")
-                    != draft.provenance.derived_from_artifact_id
-                    or output.data.get("format") != "csv"
-                    or output.data.get("filename") != draft.suggested_filename
-                    or output.data.get("row_count") != draft.provenance.row_count
-                    or output.data.get("column_count") != len(draft.provenance.columns)
-                ):
-                    raise ToolOutputValidationError(
-                        "artifact conversion summary differs from its snapshot facts"
-                    )
-            else:
-                raise ToolOutputValidationError(
-                    "exact-source artifact came from a non-export capability"
-                )
-        if policy.max_artifact_count != 1:
-            raise ToolOutputValidationError(
-                "artifact draft exceeds the capability artifact count"
-            )
-        if draft.media_type not in policy.allowed_media_types:
-            raise ToolOutputValidationError(
-                "artifact draft media type is outside the capability policy"
-            )
-        if (
-            len(draft.content) > policy.max_bytes_per_artifact
-            or len(draft.content) > policy.max_total_bytes_per_call
-        ):
-            raise ToolOutputValidationError(
-                "artifact draft bytes exceed the capability policy"
-            )
-        try:
-            canonical_artifact_filename(
-                draft.suggested_filename,
-                draft.media_type,
-                policy.allowed_extensions,
-            )
-        except ArtifactError as error:
-            raise ToolOutputValidationError(
-                "artifact draft filename or extension violates the capability policy"
-            ) from error
-        if self._artifacts is None:
-            raise ArtifactError(
-                "artifact_storage_failed",
-                "Artifact storage is unavailable.",
-                {"stage": "composition"},
-            )
-        bound = await self._bind_artifact_provenance(
-            run,
-            capability,
-            arguments or {},
-            draft,
-        )
-        return await self._artifacts.commit(
-            bound,
-            policy,
-            run_id=run.id,
-            conversation_id=run.conversation_id or run.id,
-            call_id=call.id,
-            capability_id=capability.id,
-        )
-
-    async def _bind_artifact_provenance(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: Mapping[str, object],
-        draft: ArtifactDraft,
-    ) -> ArtifactDraft:
-        provenance = draft.provenance
-        if provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
-            if capability.id in _EXACT_TABULAR_CAPABILITIES:
-                return await self._bind_exact_export_provenance(
-                    run,
-                    capability,
-                    arguments,
-                    draft,
-                )
-            if capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
-                return await self._bind_local_file_copy_provenance(
-                    run,
-                    arguments,
-                    draft,
-                )
-            if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
-                return await self._bind_artifact_conversion_provenance(
-                    run,
-                    arguments,
-                    draft,
-                )
-            raise ToolOutputValidationError(
-                "exact-source artifact came from a non-export capability"
-            )
-        if provenance.authorship is not ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS:
-            raise ToolOutputValidationError("artifact authorship is not supported")
-        evidence_call_ids = provenance.evidence_call_ids
-        if not evidence_call_ids:
-            return ArtifactDraft(
-                content=draft.content,
-                suggested_filename=draft.suggested_filename,
-                media_type=draft.media_type,
-                sensitivity=_resolved_sensitivity((draft.sensitivity,)),
-                provenance=ArtifactProvenance(
-                    authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
-                ),
-            )
-        if self._transcripts is None:
-            raise CapabilityInputError(
-                "invalid_argument_value",
-                "Artifact evidence validation is unavailable.",
-                {"name": "evidence_call_ids"},
-            )
-        try:
-            transcript = await self._transcripts.load(run.id)
-        except KeyError as error:
-            raise CapabilityInputError(
-                "invalid_argument_value",
-                "Artifact evidence must reference the current run.",
-                {"name": "evidence_call_ids"},
-            ) from error
-        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
-            raise CapabilityInputError(
-                "invalid_argument_value",
-                "Artifact evidence belongs to another run.",
-                {"name": "evidence_call_ids"},
-            )
-        bindings: dict[tuple[str, str], ArtifactResourceBinding] = {}
-        sensitivities: list[Sensitivity] = [draft.sensitivity]
-        schema_cache: dict[str, dict[str, ResourceSchema]] = {}
-        for call_id in evidence_call_ids:
-            results = tuple(
-                block
-                for message in transcript.messages
-                if message.role is MessageRole.TOOL
-                for block in message.content
-                if isinstance(block, ToolResultBlock) and block.call_id == call_id
-            )
-            call_exists = any(
-                candidate.id == call_id
-                for message in transcript.messages
-                if message.role is MessageRole.ASSISTANT
-                for candidate in message.tool_calls
-            )
-            if len(results) != 1 or not call_exists or results[0].is_error:
-                raise CapabilityInputError(
-                    "invalid_argument_value",
-                    "Artifact evidence must reference one earlier successful data call.",
-                    {"name": "evidence_call_ids", "call_id": call_id},
-                )
-            block = results[0]
-            if block.output.get("kind") not in {
-                SQLITE_QUERY_EVIDENCE_KIND,
-                POSTGRESQL_QUERY_EVIDENCE_KIND,
-                LOCAL_FILE_READ_EVIDENCE_KIND,
-            }:
-                raise CapabilityInputError(
-                    "invalid_argument_value",
-                    "Artifact evidence must reference a validated data result.",
-                    {"name": "evidence_call_ids", "call_id": call_id},
-                )
-            data = block.output.get("data")
-            if not isinstance(data, Mapping):
-                raise CapabilityInputError(
-                    "invalid_argument_value",
-                    "Artifact evidence result data is unavailable.",
-                    {"name": "evidence_call_ids", "call_id": call_id},
-                )
-            source_id = data.get("source_id")
-            source_revision = data.get("source_revision")
-            if not isinstance(source_id, str) or not isinstance(source_revision, str):
-                raise CapabilityInputError(
-                    "invalid_argument_value",
-                    "Artifact evidence source identity is unavailable.",
-                    {"name": "evidence_call_ids", "call_id": call_id},
-                )
-            raw_resources: tuple[tuple[str, str], ...]
-            if block.output.get("kind") == LOCAL_FILE_READ_EVIDENCE_KIND:
-                resource_id = data.get("resource_id")
-                resource_revision = data.get("resource_revision")
-                raw_resources = (
-                    ((resource_id, resource_revision),)
-                    if isinstance(resource_id, str)
-                    and isinstance(resource_revision, str)
-                    else ()
-                )
-            else:
-                raw_revisions = data.get("resource_revisions")
-                raw_resources = tuple(
-                    (resource_id, revision)
-                    for item in (
-                        raw_revisions if isinstance(raw_revisions, tuple) else ()
-                    )
-                    if isinstance(item, Mapping)
-                    and isinstance((resource_id := item.get("resource_id")), str)
-                    and isinstance((revision := item.get("revision")), str)
-                )
-            if not raw_resources:
-                raise CapabilityInputError(
-                    "invalid_argument_value",
-                    "Artifact evidence resource identity is unavailable.",
-                    {"name": "evidence_call_ids", "call_id": call_id},
-                )
-            schemas = schema_cache.get(source_id)
-            if schemas is None:
-                schemas = {
-                    item.resource_id: item
-                    for item in await self._catalog.resource_schemas(
-                        run.agent_id,
-                        source_id,
-                    )
-                }
-                schema_cache[source_id] = schemas
-            for resource_id, resource_revision in raw_resources:
-                schema = schemas.get(resource_id)
-                if (
-                    schema is None
-                    or schema.revision != resource_revision
-                    or schema.source_revision != source_revision
-                ):
-                    raise CapabilityInputError(
-                        "invalid_argument_value",
-                        "Artifact evidence is no longer current in the catalog.",
-                        {"name": "evidence_call_ids", "call_id": call_id},
-                    )
-                key = (source_id, resource_id)
-                binding = ArtifactResourceBinding(
-                    source_id=source_id,
-                    source_revision=source_revision,
-                    resource_id=resource_id,
-                    resource_revision=resource_revision,
-                )
-                prior = bindings.get(key)
-                if prior is not None and prior != binding:
-                    raise CapabilityInputError(
-                        "invalid_argument_value",
-                        "Artifact evidence contains conflicting resource revisions.",
-                        {"name": "evidence_call_ids", "call_id": call_id},
-                    )
-                bindings[key] = binding
-                try:
-                    sensitivities.append(Sensitivity(schema.sensitivity_class))
-                except ValueError:
-                    sensitivities.append(Sensitivity.RESTRICTED)
-        return ArtifactDraft(
-            content=draft.content,
-            suggested_filename=draft.suggested_filename,
-            media_type=draft.media_type,
-            sensitivity=_resolved_sensitivity(tuple(sensitivities)),
-            provenance=ArtifactProvenance(
-                authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
-                evidence_call_ids=evidence_call_ids,
-                resource_bindings=tuple(bindings[key] for key in sorted(bindings)),
-            ),
-        )
-
-    async def _bind_exact_export_provenance(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: Mapping[str, object],
-        draft: ArtifactDraft,
-    ) -> ArtifactDraft:
-        source_id = arguments.get("source_id")
-        sql = arguments.get("sql")
-        parameters = arguments.get("parameters", ())
-        if (
-            not isinstance(source_id, str)
-            or not isinstance(sql, str)
-            or not isinstance(parameters, tuple)
-        ):
-            raise ToolOutputValidationError(
-                "exact export execution arguments are unavailable"
-            )
-        expected_adapter = (
-            "postgresql"
-            if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
-            else "sqlite"
-        )
-        if (
-            await self._catalog.source_adapter_id(run.agent_id, source_id)
-            != expected_adapter
-        ):
-            raise ArtifactError(
-                "artifact_incomplete_export",
-                "Current source facts no longer prove the exact tabular export.",
-                {
-                    "reason": "catalog_changed",
-                    "completed_rows": draft.provenance.row_count or 0,
-                    "completed_columns": len(draft.provenance.columns),
-                    "completed_bytes": len(draft.content),
-                },
-            )
-        resources = await self._catalog.resource_schemas(run.agent_id, source_id)
-        try:
-            readable = await self._catalog.readable_resource_ids(
-                run.agent_id,
-                (source_id,),
-            )
-        except SourcePermissionStateError:
-            raise ArtifactError(
-                "artifact_incomplete_export",
-                "Current source permission state no longer proves the exact export.",
-                {
-                    "reason": "permission_state_invalid",
-                    "completed_rows": draft.provenance.row_count or 0,
-                    "completed_columns": len(draft.provenance.columns),
-                    "completed_bytes": len(draft.content),
-                },
-            )
-        validator = (
-            validate_postgresql_read
-            if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
-            else validate_sqlite_read
-        )
-        validation = validator(
-            sql,
-            source_id=source_id,
-            resources=resources,
-            parameters=parameters,
-            allowed_resource_ids=readable,
-        )
-        if (
-            not validation.valid
-            or validation.analysis is None
-            or validation.source_revision is None
-            or not validation.resource_ids
-            or len(validation.resource_revisions) != len(validation.resource_ids)
-        ):
-            raise ArtifactError(
-                "artifact_incomplete_export",
-                "Current catalog facts no longer prove the exact tabular export.",
-                {
-                    "reason": "catalog_changed",
-                    "completed_rows": draft.provenance.row_count or 0,
-                    "completed_columns": len(draft.provenance.columns),
-                    "completed_bytes": len(draft.content),
-                },
-            )
-        schemas = {item.resource_id: item for item in resources}
-        bindings = tuple(
-            ArtifactResourceBinding(
-                source_id=source_id,
-                source_revision=validation.source_revision,
-                resource_id=resource_id,
-                resource_revision=revision,
-            )
-            for resource_id, revision in sorted(validation.resource_revisions)
-        )
-        parameters_sha256 = (
-            "sha256:" + sha256(canonical_json(parameters).encode("utf-8")).hexdigest()
-        )
-        provenance = draft.provenance
-        if (
-            provenance.resource_bindings != bindings
-            or provenance.sql_fingerprint != validation.analysis.sql_fingerprint
-            or provenance.parameters_sha256 != parameters_sha256
-        ):
-            raise ToolOutputValidationError(
-                "exact artifact provenance differs from current runtime execution facts"
-            )
-        sensitivities = [draft.sensitivity]
-        current_sensitivities: list[Sensitivity] = []
-        for resource_id in validation.resource_ids:
-            schema = schemas.get(resource_id)
-            if schema is None:
-                raise ToolOutputValidationError(
-                    "exact artifact resource is absent from current catalog facts"
-                )
-            try:
-                current_sensitivities.append(Sensitivity(schema.sensitivity_class))
-            except ValueError:
-                current_sensitivities.append(Sensitivity.RESTRICTED)
-        current_sensitivity = _resolved_sensitivity(tuple(current_sensitivities))
-        if draft.sensitivity is not current_sensitivity:
-            raise ArtifactError(
-                "artifact_incomplete_export",
-                "Current catalog sensitivity no longer proves the exact tabular export.",
-                {
-                    "reason": "catalog_changed",
-                    "completed_rows": draft.provenance.row_count or 0,
-                    "completed_columns": len(draft.provenance.columns),
-                    "completed_bytes": len(draft.content),
-                },
-            )
-        sensitivities.extend(current_sensitivities)
-        return ArtifactDraft(
-            content=draft.content,
-            suggested_filename=draft.suggested_filename,
-            media_type=draft.media_type,
-            sensitivity=_resolved_sensitivity(tuple(sensitivities)),
-            provenance=ArtifactProvenance(
-                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                resource_bindings=bindings,
-                sql_fingerprint=validation.analysis.sql_fingerprint,
-                parameters_sha256=parameters_sha256,
-                columns=provenance.columns,
-                row_count=provenance.row_count,
-            ),
-        )
-
-    async def _bind_local_file_copy_provenance(
-        self,
-        run: RunInput,
-        arguments: Mapping[str, object],
-        draft: ArtifactDraft,
-    ) -> ArtifactDraft:
-        source_id = arguments.get("source_id")
-        resource_id = arguments.get("resource_id")
-        provenance = draft.provenance
-        if not isinstance(source_id, str) or not isinstance(resource_id, str):
-            raise ToolOutputValidationError(
-                "local-file copy execution arguments are unavailable"
-            )
-        if (
-            len(provenance.resource_bindings) != 1
-            or provenance.sql_fingerprint is not None
-            or provenance.parameters_sha256 is not None
-            or provenance.columns
-            or provenance.row_count is not None
-        ):
-            raise ToolOutputValidationError(
-                "local-file copy provenance differs from byte-copy facts"
-            )
-        binding = provenance.resource_bindings[0]
-        identity = await self._catalog.resource_identity(run.agent_id, resource_id)
-        if (
-            await self._catalog.source_adapter_id(run.agent_id, source_id)
-            != "local-directory"
-            or identity != (source_id, "file", binding.resource_revision)
-            or not await self._catalog.is_current_tabular_file(
-                run.agent_id,
-                source_id,
-                resource_id,
-            )
-        ):
-            raise ArtifactError(
-                "artifact_incomplete_export",
-                "Current catalog facts no longer prove the local-file copy.",
-                {
-                    "reason": "catalog_changed",
-                    "completed_rows": 0,
-                    "completed_columns": 0,
-                    "completed_bytes": len(draft.content),
-                },
-            )
-        schema = next(
-            (
-                item
-                for item in await self._catalog.resource_schemas(
-                    run.agent_id,
-                    source_id,
-                )
-                if item.resource_id == resource_id
-            ),
-            None,
-        )
-        if (
-            schema is None
-            or schema.resource_kind != "file"
-            or schema.revision is None
-            or schema.source_revision is None
-            or schema.revision != binding.resource_revision
-            or schema.source_revision != binding.source_revision
-            or binding.source_id != source_id
-            or binding.resource_id != resource_id
-        ):
-            raise ArtifactError(
-                "artifact_incomplete_export",
-                "Current catalog revisions no longer prove the local-file copy.",
-                {
-                    "reason": "catalog_changed",
-                    "completed_rows": 0,
-                    "completed_columns": 0,
-                    "completed_bytes": len(draft.content),
-                },
-            )
-        try:
-            catalog_sensitivity = Sensitivity(schema.sensitivity_class)
-        except ValueError:
-            catalog_sensitivity = Sensitivity.RESTRICTED
-        current_sensitivity = _resolved_sensitivity((catalog_sensitivity,))
-        if draft.sensitivity is not current_sensitivity:
-            raise ArtifactError(
-                "artifact_incomplete_export",
-                "Current catalog sensitivity no longer proves the local-file copy.",
-                {
-                    "reason": "catalog_changed",
-                    "completed_rows": 0,
-                    "completed_columns": 0,
-                    "completed_bytes": len(draft.content),
-                },
-            )
-        current_binding = ArtifactResourceBinding(
-            source_id=source_id,
-            source_revision=schema.source_revision,
-            resource_id=resource_id,
-            resource_revision=schema.revision,
-        )
-        return ArtifactDraft(
-            content=draft.content,
-            suggested_filename=draft.suggested_filename,
-            media_type=draft.media_type,
-            sensitivity=_resolved_sensitivity((draft.sensitivity, catalog_sensitivity)),
-            provenance=ArtifactProvenance(
-                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                resource_bindings=(current_binding,),
-            ),
-        )
-
-    async def _bind_artifact_conversion_provenance(
-        self,
-        run: RunInput,
-        arguments: Mapping[str, object],
-        draft: ArtifactDraft,
-    ) -> ArtifactDraft:
-        artifact_id = arguments.get("artifact_id")
-        if not isinstance(artifact_id, str):
-            raise ToolOutputValidationError(
-                "artifact conversion input identity is unavailable"
-            )
-        source = await self._current_conversation_artifact_ref(run, artifact_id)
-        if source is None:
-            raise ArtifactError(
-                "artifact_missing",
-                "The requested artifact is not available in the current conversation.",
-                {"artifact_id": artifact_id},
-            )
-        if (
-            source.capability_id not in _EXACT_TABULAR_CAPABILITIES
-            or source.media_type != XLSX_MEDIA_TYPE
-            or source.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA
-        ):
-            raise ArtifactError(
-                "artifact_invalid_format",
-                "Only a Daita-generated exact XLSX artifact can be converted to CSV.",
-                {
-                    "media_type": source.media_type,
-                    "allowed_extensions": (".xlsx",),
-                },
-            )
-        if self._artifacts is None:
-            raise ArtifactError(
-                "artifact_storage_failed",
-                "Artifact storage is unavailable.",
-                {"stage": "composition"},
-            )
-        await self._artifacts.read_ref(source)
-        provenance = draft.provenance
-        source_provenance = source.provenance
-        if (
-            provenance.derived_from_artifact_id != source.artifact_id
-            or provenance.resource_bindings != source_provenance.resource_bindings
-            or provenance.sql_fingerprint != source_provenance.sql_fingerprint
-            or provenance.parameters_sha256 != source_provenance.parameters_sha256
-            or provenance.columns != source_provenance.columns
-            or provenance.row_count != source_provenance.row_count
-            or draft.sensitivity is not source.sensitivity
-            or draft.media_type != "text/csv"
-        ):
-            raise ToolOutputValidationError(
-                "artifact conversion differs from its verified source snapshot"
-            )
-        return ArtifactDraft(
-            content=draft.content,
-            suggested_filename=draft.suggested_filename,
-            media_type="text/csv",
-            sensitivity=source.sensitivity,
-            provenance=ArtifactProvenance(
-                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                derived_from_artifact_id=source.artifact_id,
-                resource_bindings=source_provenance.resource_bindings,
-                sql_fingerprint=source_provenance.sql_fingerprint,
-                parameters_sha256=source_provenance.parameters_sha256,
-                columns=source_provenance.columns,
-                row_count=source_provenance.row_count,
-            ),
-        )
-
-    async def _execute_side_effect(
-        self,
-        run: RunInput,
-        call: ToolCall,
-        capability: Capability,
-        executor: Executor,
-        execution: ToolExecution,
-    ) -> tuple[ToolResultBlock, bool]:
-        if (
-            capability.access_mode is not AccessMode.WRITE
-            or not capability.side_effecting
-        ):
-            raise ValueError("side-effect execution requires a write capability")
-        selected_candidate = self._selected_learning_candidates.get(run.id)
-        if selected_candidate is not None and not candidate_matches_mutation_call(
-            selected_candidate,
-            call,
-        ):
-            return (
-                _error(
-                    call,
-                    "candidate_mismatch",
-                    "This acceptance run may mutate only the explicitly selected "
-                    "candidate's exact target content.",
-                    {"candidate_id": selected_candidate.id},
-                ),
-                False,
-            )
-        preflight = getattr(executor, "preflight", None)
-        if not callable(preflight):
-            raise ValueError("side-effecting executor must provide preflight")
-        side_effect = cast(SideEffectExecutor, executor)
-        fingerprint = await side_effect.preflight(execution)
-        if not isinstance(fingerprint, FrozenJsonObject):
-            raise ValueError("side-effect preflight must return FrozenJsonObject")
-        await self._validate_semantic_preflight(run, capability, fingerprint)
-        if (
-            capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
-            and fingerprint.get("requires_approval") is False
-        ):
-            return await self._execute_preflighted_side_effect(
-                run,
-                call,
-                capability,
-                side_effect,
-                execution,
-                fingerprint,
-                selected_candidate,
-            )
-        if self._approval_handler is None:
-            return (
-                _error(
-                    call,
-                    "approval_required",
-                    "This side effect requires an approval handler.",
-                    {"capability_id": capability.id},
-                ),
-                False,
-            )
-
-        approval_arguments = (
-            fingerprint
-            if capability.id
-            in {
-                ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
-                ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
-            }
-            else cast(FrozenJsonObject, execution.arguments)
-        )
-        reason = "Allow this exact side-effecting tool invocation once?"
-        if capability.id == ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID:
-            if self._artifact_delivery is None:
-                raise ArtifactError(
-                    "artifact_storage_failed",
-                    "Artifact delivery configuration is unavailable.",
-                    {"stage": "composition"},
-                )
-            reason = self._artifact_delivery.approval_prompt_for_default(fingerprint)
-        request = ApprovalRequest(
-            run_id=run.id,
-            call_id=call.id,
-            tool_name=call.name,
-            capability_id=capability.id,
-            arguments=approval_arguments,
-            reason=reason,
-        )
-        self._emit_approval_requested(run, call, capability)
-        try:
-            decision = await self._approval_handler(request)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self._emit_approval_decided(run, call, "failed")
-            return (
-                _error(
-                    call,
-                    "approval_failed",
-                    "The approval handler failed closed.",
-                    {"capability_id": capability.id},
-                ),
-                False,
-            )
-        if not isinstance(decision, ApprovalDecision):
-            self._emit_approval_decided(run, call, "failed")
-            return (
-                _error(
-                    call,
-                    "approval_failed",
-                    "The approval handler returned an invalid decision.",
-                    {"capability_id": capability.id},
-                ),
-                False,
-            )
-        if decision is ApprovalDecision.DENY:
-            self._emit_approval_decided(run, call, "denied")
-            return (
-                _error(
-                    call,
-                    "approval_denied",
-                    "The side effect was denied.",
-                    {"capability_id": capability.id},
-                ),
-                False,
-            )
-
-        self._emit_approval_decided(run, call, "approved")
-        return await self._execute_preflighted_side_effect(
-            run,
-            call,
-            capability,
-            side_effect,
-            execution,
-            fingerprint,
-            selected_candidate,
-        )
-
-    async def _execute_preflighted_side_effect(
-        self,
-        run: RunInput,
-        call: ToolCall,
-        capability: Capability,
-        side_effect: SideEffectExecutor,
-        execution: ToolExecution,
-        fingerprint: FrozenJsonObject,
-        selected_candidate: LearningCandidate | None,
-    ) -> tuple[ToolResultBlock, bool]:
-        async with self._mutation_lock:
-            if capability.id != POSTGRESQL_UPDATE_CAPABILITY_ID:
-                try:
-                    current = await side_effect.preflight(execution)
-                    await self._validate_semantic_preflight(run, capability, current)
-                except asyncio.CancelledError:
-                    raise
-                except (
-                    CapabilityInputError,
-                    SemanticDigestMismatchError,
-                    SemanticNotFoundError,
-                    SemanticValidationError,
-                    SkillNotFoundError,
-                    ArtifactError,
-                ):
-                    return (
-                        _error(
-                            call,
-                            "state_changed",
-                            "The validated state changed while approval was pending.",
-                            {"capability_id": capability.id},
-                        ),
-                        False,
-                    )
-                if not isinstance(current, FrozenJsonObject):
-                    raise ValueError(
-                        "side-effect preflight must return FrozenJsonObject"
-                    )
-                if current != fingerprint:
-                    return (
-                        _error(
-                            call,
-                            "state_changed",
-                            "The validated state changed while approval was pending.",
-                            {"capability_id": capability.id},
-                        ),
-                        False,
-                    )
-            candidate, execution_error, cancelled = await _execute_definitely(
-                side_effect,
-                execution,
-            )
-            if execution_error is not None:
-                if isinstance(execution_error, asyncio.CancelledError):
-                    raise execution_error
-                return _exception_result(call, execution_error), cancelled
-            if selected_candidate is not None:
-                self._successful_learning_candidate_mutations.add(run.id)
-            output = self._registry.validate_output(capability.id, candidate)
-            if output.artifact is not None or capability.artifact_policy is not None:
-                raise ToolOutputValidationError(
-                    "side-effect capability cannot produce an artifact draft"
-                )
-            return _success(call, output), cancelled
-
-    async def _validate_semantic_preflight(
-        self,
-        run: RunInput,
-        capability: Capability,
-        fingerprint: FrozenJsonObject,
-    ) -> None:
-        if capability.id != SEMANTIC_SAVE_CAPABILITY_ID:
-            return
-        raw_annotation = fingerprint.get("annotation")
-        if not isinstance(raw_annotation, Mapping):
-            raise ValueError("semantic preflight omitted its candidate annotation")
-        annotation = semantic_annotation_from_mapping(raw_annotation)
-        if annotation.agent_id != run.agent_id:
-            raise CapabilityInputError(
-                "semantic_foreign_agent",
-                "The semantic annotation belongs to another agent.",
-            )
-        issue = await self._semantic_annotation_issue(run.agent_id, annotation)
-        if issue is not None:
-            code, message, details = issue
-            raise CapabilityInputError(code, message, details)
-
-    async def _bind_current_semantic_evidence(
-        self,
-        run: RunInput,
-        arguments: Mapping[str, object],
-    ) -> FrozenJsonObject:
-        """Replace model-authored provenance with exact current transcript facts."""
-
-        if self._transcripts is None:
-            raise CapabilityInputError(
-                "semantic_evidence_unavailable",
-                "Semantic evidence validation is unavailable.",
-            )
-        try:
-            transcript = await self._transcripts.load(run.id)
-        except KeyError as error:
-            raise CapabilityInputError(
-                "semantic_invalid_evidence",
-                "The current semantic write transcript is unavailable.",
-                {"run_id": run.id},
-            ) from error
-        if transcript.run.id != run.id or transcript.run.agent_id != run.agent_id:
-            raise CapabilityInputError(
-                "semantic_invalid_evidence",
-                "The current semantic write transcript identity does not match.",
-                {"run_id": run.id},
-            )
-
-        raw_evidence = arguments.get("evidence")
-        if not isinstance(raw_evidence, tuple):
-            raise CapabilityInputError(
-                "semantic_invalid_evidence",
-                "Semantic evidence must be a bounded array.",
-            )
-        user_positions = tuple(
-            position
-            for position, message in enumerate(transcript.messages)
-            if message.role is MessageRole.USER
-        )
-        bound: list[dict[str, object]] = []
-        for item in raw_evidence:
-            if not isinstance(item, Mapping):
-                raise CapabilityInputError(
-                    "semantic_invalid_evidence",
-                    "Semantic evidence entries must be objects.",
-                )
-            kind_value = item.get("kind")
-            try:
-                kind = SemanticEvidenceKind(kind_value)
-            except (TypeError, ValueError) as error:
-                raise CapabilityInputError(
-                    "semantic_invalid_evidence",
-                    "Semantic evidence kind is not supported.",
-                ) from error
-            note = item.get("note")
-            entry: dict[str, object] = {
-                "kind": kind.value,
-                "run_id": run.id,
-            }
-            if note is not None:
-                entry["note"] = note
-            if kind in {
-                SemanticEvidenceKind.USER_ASSERTION,
-                SemanticEvidenceKind.USER_CONFIRMATION,
-            }:
-                if len(user_positions) != 1:
-                    raise CapabilityInputError(
-                        "semantic_invalid_evidence",
-                        "Current-run user evidence must resolve to exactly one message.",
-                        {"run_id": run.id},
-                    )
-                entry["message_position"] = user_positions[0]
-            else:
-                tool_call_id = item.get("tool_call_id")
-                if not isinstance(tool_call_id, str):
-                    raise CapabilityInputError(
-                        "semantic_invalid_evidence",
-                        "Tool-result evidence requires a tool_call_id.",
-                    )
-                result_positions = tuple(
-                    position
-                    for position, message in enumerate(transcript.messages)
-                    if message.role is MessageRole.TOOL
-                    and any(
-                        isinstance(block, ToolResultBlock)
-                        and block.call_id == tool_call_id
-                        for block in message.content
-                    )
-                )
-                if len(result_positions) != 1:
-                    raise CapabilityInputError(
-                        "semantic_invalid_evidence",
-                        (
-                            "Tool-result evidence must reference exactly one result "
-                            "from an earlier completed tool step in the current run."
-                        ),
-                        {"run_id": run.id, "tool_call_id": tool_call_id},
-                    )
-                entry["message_position"] = result_positions[0]
-                entry["tool_call_id"] = tool_call_id
-            bound.append(entry)
-
-        normalized = (
-            arguments.to_dict()
-            if isinstance(arguments, FrozenJsonObject)
-            else dict(arguments)
-        )
-        normalized["evidence"] = bound
-        return FrozenJsonObject.from_mapping(normalized)
-
-    async def _decorate_semantic_view(
-        self,
-        run: RunInput,
-        arguments: Mapping[str, object],
-        output: ToolOutput,
-    ) -> ToolOutput:
-        annotation_id = arguments.get("id")
-        if not isinstance(annotation_id, str):
-            raise CapabilityInputError(
-                "semantic_invalid_id",
-                "Semantic view requires an annotation id.",
-            )
-        selected = next(
-            (
-                view
-                for view in await self._current_semantic_views(run.agent_id)
-                if view.annotation.id == annotation_id
-            ),
-            None,
-        )
-        if selected is None:
-            raise SemanticNotFoundError(annotation_id)
-        if output.data.get("current_sha256") != selected.sha256:
-            raise CapabilityInputError(
-                "semantic_state_changed",
-                "The semantic annotation changed during inspection; view it again.",
-                {"id": annotation_id},
-            )
-        data = dict(output.data)
-        data["maintenance"] = {
-            "state": selected.state.value,
-            "usable_as_current_meaning": selected.usable_as_current_meaning,
-            "requires_revalidation": selected.requires_revalidation,
-            "stale_reasons": selected.stale_reasons,
-            "conflicting_ids": selected.conflicting_ids,
-            "duplicate_ids": selected.duplicate_ids,
-            "duplicate_of_id": selected.duplicate_of_id,
-            "superseded_by_id": selected.superseded_by_id,
-        }
-        return ToolOutput(kind=output.kind, data=data)
-
-    async def _filter_semantic_list(
-        self,
-        run: RunInput,
-        arguments: Mapping[str, object],
-        output: ToolOutput,
-    ) -> ToolOutput:
-        raw = output.data.get("annotations")
-        if not isinstance(raw, tuple):
-            raise ToolOutputValidationError(
-                "semantic list output annotations must be an array"
-            )
-        source_id = arguments.get("source_id")
-        resource_id = arguments.get("resource_id")
-        kind = arguments.get("kind")
-        limit = arguments.get("limit", 24)
-        assert source_id is None or isinstance(source_id, str)
-        assert resource_id is None or isinstance(resource_id, str)
-        assert kind is None or isinstance(kind, str)
-        assert isinstance(limit, int) and not isinstance(limit, bool)
-        active = tuple(
-            view
-            for view in await self._current_semantic_views(run.agent_id)
-            if view.state is SemanticAnnotationState.ACTIVE
-            and (source_id is None or source_id in view.annotation.subject.source_ids)
-            and (
-                resource_id is None
-                or resource_id in view.annotation.subject.resource_ids
-            )
-            and (kind is None or view.annotation.kind.value == kind)
-        )[:limit]
-        annotations = tuple(
-            {
-                "id": view.annotation.id,
-                "kind": view.annotation.kind.value,
-                "resource_ids": view.annotation.subject.resource_ids,
-                "field_count": len(view.annotation.subject.fields),
-                "statement_preview": view.annotation.statement[:240],
-                "current_sha256": view.sha256,
-            }
-            for view in active
-        )
-        return ToolOutput(
-            kind=output.kind,
-            data={"annotations": annotations, "count": len(annotations)},
-        )
-
-    async def _current_semantic_views(
-        self,
-        agent_id: str,
-    ) -> tuple[SemanticAnnotationView, ...]:
-        if self._transcripts is None:
-            raise CapabilityInputError(
-                "semantic_state_unavailable",
-                "Semantic state validation is unavailable.",
-            )
-        annotations = await self._transcripts.list_semantic_annotations(agent_id)
-        resource_ids = tuple(
-            sorted(
-                {
-                    resource_id
-                    for annotation in annotations
-                    for resource_id in annotation.subject.resource_ids
-                }
-            )
-        )
-        facts = await self._catalog.semantic_resource_facts(agent_id, resource_ids)
-        readable_fact_ids = {fact.resource_id for fact in facts}
-        readable_annotations = tuple(
-            annotation
-            for annotation in annotations
-            if set(annotation.subject.resource_ids) <= readable_fact_ids
-        )
-        return inspect_semantic_annotations(readable_annotations, facts)
-
-    async def _semantic_annotation_issue(
-        self,
-        agent_id: str,
-        annotation: SemanticAnnotation,
-    ) -> tuple[str, str, Mapping[str, object]] | None:
-        if annotation.agent_id != agent_id:
-            return (
-                "semantic_foreign_agent",
-                "The semantic annotation belongs to another agent.",
-                {"annotation_id": annotation.id},
-            )
-        facts = await self._catalog.semantic_resource_facts(
-            agent_id,
-            annotation.subject.resource_ids,
-        )
-        fact_by_id = {item.resource_id: item for item in facts}
-        for resource_id in annotation.subject.resource_ids:
-            if resource_id not in fact_by_id:
-                return (
-                    "semantic_unknown_resource",
-                    "A semantic subject resource is not current for this agent.",
-                    {"resource_id": resource_id},
-                )
-        actual_sources = tuple(
-            sorted(
-                {fact_by_id[item].source_id for item in annotation.subject.resource_ids}
-            )
-        )
-        if actual_sources != annotation.subject.source_ids:
-            return (
-                "semantic_source_mismatch",
-                "Semantic source scope does not match the current catalog resources.",
-                {
-                    "actual_source_ids": actual_sources,
-                    "subject_source_ids": annotation.subject.source_ids,
-                },
-            )
-        revisions = {
-            item.resource_id: item.revision for item in annotation.catalog_revisions
-        }
-        for resource_id in annotation.subject.resource_ids:
-            current_revision = fact_by_id[resource_id].revision
-            if revisions[resource_id] != current_revision:
-                return (
-                    "semantic_stale_revision",
-                    "A semantic revision binding does not match the current catalog.",
-                    {
-                        "current_revision": current_revision,
-                        "resource_id": resource_id,
-                        "requested_revision": revisions[resource_id],
-                    },
-                )
-        for field in annotation.subject.fields:
-            if field.field_name not in fact_by_id[field.resource_id].field_names:
-                return (
-                    "semantic_unknown_field",
-                    "A semantic subject field is not current for its resource.",
-                    {
-                        "field_name": field.field_name,
-                        "resource_id": field.resource_id,
-                    },
-                )
-        return await self._semantic_evidence_issue(agent_id, annotation)
-
-    async def _semantic_evidence_issue(
-        self,
-        agent_id: str,
-        annotation: SemanticAnnotation,
-    ) -> tuple[str, str, Mapping[str, object]] | None:
-        if self._transcripts is None:
-            return (
-                "semantic_evidence_unavailable",
-                "Semantic evidence validation is unavailable.",
-                {"annotation_id": annotation.id},
-            )
-        for evidence in annotation.evidence:
-            position = evidence.message_position
-            assert position is not None
-            try:
-                transcript = await self._transcripts.load(evidence.run_id)
-            except KeyError:
-                return (
-                    "semantic_invalid_evidence",
-                    "Semantic evidence references an unknown run.",
-                    {"run_id": evidence.run_id},
-                )
-            if transcript.run.agent_id != agent_id:
-                return (
-                    "semantic_invalid_evidence",
-                    "Semantic evidence references a run owned by another agent.",
-                    {"run_id": evidence.run_id},
-                )
-            if position >= len(transcript.messages):
-                return (
-                    "semantic_invalid_evidence",
-                    "Semantic evidence references a missing transcript message.",
-                    {
-                        "message_position": evidence.message_position,
-                        "run_id": evidence.run_id,
-                    },
-                )
-            message = transcript.messages[position]
-            if evidence.kind in {
-                SemanticEvidenceKind.USER_ASSERTION,
-                SemanticEvidenceKind.USER_CONFIRMATION,
-            }:
-                if message.role is not MessageRole.USER:
-                    return (
-                        "semantic_invalid_evidence",
-                        "User semantic evidence must reference an exact user message.",
-                        {
-                            "message_position": evidence.message_position,
-                            "run_id": evidence.run_id,
-                        },
-                    )
                 continue
-            if message.role is not MessageRole.TOOL:
-                return (
-                    "semantic_invalid_evidence",
-                    "Tool-result evidence must reference an exact tool-result message.",
-                    {
-                        "message_position": evidence.message_position,
-                        "run_id": evidence.run_id,
-                    },
-                )
-            result = next(
+            if capability.id in _CATALOG_CAPABILITIES:
+                if facts:
+                    names.append(name)
+                continue
+            required_adapter = next(
                 (
-                    block
-                    for block in message.content
-                    if isinstance(block, ToolResultBlock)
-                    and block.call_id == evidence.tool_call_id
+                    adapter_id
+                    for adapter_id, capability_ids in _ADAPTER_CAPABILITIES.items()
+                    if capability.id in capability_ids
                 ),
                 None,
             )
-            if (
-                result is None
-                or result.is_error
-                or result.output.get("kind")
-                not in {
-                    SQLITE_QUERY_EVIDENCE_KIND,
-                    POSTGRESQL_QUERY_EVIDENCE_KIND,
-                    LOCAL_FILE_READ_EVIDENCE_KIND,
-                }
-            ):
-                return (
-                    "semantic_invalid_evidence",
-                    "Tool-result evidence must reference a successful validated data read.",
-                    {
-                        "run_id": evidence.run_id,
-                        "tool_call_id": evidence.tool_call_id,
-                    },
-                )
-            call_exists = any(
-                call.id == evidence.tool_call_id
-                for prior in transcript.messages[: evidence.message_position]
-                if prior.role is MessageRole.ASSISTANT
-                for call in prior.tool_calls
-            )
-            if not call_exists:
-                return (
-                    "semantic_invalid_evidence",
-                    "Tool-result evidence has no matching prior tool call.",
-                    {
-                        "run_id": evidence.run_id,
-                        "tool_call_id": evidence.tool_call_id,
-                    },
-                )
-        return None
+            if required_adapter not in active_adapter_ids:
+                continue
+            if capability.id in _UPDATE_CAPABILITIES and not update_source_ids:
+                continue
+            names.append(name)
+        return tuple(names)
 
-    def _is_side_effecting(
+    def normalize_arguments(
         self,
-        call: ToolCall,
-        projected: frozenset[str],
-    ) -> bool:
-        if call.name not in projected:
-            return False
-        try:
-            _, capability = self._registry.resolve_tool(call.name)
-        except KeyError:
-            return False
-        return capability.side_effecting
-
-    def _emit_tool_started(
-        self,
-        run: RunInput,
-        call: ToolCall,
-        capability: Capability | None,
-    ) -> None:
-        data: dict[str, object] = {
-            "call_id": call.id,
-            "tool_name": call.name,
-        }
-        if capability is not None:
-            data["capability_id"] = capability.id
-        self._emit(AgentEventKind.TOOL_STARTED, run, data)
-
-    def _emit_approval_requested(
-        self,
-        run: RunInput,
-        call: ToolCall,
-        capability: Capability,
-    ) -> None:
-        self._emit(
-            AgentEventKind.APPROVAL_REQUESTED,
-            run,
-            {
-                "call_id": call.id,
-                "tool_name": call.name,
-                "capability_id": capability.id,
-            },
-        )
-
-    def _emit_approval_decided(
-        self,
-        run: RunInput,
-        call: ToolCall,
-        outcome: str,
-    ) -> None:
-        self._emit(
-            AgentEventKind.APPROVAL_DECIDED,
-            run,
-            {"call_id": call.id, "outcome": outcome},
-        )
-
-    def _emit_tool_completed(
-        self,
-        run: RunInput,
-        call: ToolCall,
-        result: ToolResultBlock,
-        started: float | None,
-    ) -> None:
-        if self._observer is None:
-            return
-        assert started is not None
-        self._emit(
-            AgentEventKind.TOOL_COMPLETED,
-            run,
-            {
-                "call_id": call.id,
-                "tool_name": call.name,
-                "duration_ms": _duration_ms(started),
-                "success": not result.is_error,
-                "error_code": _result_error_code(result),
-            },
-        )
-
-    def _emit(
-        self,
-        kind: AgentEventKind,
-        run: RunInput,
-        data: Mapping[str, object],
-    ) -> None:
-        if self._observer is None:
-            return
-        try:
-            event = AgentEvent(
-                kind=kind,
-                occurred_at=self._clock(),
-                run_id=run.id,
-                conversation_id=run.conversation_id or run.id,
-                data=FrozenJsonObject.from_mapping(data),
-            )
-        except Exception:
-            return
-        _emit_safely(self._observer, event)
-
-    async def _validate(
-        self,
-        run: RunInput,
         capability: Capability,
         arguments: Mapping[str, object],
-    ) -> tuple[str, str, Mapping[str, object]] | None:
-        source_scope_error = await self._validate_source_scope(
-            run,
-            capability,
-            arguments,
-        )
-        if source_scope_error is not None:
-            return source_scope_error
-        read_scope_error = await self._validate_resource_read_scope(
-            run,
-            capability,
-            arguments,
-        )
-        if read_scope_error is not None:
-            return read_scope_error
-        if capability.access_mode is AccessMode.WRITE:
-            if (
-                capability.id
-                in {
-                    MEMORY_SET_CAPABILITY_ID,
-                    SEMANTIC_SAVE_CAPABILITY_ID,
-                    SEMANTIC_DELETE_CAPABILITY_ID,
-                    SKILL_SAVE_CAPABILITY_ID,
-                    SKILL_DELETE_CAPABILITY_ID,
-                    ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
-                    ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
-                    POSTGRESQL_UPDATE_CAPABILITY_ID,
-                }
-                and capability.side_effecting
-            ):
-                if capability.id != POSTGRESQL_UPDATE_CAPABILITY_ID:
-                    return None
-            else:
-                return (
-                    "write_not_enabled",
-                    "Write tools are not enabled in the MVP agent loop.",
-                    {"capability_id": capability.id},
-                )
-        if capability.id == SKILL_VIEW_CAPABILITY_ID:
-            name = arguments.get("name")
-            try:
-                if not isinstance(name, str):
-                    raise TypeError("skill name must be text")
-                validate_skill_name(name)
-            except (TypeError, SkillValidationError):
-                return (
-                    "skill_invalid_name",
-                    "Skill names must match [a-z][a-z0-9-]{0,63}.",
-                    {},
-                )
+    ) -> Mapping[str, object]:
+        return arguments
+
+    async def prepare_call(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
+    ) -> FrozenJsonObject:
+        del request_sensitivity
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.validate_effect(run.id, call)
+        arguments = self._apply_source_scope(run, capability, arguments)
+        await self._validate_source_scope(run, capability, arguments)
+        self._validate_execution_resource_scope(run, capability, arguments)
+        await self._validate_resource_read_scope(run, capability, arguments)
+        if capability.access_mode is AccessMode.WRITE and (
+            capability.id != POSTGRESQL_UPDATE_CAPABILITY_ID
+            or capability.operational_effect is not OperationalEffect.MUTATE_DATA
+        ):
+            raise CapabilityInputError(
+                "write_not_enabled",
+                "This data write is not enabled in the current runtime.",
+                {"capability_id": capability.id},
+            )
         if capability.id == CATALOG_SEARCH_CAPABILITY_ID:
-            search_query = cast(str, arguments["query"])
-            if not search_query.strip():
-                return (
+            query = cast(str, arguments["query"])
+            if not query.strip():
+                raise CapabilityInputError(
                     "catalog_invalid_search",
                     "Catalog search requires a non-empty query.",
-                    {},
                 )
         if capability.id == CATALOG_INSPECT_CAPABILITY_ID:
-            inspect_resource_id = cast(str, arguments["resource_id"])
-            if not inspect_resource_id.strip():
-                return (
+            resource_id = cast(str, arguments["resource_id"])
+            if not resource_id.strip():
+                raise CapabilityInputError(
                     "catalog_invalid_resource",
                     "Catalog inspection requires a resource_id.",
-                    {},
                 )
         if capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
             schema_query = cast(str | None, arguments.get("query"))
-            schema_resource_ids = cast(
-                tuple[str, ...], arguments.get("resource_ids", ())
-            )
+            resource_ids = cast(tuple[str, ...], arguments.get("resource_ids", ()))
             schema_source_id = cast(str | None, arguments.get("source_id"))
             if (
                 (schema_query is not None and not schema_query.strip())
-                or any(not resource_id.strip() for resource_id in schema_resource_ids)
-                or (schema_query is None and not schema_resource_ids)
+                or any(not item.strip() for item in resource_ids)
+                or (schema_query is None and not resource_ids)
                 or (schema_source_id is not None and not schema_source_id.strip())
             ):
-                return (
+                raise CapabilityInputError(
                     "catalog_invalid_schema",
-                    (
-                        "Catalog schema requires a non-empty query or explicit "
-                        "resource IDs and an optional non-empty current source scope."
-                    ),
-                    {},
+                    "Catalog schema requires a non-empty query or explicit resource "
+                    "IDs and an optional non-empty current source scope.",
                 )
-        if capability.id in {
-            ARTIFACT_READ_CAPABILITY_ID,
-            ARTIFACT_CONVERT_CAPABILITY_ID,
-        }:
-            artifact_id = arguments.get("artifact_id")
-            ref = (
-                await self._current_conversation_artifact_ref(run, artifact_id)
-                if isinstance(artifact_id, str)
-                else None
-            )
-            if ref is None:
-                return (
-                    "artifact_missing",
-                    "The requested artifact is not available in the current conversation.",
-                    {"artifact_id": artifact_id},
-                )
-            if capability.id == ARTIFACT_READ_CAPABILITY_ID and ref.media_type not in {
-                "application/json",
-                "text/csv",
-                "text/markdown",
-                "text/plain",
-                XLSX_MEDIA_TYPE,
-            }:
-                return (
-                    "artifact_invalid_format",
-                    "This artifact format does not support a model preview.",
-                    {"media_type": ref.media_type},
-                )
-            if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID and (
-                ref.capability_id not in _EXACT_TABULAR_CAPABILITIES
-                or ref.media_type != XLSX_MEDIA_TYPE
-                or ref.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA
-            ):
-                return (
-                    "artifact_invalid_format",
-                    "Only a Daita-generated exact XLSX artifact can be converted to CSV.",
-                    {
-                        "media_type": ref.media_type,
-                        "allowed_extensions": (".xlsx",),
-                    },
-                )
-        if capability.id in {
-            SQLITE_QUERY_CAPABILITY_ID,
-            POSTGRESQL_QUERY_CAPABILITY_ID,
-            SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-            POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-        }:
-            return await self._validate_sql(run, capability, arguments)
-        if capability.id in {
-            POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
-            POSTGRESQL_UPDATE_CAPABILITY_ID,
-        }:
-            return await self._validate_postgresql_update_call(
+        if capability.id in _QUERY_CAPABILITIES:
+            await self._validate_sql(run, capability, arguments)
+        if capability.id in _UPDATE_CAPABILITIES:
+            await self._validate_postgresql_update_call(
                 run,
                 arguments,
                 execution=capability.id == POSTGRESQL_UPDATE_CAPABILITY_ID,
             )
-        if capability.id in {
-            LOCAL_FILE_READ_CAPABILITY_ID,
-            LOCAL_FILE_COPY_CAPABILITY_ID,
-        }:
-            source_id = arguments.get("source_id")
-            resource_id = arguments.get("resource_id")
+        if capability.id == LOCAL_FILE_READ_CAPABILITY_ID:
+            file_source_id = arguments.get("source_id")
+            file_resource_id = arguments.get("resource_id")
             if (
-                not isinstance(source_id, str)
-                or not isinstance(resource_id, str)
+                not isinstance(file_source_id, str)
+                or not isinstance(file_resource_id, str)
                 or not await self._catalog.is_current_tabular_file(
-                    run.agent_id, source_id, resource_id
+                    run.agent_id,
+                    file_source_id,
+                    file_resource_id,
                 )
             ):
-                return (
+                raise CapabilityInputError(
                     "file_not_current_or_tabular",
                     "The selected file is not a current tabular catalog resource.",
-                    {"resource_id": resource_id, "source_id": source_id},
+                    {
+                        "resource_id": file_resource_id,
+                        "source_id": file_source_id,
+                    },
                 )
-        return None
+        return arguments
 
-    async def _validate_postgresql_update_call(
+    async def side_effect_plan(
         self,
         run: RunInput,
-        arguments: Mapping[str, object],
-        *,
-        execution: bool,
-    ) -> tuple[str, str, Mapping[str, object]] | None:
-        source_id = arguments.get("source_id")
-        if not isinstance(source_id, str):
-            return (
-                "write_source_not_available",
-                "PostgreSQL update requires an exact current source.",
-                {},
-            )
-        adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
-        if adapter_id != "postgresql":
-            return (
-                "write_source_not_available",
-                "The selected source is not an active PostgreSQL source owned by this agent.",
-                {"source_id": source_id},
-            )
-        try:
-            intent = (
-                PostgreSQLUpdateCommand.from_mapping(arguments).intent
-                if execution
-                else PostgreSQLUpdateIntent.from_mapping(arguments)
-            )
-        except (TypeError, ValueError):
-            return (
-                "write_assignment_invalid",
-                "The PostgreSQL update intent is malformed.",
-                {},
-            )
-        try:
-            scope_issue = await self._catalog.postgresql_update_scope_issue(
-                run.agent_id,
-                source_id,
-                intent.resource_id,
-                tuple(item.column for item in intent.assignments),
-            )
-        except SourcePermissionStateError:
-            return (
-                "source_permission_state_invalid",
-                "Stored source permission state is missing or invalid.",
-                {},
-            )
-        if scope_issue is not None:
-            return scope_issue[0], scope_issue[1], {}
-        validation = validate_postgresql_update_intent(
-            intent,
-            resources=await self._catalog.resource_schemas(
-                run.agent_id,
-                source_id,
-            ),
-        )
-        if validation.valid:
-            return None
-        issue = validation.issues[0]
-        return (
-            issue.code,
-            issue.message,
-            {"source_id": source_id, "resource_id": intent.resource_id},
-        )
+        call: ToolCall,
+        capability: Capability,
+        execution: ToolExecution,
+        fingerprint: FrozenJsonObject,
+    ) -> SideEffectPlan:
+        if (
+            capability.id not in _UPDATE_CAPABILITIES
+            or capability.operational_effect is not OperationalEffect.MUTATE_DATA
+        ):
+            raise ValueError("data domain received an unsupported side effect")
+        return SideEffectPlan(recheck_after_approval=False)
 
-    async def _validate_resource_read_scope(
+    async def finalize_output(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        output: ToolOutput,
+        *,
+        request_sensitivity: ModelSensitivity,
+    ) -> ToolOutput:
+        del request_sensitivity
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.mark_effect_succeeded(run.id)
+        return await self._classify(run, call, capability, output)
+
+    def normalize_error(
+        self,
+        call: ToolCall,
+        error: BaseException,
+    ) -> CapabilityFailure | None:
+        return None
+
+    def _apply_source_scope(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+    ) -> FrozenJsonObject:
+        if (
+            run.source_id is None
+            or capability.id
+            not in {CATALOG_SEARCH_CAPABILITY_ID, CATALOG_SCHEMA_CAPABILITY_ID}
+            or arguments.get("source_id") is not None
+        ):
+            return arguments
+        scoped = arguments.to_dict()
+        scoped["source_id"] = run.source_id
+        return FrozenJsonObject.from_mapping(scoped)
+
+    async def _validate_source_scope(
         self,
         run: RunInput,
         capability: Capability,
         arguments: Mapping[str, object],
-    ) -> tuple[str, str, Mapping[str, object]] | None:
+    ) -> None:
+        selected_source_id = run.source_id
+        if selected_source_id is None:
+            return
+        supplied_source_id = arguments.get("source_id")
+        if supplied_source_id is not None and supplied_source_id != selected_source_id:
+            raise CapabilityInputError(
+                "source_scope_violation",
+                "This run can only access the source selected by the user.",
+                {
+                    "selected_source_id": selected_source_id,
+                    "requested_source_id": supplied_source_id,
+                },
+            )
         resource_ids: tuple[object, ...] = ()
-        if capability.id in {
-            CATALOG_INSPECT_CAPABILITY_ID,
-            LOCAL_FILE_READ_CAPABILITY_ID,
-            LOCAL_FILE_COPY_CAPABILITY_ID,
-            POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
-            POSTGRESQL_UPDATE_CAPABILITY_ID,
-        }:
+        if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
             resource_ids = (arguments.get("resource_id"),)
         elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
             raw = arguments.get("resource_ids", ())
@@ -2166,122 +412,6 @@ class DataToolRuntime:
                 *(raw_from if isinstance(raw_from, tuple) else ()),
                 *(raw_to if isinstance(raw_to, tuple) else ()),
             )
-        elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:
-            resource_ids = (arguments.get("resource_id"),)
-        elif capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
-            subject = arguments.get("subject")
-            raw = subject.get("resource_ids") if isinstance(subject, Mapping) else ()
-            resource_ids = raw if isinstance(raw, tuple) else ()
-
-        requested = tuple(
-            resource_id for resource_id in resource_ids if isinstance(resource_id, str)
-        )
-        if not requested:
-            return None
-        source_id = arguments.get("source_id")
-        source_ids = (source_id,) if isinstance(source_id, str) else ()
-        try:
-            readable = await self._catalog.readable_resource_ids(
-                run.agent_id,
-                source_ids,
-            )
-        except SourcePermissionStateError:
-            return (
-                "source_permission_state_invalid",
-                "Stored source permission state is missing or invalid.",
-                {},
-            )
-        if any(resource_id not in readable for resource_id in requested):
-            return (
-                "resource_read_not_allowed",
-                "The requested resource is not available for reading.",
-                {},
-            )
-        return None
-
-    async def _current_conversation_artifact_ref(
-        self,
-        run: RunInput,
-        artifact_id: str,
-    ) -> ArtifactRef | None:
-        if self._artifacts is None:
-            return None
-        return next(
-            (
-                item
-                for item in await self._artifacts.list_refs(
-                    conversation_id=run.conversation_id or run.id
-                )
-                if item.artifact_id == artifact_id
-            ),
-            None,
-        )
-
-    def _apply_source_scope(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: FrozenJsonObject,
-    ) -> FrozenJsonObject:
-        if (
-            run.source_id is None
-            or capability.id
-            not in {
-                CATALOG_SEARCH_CAPABILITY_ID,
-                CATALOG_SCHEMA_CAPABILITY_ID,
-                SEMANTIC_LIST_CAPABILITY_ID,
-            }
-            or arguments.get("source_id") is not None
-        ):
-            return arguments
-        scoped = arguments.to_dict()
-        scoped["source_id"] = run.source_id
-        return self._registry.validate_arguments(capability.id, scoped)
-
-    async def _validate_source_scope(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: Mapping[str, object],
-    ) -> tuple[str, str, Mapping[str, object]] | None:
-        selected_source_id = run.source_id
-        if selected_source_id is None:
-            return None
-        supplied_source_id = arguments.get("source_id")
-        if supplied_source_id is not None and supplied_source_id != selected_source_id:
-            return (
-                "source_scope_violation",
-                "This run can only access the source selected by the user.",
-                {
-                    "selected_source_id": selected_source_id,
-                    "requested_source_id": supplied_source_id,
-                },
-            )
-        semantic_scope_error = await self._validate_semantic_source_scope(
-            run,
-            capability,
-            arguments,
-        )
-        if semantic_scope_error is not None:
-            return semantic_scope_error
-        resource_ids: tuple[object, ...] = ()
-        if capability.id == CATALOG_INSPECT_CAPABILITY_ID:
-            resource_ids = (arguments.get("resource_id"),)
-        elif capability.id in {
-            POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
-            POSTGRESQL_UPDATE_CAPABILITY_ID,
-        }:
-            resource_ids = (arguments.get("resource_id"),)
-        elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
-            value = arguments.get("resource_ids", ())
-            resource_ids = value if isinstance(value, tuple) else ()
-        elif capability.id == CATALOG_TRAVERSE_CAPABILITY_ID:
-            from_ids = arguments.get("from_resource_ids", ())
-            to_ids = arguments.get("to_resource_ids", ())
-            resource_ids = (
-                *(from_ids if isinstance(from_ids, tuple) else ()),
-                *(to_ids if isinstance(to_ids, tuple) else ()),
-            )
         for resource_id in resource_ids:
             if not isinstance(resource_id, str):
                 continue
@@ -2290,7 +420,7 @@ class DataToolRuntime:
                 resource_id,
             )
             if identity is None or identity[0] != selected_source_id:
-                return (
+                raise CapabilityInputError(
                     "source_scope_violation",
                     "This run can only access resources from the selected source.",
                     {
@@ -2298,75 +428,55 @@ class DataToolRuntime:
                         "selected_source_id": selected_source_id,
                     },
                 )
-        return None
 
-    async def _validate_semantic_source_scope(
+    async def _validate_resource_read_scope(
         self,
         run: RunInput,
         capability: Capability,
         arguments: Mapping[str, object],
-    ) -> tuple[str, str, Mapping[str, object]] | None:
-        selected_source_id = run.source_id
-        if selected_source_id is None or capability.id not in _SEMANTIC_CAPABILITIES:
-            return None
-        if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
-            subject = arguments.get("subject")
-            source_ids = (
-                subject.get("source_ids") if isinstance(subject, Mapping) else None
+    ) -> None:
+        resource_ids: tuple[object, ...] = ()
+        if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
+            resource_ids = (arguments.get("resource_id"),)
+        elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
+            raw = arguments.get("resource_ids", ())
+            resource_ids = raw if isinstance(raw, tuple) else ()
+        elif capability.id == CATALOG_TRAVERSE_CAPABILITY_ID:
+            raw_from = arguments.get("from_resource_ids", ())
+            raw_to = arguments.get("to_resource_ids", ())
+            resource_ids = (
+                *(raw_from if isinstance(raw_from, tuple) else ()),
+                *(raw_to if isinstance(raw_to, tuple) else ()),
             )
-            if source_ids != (selected_source_id,):
-                return (
-                    "source_scope_violation",
-                    "A semantic write must stay within the source selected by "
-                    "the user.",
-                    {"selected_source_id": selected_source_id},
-                )
-        referenced_ids: tuple[object, ...] = ()
-        if capability.id in {
-            SEMANTIC_VIEW_CAPABILITY_ID,
-            SEMANTIC_DELETE_CAPABILITY_ID,
-        }:
-            referenced_ids = (arguments.get("id"),)
-        elif capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
-            referenced_ids = (
-                arguments.get("id"),
-                arguments.get("supersedes_id"),
+        requested = tuple(item for item in resource_ids if isinstance(item, str))
+        if not requested:
+            return
+        source_id = arguments.get("source_id")
+        source_ids = (source_id,) if isinstance(source_id, str) else ()
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                source_ids,
             )
-        annotation_ids = tuple(item for item in referenced_ids if isinstance(item, str))
-        if not annotation_ids:
-            return None
-        if self._transcripts is None:
-            return (
-                "semantic_state_unavailable",
-                "Semantic source-scope validation is unavailable.",
-                {},
+        except SourcePermissionStateError as error:
+            raise CapabilityInputError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from error
+        if run.execution_scope is not None:
+            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
+        if any(resource_id not in readable for resource_id in requested):
+            raise CapabilityInputError(
+                "resource_read_not_allowed",
+                "The requested resource is not available for reading.",
             )
-        current = {
-            item.id: item
-            for item in await self._transcripts.list_semantic_annotations(run.agent_id)
-        }
-        for annotation_id in annotation_ids:
-            annotation = current.get(annotation_id)
-            if annotation is not None and annotation.subject.source_ids != (
-                selected_source_id,
-            ):
-                return (
-                    "source_scope_violation",
-                    "This run can only access semantic annotations from the "
-                    "source selected by the user.",
-                    {
-                        "annotation_id": annotation_id,
-                        "selected_source_id": selected_source_id,
-                    },
-                )
-        return None
 
     async def _validate_sql(
         self,
         run: RunInput,
         capability: Capability,
         arguments: Mapping[str, object],
-    ) -> tuple[str, str, Mapping[str, object]] | None:
+    ) -> None:
         source_id = arguments.get("source_id")
         sql = arguments.get("sql")
         parameters = arguments.get("parameters", ())
@@ -2376,23 +486,22 @@ class DataToolRuntime:
             or not sql.strip()
             or not isinstance(parameters, tuple)
         ):
-            return (
+            raise CapabilityInputError(
                 "sql_invalid_input",
-                "SQL reads require source_id, non-empty sql, and an array of parameters.",
-                {},
+                "SQL reads require source_id, non-empty sql, and an array of "
+                "parameters.",
             )
         expected_adapter = (
             "postgresql"
-            if capability.id
-            in {
-                POSTGRESQL_QUERY_CAPABILITY_ID,
-                POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-            }
+            if capability.id == POSTGRESQL_QUERY_CAPABILITY_ID
             else "sqlite"
         )
-        actual_adapter = await self._catalog.source_adapter_id(run.agent_id, source_id)
+        actual_adapter = await self._catalog.source_adapter_id(
+            run.agent_id,
+            source_id,
+        )
         if actual_adapter != expected_adapter:
-            return (
+            raise CapabilityInputError(
                 "sql_source_adapter_mismatch",
                 "The selected SQL tool does not match the source adapter.",
                 {
@@ -2407,12 +516,13 @@ class DataToolRuntime:
                 run.agent_id,
                 (source_id,),
             )
-        except SourcePermissionStateError:
-            return (
+        except SourcePermissionStateError as error:
+            raise CapabilityInputError(
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
-                {},
-            )
+            ) from error
+        if run.execution_scope is not None:
+            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         validator = (
             validate_postgresql_read
             if expected_adapter == "postgresql"
@@ -2426,335 +536,186 @@ class DataToolRuntime:
             allowed_resource_ids=readable,
         )
         if result.valid:
-            return None
-        issue_codes = {issue.code for issue in result.issues}
-        if issue_codes & {"resource_out_of_scope", "unknown_resource"}:
-            return (
+            return
+        if {item.code for item in result.issues} & {
+            "resource_out_of_scope",
+            "unknown_resource",
+        }:
+            raise CapabilityInputError(
                 "resource_read_not_allowed",
                 "One or more requested resources are not available for reading.",
-                {},
             )
-        return (
+        raise CapabilityInputError(
             "sql_validation_failed",
             "The SQL read is invalid. Correct all reported issues before retrying.",
             {
                 "issues": [
                     {
-                        "code": issue.code,
-                        "message": issue.message,
-                        "details": issue.details,
+                        "code": item.code,
+                        "message": item.message,
+                        "details": item.details,
                     }
-                    for issue in result.issues
+                    for item in result.issues
                 ],
                 "source_id": source_id,
             },
         )
 
-    async def _projected_tool_names(self, run: RunInput) -> tuple[str, ...]:
-        candidates: list[tuple[str, str, ToolApplicability]] = []
-        selected_candidate = self._selected_learning_candidates.get(run.id)
-        candidate_mutation_tool = (
-            None
-            if selected_candidate is None
-            else _learning_candidate_mutation_tool(selected_candidate)
-        )
-        semantic_requested = run.id in self._explicit_learning_runs
-        artifact_refs = (
-            ()
-            if self._artifacts is None
-            else await self._artifacts.list_refs(
-                conversation_id=run.conversation_id or run.id
+    def _validate_execution_resource_scope(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> None:
+        scope = run.execution_scope
+        if scope is None:
+            return
+        if capability.id in {
+            CATALOG_SEARCH_CAPABILITY_ID,
+            CATALOG_TRAVERSE_CAPABILITY_ID,
+        }:
+            raise CapabilityInputError(
+                "execution_scope_resource_violation",
+                "This autonomous run cannot perform open-ended catalog discovery.",
             )
-        )
-        has_current_run_artifacts = any(item.run_id == run.id for item in artifact_refs)
-        has_prior_conversation_artifacts = any(
-            item.run_id != run.id for item in artifact_refs
-        )
-        if not semantic_requested:
-            semantic_requested = await self._semantic_maintenance_requested(run)
-        for name in sorted(self._registry.tool_names):
-            view, capability = self._registry.resolve_tool(name)
-            if capability.id not in _MVP_CAPABILITIES:
-                continue
-            if (
-                candidate_mutation_tool is not None
-                and capability.side_effecting
-                and name != candidate_mutation_tool
-            ):
-                continue
-            if (
-                capability.id in _SEMANTIC_CAPABILITIES
-                and not semantic_requested
-                and name != candidate_mutation_tool
-            ):
-                continue
-            if (
-                capability.id
-                in {
-                    ARTIFACT_LIST_CAPABILITY_ID,
-                    ARTIFACT_READ_CAPABILITY_ID,
-                    ARTIFACT_CONVERT_CAPABILITY_ID,
-                }
-                and not has_prior_conversation_artifacts
-            ):
-                continue
-            if capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID and not (
-                has_current_run_artifacts or has_prior_conversation_artifacts
-            ):
-                continue
-            candidates.append((name, capability.id, view.applicability))
-        facts = (
-            await self._catalog.source_routing_facts(
-                run.agent_id,
-                (run.source_id,),
-            )
-            if run.source_id is not None
-            else await self._catalog.source_routing_facts(
-                run.agent_id,
-            )
-        )
-        has_update_candidates = any(
-            capability_id
-            in {
-                POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
-                POSTGRESQL_UPDATE_CAPABILITY_ID,
-            }
-            for _, capability_id, _ in candidates
-        )
-        update_source_ids = (
-            await self._catalog.postgresql_update_applicable_source_ids(
-                run.agent_id,
-                (() if run.source_id is None else (run.source_id,)),
-            )
-            if has_update_candidates
-            else frozenset()
-        )
-        return tuple(
-            name
-            for name, capability_id, applicability in candidates
-            if _applicable(applicability, facts)
-            and (
-                capability_id
-                not in {
-                    POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
-                    POSTGRESQL_UPDATE_CAPABILITY_ID,
-                }
-                or bool(update_source_ids)
-            )
-        )
-
-    async def _semantic_maintenance_requested(self, run: RunInput) -> bool:
-        if self._transcripts is None:
-            return False
-        views = await self._current_semantic_views(run.agent_id)
-        if not any(
-            view.requires_revalidation
-            or view.state is SemanticAnnotationState.DUPLICATE
-            or bool(view.duplicate_ids)
-            for view in views
+        resource_ids: tuple[object, ...] = ()
+        if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
+            resource_ids = (arguments.get("resource_id"),)
+        elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
+            raw = arguments.get("resource_ids", ())
+            resource_ids = raw if isinstance(raw, tuple) else ()
+            if not resource_ids:
+                raise CapabilityInputError(
+                    "execution_scope_resource_violation",
+                    "This autonomous run requires exact catalog resource IDs.",
+                )
+        allowed = frozenset(scope.allowed_resource_ids)
+        if any(
+            not isinstance(resource_id, str) or resource_id not in allowed
+            for resource_id in resource_ids
         ):
-            return False
-        catalog = await self._catalog.catalog_context(
-            run.agent_id,
-            run.message[:CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS],
-            limit=CATALOG_CONTEXT_DEFAULT_LIMIT,
-            source_ids=(() if run.source_id is None else (run.source_id,)),
-        )
-        resources = catalog.get("resources")
-        if not isinstance(resources, tuple):
-            return False
-        selected_resource_ids = tuple(
-            resource_id
-            for resource in resources
-            if isinstance(resource, FrozenJsonObject)
-            and isinstance((resource_id := resource.get("resource_id")), str)
-        )
-        return semantic_maintenance_intersects(
-            views,
-            selected_resource_ids=selected_resource_ids,
-            query=run.message,
-        )
+            raise CapabilityInputError(
+                "execution_scope_resource_violation",
+                "The requested resource is outside this run's immutable scope.",
+            )
 
-
-def _learning_candidate_mutation_tool(candidate: LearningCandidate) -> str:
-    """Resolve one trusted candidate record to its sole eligible write tool."""
-
-    if candidate.target in {
-        LearningCandidateTarget.MEMORY,
-        LearningCandidateTarget.USER,
-    }:
-        return MEMORY_SET_TOOL_NAME
-    if candidate.target is LearningCandidateTarget.SKILL:
-        skill_content = cast(SkillCandidateContent, candidate.content)
-        return (
-            SKILL_DELETE_TOOL_NAME
-            if skill_content.action is LearningCandidateAction.DELETE
-            else SKILL_SAVE_TOOL_NAME
-        )
-    semantic_content = cast(SemanticCandidateContent, candidate.content)
-    return (
-        SEMANTIC_DELETE_TOOL_NAME
-        if semantic_content.action is LearningCandidateAction.DELETE
-        else SEMANTIC_SAVE_TOOL_NAME
-    )
-
-
-def _without_runtime_owned_semantic_evidence(
-    arguments: Mapping[str, object],
-) -> Mapping[str, object]:
-    """Remove provenance fields that only the runtime is allowed to establish."""
-
-    raw_evidence = arguments.get("evidence")
-    if not isinstance(raw_evidence, tuple):
-        return arguments
-    normalized = dict(arguments)
-    normalized["evidence"] = [
-        (
-            {
-                key: value
-                for key, value in item.items()
-                if key not in {"run_id", "message_position"}
-            }
-            if isinstance(item, Mapping)
-            else item
-        )
-        for item in raw_evidence
-    ]
-    return normalized
-
-
-async def _execute_definitely(
-    executor: SideEffectExecutor,
-    execution: ToolExecution,
-) -> tuple[ToolOutput | None, BaseException | None, bool]:
-    worker = asyncio.create_task(executor.execute(execution))
-    cancelled = False
-    while not worker.done():
+    async def _validate_postgresql_update_call(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        *,
+        execution: bool,
+    ) -> None:
+        source_id = arguments.get("source_id")
+        if not isinstance(source_id, str):
+            raise CapabilityInputError(
+                "write_source_not_available",
+                "PostgreSQL update requires an exact current source.",
+            )
+        if (
+            await self._catalog.source_adapter_id(run.agent_id, source_id)
+            != "postgresql"
+        ):
+            raise CapabilityInputError(
+                "write_source_not_available",
+                "The selected source is not an active PostgreSQL source owned by "
+                "this agent.",
+                {"source_id": source_id},
+            )
         try:
-            await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            cancelled = True
-            continue
-        except BaseException:
-            if worker.done():
-                break
-            raise
-    try:
-        return worker.result(), None, cancelled
-    except BaseException as error:
-        return None, error, cancelled
-
-
-def _exception_result(call: ToolCall, error: BaseException) -> ToolResultBlock:
-    if isinstance(error, ToolOutputValidationError):
-        return _error(call, "invalid_tool_result", str(error))
-    if isinstance(error, ArtifactError):
-        return _error(call, error.code, error.message, error.details)
-    if isinstance(error, PluginError):
-        details = getattr(error, "details", None)
-        return _error(
-            call,
-            error.error_code,
-            str(error),
-            details if isinstance(details, Mapping) else None,
+            intent = (
+                PostgreSQLUpdateCommand.from_mapping(arguments).intent
+                if execution
+                else PostgreSQLUpdateIntent.from_mapping(arguments)
+            )
+        except (TypeError, ValueError) as error:
+            raise CapabilityInputError(
+                "write_assignment_invalid",
+                "The PostgreSQL update intent is malformed.",
+            ) from error
+        try:
+            issue = await self._catalog.postgresql_update_scope_issue(
+                run.agent_id,
+                source_id,
+                intent.resource_id,
+                tuple(item.column for item in intent.assignments),
+            )
+        except SourcePermissionStateError as error:
+            raise CapabilityInputError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from error
+        if issue is not None:
+            raise CapabilityInputError(issue[0], issue[1])
+        validation = validate_postgresql_update_intent(
+            intent,
+            resources=await self._catalog.resource_schemas(
+                run.agent_id,
+                source_id,
+            ),
         )
-    return _error(
-        call,
-        "tool_execution_failed",
-        "The tool could not complete because of an unexpected internal error.",
-    )
+        if not validation.valid:
+            first = validation.issues[0]
+            raise CapabilityInputError(
+                first.code,
+                first.message,
+                {"source_id": source_id, "resource_id": intent.resource_id},
+            )
 
+    async def _classify(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        output: ToolOutput,
+    ) -> ToolOutput:
+        if output.sensitivity is not None:
+            return output
+        source_id = call.arguments.get("source_id")
+        source_ids = (
+            (source_id,)
+            if isinstance(source_id, str)
+            else (() if run.source_id is None else (run.source_id,))
+        )
+        sensitivity = await self._catalog.admitted_model_sensitivity(
+            run.agent_id,
+            source_ids,
+        )
+        if sensitivity is None:
+            raise CapabilityInputError(
+                "result_classification_unavailable",
+                "The current admitted result scope cannot be classified safely.",
+                {"capability_id": capability.id},
+            )
+        readable = await self._catalog.readable_resource_ids(
+            run.agent_id,
+            source_ids,
+        )
+        if run.execution_scope is not None:
+            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
+        return replace(
+            output,
+            sensitivity=sensitivity,
+            sensitivity_provenance={
+                "authority": "current_admitted_resource_scope",
+                "capability_id": capability.id,
+                "source_ids": source_ids,
+                "resource_ids": tuple(sorted(readable)),
+            },
+        )
 
-def _result_error_code(result: ToolResultBlock) -> str | None:
-    if not result.is_error:
-        return None
-    error = result.output.get("error")
-    if not isinstance(error, Mapping):
-        return "unknown_tool_error"
-    code = error.get("code")
-    return code if isinstance(code, str) else "unknown_tool_error"
-
-
-def _duration_ms(started: float) -> int:
-    elapsed = asyncio.get_running_loop().time() - started
-    return max(0, int(elapsed * 1_000))
-
-
-def _applicable(
-    applicability: ToolApplicability,
-    facts: tuple[Mapping[str, object], ...],
-) -> bool:
-    matching = []
-    for fact in facts:
-        adapter_id = fact.get("adapter_id")
-        if applicability.source_adapter_ids and adapter_id not in set(
-            applicability.source_adapter_ids
-        ):
-            continue
-        matching.append(fact)
-    return len(matching) >= applicability.minimum_active_sources
-
-
-def _success(
-    call: ToolCall,
-    result: ToolOutput,
-    *,
-    artifact_ref: ArtifactRef | None = None,
-) -> ToolResultBlock:
-    output: dict[str, object] = {
-        "kind": result.kind,
-        "data": result.data,
-    }
-    if artifact_ref is not None:
-        output["artifact"] = artifact_ref_to_mapping(artifact_ref)
-        output["delivery_status"] = "not_delivered"
-    return ToolResultBlock(call_id=call.id, output=output)
-
-
-def _resolved_sensitivity(values: tuple[Sensitivity, ...]) -> Sensitivity:
-    ordered = {
-        Sensitivity.PUBLIC: 0,
-        Sensitivity.INTERNAL: 1,
-        Sensitivity.CONFIDENTIAL: 2,
-        Sensitivity.RESTRICTED: 3,
-        Sensitivity.UNKNOWN: 3,
-    }
-    selected = max(values, key=lambda item: ordered[item])
-    return Sensitivity.RESTRICTED if selected is Sensitivity.UNKNOWN else selected
-
-
-def _error(
-    call: ToolCall,
-    code: str,
-    message: str,
-    details: Mapping[str, object] | None = None,
-) -> ToolResultBlock:
-    return ToolResultBlock(
-        call_id=call.id,
-        is_error=True,
-        output={
-            "error": {
-                "code": code,
-                "message": message,
-                "details": {} if details is None else details,
-            }
-        },
-    )
-
-
-# The data loop intentionally has no final-answer readiness evaluator and no
-# observation schema. Model text completes the run directly.
 
 __all__ = [
-    "CatalogDataReader",
     "CatalogSchemaReader",
-    "DataToolRuntime",
+    "DATA_DOMAIN_OWNER_ID",
+    "DataCapabilityDomain",
+    "DataDomainCatalog",
     "POSTGRESQL_QUERY_CAPABILITY_ID",
     "POSTGRESQL_QUERY_EVIDENCE_KIND",
-    "POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID",
-    "POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND",
     "POSTGRESQL_UPDATE_CAPABILITY_ID",
     "POSTGRESQL_UPDATE_EVIDENCE_KIND",
+    "POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID",
+    "POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND",
     "PostgreSQLUpdateCatalogReader",
     "ReadScopedCatalogReader",
     "SQLITE_QUERY_CAPABILITY_ID",

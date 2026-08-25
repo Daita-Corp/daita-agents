@@ -9,7 +9,6 @@ import pytest
 from daita import Agent, PostgreSQLSource
 from daita.adapters import postgresql as postgresql_module
 from daita.adapters.models import DiscoveryRequest, DiscoveryResult, SourceRegistration
-from daita.capabilities import ExtensionDeclarations
 from daita.catalog.models import (
     CatalogFacet,
     CatalogSync,
@@ -20,8 +19,10 @@ from daita.catalog.models import (
     TabularFacet,
 )
 from daita.domains.data.capabilities import (
-    postgresql_update_extension_declarations,
-    postgresql_update_preview_extension_declarations,
+    POSTGRESQL_UPDATE_CAPABILITY_ID,
+    POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+    postgresql_update_capability_declarations,
+    postgresql_update_preview_capability_declarations,
 )
 from daita.domains.data.context import _system_prompt
 from daita.hosting import embedded as embedded_module
@@ -32,8 +33,8 @@ NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 
 
 def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> None:
-    preview = postgresql_update_preview_extension_declarations()
-    update = postgresql_update_extension_declarations()
+    preview = postgresql_update_preview_capability_declarations()
+    update = postgresql_update_capability_declarations()
 
     preview_description = preview.tool_views[0].description
     update_description = update.tool_views[0].description
@@ -44,17 +45,20 @@ def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> No
 
     prompt = _system_prompt(
         {},
+        capability_ids=frozenset(
+            {
+                POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+                POSTGRESQL_UPDATE_CAPABILITY_ID,
+            }
+        ),
+        tool_manifest=(),
+        has_deferred_tools=False,
         memory_text="",
         user_profile="",
         skill_index=None,
         semantic_text="",
         candidate_text="",
         artifact_destinations=(),
-        artifact_tools_available=False,
-        artifact_default_tool_available=False,
-        semantic_tools_available=False,
-        postgresql_update_preview_available=True,
-        postgresql_update_available=True,
         final=False,
     )
     assert "a successful preview is not a terminal answer" in prompt
@@ -214,9 +218,6 @@ async def test_postgresql_refresh_preserves_read_scope_outside_connection_identi
         def registration(self) -> SourceRegistration:
             return connection_registration
 
-        def declarations(self) -> ExtensionDeclarations:
-            return ExtensionDeclarations()
-
         async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
             sync = CatalogSync(
                 id=request.sync_id,
@@ -335,9 +336,6 @@ async def test_committed_source_edit_deletes_only_the_previous_owned_credential(
         @property
         def registration(self) -> SourceRegistration:
             return edited
-
-        def declarations(self) -> ExtensionDeclarations:
-            return ExtensionDeclarations()
 
         async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
             sync = CatalogSync(

@@ -1,4 +1,4 @@
-"""Small Textual forms that precede external document editing or review."""
+"""Collect skill names and review cost limits before editing or evaluation."""
 
 from __future__ import annotations
 

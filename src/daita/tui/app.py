@@ -1,4 +1,4 @@
-"""Daita Textual application: one interactive lifecycle, one Agent.run() path."""
+"""Coordinate the Textual application lifecycle, navigation, and Agent.run path."""
 
 from __future__ import annotations
 
@@ -10,7 +10,13 @@ from typing import Any
 from textual.app import App, ComposeResult
 from textual.theme import Theme
 
-from daita import ApprovalDecision, ApprovalRequest, LoopExit, LoopExitKind
+from daita import (
+    ApprovalDecision,
+    ApprovalRequest,
+    JobStatus,
+    LoopExit,
+    LoopExitKind,
+)
 from daita.observation import AgentEventKind
 from daita.security import KeychainStore
 
@@ -40,9 +46,11 @@ from .screens.catalog import CatalogScreen
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
+from .screens.inbox import InboxScreen
+from .screens.jobs import JobsScreen
+from .screens.mcp import MCPManagementScreen, MCPSetupScreen
 from .screens.onboarding import (
     AgentCreateScreen,
-    CatalogRepairScreen,
     ModelSetupScreen,
     SourceSetupScreen,
 )
@@ -84,6 +92,8 @@ DAITA_THEME = Theme(
         "input-selection-foreground": "#FFFFFF",
     },
 )
+
+_CREATE_NEW_AGENT_SELECTION = "daita:create-new-agent"
 
 
 def _run_failure_notice(result: LoopExit) -> str:
@@ -144,6 +154,11 @@ class DaitaApp(App[int]):
         self._modal_future: asyncio.Future[Any] | None = None
         self._start_bootstrap = start_bootstrap
         self._startup_error: Exception | None = None
+        self._active_job_count = 0
+        self._inbox_item_count = 0
+        self._autonomous_run_ids: set[str] = set()
+        self._known_inbox_ids: set[str] | None = None
+        self._background_refresh_lock = asyncio.Lock()
         self._completion_cache: (
             tuple[
                 tuple[tuple[str, str], ...],
@@ -156,6 +171,11 @@ class DaitaApp(App[int]):
         yield WelcomeView(booting=True, id="boot")
 
     def on_mount(self) -> None:
+        self.set_interval(
+            2.0,
+            self._poll_background_status,
+            name="daita-background-status",
+        )
         if self._start_bootstrap:
             self.run_worker(self._bootstrap(), exclusive=True, name="bootstrap")
 
@@ -230,16 +250,24 @@ class DaitaApp(App[int]):
         elif len(names) == 1:
             await self._open(names[0])
         elif names:
-            selected = await self._await_modal(
-                SelectionScreen(
-                    title="Select an agent",
-                    options=tuple(PickerOption(name, name) for name in names),
+            while self.controller.agent is None:
+                selected = await self._await_modal(
+                    SelectionScreen(
+                        title="Select an agent",
+                        options=tuple(PickerOption(name, name) for name in names),
+                        secondary_action=PickerOption(
+                            _CREATE_NEW_AGENT_SELECTION,
+                            "Create new agent",
+                        ),
+                    )
                 )
-            )
-            if selected is None:
-                self.exit(0)
-                return
-            await self._open(selected[0])
+                if selected is None:
+                    self.exit(0)
+                    return
+                if selected == (_CREATE_NEW_AGENT_SELECTION,):
+                    await self._await_modal(AgentCreateScreen())
+                    continue
+                await self._open(selected[0])
         else:
             created = await self._await_modal(AgentCreateScreen())
             if created is None:
@@ -248,6 +276,7 @@ class DaitaApp(App[int]):
         await self._ensure_ready()
 
     async def create_named_agent(self, name: str) -> None:
+        self._reset_background_status()
         await self.controller.create_agent(
             name,
             observer=self._observer,
@@ -255,6 +284,7 @@ class DaitaApp(App[int]):
         )
 
     async def _open(self, name: str) -> None:
+        self._reset_background_status()
         await self.controller.open_agent(
             name,
             observer=self._observer,
@@ -262,34 +292,31 @@ class DaitaApp(App[int]):
         )
 
     async def _ensure_ready(self) -> None:
+        await self._show_chat()
+        await self._show_home_guidance()
+
+    async def _show_home_guidance(self) -> None:
+        chat = self.chat()
+        if chat is None or self.controller.agent is None:
+            return
+        guidance: list[str] = []
         agent = self.controller.require_agent()
         if agent.model_profile is None:
-            configured = await self._await_modal(ModelSetupScreen())
-            if not configured:
-                self.exit(0)
-                return
-            await self.controller.reopen_agent(
-                observer=self._observer,
-                approval_handler=self.handle_approval,
-            )
+            guidance.append("no model · use /model")
         sources = tuple(
             source for source in await self.controller.list_sources() if source.active
         )
         if not sources:
-            attached = await self._await_modal(SourceSetupScreen())
-            if not attached:
-                self.exit(0)
-                return
-        elif len(sources) > 1 and await agent.active_source() is None:
-            await self._pick_source()
-        summary = await self.controller.catalog_summary()
-        while summary.is_empty:
-            action = await self._await_modal(CatalogRepairScreen())
-            if action != "added":
-                self.exit(0)
-                return
-            summary = await self.controller.catalog_summary()
-        await self._show_chat()
+            guidance.append("no source · use /source add")
+        else:
+            if len(sources) > 1 and await self.controller.active_source() is None:
+                guidance.append("choose a source · use /source")
+            if (await self.controller.catalog_summary()).is_empty:
+                guidance.append("catalog has 0 resources · use /source edit")
+        if guidance:
+            chat.show_notice("Setup  " + "  ·  ".join(guidance))
+        else:
+            chat.clear_notice()
 
     async def _pick_source(self) -> None:
         sources = await self.controller.list_sources()
@@ -311,6 +338,69 @@ class DaitaApp(App[int]):
         await self.push_screen(ChatScreen())
         await self._replace_conversation_transcript()
         await self._refresh_status()
+        await self.refresh_background_status(notify_new=False)
+
+    def _reset_background_status(self) -> None:
+        self._active_job_count = 0
+        self._inbox_item_count = 0
+        self._autonomous_run_ids.clear()
+        self._known_inbox_ids = None
+
+    async def _poll_background_status(self) -> None:
+        await self.refresh_background_status(notify_new=True)
+
+    async def refresh_background_status(self, *, notify_new: bool) -> None:
+        """Refresh bounded read-only background indicators for the open TUI."""
+
+        if (
+            self._shutting_down
+            or self.controller.agent is None
+            or self._background_refresh_lock.locked()
+        ):
+            return
+        async with self._background_refresh_lock:
+            jobs = None
+            inbox = None
+            try:
+                jobs = await self.controller.list_jobs()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            try:
+                inbox = await self.controller.list_inbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            if jobs is not None:
+                self._active_job_count = sum(
+                    item.status
+                    in {
+                        JobStatus.QUEUED,
+                        JobStatus.RUNNING,
+                        JobStatus.CANCEL_REQUESTED,
+                    }
+                    for item in jobs
+                )
+            new_delivery_ids: set[str] = set()
+            if inbox is not None:
+                current_ids = {item.delivery_id for item in inbox}
+                self._inbox_item_count = len(current_ids)
+                if self._known_inbox_ids is None:
+                    self._known_inbox_ids = set(current_ids)
+                else:
+                    new_delivery_ids = current_ids - self._known_inbox_ids
+                    self._known_inbox_ids.update(current_ids)
+            await self._refresh_status()
+            if notify_new and new_delivery_ids:
+                count = len(new_delivery_ids)
+                noun = "report is" if count == 1 else "reports are"
+                self.notify(
+                    f"{count} background {noun} ready. Open /inbox to review.",
+                    title="Inbox",
+                    timeout=8,
+                )
 
     async def _replace_conversation_transcript(self) -> None:
         screen = self.chat()
@@ -393,6 +483,9 @@ class DaitaApp(App[int]):
             context_total=(
                 profile.context_window_tokens if profile is not None else None
             ),
+            active_jobs=self._active_job_count,
+            active_reports=len(self._autonomous_run_ids),
+            inbox_items=self._inbox_item_count,
             too_small=too_small,
         )
         if too_small:
@@ -488,7 +581,11 @@ class DaitaApp(App[int]):
             return
         if outcome.kind == "screen":
             try:
-                await self._open_command_screen(outcome.screen, outcome.payload)
+                await self._open_command_screen(
+                    outcome.screen,
+                    outcome.payload,
+                    message=outcome.message,
+                )
             except (UserInputError, ValueError, RuntimeError, OSError) as error:
                 screen.show_notice(
                     sanitize_terminal_text(
@@ -525,10 +622,12 @@ class DaitaApp(App[int]):
         if screen_name == "source_picker":
             await self._pick_source()
             await self._refresh_status()
+            await self._show_home_guidance()
             return
         if screen_name == "source_setup":
             await self._await_modal(SourceSetupScreen())
             await self._refresh_status()
+            await self._show_home_guidance()
             return
         if screen_name == "source_edit":
             changed = await self._await_modal(SourceEditScreen())
@@ -538,9 +637,13 @@ class DaitaApp(App[int]):
                 await self._replace_conversation_transcript()
                 chat = self.chat()
                 if chat is not None:
-                    chat.show_notice(
-                        "Source connection updated. Started a new conversation."
-                    )
+                    summary = await self.controller.catalog_summary()
+                    notice = "Source connection updated. Started a new conversation."
+                    if summary.is_empty:
+                        notice += " Catalog contains 0 resources; use /source edit to correct its scope."
+                    chat.show_notice(notice)
+            else:
+                await self._show_home_guidance()
             await self._refresh_status()
             return
         if screen_name == "model_setup":
@@ -552,9 +655,34 @@ class DaitaApp(App[int]):
                 )
                 self._reset_context_usage()
             await self._refresh_status()
+            await self._show_home_guidance()
             return
         if screen_name == "permissions":
             await self._await_modal(PermissionsScreen())
+            return
+        if screen_name == "mcp_management":
+            result = await self._await_modal(MCPManagementScreen())
+            await self._complete_mcp_screen(result)
+            return
+        if screen_name == "mcp_setup":
+            result = await self._await_modal(MCPSetupScreen())
+            await self._complete_mcp_screen(result)
+            return
+        if screen_name == "jobs":
+            await self._await_modal(
+                JobsScreen(
+                    job_id=(
+                        str(payload["job_id"])
+                        if isinstance(payload.get("job_id"), str)
+                        else None
+                    ),
+                    initial_view=str(payload.get("view", "details")),
+                )
+            )
+            return
+        if screen_name == "inbox":
+            await self._await_modal(InboxScreen())
+            await self.refresh_background_status(notify_new=False)
             return
         if screen_name == "catalog":
             sources = tuple(
@@ -580,12 +708,16 @@ class DaitaApp(App[int]):
                     sources=sources,
                     resources=resources,
                     current_source_id=None if current is None else current.id,
+                    notice=message,
+                    notice_warning=bool(payload.get("catalog_notice_warning", False)),
                 )
             )
+            if message:
+                chat = self.chat()
+                if chat is not None:
+                    chat.show_notice(message)
             return
-        if screen_name == "catalog_repair":
-            await self._await_modal(CatalogRepairScreen())
-            return
+
         if screen_name == "skill_create":
             await self._create_skill(str(payload.get("name", "")))
             return
@@ -623,6 +755,34 @@ class DaitaApp(App[int]):
                 await self.controller.delete_open_agent()
                 self.exit(0)
             return
+        if screen_name == "confirm_cancel_job":
+            job_id = str(payload.get("job_id", ""))
+            accepted = await self._await_modal(ConfirmScreen(message))
+            if not accepted:
+                return
+            inspection = await self.controller.cancel_job(job_id)
+            if inspection is None:
+                raise UserInputError(
+                    "The job no longer exists within this agent boundary."
+                )
+            status = inspection.summary.status.value
+            if status in {"cancel_requested", "cancelled"}:
+                notice = "Cancellation requested · " + job_id + " · " + status
+            else:
+                notice = (
+                    "Job became "
+                    + status
+                    + " before cancellation was applied · "
+                    + job_id
+                )
+            await self._await_modal(
+                JobsScreen(
+                    job_id=job_id,
+                    initial_view="details",
+                    notice=notice,
+                )
+            )
+            return
         if screen_name == "confirm_detach_source":
             accepted = await self._await_modal(ConfirmScreen(message))
             if accepted:
@@ -630,6 +790,17 @@ class DaitaApp(App[int]):
                 self.controller.conversation_id = None
                 self._reset_context_usage()
                 await self._replace_conversation_transcript()
+            await self._refresh_status()
+            return
+        if screen_name == "confirm_revoke_mcp":
+            accepted = await self._await_modal(ConfirmScreen(message))
+            if accepted:
+                notice = await self.controller.revoke_mcp_server(
+                    str(payload["binding_id"])
+                )
+                chat = self.chat()
+                if chat is not None:
+                    chat.show_notice(notice)
             await self._refresh_status()
             return
         if screen_name == "confirm_delete_skill":
@@ -657,6 +828,30 @@ class DaitaApp(App[int]):
                         f"{'deleted' if deleted else 'not found'}."
                     )
             return
+
+    async def _complete_mcp_screen(self, result: str | None) -> None:
+        chat = self.chat()
+        if result == "reopen":
+            await self.controller.reopen_agent(
+                observer=self._observer,
+                approval_handler=self.handle_approval,
+            )
+            self._reset_context_usage()
+            if chat is not None:
+                statuses = await self.controller.list_mcp_servers()
+                if any(status.reopen_required for status in statuses):
+                    chat.show_notice(
+                        "The agent runtime restarted, but some MCP tools could not "
+                        "be activated. Open /mcp to review their status."
+                    )
+                else:
+                    chat.show_notice("MCP tools activated.")
+        elif result == "restart_required" and chat is not None:
+            chat.show_notice(
+                "MCP changes saved. Restart the agent runtime from /mcp before "
+                "using the changed tools."
+            )
+        await self._refresh_status()
 
     def _edit_document(self, seed: str) -> str:
         """Give the configured external editor temporary control of the terminal."""
@@ -889,6 +1084,15 @@ class DaitaApp(App[int]):
         if self._shutting_down:
             return
         event = message.event
+        if event.run_origin != "user":
+            if event.kind is AgentEventKind.RUN_STARTED:
+                self._autonomous_run_ids.add(event.run_id)
+                await self._refresh_status()
+            elif event.kind is AgentEventKind.RUN_COMPLETED:
+                self._autonomous_run_ids.discard(event.run_id)
+                await self._refresh_status()
+                await self.refresh_background_status(notify_new=True)
+            return
         screen = self.chat()
         if screen is None:
             return

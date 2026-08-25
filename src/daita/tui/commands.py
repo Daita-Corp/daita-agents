@@ -1,4 +1,4 @@
-"""Slash-command parsing, completions, and one-run source selectors."""
+"""Parse slash commands, completions, source overrides, and editor documents."""
 
 from __future__ import annotations
 
@@ -34,6 +34,21 @@ SLASH_COMMAND_COMPLETIONS = (
         "/source permissions",
         "Configure read and PostgreSQL update access",
     ),
+    ("/jobs", "/jobs", "Manage durable jobs"),
+    ("/jobs inspect ", "/jobs inspect <id>", "Inspect one durable job"),
+    ("/jobs results ", "/jobs results <id>", "Read one completed job result"),
+    ("/jobs cancel ", "/jobs cancel <id>", "Cancel one queued or running job"),
+    ("/inbox", "/inbox", "Inspect and acknowledge completed background reports"),
+    ("/mcp", "/mcp", "Manage remote MCP read tools"),
+    ("/mcp add", "/mcp add", "Guided MCP server setup"),
+    ("/mcp inspect ", "/mcp inspect <endpoint>", "Inspect one no-auth endpoint"),
+    (
+        "/mcp attach ",
+        "/mcp attach <endpoint> <remote-tool> <local-alias>",
+        "Advanced: admit one exact no-auth read tool",
+    ),
+    ("/mcp refresh ", "/mcp refresh <binding-id>", "Refresh one MCP binding"),
+    ("/mcp revoke ", "/mcp revoke <binding-id>", "Revoke one MCP binding"),
     ("/catalog", "/catalog", "Browse current catalog resources by source"),
     ("/settings", "/settings", "Show agent and model settings"),
     ("/new", "/new", "Start a new conversation"),
@@ -80,8 +95,11 @@ BUILTIN_SLASH_COMMANDS = frozenset(
         "/conversation",
         "/exit",
         "/help",
+        "/inbox",
+        "/jobs",
         "/learn",
         "/memory",
+        "/mcp",
         "/model",
         "/new",
         "/review",

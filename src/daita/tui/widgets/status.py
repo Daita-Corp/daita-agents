@@ -1,4 +1,4 @@
-"""Compact identity, context-window, and live execution status."""
+"""Display compact identity, context-window, execution, and notification status."""
 
 from __future__ import annotations
 
@@ -55,6 +55,13 @@ class StatusBar(Horizontal):
             Text("DAITA", style="bold #ACFD21"),
             id="status-primary",
         )
+        background = Static("", id="background-status")
+        background.display = False
+        background.tooltip = (
+            "Background jobs, autonomous reporting, and unacknowledged inbox "
+            "results. Use /jobs or /inbox."
+        )
+        yield background
         context = Static(context_window_text(None, None), id="context-window")
         context.tooltip = (
             "Exact input tokens in the latest model request / model context window"
@@ -70,17 +77,28 @@ class StatusBar(Horizontal):
         state: str,
         context_used: int | None = None,
         context_total: int | None = None,
+        active_jobs: int = 0,
+        active_reports: int = 0,
+        inbox_items: int = 0,
         too_small: bool = False,
     ) -> None:
         primary = self.query_one("#status-primary", Static)
+        background = self.query_one("#background-status", Static)
         context = self.query_one("#context-window", Static)
         if too_small:
             message = Text("DAITA", style="bold #ACFD21")
             message.append("  Terminal too small; 32x8 required", style="bold")
             primary.update(message)
+            background.display = False
             context.display = False
             return
         context.display = True
+        self._update_background(
+            background,
+            active_jobs=active_jobs,
+            active_reports=active_reports,
+            inbox_items=inbox_items,
+        )
         safe_agent = sanitize_terminal_text(
             agent, maximum=32, preserve_lines=False, fallback="agent"
         )
@@ -99,6 +117,40 @@ class StatusBar(Horizontal):
         message.append(f"[{safe_state}]", style=state_style)
         primary.update(message)
         context.update(context_window_text(context_used, context_total))
+
+    @staticmethod
+    def _update_background(
+        target: Static,
+        *,
+        active_jobs: int,
+        active_reports: int,
+        inbox_items: int,
+    ) -> None:
+        for value, name in (
+            (active_jobs, "active_jobs"),
+            (active_reports, "active_reports"),
+            (inbox_items, "inbox_items"),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        labels: list[tuple[str, str]] = []
+        if active_jobs:
+            labels.append((f"jobs {active_jobs}", "bold #ACFD21"))
+        if active_reports:
+            labels.append((f"reporting {active_reports}", "bold #ACFD21"))
+        if inbox_items:
+            labels.append((f"inbox {inbox_items}", "bold #FBBF24"))
+        if not labels:
+            target.update("")
+            target.display = False
+            return
+        content = Text()
+        for index, (label, style) in enumerate(labels):
+            if index:
+                content.append("  ·  ", style="dim")
+            content.append(label, style=style)
+        target.update(content)
+        target.display = True
 
 
 class ActivityBar(Static):

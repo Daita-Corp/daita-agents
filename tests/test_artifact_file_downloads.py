@@ -15,13 +15,17 @@ import pytest
 import daita.adapters.local_files as local_files_module
 from daita import Agent, ArtifactError, LocalDirectorySource, cli
 from daita.artifacts.models import ArtifactAuthorship
-from daita.capabilities import CapabilityInputError, CapabilityRegistry
+from daita.capabilities import (
+    CapabilityDeclarations,
+    CapabilityInputError,
+    CapabilityRegistry,
+)
 from daita.domains.data.export_capabilities import (
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
     LOCAL_FILE_COPY_CAPABILITY_ID,
     LOCAL_FILE_COPY_TOOL_NAME,
     LocalFileCopyExecutor,
-    artifact_extension_declarations,
+    artifact_capability_declarations,
 )
 from daita.hosting.embedded import EmbeddedAgent
 from daita.llm.models import (
@@ -226,7 +230,7 @@ async def test_cataloged_csv_and_json_downloads_are_byte_identical(
 
 
 def test_local_file_copy_is_one_fixed_catalog_id_only_capability() -> None:
-    declarations = artifact_extension_declarations()
+    declarations = artifact_capability_declarations()
     copies = tuple(
         capability
         for capability in declarations.capabilities
@@ -257,9 +261,15 @@ def test_local_file_copy_is_one_fixed_catalog_id_only_capability() -> None:
         item for item in declarations.tool_views if item.capability_id == capability.id
     )
     registry = CapabilityRegistry(
-        capabilities=(capability,),
+        declarations=(
+            CapabilityDeclarations(
+                domain_owner_id="artifacts",
+                capabilities=(capability,),
+                executor_ids=(capability.executor_id,),
+                tool_views=(view,),
+            ),
+        ),
         executors=(_UnusedExecutor(),),
-        tool_views=(view,),
     )
     for forbidden in (
         "path",

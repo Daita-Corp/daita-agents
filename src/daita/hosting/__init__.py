@@ -1,4 +1,4 @@
-"""In-process agent hosting."""
+"""Export in-process hosting for persistent Daita agents."""
 
 from .embedded import EmbeddedAgent
 

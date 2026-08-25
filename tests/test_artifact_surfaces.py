@@ -375,9 +375,9 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
 def test_open_reveal_and_folder_picker_are_user_actions_not_model_or_shell_tools() -> (
     None
 ):
-    from daita.domains.data.export_capabilities import artifact_extension_declarations
+    from daita.domains.data.export_capabilities import artifact_capability_declarations
 
-    tool_names = {item.name for item in artifact_extension_declarations().tool_views}
+    tool_names = {item.name for item in artifact_capability_declarations().tool_views}
     assert tool_names.isdisjoint(
         {"artifact_open", "artifact_reveal", "artifact_pick_folder"}
     )

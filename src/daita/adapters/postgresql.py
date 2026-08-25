@@ -1,4 +1,4 @@
-"""Read-only PostgreSQL source discovery and inspection adapter."""
+"""Discover and inspect read-admitted PostgreSQL schemas and tables."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from urllib.parse import quote
 
 from .._installation import repair_guidance
 from .._json import canonical_json
-from ..capabilities import ExtensionDeclarations
 from ..catalog.models import (
     CatalogFacet,
     CatalogRelationship,
@@ -33,10 +32,6 @@ from ..catalog.models import (
     TabularFacet,
     TabularIndex,
     catalog_resource_id,
-)
-from ..domains.data.capabilities import (
-    postgresql_query_extension_declarations,
-    postgresql_update_preview_extension_declarations,
 )
 from ..security import (
     SecretProvider,
@@ -454,15 +449,6 @@ class PostgreSQLResourceAdapter:
     @property
     def registration(self) -> SourceRegistration:
         return self._registration
-
-    def declarations(self) -> ExtensionDeclarations:
-        query = postgresql_query_extension_declarations()
-        preview = postgresql_update_preview_extension_declarations()
-        return ExtensionDeclarations(
-            capabilities=(*query.capabilities, *preview.capabilities),
-            executor_ids=(*query.executor_ids, *preview.executor_ids),
-            tool_views=(*query.tool_views, *preview.tool_views),
-        )
 
     async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
         self._require_request(request)

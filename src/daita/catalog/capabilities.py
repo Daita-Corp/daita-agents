@@ -1,4 +1,4 @@
-"""Catalog capability declarations and runtime executors."""
+"""Declare and execute catalog search, inspection, schema, and traversal tools."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ from ..capabilities import (
     AccessMode,
     Capability,
     Executor,
-    ToolApplicability,
+    ToolDiscoveryMetadata,
     ToolExecution,
+    ToolExposureClass,
     ToolOutput,
     ToolView,
 )
@@ -118,6 +119,7 @@ class CatalogSearchExecutor:
                 ],
                 "query": query,
                 "total_matches": result.total_matches,
+                "returned_count": result.returned_count,
                 "truncated": result.truncated,
                 "trust_classification": "untrusted_external_data",
             },
@@ -283,7 +285,6 @@ def catalog_declarations(
         output_schema=_search_output_schema(),
         executor_id=search_executor.executor_id,
         access_mode=AccessMode.READ,
-        side_effecting=False,
     )
     schema = Capability(
         id=CATALOG_SCHEMA_CAPABILITY_ID,
@@ -338,7 +339,6 @@ def catalog_declarations(
         output_schema=_schema_output_schema(),
         executor_id=schema_executor.executor_id,
         access_mode=AccessMode.READ,
-        side_effecting=False,
     )
     inspect = Capability(
         id=CATALOG_INSPECT_CAPABILITY_ID,
@@ -380,7 +380,6 @@ def catalog_declarations(
         },
         executor_id=inspect_executor.executor_id,
         access_mode=AccessMode.READ,
-        side_effecting=False,
     )
     traverse = Capability(
         id=CATALOG_TRAVERSE_CAPABILITY_ID,
@@ -455,7 +454,6 @@ def catalog_declarations(
         output_schema=_traverse_output_schema(),
         executor_id=traverse_executor.executor_id,
         access_mode=AccessMode.READ,
-        side_effecting=False,
     )
     return CatalogDeclarations(
         capabilities=(search, schema, inspect, traverse),
@@ -470,25 +468,49 @@ def catalog_declarations(
                 name="catalog_search",
                 capability_id=search.id,
                 description=search.description,
-                applicability=ToolApplicability(minimum_active_sources=1),
+                discovery=ToolDiscoveryMetadata(
+                    summary="Find catalog resources and fields by trusted structural metadata.",
+                    when_to_use="Use when exact source or resource identifiers are not yet known.",
+                    keywords=("catalog", "find", "resource", "schema"),
+                    exposure_class=ToolExposureClass.CORE,
+                    eager_priority=1_000,
+                ),
             ),
             ToolView(
                 name="catalog_schema",
                 capability_id=schema.id,
                 description=schema.description,
-                applicability=ToolApplicability(minimum_active_sources=1),
+                discovery=ToolDiscoveryMetadata(
+                    summary="Read SQL-ready schemas, relationships, bridges, and join paths.",
+                    when_to_use="Use before composing SQL or when exact field structure is required.",
+                    keywords=("catalog", "schema", "sql", "join"),
+                    exposure_class=ToolExposureClass.CORE,
+                    eager_priority=990,
+                ),
             ),
             ToolView(
                 name="catalog_inspect",
                 capability_id=inspect.id,
                 description=inspect.description,
-                applicability=ToolApplicability(minimum_active_sources=1),
+                discovery=ToolDiscoveryMetadata(
+                    summary="Inspect one catalog resource's complete bounded structural facts.",
+                    when_to_use="Use for facets, freshness, containment, and diagnostics.",
+                    keywords=("catalog", "inspect", "facets", "freshness"),
+                    exposure_class=ToolExposureClass.CORE,
+                    eager_priority=980,
+                ),
             ),
             ToolView(
                 name="catalog_traverse",
                 capability_id=traverse.id,
                 description=traverse.description,
-                applicability=ToolApplicability(minimum_active_sources=1),
+                discovery=ToolDiscoveryMetadata(
+                    summary="Resolve a bounded multi-hop path between catalog resources.",
+                    when_to_use="Use only after catalog schema evidence leaves a path unresolved.",
+                    keywords=("catalog", "traverse", "path", "relationship"),
+                    exposure_class=ToolExposureClass.STANDARD,
+                    eager_priority=700,
+                ),
             ),
         ),
     )
@@ -501,6 +523,7 @@ def _search_output_schema() -> dict[str, object]:
             "hits": {"type": "array"},
             "query": {"type": "string"},
             "total_matches": {"type": "integer"},
+            "returned_count": {"type": "integer"},
             "truncated": {"type": "boolean"},
             "trust_classification": {"type": "string"},
         },
@@ -508,6 +531,7 @@ def _search_output_schema() -> dict[str, object]:
             "hits",
             "query",
             "total_matches",
+            "returned_count",
             "truncated",
             "trust_classification",
         ],

@@ -1,4 +1,4 @@
-"""Small public configuration for the MVP agent."""
+"""Define validated public configuration for an agent instance."""
 
 from __future__ import annotations
 

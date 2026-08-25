@@ -1,8 +1,4 @@
-"""Caller-owned deterministic learning evaluation and effectiveness reports.
-
-This module owns no durable state. Callers retain benchmark labels and bounded
-observer events, then pass them to these pure aggregation and rendering helpers.
-"""
+"""Aggregate caller-supplied learning observations into effectiveness reports."""
 
 from __future__ import annotations
 

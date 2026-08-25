@@ -1,4 +1,4 @@
-"""Small tool declaration and execution contracts."""
+"""Define capability metadata, tool schemas, executors, and registry contracts."""
 
 from __future__ import annotations
 
@@ -7,16 +7,27 @@ import math
 import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum
+from hashlib import sha256
+from types import MappingProxyType
 from typing import Protocol, TypeVar
 
 from ._json import FrozenJsonObject, canonical_json
 from .artifacts.models import ArtifactDraft
-from .llm.models import ToolDefinition
+from .llm.models import ModelSensitivity, ToolDefinition
 
 _T = TypeVar("_T")
 
 MAX_APPROVAL_DOCUMENT_CHARACTERS = 64 * 1_024
+MAX_TOOL_DISCOVERY_SUMMARY_CHARACTERS = 256
+MAX_TOOL_DISCOVERY_GUIDANCE_CHARACTERS = 512
+MAX_TOOL_DISCOVERY_KEYWORDS = 16
+MAX_TOOL_DISCOVERY_KEYWORD_CHARACTERS = 64
+MAX_TOOL_EAGER_PRIORITY = 1_000
+RESERVED_TOOL_NAMES = frozenset({"tool_search", "tool_describe", "tool_call"})
+MAX_EXECUTION_SCOPE_IDENTITIES = 256
+MAX_EXECUTION_SCOPE_IDENTITY_CHARACTERS = 2_048
 
 
 def _text(value: str, name: str) -> None:
@@ -25,8 +36,248 @@ def _text(value: str, name: str) -> None:
 
 
 class AccessMode(str, Enum):
+    NONE = "none"
     READ = "read"
     WRITE = "write"
+
+
+class OperationalEffect(str, Enum):
+    NONE = "none"
+    CHANGE_ADVISORY_CONTEXT = "change_advisory_context"
+    START_JOB = "start_job"
+    SUBMIT_EXECUTION_GRAPH = "submit_execution_graph"
+    EXTEND_EXECUTION_GRAPH = "extend_execution_graph"
+    CANCEL_JOB = "cancel_job"
+    CANCEL_EXECUTION_GRAPH = "cancel_execution_graph"
+    MUTATE_DATA = "mutate_data"
+    CHANGE_INFRASTRUCTURE = "change_infrastructure"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionScope:
+    """One immutable, digestible ceiling carried by a bounded reasoning run."""
+
+    scope_id: str
+    revision: int
+    agent_id: str
+    principal_id: str
+    grant_id: str
+    job_id: str | None
+    job_revision: int | None
+    allowed_source_ids: tuple[str, ...]
+    allowed_resource_ids: tuple[str, ...]
+    allowed_capability_ids: tuple[str, ...]
+    allowed_access_modes: frozenset[AccessMode]
+    allowed_operational_effects: frozenset[OperationalEffect]
+    sensitivity_ceiling: ModelSensitivity
+    eligible_model_routes: tuple[str, ...]
+    per_run_max_cost_usd: Decimal
+    per_run_max_tokens: int
+    delivery_destination: str
+
+    def __post_init__(self) -> None:
+        for identity_value, identity_name in (
+            (self.scope_id, "execution scope_id"),
+            (self.agent_id, "execution scope agent_id"),
+            (self.principal_id, "execution scope principal_id"),
+            (self.grant_id, "execution scope grant_id"),
+            (self.delivery_destination, "execution scope delivery_destination"),
+        ):
+            _text(identity_value, identity_name)
+            if len(identity_value) > 512 or any(
+                character in "\r\n\x00" for character in identity_value
+            ):
+                raise ValueError(f"{identity_name} must be bounded single-line text")
+        if self.job_id is not None:
+            _text(self.job_id, "execution scope job_id")
+            if len(self.job_id) > 512 or any(
+                character in "\r\n\x00" for character in self.job_id
+            ):
+                raise ValueError(
+                    "execution scope job_id must be bounded single-line text"
+                )
+        if (self.job_id is None) != (self.job_revision is None):
+            raise ValueError(
+                "execution scope job identity and revision must be present together"
+            )
+        revision_values = [(self.revision, "execution scope revision")]
+        if self.job_revision is not None:
+            revision_values.append((self.job_revision, "execution scope job_revision"))
+        for revision_value, revision_name in revision_values:
+            if (
+                not isinstance(revision_value, int)
+                or isinstance(revision_value, bool)
+                or revision_value < 1
+            ):
+                raise ValueError(f"{revision_name} must be positive")
+        sources = _scope_identities(self.allowed_source_ids, "allowed_source_ids")
+        resources = _scope_identities(
+            self.allowed_resource_ids,
+            "allowed_resource_ids",
+        )
+        capabilities = _scope_identities(
+            self.allowed_capability_ids,
+            "allowed_capability_ids",
+        )
+        routes = _scope_identities(
+            self.eligible_model_routes,
+            "eligible_model_routes",
+        )
+        if not sources or not resources or not capabilities or not routes:
+            raise ValueError("execution scope identity ceilings cannot be empty")
+        access_modes = frozenset(self.allowed_access_modes)
+        effects = frozenset(self.allowed_operational_effects)
+        if not access_modes or any(
+            not isinstance(item, AccessMode) for item in access_modes
+        ):
+            raise ValueError("execution scope requires allowed access modes")
+        if not effects or any(
+            not isinstance(item, OperationalEffect) for item in effects
+        ):
+            raise ValueError("execution scope requires allowed operational effects")
+        if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
+            raise TypeError("execution scope sensitivity ceiling is invalid")
+        if (
+            not isinstance(self.per_run_max_cost_usd, Decimal)
+            or not self.per_run_max_cost_usd.is_finite()
+            or self.per_run_max_cost_usd < 0
+        ):
+            raise ValueError(
+                "execution scope per-run cost must be a finite non-negative Decimal"
+            )
+        if (
+            not isinstance(self.per_run_max_tokens, int)
+            or isinstance(self.per_run_max_tokens, bool)
+            or self.per_run_max_tokens < 1
+        ):
+            raise ValueError("execution scope per-run tokens must be positive")
+        object.__setattr__(self, "allowed_source_ids", sources)
+        object.__setattr__(self, "allowed_resource_ids", resources)
+        object.__setattr__(self, "allowed_capability_ids", capabilities)
+        object.__setattr__(self, "eligible_model_routes", routes)
+        object.__setattr__(self, "allowed_access_modes", access_modes)
+        object.__setattr__(self, "allowed_operational_effects", effects)
+
+    @property
+    def digest(self) -> str:
+        return (
+            "sha256:"
+            + sha256(
+                canonical_json(
+                    {
+                        "scope_id": self.scope_id,
+                        "revision": self.revision,
+                        "agent_id": self.agent_id,
+                        "principal_id": self.principal_id,
+                        "grant_id": self.grant_id,
+                        "job_id": self.job_id,
+                        "job_revision": self.job_revision,
+                        "allowed_source_ids": self.allowed_source_ids,
+                        "allowed_resource_ids": self.allowed_resource_ids,
+                        "allowed_capability_ids": self.allowed_capability_ids,
+                        "allowed_access_modes": tuple(
+                            sorted(item.value for item in self.allowed_access_modes)
+                        ),
+                        "allowed_operational_effects": tuple(
+                            sorted(
+                                item.value for item in self.allowed_operational_effects
+                            )
+                        ),
+                        "sensitivity_ceiling": self.sensitivity_ceiling.value,
+                        "eligible_model_routes": self.eligible_model_routes,
+                        "per_run_max_cost_usd": str(self.per_run_max_cost_usd),
+                        "per_run_max_tokens": self.per_run_max_tokens,
+                        "delivery_destination": self.delivery_destination,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+
+    def allows(self, capability: "Capability") -> bool:
+        return (
+            capability.id in self.allowed_capability_ids
+            and capability.access_mode in self.allowed_access_modes
+            and capability.operational_effect in self.allowed_operational_effects
+        )
+
+
+def _scope_identities(values: Iterable[str], name: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"execution scope {name} must be a sequence")
+    items = tuple(values)
+    if len(items) > MAX_EXECUTION_SCOPE_IDENTITIES:
+        raise ValueError(f"execution scope {name} exceeds its bound")
+    if any(
+        not isinstance(item, str)
+        or not item
+        or item != item.strip()
+        or len(item) > MAX_EXECUTION_SCOPE_IDENTITY_CHARACTERS
+        or any(character in "\r\n\x00" for character in item)
+        for item in items
+    ):
+        raise ValueError(f"execution scope {name} contains invalid text")
+    if len(items) != len(set(items)):
+        raise ValueError(f"execution scope {name} cannot contain duplicates")
+    return tuple(sorted(items))
+
+
+class ToolExposureClass(str, Enum):
+    CORE = "core"
+    STANDARD = "standard"
+    DEFERRED = "deferred"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDiscoveryMetadata:
+    """Bounded trusted text used only to present an admitted tool."""
+
+    summary: str
+    when_to_use: str
+    keywords: tuple[str, ...]
+    exposure_class: ToolExposureClass
+    eager_priority: int
+
+    def __post_init__(self) -> None:
+        for value, name, maximum in (
+            (
+                self.summary,
+                "tool discovery summary",
+                MAX_TOOL_DISCOVERY_SUMMARY_CHARACTERS,
+            ),
+            (
+                self.when_to_use,
+                "tool discovery when_to_use",
+                MAX_TOOL_DISCOVERY_GUIDANCE_CHARACTERS,
+            ),
+        ):
+            _text(value, name)
+            if len(value) > maximum:
+                raise ValueError(f"{name} exceeds its character bound")
+        keywords = tuple(self.keywords)
+        if len(keywords) > MAX_TOOL_DISCOVERY_KEYWORDS:
+            raise ValueError("tool discovery has too many keywords")
+        if len(keywords) != len(set(keywords)):
+            raise ValueError("tool discovery keywords must be distinct")
+        for keyword in keywords:
+            if (
+                not isinstance(keyword, str)
+                or not keyword
+                or keyword != keyword.strip().lower()
+                or len(keyword) > MAX_TOOL_DISCOVERY_KEYWORD_CHARACTERS
+                or re.fullmatch(r"[a-z0-9][a-z0-9 _.-]*", keyword) is None
+            ):
+                raise ValueError(
+                    "tool discovery keywords must be bounded normalized text"
+                )
+        if not isinstance(self.exposure_class, ToolExposureClass):
+            raise TypeError("tool discovery exposure_class must be ToolExposureClass")
+        if (
+            not isinstance(self.eager_priority, int)
+            or isinstance(self.eager_priority, bool)
+            or not 0 <= self.eager_priority <= MAX_TOOL_EAGER_PRIORITY
+        ):
+            raise ValueError("tool discovery eager_priority is outside its bound")
+        object.__setattr__(self, "keywords", keywords)
 
 
 class ApprovalDecision(str, Enum):
@@ -162,8 +413,8 @@ class Capability:
     output_kind: str
     output_schema: Mapping[str, object]
     executor_id: str
-    access_mode: AccessMode = AccessMode.READ
-    side_effecting: bool = False
+    access_mode: AccessMode = AccessMode.NONE
+    operational_effect: OperationalEffect = OperationalEffect.NONE
     artifact_policy: ArtifactPolicy | None = None
 
     def __post_init__(self) -> None:
@@ -176,16 +427,12 @@ class Capability:
             _text(value, name)
         if not isinstance(self.access_mode, AccessMode):
             raise TypeError("access_mode must be AccessMode")
-        if not isinstance(self.side_effecting, bool):
-            raise TypeError("side_effecting must be a boolean")
+        if not isinstance(self.operational_effect, OperationalEffect):
+            raise TypeError("operational_effect must be OperationalEffect")
         if self.artifact_policy is not None and not isinstance(
             self.artifact_policy, ArtifactPolicy
         ):
             raise TypeError("artifact_policy must be ArtifactPolicy or None")
-        if (self.access_mode is AccessMode.WRITE) is not self.side_effecting:
-            raise ValueError(
-                "write tools must be side-effecting and read tools cannot be"
-            )
         input_schema = FrozenJsonObject.from_mapping(self.input_schema)
         output_schema = FrozenJsonObject.from_mapping(self.output_schema)
         _check_schema(input_schema)
@@ -194,24 +441,46 @@ class Capability:
         object.__setattr__(self, "output_schema", output_schema)
 
 
-@dataclass(frozen=True, slots=True)
-class ToolApplicability:
-    source_adapter_ids: tuple[str, ...] = ()
-    minimum_active_sources: int = 0
+def capability_contract_digest(
+    capability: Capability,
+    *,
+    domain_owner_id: str,
+) -> str:
+    """Return the exact immutable execution contract identity for a capability."""
 
-    def __post_init__(self) -> None:
-        source_adapter_ids = tuple(self.source_adapter_ids)
-        if any(not isinstance(value, str) or not value for value in source_adapter_ids):
-            raise ValueError("source_adapter_ids must contain non-empty strings")
-        if len(source_adapter_ids) != len(set(source_adapter_ids)):
-            raise ValueError("source_adapter_ids cannot contain duplicates")
-        object.__setattr__(self, "source_adapter_ids", source_adapter_ids)
-        if (
-            not isinstance(self.minimum_active_sources, int)
-            or isinstance(self.minimum_active_sources, bool)
-            or self.minimum_active_sources < 0
-        ):
-            raise ValueError("minimum_active_sources must be non-negative")
+    if not isinstance(capability, Capability):
+        raise TypeError("capability contract requires Capability")
+    _text(domain_owner_id, "capability contract domain owner")
+    material = {
+        "domain_owner_id": domain_owner_id,
+        "capability_id": capability.id,
+        "description": capability.description,
+        "input_schema": capability.input_schema,
+        "output_kind": capability.output_kind,
+        "output_schema": capability.output_schema,
+        "executor_id": capability.executor_id,
+        "access_mode": capability.access_mode.value,
+        "operational_effect": capability.operational_effect.value,
+        "artifact_policy": (
+            None
+            if capability.artifact_policy is None
+            else {
+                "allowed_media_types": sorted(
+                    capability.artifact_policy.allowed_media_types
+                ),
+                "allowed_extensions": capability.artifact_policy.allowed_extensions,
+                "artifact_required": capability.artifact_policy.artifact_required,
+                "max_artifact_count": capability.artifact_policy.max_artifact_count,
+                "max_bytes_per_artifact": (
+                    capability.artifact_policy.max_bytes_per_artifact
+                ),
+                "max_total_bytes_per_call": (
+                    capability.artifact_policy.max_total_bytes_per_call
+                ),
+            }
+        ),
+    }
+    return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,7 +488,8 @@ class ToolView:
     name: str
     capability_id: str
     description: str
-    applicability: ToolApplicability = field(default_factory=ToolApplicability)
+    discovery: ToolDiscoveryMetadata
+    origin_revision_digest: str | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -228,8 +498,16 @@ class ToolView:
             (self.description, "tool description"),
         ):
             _text(value, name)
-        if not isinstance(self.applicability, ToolApplicability):
-            raise TypeError("applicability must be ToolApplicability")
+        if self.name in RESERVED_TOOL_NAMES:
+            raise ValueError(f"reserved runtime control tool name: {self.name}")
+        if not isinstance(self.discovery, ToolDiscoveryMetadata):
+            raise TypeError("tool discovery metadata is required")
+        if (
+            self.origin_revision_digest is not None
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", self.origin_revision_digest)
+            is None
+        ):
+            raise ValueError("tool origin revision digest must use sha256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,12 +534,24 @@ class ToolOutput:
     kind: str
     data: Mapping[str, object] = field(default_factory=dict)
     artifact: ArtifactDraft | None = None
+    sensitivity: ModelSensitivity | None = None
+    sensitivity_provenance: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _text(self.kind, "tool output kind")
         if self.artifact is not None and not isinstance(self.artifact, ArtifactDraft):
             raise TypeError("artifact must be ArtifactDraft or None")
+        if self.sensitivity is not None and not isinstance(
+            self.sensitivity, ModelSensitivity
+        ):
+            raise TypeError("tool output sensitivity must be ModelSensitivity or None")
+        provenance = FrozenJsonObject.from_mapping(self.sensitivity_provenance)
+        if (self.sensitivity is None) is bool(provenance):
+            raise ValueError(
+                "tool output sensitivity and provenance must be present together"
+            )
         object.__setattr__(self, "data", FrozenJsonObject.from_mapping(self.data))
+        object.__setattr__(self, "sensitivity_provenance", provenance)
 
 
 class Executor(Protocol):
@@ -276,12 +566,14 @@ class SideEffectExecutor(Executor, Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class ExtensionDeclarations:
+class CapabilityDeclarations:
+    domain_owner_id: str
     capabilities: tuple[Capability, ...] = ()
     executor_ids: tuple[str, ...] = ()
     tool_views: tuple[ToolView, ...] = ()
 
     def __post_init__(self) -> None:
+        _text(self.domain_owner_id, "domain owner id")
         capabilities = tuple(self.capabilities)
         executor_ids = tuple(self.executor_ids)
         views = tuple(self.tool_views)
@@ -306,28 +598,161 @@ class ExtensionDeclarations:
 
 
 class CapabilityRegistry:
-    """Resolve model-facing tools to their declared executor."""
+    """Resolve statically declared tools, capabilities, owners, and executors."""
 
     def __init__(
         self,
         *,
-        capabilities: Iterable[Capability] = (),
+        declarations: Iterable[CapabilityDeclarations] = (),
         executors: Iterable[Executor] = (),
-        tool_views: Iterable[ToolView] = (),
     ) -> None:
-        self._capabilities = _unique(capabilities, lambda item: item.id, "capability")
-        self._executors = _unique(executors, lambda item: item.executor_id, "executor")
-        self._views = _unique(tool_views, lambda item: item.name, "tool")
+        declared = _unique(
+            declarations,
+            lambda item: item.domain_owner_id,
+            "domain owner",
+        )
+        self._declarations = MappingProxyType(declared)
+        capabilities = tuple(
+            capability
+            for declaration in declared.values()
+            for capability in declaration.capabilities
+        )
+        tool_views = tuple(
+            view for declaration in declared.values() for view in declaration.tool_views
+        )
+        self._capabilities = MappingProxyType(
+            _unique(capabilities, lambda item: item.id, "capability")
+        )
+        self._executors = MappingProxyType(
+            _unique(executors, lambda item: item.executor_id, "executor")
+        )
+        self._views = MappingProxyType(
+            _unique(tool_views, lambda item: item.name, "tool")
+        )
+        self._domain_owners = MappingProxyType(
+            {
+                capability.id: declaration.domain_owner_id
+                for declaration in declared.values()
+                for capability in declaration.capabilities
+            }
+        )
         for capability in self._capabilities.values():
             if capability.executor_id not in self._executors:
                 raise ValueError(f"missing executor: {capability.executor_id}")
         for view in self._views.values():
             if view.capability_id not in self._capabilities:
                 raise ValueError(f"missing capability: {view.capability_id}")
+        declared_executor_ids = {
+            executor_id
+            for declaration in declared.values()
+            for executor_id in declaration.executor_ids
+        }
+        if declared_executor_ids != set(self._executors):
+            missing = sorted(declared_executor_ids - set(self._executors))
+            unexpected = sorted(set(self._executors) - declared_executor_ids)
+            raise ValueError(
+                "registered executors must match static declarations: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        self._digest = (
+            "sha256:"
+            + sha256(
+                canonical_json(
+                    [
+                        {
+                            "domain_owner_id": declaration.domain_owner_id,
+                            "capabilities": [
+                                {
+                                    "id": capability.id,
+                                    "description": capability.description,
+                                    "input_schema": capability.input_schema,
+                                    "output_kind": capability.output_kind,
+                                    "output_schema": capability.output_schema,
+                                    "executor_id": capability.executor_id,
+                                    "access_mode": capability.access_mode.value,
+                                    "operational_effect": (
+                                        capability.operational_effect.value
+                                    ),
+                                    "artifact_policy": (
+                                        None
+                                        if capability.artifact_policy is None
+                                        else {
+                                            "allowed_media_types": sorted(
+                                                capability.artifact_policy.allowed_media_types
+                                            ),
+                                            "allowed_extensions": (
+                                                capability.artifact_policy.allowed_extensions
+                                            ),
+                                            "artifact_required": (
+                                                capability.artifact_policy.artifact_required
+                                            ),
+                                            "max_artifact_count": (
+                                                capability.artifact_policy.max_artifact_count
+                                            ),
+                                            "max_bytes_per_artifact": (
+                                                capability.artifact_policy.max_bytes_per_artifact
+                                            ),
+                                            "max_total_bytes_per_call": (
+                                                capability.artifact_policy.max_total_bytes_per_call
+                                            ),
+                                        }
+                                    ),
+                                }
+                                for capability in sorted(
+                                    declaration.capabilities, key=lambda item: item.id
+                                )
+                            ],
+                            "tool_views": [
+                                {
+                                    "name": view.name,
+                                    "capability_id": view.capability_id,
+                                    "description": view.description,
+                                    "discovery": {
+                                        "summary": view.discovery.summary,
+                                        "when_to_use": view.discovery.when_to_use,
+                                        "keywords": view.discovery.keywords,
+                                        "exposure_class": (
+                                            view.discovery.exposure_class.value
+                                        ),
+                                        "eager_priority": view.discovery.eager_priority,
+                                    },
+                                    "origin_revision_digest": (
+                                        view.origin_revision_digest
+                                    ),
+                                }
+                                for view in sorted(
+                                    declaration.tool_views, key=lambda item: item.name
+                                )
+                            ],
+                        }
+                        for declaration in sorted(
+                            declared.values(), key=lambda item: item.domain_owner_id
+                        )
+                    ]
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        self._contract_digests = MappingProxyType(
+            {
+                capability.id: capability_contract_digest(
+                    capability,
+                    domain_owner_id=self._domain_owners[capability.id],
+                )
+                for capability in self._capabilities.values()
+            }
+        )
 
     @property
     def tool_names(self) -> frozenset[str]:
         return frozenset(self._views)
+
+    @property
+    def domain_owner_ids(self) -> frozenset[str]:
+        return frozenset(self._declarations)
+
+    @property
+    def digest(self) -> str:
+        return self._digest
 
     def resolve_tool(self, name: str) -> tuple[ToolView, Capability]:
         try:
@@ -335,6 +760,16 @@ class CapabilityRegistry:
             return view, self._capabilities[view.capability_id]
         except KeyError as error:
             raise KeyError(f"unknown tool: {name}") from error
+
+    def resolve_domain_owner(self, capability_id: str) -> str:
+        try:
+            return self._domain_owners[capability_id]
+        except KeyError as error:
+            raise KeyError(f"unknown capability: {capability_id}") from error
+
+    def resolve_tool_owner(self, name: str) -> tuple[ToolView, Capability, str]:
+        view, capability = self.resolve_tool(name)
+        return view, capability, self.resolve_domain_owner(capability.id)
 
     def tool_definition(self, name: str) -> ToolDefinition:
         view, capability = self.resolve_tool(name)
@@ -352,9 +787,64 @@ class CapabilityRegistry:
         _validate(capability.input_schema, value, CapabilityInputError)
         return value
 
+    def validate_execution_scope_grant(
+        self,
+        capability_ids: Iterable[str],
+        *,
+        allowed_access_modes: frozenset[AccessMode],
+        allowed_operational_effects: frozenset[OperationalEffect],
+    ) -> tuple[str, ...]:
+        """Validate immutable grant metadata without creating an execution path."""
+
+        material = tuple(capability_ids)
+        if not material or len(material) != len(set(material)):
+            raise ValueError("execution scope grant requires distinct capabilities")
+        public_capability_ids = {view.capability_id for view in self._views.values()}
+        for capability_id in material:
+            try:
+                capability = self._capabilities[capability_id]
+            except KeyError as error:
+                raise KeyError(f"unknown capability: {capability_id}") from error
+            if capability_id not in public_capability_ids:
+                raise ValueError(
+                    f"execution scope capability is not model-visible: {capability_id}"
+                )
+            if (
+                capability.access_mode not in allowed_access_modes
+                or capability.operational_effect not in allowed_operational_effects
+            ):
+                raise ValueError(
+                    f"execution scope capability metadata is not admitted: {capability_id}"
+                )
+        return tuple(sorted(material))
+
     def resolve_execution(self, capability_id: str) -> tuple[Capability, Executor]:
         capability = self._capabilities[capability_id]
-        return capability, self._executors[capability.executor_id]
+        executor = self._executors[capability.executor_id]
+        if executor.executor_id != capability.executor_id:
+            raise ValueError(f"executor identity changed: {capability.executor_id}")
+        return capability, executor
+
+    def contract_digest(self, capability_id: str) -> str:
+        try:
+            return self._contract_digests[capability_id]
+        except KeyError as error:
+            raise KeyError(f"unknown capability: {capability_id}") from error
+
+    def resolve_internal_execution(
+        self,
+        capability_id: str,
+        contract_digest: str,
+    ) -> tuple[Capability, Executor, str]:
+        capability, executor = self.resolve_execution(capability_id)
+        if any(view.capability_id == capability_id for view in self._views.values()):
+            raise ValueError(
+                "trusted internal execution requires an internal-only capability"
+            )
+        expected = self.contract_digest(capability_id)
+        if contract_digest != expected:
+            raise ValueError("internal execution capability contract changed")
+        return capability, executor, self.resolve_domain_owner(capability_id)
 
     def validate_output(self, capability_id: str, output: object) -> ToolOutput:
         capability = self._capabilities[capability_id]
@@ -367,7 +857,11 @@ class CapabilityRegistry:
         _validate(capability.output_schema, output.data, ToolOutputValidationError)
         return output
 
-    def validate_declarations(self, declarations: ExtensionDeclarations) -> None:
+    def validate_declarations(self, declarations: CapabilityDeclarations) -> None:
+        if self._declarations.get(declarations.domain_owner_id) != declarations:
+            raise ValueError(
+                f"domain declaration differs: {declarations.domain_owner_id}"
+            )
         for capability in declarations.capabilities:
             if self._capabilities.get(capability.id) != capability:
                 raise ValueError(f"capability declaration differs: {capability.id}")
@@ -510,6 +1004,19 @@ def _validate(
         _validate_rule(name, item, rule, error_type)
 
 
+def validate_tool_schema_value(
+    schema: Mapping[str, object],
+    value: Mapping[str, object],
+) -> FrozenJsonObject:
+    """Validate one object against the registry's bounded tool-schema contract."""
+
+    frozen_schema = FrozenJsonObject.from_mapping(schema)
+    frozen_value = FrozenJsonObject.from_mapping(value)
+    _check_schema(frozen_schema)
+    _validate(frozen_schema, frozen_value, ToolOutputValidationError)
+    return frozen_value
+
+
 def _validate_rule(
     name: str,
     item: object,
@@ -620,14 +1127,19 @@ __all__ = [
     "Capability",
     "CapabilityInputError",
     "CapabilityRegistry",
+    "capability_contract_digest",
     "Executor",
-    "ExtensionDeclarations",
+    "OperationalEffect",
+    "CapabilityDeclarations",
     "MAX_APPROVAL_DOCUMENT_CHARACTERS",
     "SideEffectExecutor",
-    "ToolApplicability",
     "ToolExecution",
+    "ToolDiscoveryMetadata",
+    "ToolExposureClass",
     "ToolOutput",
     "ToolOutputValidationError",
     "ToolView",
+    "RESERVED_TOOL_NAMES",
     "render_approval_arguments",
+    "validate_tool_schema_value",
 ]

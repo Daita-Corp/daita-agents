@@ -8,6 +8,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from _capability_runtime_support import execute_projected
 
 import daita.skills.store as skill_module
 from daita import Agent, SQLiteSource
@@ -18,12 +19,18 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import RunInput
+from daita.loop.models import (
+    LoopLimits,
+    RunInput,
+    ToolBatchOutcome,
+    ToolProjectionMode,
+)
 from daita.skills import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,
     SKILL_INDEX_MAX_CHARACTERS,
@@ -47,6 +54,7 @@ from daita.skills.capabilities import (
 from daita.storage.sqlite_migrations import migration_rows
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 def _profile(provider: MockModelProvider, *, context: int = 20_000) -> ModelProfile:
@@ -475,6 +483,7 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
     )
     try:
         registry = agent._embedded._capabilities
@@ -494,8 +503,13 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
         assert resolved == capability
         await agent.run("What can you do?")
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
+            "artifact_convert",
             "artifact_create_document",
+            "artifact_list",
+            "artifact_read",
+            "artifact_save_local",
             "artifact_set_export_location",
+            "job_list",
             "memory_set",
             "skill_delete",
             "skill_save",
@@ -599,16 +613,21 @@ async def test_missing_invalid_and_malformed_skill_views_are_bounded_errors(tmp_
         (directory / "SKILL.md").write_text("bad", encoding="utf-8")
         loop = agent._embedded._loop
         assert loop is not None
-        results = await loop._tools.execute_all(
-            RunInput(
-                id="malformed-skill-run",
-                agent_id=agent.id,
-                message="Load broken",
-                created_at=NOW,
-            ),
-            (ToolCall(id="bad", name="skill_view", arguments={"name": "broken"}),),
+        runtime = loop._tools
+        run = RunInput(
+            id="malformed-skill-run",
+            agent_id=agent.id,
+            message="Load broken",
+            created_at=NOW,
         )
-        error = results[0].output["error"]
+        catalog = await runtime.prepare_run(run)
+        outcome = await runtime.execute_all(
+            run,
+            (ToolCall(id="bad", name="skill_view", arguments={"name": "broken"}),),
+            projection=runtime.project(catalog, ()),
+            sensitivity=ModelSensitivity.INTERNAL,
+        )
+        error = outcome.ordered_results[0].output["error"]
         assert isinstance(error, Mapping)
         assert error["code"] == "skill_unavailable"
         assert "SKILL.md" not in error["message"]
@@ -684,7 +703,11 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
         )
     )
     agent = await Agent.create(
-        "inert-skill", root=tmp_path, model=provider, model_profile=_profile(provider)
+        "inert-skill",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
     )
     try:
         await agent.save_skill(
@@ -698,8 +721,13 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
         result = await agent.run("Do not mutate anything")
         transcript = await agent.transcript(result.run_id)
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
+            "artifact_convert",
             "artifact_create_document",
+            "artifact_list",
+            "artifact_read",
+            "artifact_save_local",
             "artifact_set_export_location",
+            "job_list",
             "memory_set",
             "skill_delete",
             "skill_save",
@@ -809,7 +837,8 @@ async def test_parallel_skill_and_data_reads_start_together_and_keep_order(
             created_at=NOW,
         )
         results = await asyncio.wait_for(
-            runtime.execute_all(
+            execute_projected(
+                runtime,
                 run,
                 (
                     ToolCall(
@@ -860,19 +889,41 @@ async def test_direct_operations_emit_no_model_calls_or_observer_events(tmp_path
 
 async def test_custom_context_builder_remains_unwrapped(tmp_path):
     class CustomContext:
-        async def build(self, run, messages, tools, *, step, final=False):
-            del run, step, final
-            return ModelRequest(messages=messages, tools=tools)
+        async def prepare(self, run, messages, tool_context):
+            del run
+            return messages[:-1], tool_context
+
+        def project(
+            self,
+            snapshot,
+            messages,
+            *,
+            tool_context,
+            step,
+            final=False,
+            previous_request_input_tokens=None,
+        ):
+            del step, previous_request_input_tokens
+            static, catalog = snapshot
+            assert tool_context is catalog
+            return ModelRequest(
+                messages=(*static, *messages),
+                tools=(),
+            )
 
     class NoTools:
-        async def definitions(self, run):
+        async def prepare_run(self, run):
             del run
             return ()
 
-        async def execute_all(self, run, calls):
-            del run
+        def project(self, catalog, messages):
+            del messages
+            return catalog
+
+        async def execute_all(self, run, calls, *, projection, sensitivity):
+            del run, projection, sensitivity
             assert calls == ()
-            return ()
+            return ToolBatchOutcome(())
 
     provider = MockModelProvider((_stop(),))
     context = CustomContext()
@@ -903,7 +954,7 @@ async def test_skill_index_is_mandatory_for_default_request_budget(tmp_path):
         "skill-budget",
         root=tmp_path,
         model=provider,
-        model_profile=_profile(provider, context=4_500),
+        model_profile=_profile(provider, context=5_000),
     )
     try:
         for index in range(12):
@@ -933,8 +984,12 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
             )
         }
         assert tables == {
+            "autonomous_followups",
+            "conversation_inbox",
             "database_write_receipts",
             "learning_candidates",
+            "job_runs",
+            "mcp_server_bindings",
             "messages",
             "metadata",
             "postgresql_update_scopes",

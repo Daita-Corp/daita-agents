@@ -1,4 +1,4 @@
-"""Focused local artifact delivery and destination configuration."""
+"""Authorize and publish committed artifacts to configured local destinations."""
 
 from __future__ import annotations
 

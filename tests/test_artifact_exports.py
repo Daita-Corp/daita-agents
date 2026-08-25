@@ -42,7 +42,7 @@ from daita.domains.data.export_capabilities import (
     POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
     SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
     SQLITE_TABULAR_EXPORT_TOOL_NAME,
-    artifact_extension_declarations,
+    artifact_capability_declarations,
 )
 from daita.domains.data.sql import ResourceSchema
 from daita.llm.models import (
@@ -607,7 +607,7 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
 def test_source_specific_csv_tool_schemas_cannot_accept_rows_bytes_or_provenance() -> (
     None
 ):
-    extension = artifact_extension_declarations()
+    extension = artifact_capability_declarations()
     views = {
         item.name: item
         for item in extension.tool_views
@@ -922,7 +922,7 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
         stale = await agent.run("Export this as CSV.")
         stale_block = (await agent.transcript(stale.run_id)).messages[2].content[0]
         assert isinstance(stale_block, ToolResultBlock)
-        assert _error_code(stale_block) == "tool_execution_failed"
+        assert _error_code(stale_block) == "catalog_source_stale"
         assert stale.artifacts == ()
 
         await agent.detach(source_id)

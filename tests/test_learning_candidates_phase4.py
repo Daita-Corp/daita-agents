@@ -52,7 +52,10 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.loop.models import LoopLimits, ToolProjectionMode
 from daita.storage.sqlite import SQLiteStateStore
+
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 from daita.tui.controller import PresentationController
 
 
@@ -394,6 +397,7 @@ async def test_acceptance_uses_fresh_foreground_approval_and_marks_only_on_succe
         root=tmp_path,
         model=foreground,
         model_profile=foreground.model_profile,
+        limits=EAGER_LIMITS,
         reviewer_model=reviewer,
         approval_handler=approve,
         id_factory=_ids(),
@@ -493,6 +497,7 @@ async def test_acceptance_without_approval_handler_fails_closed(tmp_path):
         root=tmp_path,
         model=foreground,
         model_profile=foreground.model_profile,
+        limits=EAGER_LIMITS,
         reviewer_model=reviewer,
         id_factory=_ids(),
     )
@@ -556,6 +561,7 @@ async def test_acceptance_run_cannot_mutate_content_other_than_selected_candidat
         root=tmp_path,
         model=foreground,
         model_profile=foreground.model_profile,
+        limits=EAGER_LIMITS,
         reviewer_model=reviewer,
         approval_handler=approve,
         id_factory=_ids(),

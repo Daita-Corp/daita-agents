@@ -1,1 +1,1 @@
-"""Built-in semantic domains for the autonomous-agent runtime."""
+"""Group the statically composed capability domains used by the agent runtime."""

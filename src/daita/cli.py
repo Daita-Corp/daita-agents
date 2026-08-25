@@ -1,4 +1,4 @@
-"""Small CLI that calls the same public Agent API as Python users."""
+"""Implement headless command-line workflows through the public Agent API."""
 
 from __future__ import annotations
 
@@ -28,6 +28,10 @@ from . import (
     LearningCandidateView,
     LocalDirectorySource,
     LoopExit,
+    MCPAuthentication,
+    MCPBindingStatus,
+    MCPServerInspection,
+    MCPToolSelection,
     PostgreSQLSource,
     Skill,
     SkillSummary,
@@ -58,6 +62,7 @@ from .llm import (
     CostEstimate,
     ModelProfile,
     ModelProvider,
+    ModelSensitivity,
     aggregate_cost_estimates,
 )
 from .llm.profiles import reviewed_model_profile
@@ -80,6 +85,7 @@ _BUILTIN_CHAT_COMMANDS = frozenset(
         "/help",
         "/learn",
         "/memory",
+        "/mcp",
         "/model",
         "/new",
         "/resume",
@@ -147,6 +153,75 @@ def _learning_candidate_mapping(
     return value
 
 
+def _mcp_authentication(bearer_env: str | None) -> MCPAuthentication:
+    return (
+        MCPAuthentication.no_auth()
+        if bearer_env is None
+        else MCPAuthentication.bearer(SecretReference.environment(bearer_env))
+    )
+
+
+def _mcp_inspection_mapping(inspection: MCPServerInspection) -> dict[str, object]:
+    return {
+        "endpoint": inspection.endpoint,
+        "protocol_version": inspection.protocol_version,
+        "server_name": inspection.server_name,
+        "server_version": inspection.server_version,
+        "observed_at": inspection.observed_at.isoformat(),
+        "tools": [
+            {
+                "remote_name": tool.remote_name,
+                "supported": tool.supported,
+                "unsupported_reason": tool.unsupported_reason,
+                "input_schema": (
+                    None if tool.input_schema is None else tool.input_schema.to_dict()
+                ),
+                "input_schema_digest": tool.input_schema_digest,
+                "output_schema": (
+                    None if tool.output_schema is None else tool.output_schema.to_dict()
+                ),
+                "output_schema_digest": tool.output_schema_digest,
+            }
+            for tool in inspection.tools
+        ],
+    }
+
+
+def _mcp_status_mapping(status: MCPBindingStatus) -> dict[str, object]:
+    binding = status.binding
+    return {
+        "binding_id": binding.binding_id,
+        "endpoint": binding.endpoint,
+        "protocol_version": binding.protocol_version,
+        "server_name": binding.server_name,
+        "server_version": binding.server_version,
+        "local_label": binding.local_label,
+        "maximum_outbound_sensitivity": (binding.maximum_outbound_sensitivity.value),
+        "state": binding.state.value,
+        "revision": binding.revision,
+        "activated_revision": status.activated_revision,
+        "active_in_runtime": status.active_in_runtime,
+        "reopen_required": status.reopen_required,
+        "stale_reason": binding.stale_reason,
+        "admitted_at": binding.admitted_at.isoformat(),
+        "last_checked_at": binding.last_checked_at.isoformat(),
+        "revoked_at": (
+            None if binding.revoked_at is None else binding.revoked_at.isoformat()
+        ),
+        "tools": [
+            {
+                "local_name": tool.local_name,
+                "remote_name": tool.remote_name,
+                "capability_id": tool.capability_id,
+                "input_schema_digest": tool.input_schema_digest,
+                "output_schema_digest": tool.output_schema_digest,
+                "result_sensitivity": tool.result_sensitivity.value,
+            }
+            for tool in binding.tools
+        ],
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="daita")
     parser.add_argument("--version", action="version", version=f"daita {__version__}")
@@ -184,6 +259,47 @@ def build_parser() -> argparse.ArgumentParser:
 
     sources = commands.add_parser("sources", help="list attached sources")
     sources.add_argument("name")
+
+    mcp = commands.add_parser("mcp", help="manage admitted remote MCP read tools")
+    mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
+    mcp_inspect = mcp_commands.add_parser(
+        "inspect",
+        help="inspect one endpoint without admitting tools",
+    )
+    mcp_inspect.add_argument("name")
+    mcp_inspect.add_argument("endpoint")
+    mcp_inspect.add_argument("--bearer-env")
+    mcp_attach = mcp_commands.add_parser(
+        "attach",
+        help="admit exact read-only tools for activation on reopen",
+    )
+    mcp_attach.add_argument("name")
+    mcp_attach.add_argument("endpoint")
+    mcp_attach.add_argument("--bearer-env")
+    mcp_attach.add_argument("--binding-id")
+    mcp_attach.add_argument(
+        "--maximum-outbound-sensitivity",
+        choices=tuple(item.value for item in ModelSensitivity),
+        default=ModelSensitivity.INTERNAL.value,
+    )
+    mcp_attach.add_argument(
+        "--tool",
+        action="append",
+        nargs=4,
+        required=True,
+        metavar=("REMOTE", "ALIAS", "DESCRIPTION", "RESULT_SENSITIVITY"),
+        help="repeat for each exact read tool; quote descriptions containing spaces",
+    )
+    mcp_status = mcp_commands.add_parser("status", help="show bounded binding status")
+    mcp_status.add_argument("name")
+    mcp_status.add_argument("binding_id", nargs="?")
+    mcp_refresh = mcp_commands.add_parser("refresh", help="refresh one exact binding")
+    mcp_refresh.add_argument("name")
+    mcp_refresh.add_argument("binding_id")
+    mcp_revoke = mcp_commands.add_parser("revoke", help="revoke one exact binding")
+    mcp_revoke.add_argument("name")
+    mcp_revoke.add_argument("binding_id")
+    mcp_revoke.add_argument("--yes", action="store_true")
 
     readiness = commands.add_parser(
         "postgresql-update-readiness",
@@ -368,6 +484,7 @@ def _write_event_jsonl(event: AgentEvent) -> None:
                 "occurred_at": event.occurred_at.isoformat(),
                 "run_id": event.run_id,
                 "conversation_id": event.conversation_id,
+                "run_origin": event.run_origin,
                 "data": event.data.to_dict(),
             },
             sort_keys=True,
@@ -1225,6 +1342,53 @@ async def _execute(args: argparse.Namespace) -> object:
                 "adapter": registration.adapter_id,
                 "name": registration.display_name,
             }
+        if args.command == "mcp":
+            if args.mcp_command == "inspect":
+                inspection = await agent.inspect_mcp_server(
+                    endpoint=args.endpoint,
+                    authentication=_mcp_authentication(args.bearer_env),
+                )
+                return _mcp_inspection_mapping(inspection)
+            if args.mcp_command == "attach":
+                selections = tuple(
+                    MCPToolSelection(
+                        remote_name=remote_name,
+                        local_alias=local_alias,
+                        description=description,
+                        result_sensitivity=ModelSensitivity(result_sensitivity),
+                    )
+                    for remote_name, local_alias, description, result_sensitivity in (
+                        args.tool
+                    )
+                )
+                status = await agent.attach_mcp_server(
+                    endpoint=args.endpoint,
+                    authentication=_mcp_authentication(args.bearer_env),
+                    maximum_outbound_sensitivity=ModelSensitivity(
+                        args.maximum_outbound_sensitivity
+                    ),
+                    selections=selections,
+                    binding_id=args.binding_id,
+                )
+                return _mcp_status_mapping(status)
+            if args.mcp_command == "status":
+                statuses = await agent.list_mcp_servers()
+                if args.binding_id is not None:
+                    statuses = tuple(
+                        status
+                        for status in statuses
+                        if status.binding.binding_id == args.binding_id
+                    )
+                    if not statuses:
+                        raise ValueError("MCP binding does not exist")
+                return [_mcp_status_mapping(status) for status in statuses]
+            if args.mcp_command == "refresh":
+                return _mcp_status_mapping(
+                    await agent.refresh_mcp_server(args.binding_id)
+                )
+            if not args.yes:
+                raise ValueError("mcp revoke requires --yes")
+            return _mcp_status_mapping(await agent.revoke_mcp_server(args.binding_id))
         if args.command == "postgresql-update-readiness":
             readiness_result = await agent.postgresql_update_readiness(
                 args.source_id,
@@ -1270,14 +1434,16 @@ async def _execute(args: argparse.Namespace) -> object:
                     ],
                 }
             if args.memory_command == "list-candidates":
-                status = (
+                candidate_status = (
                     None
                     if args.status is None
                     else LearningCandidateStatus(args.status)
                 )
                 return [
                     _learning_candidate_mapping(view)
-                    for view in await agent.list_learning_candidates(status=status)
+                    for view in await agent.list_learning_candidates(
+                        status=candidate_status
+                    )
                 ]
             if args.memory_command == "show-candidate":
                 view = await agent.read_learning_candidate(args.candidate_id)

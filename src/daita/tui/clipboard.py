@@ -1,4 +1,4 @@
-"""One truthful bounded clipboard path for the Textual presentation."""
+"""Copy bounded terminal content through pbcopy or OSC 52 and report the mechanism."""
 
 from __future__ import annotations
 

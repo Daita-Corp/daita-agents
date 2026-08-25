@@ -116,15 +116,48 @@ model like any other result, so it can correct the call on the next step. The
 loop has bounded steps, wall time, tokens, and estimated cost; it does not add
 a verifier pass or a session runtime.
 
-Data access is read first. All current data tools are non-side-effecting reads
-except the explicitly scoped PostgreSQL update. SQL and local paths are
-checked against the current catalog before source I/O, and every requested tool
-call receives one ordered result even if another call fails.
+Data access is read first. Capability metadata records data access separately
+from operational effect: ordinary queries read data without an operational
+effect, the durable-profile start reads current catalog scope and starts one
+job, and the explicitly scoped PostgreSQL update is the only current data
+mutation. SQL and local paths are checked against the current catalog before
+source I/O, and every requested tool call receives one ordered result even if
+another call fails.
 
 Agent identity, source registrations, catalog snapshots, transcripts, and
 terminal results live in a small SQLite database inside the agent home.
 Conversation continuity projects a bounded tail of completed runs: at most 8
 runs, 40 messages, and 24,000 UTF-8 bytes.
+
+The `start_data_profile` capability can freeze one exact read-only profile job
+over current admitted resources. Its `JobRun` is persisted before background
+work, continues under the currently open agent host after the originating
+model run finishes, and produces a bounded result plus one verified JSON
+artifact. `Agent.list_jobs`, `inspect_job`, `read_job_result`, and `cancel_job`
+provide bounded lifecycle access. The model-facing lifecycle tools use the same
+agent ownership boundary, so a new conversation can list the agent's jobs,
+inspect one, read its result, or cancel it. The originating conversation remains
+visible as provenance rather than acting as an access gate. Work pauses while no
+agent host is open and safe stale attempts are fenced on reopen; Daita does not
+run a resident daemon.
+
+The external-executor contract currently has deterministic offline conformance
+coverage only. No real external job profile ships, and no connected service is
+selected automatically or used as a fallback.
+
+Explicitly admitted remote MCP servers can contribute read-only tools through
+the same registry, runtime, ordered result, transcript, and context path.
+Bindings use remote Streamable HTTP, exact allowlists, secret references,
+call-time identity/schema rechecks, and per-binding revocation; remote metadata
+never authorizes or instructs the agent. Agent open is network-free: accepted
+metadata composes immutable declarations locally, while clients initialize and
+recheck exact remote identity only at an admitted call. Large surfaces use a
+bounded per-run catalog with stable direct definitions and transcript-bound
+`tool_search` → `tool_describe` → `tool_call` deferred invocation. In the TUI,
+`/mcp` opens a grouped
+server manager and `/mcp add` guides endpoint inspection, multi-tool selection,
+read-only attestation, and controlled activation. See
+[Remote MCP read connectivity](docs/MCP_CONNECTIVITY.md).
 
 Memory and skills are bounded, advisory Markdown. They are not source truth,
 authorization, or evidence. Agent proposed changes occur only in the
@@ -142,10 +175,12 @@ File requests use the same direct loop. Exact SQL results can become CSV or
 XLSX artifacts, while attached cataloged CSV and JSON resources can be copied
 byte-for-byte without passing source bytes through the model. A later turn can
 use a bounded model-only `artifact_list` for the current conversation,
-`artifact_read` for a bounded preview, and `artifact_convert` for the supported
-Daita XLSX `Data` snapshot to CSV conversion. There is no public artifact
-inventory, CLI list command, hidden current-file pointer, or prompt keyword
-router.
+`artifact_read` for a bounded preview of an exact known ID owned by the agent,
+and `artifact_convert` for the supported current-conversation Daita XLSX `Data`
+snapshot to CSV conversion. This lets a new conversation read an exact artifact
+reference returned by a durable job without creating an agent-wide inventory.
+There is no public artifact inventory, CLI list command, hidden current-file
+pointer, or prompt keyword router.
 
 Local files are normally delivered automatically to the authorized default
 destination and reported with the verified saved path. Public recovery remains
@@ -180,17 +215,28 @@ daita memory --help
 daita skills --help
 ```
 
-## Manage local data
+## Manage jobs and local data
 
 The terminal provides confirmed lifecycle commands:
 
 ```text
+/jobs
+/jobs inspect <id>
+/jobs results <id>
+/jobs cancel <id>
 /source edit
 /source permissions
 /source detach <source>
 /conversation clear
 /agent delete
 ```
+
+`/jobs` opens the bounded durable-job manager. It lists up to 50 current jobs
+owned by the agent and provides direct refresh, lifecycle details, validated
+results, exact artifact references, and confirmed cancellation without using a
+model turn. The inspect, results, and cancel forms are equivalent power-user
+commands for a known job ID. Jobs still run only while that agent host is open;
+the manager does not add a daemon, scheduler, retry path, or generic job starter.
 
 `/source edit` changes the active source connection without dropping the
 working connection first. Daita validates and catalogs the edited connection,
@@ -229,7 +275,8 @@ the operation can be retried.
 ## Python and examples
 
 The public async API supports creating and opening agents, attaching sources,
-running questions, continuing conversations, and inspecting transcripts.
+administering explicit remote MCP read bindings, running questions, continuing
+conversations, and inspecting transcripts.
 Start with the deterministic offline
 [SQLite quickstart](examples/00_quickstart_sqlite_from_db.py), then explore
 the [examples guide](examples/README.md).
@@ -248,39 +295,16 @@ pipx reinstall daita-agents
 pipx uninstall daita-agents
 ```
 
-Local state has its own immutable, checksummed migration journal, independent
-of the package version. On the first normal launch after an upgrade, Daita
-validates a supported journal prefix under the existing per-agent writer lock
-and automatically applies its known missing suffix to a verified staged copy.
-It validates the complete result and atomically activates it only after every
-check succeeds. No separate state command, import, restore, or backup step is
-part of a routine upgrade, and existing agent homes should never be reset for a
-normal application update.
+The first production state format has not been frozen. During active North Star
+development, local agent homes have no backward-compatibility guarantee and may
+need to be recreated after a state-shape change. Daita keeps one current schema,
+one current shape per persisted record family, and one mutable checksummed
+development baseline; it does not migrate between unreleased formats.
 
-The upgrade preserves identity, configuration and secret references, settings,
-sources and catalogs, active-source selection, exact permissions, complete
-conversations and results, artifacts, approved memory and user profile, skills,
-semantics, learning state, and database-write receipts. Before activation Daita
-retains the verified prior database as one bounded `state.db.rollback-*`
-recovery point. Failure or cancellation before activation removes the staging
-files and will leave the prior database unchanged.
-
-Unknown, reordered, gapped, or checksum-mismatched journals, newer state from
-an attempted package downgrade, recognizable pre-1.0 homes, and damaged schemas
-fail closed without moving, replacing, emptying, or recreating the home. Install
-the same or a newer Daita release for newer state; opening an upgraded home with
-an older package is not a supported downgrade path. See the
-[local state upgrade contract](docs/LOCAL_STATE_UPGRADES.md).
-
-No manual backup is required for compatibility. A complete copy made while
-Daita is closed is optional disaster recovery, not a compatibility mechanism:
-
-```bash
-cp -a ~/.daita ~/.daita-backup-before-upgrade
-```
-
-Secret values stored in the OS keychain are referenced by the copied
-configuration but are not duplicated into the agent home.
+At the explicitly approved first production release, that complete state shape
+will become the first immutable baseline. Subsequent package upgrades will use
+the existing staged-copy migration engine automatically on first open. See
+[local state during development](docs/LOCAL_STATE_UPGRADES.md).
 
 Use `pipx reinstall daita-agents` to repair missing or damaged application
 dependencies. Uninstalling the application does not delete existing agent

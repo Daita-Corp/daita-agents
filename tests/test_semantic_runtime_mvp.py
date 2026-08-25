@@ -12,16 +12,18 @@ from daita import (
     ApprovalRequest,
     SemanticEvidenceKind,
 )
+from daita.capabilities import OperationalEffect
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import RunInput
+from daita.loop.models import LoopLimits, RunInput, ToolProjectionMode
 from daita.semantics import (
     SEMANTIC_DELETE_CAPABILITY_ID,
     SEMANTIC_DELETE_TOOL_NAME,
@@ -38,6 +40,7 @@ from daita.tui.commands import (
 )
 
 NOW = datetime(2026, 7, 28, 14, tzinfo=UTC)
+EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -156,11 +159,13 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         id_factory=_ids(),
         clock=lambda: NOW,
     )
     try:
-        runtime = agent._embedded._data_tool_runtime
+        runtime = agent._embedded._capability_runtime
+        semantic_domain = agent._embedded._semantic_domain
         projection_run = RunInput(
             id="projection-run",
             agent_id=agent.id,
@@ -169,9 +174,13 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             conversation_id="projection-conversation",
             source_id=source.id,
         )
-        runtime.select_explicit_learning_run(projection_run.id)
-        definitions = await runtime.definitions(projection_run)
-        runtime.clear_explicit_learning_run(projection_run.id)
+        semantic_domain.select_explicit_learning_run(projection_run.id)
+        catalog = await runtime.prepare_run(projection_run)
+        definitions = tuple(
+            runtime._registry.tool_definition(entry.view.name)
+            for entry in catalog.entries
+        )
+        semantic_domain.clear_explicit_learning_run(projection_run.id)
         names = {item.name for item in definitions}
         assert {
             SEMANTIC_LIST_TOOL_NAME,
@@ -190,8 +199,10 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             view, capability = registry.resolve_tool(name)
             assert view.capability_id == capability_id
             assert capability.id == capability_id
-            assert capability.side_effecting is (
-                name in {SEMANTIC_SAVE_TOOL_NAME, SEMANTIC_DELETE_TOOL_NAME}
+            assert capability.operational_effect is (
+                OperationalEffect.CHANGE_ADVISORY_CONTEXT
+                if name in {SEMANTIC_SAVE_TOOL_NAME, SEMANTIC_DELETE_TOOL_NAME}
+                else OperationalEffect.NONE
             )
         save_definition = next(
             item for item in definitions if item.name == SEMANTIC_SAVE_TOOL_NAME
@@ -206,7 +217,7 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
         assert isinstance(evidence_properties, Mapping)
         assert "run_id" not in evidence_properties
         assert "message_position" not in evidence_properties
-        ordinary = await runtime.definitions(
+        ordinary = await runtime.prepare_run(
             RunInput(
                 id="ordinary-run",
                 agent_id=agent.id,
@@ -221,8 +232,8 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             SEMANTIC_VIEW_TOOL_NAME,
             SEMANTIC_SAVE_TOOL_NAME,
             SEMANTIC_DELETE_TOOL_NAME,
-        }.intersection(item.name for item in ordinary)
-        incidental = await runtime.definitions(
+        }.intersection(item.view.name for item in ordinary.entries)
+        incidental = await runtime.prepare_run(
             RunInput(
                 id="incidental-run",
                 agent_id=agent.id,
@@ -237,7 +248,7 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             SEMANTIC_VIEW_TOOL_NAME,
             SEMANTIC_SAVE_TOOL_NAME,
             SEMANTIC_DELETE_TOOL_NAME,
-        }.intersection(item.name for item in incidental)
+        }.intersection(item.view.name for item in incidental.entries)
     finally:
         await agent.close()
 
@@ -254,6 +265,7 @@ async def test_missing_approval_and_denial_bind_current_evidence_without_state(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         id_factory=_ids(),
         clock=lambda: NOW,
     )
@@ -294,6 +306,7 @@ async def test_missing_approval_and_denial_bind_current_evidence_without_state(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=deny,
         id_factory=_ids("denied"),
         clock=lambda: NOW,
@@ -365,6 +378,7 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
@@ -445,6 +459,7 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
@@ -480,8 +495,10 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
             conversation_id="delete-approved-conversation",
             source_id=source.id,
         )
-        runtime = agent._embedded._data_tool_runtime
-        runtime.select_explicit_learning_run(delete_run.id)
+        runtime = agent._embedded._capability_runtime
+        semantic_domain = agent._embedded._semantic_domain
+        semantic_domain.select_explicit_learning_run(delete_run.id)
+        catalog = await runtime.prepare_run(delete_run)
         deleted = (
             await runtime.execute_all(
                 delete_run,
@@ -495,9 +512,11 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
                         },
                     ),
                 ),
+                projection=runtime.project(catalog, ()),
+                sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
-        runtime.clear_explicit_learning_run(delete_run.id)
+        semantic_domain.clear_explicit_learning_run(delete_run.id)
         assert deleted.is_error is False
         assert len(approvals) == 2
         assert await agent.read_semantic_annotation("booked-revenue") is None
@@ -532,23 +551,30 @@ async def test_state_change_during_semantic_approval_returns_state_changed(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
     )
     try:
-        runtime = agent._embedded._data_tool_runtime
-        original_validation = runtime._validate_semantic_preflight
+        semantic_domain = agent._embedded._semantic_domain
+        original_plan = semantic_domain.side_effect_plan
         validations = 0
 
-        async def state_changes(run, capability, fingerprint):
+        async def state_changes(run, call, capability, execution, fingerprint):
             nonlocal validations
             validations += 1
             if validations == 2:
                 raise SemanticValidationError("semantic facts changed")
-            return await original_validation(run, capability, fingerprint)
+            return await original_plan(
+                run,
+                call,
+                capability,
+                execution,
+                fingerprint,
+            )
 
-        monkeypatch.setattr(runtime, "_validate_semantic_preflight", state_changes)
+        monkeypatch.setattr(semantic_domain, "side_effect_plan", state_changes)
         await agent.learn("Booked revenue means booked_at.")
         result = _tool_results(provider)[0]
         assert _error_code(result) == "state_changed"
@@ -590,6 +616,7 @@ async def test_tool_result_evidence_is_valid_and_save_is_recalled_after_reopen(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
@@ -669,6 +696,7 @@ async def test_natural_language_and_learn_route_to_semantics_without_new_command
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,

@@ -1,4 +1,4 @@
-"""Immutable contracts shared by SQL analysis and catalog validation."""
+"""Define immutable SQL analysis, schema, reference, and validation records."""
 
 from __future__ import annotations
 

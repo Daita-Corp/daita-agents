@@ -1,10 +1,9 @@
-"""Managed-installer lifecycle smoke against one already-built candidate wheel.
+"""Managed-installer lifecycle smoke against one candidate wheel.
 
 The smoke renders deterministic immutable download fixtures into the canonical
-``scripts/install.sh`` source. With a baseline wheel, it creates agent state
-under that package, installs the distinct candidate artifact (including during
-same-package-version release development), and opens the state to certify its
-format migration. It does not claim public artifact, clean-machine, or
+``scripts/install.sh`` source. It certifies install, repair, rollback, and
+uninstall mechanics for the same pre-production artifact. It does not claim
+cross-version state compatibility, public artifact, clean-machine, or
 real-terminal evidence and it never contacts the public installer endpoint.
 
 By default, uv and Python are deterministic local fixtures. Supplying the five
@@ -18,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import sqlite3
 import subprocess
 import tempfile
 from pathlib import Path
@@ -35,7 +33,6 @@ from installer_fixtures import (
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--candidate-wheel", type=Path, required=True)
-    parser.add_argument("--baseline-wheel", type=Path)
     parser.add_argument("--real-uv-archive", type=Path)
     parser.add_argument("--real-uv-version")
     parser.add_argument("--real-uv-member")
@@ -53,10 +50,6 @@ def _arguments() -> argparse.Namespace:
         value is not None for value in real_values
     ):
         parser.error("all five --real-* bootstrap arguments are required together")
-    candidate = arguments.candidate_wheel.resolve(strict=True)
-    _, candidate_version, _ = wheel_metadata(candidate)
-    if candidate_version != "1.0.0" and arguments.baseline_wheel is None:
-        parser.error("later 1.x candidates require --baseline-wheel")
     return arguments
 
 
@@ -121,35 +114,10 @@ def _tree_hashes(root: Path) -> dict[str, str]:
     }
 
 
-def _without_state_databases(values: dict[str, str]) -> dict[str, str]:
-    return {
-        name: digest
-        for name, digest in values.items()
-        if not name.endswith("/state.db")
-        and "/state.db.rollback-" not in f"/{name}"
-        and "/run/" not in f"/{name}"
-    }
-
-
 def _without_run_files(values: dict[str, str]) -> dict[str, str]:
     return {
         name: digest for name, digest in values.items() if "/run/" not in f"/{name}"
     }
-
-
-def _database_rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
-    with sqlite3.connect(path) as connection:
-        tables = tuple(
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-            )
-        )
-        return {
-            table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
-            for table in tables
-        }
 
 
 def _current_generation(root: Path) -> Path:
@@ -213,56 +181,22 @@ def main() -> int:
         keychain.write_text("no real keychain access", encoding="utf-8")
         sentinels = {outside: sha256(outside), keychain: sha256(keychain)}
 
-        if arguments.baseline_wheel is None:
-            active_fixture = _create_fixture(
-                workspace / "candidate-fixture",
-                wheel=candidate,
-                arguments=arguments,
-                release_sequence=1,
-            )
-            environment = fixture_environment(active_fixture, home)
-            _run(
-                [
-                    "bash",
-                    str(active_fixture.installer),
-                    "--no-onboard",
-                    "--no-modify-path",
-                ],
-                env=environment,
-            )
-        else:
-            baseline = arguments.baseline_wheel.resolve(strict=True)
-            baseline_name, baseline_version, _ = wheel_metadata(baseline)
-            if baseline_name != "daita-agents":
-                raise AssertionError("baseline is not a daita-agents wheel")
-            if baseline_version.startswith("0.") or baseline == candidate:
-                raise AssertionError(
-                    "upgrade smoke requires a distinct supported 1.x baseline wheel"
-                )
-            baseline_fixture = _create_fixture(
-                workspace / "baseline-fixture",
-                wheel=baseline,
-                arguments=arguments,
-                installer_version=f"{baseline_version}-fixture",
-                release_sequence=1,
-            )
-            environment = fixture_environment(baseline_fixture, home)
-            _run(
-                [
-                    "bash",
-                    str(baseline_fixture.installer),
-                    "--no-onboard",
-                    "--no-modify-path",
-                ],
-                env=environment,
-            )
-            active_fixture = _create_fixture(
-                workspace / "candidate-fixture",
-                wheel=candidate,
-                arguments=arguments,
-                installer_version=f"{candidate_version}-fixture",
-                release_sequence=2,
-            )
+        active_fixture = _create_fixture(
+            workspace / "candidate-fixture",
+            wheel=candidate,
+            arguments=arguments,
+            release_sequence=1,
+        )
+        environment = fixture_environment(active_fixture, home)
+        _run(
+            [
+                "bash",
+                str(active_fixture.installer),
+                "--no-onboard",
+                "--no-modify-path",
+            ],
+            env=environment,
+        )
 
         environment = fixture_environment(active_fixture, home)
         launcher = home / ".local" / "bin" / "daita"
@@ -327,20 +261,6 @@ asyncio.run(main())
         artifact = agent_root / "preserved-artifact.csv"
         artifact.write_text("id,value\n1,preserved\n", encoding="utf-8")
         expected_agent_hashes = _tree_hashes(agent_root)
-        state_path = agent_root / "agents" / "preservation-agent" / "state.db"
-        expected_database_rows = _database_rows(state_path)
-
-        if arguments.baseline_wheel is not None:
-            _run(
-                [
-                    "bash",
-                    str(active_fixture.installer),
-                    "--no-onboard",
-                    "--no-modify-path",
-                ],
-                env=environment,
-            )
-            _assert_preserved(agent_root, expected_agent_hashes, sentinels)
 
         version = _run([str(launcher), "--version"], env=environment)
         if version.stdout != f"daita {candidate_version}\n":
@@ -360,70 +280,10 @@ asyncio.run(main())
             env=environment,
         )
         opened_agent_hashes = _tree_hashes(agent_root)
-        if arguments.baseline_wheel is None:
-            if _without_run_files(opened_agent_hashes) != _without_run_files(
-                expected_agent_hashes
-            ):
-                raise AssertionError("current-format managed open changed agent state")
-        else:
-            if _without_state_databases(
-                opened_agent_hashes
-            ) != _without_state_databases(expected_agent_hashes):
-                before_files = _without_state_databases(expected_agent_hashes)
-                after_files = _without_state_databases(opened_agent_hashes)
-                changed = sorted(
-                    name
-                    for name in set(before_files) | set(after_files)
-                    if before_files.get(name) != after_files.get(name)
-                )
-                raise AssertionError(
-                    "managed candidate open changed state outside the migrated database: "
-                    + ", ".join(changed)
-                )
-            migrated_rows = _database_rows(state_path)
-            if any(
-                migrated_rows.get(table) != rows
-                for table, rows in expected_database_rows.items()
-                if table
-                not in {"database_write_receipts", "sources", "state_migrations"}
-            ):
-                raise AssertionError(
-                    "managed candidate migration changed baseline-owned rows"
-                )
-            expected_journal = (
-                (
-                    1,
-                    "20260810_database_write_receipts",
-                    "0cf5d23bf0426851e51c24450d1f8febd221880e74c78fc39648b6a1dd015b84",
-                ),
-                (
-                    2,
-                    "20260811_postgresql_write_admission",
-                    "451840240521fe5ad424d43e0bc5b7df2d124b3261b35be64b53bd36e08431d0",
-                ),
-                (
-                    3,
-                    "20260812_scoped_source_permissions",
-                    "2ed3f7017f9d4c683ee17a0ba43c88ad4452c5af1b06223343cd43248f699d95",
-                ),
-                (
-                    4,
-                    "20260814_generalized_postgresql_updates",
-                    "b08069f61481986937a864d33471185c6fbf031affe81f275a271f0e56a8f428",
-                ),
-            )
-            with sqlite3.connect(state_path) as connection:
-                journal = tuple(
-                    connection.execute(
-                        "SELECT ordinal, migration_id, checksum "
-                        "FROM state_migrations ORDER BY ordinal"
-                    )
-                )
-            if journal != expected_journal:
-                raise AssertionError(
-                    "managed candidate did not stamp the immutable migration journal"
-                )
-            expected_agent_hashes = opened_agent_hashes
+        if _without_run_files(opened_agent_hashes) != _without_run_files(
+            expected_agent_hashes
+        ):
+            raise AssertionError("current-format managed open changed agent state")
 
         generation = _current_generation(managed_root)
         manifest = _manifest(generation / "manifest")

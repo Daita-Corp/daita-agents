@@ -1,4 +1,4 @@
-"""One concrete, bounded artifact store inside an admitted agent home."""
+"""Commit, read, list, and clean bounded artifacts within an admitted agent home."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ import os
 import re
 import stat
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import NoReturn, Protocol
+from typing import NoReturn, Protocol, cast
 from uuid import uuid4
 
 from .._json import canonical_json
@@ -129,6 +129,20 @@ class AgentHomeArtifactStore:
         )
         try:
             refs = await references.list_artifact_refs(agent_id)
+            reservation_loader = getattr(
+                references,
+                "list_reserved_artifact_ids",
+                None,
+            )
+            reservations: frozenset[tuple[str, str]]
+            if callable(reservation_loader):
+                load_reservations = cast(
+                    Callable[[str], Awaitable[frozenset[tuple[str, str]]]],
+                    reservation_loader,
+                )
+                reservations = await load_reservations(agent_id)
+            else:
+                reservations = frozenset()
         except asyncio.CancelledError:
             raise
         except ArtifactError as error:
@@ -143,7 +157,9 @@ class AgentHomeArtifactStore:
             store._admission_error.__cause__ = error
             return store
 
-        worker = asyncio.create_task(asyncio.to_thread(store._admit_and_cleanup, refs))
+        worker = asyncio.create_task(
+            asyncio.to_thread(store._admit_and_cleanup, refs, reservations)
+        )
         cancelled = False
         while not worker.done():
             try:
@@ -222,6 +238,20 @@ class AgentHomeArtifactStore:
             )
         return await asyncio.to_thread(self._read_ref, ref)
 
+    async def recover_reserved(
+        self,
+        run_id: str,
+        artifact_id: str,
+    ) -> ArtifactRef | None:
+        """Recover one exactly reserved published artifact after host loss."""
+
+        self._require_available()
+        return await asyncio.to_thread(
+            self._recover_reserved_sync,
+            run_id,
+            artifact_id,
+        )
+
     async def commit(
         self,
         draft: ArtifactDraft,
@@ -231,6 +261,7 @@ class AgentHomeArtifactStore:
         conversation_id: str,
         call_id: str,
         capability_id: str,
+        reserved_artifact_id: str | None = None,
     ) -> ArtifactRef:
         self._require_available()
         gate = _PublicationGate()
@@ -243,6 +274,7 @@ class AgentHomeArtifactStore:
                 conversation_id,
                 call_id,
                 capability_id,
+                reserved_artifact_id,
                 gate,
             )
         )
@@ -291,7 +323,11 @@ class AgentHomeArtifactStore:
                 self._admission_error.details,
             )
 
-    def _admit_and_cleanup(self, refs: tuple[ArtifactRef, ...]) -> None:
+    def _admit_and_cleanup(
+        self,
+        refs: tuple[ArtifactRef, ...],
+        reservations: frozenset[tuple[str, str]],
+    ) -> None:
         try:
             home = self.agent_home.resolve(strict=True)
             if not home.is_dir() or self.agent_home.is_symlink():
@@ -337,6 +373,8 @@ class AgentHomeArtifactStore:
                         raise OSError("artifact directory has an invalid identity")
                     ref = referenced.get(artifact_entry.name)
                     if ref is None:
+                        if (run_entry.name, artifact_entry.name) in reservations:
+                            continue
                         _remove_artifact_directory(artifact_path)
                         continue
                     if ref.run_id != run_entry.name:
@@ -356,6 +394,42 @@ class AgentHomeArtifactStore:
                 {"stage": "admission_cleanup"},
             ) from error
 
+    def _recover_reserved_sync(
+        self,
+        run_id: str,
+        artifact_id: str,
+    ) -> ArtifactRef | None:
+        if (
+            _RUN_ID.fullmatch(run_id) is None
+            or _ARTIFACT_ID.fullmatch(artifact_id) is None
+        ):
+            raise ArtifactError(
+                "artifact_storage_failed",
+                "The reserved artifact identity is invalid.",
+                {"stage": "reservation_identity"},
+            )
+        directory = self.root / run_id / artifact_id
+        if not directory.exists():
+            return None
+        try:
+            manifest = _read_regular(directory / "manifest.json", _MAX_MANIFEST_BYTES)
+            raw = json.loads(manifest.decode("utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("artifact manifest is not an object")
+            ref = artifact_ref_from_mapping(raw)
+            if ref.run_id != run_id or ref.artifact_id != artifact_id:
+                raise ValueError("reserved artifact manifest identity changed")
+            self._read_ref(ref)
+            return ref
+        except ArtifactError:
+            raise
+        except Exception as error:
+            raise ArtifactError(
+                "artifact_corrupt",
+                "The reserved job artifact could not be reconciled safely.",
+                {"artifact_id": artifact_id},
+            ) from error
+
     def _commit_sync(
         self,
         draft: ArtifactDraft,
@@ -364,6 +438,7 @@ class AgentHomeArtifactStore:
         conversation_id: str,
         call_id: str,
         capability_id: str,
+        reserved_artifact_id: str | None,
         gate: _PublicationGate,
     ) -> ArtifactRef:
         if not isinstance(draft, ArtifactDraft):
@@ -418,7 +493,7 @@ class AgentHomeArtifactStore:
             _check_quota(
                 "agent", "bytes", MAX_ARTIFACT_BYTES_PER_AGENT, agent_bytes + size
             )
-            artifact_id = self._id_factory("artifact")
+            artifact_id = reserved_artifact_id or self._id_factory("artifact")
             if (
                 not isinstance(artifact_id, str)
                 or _ARTIFACT_ID.fullmatch(artifact_id) is None

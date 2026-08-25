@@ -1,4 +1,4 @@
-"""Ready-agent chat surface."""
+"""Implement the ready-agent chat screen and interactive run flow."""
 
 from __future__ import annotations
 
@@ -150,6 +150,9 @@ class ChatScreen(Screen[None]):
         state: str,
         context_used: int | None = None,
         context_total: int | None = None,
+        active_jobs: int = 0,
+        active_reports: int = 0,
+        inbox_items: int = 0,
         too_small: bool = False,
     ) -> None:
         self.query_one(StatusBar).update_status(
@@ -159,6 +162,9 @@ class ChatScreen(Screen[None]):
             state=state,
             context_used=context_used,
             context_total=context_total,
+            active_jobs=active_jobs,
+            active_reports=active_reports,
+            inbox_items=inbox_items,
             too_small=too_small,
         )
         self.query_one(WelcomeView).update_identity(

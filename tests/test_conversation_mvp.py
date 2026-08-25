@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 import daita
 from daita import Agent
@@ -26,6 +27,7 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolDefinition,
@@ -39,6 +41,7 @@ from daita.loop import (
     LoopExit,
     LoopExitKind,
     RunInput,
+    ToolBatchOutcome,
     Transcript,
 )
 from daita.storage.sqlite import SQLiteStateStore
@@ -46,64 +49,121 @@ from daita.storage.sqlite import SQLiteStateStore
 NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
+async def _prepared_request(
+    builder: DataContextBuilder,
+    run: RunInput,
+    messages: tuple[CanonicalMessage, ...],
+    tools: tuple[ToolDefinition, ...],
+    *,
+    step: int,
+    final: bool = False,
+) -> ModelRequest:
+    current_start = max(
+        index
+        for index, message in enumerate(messages)
+        if message.role is MessageRole.USER
+    )
+    catalog = context_tool_catalog(run, tools)
+    snapshot = await builder.prepare(
+        run,
+        messages[: current_start + 1],
+        catalog,
+    )
+    return builder.project(
+        snapshot,
+        messages[current_start:],
+        step=step,
+        tool_context=context_step_projection(catalog),
+        final=final,
+    )
+
+
 def test_context_builder_exposes_only_fixed_absolute_history_bounds():
     assert "retain_messages" not in inspect.signature(DataContextBuilder).parameters
 
 
 class TranscriptContext:
-    async def build(self, run, messages, tools, *, step, final=False):
-        del run, step, final
-        return ModelRequest(messages=messages, tools=tools)
+    async def prepare(self, run, messages, tool_context):
+        del run
+        return messages[:-1], tool_context.provider_definitions
+
+    def project(
+        self,
+        snapshot,
+        messages,
+        *,
+        step,
+        tool_context,
+        final=False,
+        previous_request_input_tokens=None,
+    ):
+        del step, previous_request_input_tokens, tool_context
+        static, tools = snapshot
+        return ModelRequest(
+            messages=(*static, *messages),
+            tools=() if final else tools,
+        )
 
 
 class NoTools:
-    async def definitions(self, run):
-        del run
-        return ()
+    async def prepare_run(self, run):
+        return context_tool_catalog(run, ())
 
-    async def execute_all(self, run, calls):
-        del run
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
         assert calls == ()
-        return ()
+        return ToolBatchOutcome(())
 
 
 class ReplayTools:
-    async def definitions(self, run):
-        del run
-        return tuple(
-            ToolDefinition(
-                name=name,
-                description=name,
-                input_schema={"type": "object"},
-            )
-            for name in ("memory_set", "skill_save", "skill_delete", "skill_view")
+    async def prepare_run(self, run):
+        return context_tool_catalog(
+            run,
+            tuple(
+                ToolDefinition(
+                    name=name,
+                    description=name,
+                    input_schema={"type": "object"},
+                )
+                for name in ("memory_set", "skill_save", "skill_delete", "skill_view")
+            ),
         )
 
-    async def execute_all(self, run, calls):
-        del run
-        return tuple(
-            ToolResultBlock(
-                call_id=call.id,
-                output=(
-                    {
-                        "kind": "skill.document",
-                        "data": {
-                            "name": "secret-skill",
-                            "instructions": "SECRET SKILL BODY",
-                        },
-                    }
-                    if call.name == "skill_view"
-                    else {
-                        "kind": {
-                            "memory_set": "memory.replacement",
-                            "skill_save": "skill.saved",
-                            "skill_delete": "skill.deleted",
-                        }[call.name],
-                        "data": {"ok": True},
-                    }
-                ),
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
+        return ToolBatchOutcome(
+            tuple(
+                ToolResultBlock(
+                    call_id=call.id,
+                    output=(
+                        {
+                            "kind": "skill.document",
+                            "data": {
+                                "name": "secret-skill",
+                                "instructions": "SECRET SKILL BODY",
+                            },
+                        }
+                        if call.name == "skill_view"
+                        else {
+                            "kind": {
+                                "memory_set": "memory.replacement",
+                                "skill_save": "skill.saved",
+                                "skill_delete": "skill.deleted",
+                            }[call.name],
+                            "data": {"ok": True},
+                        }
+                    ),
+                )
+                for call in calls
             )
-            for call in calls
         )
 
 
@@ -111,55 +171,71 @@ class FreshQueryTools:
     def __init__(self):
         self.calls = []
 
-    async def definitions(self, run):
-        del run
-        return (
-            ToolDefinition(
-                name="data_query_postgresql",
-                description="Run a fresh read-only PostgreSQL query.",
-                input_schema={"type": "object"},
+    async def prepare_run(self, run):
+        return context_tool_catalog(
+            run,
+            (
+                ToolDefinition(
+                    name="data_query_postgresql",
+                    description="Run a fresh read-only PostgreSQL query.",
+                    input_schema={"type": "object"},
+                ),
             ),
         )
 
-    async def execute_all(self, run, calls):
-        del run
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
         self.calls.extend(calls)
-        return tuple(
-            ToolResultBlock(
-                call_id=call.id,
-                output={
-                    "kind": "data.postgresql.query_result",
-                    "data": {
-                        "columns": ["segment", "paid_revenue"],
-                        "rows": [{"segment": "enterprise", "paid_revenue": 321}],
-                        "total_rows": 1,
-                        "returned_rows": 1,
-                        "truncated": False,
-                        "resource_revisions": [
-                            {
-                                "resource_id": "orders",
-                                "revision": "sha256:" + ("d" * 64),
-                            }
-                        ],
-                        "source_id": "warehouse",
-                        "source_revision": "catalog:current",
+        return ToolBatchOutcome(
+            tuple(
+                ToolResultBlock(
+                    call_id=call.id,
+                    output={
+                        "kind": "data.postgresql.query_result",
+                        "data": {
+                            "columns": ["segment", "paid_revenue"],
+                            "rows": [{"segment": "enterprise", "paid_revenue": 321}],
+                            "total_rows": 1,
+                            "returned_rows": 1,
+                            "truncated": False,
+                            "resource_revisions": [
+                                {
+                                    "resource_id": "orders",
+                                    "revision": "sha256:" + ("d" * 64),
+                                }
+                            ],
+                            "source_id": "warehouse",
+                            "source_revision": "catalog:current",
+                        },
                     },
-                },
+                )
+                for call in calls
             )
-            for call in calls
         )
 
 
 class CatalogSpy:
-    def __init__(self, resources=()):
+    def __init__(self, resources=(), sources=()):
         self.queries = []
         self.resources = resources
+        self.sources = sources
+
+    async def admitted_model_sensitivity(
+        self, agent_id: str, source_ids: tuple[str, ...] = ()
+    ) -> ModelSensitivity:
+        del agent_id, source_ids
+        return ModelSensitivity.PUBLIC
 
     async def catalog_context(
         self,
         agent_id,
         query,
         *,
+        prior_query=None,
         limit,
         source_ids=(),
         resource_ids=(),
@@ -167,11 +243,13 @@ class CatalogSpy:
         del agent_id, limit, source_ids, resource_ids
         from daita._json import FrozenJsonObject
 
-        self.queries.append(query)
+        self.queries.append((query, prior_query))
         return FrozenJsonObject.from_mapping(
             {
                 "resources": self.resources,
+                "sources": self.sources,
                 "total_matches": len(self.resources),
+                "returned_count": len(self.resources),
                 "truncated": False,
                 "trust_classification": "untrusted_external_data",
             }
@@ -843,7 +921,8 @@ async def test_oversized_analytical_history_keeps_compact_contract_and_requeries
         supports_tools=True,
     )
     builder = DataContextBuilder(catalog, profile=profile)
-    request = await builder.build(
+    request = await _prepared_request(
+        builder,
         RunInput(
             id="enterprise-follow-up",
             agent_id="agent-history",
@@ -1140,13 +1219,14 @@ async def test_whole_request_budget_downgrades_full_turn_before_dropping_it():
         CatalogSpy(),
         profile=ModelProfile(
             id="mock:full-downgrade",
-            context_window_tokens=15_500,
+            context_window_tokens=10_000,
             max_output_tokens=1_000,
             supports_tools=True,
         ),
     )
     current = "current-run-message-must-remain-complete"
-    request = await builder.build(
+    request = await _prepared_request(
+        builder,
         RunInput(
             id="full-downgrade-run",
             agent_id="agent-history",
@@ -1253,7 +1333,7 @@ async def test_final_budget_omits_oldest_turns_and_preserves_current_exchange():
     catalog = CatalogSpy()
     profile = ModelProfile(
         id="mock:budget",
-        context_window_tokens=15_000,
+        context_window_tokens=9_500,
         max_output_tokens=1_000,
         supports_tools=True,
     )
@@ -1276,7 +1356,8 @@ async def test_final_budget_omits_oldest_turns_and_preserves_current_exchange():
             content=(ToolResultBlock(call_id=current_call.id, output={"value": 1}),),
         ),
     )
-    request = await builder.build(
+    request = await _prepared_request(
+        builder,
         RunInput(
             id="budget-run",
             agent_id="agent-history",
@@ -1298,7 +1379,7 @@ async def test_final_budget_omits_oldest_turns_and_preserves_current_exchange():
     assert roles[-3:] == [MessageRole.USER, MessageRole.ASSISTANT, MessageRole.TOOL]
 
 
-async def test_catalog_query_uses_current_and_most_recent_prior_user_message():
+async def test_catalog_queries_keep_current_and_most_recent_prior_user_separate():
     catalog = CatalogSpy()
     builder = DataContextBuilder(
         catalog,
@@ -1315,7 +1396,8 @@ async def test_catalog_query_uses_current_and_most_recent_prior_user_message():
             _simple_conversation_record(1),
         )
     )
-    request = await builder.build(
+    request = await _prepared_request(
+        builder,
         RunInput(
             id="referential-run",
             agent_id="agent-history",
@@ -1333,19 +1415,100 @@ async def test_catalog_query_uses_current_and_most_recent_prior_user_message():
         (),
         step=1,
     )
-    assert catalog.queries == ["Now only EMEA\n\nPrior user message:\nhistory user 1"]
+    assert catalog.queries == [("Now only EMEA", "history user 1")]
     system_text = request.messages[0].content[0]
     assert isinstance(system_text, TextBlock)
     assert (
         "fresh source/tool evidence outrank stale historical claims" in system_text.text
     )
+    assert (
+        "use its resource_id directly. Use catalog_search only when the target is "
+        "missing or ambiguous" in system_text.text
+    )
+
+
+async def test_context_fitting_retains_exact_current_anchor_and_updates_counts():
+    source_id = "source:exact-current"
+    resources = (
+        {
+            "kind": "table",
+            "match_reasons": ("resource_name_exact_mention",),
+            "name": "exact_current_target",
+            "resource_id": "resource:exact-current",
+            "revision": "sha256:" + ("a" * 64),
+            "sensitivity": "internal",
+            "source_id": source_id,
+        },
+        {
+            "kind": "table",
+            "match_reasons": ("resource_name_exact_mention",),
+            "name": "prior_target_" + ("p" * 30_000),
+            "resource_id": "resource:prior",
+            "revision": "sha256:" + ("b" * 64),
+            "sensitivity": "internal",
+            "source_id": source_id,
+        },
+        {
+            "kind": "table",
+            "match_reasons": ("resource_name_contains",),
+            "name": "broad_candidate_" + ("b" * 30_000),
+            "resource_id": "resource:broad",
+            "revision": "sha256:" + ("c" * 64),
+            "sensitivity": "internal",
+            "source_id": source_id,
+        },
+    )
+    sources = (
+        {
+            "source_id": source_id,
+            "source_revision": "catalog:sha256:" + ("d" * 64),
+            "sync_id": "catalog-sync-current",
+        },
+    )
+    catalog = CatalogSpy(resources, sources)
+    builder = DataContextBuilder(
+        catalog,
+        profile=ModelProfile(
+            id="mock:catalog-fitting",
+            context_window_tokens=20_000,
+            max_output_tokens=1_000,
+            supports_tools=True,
+        ),
+    )
+    run = RunInput(
+        id="catalog-fitting-run",
+        agent_id="agent-history",
+        message="Profile exact_current_target",
+        created_at=NOW,
+        conversation_id="catalog-fitting-conversation",
+    )
+    request = await _prepared_request(
+        builder,
+        run,
+        (
+            CanonicalMessage(
+                role=MessageRole.USER,
+                content=(TextBlock(run.message),),
+            ),
+        ),
+        (),
+        step=1,
+    )
+    system = request.messages[0].content[0]
+    assert isinstance(system, TextBlock)
+    assert "exact_current_target" in system.text
+    assert "prior_target_" not in system.text
+    assert "broad_candidate_" not in system.text
+    assert '"returned_count":1' in system.text
+    assert '"total_matches":3' in system.text
+    assert '"truncated":true' in system.text
 
 
 async def test_context_overflow_fails_before_provider_and_is_not_replayed(tmp_path):
     provider = MockModelProvider((_stop("must not run"),))
     tiny_profile = ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=2_000,
+        context_window_tokens=20_000,
         max_output_tokens=500,
         supports_tools=True,
     )
@@ -1356,7 +1519,7 @@ async def test_context_overflow_fails_before_provider_and_is_not_replayed(tmp_pa
         model_profile=tiny_profile,
     )
     try:
-        failed = await agent.run("overflow sentinel " + ("x" * 2_000))
+        failed = await agent.run("overflow sentinel " + ("x" * 80_000))
         assert failed.kind is LoopExitKind.FAILED
         assert failed.reason == "context_window_exceeded"
         assert provider.requests == ()
@@ -1419,18 +1582,24 @@ async def test_inspection_keeps_nonreplayable_runs_but_history_excludes_them(tmp
                     content=(TextBlock(sentinel),),
                 ),
             )
-            await store.finish(
-                LoopExit(
-                    run_id=run.id,
-                    conversation_id=first.conversation_id,
-                    kind=kind,
-                    reason=kind.value,
-                    created_at=NOW,
-                    final_text=(
-                        "claimed complete" if kind is LoopExitKind.COMPLETED else None
-                    ),
-                )
+            terminal = LoopExit(
+                run_id=run.id,
+                conversation_id=first.conversation_id,
+                kind=kind,
+                reason=kind.value,
+                created_at=NOW,
+                final_text=(
+                    "claimed complete" if kind is LoopExitKind.COMPLETED else None
+                ),
             )
+            if kind is LoopExitKind.COMPLETED:
+                with pytest.raises(
+                    ValueError,
+                    match="atomic transcript completion",
+                ):
+                    await store.finish(terminal)
+            else:
+                await store.finish(terminal)
         unfinished = RunInput(
             id="manual-unfinished",
             agent_id=agent_id,
@@ -1479,7 +1648,8 @@ async def test_inspection_keeps_nonreplayable_runs_but_history_excludes_them(tmp
         assert records[3].result is not None
         assert records[1].result.kind is LoopExitKind.FAILED
         assert records[2].result.kind is LoopExitKind.INTERRUPTED
-        assert records[3].result.kind is LoopExitKind.COMPLETED
+        assert records[3].result.kind is LoopExitKind.INTERRUPTED
+        assert records[3].result.reason == "previous_process_terminated"
     finally:
         await reopened.close()
 
@@ -1569,6 +1739,9 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
         "revision": revision,
         "sensitivity": "internal",
         "source_id": source_id,
+    }
+    current_source = {
+        "source_id": source_id,
         "source_revision": source_revision,
         "sync_id": sync_id,
     }
@@ -1590,10 +1763,11 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
         content=(TextBlock(run.message),),
     )
 
-    unchanged = await DataContextBuilder(
-        CatalogSpy((current_resource,)),
-        profile=profile,
-    ).build(
+    unchanged = await _prepared_request(
+        DataContextBuilder(
+            CatalogSpy((current_resource,), (current_source,)),
+            profile=profile,
+        ),
         run,
         (*prior, current_user),
         (),
@@ -1606,13 +1780,17 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
     changed_resource = {
         **current_resource,
         "revision": "sha256:" + ("e" * 64),
+    }
+    changed_source = {
+        **current_source,
         "sync_id": "catalog-sync-refreshed",
         "source_revision": "catalog:sha256:" + ("f" * 64),
     }
-    changed = await DataContextBuilder(
-        CatalogSpy((changed_resource,)),
-        profile=profile,
-    ).build(
+    changed = await _prepared_request(
+        DataContextBuilder(
+            CatalogSpy((changed_resource,), (changed_source,)),
+            profile=profile,
+        ),
         run,
         (*prior, current_user),
         (),
@@ -1622,3 +1800,17 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
     assert "catalog.schema_slice" not in changed_text
     assert "'name', 'paid_revenue'" not in changed_text
     assert _HISTORY_OMISSION_MARKER in changed_text
+
+    missing_source = await _prepared_request(
+        DataContextBuilder(
+            CatalogSpy((current_resource,), ()),
+            profile=profile,
+        ),
+        run,
+        (*prior, current_user),
+        (),
+        step=1,
+    )
+    missing_source_text = repr(missing_source.messages)
+    assert "catalog.schema_slice" not in missing_source_text
+    assert _HISTORY_OMISSION_MARKER in missing_source_text

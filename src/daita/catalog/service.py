@@ -1,4 +1,4 @@
-"""Catalog-owned projections consumed by tools and the data domain."""
+"""Synchronize, index, search, inspect, and traverse canonical catalog state."""
 
 from __future__ import annotations
 
@@ -179,6 +179,21 @@ class _RankedCandidate:
     hit: CatalogSearchHit
     matched_terms: tuple[str, ...]
     rank_key: tuple[int, int, int, int, int, int, int, int, int, str, str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _CatalogHitSelection:
+    exact_anchors: tuple[CatalogSearchHit, ...]
+    broad_matches: tuple[CatalogSearchHit, ...]
+    relationship_neighbors: tuple[CatalogSearchHit, ...]
+
+    @property
+    def ordered_hits(self) -> tuple[CatalogSearchHit, ...]:
+        return (
+            *self.exact_anchors,
+            *self.broad_matches,
+            *self.relationship_neighbors,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,6 +518,28 @@ class CatalogService:
         *,
         readable_resource_ids: frozenset[str] | None = None,
     ) -> CatalogSearchResult:
+        selection = self._select_index_hits(
+            request,
+            indexes,
+            readable_resource_ids=readable_resource_ids,
+        )
+        all_hits = selection.ordered_hits
+        hits = tuple(all_hits[: request.limit])
+        return CatalogSearchResult(
+            request=request,
+            hits=hits,
+            total_matches=len(all_hits),
+            returned_count=len(hits),
+            truncated=len(all_hits) > len(hits),
+        )
+
+    def _select_index_hits(
+        self,
+        request: CatalogSearchRequest,
+        indexes: tuple[_SourceCatalogIndex, ...],
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
+    ) -> _CatalogHitSelection:
         for index in indexes:
             if index.agent_id != request.agent_id or (
                 request.source_ids and index.source_id not in request.source_ids
@@ -533,33 +570,47 @@ class CatalogService:
                     key=_resource_search_tie_key,
                 )
             )
+            exact_anchors: tuple[_RankedCandidate, ...] = ()
+            broad_candidates = candidates
         else:
             postings_by_candidate: dict[str, set[_IndexedPosting]] = {}
             candidate_resources: dict[str, CatalogResource] = {}
+            anchor_postings_by_candidate: dict[str, set[_IndexedPosting]] = {}
             for index in indexes:
-                exact_ids = index.exact_resource_names.get(
-                    normalized_query.complete,
-                    (),
-                )
-                for resource_id in exact_ids:
-                    resource = index.resources_by_id[resource_id]
-                    if (
-                        readable_resource_ids is not None
-                        and resource.id not in readable_resource_ids
-                    ) or (resource_kinds and resource.kind not in resource_kinds):
+                for (
+                    normalized_identity,
+                    exact_ids,
+                ) in index.exact_resource_names.items():
+                    if not _contains_bounded_identifier(
+                        normalized_query.complete,
+                        normalized_identity,
+                    ):
                         continue
-                    candidate_resources[resource_id] = resource
-                    matching = tuple(
-                        posting
-                        for posting in index.postings_by_resource_id.get(
-                            resource_id,
-                            (),
+                    for resource_id in exact_ids:
+                        resource = index.resources_by_id[resource_id]
+                        if (
+                            readable_resource_ids is not None
+                            and resource.id not in readable_resource_ids
+                        ) or (resource_kinds and resource.kind not in resource_kinds):
+                            continue
+                        candidate_resources[resource_id] = resource
+                        matching = tuple(
+                            posting
+                            for posting in index.postings_by_resource_id.get(
+                                resource_id,
+                                (),
+                            )
+                            if posting.field_kind
+                            in {"resource_name", "native_identity"}
+                            and posting.normalized_value == normalized_identity
                         )
-                        if posting.normalized_value == normalized_query.complete
-                    )
-                    postings_by_candidate.setdefault(resource_id, set()).update(
-                        matching
-                    )
+                        postings_by_candidate.setdefault(resource_id, set()).update(
+                            matching
+                        )
+                        anchor_postings_by_candidate.setdefault(
+                            resource_id,
+                            set(),
+                        ).update(matching)
                 for term in significant_terms:
                     token_position = bisect_left(index.posting_tokens, term)
                     while token_position < len(index.posting_tokens):
@@ -582,7 +633,7 @@ class CatalogService:
                                 set(),
                             ).add(posting)
                         token_position += 1
-            candidates = tuple(
+            ranked_candidates = tuple(
                 _rank_index_candidate(
                     candidate_resources[resource_id],
                     tuple(sorted(postings, key=_posting_sort_key)),
@@ -591,7 +642,46 @@ class CatalogService:
                 )
                 for resource_id, postings in sorted(postings_by_candidate.items())
             )
-            candidates = _diversify_candidates(candidates, significant_terms)
+            anchor_resource_ids = frozenset(anchor_postings_by_candidate)
+            exact_anchors = tuple(
+                sorted(
+                    (
+                        _embedded_exact_anchor_candidate(
+                            candidate,
+                            tuple(
+                                sorted(
+                                    anchor_postings_by_candidate[
+                                        candidate.hit.resource_id
+                                    ],
+                                    key=_posting_sort_key,
+                                )
+                            ),
+                            whole_query_exact=(
+                                any(
+                                    posting.normalized_value
+                                    == normalized_query.complete
+                                    for posting in anchor_postings_by_candidate[
+                                        candidate.hit.resource_id
+                                    ]
+                                )
+                            ),
+                        )
+                        for candidate in ranked_candidates
+                        if candidate.hit.resource_id in anchor_resource_ids
+                    ),
+                    key=lambda candidate: candidate.rank_key,
+                )
+            )
+            broad_candidates = _diversify_candidates(
+                tuple(
+                    candidate
+                    for candidate in ranked_candidates
+                    if candidate.hit.resource_id not in anchor_resource_ids
+                ),
+                significant_terms,
+            )
+
+        candidates = (*exact_anchors, *broad_candidates)
 
         direct_ids = {candidate.hit.resource_id for candidate in candidates}
         neighbor_by_id: dict[
@@ -636,17 +726,15 @@ class CatalogService:
                 if existing is None or order < existing[0]:
                     neighbor_by_id[neighbor.id] = (order, hit)
 
-        direct_hits = tuple(candidate.hit for candidate in candidates)
+        exact_hits = tuple(candidate.hit for candidate in exact_anchors)
+        broad_hits = tuple(candidate.hit for candidate in broad_candidates)
         neighbors = tuple(
             hit for _, hit in sorted(neighbor_by_id.values(), key=lambda item: item[0])
         )
-        all_hits = (*direct_hits, *neighbors)
-        hits = tuple(all_hits[: request.limit])
-        return CatalogSearchResult(
-            request=request,
-            hits=hits,
-            total_matches=len(all_hits),
-            truncated=len(all_hits) > len(hits),
+        return _CatalogHitSelection(
+            exact_anchors=exact_hits,
+            broad_matches=broad_hits,
+            relationship_neighbors=neighbors,
         )
 
     async def schema_slice(
@@ -1978,31 +2066,6 @@ class CatalogService:
             )
         return registration
 
-    async def _current_resource_sync(
-        self,
-        agent_id: str,
-        resource: CatalogResource,
-        sync_by_id: dict[str, CatalogSync],
-    ) -> CatalogSync:
-        sync = sync_by_id.get(resource.current_sync_id)
-        if sync is None:
-            loaded = await self._store.load_sync(
-                agent_id,
-                resource.current_sync_id,
-            )
-            if loaded is None:
-                raise CatalogStoreError("catalog resource lacks its current sync")
-            sync = loaded
-            sync_by_id[sync.id] = sync
-        if (
-            sync.agent_id != agent_id
-            or sync.source_id != resource.source_id
-            or sync.id != resource.current_sync_id
-            or sync.status is not CatalogSyncStatus.SUCCEEDED
-        ):
-            raise CatalogStoreError("catalog resource sync is not current")
-        return sync
-
     def _schema_resource_structure(
         self,
         facets: tuple[CatalogFacet, ...],
@@ -2155,59 +2218,158 @@ class CatalogService:
         agent_id: str,
         query: str,
         *,
+        prior_query: str | None = None,
         limit: int,
         source_ids: tuple[str, ...] = (),
         resource_ids: tuple[str, ...] = (),
         readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
-        result = await self.search(
-            CatalogSearchRequest(
+        request_limit = (
+            CATALOG_MAX_LIMIT if resource_ids else min(limit, CATALOG_MAX_LIMIT)
+        )
+        current_request = CatalogSearchRequest(
+            agent_id=agent_id,
+            query=query,
+            source_ids=source_ids,
+            limit=request_limit,
+        )
+        prior_request = (
+            None
+            if prior_query is None
+            else CatalogSearchRequest(
                 agent_id=agent_id,
-                query=query,
+                query=prior_query,
                 source_ids=source_ids,
-                limit=(
-                    CATALOG_MAX_LIMIT if resource_ids else min(limit, CATALOG_MAX_LIMIT)
-                ),
-            ),
-            readable_resource_ids=readable_resource_ids,
-        )
-        hits = tuple(
-            hit
-            for hit in result.hits
-            if not resource_ids or hit.resource_id in resource_ids
-        )[:limit]
-        sync_by_id: dict[str, CatalogSync] = {}
-        current_by_id: dict[str, tuple[CatalogResource, CatalogSync]] = {}
-        for hit in hits:
-            resource = await self._active_resource(agent_id, hit.resource_id)
-            sync = await self._current_resource_sync(
-                agent_id,
-                resource,
-                sync_by_id,
+                limit=request_limit,
             )
-            current_by_id[hit.resource_id] = (resource, sync)
-        return FrozenJsonObject.from_mapping(
-            {
-                "resources": [
-                    {
-                        "kind": hit.kind.value,
-                        "name": hit.name,
-                        "resource_id": hit.resource_id,
-                        "revision": hit.revision,
-                        "sensitivity": hit.sensitivity.value,
-                        "source_id": hit.source_id,
-                        "source_revision": current_by_id[hit.resource_id][
-                            1
-                        ].source_revision,
-                        "sync_id": current_by_id[hit.resource_id][0].current_sync_id,
-                    }
-                    for hit in hits
-                ],
-                "total_matches": len(hits),
-                "truncated": result.truncated,
-                "trust_classification": "untrusted_external_data",
-            }
         )
+        for attempt in range(2):
+            active_source_ids = await self._active_source_ids(agent_id)
+            scoped_source_ids = (
+                tuple(
+                    source_id
+                    for source_id in active_source_ids
+                    if source_id in source_ids
+                )
+                if source_ids
+                else active_source_ids
+            )
+            refs = (
+                ()
+                if not active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    agent_id,
+                    active_source_ids,
+                )
+            )
+            await self._evict_stale_indexes(agent_id, active_source_ids, refs)
+            selected_refs = tuple(
+                ref for ref in refs if ref.source_id in scoped_source_ids
+            )
+            indexes: list[_SourceCatalogIndex] = []
+            generation_changed = False
+            for ref in selected_refs:
+                try:
+                    indexes.append(await self._index_for_ref(ref))
+                except _CatalogGenerationChanged:
+                    generation_changed = True
+                    break
+            if generation_changed:
+                if attempt == 0:
+                    continue
+                break
+
+            indexed = tuple(indexes)
+            resources_by_id = {
+                resource.id: resource
+                for index in indexed
+                for resource in index.resources_by_id.values()
+            }
+            if resource_ids:
+                selected_resources: dict[str, CatalogResource] = {}
+                for resource_id in resource_ids:
+                    resource = resources_by_id.get(resource_id)
+                    if resource is None or (
+                        readable_resource_ids is not None
+                        and resource_id not in readable_resource_ids
+                    ):
+                        raise CatalogResourceNotFoundError(agent_id, resource_id)
+                    selected_resources[resource_id] = resource
+                all_hits = tuple(
+                    _resource_id_hit(resource)
+                    for resource in sorted(
+                        selected_resources.values(),
+                        key=_resource_search_tie_key,
+                    )
+                )
+            else:
+                current_selection = self._select_index_hits(
+                    current_request,
+                    indexed,
+                    readable_resource_ids=readable_resource_ids,
+                )
+                prior_selection = (
+                    None
+                    if prior_request is None
+                    else self._select_index_hits(
+                        prior_request,
+                        indexed,
+                        readable_resource_ids=readable_resource_ids,
+                    )
+                )
+                all_hits = _merge_context_selections(
+                    current_selection,
+                    prior_selection,
+                )
+
+            hits = all_hits[: min(limit, CATALOG_MAX_LIMIT)]
+            index_by_source_id = {index.source_id: index for index in indexed}
+            source_ids_in_hits = {hit.source_id for hit in hits}
+            projection = FrozenJsonObject.from_mapping(
+                {
+                    "sources": [
+                        {
+                            "source_id": source_id,
+                            "source_revision": index_by_source_id[
+                                source_id
+                            ].snapshot.sync.source_revision,
+                            "sync_id": index_by_source_id[source_id].sync_id,
+                        }
+                        for source_id in sorted(source_ids_in_hits)
+                    ],
+                    "resources": [
+                        {
+                            "kind": hit.kind.value,
+                            "match_reasons": hit.match_reasons,
+                            "name": hit.name,
+                            "resource_id": hit.resource_id,
+                            "revision": hit.revision,
+                            "sensitivity": hit.sensitivity.value,
+                            "source_id": hit.source_id,
+                        }
+                        for hit in hits
+                    ],
+                    "total_matches": len(all_hits),
+                    "returned_count": len(hits),
+                    "truncated": len(all_hits) > len(hits),
+                    "trust_classification": "untrusted_external_data",
+                }
+            )
+
+            current_active_source_ids = await self._active_source_ids(agent_id)
+            current_refs = (
+                ()
+                if not current_active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    agent_id,
+                    current_active_source_ids,
+                )
+            )
+            if current_active_source_ids == active_source_ids and current_refs == refs:
+                return projection
+            if attempt == 1:
+                break
+        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
 
 
 def _resource_join_key(resource: CatalogResource) -> tuple[str, str, str]:
@@ -2515,6 +2677,26 @@ def _normalize_search_text(value: str) -> _NormalizedText:
     return _NormalizedText(complete=complete, tokens=bounded_tokens)
 
 
+def _contains_bounded_identifier(query: str, identifier: str) -> bool:
+    """Return whether one normalized identity occurs at identifier boundaries."""
+
+    if not identifier:
+        return False
+    start = query.find(identifier)
+    while start >= 0:
+        end = start + len(identifier)
+        before_is_identifier = start > 0 and _is_identifier_character(query[start - 1])
+        after_is_identifier = end < len(query) and _is_identifier_character(query[end])
+        if not before_is_identifier and not after_is_identifier:
+            return True
+        start = query.find(identifier, start + 1)
+    return False
+
+
+def _is_identifier_character(value: str) -> bool:
+    return value.isalnum() or value == "_"
+
+
 def _posting_sort_key(posting: _IndexedPosting) -> tuple[str, str, str, str]:
     return (
         posting.resource_id,
@@ -2549,6 +2731,98 @@ def _inventory_candidate(resource: CatalogResource) -> _RankedCandidate:
         matched_terms=(),
         rank_key=(0, 0, 0, 0, 0, 0, 0, 0, 0, normalized, resource.name, resource.id),
     )
+
+
+def _embedded_exact_anchor_candidate(
+    candidate: _RankedCandidate,
+    anchor_postings: tuple[_IndexedPosting, ...],
+    *,
+    whole_query_exact: bool,
+) -> _RankedCandidate:
+    if whole_query_exact:
+        return candidate
+    exact_native = int(
+        any(posting.field_kind == "native_identity" for posting in anchor_postings)
+    )
+    exact_name = int(
+        any(posting.field_kind == "resource_name" for posting in anchor_postings)
+    )
+    anchor_fields = tuple(
+        posting.field_name
+        for posting in sorted(
+            anchor_postings,
+            key=lambda posting: (
+                0 if posting.field_kind == "resource_name" else 1,
+                posting.field_name.casefold(),
+                posting.field_name,
+            ),
+        )
+    )
+    matched_fields = tuple(
+        dict.fromkeys((*anchor_fields, *candidate.hit.matched_fields))
+    )[:32]
+    return _RankedCandidate(
+        hit=CatalogSearchHit(
+            resource_id=candidate.hit.resource_id,
+            source_id=candidate.hit.source_id,
+            kind=candidate.hit.kind,
+            name=candidate.hit.name,
+            revision=candidate.hit.revision,
+            sensitivity=candidate.hit.sensitivity,
+            score=max(
+                candidate.hit.score,
+                float(exact_native * 200_000 + exact_name * 180_000),
+            ),
+            matched_fields=matched_fields,
+            match_reasons=("resource_name_exact_mention",),
+        ),
+        matched_terms=candidate.matched_terms,
+        rank_key=(
+            -exact_native,
+            -exact_name,
+            *candidate.rank_key[2:],
+        ),
+    )
+
+
+def _resource_id_hit(resource: CatalogResource) -> CatalogSearchHit:
+    return CatalogSearchHit(
+        resource_id=resource.id,
+        source_id=resource.source_id,
+        kind=resource.kind,
+        name=resource.name,
+        revision=resource.current_revision,
+        sensitivity=resource.sensitivity,
+        score=0.0,
+        matched_fields=(),
+        match_reasons=("resource_id_exact",),
+    )
+
+
+def _merge_context_selections(
+    current: _CatalogHitSelection,
+    prior: _CatalogHitSelection | None,
+) -> tuple[CatalogSearchHit, ...]:
+    prior_exact = () if prior is None else prior.exact_anchors
+    prior_broad = () if prior is None else prior.broad_matches
+    prior_neighbors = () if prior is None else prior.relationship_neighbors
+    ordered = (
+        current.exact_anchors,
+        prior_exact,
+        current.broad_matches,
+        prior_broad,
+        current.relationship_neighbors,
+        prior_neighbors,
+    )
+    selected: list[CatalogSearchHit] = []
+    selected_ids: set[str] = set()
+    for group in ordered:
+        for hit in group:
+            if hit.resource_id in selected_ids:
+                continue
+            selected.append(hit)
+            selected_ids.add(hit.resource_id)
+    return tuple(selected)
 
 
 def _rank_index_candidate(

@@ -1,4 +1,4 @@
-"""Deterministic scripted provider for loop and recovery tests."""
+"""Provide deterministic scripted model providers for loop and recovery tests."""
 
 from __future__ import annotations
 

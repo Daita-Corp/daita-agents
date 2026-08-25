@@ -1,10 +1,4 @@
-"""Bounded subscription-authentication flows owned by Daita.
-
-The Codex device flow is intentionally independent of the Codex executable.
-Daita stores the resulting OAuth bundle through its existing secret-reference
-boundary and refreshes it without reading or mutating another application's
-login state.
-"""
+"""Run Daita-owned Codex device authorization, refresh, and credential flows."""
 
 from __future__ import annotations
 

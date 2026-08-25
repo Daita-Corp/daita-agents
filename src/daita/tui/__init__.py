@@ -1,1 +1,1 @@
-"""Textual presentation package. Importing this package is the lazy UI boundary."""
+"""Mark the lazy import boundary for the Textual presentation package."""

@@ -1,6 +1,21 @@
-"""Daita agent."""
+"""Export the public APIs for configuring and running a Daita agent."""
 
-from .adapters import LocalDirectorySource, PostgreSQLSource, SQLiteSource
+from .adapters import (
+    LocalDirectorySource,
+    MCPAdmissionError,
+    MCPAuthentication,
+    MCPAuthenticationMode,
+    MCPBindingState,
+    MCPBindingStatus,
+    MCPError,
+    MCPInspectedTool,
+    MCPServerBinding,
+    MCPServerInspection,
+    MCPToolBinding,
+    MCPToolSelection,
+    PostgreSQLSource,
+    SQLiteSource,
+)
 from .adapters.postgresql_write import PostgreSQLUpdateReadiness
 from .agent import Agent
 from .artifacts import (
@@ -10,9 +25,22 @@ from .artifacts import (
     ArtifactPayload,
     ArtifactRef,
 )
+from .autonomy import (
+    DeliveryState,
+    DeliverySubject,
+    DeliverySubjectKind,
+    InboxItem,
+)
 from .capabilities import ApprovalDecision, ApprovalHandler, ApprovalRequest
 from .catalog import CatalogSummary
 from .config import AgentConfig
+from .jobs import (
+    JobExecutionMode,
+    JobInspection,
+    JobResultView,
+    JobStatus,
+    JobSummary,
+)
 from .learning_candidates import (
     DocumentCandidateContent,
     LearningCandidate,
@@ -33,7 +61,14 @@ from .llm import (
     RetryPolicy,
     create_llm_provider,
 )
-from .loop import ConversationRun, LoopExit, LoopExitKind, LoopLimits, Transcript
+from .loop import (
+    ConversationRun,
+    LoopExit,
+    LoopExitKind,
+    LoopLimits,
+    ToolProjectionMode,
+    Transcript,
+)
 from .observation import AgentEvent, AgentEventKind, AgentObserver
 from .semantics import (
     ResourceRevisionBinding,
@@ -70,6 +105,9 @@ __all__ = [
     "CatalogSummary",
     "LocalDirectorySource",
     "DocumentCandidateContent",
+    "DeliveryState",
+    "DeliverySubject",
+    "DeliverySubjectKind",
     "LearningCandidate",
     "LearningCandidateAction",
     "LearningCandidateError",
@@ -79,9 +117,27 @@ __all__ = [
     "LearningCandidateView",
     "LearningReviewResult",
     "LearningReviewStatus",
+    "JobExecutionMode",
+    "InboxItem",
+    "JobInspection",
+    "JobResultView",
+    "JobStatus",
+    "JobSummary",
     "LoopExit",
     "LoopExitKind",
     "LoopLimits",
+    "ToolProjectionMode",
+    "MCPAdmissionError",
+    "MCPAuthentication",
+    "MCPAuthenticationMode",
+    "MCPBindingState",
+    "MCPBindingStatus",
+    "MCPError",
+    "MCPInspectedTool",
+    "MCPServerBinding",
+    "MCPServerInspection",
+    "MCPToolBinding",
+    "MCPToolSelection",
     "ModelRoute",
     "ModelRouteCandidate",
     "PostgreSQLSource",

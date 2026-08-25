@@ -1,4 +1,4 @@
-"""Bounded tool status and result presentation."""
+"""Display bounded tool status, details, errors, and tabular result previews."""
 
 from __future__ import annotations
 

@@ -1,10 +1,4 @@
-"""Bounded inactive learning candidates and one-shot auxiliary review.
-
-The reviewer in this module is deliberately not an agent loop.  It makes at
-most one tool-free model request and can persist only inactive review material.
-Active memory, semantics, and skills remain owned by their existing foreground
-approval-gated capabilities.
-"""
+"""Define persisted learning candidates and their bounded one-shot review flow."""
 
 from __future__ import annotations
 

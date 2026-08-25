@@ -1,4 +1,4 @@
-"""Bounded local-file read capability over an injected source backend."""
+"""Declare and execute bounded reads of catalog-admitted local data files."""
 
 from __future__ import annotations
 
@@ -9,10 +9,11 @@ from ..._json import FrozenJsonObject
 from ...capabilities import (
     AccessMode,
     Capability,
+    CapabilityDeclarations,
     Executor,
-    ExtensionDeclarations,
-    ToolApplicability,
+    ToolDiscoveryMetadata,
     ToolExecution,
+    ToolExposureClass,
     ToolOutput,
     ToolView,
 )
@@ -207,15 +208,15 @@ def local_file_read_declarations(
     backend: LocalFileReadBackend,
 ) -> LocalFileReadDeclarations:
     executor = LocalFileReadExecutor(agent_id, backend)
-    extension = local_file_read_extension_declarations()
+    declarations = local_file_read_capability_declarations()
     return LocalFileReadDeclarations(
-        capabilities=extension.capabilities,
+        capabilities=declarations.capabilities,
         executors=(executor,),
-        tool_views=extension.tool_views,
+        tool_views=declarations.tool_views,
     )
 
 
-def local_file_read_extension_declarations() -> ExtensionDeclarations:
+def local_file_read_capability_declarations() -> CapabilityDeclarations:
     """Advertise the stable file-read contract without opening a local root."""
 
     capability = Capability(
@@ -234,18 +235,21 @@ def local_file_read_extension_declarations() -> ExtensionDeclarations:
         output_schema=_file_read_output_schema(),
         executor_id=LOCAL_FILE_READ_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        side_effecting=False,
     )
     view = ToolView(
         name=LOCAL_FILE_READ_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
-        applicability=ToolApplicability(
-            source_adapter_ids=("local-directory",),
-            minimum_active_sources=1,
+        discovery=ToolDiscoveryMetadata(
+            summary="Read bounded rows from one attached CSV or JSON resource.",
+            when_to_use="Use for validated values from an attached local data file.",
+            keywords=("data", "file", "csv", "json", "read"),
+            exposure_class=ToolExposureClass.CORE,
+            eager_priority=900,
         ),
     )
-    return ExtensionDeclarations(
+    return CapabilityDeclarations(
+        domain_owner_id="data",
         capabilities=(capability,),
         executor_ids=(LOCAL_FILE_READ_EXECUTOR_ID,),
         tool_views=(view,),
@@ -290,5 +294,5 @@ __all__ = [
     "LocalFileReadExecutor",
     "LocalFileReadResult",
     "local_file_read_declarations",
-    "local_file_read_extension_declarations",
+    "local_file_read_capability_declarations",
 ]

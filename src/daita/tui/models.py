@@ -1,4 +1,4 @@
-"""Small framework-neutral presentation records."""
+"""Define framework-neutral records and validation for the terminal presentation."""
 
 from __future__ import annotations
 

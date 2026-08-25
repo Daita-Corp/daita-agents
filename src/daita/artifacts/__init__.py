@@ -1,4 +1,4 @@
-"""Immutable artifact records exported by the focused local lifecycle."""
+"""Export artifact lifecycle records and local delivery types."""
 
 from .models import (
     ArtifactDeliveryReceipt,

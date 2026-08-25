@@ -1,4 +1,4 @@
-"""Canonical provider-neutral model records."""
+"""Define canonical messages, tool calls, requests, responses, usage, and profiles."""
 
 from __future__ import annotations
 
@@ -160,12 +160,36 @@ class ToolResultBlock:
     call_id: str
     output: Mapping[str, object] = field(default_factory=dict)
     is_error: bool = False
+    sensitivity: ModelSensitivity | None = None
+    sensitivity_provenance: Mapping[str, object] = field(default_factory=dict)
+    capability_id: str | None = None
+    executor_id: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.call_id, "tool-result call_id")
         if not isinstance(self.is_error, bool):
             raise TypeError("tool-result is_error must be a boolean")
+        if self.sensitivity is not None and not isinstance(
+            self.sensitivity, ModelSensitivity
+        ):
+            raise TypeError("tool-result sensitivity must be ModelSensitivity or None")
+        provenance = FrozenJsonObject.from_mapping(self.sensitivity_provenance)
+        if (self.sensitivity is None) is bool(provenance):
+            raise ValueError(
+                "tool-result sensitivity and provenance must be present together"
+            )
+        if self.is_error and self.sensitivity is not None:
+            raise ValueError("error tool results cannot establish sensitivity")
+        if (self.capability_id is None) != (self.executor_id is None):
+            raise ValueError(
+                "tool-result capability and executor lineage must be present together"
+            )
+        if self.capability_id is not None:
+            _required_text(self.capability_id, "tool-result capability_id")
+            assert self.executor_id is not None
+            _required_text(self.executor_id, "tool-result executor_id")
         object.__setattr__(self, "output", FrozenJsonObject.from_mapping(self.output))
+        object.__setattr__(self, "sensitivity_provenance", provenance)
 
 
 ContentBlock = TextBlock | ToolResultBlock
@@ -282,6 +306,7 @@ class ModelRequest:
     tools: tuple[ToolDefinition, ...] = ()
     response_schema: Mapping[str, object] | None = None
     sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
+    sensitivity_provenance: Mapping[str, object] = field(default_factory=dict)
     allow_parallel_tool_calls: bool | None = None
 
     def __post_init__(self) -> None:
@@ -310,6 +335,9 @@ class ModelRequest:
                 )
         if not isinstance(self.sensitivity, ModelSensitivity):
             raise TypeError("model-request sensitivity must be ModelSensitivity")
+        sensitivity_provenance = FrozenJsonObject.from_mapping(
+            self.sensitivity_provenance
+        )
         if self.allow_parallel_tool_calls is not None and not isinstance(
             self.allow_parallel_tool_calls,
             bool,
@@ -320,6 +348,11 @@ class ModelRequest:
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "response_schema", response_schema)
+        object.__setattr__(
+            self,
+            "sensitivity_provenance",
+            sensitivity_provenance,
+        )
 
 
 @dataclass(frozen=True, slots=True)

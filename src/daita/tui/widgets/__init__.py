@@ -1,1 +1,1 @@
-"""Focused Textual widgets for the Daita app."""
+"""Group reusable Textual widgets for chat, status, approvals, and welcome views."""

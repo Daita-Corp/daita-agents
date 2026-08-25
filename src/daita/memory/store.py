@@ -1,4 +1,4 @@
-"""Safe fixed-file storage for bounded advisory agent memory."""
+"""Validate and atomically store bounded MEMORY.md and USER.md documents."""
 
 from __future__ import annotations
 

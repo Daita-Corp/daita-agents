@@ -1,4 +1,4 @@
-"""Guarded PostgreSQL read backend invoked only by the runtime executor."""
+"""Execute catalog-validated, bounded read queries against PostgreSQL."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from ..domains.data.export_capabilities import (
 )
 from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_postgresql_read
-from ..errors import PluginError
+from ..errors import DaitaError
 from ..security import SecretProvider, default_secret_provider
 from ..storage.sqlite_records import SourcePermissionStateError
 from .postgresql import (
@@ -52,7 +52,7 @@ _MAX_VALUE_DEPTH = 32
 _BOUNDED_RESULT_MARKER = "/* daita:postgresql.bounded_result */"
 
 
-class PostgreSQLQueryError(PluginError):
+class PostgreSQLQueryError(DaitaError):
     """Normalized query-boundary failure without connector error leakage."""
 
     def __init__(self, code: str, message: str) -> None:
@@ -61,7 +61,7 @@ class PostgreSQLQueryError(PluginError):
         if not isinstance(message, str) or not message.strip():
             raise ValueError("query error message must be a non-empty string")
         self.code = code
-        super().__init__(message, plugin_id="postgresql", error_code=code)
+        super().__init__(message, error_code=code)
 
 
 class PostgreSQLQueryBackend:

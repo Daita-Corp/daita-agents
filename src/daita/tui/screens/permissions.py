@@ -1,4 +1,4 @@
-"""Read and PostgreSQL update scope review."""
+"""Review and edit source read scopes and PostgreSQL update permissions."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ class PermissionsScreen(Screen[bool]):
         self._preview: Any = None
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="permissions"):
+        with Vertical(id="permissions", classes="control-panel"):
             yield Label("Source permissions", id="onboard-title", markup=False)
             yield Static(
                 "Review exact read and update scopes.", id="perm-help", markup=False

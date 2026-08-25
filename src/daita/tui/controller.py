@@ -1,4 +1,4 @@
-"""Presentation adapter over the public Agent API."""
+"""Adapt the public Agent API into presentation-safe operations for Textual screens."""
 
 from __future__ import annotations
 
@@ -16,10 +16,20 @@ from daita import (
     Agent,
     ApprovalHandler,
     ConversationRun,
+    InboxItem,
+    JobInspection,
+    JobResultView,
+    JobStatus,
+    JobSummary,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningReviewStatus,
     LoopExit,
+    MCPAdmissionError,
+    MCPBindingState,
+    MCPBindingStatus,
+    MCPServerInspection,
+    MCPToolSelection,
     Transcript,
 )
 from daita.agent import (
@@ -425,8 +435,55 @@ class PresentationController:
     async def store_postgresql_password(self, password: str) -> SecretReference:
         return await self.require_agent().store_postgresql_password(password)
 
+    async def delete_postgresql_password(self, reference: SecretReference) -> None:
+        await self.require_agent().delete_postgresql_password(reference)
+
     async def probe_postgresql(self, **kwargs: Any) -> Any:
         return await self.require_agent().probe_postgresql(**kwargs)
+
+    async def probe_postgresql_source(
+        self,
+        source: Any,
+        *,
+        host: str,
+        port: int,
+        database: str,
+        username: str,
+        password: str | None,
+        ssl_mode: str,
+    ) -> Any:
+        """Probe edited PostgreSQL fields without changing the saved source."""
+
+        if source.adapter_id != "postgresql":
+            raise UserInputError("Only PostgreSQL sources expose schema discovery.")
+        agent = self.require_agent()
+        reference_text = source.configuration.get("credential_ref")
+        credential = (
+            SecretReference.parse(reference_text)
+            if isinstance(reference_text, str)
+            else None
+        )
+        temporary_credential: SecretReference | None = None
+        try:
+            if password:
+                temporary_credential = await agent.store_postgresql_password(password)
+                credential = temporary_credential
+            if credential is None:
+                raise UserInputError(
+                    "This PostgreSQL source has no saved password; enter a new password."
+                )
+            return await agent.probe_postgresql(
+                host=host,
+                port=port,
+                database=database,
+                username=username,
+                credential=credential,
+                ssl_mode=ssl_mode,
+            )
+        finally:
+            password = None
+            if temporary_credential is not None:
+                await agent.delete_postgresql_password(temporary_credential)
 
     async def attach_postgresql(self, **kwargs: Any) -> Any:
         return await self.require_agent().attach_postgresql(**kwargs)
@@ -587,6 +644,24 @@ class PresentationController:
     async def list_sources(self) -> tuple[Any, ...]:
         return await self.require_agent().list_sources()
 
+    async def list_jobs(self) -> tuple[JobSummary, ...]:
+        return await self.require_agent().list_jobs(limit=50)
+
+    async def list_inbox(self) -> tuple[InboxItem, ...]:
+        return await self.require_agent().inbox(limit=50)
+
+    async def acknowledge_inbox(self, delivery_id: str) -> InboxItem | None:
+        return await self.require_agent().acknowledge_inbox(delivery_id)
+
+    async def inspect_job(self, job_id: str) -> JobInspection | None:
+        return await self.require_agent().inspect_job(job_id)
+
+    async def read_job_result(self, job_id: str) -> JobResultView | None:
+        return await self.require_agent().read_job_result(job_id)
+
+    async def cancel_job(self, job_id: str) -> JobInspection | None:
+        return await self.require_agent().cancel_job(job_id)
+
     async def select_source(self, selector: str) -> Any:
         try:
             return await self.require_agent().select_source(selector)
@@ -701,6 +776,22 @@ class PresentationController:
                 await self._sources_text(),
                 conversation_id=conversation_id,
             )
+        if name == "/mcp":
+            return await self._mcp_command(parts)
+        if name == "/jobs":
+            return await self._jobs_command(parts)
+        if name == "/inbox":
+            if len(parts) == 1:
+                return CommandOutcome(
+                    "screen",
+                    screen="inbox",
+                    conversation_id=conversation_id,
+                )
+            return CommandOutcome(
+                "notice",
+                "Usage: /inbox",
+                conversation_id=conversation_id,
+            )
         if name == "/catalog" and len(parts) == 1:
             return CommandOutcome(
                 "screen",
@@ -772,18 +863,27 @@ class PresentationController:
                 payload={"source_id": source.id, "display_name": source.display_name},
             )
         if name == "/source" and len(parts) == 3 and parts[1] == "refresh":
-            await self.refresh_source(parts[2])
-            summary = await self.catalog_summary()
-            if summary.is_empty:
-                return CommandOutcome(
-                    "screen",
-                    screen="catalog_repair",
-                    conversation_id=conversation_id,
+            refreshed = await self.refresh_source(parts[2])
+            resources = await self.list_catalog_resources(source_id=refreshed.id)
+            noun = "resource" if len(resources) == 1 else "resources"
+            if resources:
+                message = (
+                    "Catalog refresh succeeded · "
+                    + safe_display(refreshed.display_name, fallback="source")
+                    + f" · {len(resources)} {noun}"
+                )
+            else:
+                message = (
+                    "Catalog refresh completed, but found no resources · "
+                    + safe_display(refreshed.display_name, fallback="source")
+                    + " · use /source edit to review its schemas or path"
                 )
             return CommandOutcome(
                 "screen",
+                message,
                 screen="catalog",
                 conversation_id=conversation_id,
+                payload={"catalog_notice_warning": not resources},
             )
         if name == "/source" and parts[1:] == ["permissions"]:
             return CommandOutcome(
@@ -828,6 +928,227 @@ class PresentationController:
         if name in BUILTIN_SLASH_COMMANDS:
             return CommandOutcome("notice", f"Usage: {name}")
         return CommandOutcome("notice", "Unknown command. Type / to browse commands.")
+
+    async def _jobs_command(self, parts: list[str]) -> CommandOutcome:
+        conversation_id = self.conversation_id
+        usage = (
+            "Usage: /jobs | /jobs inspect <id> | /jobs results <id> | "
+            "/jobs cancel <id>"
+        )
+        if len(parts) == 1:
+            return CommandOutcome(
+                "screen",
+                screen="jobs",
+                conversation_id=conversation_id,
+            )
+        if len(parts) != 3 or parts[1] not in {"inspect", "results", "cancel"}:
+            return CommandOutcome("notice", usage, conversation_id=conversation_id)
+        action, job_id = parts[1], parts[2]
+        if action != "cancel":
+            return CommandOutcome(
+                "screen",
+                screen="jobs",
+                conversation_id=conversation_id,
+                payload={"job_id": job_id, "view": action},
+            )
+        inspection = await self.inspect_job(job_id)
+        if inspection is None:
+            raise UserInputError("No durable job with that ID belongs to this agent.")
+        status = inspection.summary.status
+        if status not in {JobStatus.QUEUED, JobStatus.RUNNING}:
+            return CommandOutcome(
+                "notice",
+                "Job "
+                + safe_display(job_id, fallback="job", maximum=256)
+                + f" is {status.value} and cannot be cancelled.",
+                conversation_id=conversation_id,
+            )
+        return CommandOutcome(
+            "confirm",
+            "Cancel durable job "
+            + safe_display(job_id, fallback="job", maximum=256)
+            + "?\n"
+            + safe_display(
+                inspection.summary.job_kind,
+                fallback="job",
+                maximum=128,
+            )
+            + f" · {status.value}\n\nCancellation is requested immediately and cannot be undone.",
+            conversation_id=conversation_id,
+            screen="confirm_cancel_job",
+            payload={"job_id": job_id},
+        )
+
+    async def _mcp_command(self, parts: list[str]) -> CommandOutcome:
+        agent = self.require_agent()
+        conversation_id = self.conversation_id
+        if len(parts) == 1:
+            return CommandOutcome(
+                "screen",
+                screen="mcp_management",
+                conversation_id=conversation_id,
+            )
+        if parts[1:] == ["add"]:
+            return CommandOutcome(
+                "screen",
+                screen="mcp_setup",
+                conversation_id=conversation_id,
+            )
+        if parts[1:] == ["status"]:
+            statuses = await agent.list_mcp_servers()
+            if not statuses:
+                message = "MCP binding details  none"
+            else:
+                lines = ["MCP binding details"]
+                for status in statuses:
+                    binding = status.binding
+                    display_state = (
+                        "needs refresh"
+                        if binding.state is MCPBindingState.STALE
+                        else (
+                            "revoked"
+                            if binding.state is MCPBindingState.REVOKED
+                            else (
+                                "restart required"
+                                if status.reopen_required
+                                else (
+                                    "ready"
+                                    if status.active_in_runtime
+                                    else "unavailable"
+                                )
+                            )
+                        )
+                    )
+                    lines.append(
+                        "  "
+                        + safe_display(binding.binding_id, fallback="binding")
+                        + "  "
+                        + display_state
+                        + "  "
+                        + safe_display(
+                            binding.endpoint, fallback="endpoint unavailable"
+                        )
+                    )
+                message = "\n".join(lines)
+            return CommandOutcome(
+                "notice",
+                message,
+                conversation_id=conversation_id,
+            )
+        if len(parts) == 3 and parts[1] == "inspect":
+            inspection = await self.inspect_mcp_server(parts[2])
+            lines = [
+                "MCP inspection  "
+                + safe_display(inspection.server_name, fallback="unknown server")
+                + "  "
+                + safe_display(inspection.server_version, fallback="unknown version")
+            ]
+            lines.extend(
+                "  "
+                + safe_display(tool.remote_name, fallback="tool")
+                + ("  supported" if tool.supported else "  unsupported")
+                + (
+                    ""
+                    if tool.unsupported_reason is None
+                    else "  "
+                    + safe_display(tool.unsupported_reason, fallback="rejected")
+                )
+                for tool in inspection.tools
+            )
+            return CommandOutcome(
+                "notice",
+                "\n".join(lines),
+                conversation_id=conversation_id,
+            )
+        if len(parts) == 5 and parts[1] == "attach":
+            endpoint, remote_name, local_alias = parts[2:]
+            status = await self.attach_mcp_tools(
+                endpoint,
+                (
+                    MCPToolSelection(
+                        remote_name=remote_name,
+                        local_alias=local_alias,
+                        description=(
+                            "Read the explicitly admitted MCP tool " + remote_name + "."
+                        ),
+                    ),
+                ),
+            )
+            return CommandOutcome(
+                "notice",
+                "MCP binding "
+                + safe_display(status.binding.binding_id, fallback="created")
+                + " attached; reopen Daita to activate it.",
+                conversation_id=conversation_id,
+            )
+        if len(parts) == 3 and parts[1] == "refresh":
+            status = await self.refresh_mcp_server(parts[2])
+            return CommandOutcome(
+                "notice",
+                "MCP binding "
+                + safe_display(status.binding.binding_id, fallback="binding")
+                + " refreshed; state "
+                + safe_display(status.binding.state.value, fallback="unknown")
+                + ".",
+                conversation_id=conversation_id,
+            )
+        if len(parts) == 3 and parts[1] == "revoke":
+            return CommandOutcome(
+                "confirm",
+                "Revoke MCP binding "
+                + safe_display(parts[2], fallback="this binding")
+                + "?",
+                conversation_id=conversation_id,
+                screen="confirm_revoke_mcp",
+                payload={"binding_id": parts[2]},
+            )
+        return CommandOutcome(
+            "notice",
+            "Usage: /mcp | /mcp add | /mcp status | /mcp inspect <endpoint> | "
+            "/mcp attach <endpoint> <remote-tool> <local-alias> | "
+            "/mcp refresh <binding-id> | /mcp revoke <binding-id>",
+            conversation_id=conversation_id,
+        )
+
+    async def list_mcp_servers(self) -> tuple[MCPBindingStatus, ...]:
+        return await self.require_agent().list_mcp_servers()
+
+    async def inspect_mcp_server(self, endpoint: str) -> MCPServerInspection:
+        return await self.require_agent().inspect_mcp_server(endpoint=endpoint)
+
+    async def attach_mcp_tools(
+        self,
+        endpoint: str,
+        selections: tuple[MCPToolSelection, ...],
+    ) -> MCPBindingStatus:
+        try:
+            return await self.require_agent().attach_mcp_server(
+                endpoint=endpoint,
+                selections=selections,
+            )
+        except MCPAdmissionError as error:
+            reason = error.details.get("reason")
+            if error.code != "mcp_schema_unsupported" or not isinstance(reason, str):
+                raise
+            raise UserInputError(
+                "Cannot attach MCP tool: "
+                + safe_display(
+                    reason,
+                    fallback="unsupported schema",
+                    maximum=512,
+                )
+            ) from error
+
+    async def refresh_mcp_server(self, binding_id: str) -> MCPBindingStatus:
+        return await self.require_agent().refresh_mcp_server(binding_id)
+
+    async def revoke_mcp_server(self, binding_id: str) -> str:
+        status = await self.require_agent().revoke_mcp_server(binding_id)
+        return (
+            "MCP binding "
+            + safe_display(status.binding.binding_id, fallback="binding")
+            + " revoked."
+        )
 
     async def _use_source(self, selector: str) -> CommandOutcome:
         prior = await self.require_agent().active_source(

@@ -1,4 +1,4 @@
-"""Shared application installation repair guidance."""
+"""Build installation-repair guidance, including managed-runtime checks."""
 
 from __future__ import annotations
 

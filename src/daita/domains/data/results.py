@@ -1,4 +1,4 @@
-"""Deterministic bounded projection for untrusted tabular result rows."""
+"""Bound and normalize untrusted tabular rows for model-visible tool results."""
 
 from __future__ import annotations
 

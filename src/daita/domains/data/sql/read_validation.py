@@ -1,4 +1,4 @@
-"""Catalog-scoped validation for bounded SQLite and PostgreSQL reads."""
+"""Validate parsed SQLite and PostgreSQL reads against catalog resources and fields."""
 
 from __future__ import annotations
 

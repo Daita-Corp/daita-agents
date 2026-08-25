@@ -1,21 +1,29 @@
-"""Fixed declarations for progressive skill reads and approved skill writes."""
+"""Project progressive skill reads and execute approved skill saves or deletions."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 
 from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
     Capability,
+    CapabilityDeclarations,
     CapabilityInputError,
     Executor,
+    OperationalEffect,
     SideEffectExecutor,
-    ToolApplicability,
+    ToolDiscoveryMetadata,
     ToolExecution,
+    ToolExposureClass,
     ToolOutput,
     ToolView,
 )
+from ..capability_runtime import CapabilityFailure, SideEffectPlan
+from ..domains.learning import LearningCandidateGuard
+from ..llm.models import ModelSensitivity, ToolCall
+from ..loop.models import RunInput
 from .store import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,
     SKILL_INSTRUCTIONS_MAX_CHARACTERS,
@@ -23,6 +31,7 @@ from .store import (
     SkillStore,
     SkillStoreError,
     SkillValidationError,
+    validate_skill_name,
 )
 
 SKILL_VIEW_CAPABILITY_ID = "skill.view"
@@ -41,6 +50,7 @@ SKILL_DELETE_OUTPUT_KIND = "skill.deleted"
 SKILL_DELETE_TOOL_NAME = "skill_delete"
 
 _SKILL_NAME_PATTERN = "^[a-z][a-z0-9-]{0,63}$"
+SKILL_DOMAIN_OWNER_ID = "skills"
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,8 +218,7 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 "additionalProperties": False,
             },
             executor_id=view.executor_id,
-            access_mode=AccessMode.READ,
-            side_effecting=False,
+            access_mode=AccessMode.NONE,
         ),
         Capability(
             id=SKILL_SAVE_CAPABILITY_ID,
@@ -260,8 +269,8 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 "additionalProperties": False,
             },
             executor_id=save.executor_id,
-            access_mode=AccessMode.WRITE,
-            side_effecting=True,
+            access_mode=AccessMode.NONE,
+            operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
         ),
         Capability(
             id=SKILL_DELETE_CAPABILITY_ID,
@@ -278,8 +287,8 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 "additionalProperties": False,
             },
             executor_id=delete.executor_id,
-            access_mode=AccessMode.WRITE,
-            side_effecting=True,
+            access_mode=AccessMode.NONE,
+            operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
         ),
     )
     return SkillDeclarations(
@@ -290,19 +299,176 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 name=name,
                 capability_id=capability.id,
                 description=capability.description,
-                applicability=ToolApplicability(minimum_active_sources=0),
+                discovery=discovery,
             )
-            for name, capability in zip(
+            for name, capability, discovery in zip(
                 (
                     SKILL_VIEW_TOOL_NAME,
                     SKILL_SAVE_TOOL_NAME,
                     SKILL_DELETE_TOOL_NAME,
                 ),
                 capabilities,
+                (
+                    ToolDiscoveryMetadata(
+                        summary="Load one complete user-authorized procedural skill.",
+                        when_to_use="Use when an indexed procedure is relevant to the request.",
+                        keywords=("skill", "procedure", "guidance", "view"),
+                        exposure_class=ToolExposureClass.STANDARD,
+                        eager_priority=650,
+                    ),
+                    ToolDiscoveryMetadata(
+                        summary="Create or replace one bounded procedural skill.",
+                        when_to_use="Use only for an explicit validated reusable procedure.",
+                        keywords=("skill", "procedure", "save", "learn"),
+                        exposure_class=ToolExposureClass.DEFERRED,
+                        eager_priority=180,
+                    ),
+                    ToolDiscoveryMetadata(
+                        summary="Delete one exact existing procedural skill.",
+                        when_to_use="Use only for an explicit exact skill deletion.",
+                        keywords=("skill", "procedure", "delete"),
+                        exposure_class=ToolExposureClass.DEFERRED,
+                        eager_priority=170,
+                    ),
+                ),
                 strict=True,
             )
         ),
     )
+
+
+class SkillCapabilityDomain:
+    """Own fixed skill applicability, validation, and safe failure semantics."""
+
+    domain_owner_id = SKILL_DOMAIN_OWNER_ID
+
+    def __init__(
+        self,
+        declarations: CapabilityDeclarations,
+        learning: LearningCandidateGuard,
+    ) -> None:
+        if declarations.domain_owner_id != self.domain_owner_id:
+            raise ValueError("skill declarations have the wrong domain owner")
+        if {item.id for item in declarations.capabilities} != {
+            SKILL_VIEW_CAPABILITY_ID,
+            SKILL_SAVE_CAPABILITY_ID,
+            SKILL_DELETE_CAPABILITY_ID,
+        }:
+            raise ValueError("skill domain requires its exact capabilities")
+        self._declarations = declarations
+        self._learning = learning
+        self._views = tuple(declarations.tool_views)
+        self._capabilities = {item.id: item for item in declarations.capabilities}
+
+    @property
+    def declarations(self) -> CapabilityDeclarations:
+        return self._declarations
+
+    async def project(self, run: RunInput) -> tuple[str, ...]:
+        return tuple(
+            view.name
+            for view in self._views
+            if self._learning.allows(
+                run.id,
+                view.name,
+                effectful=(
+                    self._capabilities[view.capability_id].operational_effect
+                    is not OperationalEffect.NONE
+                ),
+            )
+        )
+
+    def normalize_arguments(
+        self,
+        capability: Capability,
+        arguments: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        return arguments
+
+    async def prepare_call(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
+    ) -> FrozenJsonObject:
+        del request_sensitivity
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.validate_effect(run.id, call)
+        if capability.id == SKILL_VIEW_CAPABILITY_ID:
+            name = arguments.get("name")
+            try:
+                if not isinstance(name, str):
+                    raise TypeError("skill name must be text")
+                validate_skill_name(name)
+            except (TypeError, SkillValidationError) as error:
+                raise CapabilityInputError(
+                    "skill_invalid_name",
+                    "Skill names must match [a-z][a-z0-9-]{0,63}.",
+                ) from error
+        return arguments
+
+    async def side_effect_plan(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        execution: ToolExecution,
+        fingerprint: FrozenJsonObject,
+    ) -> SideEffectPlan:
+        return SideEffectPlan()
+
+    async def finalize_output(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        output: ToolOutput,
+        *,
+        request_sensitivity: ModelSensitivity,
+    ) -> ToolOutput:
+        del request_sensitivity
+        if capability.operational_effect is not OperationalEffect.NONE:
+            self._learning.mark_effect_succeeded(run.id)
+        if output.sensitivity is not None:
+            return output
+        return replace(
+            output,
+            sensitivity=ModelSensitivity.INTERNAL,
+            sensitivity_provenance={
+                "authority": "skill_domain",
+                "capability_id": capability.id,
+            },
+        )
+
+    def normalize_error(
+        self,
+        call: ToolCall,
+        error: BaseException,
+    ) -> CapabilityFailure | None:
+        if (
+            isinstance(error, CapabilityInputError)
+            and error.details.get("name") == "name"
+        ):
+            return CapabilityFailure(
+                "skill_invalid_name",
+                "Skill names must match [a-z][a-z0-9-]{0,63}.",
+            )
+        if isinstance(error, SkillNotFoundError):
+            return CapabilityFailure(
+                "skill_not_found",
+                "The requested skill is not available.",
+                {"name": call.arguments.get("name")},
+            )
+        if isinstance(error, SkillStoreError):
+            return CapabilityFailure(
+                "skill_unavailable",
+                "The requested skill document is unavailable or invalid.",
+            )
+        return None
 
 
 def _name_input_schema() -> dict[str, object]:
@@ -395,6 +561,7 @@ __all__ = [
     "SKILL_DELETE_EXECUTOR_ID",
     "SKILL_DELETE_OUTPUT_KIND",
     "SKILL_DELETE_TOOL_NAME",
+    "SKILL_DOMAIN_OWNER_ID",
     "SKILL_SAVE_CAPABILITY_ID",
     "SKILL_SAVE_EXECUTOR_ID",
     "SKILL_SAVE_OUTPUT_KIND",
@@ -404,6 +571,7 @@ __all__ = [
     "SKILL_VIEW_OUTPUT_KIND",
     "SKILL_VIEW_TOOL_NAME",
     "SkillDeclarations",
+    "SkillCapabilityDomain",
     "SkillDeleteExecutor",
     "SkillSaveExecutor",
     "SkillViewExecutor",

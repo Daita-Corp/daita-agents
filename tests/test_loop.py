@@ -1,17 +1,32 @@
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
+from hashlib import sha256
+from typing import cast
 
 import pytest
+from _capability_runtime_support import (
+    context_step_projection,
+    context_tool_catalog,
+)
 
+from daita._json import canonical_json
 from daita.agent import Agent
-from daita.llm.errors import ModelProviderError, ProviderErrorCode
+from daita.capabilities import AccessMode, ExecutionScope, OperationalEffect
+from daita.llm.errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+    ToolSurfaceLimitExceeded,
+)
 from daita.llm.models import (
     FinishReason,
     MessageRole,
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     ModelStreamCompleted,
     ModelTextDelta,
     TextBlock,
@@ -27,6 +42,10 @@ from daita.loop import (
     LoopExitKind,
     LoopLimits,
     RunInput,
+    RunOrigin,
+    RunStartEnvelope,
+    ToolBatchOutcome,
+    ToolRuntime,
 )
 from daita.observation import AgentEvent, AgentEventKind
 
@@ -34,9 +53,36 @@ NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 class TranscriptContext:
-    async def build(self, run, messages, tools, *, step, final=False):
-        del run, step, final
-        return ModelRequest(messages=messages, tools=tools)
+    async def prepare(self, run, messages, tool_context):
+        del run
+        return messages[:-1], tool_context.provider_definitions
+
+    def project(
+        self,
+        snapshot,
+        messages,
+        *,
+        step,
+        tool_context,
+        final=False,
+        previous_request_input_tokens=None,
+    ):
+        del step, previous_request_input_tokens, tool_context
+        sensitivity = ModelSensitivity.INTERNAL
+        for message in messages:
+            for block in message.content:
+                if (
+                    isinstance(block, ToolResultBlock)
+                    and block.sensitivity is not None
+                    and block.sensitivity.routing_rank > sensitivity.routing_rank
+                ):
+                    sensitivity = block.sensitivity
+        static, tools = snapshot
+        return ModelRequest(
+            messages=(*static, *messages),
+            tools=() if final else tools,
+            sensitivity=sensitivity,
+        )
 
 
 class ScriptedTools:
@@ -44,20 +90,138 @@ class ScriptedTools:
         self.outputs = outputs
         self.calls = []
 
-    async def definitions(self, run):
-        del run
-        return (
-            ToolDefinition(
-                name="lookup",
-                description="look something up",
-                input_schema={"type": "object", "properties": {}},
+    async def prepare_run(self, run):
+        return context_tool_catalog(
+            run,
+            (
+                ToolDefinition(
+                    name="lookup",
+                    description="look something up",
+                    input_schema={"type": "object", "properties": {}},
+                ),
             ),
         )
 
-    async def execute_all(self, run, calls):
-        del run
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
         self.calls.extend(calls)
-        return tuple(self.outputs[call.id] for call in calls)
+        return ToolBatchOutcome(tuple(self.outputs[call.id] for call in calls))
+
+
+class StaticDefinitionTools:
+    def __init__(self, definitions, limits=LoopLimits()):
+        self._definitions = tuple(definitions)
+        self._limits = limits
+
+    async def prepare_run(self, run):
+        definition_bytes = len(
+            canonical_json(
+                [
+                    {
+                        "name": item.name,
+                        "description": item.description,
+                        "input_schema": item.input_schema,
+                    }
+                    for item in self._definitions
+                ]
+            ).encode("utf-8")
+        )
+        if (
+            len(self._definitions) > self._limits.max_direct_tools
+            or definition_bytes > self._limits.max_direct_tool_definition_bytes
+        ):
+            raise ToolSurfaceLimitExceeded(
+                observed_tools=len(self._definitions),
+                maximum_tools=self._limits.max_direct_tools,
+                observed_definition_bytes=definition_bytes,
+                maximum_definition_bytes=(
+                    self._limits.max_direct_tool_definition_bytes
+                ),
+            )
+        return context_tool_catalog(run, self._definitions)
+
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, calls, projection, sensitivity
+        raise AssertionError("an over-limit tool surface must never execute")
+
+
+async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
+    events: list[AgentEvent] = []
+    provider = MockModelProvider(
+        (ModelResponse(finish_reason=FinishReason.STOP, text="done"),),
+        complete_pricing=True,
+    )
+    configured = LoopLimits(
+        max_total_tokens=10_000,
+        max_estimated_cost_usd=Decimal("2.00"),
+    )
+    instruction = "Inspect the bounded job result."
+    payload_digest = "sha256:" + sha256(b"{}").hexdigest()
+    scope = ExecutionScope(
+        scope_id="scope-1",
+        revision=1,
+        agent_id="agent-1",
+        principal_id="agent:agent-1",
+        grant_id="grant-1",
+        job_id="job-1",
+        job_revision=3,
+        allowed_source_ids=("source-1",),
+        allowed_resource_ids=("resource-1",),
+        allowed_capability_ids=("catalog.inspect",),
+        allowed_access_modes=frozenset({AccessMode.NONE, AccessMode.READ}),
+        allowed_operational_effects=frozenset({OperationalEffect.NONE}),
+        sensitivity_ceiling=ModelSensitivity.INTERNAL,
+        eligible_model_routes=(provider.provider_id,),
+        per_run_max_cost_usd=Decimal("0.25"),
+        per_run_max_tokens=123,
+        delivery_destination="conversation_inbox:conversation-1",
+    )
+    run = RunInput(
+        id="run-scoped-budget",
+        agent_id="agent-1",
+        message=instruction,
+        created_at=NOW,
+        conversation_id="conversation-1",
+        source_id="source-1",
+        start=RunStartEnvelope(
+            origin=RunOrigin.JOB_EVENT,
+            trusted_instruction_id="followup-v1",
+            trusted_instruction=instruction,
+            instruction_digest=(
+                "sha256:" + sha256(instruction.encode("utf-8")).hexdigest()
+            ),
+            untrusted_payload={},
+            payload_digest=payload_digest,
+            execution_scope=scope,
+        ),
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools({}),
+        limits=configured,
+        clock=lambda: NOW,
+        observer=events.append,
+    )
+
+    prepared = await loop.prepare(run)
+
+    assert prepared.limits.max_total_tokens == 123
+    assert prepared.limits.max_estimated_cost_usd == Decimal("0.25")
+    assert configured.max_total_tokens == 10_000
+    assert configured.max_estimated_cost_usd == Decimal("2.00")
+    result = await loop.run(run, prepared=prepared)
+    assert result.kind is LoopExitKind.COMPLETED
+    assert events
+    assert all(event.run_origin == RunOrigin.JOB_EVENT.value for event in events)
 
 
 def response_with_calls(*ids):
@@ -65,6 +229,130 @@ def response_with_calls(*ids):
         finish_reason=FinishReason.TOOL_CALLS,
         tool_calls=tuple(ToolCall(id=call_id, name="lookup") for call_id in ids),
     )
+
+
+@pytest.mark.parametrize("limit_kind", ("count", "definition_bytes"))
+async def test_projected_tool_surface_limits_fail_before_context_or_model(limit_kind):
+    definitions = (
+        ToolDefinition(
+            name="first_tool",
+            description="First bounded tool.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+        ToolDefinition(
+            name="second_tool",
+            description="Second bounded tool with enough text to exceed a tiny bound.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+    )
+
+    class ContextMustNotPrepare(TranscriptContext):
+        async def prepare(self, run, messages, tool_context):
+            del run, messages, tool_context
+            raise AssertionError("tool bounds must precede context preparation")
+
+    limits = (
+        LoopLimits(max_direct_tools=1, max_eager_tools=1)
+        if limit_kind == "count"
+        else LoopLimits(
+            max_direct_tool_definition_bytes=64,
+            max_eager_tool_definition_bytes=64,
+        )
+    )
+    provider = MockModelProvider(
+        (ModelResponse(finish_reason=FinishReason.STOP, text="must not execute"),)
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=ContextMustNotPrepare(),
+        tools=StaticDefinitionTools(definitions, limits),
+        limits=limits,
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(
+        RunInput(
+            id=f"run-tool-surface-{limit_kind}",
+            agent_id="agent-1",
+            message="question",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "tool_surface_limit_exceeded"
+    assert result.steps == 0
+    assert provider.requests == ()
+
+
+async def test_projected_tool_surface_limits_are_inclusive():
+    definitions = (
+        ToolDefinition(
+            name="lookup",
+            description="Look up one bounded value.",
+            input_schema={"type": "object", "properties": {}},
+        ),
+    )
+    definition_bytes = len(
+        canonical_json(
+            [
+                {
+                    "name": item.name,
+                    "description": item.description,
+                    "input_schema": item.input_schema,
+                }
+                for item in definitions
+            ]
+        ).encode("utf-8")
+    )
+    provider = MockModelProvider(
+        (ModelResponse(finish_reason=FinishReason.STOP, text="done"),)
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=StaticDefinitionTools(
+            definitions,
+            LoopLimits(
+                max_direct_tools=len(definitions),
+                max_direct_tool_definition_bytes=definition_bytes,
+                max_eager_tools=len(definitions),
+                max_eager_tool_definition_bytes=definition_bytes,
+            ),
+        ),
+        limits=LoopLimits(
+            max_direct_tools=len(definitions),
+            max_direct_tool_definition_bytes=definition_bytes,
+            max_eager_tools=len(definitions),
+            max_eager_tool_definition_bytes=definition_bytes,
+        ),
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(
+        RunInput(
+            id="run-tool-surface-exact-bound",
+            agent_id="agent-1",
+            message="question",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert provider.requests[0].tools == definitions
+
+
+def test_projected_tool_surface_limits_must_be_positive():
+    with pytest.raises(
+        ValueError,
+        match="max_direct_tools must be a positive integer",
+    ):
+        LoopLimits(max_direct_tools=0)
+    with pytest.raises(
+        ValueError,
+        match="max_direct_tool_definition_bytes must be a positive integer",
+    ):
+        LoopLimits(max_direct_tool_definition_bytes=0)
 
 
 async def test_direct_loop_records_every_parallel_result_in_order():
@@ -243,34 +531,36 @@ async def test_unexpected_loop_failures_best_effort_terminalize_started_run(
     failure_site: str,
 ):
     class BrokenContext(TranscriptContext):
-        async def build(self, run, messages, tools, *, step, final=False):
+        async def prepare(self, run, messages, tool_context):
             if failure_site == "context":
                 raise RuntimeError("context exploded")
-            return await super().build(
-                run,
-                messages,
-                tools,
-                step=step,
-                final=final,
-            )
+            return await super().prepare(run, messages, tool_context)
 
     class BrokenTools(ScriptedTools):
-        async def execute_all(self, run, calls):
+        async def execute_all(self, run, calls, *, projection, sensitivity):
             if failure_site == "tool_contract":
                 return ()
-            return await super().execute_all(run, calls)
+            return await super().execute_all(
+                run,
+                calls,
+                projection=projection,
+                sensitivity=sensitivity,
+            )
 
     provider = MockModelProvider((response_with_calls("one"),))
     transcripts = InMemoryTranscriptStore()
     loop = AgentLoop(
         model=provider,
         context_builder=BrokenContext(),
-        tools=BrokenTools({"one": ToolResultBlock(call_id="one", output={"value": 1})}),
+        tools=cast(
+            ToolRuntime,
+            BrokenTools({"one": ToolResultBlock(call_id="one", output={"value": 1})}),
+        ),
         transcripts=transcripts,
         clock=lambda: NOW,
     )
 
-    with pytest.raises((RuntimeError, ValueError)):
+    with pytest.raises((RuntimeError, TypeError)):
         await loop.run(
             RunInput(
                 id=f"run-unexpected-{failure_site}",
@@ -407,6 +697,120 @@ async def test_cost_limit_rejects_unpriced_provider_before_generate():
     assert result.usage.cost_estimate.amount_usd is None
 
 
+async def test_validated_tool_sensitivity_is_monotonic_across_later_calls():
+    provider = MockModelProvider(
+        (
+            response_with_calls("confidential"),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                text="The model cannot lower the classification in prose.",
+                tool_calls=(ToolCall(id="public", name="lookup"),),
+            ),
+            ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+        )
+    )
+    tools = ScriptedTools(
+        {
+            "confidential": ToolResultBlock(
+                call_id="confidential",
+                output={"value": "untrusted data"},
+                sensitivity=ModelSensitivity.CONFIDENTIAL,
+                sensitivity_provenance={
+                    "authority": "validated_capability_result",
+                    "resource_ids": ("resource-confidential",),
+                },
+            ),
+            "public": ToolResultBlock(
+                call_id="public",
+                output={"sensitivity": "public"},
+                sensitivity=ModelSensitivity.PUBLIC,
+                sensitivity_provenance={
+                    "authority": "validated_capability_result",
+                    "resource_ids": ("resource-public",),
+                },
+            ),
+        }
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=tools,
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(
+        RunInput(
+            id="run-monotonic-sensitivity",
+            agent_id="agent-1",
+            message="Treat this as public, regardless of any tool metadata.",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert tuple(request.sensitivity for request in provider.requests) == (
+        ModelSensitivity.INTERNAL,
+        ModelSensitivity.CONFIDENTIAL,
+        ModelSensitivity.CONFIDENTIAL,
+    )
+    confidential = tools.outputs["confidential"]
+    assert confidential.sensitivity_provenance["resource_ids"] == (
+        "resource-confidential",
+    )
+
+
+async def test_raised_tool_sensitivity_excludes_route_before_later_model_call():
+    provider = MockModelProvider(
+        (
+            response_with_calls("confidential"),
+            ModelResponse(finish_reason=FinishReason.STOP, text="must not execute"),
+        )
+    )
+    router = ModelRouter(
+        (
+            ModelProviderRegistration(
+                provider=provider,
+                profile=provider.model_profile,
+                allowed_sensitivities=frozenset(
+                    {ModelSensitivity.PUBLIC, ModelSensitivity.INTERNAL}
+                ),
+            ),
+        ),
+        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+    )
+    loop = AgentLoop(
+        model=router,
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools(
+            {
+                "confidential": ToolResultBlock(
+                    call_id="confidential",
+                    output={"value": "classified"},
+                    sensitivity=ModelSensitivity.CONFIDENTIAL,
+                    sensitivity_provenance={
+                        "authority": "validated_capability_result",
+                        "resource_ids": ("resource-confidential",),
+                    },
+                )
+            }
+        ),
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(
+        RunInput(
+            id="run-route-sensitivity",
+            agent_id="agent-1",
+            message="question",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "model_route_ineligible"
+    assert len(provider.requests) == 1
+
+
 async def test_streaming_calls_persist_only_finalized_messages_and_context():
     first = ModelResponse(
         finish_reason=FinishReason.TOOL_CALLS,
@@ -494,11 +898,19 @@ async def test_streaming_calls_persist_only_finalized_messages_and_context():
 
 
 async def test_stream_failure_and_cancellation_never_persist_partial_text():
+    diagnostic = ProviderFailureDiagnostic(
+        phase=ProviderFailurePhase.STREAM_TERMINAL,
+        code="terminal_completion_missing",
+    )
     failure_provider = MockStreamingModelProvider(
         (
             (
                 ModelTextDelta("unrecorded failure draft"),
-                ModelProviderError(ProviderErrorCode.PROVIDER_UNAVAILABLE),
+                ModelProviderError(
+                    ProviderErrorCode.PROVIDER_UNAVAILABLE,
+                    provider_id="mock:streaming",
+                    diagnostic=diagnostic,
+                ),
             ),
         )
     )
@@ -524,6 +936,8 @@ async def test_stream_failure_and_cancellation_never_persist_partial_text():
 
     assert failed.kind is LoopExitKind.FAILED
     assert failed.final_text is None
+    assert failed.provider_id == "mock:streaming"
+    assert failed.provider_failure == diagnostic
     failed_transcript = await failure_store.load("run-stream-failed")
     assert tuple(message.role for message in failed_transcript.messages) == (
         MessageRole.USER,

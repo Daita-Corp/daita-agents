@@ -1,4 +1,4 @@
-"""Bounded user-authorized procedural skill documents."""
+"""Export user-authorized procedural skill records, storage, and capabilities."""
 
 from .store import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,

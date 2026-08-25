@@ -1,4 +1,4 @@
-"""Bounded advisory documents owned by one agent home."""
+"""Export bounded advisory memory documents, storage, and capabilities."""
 
 from .store import (
     MEMORY_MAX_CHARACTERS,

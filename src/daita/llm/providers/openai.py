@@ -1,4 +1,4 @@
-"""OpenAI Responses adapter for the provider-neutral model boundary."""
+"""Translate canonical requests and streaming responses for OpenAI Responses."""
 
 from __future__ import annotations
 
@@ -8,12 +8,19 @@ from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from hashlib import sha256
 from typing import Protocol, cast
 from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json, thaw_json
-from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
+from ..errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+    detached_provider_error,
+)
 from ..models import (
     CanonicalMessage,
     FinishReason,
@@ -47,6 +54,16 @@ class _ResponsesResource(Protocol):
 class _OpenAIClient(Protocol):
     @property
     def responses(self) -> _ResponsesResource: ...
+
+
+class _OpenAIResponseDecodeFailure(ValueError):
+    """Carry one bounded structural checkpoint across the provider boundary."""
+
+    __slots__ = ("diagnostic_code",)
+
+    def __init__(self, diagnostic_code: str) -> None:
+        super().__init__(diagnostic_code)
+        self.diagnostic_code = diagnostic_code
 
 
 class _ResponseOutputOverride:
@@ -180,10 +197,14 @@ class OpenAIResponsesProvider:
             failure = ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "OpenAI provider boundary failed",
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
+                    code="unexpected_provider_boundary_failure",
+                ),
             )
         if failure is None:
             raise AssertionError("OpenAI provider failed without an error")
-        raise detached_provider_error(failure)
+        raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
@@ -208,6 +229,16 @@ class OpenAIResponsesProvider:
             raise ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "OpenAI returned a malformed response",
+                provider_id=self.provider_id,
+                diagnostic=_openai_failure_diagnostic(
+                    response,
+                    phase=ProviderFailurePhase.RESPONSE_DECODE,
+                    code=(
+                        error.diagnostic_code
+                        if isinstance(error, _OpenAIResponseDecodeFailure)
+                        else "response_decode_failed"
+                    ),
+                ),
             ) from error
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
@@ -230,10 +261,14 @@ class OpenAIResponsesProvider:
             failure = ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "OpenAI provider boundary failed",
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
+                    code="unexpected_provider_boundary_failure",
+                ),
             )
         if failure is None:
             raise AssertionError("OpenAI provider failed without an error")
-        raise detached_provider_error(failure)
+        raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _stream(
         self,
@@ -262,9 +297,13 @@ class OpenAIResponsesProvider:
         completed_items_by_index: dict[int, object] = {}
         allocated_ids: set[str] = set()
         completed = False
+        current_event_type: str | None = None
+        terminal_diagnostic: ProviderFailureDiagnostic | None = None
         try:
             async for event in cast(AsyncIterator[object], stream):
+                current_event_type = None
                 event_type = _required_text(_field(event, "type"), "stream event type")
+                current_event_type = _safe_structural_token(event_type)
                 if event_type == "response.output_text.delta":
                     delta = _stream_fragment(_field(event, "delta"), "text delta")
                     if delta:
@@ -337,28 +376,60 @@ class OpenAIResponsesProvider:
                     "response.failed",
                 }:
                     native_response = _field(event, "response")
+                    terminal_diagnostic = _openai_failure_diagnostic(
+                        native_response,
+                        phase=ProviderFailurePhase.STREAM_TERMINAL,
+                        code="terminal_response_decode_failed",
+                        event_type=event_type,
+                    )
                     native_output = _field(native_response, "output", ())
                     if (
                         isinstance(native_output, Sequence)
                         and not isinstance(native_output, (str, bytes))
-                        and not native_output
                         and completed_items_by_index
                     ):
+                        output_count = max(
+                            len(native_output),
+                            max(completed_items_by_index) + 1,
+                        )
+                        completed_output: list[object] = []
+                        for output_index in range(output_count):
+                            completed_item = completed_items_by_index.get(output_index)
+                            if completed_item is not None:
+                                completed_output.append(completed_item)
+                            elif output_index < len(native_output):
+                                completed_output.append(native_output[output_index])
+                            else:
+                                terminal_diagnostic = _openai_failure_diagnostic(
+                                    native_response,
+                                    phase=ProviderFailurePhase.STREAM_TERMINAL,
+                                    code="terminal_output_reconstruction_invalid",
+                                    event_type=event_type,
+                                )
+                                raise ValueError(
+                                    "completed stream output contains an index gap"
+                                )
                         native_response = _ResponseOutputOverride(
                             native_response,
-                            tuple(
-                                completed_items_by_index[index]
-                                for index in sorted(completed_items_by_index)
+                            tuple(completed_output),
+                        )
+                    try:
+                        response = self._decode_response(
+                            native_response,
+                            requested_at=requested_at,
+                            canonical_ids_by_index=canonical_ids_by_index,
+                            canonical_ids_by_provider_call_id=(
+                                canonical_ids_by_provider_call_id
                             ),
                         )
-                    response = self._decode_response(
-                        native_response,
-                        requested_at=requested_at,
-                        canonical_ids_by_index=canonical_ids_by_index,
-                        canonical_ids_by_provider_call_id=(
-                            canonical_ids_by_provider_call_id
-                        ),
-                    )
+                    except _OpenAIResponseDecodeFailure as error:
+                        terminal_diagnostic = _openai_failure_diagnostic(
+                            native_response,
+                            phase=ProviderFailurePhase.STREAM_TERMINAL,
+                            code=error.diagnostic_code,
+                            event_type=event_type,
+                        )
+                        raise
                     yield ModelStreamCompleted(response)
                     completed = True
                     return
@@ -380,6 +451,15 @@ class OpenAIResponsesProvider:
             raise ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "OpenAI returned a malformed stream",
+                provider_id=self.provider_id,
+                diagnostic=(
+                    terminal_diagnostic
+                    or ProviderFailureDiagnostic(
+                        phase=ProviderFailurePhase.STREAM_EVENT,
+                        code="event_decode_failed",
+                        event_type=current_event_type,
+                    )
+                ),
             ) from error
         except Exception as error:
             raise _normalize_error(error) from error
@@ -387,6 +467,11 @@ class OpenAIResponsesProvider:
             raise ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "OpenAI stream ended without a terminal response",
+                provider_id=self.provider_id,
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.STREAM_TERMINAL,
+                    code="terminal_completion_missing",
+                ),
             )
 
     def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
@@ -435,7 +520,13 @@ class OpenAIResponsesProvider:
         canonical_ids_by_index: Mapping[int, str] | None = None,
         canonical_ids_by_provider_call_id: Mapping[str, str] | None = None,
     ) -> ModelResponse:
-        status = _optional_text(_field(response, "status", None), "response status")
+        try:
+            status = _optional_text(
+                _field(response, "status", None),
+                "response status",
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure("response_status_invalid") from error
         if status == "failed":
             failure = _field(response, "error", None)
             code = _optional_text(_field(failure, "code", None), "response error code")
@@ -444,9 +535,12 @@ class OpenAIResponsesProvider:
                 "OpenAI reported a failed response",
             )
 
-        output = _field(response, "output", ())
-        if not isinstance(output, Sequence) or isinstance(output, (str, bytes)):
-            raise ValueError("response output must be a sequence")
+        try:
+            output = _field(response, "output", ())
+            if not isinstance(output, Sequence) or isinstance(output, (str, bytes)):
+                raise ValueError("response output must be a sequence")
+        except (KeyError, TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure("response_output_invalid") from error
 
         text_parts: list[str] = []
         calls: list[ToolCall] = []
@@ -458,46 +552,56 @@ class OpenAIResponsesProvider:
             if canonical_ids_by_provider_call_id is None
             else canonical_ids_by_provider_call_id
         )
-        for output_index, item in enumerate(output):
-            item_type = _required_text(_field(item, "type"), "response item type")
-            if item_type == "function_call":
-                provider_call_id = _required_text(
-                    _field(item, "call_id"), "provider call_id"
-                )
-                name = _required_text(_field(item, "name"), "function name")
-                encoded_arguments = _required_text(
-                    _field(item, "arguments"), "function arguments"
-                )
-                decoded_arguments = json.loads(encoded_arguments)
-                if not isinstance(decoded_arguments, dict):
-                    raise ValueError("function arguments must decode to an object")
-                canonical_id = provider_ids.get(
-                    provider_call_id,
-                    index_ids.get(output_index),
-                )
-                if canonical_id is None:
-                    canonical_id = self._id_factory("call")
-                if canonical_id in canonical_ids:
-                    raise ValueError("id_factory returned a duplicate call ID")
-                canonical_ids.add(canonical_id)
-                calls.append(
-                    ToolCall(
-                        id=canonical_id,
-                        provider_call_id=provider_call_id,
-                        name=name,
-                        arguments=decoded_arguments,
+        try:
+            for output_index, item in enumerate(output):
+                item_type = _required_text(_field(item, "type"), "response item type")
+                if item_type == "function_call":
+                    provider_call_id = _required_text(
+                        _field(item, "call_id"), "provider call_id"
                     )
-                )
-            elif item_type == "message":
-                text_parts.extend(_message_text(item))
-            elif item_type == "reasoning":
-                replay_items.append(_plain_provider_item(item))
-            elif item_type == "computer_tool_call":
-                continue
+                    name = _required_text(_field(item, "name"), "function name")
+                    encoded_arguments = _required_text(
+                        _field(item, "arguments"), "function arguments"
+                    )
+                    decoded_arguments = json.loads(encoded_arguments)
+                    if not isinstance(decoded_arguments, dict):
+                        raise ValueError("function arguments must decode to an object")
+                    canonical_id = provider_ids.get(
+                        provider_call_id,
+                        index_ids.get(output_index),
+                    )
+                    if canonical_id is None:
+                        canonical_id = self._id_factory("call")
+                    if canonical_id in canonical_ids:
+                        raise ValueError("id_factory returned a duplicate call ID")
+                    canonical_ids.add(canonical_id)
+                    calls.append(
+                        ToolCall(
+                            id=canonical_id,
+                            provider_call_id=provider_call_id,
+                            name=name,
+                            arguments=decoded_arguments,
+                        )
+                    )
+                elif item_type == "message":
+                    text_parts.extend(_message_text(item))
+                elif item_type == "reasoning":
+                    replay_items.append(_plain_provider_item(item))
+                elif item_type == "computer_tool_call":
+                    continue
+        except ModelProviderError:
+            raise
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise _OpenAIResponseDecodeFailure("response_item_invalid") from error
 
-        fallback_value = _field(response, "output_text", None)
-        if fallback_value is not None and not isinstance(fallback_value, str):
-            raise ValueError("response output_text must be text")
+        try:
+            fallback_value = _field(response, "output_text", None)
+            if fallback_value is not None and not isinstance(fallback_value, str):
+                raise ValueError("response output_text must be text")
+        except (KeyError, TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure(
+                "response_output_text_invalid"
+            ) from error
         fallback_text = (
             None
             if fallback_value is None or not fallback_value.strip()
@@ -525,17 +629,20 @@ class OpenAIResponsesProvider:
                     ProviderErrorCode.OUTPUT_LIMIT,
                     "OpenAI exhausted the output token limit",
                 )
-            raise ValueError("response contains neither text nor function calls")
+            raise _OpenAIResponseDecodeFailure("terminal_content_missing")
 
-        response_id = _optional_text(_field(response, "id", None), "response id")
-        response_model = _required_text(
-            _field(response, "model"),
-            "response model",
-        )
-        service_tier = _optional_text(
-            _field(response, "service_tier", None),
-            "response service tier",
-        )
+        try:
+            response_id = _optional_text(_field(response, "id", None), "response id")
+            response_model = _required_text(
+                _field(response, "model"),
+                "response model",
+            )
+            service_tier = _optional_text(
+                _field(response, "service_tier", None),
+                "response service tier",
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure("response_metadata_invalid") from error
         provider_metadata: dict[str, object] = {}
         if replay_items:
             provider_metadata["openai_replay_items"] = replay_items
@@ -545,7 +652,10 @@ class OpenAIResponsesProvider:
             "region": self._region,
         }
         usage_value = _field(response, "usage", None)
-        usage = _decode_usage(usage_value)
+        try:
+            usage = _decode_usage(usage_value)
+        except (KeyError, TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure("usage_invalid") from error
         if usage_value is not None:
             if not _has_complete_billing_dimensions(usage_value):
                 usage = replace(
@@ -560,30 +670,36 @@ class OpenAIResponsesProvider:
                     if service_tier is not None
                     else {"region": self._region}
                 )
-                usage = replace(
-                    usage,
-                    cost_estimate=calculate_cost_estimate(
-                        self._pricing_schedules,
-                        provider="openai",
-                        model=response_model,
-                        endpoint="responses",
-                        requested_at=requested_at or self._clock(),
-                        qualifiers=qualifiers,
-                        usage_values={
-                            "request_input_tokens": Decimal(usage.input_tokens)
-                        },
-                        quantities=_billable_quantities(usage),
-                    ),
-                )
-        return ModelResponse(
-            finish_reason=finish_reason,
-            text=normalized_text,
-            tool_calls=tuple(calls),
-            usage=usage,
-            provider_id=self.provider_id,
-            provider_response_id=response_id,
-            provider_metadata=provider_metadata,
-        )
+                try:
+                    usage = replace(
+                        usage,
+                        cost_estimate=calculate_cost_estimate(
+                            self._pricing_schedules,
+                            provider="openai",
+                            model=response_model,
+                            endpoint="responses",
+                            requested_at=requested_at or self._clock(),
+                            qualifiers=qualifiers,
+                            usage_values={
+                                "request_input_tokens": Decimal(usage.input_tokens)
+                            },
+                            quantities=_billable_quantities(usage),
+                        ),
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise _OpenAIResponseDecodeFailure("pricing_invalid") from error
+        try:
+            return ModelResponse(
+                finish_reason=finish_reason,
+                text=normalized_text,
+                tool_calls=tuple(calls),
+                usage=usage,
+                provider_id=self.provider_id,
+                provider_response_id=response_id,
+                provider_metadata=provider_metadata,
+            )
+        except (TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure("canonical_response_invalid") from error
 
 
 OpenAIProvider = OpenAIResponsesProvider
@@ -823,6 +939,58 @@ def _code_from_provider_value(value: str | None) -> ProviderErrorCode:
     if value in {"timeout", "request_timeout"}:
         return ProviderErrorCode.TIMEOUT
     return ProviderErrorCode.PROVIDER_UNAVAILABLE
+
+
+def _openai_failure_diagnostic(
+    response: object,
+    *,
+    phase: ProviderFailurePhase,
+    code: str,
+    event_type: str | None = None,
+) -> ProviderFailureDiagnostic:
+    status = _safe_structural_token(_safe_field(response, "status"))
+    response_id = _safe_structural_token(_safe_field(response, "id"))
+    output_item_types: list[str] = []
+    output = _safe_field(response, "output")
+    if isinstance(output, Sequence) and not isinstance(output, (str, bytes)):
+        for item in output[:8]:
+            item_type = _safe_structural_token(_safe_field(item, "type"))
+            if item_type is not None:
+                output_item_types.append(item_type)
+    return ProviderFailureDiagnostic(
+        phase=phase,
+        code=code,
+        event_type=_safe_structural_token(event_type),
+        terminal_status=status,
+        output_item_types=tuple(output_item_types),
+        response_id_digest=(
+            None
+            if response_id is None
+            else "sha256:" + sha256(response_id.encode("utf-8")).hexdigest()
+        ),
+    )
+
+
+def _safe_field(value: object, name: str) -> object | None:
+    try:
+        return _field(value, name, None)
+    except Exception:
+        return None
+
+
+def _safe_structural_token(value: object) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 96:
+        return None
+    if (
+        not value[0].isascii()
+        or not value[0].isalnum()
+        or any(
+            not character.isascii() or not (character.isalnum() or character in "._:-")
+            for character in value
+        )
+    ):
+        return None
+    return value
 
 
 _MISSING = object()

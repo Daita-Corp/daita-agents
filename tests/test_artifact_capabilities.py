@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _capability_runtime_support import (
+    context_step_projection,
+    context_tool_catalog,
+)
 
 import daita.domains.data.controller as data_controller
 from daita import Agent, ApprovalDecision, ApprovalRequest, ArtifactError
@@ -19,20 +23,41 @@ from daita.domains.data.export_capabilities import (
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
     ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
     DOCUMENT_CREATE_TOOL_NAME,
-    artifact_extension_declarations,
+    artifact_capability_declarations,
 )
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
     MessageRole,
     ModelProfile,
+    ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     TextBlock,
     ToolCall,
+    ToolDefinition,
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
+
+
+async def _prepared_request(
+    builder: DataContextBuilder,
+    run: RunInput,
+    messages: tuple[CanonicalMessage, ...],
+    tools: tuple[ToolDefinition, ...],
+    *,
+    step: int,
+) -> ModelRequest:
+    catalog = context_tool_catalog(run, tools)
+    snapshot = await builder.prepare(run, messages, catalog)
+    return builder.project(
+        snapshot,
+        messages,
+        step=step,
+        tool_context=context_step_projection(catalog),
+    )
 
 
 def _ids():
@@ -87,7 +112,7 @@ def _result_error_code(result: ToolResultBlock) -> str:
 def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -> None:
     assert not hasattr(data_controller, "_explicit_artifact_request")
     assert not hasattr(data_controller, "_explicit_default_location_request")
-    declarations = artifact_extension_declarations()
+    declarations = artifact_capability_declarations()
     schemas = {
         view.name: next(
             item for item in declarations.capabilities if item.id == view.capability_id
@@ -121,7 +146,7 @@ def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -
 def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite() -> (
     None
 ):
-    extension = artifact_extension_declarations()
+    extension = artifact_capability_declarations()
     view = next(
         item
         for item in extension.tool_views
@@ -158,7 +183,7 @@ def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite()
 
 
 def test_artifact_set_export_location_schema_accepts_only_one_destination_id() -> None:
-    extension = artifact_extension_declarations()
+    extension = artifact_capability_declarations()
     view = next(
         item
         for item in extension.tool_views
@@ -314,8 +339,11 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
             created_at=agent._embedded.identity.created_at,
             conversation_id=created.conversation_id,
         )
+        runtime = agent._embedded._capability_runtime
+        catalog = await runtime.prepare_run(run)
+        projection = runtime.project(catalog, ())
         result = (
-            await agent._embedded._data_tool_runtime.execute_all(
+            await runtime.execute_all(
                 run,
                 (
                     ToolCall(
@@ -327,6 +355,8 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
                         },
                     ),
                 ),
+                projection=projection,
+                sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
         assert not result.is_error
@@ -541,7 +571,7 @@ async def test_model_artifact_tools_are_projected_without_prompt_classification(
             ARTIFACT_READ_TOOL_NAME,
             ARTIFACT_CONVERT_TOOL_NAME,
             ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-        }.isdisjoint(projected)
+        } <= projected
         assert not tuple(downloads.iterdir())
     finally:
         await agent.close()
@@ -568,7 +598,7 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
         request = provider.requests[0]
         projected = {tool.name for tool in request.tools}
         assert ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME in projected
-        assert ARTIFACT_SAVE_LOCAL_TOOL_NAME not in projected
+        assert ARTIFACT_SAVE_LOCAL_TOOL_NAME in projected
         assert DOCUMENT_CREATE_TOOL_NAME in projected
         system = "\n".join(
             block.text
@@ -584,12 +614,20 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
 
 
 class _Catalog:
+    async def admitted_model_sensitivity(
+        self, agent_id: str, source_ids: tuple[str, ...] = ()
+    ) -> ModelSensitivity:
+        del agent_id, source_ids
+        return ModelSensitivity.PUBLIC
+
     async def catalog_context(self, *args, **kwargs) -> FrozenJsonObject:
         del args, kwargs
         return FrozenJsonObject.from_mapping(
             {
                 "resources": [],
+                "sources": [],
                 "total_matches": 0,
+                "returned_count": 0,
                 "truncated": False,
                 "trust_classification": "untrusted_external_data",
             }
@@ -606,7 +644,8 @@ async def test_hosted_composition_does_not_project_local_delivery_tools_or_paths
         supports_tools=True,
     )
     builder = DataContextBuilder(_Catalog(), profile=profile)
-    request = await builder.build(
+    request = await _prepared_request(
+        builder,
         RunInput(
             id="run-hosted",
             agent_id="agent-hosted",

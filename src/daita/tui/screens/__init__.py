@@ -1,1 +1,1 @@
-"""Textual screens for Daita onboarding, chat, and modal flows."""
+"""Group Textual screens for onboarding, chat, management, and modal flows."""

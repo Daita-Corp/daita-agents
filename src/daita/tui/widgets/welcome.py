@@ -1,4 +1,4 @@
-"""Branded startup and empty-chat welcome presentation."""
+"""Render branded startup and empty-chat welcome content."""
 
 from __future__ import annotations
 

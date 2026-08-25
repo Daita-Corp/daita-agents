@@ -1,4 +1,4 @@
-"""Loopback-only Ollama specialization of the compatible chat adapter."""
+"""Configure the OpenAI-compatible chat adapter for loopback-only Ollama."""
 
 from __future__ import annotations
 

@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import daita
-from daita.capabilities import AccessMode
+from daita.capabilities import AccessMode, OperationalEffect
 from daita.storage.sqlite import SQLiteStateStore
 
 PACKAGE = Path(daita.__file__).parent
@@ -60,6 +60,202 @@ def _imports(path: Path) -> set[str]:
     return imported
 
 
+def test_stage_m1_has_one_common_runtime_and_no_legacy_compatibility_surface():
+    prohibited = (
+        "Data" + "ToolRuntime",
+        "_MVP_" + "CAPABILITIES",
+        "_projected_" + "tool_names",
+        "Tool" + "Applicability",
+        "Extension" + "Declarations",
+        "extension_" + "declarations",
+        "Plugin" + "Error",
+        "plugin_" + "id",
+        "_data_" + "tool_runtime",
+        "Catalog" + "DataReader",
+    )
+    production = _python_text(PACKAGE)
+    for symbol in prohibited:
+        assert symbol not in production
+
+    runtime_path = PACKAGE / "capability_runtime.py"
+    runtime = runtime_path.read_text(encoding="utf-8")
+    runtime_tree = ast.parse(runtime)
+    assert _class_owners("CapabilityRuntime") == {"capability_runtime.py"}
+    assert not {
+        "adapters",
+        "catalog",
+        "domains.data",
+        "memory",
+        "semantics",
+        "skills",
+    } & _imports(runtime_path)
+    assert not {
+        node.id
+        for node in ast.walk(runtime_tree)
+        if isinstance(node, ast.Name) and node.id.endswith("_CAPABILITY_ID")
+    }
+    string_literals = {
+        node.value
+        for node in ast.walk(runtime_tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    for prefix in ("artifact.", "catalog.", "data.", "memory.", "semantic.", "skill."):
+        assert not any(value.startswith(prefix) for value in string_literals)
+
+
+def test_stage_m3_has_one_run_catalog_and_deletes_complete_surface_recomputation():
+    runtime_path = PACKAGE / "capability_runtime.py"
+    loop_path = PACKAGE / "loop" / "driver.py"
+    runtime = runtime_path.read_text(encoding="utf-8")
+    loop = loop_path.read_text(encoding="utf-8")
+    production = _python_text(PACKAGE)
+
+    assert _class_owners("ToolDiscoveryMetadata") == {"capabilities.py"}
+    assert _class_owners("ToolExposureClass") == {"capabilities.py"}
+    assert _class_owners("RunToolCatalog") == {"capability_runtime.py"}
+    assert _class_owners("StepToolProjection") == {"capability_runtime.py"}
+    assert _class_owners("ToolProjectionMode") == {"loop/models.py"}
+    assert "definitions" not in _class_methods(loop_path, "ToolRuntime")
+    assert "definitions" not in _class_methods(runtime_path, "CapabilityRuntime")
+    assert "await domain.project(run)" in runtime
+    assert runtime.count("await domain.project(run)") == 1
+    assert "definitions(run)" not in production
+    assert "max_projected_tools" not in production
+    assert "max_projected_tool_definition_bytes" not in production
+    assert "tool_search" not in _python_text(PACKAGE / "llm" / "providers")
+    assert "RunToolCatalog" not in _python_text(PACKAGE / "storage")
+    assert "StepToolProjection" not in _python_text(PACKAGE / "storage")
+
+    mcp = (PACKAGE / "domains" / "mcp.py").read_text(encoding="utf-8")
+    activation = mcp.split("async def activate_mcp_domain(", 1)[1].split(
+        "def _binding_revision_is_active(", 1
+    )[0]
+    assert ".inspect(" not in activation
+    assert "client_factory.create(" not in activation
+    for forbidden in (
+        "ToolSearchIndex",
+        "DeferredToolRuntime",
+        "ToolDispatcher",
+        "LoadedToolSession",
+        "tool_catalog_cache",
+        "descriptor_cache",
+        "embedding",
+        "dynamic_registration",
+    ):
+        assert forbidden not in production
+
+
+def test_stage_m1_keeps_loop_context_and_composition_owners_exact():
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
+    assert _class_owners("DataContextBuilder") == {"domains/data/context.py"}
+    assert _class_owners("ToolRuntime") == {"loop/driver.py"}
+    assert "tools: ToolRuntime" in loop
+    assert "_capability_runtime" in embedded
+    assert "CapabilityRuntime(" in embedded
+    assert "capability_runtime" not in loop
+
+
+def test_stage_m2_is_server_neutral_lazy_and_uses_existing_runtime_owners():
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
+    adapter_path = PACKAGE / "adapters" / "mcp.py"
+    adapter = adapter_path.read_text(encoding="utf-8")
+    domain = (PACKAGE / "domains" / "mcp.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    production = _python_text(PACKAGE)
+
+    assert "MCP" not in runtime
+    assert "mcp" not in _imports(PACKAGE / "capability_runtime.py")
+    adapter_tree = ast.parse(adapter)
+    top_level_imports = {
+        alias.name.split(".")[0]
+        for node in adapter_tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert "httpx" not in top_level_imports
+    assert _class_owners("StreamableHTTPMCPClient") == {"adapters/mcp.py"}
+    assert _class_owners("MCPCapabilityDomain") == {"domains/mcp.py"}
+    assert "CapabilityRuntime(" not in adapter
+    assert "CapabilityRuntime(" not in domain
+    assert "activate_mcp_domain" in embedded
+    assert "mcp_domain" in embedded
+    assert "mcp_server_bindings" in (
+        PACKAGE / "storage" / "sqlite_schema.py"
+    ).read_text(encoding="utf-8")
+
+    for fixture_only in (
+        "alpha.fixture.test",
+        "beta.fixture.test",
+        "fixture-alpha",
+        "fixture-beta",
+    ):
+        assert fixture_only not in production
+    for prohibited in (
+        "SupportedMCPServer",
+        "MCPRuntime",
+        "MCPRegistry",
+        "MCPContextBuilder",
+        "singleton_mcp",
+        "built_in_endpoint",
+    ):
+        assert prohibited not in production
+
+    public_operations = {
+        "inspect_mcp_server",
+        "attach_mcp_server",
+        "list_mcp_servers",
+        "refresh_mcp_server",
+        "revoke_mcp_server",
+    }
+    assert public_operations <= _class_methods(PACKAGE / "agent.py", "Agent")
+    assert public_operations <= _class_methods(
+        PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
+    )
+
+
+async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
+    tmp_path,
+):
+    agent = await daita.Agent.create("stage-m1-owners", root=tmp_path)
+    try:
+        registry = agent._embedded._capabilities
+        runtime = agent._embedded._capability_runtime
+        expected_owners = {
+            "artifacts",
+            "data",
+            "data_profile_jobs",
+            "jobs",
+            "memory",
+            "semantics",
+            "skills",
+        }
+        assert registry.domain_owner_ids == expected_owners
+        assert set(runtime._domains) == expected_owners
+
+        resolved = {}
+        for name in registry.tool_names:
+            view, capability, owner_id = registry.resolve_tool_owner(name)
+            assert view.capability_id == capability.id
+            assert registry.resolve_domain_owner(capability.id) == owner_id
+            assert capability in runtime._domains[owner_id].declarations.capabilities
+            resolved[name] = owner_id
+
+        assert resolved["catalog_search"] == "data"
+        assert resolved["data_query_sqlite"] == "data"
+        assert resolved["data_query_postgresql"] == "data"
+        assert resolved["data_read_file"] == "data"
+        assert resolved["data_update_postgresql"] == "data"
+        assert resolved["memory_set"] == "memory"
+        assert resolved["skill_view"] == "skills"
+        assert resolved["semantic_list"] == "semantics"
+        assert resolved["artifact_create_document"] == "artifacts"
+        assert resolved["start_data_profile"] == "data_profile_jobs"
+        assert resolved["job_list"] == "jobs"
+    finally:
+        await agent.close()
+
+
 def test_final_src_layout_has_one_package_owner_and_no_replacement_alias():
     assert PACKAGE == ROOT / "src" / "daita"
     assert not (ROOT / "daita").exists()
@@ -97,6 +293,9 @@ def test_public_surface_is_focused():
         "ConversationRun",
         "CatalogSummary",
         "DocumentCandidateContent",
+        "DeliverySubject",
+        "DeliverySubjectKind",
+        "DeliveryState",
         "LearningCandidate",
         "LearningCandidateAction",
         "LearningCandidateError",
@@ -106,10 +305,28 @@ def test_public_surface_is_focused():
         "LearningCandidateView",
         "LearningReviewResult",
         "LearningReviewStatus",
+        "JobExecutionMode",
+        "InboxItem",
+        "JobInspection",
+        "JobResultView",
+        "JobStatus",
+        "JobSummary",
         "LocalDirectorySource",
         "LoopExit",
         "LoopExitKind",
         "LoopLimits",
+        "ToolProjectionMode",
+        "MCPAdmissionError",
+        "MCPAuthentication",
+        "MCPAuthenticationMode",
+        "MCPBindingState",
+        "MCPBindingStatus",
+        "MCPError",
+        "MCPInspectedTool",
+        "MCPServerBinding",
+        "MCPServerInspection",
+        "MCPToolBinding",
+        "MCPToolSelection",
         "ModelRoute",
         "ModelRouteCandidate",
         "PostgreSQLSource",
@@ -135,6 +352,83 @@ def test_public_surface_is_focused():
         "__version__",
         "create_llm_provider",
     }
+
+
+def test_stage_b_has_one_job_aggregate_and_no_parallel_execution_system():
+    assert _class_owners("JobRun") == {"jobs/models.py"}
+    assert _class_owners("JobOwner") == {"jobs/owner.py"}
+    assert _class_owners("JobSupervisor") == {"jobs/supervisor.py"}
+    assert _class_owners("InternalCapabilityRequest") == {"capability_runtime.py"}
+
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
+    assert schema.count("CREATE TABLE job_runs") == 1
+    for parallel_table in (
+        "job_attempts",
+        "job_results",
+        "job_workers",
+        "job_queue",
+        "job_events",
+        "job_schedules",
+    ):
+        assert f"CREATE TABLE {parallel_table}" not in schema
+
+
+def test_stage_c_has_one_followup_aggregate_and_one_inbox_without_parallel_runtime():
+    assert _class_owners("AutonomousFollowup") == {"autonomy.py"}
+    assert _class_owners("InboxItem") == {"autonomy.py"}
+    assert _class_owners("RunStartEnvelope") == {"loop/models.py"}
+    assert _class_owners("InboxScreen") == {"tui/screens/inbox.py"}
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
+    assert schema.count("CREATE TABLE autonomous_followups") == 1
+    assert schema.count("CREATE TABLE conversation_inbox") == 1
+    production = _python_text(PACKAGE)
+    assert "allowed_read_capabilities" not in production
+    assert "mark_job_terminal_observed" not in production
+    for table in (
+        "completion_events",
+        "followup_attempts",
+        "followup_claims",
+        "followup_budgets",
+        "delivery_attempts",
+        "completion_routes",
+    ):
+        assert f"CREATE TABLE {table}" not in schema
+
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
+    supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop")
+    providers = _python_text(PACKAGE / "llm" / "providers")
+    assert "data_profile" not in runtime
+    assert "JobRun" not in runtime
+    assert "JobRun" not in loop
+    assert "JobRun" not in providers
+    assert "execute_internal(" in supervisor
+    assert "executor.execute(" not in supervisor
+    assert "execute_read(" not in supervisor
+
+    inbox_screen = (PACKAGE / "tui" / "screens" / "inbox.py").read_text(
+        encoding="utf-8"
+    )
+    tui_controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
+    tui_app = (PACKAGE / "tui" / "app.py").read_text(encoding="utf-8")
+    assert "require_agent().inbox(" in tui_controller
+    assert "require_agent().acknowledge_inbox(" in tui_controller
+    assert "event.run_origin" in tui_app
+    assert "Agent.run" not in inbox_screen
+    assert "_embedded" not in inbox_screen
+
+    production = _python_text(PACKAGE)
+    for forbidden in (
+        "class JobRegistry",
+        "class JobHandler",
+        "class Scheduler",
+        "class Workflow",
+        "class ExecutionGraph",
+        "class RecoveryService",
+        "class CompletionRouter",
+        "class ResidentDaemon",
+    ):
+        assert forbidden not in production
 
 
 def test_stage_seven_exports_records_without_exporting_their_owners():
@@ -348,13 +642,14 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
         PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
     )
 
-    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+    skill_capabilities = (PACKAGE / "skills" / "capabilities.py").read_text(
         encoding="utf-8"
     )
     context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
-    assert "SKILL_VIEW_CAPABILITY_ID" in controller
-    assert "SKILL_SAVE_CAPABILITY_ID" in controller
-    assert "SKILL_DELETE_CAPABILITY_ID" in controller
+    assert "class SkillCapabilityDomain" in skill_capabilities
+    assert "SKILL_VIEW_CAPABILITY_ID" in skill_capabilities
+    assert "SKILL_SAVE_CAPABILITY_ID" in skill_capabilities
+    assert "SKILL_DELETE_CAPABILITY_ID" in skill_capabilities
     assert "skill_index" in context
     assert "historical skill body redacted" in context
 
@@ -362,9 +657,6 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
 def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
-    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
-        encoding="utf-8"
-    )
     context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
@@ -374,10 +666,10 @@ def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners(
     assert 'SEMANTIC_SAVE_TOOL_NAME = "semantic_save"' in semantics
     assert 'SEMANTIC_DELETE_TOOL_NAME = "semantic_delete"' in semantics
     assert "CREATE TABLE semantic_annotations" in schema
-    assert "semantic_resource_facts" in controller
-    assert "semantic_annotation_issue" in controller
-    assert "bind_current_semantic_evidence" in controller
-    assert "without_runtime_owned_semantic_evidence" in controller
+    assert "class SemanticCapabilityDomain" in semantics
+    assert "semantic_resource_facts" in semantics
+    assert "_annotation_issue" in semantics
+    assert "_bind_current_evidence" in semantics
     assert "render_semantic_recall" in context
     assert "semantic_declarations(identity.id, store)" in embedded
     assert "mutation_lock=mutation_lock" in embedded
@@ -410,9 +702,8 @@ def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners(
 def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
-    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
-        encoding="utf-8"
-    )
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
+    learning = (PACKAGE / "domains" / "learning.py").read_text(encoding="utf-8")
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
     schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     evaluation = (PACKAGE / "evaluation.py").read_text(encoding="utf-8")
@@ -420,23 +711,28 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
     package_text = _python_text(PACKAGE)
 
     assert _class_owners("AgentLoop") == {"loop/driver.py"}
-    assert _class_owners("DataToolRuntime") == {"domains/data/controller.py"}
+    assert _class_owners("CapabilityRuntime") == {"capability_runtime.py"}
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
     assert "semantic_duplicate_identity" in semantics
     assert "SEMANTIC_MAINTENANCE_MAX_NOTICES" in semantics
     assert "semantic-maintenance" in semantics
     assert "review material only" in context
-    assert "_decorate_semantic_view" in controller
-    assert "_semantic_management_requested" not in controller
-    assert "_SEMANTIC_MANAGEMENT_SIGNALS" not in controller
-    assert "select_explicit_learning_run" in controller
-    assert "_semantic_maintenance_requested" in controller
-    assert "capability.id in _SEMANTIC_CAPABILITIES" in controller
+    assert "_decorate_view" in semantics
+    assert "select_explicit_learning_run" in semantics
+    assert "_maintenance_requested" in semantics
+    assert "class LearningCandidateGuard" in learning
+    for capability_id in (
+        "semantics.list",
+        "semantics.view",
+        "semantics.save",
+        "semantics.delete",
+    ):
+        assert capability_id not in runtime
     assert "semantic_annotations" in storage
     assert "CREATE TABLE learning_candidates" in schema
     assert "tools=()" in candidates
     assert "AgentLoop" not in candidates
-    assert "DataToolRuntime" not in candidates
+    assert "CapabilityRuntime" not in candidates
     assert "data_query_sqlite" not in candidates
     assert "data_query_postgresql" not in candidates
     assert "evaluation" not in storage.lower()
@@ -461,30 +757,31 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
         assert forbidden not in package_text
 
 
-async def test_every_composed_builtin_write_uses_preflight_and_one_runtime_branch(
+async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_branch(
     tmp_path,
 ):
     agent = await daita.Agent.create("write-architecture", root=tmp_path)
     try:
         registry = agent._embedded._capabilities
-        write_tools = set()
+        effect_tools = set()
         for name in registry.tool_names:
             _, capability = registry.resolve_tool(name)
-            if capability.access_mode is not AccessMode.WRITE:
+            if capability.operational_effect is OperationalEffect.NONE:
                 continue
-            write_tools.add(name)
+            effect_tools.add(name)
             _, executor = registry.resolve_execution(capability.id)
-            assert capability.side_effecting is True
             assert callable(getattr(executor, "preflight", None))
-        assert write_tools == {
+        assert effect_tools == {
             "artifact_save_local",
             "artifact_set_export_location",
             "data_update_postgresql",
+            "job_cancel",
             "memory_set",
             "semantic_delete",
             "semantic_save",
             "skill_save",
             "skill_delete",
+            "start_data_profile",
         }
     finally:
         await agent.close()
@@ -516,12 +813,12 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         preview = registry.resolve_tool(preview_tool)[1]
         assert preview.id == preview_capability
         assert preview.access_mode is AccessMode.READ
-        assert preview.side_effecting is False
+        assert preview.operational_effect is OperationalEffect.NONE
         assert update_tool in registry.tool_names
         update = registry.resolve_tool(update_tool)[1]
         assert update.id == update_capability
         assert update.access_mode is AccessMode.WRITE
-        assert update.side_effecting is True
+        assert update.operational_effect is OperationalEffect.MUTATE_DATA
         _, update_executor = registry.resolve_execution(update.id)
         assert callable(getattr(update_executor, "preflight", None))
         assert forbidden_tools.isdisjoint(registry.tool_names)
@@ -530,6 +827,7 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
             encoding="utf-8"
         )
+        runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
         package_text = _python_text(PACKAGE)
         for dormant_name in forbidden_tools | forbidden_capabilities:
             assert f'"{dormant_name}"' not in package_text
@@ -543,8 +841,8 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         assert "database_write_receipts" not in write_backend
         assert "SideEffectExecutor" not in write_backend
         assert "approval_handler" not in write_backend
-        assert "_execute_side_effect" in controller
-        assert "ApprovalRequest" in controller
+        assert "_execute_side_effect" in runtime
+        assert "ApprovalRequest" in runtime
         capabilities_owner = (
             PACKAGE / "domains" / "data" / "capabilities.py"
         ).read_text(encoding="utf-8")
@@ -633,7 +931,7 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
         assert later_phase not in production
 
 
-def test_phase_c_removes_legacy_permission_runtime_but_retains_migration_evidence():
+def test_phase_c_removes_legacy_permission_runtime_and_unreleased_history():
     repository_text = (
         "\n".join(
             path.read_text(encoding="utf-8")
@@ -660,12 +958,7 @@ def test_phase_c_removes_legacy_permission_runtime_but_retains_migration_evidenc
         for path in PACKAGE.rglob("*.py")
         if any(term in path.read_text(encoding="utf-8") for term in historical_terms)
     }
-    assert matched == {
-        "storage/sqlite_codecs/sources.py",
-        "storage/sqlite_migrations/postgresql_write_admission.py",
-        "storage/sqlite_migrations/scoped_source_permissions.py",
-        "storage/sqlite_schema.py",
-    }
+    assert matched == {"storage/sqlite_codecs/sources.py"}
 
 
 def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
@@ -701,18 +994,57 @@ def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
     assert "artifact_list" not in (PACKAGE / "cli.py").read_text(encoding="utf-8")
 
 
-def test_observation_owners_keep_tool_events_out_of_loop_and_storage():
-    storage = _python_text(PACKAGE / "storage")
-    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+def test_stage_b_job_scope_has_one_agent_owner_and_no_conversation_gate():
+    capabilities = (PACKAGE / "jobs" / "capabilities.py").read_text(encoding="utf-8")
+    owner = (PACKAGE / "jobs" / "owner.py").read_text(encoding="utf-8")
+    models = (PACKAGE / "jobs" / "models.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+
+    for obsolete in (
+        "def _conversation(",
+        "_load_scoped",
+        "job_owner_conversation_scope",
+        "not available in this conversation scope",
+    ):
+        assert obsolete not in capabilities + owner
+    assert "job_owner_agent_scope" in capabilities
+    assert "origin_conversation_id" in capabilities
+    assert "origin_conversation_id" in models
+    assert (
+        "conversation_id: str | None = None"
+        not in owner.split("async def inspect", 1)[1]
+    )
+    assert "JobCapabilityDomain(job_declaration_bundle, job_owner)" in embedded
+    assert "ToolExposureClass.CORE" in capabilities
+    assert "item.id == JOB_CANCEL_CAPABILITY_ID" in capabilities
+
+
+def test_exact_artifact_read_is_agent_owned_while_list_and_convert_stay_conversation_scoped():
+    exports = (PACKAGE / "domains" / "data" / "export_capabilities.py").read_text(
         encoding="utf-8"
     )
+    assert "payload = await self._artifacts.read(artifact_id)" in exports
+    assert "exact known artifact owned by" in exports
+    conversation_capabilities = exports.split(
+        "_CONVERSATION_ARTIFACT_CAPABILITIES =", 1
+    )[1].split("_ARTIFACT_PRODUCER_CAPABILITIES", 1)[0]
+    assert "ARTIFACT_LIST_CAPABILITY_ID" in conversation_capabilities
+    assert "ARTIFACT_CONVERT_CAPABILITY_ID" in conversation_capabilities
+    assert "ARTIFACT_READ_CAPABILITY_ID" not in conversation_capabilities
+    assert "await self._artifacts.find_ref(artifact_id)" in exports
+    assert "else await self._current_ref(run, artifact_id)" in exports
+
+
+def test_observation_owners_keep_tool_events_out_of_loop_and_storage():
+    storage = _python_text(PACKAGE / "storage")
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
     loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
 
     assert "AgentEvent" not in storage
-    assert "AgentEventKind.TOOL_STARTED" in controller
-    assert "AgentEventKind.TOOL_COMPLETED" in controller
-    assert "AgentEventKind.APPROVAL_REQUESTED" in controller
-    assert "AgentEventKind.APPROVAL_DECIDED" in controller
+    assert "AgentEventKind.TOOL_STARTED" in runtime
+    assert "AgentEventKind.TOOL_COMPLETED" in runtime
+    assert "AgentEventKind.APPROVAL_REQUESTED" in runtime
+    assert "AgentEventKind.APPROVAL_DECIDED" in runtime
     assert "AgentEventKind.TOOL_STARTED" not in loop
     assert "AgentEventKind.TOOL_COMPLETED" not in loop
     assert "AgentEventKind.APPROVAL_REQUESTED" not in loop
@@ -721,9 +1053,7 @@ def test_observation_owners_keep_tool_events_out_of_loop_and_storage():
 
 def test_stage_five_governance_extends_existing_execution_and_composition_owners():
     contracts = (PACKAGE / "capabilities.py").read_text(encoding="utf-8")
-    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
-        encoding="utf-8"
-    )
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     loop = _python_text(PACKAGE / "loop").lower()
     storage = _python_text(PACKAGE / "storage").lower()
@@ -735,10 +1065,10 @@ def test_stage_five_governance_extends_existing_execution_and_composition_owners
         "class SideEffectExecutor",
     ):
         assert contract in contracts
-    assert controller.count("side_effect.preflight(execution)") == 2
-    assert "async with self._mutation_lock" in controller
-    assert "state_changed" in controller
-    assert "_execute_definitely" in controller
+    assert runtime.count("side_effect.preflight(execution)") == 2
+    assert "async with self._mutation_lock" in runtime
+    assert "state_changed" in runtime
+    assert "_execute_definitely" in runtime
     assert embedded.count("mutation_lock = asyncio.Lock()") == 1
     assert "mutation_lock=mutation_lock" in embedded
     assert "approval_handler=approval_handler" in embedded
@@ -790,7 +1120,7 @@ def test_cli_remains_a_presentation_over_the_public_agent_api():
     for forbidden in (
         "._embedded",
         "CapabilityRegistry",
-        "DataToolRuntime",
+        "CapabilityRuntime",
         "executor.execute(",
         "resolve_execution(",
         "SQLiteStateStore",
@@ -844,7 +1174,7 @@ def test_terminal_application_remains_a_presentation_over_the_public_agent_api()
         "._embedded",
         "AgentLoop",
         "CapabilityRegistry",
-        "DataToolRuntime",
+        "CapabilityRuntime",
         "ResourceAdapter",
         "SQLiteStateStore",
         "agent.toml",
@@ -1249,20 +1579,15 @@ def test_sqlite_journal_and_codecs_have_one_append_only_storage_owner():
         for path in PACKAGE.rglob("*.py")
         if "PRAGMA user_version" in path.read_text(encoding="utf-8")
     }
-    assert pragma_owners == {"storage/sqlite_migrations/preledger.py"}
+    assert pragma_owners == set()
     migration_files = {
         path.name for path in (PACKAGE / "storage" / "sqlite_migrations").glob("*.py")
     }
     assert migration_files == {
         "__init__.py",
         "baseline.py",
-        "database_write_receipts.py",
-        "generalized_postgresql_updates.py",
         "models.py",
-        "postgresql_write_admission.py",
-        "preledger.py",
         "runner.py",
-        "scoped_source_permissions.py",
     }
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
 
@@ -1349,6 +1674,10 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
         assert tables == {
             "database_write_receipts",
             "learning_candidates",
+            "job_runs",
+            "autonomous_followups",
+            "conversation_inbox",
+            "mcp_server_bindings",
             "messages",
             "metadata",
             "postgresql_update_scopes",
@@ -1369,8 +1698,26 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
                 "data",
             ),
             "learning_candidates": ("agent_id", "id", "data"),
+            "job_runs": ("agent_id", "job_id", "data"),
+            "autonomous_followups": (
+                "agent_id",
+                "followup_id",
+                "job_id",
+                "event_id",
+                "data",
+            ),
+            "conversation_inbox": (
+                "agent_id",
+                "delivery_id",
+                "conversation_id",
+                "subject_kind",
+                "subject_id",
+                "logical_key",
+                "data",
+            ),
             "messages": ("run_id", "position", "data"),
             "metadata": ("key", "data"),
+            "mcp_server_bindings": ("agent_id", "binding_id", "data"),
             "postgresql_update_scopes": (
                 "agent_id",
                 "source_id",
@@ -1445,7 +1792,7 @@ def test_skill_save_delete_cannot_mutate_registered_execution_identities():
             assert term not in text
 
 
-def test_registry_and_data_runtime_keep_executor_resolution_ownership():
+def test_registry_and_common_runtime_keep_executor_resolution_ownership():
     resolution_owners = {
         path.relative_to(PACKAGE).as_posix()
         for path in PACKAGE.rglob("*.py")
@@ -1456,8 +1803,8 @@ def test_registry_and_data_runtime_keep_executor_resolution_ownership():
         for path in PACKAGE.rglob("*.py")
         if "executor.execute(" in path.read_text(encoding="utf-8")
     }
-    assert resolution_owners == {"capabilities.py", "domains/data/controller.py"}
-    assert resolved_executor_callers == {"domains/data/controller.py"}
+    assert resolution_owners == {"capabilities.py", "capability_runtime.py"}
+    assert resolved_executor_callers == {"capability_runtime.py"}
 
 
 def test_artifacts_have_one_concrete_owner_and_no_storage_renderer_or_policy_registry():
@@ -1526,10 +1873,10 @@ def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_
     from daita.domains.data.export_capabilities import (
         POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        artifact_extension_declarations,
+        artifact_capability_declarations,
     )
 
-    declarations = artifact_extension_declarations()
+    declarations = artifact_capability_declarations()
     for capability in declarations.capabilities:
         if capability.id not in {
             SQLITE_TABULAR_EXPORT_CAPABILITY_ID,

@@ -1,4 +1,4 @@
-"""Focused public API for the MVP data agent."""
+"""Expose the public facade for configuring and running a persistent data agent."""
 
 from __future__ import annotations
 
@@ -10,6 +10,14 @@ from pathlib import Path
 from typing import Self
 
 from ._json import FrozenJsonObject
+from .adapters.job_profiles import ConnectedJobProfile
+from .adapters.mcp import (
+    MCPAuthentication,
+    MCPBindingStatus,
+    MCPClientFactory,
+    MCPServerInspection,
+    MCPToolSelection,
+)
 from .adapters.models import SourceRegistration
 from .adapters.postgresql import (
     PostgreSQLProbeResult,
@@ -25,6 +33,7 @@ from .artifacts.models import (
     ArtifactDestination,
     ArtifactPayload,
 )
+from .autonomy import DeliverySubject, DeliverySubjectKind, InboxItem
 from .capabilities import ApprovalHandler
 from .catalog.models import (
     CatalogResource,
@@ -48,6 +57,13 @@ from .hosting.embedded import (
     SourceEditResult,
     SourceSelectionError,
 )
+from .jobs.models import (
+    JobExecutionMode,
+    JobInspection,
+    JobResultView,
+    JobStatus,
+    JobSummary,
+)
 from .learning_candidates import (
     LearningCandidateContent,
     LearningCandidateRejectionReason,
@@ -55,7 +71,7 @@ from .learning_candidates import (
     LearningCandidateView,
     LearningReviewResult,
 )
-from .llm.models import ModelProfile
+from .llm.models import ModelProfile, ModelSensitivity
 from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
@@ -117,6 +133,7 @@ class Agent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        mcp_client_factory: MCPClientFactory | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
         reviewer_model: ModelProvider | None = None,
@@ -125,6 +142,7 @@ class Agent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
+        connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
         _validate_downloads_directory(downloads_directory)
         return cls(
@@ -138,6 +156,7 @@ class Agent:
                 clock=clock,
                 id_factory=id_factory,
                 secret_provider=secret_provider,
+                mcp_client_factory=mcp_client_factory,
                 keychain=keychain,
                 model_validator=model_validator,
                 reviewer_model=reviewer_model,
@@ -146,6 +165,7 @@ class Agent:
                 observer=observer,
                 approval_handler=approval_handler,
                 downloads_directory=downloads_directory,
+                connected_job_profiles=connected_job_profiles,
             )
         )
 
@@ -162,6 +182,7 @@ class Agent:
         clock: Callable[[], datetime] | None = None,
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
+        mcp_client_factory: MCPClientFactory | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
         reviewer_model: ModelProvider | None = None,
@@ -170,6 +191,7 @@ class Agent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
+        connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
         _validate_downloads_directory(downloads_directory)
         return cls(
@@ -183,6 +205,7 @@ class Agent:
                 clock=clock,
                 id_factory=id_factory,
                 secret_provider=secret_provider,
+                mcp_client_factory=mcp_client_factory,
                 keychain=keychain,
                 model_validator=model_validator,
                 reviewer_model=reviewer_model,
@@ -191,6 +214,7 @@ class Agent:
                 observer=observer,
                 approval_handler=approval_handler,
                 downloads_directory=downloads_directory,
+                connected_job_profiles=connected_job_profiles,
             )
         )
 
@@ -274,11 +298,13 @@ class Agent:
         *,
         conversation_id: str | None = None,
         source_id: str | None = None,
+        job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         return await self._embedded.run(
             message,
             conversation_id=conversation_id,
             source_id=source_id,
+            job_executor_profile_id=job_executor_profile_id,
         )
 
     async def learn(
@@ -299,6 +325,26 @@ class Agent:
     async def transcript(self, run_id: str) -> Transcript:
         return await self._embedded.transcript(run_id)
 
+    async def inbox(
+        self,
+        *,
+        conversation_id: str | None = None,
+        include_acknowledged: bool = False,
+        limit: int = 50,
+    ) -> tuple[InboxItem, ...]:
+        """Inspect bounded durable autonomous results for this agent."""
+
+        return await self._embedded.inbox(
+            conversation_id=conversation_id,
+            include_acknowledged=include_acknowledged,
+            limit=limit,
+        )
+
+    async def acknowledge_inbox(self, delivery_id: str) -> InboxItem | None:
+        """Idempotently acknowledge one exact inbox result."""
+
+        return await self._embedded.acknowledge_inbox(delivery_id)
+
     async def conversation_runs(
         self,
         conversation_id: str,
@@ -309,6 +355,23 @@ class Agent:
         """Return whether one conversation ID belongs to this agent."""
 
         return await self._embedded.conversation_exists(conversation_id)
+
+    async def list_jobs(
+        self,
+        *,
+        statuses: frozenset[JobStatus] = frozenset(),
+        limit: int = 50,
+    ) -> tuple[JobSummary, ...]:
+        return await self._embedded.list_jobs(statuses=statuses, limit=limit)
+
+    async def inspect_job(self, job_id: str) -> JobInspection | None:
+        return await self._embedded.inspect_job(job_id)
+
+    async def read_job_result(self, job_id: str) -> JobResultView | None:
+        return await self._embedded.read_job_result(job_id)
+
+    async def cancel_job(self, job_id: str) -> JobInspection | None:
+        return await self._embedded.cancel_job(job_id)
 
     async def clear_conversations(self) -> int:
         """Delete transcripts and candidate records, not approved knowledge."""
@@ -500,6 +563,45 @@ class Agent:
 
     async def delete_skill(self, name: str) -> bool:
         return await self._embedded.delete_skill(name)
+
+    async def inspect_mcp_server(
+        self,
+        *,
+        endpoint: str,
+        authentication: MCPAuthentication | None = None,
+    ) -> MCPServerInspection:
+        return await self._embedded.inspect_mcp_server(
+            endpoint=endpoint,
+            authentication=authentication,
+        )
+
+    async def attach_mcp_server(
+        self,
+        *,
+        endpoint: str,
+        selections: tuple[MCPToolSelection, ...],
+        authentication: MCPAuthentication | None = None,
+        maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
+        local_label: str | None = None,
+        binding_id: str | None = None,
+    ) -> MCPBindingStatus:
+        return await self._embedded.attach_mcp_server(
+            endpoint=endpoint,
+            selections=selections,
+            authentication=authentication,
+            maximum_outbound_sensitivity=maximum_outbound_sensitivity,
+            local_label=local_label,
+            binding_id=binding_id,
+        )
+
+    async def list_mcp_servers(self) -> tuple[MCPBindingStatus, ...]:
+        return await self._embedded.list_mcp_servers()
+
+    async def refresh_mcp_server(self, binding_id: str) -> MCPBindingStatus:
+        return await self._embedded.refresh_mcp_server(binding_id)
+
+    async def revoke_mcp_server(self, binding_id: str) -> MCPBindingStatus:
+        return await self._embedded.revoke_mcp_server(binding_id)
 
     async def attach(self, source: ResourceSource) -> SourceRegistration:
         return await self._embedded.attach(source)
@@ -834,6 +936,14 @@ __all__ = [
     "AgentNotConfiguredError",
     "AgentNotFoundError",
     "HostActiveError",
+    "DeliverySubject",
+    "DeliverySubjectKind",
+    "InboxItem",
+    "JobExecutionMode",
+    "JobInspection",
+    "JobResultView",
+    "JobStatus",
+    "JobSummary",
     "PostgreSQLProbeResult",
     "PostgreSQLSourceError",
     "SourceRefreshError",

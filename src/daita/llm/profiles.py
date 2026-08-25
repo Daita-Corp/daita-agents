@@ -1,4 +1,4 @@
-"""Release-reviewed model profile facts keyed by exact provider identity."""
+"""Return reviewed capabilities and limits for exact provider and model identities."""
 
 from __future__ import annotations
 

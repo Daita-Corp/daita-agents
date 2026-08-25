@@ -1,4 +1,4 @@
-"""Multiline composer with the existing character bound and key contracts."""
+"""Implement multiline message entry, limits, key handling, and completions."""
 
 from __future__ import annotations
 

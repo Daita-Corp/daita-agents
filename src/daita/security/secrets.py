@@ -1,4 +1,4 @@
-"""Runtime secret resolution without durable secret values."""
+"""Resolve secret references from environment, keychain, or composed providers."""
 
 from __future__ import annotations
 

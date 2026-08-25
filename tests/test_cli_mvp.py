@@ -775,6 +775,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "run",
         "chat",
         "memory",
+        "mcp",
         "skills",
     }
     assert _surface(commands["detach"]) == (

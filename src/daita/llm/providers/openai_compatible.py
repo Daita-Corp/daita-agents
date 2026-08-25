@@ -1,4 +1,4 @@
-"""Scoped OpenAI-compatible Chat Completions model adapter."""
+"""Translate canonical requests for scoped OpenAI-compatible chat endpoints."""
 
 from __future__ import annotations
 
@@ -16,7 +16,13 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json
-from ..errors import ModelProviderError, ProviderErrorCode, detached_provider_error
+from ..errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+    detached_provider_error,
+)
 from ..models import (
     CanonicalMessage,
     FinishReason,
@@ -200,10 +206,14 @@ class OpenAICompatibleProvider:
             failure = ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 f"{self.provider} provider boundary failed",
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
+                    code="unexpected_provider_boundary_failure",
+                ),
             )
         if failure is None:
             raise AssertionError("compatible provider failed without an error")
-        raise detached_provider_error(failure)
+        raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
@@ -228,6 +238,11 @@ class OpenAICompatibleProvider:
             raise ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 f"{self.provider} returned a malformed response",
+                provider_id=self.provider_id,
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.RESPONSE_DECODE,
+                    code="response_decode_failed",
+                ),
             ) from error
 
     async def stream(
@@ -251,10 +266,14 @@ class OpenAICompatibleProvider:
             failure = ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 f"{self.provider} provider boundary failed",
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
+                    code="unexpected_provider_boundary_failure",
+                ),
             )
         if failure is None:
             raise AssertionError("compatible provider failed without an error")
-        raise detached_provider_error(failure)
+        raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _stream(
         self,
@@ -281,6 +300,11 @@ class OpenAICompatibleProvider:
             raise ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 f"{self.provider} returned a malformed stream",
+                provider_id=self.provider_id,
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.STREAM_TERMINAL,
+                    code="stream_not_iterable",
+                ),
             )
 
         text_fragments: list[str] = []
@@ -424,11 +448,25 @@ class OpenAICompatibleProvider:
                 raise ModelProviderError(
                     ProviderErrorCode.MALFORMED_RESPONSE,
                     f"{self.provider} returned a malformed stream",
+                    provider_id=self.provider_id,
+                    diagnostic=ProviderFailureDiagnostic(
+                        phase=ProviderFailurePhase.STREAM_EVENT,
+                        code="event_decode_failed",
+                        terminal_status=_safe_structural_token(finish_reason),
+                    ),
                 ) from error
 
+        if finish_reason is None:
+            raise ModelProviderError(
+                ProviderErrorCode.MALFORMED_RESPONSE,
+                f"{self.provider} stream ended without a finish reason",
+                provider_id=self.provider_id,
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.STREAM_TERMINAL,
+                    code="terminal_completion_missing",
+                ),
+            )
         try:
-            if finish_reason is None:
-                raise ValueError("stream ended without a finish reason")
             if finish_reason == "content_filter":
                 raise ModelProviderError(
                     ProviderErrorCode.CONTENT_BLOCKED,
@@ -490,6 +528,12 @@ class OpenAICompatibleProvider:
             raise ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 f"{self.provider} returned a malformed stream",
+                provider_id=self.provider_id,
+                diagnostic=ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.STREAM_TERMINAL,
+                    code="terminal_response_decode_failed",
+                    terminal_status=_safe_structural_token(finish_reason),
+                ),
             ) from error
         yield ModelStreamCompleted(response)
 
@@ -897,6 +941,21 @@ def _is_loopback_host(value: str) -> bool:
         return ipaddress.ip_address(value).is_loopback
     except ValueError:
         return False
+
+
+def _safe_structural_token(value: object) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 96:
+        return None
+    if (
+        not value[0].isascii()
+        or not value[0].isalnum()
+        or any(
+            not character.isascii() or not (character.isalnum() or character in "._:-")
+            for character in value
+        )
+    ):
+        return None
+    return value
 
 
 _MISSING = object()

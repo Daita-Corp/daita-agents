@@ -1,4 +1,4 @@
-"""Canonical catalog contracts."""
+"""Export canonical catalog records, protocols, and service APIs."""
 
 from .capabilities import (
     CATALOG_INSPECT_CAPABILITY_ID,

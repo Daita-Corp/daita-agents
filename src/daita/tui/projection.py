@@ -1,4 +1,4 @@
-"""Bounded tool, transcript, and artifact projection."""
+"""Redact, bound, and project tools, transcripts, conversations, and artifacts."""
 
 from __future__ import annotations
 

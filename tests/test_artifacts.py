@@ -4,9 +4,10 @@ import asyncio
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import pytest
+from _capability_runtime_support import context_step_projection, context_tool_catalog
 
 import daita.artifacts.store as store_module
 import daita.capabilities as capabilities_module
@@ -24,8 +25,9 @@ from daita.artifacts.models import (
 from daita.artifacts.renderers import DOCUMENT_ALLOWED_EXTENSIONS, render_model_document
 from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import ArtifactPolicy, Capability, ToolOutput
+from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.models import Sensitivity
-from daita.domains.data.controller import DataToolRuntime, _resolved_sensitivity
+from daita.domains.data.export_capabilities import _resolved_sensitivity
 from daita.domains.data.file_capabilities import LocalFileReadExecutor
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
@@ -38,7 +40,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.loop import AgentLoop, InMemoryTranscriptStore
+from daita.loop import AgentLoop, InMemoryTranscriptStore, ToolBatchOutcome
 from daita.loop.models import LoopExitKind, RunInput
 
 NOW = datetime(2026, 8, 1, 12, tzinfo=UTC)
@@ -163,11 +165,12 @@ async def test_artifact_store_open_cancellation_finishes_admission_cleanup(
     def blocked_cleanup(
         store: AgentHomeArtifactStore,
         refs: tuple[ArtifactRef, ...],
+        reservations: frozenset[tuple[str, str]],
     ) -> None:
         started.set()
         assert release.wait(2)
         try:
-            original(store, refs)
+            original(store, refs, reservations)
         finally:
             finished.set()
 
@@ -202,8 +205,9 @@ async def test_artifact_store_open_preserves_admission_failure_as_unavailable(
     def fail_cleanup(
         store: AgentHomeArtifactStore,
         refs: tuple[ArtifactRef, ...],
+        reservations: frozenset[tuple[str, str]],
     ) -> None:
-        del store, refs
+        del store, refs, reservations
         raise ArtifactError(
             "artifact_storage_failed",
             "Injected admission failure.",
@@ -244,9 +248,9 @@ async def test_capability_without_artifact_policy_rejects_a_draft(
     tmp_path: Path,
 ) -> None:
     store, _ = await _store(tmp_path)
-    runtime = DataToolRuntime(
-        capabilities_module.CapabilityRegistry(),
-        cast(Any, _Catalog()),
+    runtime = CapabilityRuntime(
+        capabilities_module.CapabilityRegistry(declarations=(), executors=()),
+        (),
         artifacts=store,
     )
     capability = Capability(
@@ -651,28 +655,51 @@ async def test_clear_conversations_cancellation_never_leaves_a_persisted_danglin
 
 
 class _LoopContext:
-    async def build(self, run, messages, tools, *, step, final=False):
-        del run, step, final
-        return ModelRequest(messages=messages, tools=tools)
+    async def prepare(self, run, messages, tool_context):
+        del run
+        return messages[:-1], tool_context.provider_definitions
+
+    def project(
+        self,
+        snapshot,
+        messages,
+        *,
+        step,
+        tool_context,
+        final=False,
+        previous_request_input_tokens=None,
+    ):
+        del step, previous_request_input_tokens, tool_context
+        static, tools = snapshot
+        return ModelRequest(
+            messages=(*static, *messages),
+            tools=() if final else tools,
+        )
 
 
 class _LoopTools:
     def __init__(self, results: dict[str, ToolResultBlock]) -> None:
         self.results = results
 
-    async def definitions(self, run):
-        del run
-        return (
-            ToolDefinition(
-                name="artifact",
-                description="artifact test",
-                input_schema={"type": "object", "properties": {}},
+    async def prepare_run(self, run):
+        return context_tool_catalog(
+            run,
+            (
+                ToolDefinition(
+                    name="artifact",
+                    description="artifact test",
+                    input_schema={"type": "object", "properties": {}},
+                ),
             ),
         )
 
-    async def execute_all(self, run, calls):
-        del run
-        return tuple(self.results[call.id] for call in calls)
+    def project(self, catalog, messages):
+        del messages
+        return context_step_projection(catalog)
+
+    async def execute_all(self, run, calls, *, projection, sensitivity):
+        del run, projection, sensitivity
+        return ToolBatchOutcome(tuple(self.results[call.id] for call in calls))
 
 
 def _ref(artifact_id: str, call_id: str) -> ArtifactRef:

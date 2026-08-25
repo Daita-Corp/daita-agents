@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -202,6 +203,7 @@ async def test_broad_catalog_discovery_matches_any_term_and_resource_kind(
 
         assert tuple(hit.name for hit in result.hits) == ("child", "parent")
         assert result.total_matches == 2
+        assert result.returned_count == 2
         assert all("kind" in hit.matched_fields for hit in result.hits)
     finally:
         await agent.close()
@@ -517,6 +519,7 @@ async def test_indexed_search_normalizes_ranks_diversifies_and_exposes_evidence(
             "region_lookup",
         )
         assert diversified.total_matches == 6
+        assert diversified.returned_count == 2
         child = next(hit for hit in relationship.hits if hit.name == "child")
         order_items = next(hit for hit in relationship.hits if hit.name == "OrderItems")
         assert "column:parent_id" in child.matched_fields
@@ -528,6 +531,181 @@ async def test_indexed_search_normalizes_ranks_diversifies_and_exposes_evidence(
             "customer_outside",
             "customer_view",
         )
+    finally:
+        await agent.close()
+
+
+async def test_embedded_exact_name_anchor_outranks_128_lookalikes_and_has_boundaries(
+    tmp_path: Path,
+):
+    database = tmp_path / "embedded-exact-anchor.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE stage_b_profile_probe (id INTEGER PRIMARY KEY)"
+        )
+        for index in range(128):
+            suffix = "archive" if index % 2 == 0 else "backup"
+            connection.execute(
+                f"CREATE TABLE stage_b_profile_probe_{suffix}_{index:03d} "
+                "(id INTEGER PRIMARY KEY)"
+            )
+    agent = await Agent.create("catalog-embedded-exact-anchor", root=tmp_path)
+    try:
+        await agent.attach(SQLiteSource(database))
+        query = (
+            "Profile stage_b_profile_probe and ignore archive or backup look-alikes."
+        )
+        result = await agent.search_catalog(
+            CatalogSearchRequest(agent_id=agent.id, query=query, limit=12)
+        )
+
+        assert result.hits[0].name == "stage_b_profile_probe"
+        assert result.hits[0].match_reasons == ("resource_name_exact_mention",)
+        assert result.total_matches == 129
+        assert result.returned_count == 12
+        assert result.truncated is True
+
+        boundary = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="Profile stage_b_profile_probe_archive_000.",
+                limit=12,
+            )
+        )
+        exact_mentions = tuple(
+            hit.name
+            for hit in boundary.hits
+            if hit.match_reasons == ("resource_name_exact_mention",)
+        )
+        assert exact_mentions == ("stage_b_profile_probe_archive_000",)
+
+        native_identity = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="Please inspect main.stage_b_profile_probe.",
+                limit=12,
+            )
+        )
+        assert native_identity.hits[0].name == "stage_b_profile_probe"
+        assert native_identity.hits[0].match_reasons == ("resource_name_exact_mention",)
+
+        context = await agent._embedded._data_view.catalog_context(
+            agent.id,
+            query,
+            limit=12,
+        )
+        context_resources = context["resources"]
+        assert isinstance(context_resources, tuple)
+        first = context_resources[0]
+        assert isinstance(first, Mapping)
+        assert first["resource_id"] == result.hits[0].resource_id
+        assert first["match_reasons"] == ("resource_name_exact_mention",)
+        assert context["total_matches"] == 129
+        assert context["returned_count"] == 12
+        assert context["truncated"] is True
+    finally:
+        await agent.close()
+
+
+async def test_embedded_exact_duplicate_names_remain_source_scoped(
+    tmp_path: Path,
+):
+    first_database = tmp_path / "duplicate-exact-first.sqlite"
+    second_database = tmp_path / "duplicate-exact-second.sqlite"
+    for database in (first_database, second_database):
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
+    agent = await Agent.create("catalog-embedded-exact-duplicates", root=tmp_path)
+    try:
+        first_source = await agent.attach(SQLiteSource(first_database))
+        second_source = await agent.attach(SQLiteSource(second_database))
+
+        result = await agent.search_catalog(
+            CatalogSearchRequest(
+                agent_id=agent.id,
+                query="Please profile orders.",
+                limit=12,
+            )
+        )
+
+        assert tuple(hit.name for hit in result.hits) == ("orders", "orders")
+        assert {hit.source_id for hit in result.hits} == {
+            first_source.id,
+            second_source.id,
+        }
+        assert all(
+            hit.match_reasons == ("resource_name_exact_mention",) for hit in result.hits
+        )
+    finally:
+        await agent.close()
+
+
+async def test_catalog_context_merges_current_and_prior_queries_by_contract_priority(
+    tmp_path: Path,
+):
+    database = tmp_path / "catalog-context-priority.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE prior_target (id INTEGER PRIMARY KEY);
+            CREATE TABLE current_target (id INTEGER PRIMARY KEY);
+            CREATE TABLE profile_metrics (id INTEGER PRIMARY KEY);
+            """)
+    agent = await Agent.create("catalog-context-priority", root=tmp_path)
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        view = agent._embedded._data_view
+
+        continuity = await view.catalog_context(
+            agent.id,
+            "Profile it.",
+            prior_query="Use prior_target for this analysis.",
+            limit=12,
+        )
+        continuity_resources = continuity["resources"]
+        assert isinstance(continuity_resources, tuple)
+        continuity_records = cast(
+            tuple[Mapping[str, object], ...], continuity_resources
+        )
+        assert tuple(item["name"] for item in continuity_records[:2]) == (
+            "prior_target",
+            "profile_metrics",
+        )
+
+        switched = await view.catalog_context(
+            agent.id,
+            "Switch to current_target.",
+            prior_query="Use prior_target for this analysis.",
+            limit=12,
+        )
+        switched_resources = switched["resources"]
+        assert isinstance(switched_resources, tuple)
+        switched_records = cast(tuple[Mapping[str, object], ...], switched_resources)
+        assert tuple(item["name"] for item in switched_records[:2]) == (
+            "current_target",
+            "prior_target",
+        )
+
+        resources = await agent.list_catalog_resources(source_id=source.id)
+        prior = next(item for item in resources if item.name == "prior_target")
+        exact_id = await view.catalog_context(
+            agent.id,
+            "text that does not match catalog metadata",
+            resource_ids=(prior.id,),
+            limit=12,
+        )
+        exact_resources = exact_id["resources"]
+        exact_sources = exact_id["sources"]
+        assert isinstance(exact_resources, tuple)
+        assert isinstance(exact_sources, tuple)
+        exact_records = cast(tuple[Mapping[str, object], ...], exact_resources)
+        source_records = cast(tuple[Mapping[str, object], ...], exact_sources)
+        assert tuple(item["resource_id"] for item in exact_records) == (prior.id,)
+        assert "source_revision" not in exact_records[0]
+        assert "sync_id" not in exact_records[0]
+        assert source_records[0]["source_id"] == source.id
+        assert exact_id["total_matches"] == 1
+        assert exact_id["returned_count"] == 1
+        assert exact_id["truncated"] is False
     finally:
         await agent.close()
 
@@ -558,6 +736,7 @@ async def test_catalog_search_merges_true_global_top_k_across_more_than_64_sourc
             "target_candidate_001",
         )
         assert result.total_matches == 65
+        assert result.returned_count == 3
         assert result.truncated is True
     finally:
         await agent.close()

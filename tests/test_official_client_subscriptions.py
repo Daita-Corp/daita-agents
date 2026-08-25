@@ -11,7 +11,11 @@ import pytest
 
 import daita.llm.providers.subscription_cli as subscription_cli
 from daita import Agent
-from daita.llm.errors import ModelProviderError, ProviderErrorCode
+from daita.llm.errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailurePhase,
+)
 from daita.llm.factory import create_llm_provider
 from daita.llm.models import (
     CanonicalMessage,
@@ -454,6 +458,11 @@ async def test_grok_rejects_native_tools_and_failed_structured_output(output, co
         await provider.generate(_request())
 
     assert caught.value.code is code
+    if code is ProviderErrorCode.MALFORMED_RESPONSE:
+        assert caught.value.provider_id == "grok-build:grok-4.5"
+        assert caught.value.diagnostic is not None
+        assert caught.value.diagnostic.phase is ProviderFailurePhase.SUBSCRIPTION_OUTPUT
+        assert caught.value.diagnostic.code == "response_decode_failed"
 
 
 async def test_subscription_client_rejects_terminal_control_output():
@@ -473,6 +482,12 @@ async def test_subscription_client_rejects_terminal_control_output():
         await provider.generate(_request())
 
     assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
+    assert caught.value.provider_id == "grok-build:grok-4.5"
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.phase is ProviderFailurePhase.SUBSCRIPTION_OUTPUT
+    assert caught.value.diagnostic.code == "response_decode_failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_subscription_json_and_response_bounds_fail_closed():

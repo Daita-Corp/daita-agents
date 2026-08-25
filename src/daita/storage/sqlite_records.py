@@ -1,4 +1,4 @@
-"""SQLite-owned durable records shared with the database-write executor."""
+"""Define durable source permission records and update authorization fingerprints."""
 
 from __future__ import annotations
 

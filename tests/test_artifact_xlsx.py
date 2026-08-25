@@ -45,7 +45,7 @@ from daita.domains.data.export_capabilities import (
     POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
     SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
     SQLITE_TABULAR_EXPORT_TOOL_NAME,
-    artifact_extension_declarations,
+    artifact_capability_declarations,
 )
 from daita.llm.models import (
     FinishReason,
@@ -431,7 +431,7 @@ def test_exact_xlsx_source_failure_never_returns_a_partial_workbook() -> None:
 def test_tabular_tool_schemas_add_xlsx_without_accepting_rows_bytes_or_workbook_control() -> (
     None
 ):
-    declarations = artifact_extension_declarations()
+    declarations = artifact_capability_declarations()
     views = {
         item.name: item
         for item in declarations.tool_views

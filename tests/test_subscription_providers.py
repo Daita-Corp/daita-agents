@@ -13,7 +13,11 @@ import daita.llm.providers.codex as codex_provider
 import daita.llm.providers.subscription_cli as claude_cli
 import daita.llm.subscription_auth as subscription_auth
 from daita import Agent
-from daita.llm.errors import ModelProviderError, ProviderErrorCode
+from daita.llm.errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailurePhase,
+)
 from daita.llm.factory import create_llm_provider
 from daita.llm.models import (
     CanonicalMessage,
@@ -179,6 +183,17 @@ class _HangingClient:
         self.responses = _HangingResponses()
 
 
+class _EmptyResponses:
+    async def create(self, **kwargs: object) -> _Stream:
+        del kwargs
+        return _Stream([])
+
+
+class _EmptyClient:
+    def __init__(self) -> None:
+        self.responses = _EmptyResponses()
+
+
 async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
     client = _Client()
     provider = CodexSubscriptionProvider(
@@ -251,6 +266,25 @@ async def test_codex_total_attempt_timeout_is_normalized(monkeypatch):
 
     assert caught.value.code is ProviderErrorCode.TIMEOUT
     assert caught.value.provider_id == "codex:gpt-test"
+
+
+async def test_codex_empty_stream_retains_bounded_terminal_diagnostic():
+    provider = CodexSubscriptionProvider(
+        "gpt-test",
+        credential=_credential().to_secret(),
+        client=_EmptyClient(),
+    )
+
+    with pytest.raises(ModelProviderError) as caught:
+        await provider.generate(_request())
+
+    assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
+    assert caught.value.provider_id == "codex:gpt-test"
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.phase is ProviderFailurePhase.STREAM_TERMINAL
+    assert caught.value.diagnostic.code == "terminal_completion_missing"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 async def test_codex_refresh_is_persisted_before_using_rotated_token(monkeypatch):
@@ -355,6 +389,25 @@ async def test_claude_subscription_total_attempt_timeout_is_normalized():
 
     assert caught.value.code is ProviderErrorCode.TIMEOUT
     assert caught.value.provider_id == "claude-code:claude-test"
+
+
+async def test_claude_subscription_malformed_output_retains_bounded_diagnostic():
+    async def run(command):
+        del command
+        return claude_cli._CompletedCommand(0, b"not-json", b"")
+
+    provider = ClaudeCodeSubscriptionProvider("claude-test", runner=run)
+
+    with pytest.raises(ModelProviderError) as caught:
+        await provider.generate(_request())
+
+    assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
+    assert caught.value.provider_id == "claude-code:claude-test"
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.phase is ProviderFailurePhase.SUBSCRIPTION_OUTPUT
+    assert caught.value.diagnostic.code == "response_decode_failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 @pytest.mark.parametrize(
