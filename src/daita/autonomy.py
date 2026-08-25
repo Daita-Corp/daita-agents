@@ -14,7 +14,6 @@ from ._json import FrozenJsonObject, canonical_json
 from .capabilities import AccessMode, ExecutionScope, OperationalEffect
 from .jobs.models import JobExecutionMode, JobRun
 from .llm.models import (
-    CanonicalMessage,
     MessageRole,
     ModelSensitivity,
     ToolCall,

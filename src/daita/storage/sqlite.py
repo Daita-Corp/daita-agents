@@ -100,7 +100,6 @@ from ..jobs.models import (
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
-    ModelSensitivity,
     ToolResultBlock,
 )
 from ..llm.pricing import CostEstimateStatus

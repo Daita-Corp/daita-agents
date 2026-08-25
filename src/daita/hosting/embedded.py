@@ -53,7 +53,6 @@ from ..artifacts.models import (
 )
 from ..artifacts.store import AgentHomeArtifactStore
 from ..autonomy import (
-    DeliveryState,
     FOLLOWUP_INSTRUCTION,
     FOLLOWUP_INSTRUCTION_DIGEST,
     FOLLOWUP_INSTRUCTION_ID,
@@ -179,7 +178,6 @@ from ..jobs.models import (
     JobResultView,
     JobStatus,
     JobSummary,
-    TERMINAL_JOB_STATUSES,
 )
 from ..jobs.owner import JobOwner
 from ..jobs.supervisor import JobSupervisor
