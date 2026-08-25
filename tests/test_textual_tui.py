@@ -6,6 +6,7 @@ import asyncio
 import os
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +34,10 @@ from daita import (
     AgentEventKind,
     ApprovalDecision,
     ApprovalRequest,
+    DeliveryState,
+    DeliverySubject,
+    DeliverySubjectKind,
+    InboxItem,
     JobStatus,
     LoopExit,
     LoopExitKind,
@@ -43,6 +48,7 @@ from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelResponse,
+    ModelSensitivity,
     ToolCall,
     ToolResultBlock,
 )
@@ -83,6 +89,7 @@ from daita.tui.screens.catalog import CatalogScreen
 from daita.tui.screens.chat import ChatScreen
 from daita.tui.screens.confirm import ConfirmScreen
 from daita.tui.screens.editing import ReviewCostScreen
+from daita.tui.screens.inbox import InboxScreen, render_inbox_item
 from daita.tui.screens.jobs import JobsScreen
 from daita.tui.screens.onboarding import (
     AgentCreateScreen,
@@ -239,6 +246,64 @@ async def test_app_mounts_create_screen_and_exits_on_cancel(tmp_path: Path):
         await pilot.press("escape")
         await pilot.pause()
     assert app.return_value == 0
+
+
+async def test_agent_picker_create_button_routes_to_existing_creation_flow(
+    tmp_path: Path,
+):
+    first = await Agent.create("existing-one", root=tmp_path)
+    await first.close()
+    second = await Agent.create("existing-two", root=tmp_path)
+    await second.close()
+
+    app = DaitaApp(root=tmp_path)
+    async with app.run_test(size=(90, 28)) as pilot:
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SelectionScreen):
+                break
+        picker = app.screen
+        assert isinstance(picker, SelectionScreen)
+        create = picker.query_one("#picker-secondary", Button)
+        assert str(create.label) == "Create new agent"
+        assert await pilot.click(create) is True
+
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, AgentCreateScreen):
+                break
+        assert isinstance(app.screen, AgentCreateScreen)
+
+        await pilot.press("escape")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SelectionScreen):
+                break
+        assert isinstance(app.screen, SelectionScreen)
+        assert await pilot.click("#picker-secondary") is True
+
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, AgentCreateScreen):
+                break
+        creation = app.screen
+        assert isinstance(creation, AgentCreateScreen)
+        creation.query_one("#agent-name", Input).value = "created-from-picker"
+        assert await pilot.click("#create-agent") is True
+
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, ChatScreen):
+                break
+        assert isinstance(app.screen, ChatScreen)
+        assert app.controller.require_agent().name == "created-from-picker"
+        app.exit(0)
+
+    assert await Agent.list(root=tmp_path) == (
+        "created-from-picker",
+        "existing-one",
+        "existing-two",
+    )
 
 
 async def test_app_resize_and_too_small_screen(tmp_path: Path):
@@ -600,6 +665,41 @@ async def test_selection_screen_filters_without_reordering():
     assert app.return_value == ("b",)
 
 
+async def test_selection_screen_secondary_action_is_distinct_from_options():
+    class Harness(App[tuple[str, ...] | None]):
+        def compose(self) -> ComposeResult:
+            yield Static("host")
+
+        def on_mount(self) -> None:
+            self.run_worker(self._present(), exclusive=True)
+
+        async def _present(self) -> None:
+            result = await self.push_screen_wait(
+                SelectionScreen(
+                    title="Pick",
+                    options=(PickerOption("existing", "Existing"),),
+                    secondary_action=PickerOption("create", "Create new"),
+                )
+            )
+            self.exit(result)
+
+    with pytest.raises(ValueError, match="must differ"):
+        SelectionScreen(
+            title="Invalid",
+            options=(PickerOption("same", "Existing"),),
+            secondary_action=PickerOption("same", "Create new"),
+        )
+
+    app = Harness()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        picker = app.screen
+        assert isinstance(picker, SelectionScreen)
+        assert await pilot.click("#picker-secondary") is True
+        await pilot.pause()
+    assert app.return_value == ("create",)
+
+
 async def test_multi_selection_shows_literal_marks_and_continue_button():
     class Harness(App[tuple[str, ...] | None]):
         def compose(self) -> ComposeResult:
@@ -639,6 +739,47 @@ async def test_multi_selection_shows_literal_marks_and_continue_button():
         assert await pilot.click(button) is True
         await pilot.pause()
     assert app.return_value == ("core",)
+
+
+def _tui_inbox_item(
+    delivery_id: str = "delivery-stage-c",
+    *,
+    report: str = "The durable profile completed successfully.",
+) -> InboxItem:
+    observed = datetime(2026, 8, 23, 14, 5, tzinfo=UTC)
+    return InboxItem(
+        delivery_id=delivery_id,
+        agent_id="agent-inbox",
+        conversation_id="conversation-inbox",
+        subject=DeliverySubject(
+            kind=DeliverySubjectKind.STANDALONE_FOLLOWUP,
+            subject_id="followup-inbox",
+        ),
+        resulting_run_id="run-followup",
+        grant_id="grant-followup",
+        logical_key="standalone_followup:followup-inbox:conclusion",
+        conclusion_digest="sha256:" + "1" * 64,
+        payload={
+            "subject": {
+                "kind": "standalone_followup",
+                "subject_id": "followup-inbox",
+            },
+            "job_id": "job-profile",
+            "run_id": "run-followup",
+            "outcome": "completed",
+            "reason": "completed",
+            "report_digest": "sha256:" + "2" * 64,
+            "report_preview": report,
+            "report_truncated": False,
+            "evidence_digest": "sha256:" + "3" * 64,
+        },
+        sensitivity=ModelSensitivity.INTERNAL,
+        destination="conversation_inbox:conversation-inbox",
+        destination_sensitivity_ceiling=ModelSensitivity.INTERNAL,
+        state=DeliveryState.AVAILABLE,
+        created_at=observed,
+        updated_at=observed,
+    )
 
 
 def _tui_job_summary(
@@ -752,6 +893,232 @@ async def test_jobs_commands_route_without_model_calls(monkeypatch):
 
     with pytest.raises(UserInputError, match="belongs to this agent"):
         await app.controller.dispatch_command("/jobs cancel job-missing")
+
+
+async def test_inbox_command_routes_without_a_model_call():
+    app = DaitaApp(start_bootstrap=False)
+
+    assert (
+        "/inbox",
+        "/inbox",
+        "Inspect and acknowledge completed background reports",
+    ) in SLASH_COMMAND_COMPLETIONS
+    outcome = await app.controller.dispatch_command("/inbox")
+    assert outcome.kind == "screen"
+    assert outcome.screen == "inbox"
+    malformed = await app.controller.dispatch_command("/inbox extra")
+    assert malformed.kind == "notice"
+    assert malformed.message == "Usage: /inbox"
+
+
+async def test_inbox_screen_inspects_sanitizes_and_acknowledges(monkeypatch):
+    app = DaitaApp(start_bootstrap=False)
+    item = _tui_inbox_item(report="Ready\x1b[31m @everyone")
+    items = [item]
+    acknowledgments: list[str] = []
+
+    async def list_inbox() -> tuple[InboxItem, ...]:
+        return tuple(items)
+
+    async def acknowledge_inbox(delivery_id: str) -> InboxItem | None:
+        acknowledgments.append(delivery_id)
+        items.clear()
+        return item
+
+    monkeypatch.setattr(app.controller, "list_inbox", list_inbox)
+    monkeypatch.setattr(app.controller, "acknowledge_inbox", acknowledge_inbox)
+
+    async with app.run_test(size=(110, 36)) as pilot:
+        await app.push_screen(InboxScreen())
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if "1 unacknowledged result" in str(
+                app.screen.query_one("#inbox-summary", Static).content
+            ):
+                break
+        manager = app.screen
+        assert isinstance(manager, InboxScreen)
+        listing = manager.query_one("#inbox-list", OptionList)
+        assert listing.option_count == 1
+        assert listing.has_focus is True
+        detail = str(manager.query_one("#inbox-detail", Static).content)
+        assert "Ready?[31m @everyone" in detail
+        assert "\x1b" not in detail
+        assert "Result run: run-followup" in detail
+        assert manager.query_one("#inbox-acknowledge", Button).disabled is False
+
+        assert await pilot.click("#inbox-acknowledge") is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if "0 unacknowledged results" in str(
+                manager.query_one("#inbox-summary", Static).content
+            ):
+                break
+        assert acknowledgments == [item.delivery_id]
+        assert listing.option_count == 0
+        assert "never reruns reasoning" in str(
+            manager.query_one("#inbox-help", Static).content
+        )
+        app.exit(0)
+
+
+def test_inbox_rendering_withholds_blocked_reports_and_marks_bounded_previews():
+    available = _tui_inbox_item(report="bounded preview")
+    truncated = replace(
+        available,
+        payload={**dict(available.payload), "report_truncated": True},
+    )
+    assert "Preview truncated" in render_inbox_item(truncated)
+
+    blocked = replace(
+        available,
+        state=DeliveryState.BLOCKED,
+        payload={**dict(available.payload), "report_preview": None},
+        destination_sensitivity_ceiling=ModelSensitivity.PUBLIC,
+        terminal_error="delivery_sensitivity_ineligible",
+    )
+    rendered = render_inbox_item(blocked)
+    assert "bounded preview" not in rendered
+    assert "Preview withheld" in rendered
+    assert "delivery_sensitivity_ineligible" in rendered
+
+
+async def test_background_status_notifies_once_and_remains_outside_transcript(
+    tmp_path: Path,
+    monkeypatch,
+):
+    opened = await Agent.create("inbox-status-agent", root=tmp_path)
+    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app.controller.agent = opened
+    running = _tui_job_summary(
+        "job-running-status", JobStatus.RUNNING, result_available=False
+    )
+    current_inbox: list[InboxItem] = []
+    notifications: list[tuple[str, str | None]] = []
+
+    async def list_jobs() -> tuple[object, ...]:
+        return (running,)
+
+    async def list_inbox() -> tuple[InboxItem, ...]:
+        return tuple(current_inbox)
+
+    def notify(message: str, *, title: str | None = None, **_kwargs: object) -> None:
+        notifications.append((message, title))
+
+    monkeypatch.setattr(app.controller, "list_jobs", list_jobs)
+    monkeypatch.setattr(app.controller, "list_inbox", list_inbox)
+    monkeypatch.setattr(app, "notify", notify)
+    try:
+        async with app.run_test(size=(110, 32)) as pilot:
+            await app._show_chat()
+            await pilot.pause()
+            status = app.screen.query_one("#background-status", Static)
+            assert "jobs 1" in str(status.content)
+            assert status.display is True
+
+            current_inbox.append(_tui_inbox_item())
+            await app.refresh_background_status(notify_new=True)
+            await pilot.pause()
+            assert "jobs 1" in str(status.content)
+            assert "inbox 1" in str(status.content)
+            assert notifications == [
+                ("1 background report is ready. Open /inbox to review.", "Inbox")
+            ]
+            await app.refresh_background_status(notify_new=True)
+            assert len(notifications) == 1
+            assert app.screen.query_one(TranscriptView).is_empty
+            app.exit(0)
+    finally:
+        await opened.close()
+
+
+async def test_machine_origin_observations_do_not_project_into_foreground_chat(
+    tmp_path: Path,
+):
+    opened = await Agent.create("origin-isolation-agent", root=tmp_path)
+    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app.controller.agent = opened
+    observed = datetime.now(UTC)
+    try:
+        async with app.run_test(size=(100, 30)) as pilot:
+            await app._show_chat()
+            await pilot.pause()
+            chat = app.chat()
+            assert chat is not None
+            transcript = chat.query_one(TranscriptView)
+            context = chat.query_one("#context-window", Static)
+
+            await app.on_observer_event(
+                ObserverEvent(
+                    AgentEvent(
+                        kind=AgentEventKind.RUN_STARTED,
+                        occurred_at=observed,
+                        run_id="run-autonomous",
+                        conversation_id="conversation-origin",
+                        data=FrozenJsonObject.from_mapping({"agent_id": opened.id}),
+                        run_origin="job_event",
+                    )
+                )
+            )
+            assert "reporting 1" in str(
+                chat.query_one("#background-status", Static).content
+            )
+
+            await app.on_observer_event(
+                ObserverEvent(
+                    AgentEvent(
+                        kind=AgentEventKind.MODEL_TEXT_DELTA,
+                        occurred_at=observed,
+                        run_id="run-autonomous",
+                        conversation_id="conversation-origin",
+                        data=FrozenJsonObject.from_mapping(
+                            {"model_call_index": 1, "text": "Hidden report draft"}
+                        ),
+                        run_origin="job_event",
+                    )
+                )
+            )
+            await app.on_observer_event(
+                ObserverEvent(
+                    AgentEvent(
+                        kind=AgentEventKind.MODEL_COMPLETED,
+                        occurred_at=observed,
+                        run_id="run-autonomous",
+                        conversation_id="conversation-origin",
+                        data=FrozenJsonObject.from_mapping(
+                            {
+                                "provider_id": "mock:scripted",
+                                "model_call_index": 1,
+                                "context_input_tokens": 9_999,
+                            }
+                        ),
+                        run_origin="job_event",
+                    )
+                )
+            )
+            assert transcript.is_empty
+            assert "Hidden report draft" not in transcript.copy_text()
+            assert "ctx —" in str(context.content)
+            assert chat.query_one(ActivityBar).display is False
+
+            await app.on_observer_event(
+                ObserverEvent(
+                    AgentEvent(
+                        kind=AgentEventKind.RUN_COMPLETED,
+                        occurred_at=observed,
+                        run_id="run-autonomous",
+                        conversation_id="conversation-origin",
+                        data=FrozenJsonObject.from_mapping({"exit_kind": "completed"}),
+                        run_origin="job_event",
+                    )
+                )
+            )
+            assert "reporting" not in str(
+                chat.query_one("#background-status", Static).content
+            )
+            app.exit(0)
+    finally:
+        await opened.close()
 
 
 async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypatch):

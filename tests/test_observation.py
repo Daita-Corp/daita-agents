@@ -186,6 +186,7 @@ def test_event_contract_is_immutable_bounded_and_deeply_frozen():
         ),
     )
     assert isinstance(event.data["nested"], FrozenJsonObject)
+    assert event.run_origin == "user"
     assert event.data.to_dict() == {
         "duration_ms": 0,
         "nested": {"values": ["safe"]},
@@ -197,6 +198,7 @@ def test_event_contract_is_immutable_bounded_and_deeply_frozen():
         lambda: replace(event, occurred_at=datetime(2026, 7, 21)),
         lambda: replace(event, run_id=""),
         lambda: replace(event, conversation_id="x" * 257),
+        lambda: replace(event, run_origin=""),
         lambda: replace(
             event,
             data=FrozenJsonObject.from_mapping({"value": "x" * 1_025}),
@@ -273,6 +275,7 @@ async def test_text_run_order_payloads_and_durable_boundaries():
     ]
     assert all(event.run_id == "run-observed" for event in events)
     assert all(event.conversation_id == "conversation-observed" for event in events)
+    assert all(event.run_origin == "user" for event in events)
     assert events[0].data.to_dict() == {"agent_id": "agent-observed"}
     model_data = events[1].data.to_dict()
     assert set(model_data) == {

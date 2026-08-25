@@ -10,7 +10,13 @@ from typing import Any
 from textual.app import App, ComposeResult
 from textual.theme import Theme
 
-from daita import ApprovalDecision, ApprovalRequest, LoopExit, LoopExitKind
+from daita import (
+    ApprovalDecision,
+    ApprovalRequest,
+    JobStatus,
+    LoopExit,
+    LoopExitKind,
+)
 from daita.observation import AgentEventKind
 from daita.security import KeychainStore
 
@@ -41,6 +47,7 @@ from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
 from .screens.jobs import JobsScreen
+from .screens.inbox import InboxScreen
 from .screens.mcp import MCPManagementScreen, MCPSetupScreen
 from .screens.onboarding import (
     AgentCreateScreen,
@@ -85,6 +92,8 @@ DAITA_THEME = Theme(
         "input-selection-foreground": "#FFFFFF",
     },
 )
+
+_CREATE_NEW_AGENT_SELECTION = "daita:create-new-agent"
 
 
 def _run_failure_notice(result: LoopExit) -> str:
@@ -145,6 +154,11 @@ class DaitaApp(App[int]):
         self._modal_future: asyncio.Future[Any] | None = None
         self._start_bootstrap = start_bootstrap
         self._startup_error: Exception | None = None
+        self._active_job_count = 0
+        self._inbox_item_count = 0
+        self._autonomous_run_ids: set[str] = set()
+        self._known_inbox_ids: set[str] | None = None
+        self._background_refresh_lock = asyncio.Lock()
         self._completion_cache: (
             tuple[
                 tuple[tuple[str, str], ...],
@@ -157,6 +171,11 @@ class DaitaApp(App[int]):
         yield WelcomeView(booting=True, id="boot")
 
     def on_mount(self) -> None:
+        self.set_interval(
+            2.0,
+            self._poll_background_status,
+            name="daita-background-status",
+        )
         if self._start_bootstrap:
             self.run_worker(self._bootstrap(), exclusive=True, name="bootstrap")
 
@@ -231,16 +250,24 @@ class DaitaApp(App[int]):
         elif len(names) == 1:
             await self._open(names[0])
         elif names:
-            selected = await self._await_modal(
-                SelectionScreen(
-                    title="Select an agent",
-                    options=tuple(PickerOption(name, name) for name in names),
+            while self.controller.agent is None:
+                selected = await self._await_modal(
+                    SelectionScreen(
+                        title="Select an agent",
+                        options=tuple(PickerOption(name, name) for name in names),
+                        secondary_action=PickerOption(
+                            _CREATE_NEW_AGENT_SELECTION,
+                            "Create new agent",
+                        ),
+                    )
                 )
-            )
-            if selected is None:
-                self.exit(0)
-                return
-            await self._open(selected[0])
+                if selected is None:
+                    self.exit(0)
+                    return
+                if selected == (_CREATE_NEW_AGENT_SELECTION,):
+                    await self._await_modal(AgentCreateScreen())
+                    continue
+                await self._open(selected[0])
         else:
             created = await self._await_modal(AgentCreateScreen())
             if created is None:
@@ -249,6 +276,7 @@ class DaitaApp(App[int]):
         await self._ensure_ready()
 
     async def create_named_agent(self, name: str) -> None:
+        self._reset_background_status()
         await self.controller.create_agent(
             name,
             observer=self._observer,
@@ -256,6 +284,7 @@ class DaitaApp(App[int]):
         )
 
     async def _open(self, name: str) -> None:
+        self._reset_background_status()
         await self.controller.open_agent(
             name,
             observer=self._observer,
@@ -309,6 +338,69 @@ class DaitaApp(App[int]):
         await self.push_screen(ChatScreen())
         await self._replace_conversation_transcript()
         await self._refresh_status()
+        await self.refresh_background_status(notify_new=False)
+
+    def _reset_background_status(self) -> None:
+        self._active_job_count = 0
+        self._inbox_item_count = 0
+        self._autonomous_run_ids.clear()
+        self._known_inbox_ids = None
+
+    async def _poll_background_status(self) -> None:
+        await self.refresh_background_status(notify_new=True)
+
+    async def refresh_background_status(self, *, notify_new: bool) -> None:
+        """Refresh bounded read-only background indicators for the open TUI."""
+
+        if (
+            self._shutting_down
+            or self.controller.agent is None
+            or self._background_refresh_lock.locked()
+        ):
+            return
+        async with self._background_refresh_lock:
+            jobs = None
+            inbox = None
+            try:
+                jobs = await self.controller.list_jobs()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            try:
+                inbox = await self.controller.list_inbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            if jobs is not None:
+                self._active_job_count = sum(
+                    item.status
+                    in {
+                        JobStatus.QUEUED,
+                        JobStatus.RUNNING,
+                        JobStatus.CANCEL_REQUESTED,
+                    }
+                    for item in jobs
+                )
+            new_delivery_ids: set[str] = set()
+            if inbox is not None:
+                current_ids = {item.delivery_id for item in inbox}
+                self._inbox_item_count = len(current_ids)
+                if self._known_inbox_ids is None:
+                    self._known_inbox_ids = set(current_ids)
+                else:
+                    new_delivery_ids = current_ids - self._known_inbox_ids
+                    self._known_inbox_ids.update(current_ids)
+            await self._refresh_status()
+            if notify_new and new_delivery_ids:
+                count = len(new_delivery_ids)
+                noun = "report is" if count == 1 else "reports are"
+                self.notify(
+                    f"{count} background {noun} ready. Open /inbox to review.",
+                    title="Inbox",
+                    timeout=8,
+                )
 
     async def _replace_conversation_transcript(self) -> None:
         screen = self.chat()
@@ -391,6 +483,9 @@ class DaitaApp(App[int]):
             context_total=(
                 profile.context_window_tokens if profile is not None else None
             ),
+            active_jobs=self._active_job_count,
+            active_reports=len(self._autonomous_run_ids),
+            inbox_items=self._inbox_item_count,
             too_small=too_small,
         )
         if too_small:
@@ -584,6 +679,10 @@ class DaitaApp(App[int]):
                     initial_view=str(payload.get("view", "details")),
                 )
             )
+            return
+        if screen_name == "inbox":
+            await self._await_modal(InboxScreen())
+            await self.refresh_background_status(notify_new=False)
             return
         if screen_name == "catalog":
             sources = tuple(
@@ -985,6 +1084,15 @@ class DaitaApp(App[int]):
         if self._shutting_down:
             return
         event = message.event
+        if event.run_origin != "user":
+            if event.kind is AgentEventKind.RUN_STARTED:
+                self._autonomous_run_ids.add(event.run_id)
+                await self._refresh_status()
+            elif event.kind is AgentEventKind.RUN_COMPLETED:
+                self._autonomous_run_ids.discard(event.run_id)
+                await self._refresh_status()
+                await self.refresh_background_status(notify_new=True)
+            return
         screen = self.chat()
         if screen is None:
             return

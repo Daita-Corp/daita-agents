@@ -484,6 +484,7 @@ def _write_event_jsonl(event: AgentEvent) -> None:
                 "occurred_at": event.occurred_at.isoformat(),
                 "run_id": event.run_id,
                 "conversation_id": event.conversation_id,
+                "run_origin": event.run_origin,
                 "data": event.data.to_dict(),
             },
             sort_keys=True,

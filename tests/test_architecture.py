@@ -377,6 +377,7 @@ def test_stage_c_has_one_followup_aggregate_and_one_inbox_without_parallel_runti
     assert _class_owners("AutonomousFollowup") == {"autonomy.py"}
     assert _class_owners("InboxItem") == {"autonomy.py"}
     assert _class_owners("RunStartEnvelope") == {"loop/models.py"}
+    assert _class_owners("InboxScreen") == {"tui/screens/inbox.py"}
     schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     assert schema.count("CREATE TABLE autonomous_followups") == 1
     assert schema.count("CREATE TABLE conversation_inbox") == 1
@@ -404,6 +405,17 @@ def test_stage_c_has_one_followup_aggregate_and_one_inbox_without_parallel_runti
     assert "execute_internal(" in supervisor
     assert "executor.execute(" not in supervisor
     assert "execute_read(" not in supervisor
+
+    inbox_screen = (PACKAGE / "tui" / "screens" / "inbox.py").read_text(
+        encoding="utf-8"
+    )
+    tui_controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
+    tui_app = (PACKAGE / "tui" / "app.py").read_text(encoding="utf-8")
+    assert "require_agent().inbox(" in tui_controller
+    assert "require_agent().acknowledge_inbox(" in tui_controller
+    assert "event.run_origin" in tui_app
+    assert "Agent.run" not in inbox_screen
+    assert "_embedded" not in inbox_screen
 
     production = _python_text(PACKAGE)
     for forbidden in (

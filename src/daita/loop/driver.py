@@ -1066,6 +1066,7 @@ class AgentLoop:
                 run_id=run.id,
                 conversation_id=run.conversation_id or run.id,
                 data=FrozenJsonObject.from_mapping(data),
+                run_origin=run.origin.value,
             )
         except Exception:
             return

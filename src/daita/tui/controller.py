@@ -16,6 +16,7 @@ from daita import (
     Agent,
     ApprovalHandler,
     ConversationRun,
+    InboxItem,
     JobInspection,
     JobResultView,
     JobSummary,
@@ -646,6 +647,12 @@ class PresentationController:
     async def list_jobs(self) -> tuple[JobSummary, ...]:
         return await self.require_agent().list_jobs(limit=50)
 
+    async def list_inbox(self) -> tuple[InboxItem, ...]:
+        return await self.require_agent().inbox(limit=50)
+
+    async def acknowledge_inbox(self, delivery_id: str) -> InboxItem | None:
+        return await self.require_agent().acknowledge_inbox(delivery_id)
+
     async def inspect_job(self, job_id: str) -> JobInspection | None:
         return await self.require_agent().inspect_job(job_id)
 
@@ -773,6 +780,18 @@ class PresentationController:
             return await self._mcp_command(parts)
         if name == "/jobs":
             return await self._jobs_command(parts)
+        if name == "/inbox":
+            if len(parts) == 1:
+                return CommandOutcome(
+                    "screen",
+                    screen="inbox",
+                    conversation_id=conversation_id,
+                )
+            return CommandOutcome(
+                "notice",
+                "Usage: /inbox",
+                conversation_id=conversation_id,
+            )
         if name == "/catalog" and len(parts) == 1:
             return CommandOutcome(
                 "screen",

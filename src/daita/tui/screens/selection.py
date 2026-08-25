@@ -32,6 +32,7 @@ class SelectionScreen(ModalScreen[tuple[str, ...] | None]):
         allow_select_all: bool = False,
         allow_empty: bool = False,
         initial_selected: tuple[str, ...] = (),
+        secondary_action: PickerOption | None = None,
     ) -> None:
         super().__init__()
         self._title = title
@@ -40,12 +41,17 @@ class SelectionScreen(ModalScreen[tuple[str, ...] | None]):
         self._allow_select_all = allow_select_all
         self._allow_empty = allow_empty
         identities = {option.identity for option in options}
+        if secondary_action is not None and secondary_action.identity in identities:
+            raise ValueError(
+                "secondary action identity must differ from picker options"
+            )
         if not multi and initial_selected:
             raise ValueError("initial selection requires a multi-select picker")
         if not set(initial_selected) <= identities:
             raise ValueError("initial selection must contain known option identities")
         self._selected: set[str] = set(initial_selected)
         self._visible: tuple[PickerOption, ...] = options
+        self._secondary_action = secondary_action
 
     def compose(self) -> ComposeResult:
         with Vertical(id="picker", classes="modal-panel"):
@@ -67,6 +73,18 @@ class SelectionScreen(ModalScreen[tuple[str, ...] | None]):
                 id="picker-confirm",
                 variant="primary",
             )
+            if self._secondary_action is not None:
+                yield Button(
+                    Text(
+                        sanitize_terminal_text(
+                            self._secondary_action.label,
+                            maximum=120,
+                            preserve_lines=False,
+                            fallback="Additional action",
+                        )
+                    ),
+                    id="picker-secondary",
+                )
             yield Footer()
 
     def on_mount(self) -> None:
@@ -114,6 +132,10 @@ class SelectionScreen(ModalScreen[tuple[str, ...] | None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "picker-confirm":
             self.action_confirm()
+        elif (
+            event.button.id == "picker-secondary" and self._secondary_action is not None
+        ):
+            self.dismiss((self._secondary_action.identity,))
 
     def action_toggle_selected(self) -> None:
         if not self._multi:

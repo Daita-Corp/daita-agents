@@ -154,6 +154,7 @@ class StaticDefinitionTools:
 
 
 async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
+    events: list[AgentEvent] = []
     provider = MockModelProvider(
         (ModelResponse(finish_reason=FinishReason.STOP, text="done"),),
         complete_pricing=True,
@@ -208,6 +209,7 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
         tools=ScriptedTools({}),
         limits=configured,
         clock=lambda: NOW,
+        observer=events.append,
     )
 
     prepared = await loop.prepare(run)
@@ -216,6 +218,10 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
     assert prepared.limits.max_estimated_cost_usd == Decimal("0.25")
     assert configured.max_total_tokens == 10_000
     assert configured.max_estimated_cost_usd == Decimal("2.00")
+    result = await loop.run(run, prepared=prepared)
+    assert result.kind is LoopExitKind.COMPLETED
+    assert events
+    assert all(event.run_origin == RunOrigin.JOB_EVENT.value for event in events)
 
 
 def response_with_calls(*ids):
