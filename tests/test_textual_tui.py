@@ -197,8 +197,10 @@ def test_tool_projection_and_approval_document():
         tool_name="tool",
         capability_id="cap",
         arguments_text='{\n  "name": "safe"\n}',
+        reason="Replace the exact unchanged workspace file config.yaml?",
     )
     assert reviewable and document is not None
+    assert "Change: Replace the exact unchanged workspace file config.yaml?" in document
     _secret_doc, secret_ok = approval_review_document(
         tool_name="tool",
         capability_id="cap",

@@ -318,6 +318,7 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
                         name="artifact_save_local",
                         arguments={
                             "artifact_id": ref.artifact_id,
+                            "mode": "create_new",
                             "destination_id": "default",
                         },
                     ),
@@ -343,6 +344,49 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
     failed_messages = artifact_delivery_messages(completed_tool_pairs(failed))
     assert any(
         "remains available; local delivery failed" in text for text in failed_messages
+    )
+
+    uncertain_edit = Transcript(
+        run=run,
+        messages=(
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                tool_calls=(
+                    ToolCall(
+                        id="replace",
+                        name="artifact_save_local",
+                        arguments={
+                            "artifact_id": ref.artifact_id,
+                            "mode": "replace_bound_file",
+                        },
+                    ),
+                ),
+            ),
+            CanonicalMessage(
+                role=MessageRole.TOOL,
+                content=(
+                    ToolResultBlock(
+                        call_id="replace",
+                        output={
+                            "kind": "artifact.delivery_receipt",
+                            "data": {
+                                "artifact_id": ref.artifact_id,
+                                "mode": "replace_bound_file",
+                                "outcome": "uncertain",
+                                "relative_path": "config.yaml",
+                            },
+                        },
+                    ),
+                ),
+            ),
+        ),
+    )
+    uncertain_messages = artifact_delivery_messages(
+        completed_tool_pairs(uncertain_edit)
+    )
+    assert any(
+        "update outcome for workspace file config.yaml is uncertain" in text
+        for text in uncertain_messages
     )
 
     not_delivered = Transcript(
@@ -431,6 +475,7 @@ async def test_fake_provider_markdown_vertical_slice_commits_delivers_restarts_a
                 "artifact_save_local",
                 {
                     "artifact_id": artifact_id,
+                    "mode": "create_new",
                     "destination_id": "default",
                 },
             ),

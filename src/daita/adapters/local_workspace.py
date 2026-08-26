@@ -10,11 +10,12 @@ import hmac
 import json
 import mimetypes
 import os
+import re
 import secrets
 import stat
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -91,6 +92,8 @@ class LocalWorkspaceLimits:
     max_visible_read_bytes: int = 48 * 1_024
     max_raw_read_bytes: int = 64 * 1_024
     max_read_seconds: float = 5.0
+    max_edit_source_bytes: int = 4 * 1_024 * 1_024
+    max_edit_seconds: float = 10.0
 
     def __post_init__(self) -> None:
         integer_limits = (
@@ -115,6 +118,12 @@ class LocalWorkspaceLimits:
                 4,
                 2 * 1_024 * 1_024,
             ),
+            (
+                self.max_edit_source_bytes,
+                "max_edit_source_bytes",
+                1,
+                64 * 1_024 * 1_024,
+            ),
         )
         for value, name, minimum, maximum in integer_limits:
             if (
@@ -128,6 +137,7 @@ class LocalWorkspaceLimits:
         for seconds, name in (
             (self.max_search_seconds, "max_search_seconds"),
             (self.max_read_seconds, "max_read_seconds"),
+            (self.max_edit_seconds, "max_edit_seconds"),
         ):
             if (
                 not isinstance(seconds, (int, float))
@@ -154,6 +164,53 @@ class LocalFileBinding:
     modified_ns: int
     changed_ns: int
     observed_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class LocalBoundFileObservation:
+    """One fully observed current bound file used only by code-owned consumers."""
+
+    binding: LocalFileBinding
+    content: bytes
+    content_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class LocalBoundFileTarget:
+    """One descriptor-contained exact target resolved for artifact delivery."""
+
+    workspace_id: str
+    relative_path: str
+    filename: str
+    _admitted_root_path: Path = field(repr=False, compare=False)
+    parent_descriptor: int
+    parent_device: int
+    parent_inode: int
+    parent_mode: int
+    parent_uid: int
+    parent_gid: int
+    target_descriptor: int
+    physical_revision: str
+    content_sha256: str
+    device: int
+    inode: int
+    mode: int
+    uid: int
+    gid: int
+    link_count: int
+    size_bytes: int
+    modified_ns: int
+    changed_ns: int
+    flags: int
+
+    def revalidate_namespace(self) -> None:
+        """Prove the admitted root path still names this exact target."""
+
+        _revalidate_bound_target_namespace(self)
+
+    def close(self) -> None:
+        os.close(self.target_descriptor)
+        os.close(self.parent_descriptor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,19 +523,10 @@ class LocalWorkspaceBackend:
             facts,
             content_hash,
         ) = observed
-        binding = LocalFileBinding(
+        binding = _binding_from_facts(
             workspace_id=self.workspace_id,
             relative_path=relative_path,
-            physical_revision=_physical_revision(facts),
-            device=int(facts.st_dev),
-            inode=int(facts.st_ino),
-            mode=int(facts.st_mode),
-            uid=int(facts.st_uid),
-            gid=int(facts.st_gid),
-            link_count=int(facts.st_nlink),
-            size_bytes=int(facts.st_size),
-            modified_ns=int(facts.st_mtime_ns),
-            changed_ns=int(facts.st_ctime_ns),
+            facts=facts,
             observed_at=_utc_iso(self._clock()),
         )
         binding_token = self._encode_token(
@@ -549,6 +597,83 @@ class LocalWorkspaceBackend:
                 "The file binding is malformed or unavailable.",
             ) from error
 
+    async def observe_bound_text(
+        self,
+        *,
+        run_id: str,
+        token: str,
+    ) -> LocalBoundFileObservation:
+        """Fully observe one authenticated current-run binding without path input."""
+
+        binding = self.authenticate_file_binding(run_id=run_id, token=token)
+        descriptor = self._duplicate_root()
+        cancellation = threading.Event()
+        content, facts = await self._run_worker(
+            _observe_bound_file_sync,
+            descriptor,
+            self._root,
+            binding,
+            self._limits.max_edit_source_bytes,
+            cancellation,
+            timeout=self._limits.max_edit_seconds + 1.0,
+            timeout_code="file_edit_timeout",
+            timeout_message="Bounded file observation exceeded its worker time.",
+        )
+        current = _binding_from_facts(
+            workspace_id=self.workspace_id,
+            relative_path=binding.relative_path,
+            facts=facts,
+            observed_at=_utc_iso(self._clock()),
+        )
+        return LocalBoundFileObservation(
+            binding=current,
+            content=content,
+            content_sha256="sha256:" + sha256(content).hexdigest(),
+        )
+
+    async def resolve_bound_target(
+        self,
+        *,
+        workspace_id: str,
+        relative_path: str,
+        expected_physical_revision: str | None,
+        expected_content_sha256: str,
+    ) -> LocalBoundFileTarget:
+        """Resolve one committed binding to exact open parent/target descriptors."""
+
+        if workspace_id != self.workspace_id:
+            raise LocalWorkspaceError(
+                "workspace_unavailable",
+                "The bound artifact belongs to another workspace session.",
+            )
+        logical_path = _logical_path(relative_path)
+        if not isinstance(expected_content_sha256, str) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", expected_content_sha256
+        ):
+            raise LocalWorkspaceError(
+                "file_binding_invalid", "The committed file binding is invalid."
+            )
+        if expected_physical_revision is not None and (
+            not isinstance(expected_physical_revision, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_physical_revision)
+        ):
+            raise LocalWorkspaceError(
+                "file_binding_invalid", "The committed file binding is invalid."
+            )
+        descriptor = self._duplicate_root()
+        cancellation = threading.Event()
+        return await self._run_bound_target_worker(
+            _resolve_bound_target_sync,
+            descriptor,
+            self._root,
+            self.workspace_id,
+            logical_path,
+            expected_physical_revision,
+            expected_content_sha256,
+            self._limits.max_edit_source_bytes,
+            cancellation,
+        )
+
     async def close(self) -> None:
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close_once())
@@ -616,6 +741,40 @@ class LocalWorkspaceBackend:
             except asyncio.CancelledError:
                 cancellation.set()
                 await _settle_worker(worker)
+                raise
+        finally:
+            self._active.pop(worker, None)
+
+    async def _run_bound_target_worker(
+        self,
+        function: Callable[..., LocalBoundFileTarget],
+        *arguments: object,
+    ) -> LocalBoundFileTarget:
+        """Settle and close a descriptor-bearing result if its caller is interrupted."""
+
+        cancellation = next(
+            item for item in reversed(arguments) if isinstance(item, threading.Event)
+        )
+        worker = asyncio.create_task(asyncio.to_thread(function, *arguments))
+        self._active[worker] = cancellation
+        try:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(worker),
+                    timeout=self._limits.max_edit_seconds + 1.0,
+                )
+            except TimeoutError as error:
+                cancellation.set()
+                await _settle_worker(worker)
+                _close_bound_target_result(worker)
+                raise LocalWorkspaceError(
+                    "file_edit_timeout",
+                    "Bound file target resolution exceeded its worker time.",
+                ) from error
+            except asyncio.CancelledError:
+                cancellation.set()
+                await _settle_worker(worker)
+                _close_bound_target_result(worker)
                 raise
         finally:
             self._active.pop(worker, None)
@@ -726,6 +885,18 @@ async def _settle_worker(worker: asyncio.Task[object]) -> None:
             continue
         except BaseException:
             break
+
+
+def _close_bound_target_result(
+    worker: asyncio.Task[LocalBoundFileTarget],
+) -> None:
+    if worker.cancelled():
+        return
+    try:
+        target = worker.result()
+    except BaseException:
+        return
+    target.close()
 
 
 def _admit_root(
@@ -850,8 +1021,15 @@ def _physical_revision(value: os.stat_result) -> str:
         "size_bytes": int(value.st_size),
         "modified_ns": int(value.st_mtime_ns),
         "changed_ns": int(value.st_ctime_ns),
+        "flags": int(getattr(value, "st_flags", 0)),
     }
     return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def physical_revision_for_facts(value: os.stat_result) -> str:
+    """Return the canonical physical revision for a code-observed regular file."""
+
+    return _physical_revision(value)
 
 
 def _search_sync(
@@ -1274,6 +1452,215 @@ def _read_sync(
         os.close(root_descriptor)
 
 
+def _observe_bound_file_sync(
+    root_descriptor: int,
+    root: _RootDescriptor,
+    binding: LocalFileBinding,
+    maximum_bytes: int,
+    cancellation: threading.Event,
+) -> tuple[bytes, os.stat_result]:
+    descriptor = -1
+    try:
+        _verify_root_path(root)
+        _check_cancelled(cancellation)
+        descriptor, before = _open_relative_file(root_descriptor, binding.relative_path)
+        if _physical_revision(before) != binding.physical_revision:
+            raise LocalWorkspaceError(
+                "file_changed", "The bound workspace file changed before editing."
+            )
+        content = _read_all_bounded(
+            descriptor,
+            before,
+            maximum_bytes=maximum_bytes,
+            cancellation=cancellation,
+        )
+        finished = os.fstat(descriptor)
+        if not _same_file_version(before, finished):
+            raise LocalWorkspaceError(
+                "file_changed", "The bound workspace file changed during editing."
+            )
+        return content, finished
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(root_descriptor)
+
+
+def _resolve_bound_target_sync(
+    root_descriptor: int,
+    root: _RootDescriptor,
+    workspace_id: str,
+    relative_path: str,
+    expected_physical_revision: str | None,
+    expected_content_sha256: str,
+    maximum_bytes: int,
+    cancellation: threading.Event,
+) -> LocalBoundFileTarget:
+    parent_descriptor = -1
+    target_descriptor = -1
+    try:
+        _verify_root_path(root)
+        _check_cancelled(cancellation)
+        (
+            parent_descriptor,
+            target_descriptor,
+            before,
+            filename,
+        ) = _open_relative_target(root_descriptor, relative_path)
+        root_descriptor = -1
+        revision = _physical_revision(before)
+        if (
+            expected_physical_revision is not None
+            and revision != expected_physical_revision
+        ):
+            raise LocalWorkspaceError(
+                "file_changed", "The bound workspace file changed before publication."
+            )
+        content = _read_all_bounded(
+            target_descriptor,
+            before,
+            maximum_bytes=maximum_bytes,
+            cancellation=cancellation,
+        )
+        finished = os.fstat(target_descriptor)
+        if not _same_file_version(before, finished):
+            raise LocalWorkspaceError(
+                "file_changed", "The bound workspace file changed during validation."
+            )
+        observed_hash = "sha256:" + sha256(content).hexdigest()
+        if observed_hash != expected_content_sha256:
+            raise LocalWorkspaceError(
+                "file_changed", "The bound workspace file content changed."
+            )
+        parent_facts = os.fstat(parent_descriptor)
+        result = LocalBoundFileTarget(
+            workspace_id=workspace_id,
+            relative_path=relative_path,
+            filename=filename,
+            _admitted_root_path=root.path,
+            parent_descriptor=parent_descriptor,
+            parent_device=int(parent_facts.st_dev),
+            parent_inode=int(parent_facts.st_ino),
+            parent_mode=int(parent_facts.st_mode),
+            parent_uid=int(parent_facts.st_uid),
+            parent_gid=int(parent_facts.st_gid),
+            target_descriptor=target_descriptor,
+            physical_revision=revision,
+            content_sha256=observed_hash,
+            device=int(finished.st_dev),
+            inode=int(finished.st_ino),
+            mode=int(finished.st_mode),
+            uid=int(finished.st_uid),
+            gid=int(finished.st_gid),
+            link_count=int(finished.st_nlink),
+            size_bytes=int(finished.st_size),
+            modified_ns=int(finished.st_mtime_ns),
+            changed_ns=int(finished.st_ctime_ns),
+            flags=int(getattr(finished, "st_flags", 0)),
+        )
+        parent_descriptor = -1
+        target_descriptor = -1
+        return result
+    finally:
+        if target_descriptor >= 0:
+            os.close(target_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+
+
+def _revalidate_bound_target_namespace(target: LocalBoundFileTarget) -> None:
+    """Rewalk the admitted namespace and match its root, parent, and target."""
+
+    root_descriptor = -1
+    parent_descriptor = -1
+    target_descriptor = -1
+    try:
+        actual_root = _open_root(target._admitted_root_path)
+        root_descriptor = actual_root.descriptor
+        if _workspace_id(actual_root) != target.workspace_id:
+            raise LocalWorkspaceError(
+                "workspace_identity_changed",
+                "The local workspace identity changed after admission.",
+            )
+        consumed_root = root_descriptor
+        root_descriptor = -1
+        (
+            parent_descriptor,
+            target_descriptor,
+            target_facts,
+            filename,
+        ) = _open_relative_target(consumed_root, target.relative_path)
+        parent_facts = os.fstat(parent_descriptor)
+        if (
+            filename != target.filename
+            or int(parent_facts.st_dev) != target.parent_device
+            or int(parent_facts.st_ino) != target.parent_inode
+            or int(target_facts.st_dev) != target.device
+            or int(target_facts.st_ino) != target.inode
+            or _physical_revision(target_facts) != target.physical_revision
+        ):
+            raise LocalWorkspaceError(
+                "file_changed",
+                "The bound workspace file changed before publication.",
+            )
+    except LocalWorkspaceError as error:
+        raise LocalWorkspaceError(
+            "file_changed",
+            "The bound workspace namespace changed before publication.",
+        ) from error
+    except OSError as error:
+        raise LocalWorkspaceError(
+            "file_changed",
+            "The bound workspace namespace changed before publication.",
+        ) from error
+    finally:
+        if target_descriptor >= 0:
+            os.close(target_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+
+
+def _read_all_bounded(
+    descriptor: int,
+    facts: os.stat_result,
+    *,
+    maximum_bytes: int,
+    cancellation: threading.Event,
+) -> bytes:
+    size = int(facts.st_size)
+    if size > maximum_bytes:
+        raise LocalWorkspaceError(
+            "file_too_large",
+            "The workspace file exceeds the bounded text-edit size.",
+            {"limit": maximum_bytes, "observed": size},
+        )
+    content = bytearray()
+    offset = 0
+    while offset < size:
+        _check_cancelled(cancellation)
+        chunk = os.pread(descriptor, min(_READ_CHUNK_BYTES, size - offset), offset)
+        if not chunk:
+            raise LocalWorkspaceError(
+                "file_changed", "The workspace file changed during full observation."
+            )
+        content.extend(chunk)
+        offset += len(chunk)
+    _check_cancelled(cancellation)
+    if b"\x00" in content:
+        raise LocalWorkspaceError("file_binary", "The file appears to be binary.")
+    try:
+        bytes(content).decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise LocalWorkspaceError(
+            "encoding_unsupported", "The file is not valid UTF-8 text."
+        ) from error
+    return bytes(content)
+
+
 def _open_relative_file(
     root_descriptor: int,
     relative_path: str,
@@ -1314,6 +1701,57 @@ def _open_relative_file(
         return descriptor, os.fstat(descriptor)
     finally:
         if directory_descriptor != root_descriptor:
+            os.close(directory_descriptor)
+
+
+def _open_relative_target(
+    root_descriptor: int,
+    relative_path: str,
+) -> tuple[int, int, os.stat_result, str]:
+    """Consume one duplicated root and return an exact parent and target."""
+
+    directory_descriptor = root_descriptor
+    target_descriptor = -1
+    try:
+        parts = PurePosixPath(relative_path).parts
+        for component in parts[:-1]:
+            _deny_restricted_component(component)
+            before = os.stat(
+                component, dir_fd=directory_descriptor, follow_symlinks=False
+            )
+            if stat.S_ISLNK(before.st_mode):
+                raise LocalWorkspaceError(
+                    "symlink_not_allowed", "Workspace paths cannot traverse symlinks."
+                )
+            if not stat.S_ISDIR(before.st_mode):
+                raise LocalWorkspaceError(
+                    "path_invalid", "A workspace path component is not a directory."
+                )
+            child = _open_checked_directory(directory_descriptor, component, before)
+            os.close(directory_descriptor)
+            directory_descriptor = child
+        name = parts[-1]
+        _deny_restricted_component(name)
+        before = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(before.st_mode):
+            raise LocalWorkspaceError(
+                "symlink_not_allowed", "Workspace files cannot be symlinks."
+            )
+        if not stat.S_ISREG(before.st_mode):
+            raise LocalWorkspaceError(
+                "not_regular_file",
+                "The requested workspace path is not a regular file.",
+            )
+        target_descriptor = _open_checked_file(directory_descriptor, name, before)
+        facts = os.fstat(target_descriptor)
+        result = (directory_descriptor, target_descriptor, facts, name)
+        directory_descriptor = -1
+        target_descriptor = -1
+        return result
+    finally:
+        if target_descriptor >= 0:
+            os.close(target_descriptor)
+        if directory_descriptor >= 0:
             os.close(directory_descriptor)
 
 
@@ -1524,6 +1962,30 @@ def _binding_payload(binding: LocalFileBinding) -> dict[str, object]:
     }
 
 
+def _binding_from_facts(
+    *,
+    workspace_id: str,
+    relative_path: str,
+    facts: os.stat_result,
+    observed_at: str,
+) -> LocalFileBinding:
+    return LocalFileBinding(
+        workspace_id=workspace_id,
+        relative_path=relative_path,
+        physical_revision=_physical_revision(facts),
+        device=int(facts.st_dev),
+        inode=int(facts.st_ino),
+        mode=int(facts.st_mode),
+        uid=int(facts.st_uid),
+        gid=int(facts.st_gid),
+        link_count=int(facts.st_nlink),
+        size_bytes=int(facts.st_size),
+        modified_ns=int(facts.st_mtime_ns),
+        changed_ns=int(facts.st_ctime_ns),
+        observed_at=observed_at,
+    )
+
+
 def _token_text(payload: dict[str, object], name: str) -> str:
     value = payload.get(name)
     if not isinstance(value, str) or not value or len(value) > _MAX_TOKEN_BYTES:
@@ -1588,6 +2050,8 @@ def _media_type(relative_path: str) -> str:
 
 
 __all__ = [
+    "LocalBoundFileObservation",
+    "LocalBoundFileTarget",
     "LocalFileBinding",
     "LocalFileReadResult",
     "LocalFileSearchMatch",
@@ -1595,4 +2059,5 @@ __all__ = [
     "LocalWorkspaceBackend",
     "LocalWorkspaceError",
     "LocalWorkspaceLimits",
+    "physical_revision_for_facts",
 ]

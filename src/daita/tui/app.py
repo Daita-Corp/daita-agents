@@ -1152,16 +1152,31 @@ class DaitaApp(App[int]):
             label = (
                 event.data.get("tool_name") or event.data.get("capability_id") or "tool"
             )
-            screen.set_activity(f"Using {label}")
-            await self._refresh_status(running=True, state=f"calling {label}")
+            activity = (
+                "Preparing workspace file edit"
+                if label == "artifact_edit_text"
+                else (
+                    "Publishing local artifact"
+                    if label == "artifact_save_local"
+                    else f"Using {label}"
+                )
+            )
+            screen.set_activity(activity)
+            await self._refresh_status(running=True, state=activity.casefold())
             return
         if event.kind is AgentEventKind.TOOL_COMPLETED:
             screen.set_activity("Processing results")
             await self._refresh_status(running=True, state="working")
             return
         if event.kind is AgentEventKind.APPROVAL_REQUESTED:
-            screen.set_activity("Waiting for approval")
-            await self._refresh_status(running=True, state="approval")
+            editing = event.data.get("tool_name") == "artifact_save_local"
+            screen.set_activity(
+                "Review local file change" if editing else "Waiting for approval"
+            )
+            await self._refresh_status(
+                running=True,
+                state="edit approval" if editing else "approval",
+            )
             return
         if event.kind is AgentEventKind.APPROVAL_DECIDED:
             screen.set_activity("Applying decision")

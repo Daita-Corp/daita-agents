@@ -1,8 +1,10 @@
 # Local workspaces
 
-Every local Daita session admits exactly one workspace. The workspace is a
-bounded, read-only Files surface; it is not a registered data source and is not
-cataloged as SQLite, PostgreSQL, CSV, or JSON.
+Every local Daita session admits exactly one workspace. Workspace admission is
+a bounded, read-first Files surface; it is not a registered data source and is
+not cataloged as SQLite, PostgreSQL, CSV, or JSON. The Files domain never owns
+a writer. One existing file can change only through the separate committed
+artifact and approved exact-target delivery workflow described below.
 
 ## Launching Daita
 
@@ -51,9 +53,8 @@ non-directories are rejected.
 
 ## Read boundary
 
-`file_search` and `file_read` are the only Phase 2 workspace tools. They use
-workspace-relative logical paths and return bounded results. Daita rejects or
-skips:
+`file_search` and `file_read` use workspace-relative logical paths and return
+bounded results. Daita rejects or skips:
 
 - `..` traversal, absolute paths, path aliases, and symlinks;
 - sockets, devices, FIFOs, and other special files;
@@ -67,9 +68,29 @@ They cannot authorize tool loading, source access, writes, memory changes, or
 skill changes. Absolute workspace paths are never placed in model requests,
 tool results, transcripts, artifact provenance, or durable state.
 
-This phase adds no `file_write`, file editing, terminal execution, structured
-file query engine, or generic filesystem API. New output continues through a
-committed artifact and the existing `artifact_save_local` publication path.
+## Targeted text edits
+
+For one bounded UTF-8 text file, Daita can perform the cohesive sequence
+`file_read` → `artifact_edit_text` → approval → `artifact_save_local`. The edit
+tool accepts only the authenticated current-run binding returned by
+`file_read`; it does not accept a path, revision, or file bytes. It applies
+ordered exact replacements, including exact-anchor insertion and deletion,
+then commits the complete replacement as an internal artifact. Preparing the
+artifact never changes the workspace.
+
+The final save derives its only target from that committed binding and asks
+once for approval with a bounded relative-path change summary. Daita verifies
+the exact file identity, revision, content hash, ownership, links, metadata,
+and parent-directory safety again after approval. It stages and verifies the
+complete output beside the target, preserves safe mode and ownership, fsyncs,
+atomically replaces, and records a succeeded, failed, or uncertain receipt.
+If the source changes at any point, Daita requires a fresh read and edit; it
+does not merge, rebase, redirect, or retry the mutation.
+
+There is no `file_write`, raw byte mutation, terminal execution, binary or rich
+document editor, or generic filesystem API. New files continue through a
+committed artifact and `artifact_save_local` in `create_new` mode. Hosted and
+machine-originated runs receive no ambient local edit authority.
 
 ## Pre-production state
 

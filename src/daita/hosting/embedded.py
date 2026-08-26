@@ -88,6 +88,8 @@ from ..catalog.service import CatalogService
 from ..config import AgentConfig
 from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
+    LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
+    LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
     LOCAL_FILE_CAPABILITY_IDS,
     LOCAL_FILE_EXECUTOR_IDS,
     POSTGRESQL_QUERY_CAPABILITY_ID,
@@ -753,6 +755,7 @@ class EmbeddedAgent:
                     agent_home=home,
                     artifacts=artifact_store,
                     sources=store,
+                    exact_target_resolver=workspace_backend,
                     downloads_directory=downloads_directory,
                     clock=resolved_clock,
                     id_factory=resolved_ids,
@@ -931,6 +934,7 @@ class EmbeddedAgent:
                     agent_home=home,
                     artifacts=artifact_store,
                     sources=store,
+                    exact_target_resolver=workspace_backend,
                     downloads_directory=downloads_directory,
                     clock=resolved_clock,
                     id_factory=resolved_ids,
@@ -1084,6 +1088,7 @@ class EmbeddedAgent:
             artifact_declarations(
                 artifact_delivery,
                 artifact_store,
+                workspace=workspace_backend,
                 agent_id=identity.id,
                 sqlite_backend=sqlite_backend,
                 postgresql_backend=postgresql_backend,
@@ -1217,6 +1222,7 @@ class EmbeddedAgent:
                 store,
                 artifact_store,
                 artifact_delivery,
+                workspace_backend,
                 learning_candidate_guard,
                 files_only_run_ids=files_only_run_ids,
             )
@@ -1289,6 +1295,11 @@ class EmbeddedAgent:
                 declared_capability_ids & LOCAL_FILE_CAPABILITY_IDS
                 or declared_view_ids & LOCAL_FILE_CAPABILITY_IDS
                 or registered_executor_ids & LOCAL_FILE_EXECUTOR_IDS
+                or declared_capability_ids & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
+                or declared_view_ids & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
+                or registered_executor_ids & LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS
+                or workspace_backend is not None
+                or artifact_delivery is not None
             ):
                 raise AgentHomeError(
                     "hosted composition contains local workspace authority"

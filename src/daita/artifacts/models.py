@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .._json import FrozenJsonObject
 from ..catalog.models import Sensitivity
@@ -26,13 +26,17 @@ MAX_ONE_TIME_DESTINATIONS = 8
 MAX_FILENAME_UTF8_BYTES = 120
 MAX_DELIVERY_FILENAME_UTF8_BYTES = 128
 MAX_COLLISION_SUFFIX = 9_999
+MAX_TEXT_EDIT_OPERATIONS = 32
+MAX_ARTIFACT_CHANGE_SUMMARY_CHARACTERS = 512
 
 SYSTEM_DOWNLOADS_DESTINATION_ID = "destination-system-downloads"
+BOUND_FILE_DESTINATION_ID = "destination-bound-workspace-file"
 DEFAULT_DESTINATION_SELECTOR = "default"
 
 _ARTIFACT_ID = re.compile(r"artifact-[0-9a-f]{32}\Z")
 _DESTINATION_ID = re.compile(r"destination-[0-9a-f]{32}\Z")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_WORKSPACE_ID = re.compile(r"workspace:sha256:[0-9a-f]{64}\Z")
 _WINDOWS_DEVICE_STEMS = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{index}" for index in range(1, 10)}
@@ -74,6 +78,31 @@ def _safe_single_line(value: str, name: str, *, maximum: int) -> None:
         raise ValueError(f"{name} contains unsafe Unicode controls")
 
 
+def _workspace_relative_path(value: str, name: str) -> PurePosixPath:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 2_048
+        or "\\" in value
+        or "\x00" in value
+    ):
+        raise ValueError(f"{name} is invalid")
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for part in path.parts
+            for character in part
+        )
+    ):
+        raise ValueError(f"{name} is invalid")
+    return path
+
+
 class ArtifactError(DaitaError):
     """One safe, structured artifact failure family."""
 
@@ -99,6 +128,111 @@ class ArtifactAuthorship(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactTextChangeSummary:
+    """One bounded code-authored summary of an ordered text transformation."""
+
+    operation_count: int
+    replacement_count: int
+    insertion_count: int
+    deletion_count: int
+    occurrence_count: int
+    bytes_removed: int
+    bytes_added: int
+    description: str
+
+    def __post_init__(self) -> None:
+        counts = (
+            (self.operation_count, "operation_count"),
+            (self.replacement_count, "replacement_count"),
+            (self.insertion_count, "insertion_count"),
+            (self.deletion_count, "deletion_count"),
+            (self.occurrence_count, "occurrence_count"),
+            (self.bytes_removed, "bytes_removed"),
+            (self.bytes_added, "bytes_added"),
+        )
+        if any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value, _name in counts
+        ):
+            raise ValueError("artifact text change summary counts must be non-negative")
+        if not 1 <= self.operation_count <= MAX_TEXT_EDIT_OPERATIONS:
+            raise ValueError("artifact text change operation count exceeds its bound")
+        if (
+            self.replacement_count + self.insertion_count + self.deletion_count
+            != self.operation_count
+        ):
+            raise ValueError("artifact text change operation kinds do not add up")
+        if self.occurrence_count < self.operation_count:
+            raise ValueError("artifact text change occurrence count is invalid")
+        if self.bytes_removed > MAX_ARTIFACT_BYTES * MAX_TEXT_EDIT_OPERATIONS:
+            raise ValueError("artifact text change removed bytes exceed their bound")
+        if self.bytes_added > MAX_ARTIFACT_BYTES * MAX_TEXT_EDIT_OPERATIONS:
+            raise ValueError("artifact text change added bytes exceed their bound")
+        _safe_single_line(
+            self.description,
+            "artifact text change description",
+            maximum=MAX_ARTIFACT_CHANGE_SUMMARY_CHARACTERS,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactLocalFileBinding:
+    """Exact persisted provenance for one bounded workspace-file edit artifact."""
+
+    workspace_id: str
+    relative_path: str
+    original_physical_revision: str
+    observed_content_sha256: str
+    source_byte_size: int
+    change_summary: ArtifactTextChangeSummary
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.workspace_id, str)
+            or _WORKSPACE_ID.fullmatch(self.workspace_id) is None
+        ):
+            raise ValueError("artifact local binding workspace_id is invalid")
+        _workspace_relative_path(
+            self.relative_path, "artifact local binding relative_path"
+        )
+        _digest(
+            self.original_physical_revision,
+            "artifact local binding original_physical_revision",
+        )
+        _digest(
+            self.observed_content_sha256,
+            "artifact local binding observed_content_sha256",
+        )
+        if (
+            not isinstance(self.source_byte_size, int)
+            or isinstance(self.source_byte_size, bool)
+            or not 0 <= self.source_byte_size <= MAX_ARTIFACT_BYTES
+        ):
+            raise ValueError("artifact local binding source_byte_size is invalid")
+        if not isinstance(self.change_summary, ArtifactTextChangeSummary):
+            raise TypeError("artifact local binding change_summary is invalid")
+
+
+def artifact_text_change_summary_to_mapping(
+    value: ArtifactTextChangeSummary,
+) -> dict[str, int | str]:
+    """Return the one current serialized shape for a text change summary."""
+
+    if not isinstance(value, ArtifactTextChangeSummary):
+        raise TypeError("artifact text change summary is invalid")
+    return {
+        "operation_count": value.operation_count,
+        "replacement_count": value.replacement_count,
+        "insertion_count": value.insertion_count,
+        "deletion_count": value.deletion_count,
+        "occurrence_count": value.occurrence_count,
+        "bytes_removed": value.bytes_removed,
+        "bytes_added": value.bytes_added,
+        "description": value.description,
+    }
+
+
+@dataclass(frozen=True, slots=True)
 class ArtifactResourceBinding:
     source_id: str
     source_revision: str
@@ -121,6 +255,7 @@ class ArtifactProvenance:
     evidence_call_ids: tuple[str, ...] = ()
     derived_from_artifact_id: str | None = None
     resource_bindings: tuple[ArtifactResourceBinding, ...] = ()
+    local_file_binding: ArtifactLocalFileBinding | None = None
     sql_fingerprint: str | None = None
     parameters_sha256: str | None = None
     columns: tuple[str, ...] = ()
@@ -180,6 +315,22 @@ class ArtifactProvenance:
             raise ValueError(
                 "model-authored provenance cannot claim exact export facts"
             )
+        if self.local_file_binding is not None:
+            if not isinstance(self.local_file_binding, ArtifactLocalFileBinding):
+                raise TypeError("artifact local_file_binding has an invalid type")
+            if (
+                self.authorship is not ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
+                or evidence
+                or bindings
+                or self.derived_from_artifact_id is not None
+                or self.sql_fingerprint is not None
+                or self.parameters_sha256 is not None
+                or columns
+                or self.row_count is not None
+            ):
+                raise ValueError(
+                    "artifact local-file provenance cannot claim another authority"
+                )
         if self.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
             has_query_facts = (
                 self.sql_fingerprint is not None
@@ -217,8 +368,6 @@ class ArtifactDraft:
     def __post_init__(self) -> None:
         if not isinstance(self.content, bytes):
             raise TypeError("artifact draft content must be bytes")
-        if not self.content:
-            raise ValueError("artifact draft content must be non-empty")
         if len(self.content) > MAX_ARTIFACT_BYTES:
             raise ValueError("artifact draft exceeds the global byte bound")
         validate_safe_filename(self.suggested_filename)
@@ -262,7 +411,7 @@ class ArtifactRef:
         if (
             not isinstance(self.byte_size, int)
             or isinstance(self.byte_size, bool)
-            or not 1 <= self.byte_size <= MAX_ARTIFACT_BYTES
+            or not 0 <= self.byte_size <= MAX_ARTIFACT_BYTES
         ):
             raise ValueError("artifact byte_size is outside the global bound")
         _digest(self.sha256, "artifact sha256")
@@ -293,6 +442,17 @@ class ArtifactPayload:
 class ArtifactDestinationKind(str, Enum):
     SYSTEM_DOWNLOADS = "system_downloads"
     LOCAL_DIRECTORY = "local_directory"
+
+
+class ArtifactDeliveryMode(str, Enum):
+    CREATE_NEW = "create_new"
+    REPLACE_BOUND_FILE = "replace_bound_file"
+
+
+class ArtifactDeliveryOutcome(str, Enum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNCERTAIN = "uncertain"
 
 
 class DestinationAuthorization(str, Enum):
@@ -344,6 +504,13 @@ class ArtifactDeliveryReceipt:
     sha256: str
     renamed_for_collision: bool
     delivered_at: datetime
+    mode: ArtifactDeliveryMode = ArtifactDeliveryMode.CREATE_NEW
+    outcome: ArtifactDeliveryOutcome = ArtifactDeliveryOutcome.SUCCEEDED
+    workspace_id: str | None = None
+    relative_path: str | None = None
+    prior_physical_revision: str | None = None
+    result_physical_revision: str | None = None
+    failure_code: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -351,7 +518,10 @@ class ArtifactDeliveryReceipt:
             or _ARTIFACT_ID.fullmatch(self.artifact_id) is None
         ):
             raise ValueError("delivery artifact_id has an invalid form")
-        if self.destination_id != SYSTEM_DOWNLOADS_DESTINATION_ID and (
+        if self.destination_id not in {
+            SYSTEM_DOWNLOADS_DESTINATION_ID,
+            BOUND_FILE_DESTINATION_ID,
+        } and (
             not isinstance(self.destination_id, str)
             or _DESTINATION_ID.fullmatch(self.destination_id) is None
         ):
@@ -360,18 +530,79 @@ class ArtifactDeliveryReceipt:
             self.filename, maximum_bytes=MAX_DELIVERY_FILENAME_UTF8_BYTES
         )
         _safe_single_line(self.saved_path, "delivery saved_path", maximum=4_096)
-        if not Path(self.saved_path).is_absolute():
-            raise ValueError("delivery saved_path must be absolute")
         if (
             not isinstance(self.byte_size, int)
             or isinstance(self.byte_size, bool)
-            or not 1 <= self.byte_size <= MAX_ARTIFACT_BYTES
+            or not 0 <= self.byte_size <= MAX_ARTIFACT_BYTES
         ):
             raise ValueError("delivery byte_size is outside the artifact bound")
         _digest(self.sha256, "delivery sha256")
         if not isinstance(self.renamed_for_collision, bool):
             raise TypeError("renamed_for_collision must be a boolean")
         _utc(self.delivered_at, "delivery delivered_at")
+        if not isinstance(self.mode, ArtifactDeliveryMode):
+            raise TypeError("delivery mode is invalid")
+        if not isinstance(self.outcome, ArtifactDeliveryOutcome):
+            raise TypeError("delivery outcome is invalid")
+        if self.mode is ArtifactDeliveryMode.CREATE_NEW:
+            if not Path(self.saved_path).is_absolute():
+                raise ValueError("create-new delivery saved_path must be absolute")
+            if self.destination_id == BOUND_FILE_DESTINATION_ID:
+                raise ValueError("create-new delivery has a bound-file destination")
+            if self.outcome is not ArtifactDeliveryOutcome.SUCCEEDED:
+                raise ValueError(
+                    "create-new receipts represent only successful delivery"
+                )
+            if any(
+                item is not None
+                for item in (
+                    self.workspace_id,
+                    self.relative_path,
+                    self.prior_physical_revision,
+                    self.result_physical_revision,
+                    self.failure_code,
+                )
+            ):
+                raise ValueError("create-new delivery contains replacement facts")
+            return
+        if self.destination_id != BOUND_FILE_DESTINATION_ID:
+            raise ValueError("bound replacement has an invalid destination")
+        if (
+            self.workspace_id is None
+            or _WORKSPACE_ID.fullmatch(self.workspace_id) is None
+            or self.relative_path is None
+            or self.saved_path != self.relative_path
+            or self.renamed_for_collision
+            or self.prior_physical_revision is None
+        ):
+            raise ValueError("bound replacement receipt facts are incomplete")
+        relative = _workspace_relative_path(
+            self.relative_path, "bound replacement relative_path"
+        )
+        if relative.name != self.filename:
+            raise ValueError("bound replacement filename differs from its target")
+        _digest(self.prior_physical_revision, "delivery prior_physical_revision")
+        if self.result_physical_revision is not None:
+            _digest(self.result_physical_revision, "delivery result_physical_revision")
+        if self.outcome is ArtifactDeliveryOutcome.SUCCEEDED and (
+            self.result_physical_revision is None or self.failure_code is not None
+        ):
+            raise ValueError("successful replacement receipt facts are incomplete")
+        if self.outcome is not ArtifactDeliveryOutcome.SUCCEEDED:
+            _required_text(
+                self.failure_code or "",
+                "replacement delivery failure_code",
+                maximum=128,
+            )
+        if self.outcome is ArtifactDeliveryOutcome.FAILED and (
+            self.result_physical_revision is not None
+            or self.failure_code != "artifact_delivery_failed"
+        ):
+            raise ValueError("failed replacement receipt facts are inconsistent")
+        if self.outcome is ArtifactDeliveryOutcome.UNCERTAIN and (
+            self.failure_code != "artifact_replacement_uncertain"
+        ):
+            raise ValueError("uncertain replacement receipt facts are inconsistent")
 
 
 def validate_safe_filename(
@@ -436,7 +667,7 @@ def canonical_artifact_filename(
             {"media_type": media_type, "allowed_extensions": ()},
         )
     stem, dot, extension = normalized.rpartition(".")
-    if not dot or not stem or "." in stem or f".{extension.casefold()}" not in allowed:
+    if not dot or not stem or f".{extension.casefold()}" not in allowed:
         raise ArtifactError(
             "artifact_invalid_format",
             "The artifact filename extension does not match its media type.",
@@ -496,6 +727,24 @@ def artifact_provenance_to_mapping(value: ArtifactProvenance) -> dict[str, objec
             }
             for item in value.resource_bindings
         ),
+        "local_file_binding": (
+            None
+            if value.local_file_binding is None
+            else {
+                "workspace_id": value.local_file_binding.workspace_id,
+                "relative_path": value.local_file_binding.relative_path,
+                "original_physical_revision": (
+                    value.local_file_binding.original_physical_revision
+                ),
+                "observed_content_sha256": (
+                    value.local_file_binding.observed_content_sha256
+                ),
+                "source_byte_size": value.local_file_binding.source_byte_size,
+                "change_summary": artifact_text_change_summary_to_mapping(
+                    value.local_file_binding.change_summary
+                ),
+            }
+        ),
         "sql_fingerprint": value.sql_fingerprint,
         "parameters_sha256": value.parameters_sha256,
         "columns": value.columns,
@@ -510,17 +759,14 @@ def artifact_provenance_from_mapping(value: Mapping[str, object]) -> ArtifactPro
             "evidence_call_ids",
             "derived_from_artifact_id",
             "resource_bindings",
+            "local_file_binding",
             "sql_fingerprint",
             "parameters_sha256",
             "columns",
             "row_count",
         }
     )
-    actual_keys = set(value)
-    if actual_keys not in (
-        expected_keys,
-        expected_keys - {"derived_from_artifact_id"},
-    ):
+    if set(value) != expected_keys:
         raise ValueError("artifact provenance has an invalid shape")
     raw_bindings = value.get("resource_bindings", ())
     if not isinstance(raw_bindings, (tuple, list)):
@@ -576,11 +822,97 @@ def artifact_provenance_from_mapping(value: Mapping[str, object]) -> ArtifactPro
         raise ValueError("artifact provenance sql_fingerprint is invalid")
     if parameters_sha256 is not None and not isinstance(parameters_sha256, str):
         raise ValueError("artifact provenance parameters_sha256 is invalid")
+    raw_local_binding = value.get("local_file_binding")
+    local_binding = None
+    if raw_local_binding is not None:
+        if not isinstance(raw_local_binding, Mapping):
+            raise ValueError("artifact local_file_binding must be an object")
+        _exact_keys(
+            raw_local_binding,
+            frozenset(
+                {
+                    "workspace_id",
+                    "relative_path",
+                    "original_physical_revision",
+                    "observed_content_sha256",
+                    "source_byte_size",
+                    "change_summary",
+                }
+            ),
+            "artifact local file binding",
+        )
+        raw_summary = raw_local_binding.get("change_summary")
+        if not isinstance(raw_summary, Mapping):
+            raise ValueError("artifact local change_summary must be an object")
+        _exact_keys(
+            raw_summary,
+            frozenset(
+                {
+                    "operation_count",
+                    "replacement_count",
+                    "insertion_count",
+                    "deletion_count",
+                    "occurrence_count",
+                    "bytes_removed",
+                    "bytes_added",
+                    "description",
+                }
+            ),
+            "artifact text change summary",
+        )
+        local_binding = ArtifactLocalFileBinding(
+            workspace_id=_mapping_text(
+                raw_local_binding, "workspace_id", "artifact local binding"
+            ),
+            relative_path=_mapping_text(
+                raw_local_binding, "relative_path", "artifact local binding"
+            ),
+            original_physical_revision=_mapping_text(
+                raw_local_binding,
+                "original_physical_revision",
+                "artifact local binding",
+            ),
+            observed_content_sha256=_mapping_text(
+                raw_local_binding,
+                "observed_content_sha256",
+                "artifact local binding",
+            ),
+            source_byte_size=_mapping_int(
+                raw_local_binding, "source_byte_size", "artifact local binding"
+            ),
+            change_summary=ArtifactTextChangeSummary(
+                operation_count=_mapping_int(
+                    raw_summary, "operation_count", "artifact change summary"
+                ),
+                replacement_count=_mapping_int(
+                    raw_summary, "replacement_count", "artifact change summary"
+                ),
+                insertion_count=_mapping_int(
+                    raw_summary, "insertion_count", "artifact change summary"
+                ),
+                deletion_count=_mapping_int(
+                    raw_summary, "deletion_count", "artifact change summary"
+                ),
+                occurrence_count=_mapping_int(
+                    raw_summary, "occurrence_count", "artifact change summary"
+                ),
+                bytes_removed=_mapping_int(
+                    raw_summary, "bytes_removed", "artifact change summary"
+                ),
+                bytes_added=_mapping_int(
+                    raw_summary, "bytes_added", "artifact change summary"
+                ),
+                description=_mapping_text(
+                    raw_summary, "description", "artifact change summary"
+                ),
+            ),
+        )
     return ArtifactProvenance(
         authorship=ArtifactAuthorship(value.get("authorship")),
         evidence_call_ids=tuple(evidence),
         derived_from_artifact_id=derived_from_artifact_id,
         resource_bindings=tuple(bindings),
+        local_file_binding=local_binding,
         sql_fingerprint=sql_fingerprint,
         parameters_sha256=parameters_sha256,
         columns=tuple(columns),
@@ -659,7 +991,7 @@ def artifact_destination_to_mapping(value: ArtifactDestination) -> dict[str, obj
 def artifact_delivery_receipt_to_mapping(
     value: ArtifactDeliveryReceipt,
 ) -> dict[str, object]:
-    return {
+    result: dict[str, object] = {
         "artifact_id": value.artifact_id,
         "destination_id": value.destination_id,
         "filename": value.filename,
@@ -668,28 +1000,50 @@ def artifact_delivery_receipt_to_mapping(
         "sha256": value.sha256,
         "renamed_for_collision": value.renamed_for_collision,
         "delivered_at": _datetime_text(value.delivered_at),
+        "mode": value.mode.value,
+        "outcome": value.outcome.value,
     }
+    for name in (
+        "workspace_id",
+        "relative_path",
+        "prior_physical_revision",
+        "result_physical_revision",
+        "failure_code",
+    ):
+        selected = getattr(value, name)
+        if selected is not None:
+            result[name] = selected
+    return result
 
 
 def artifact_delivery_receipt_from_mapping(
     value: Mapping[str, object],
 ) -> ArtifactDeliveryReceipt:
-    _exact_keys(
-        value,
-        frozenset(
-            {
-                "artifact_id",
-                "destination_id",
-                "filename",
-                "saved_path",
-                "byte_size",
-                "sha256",
-                "renamed_for_collision",
-                "delivered_at",
-            }
-        ),
-        "artifact delivery receipt",
+    required = frozenset(
+        {
+            "artifact_id",
+            "destination_id",
+            "filename",
+            "saved_path",
+            "byte_size",
+            "sha256",
+            "renamed_for_collision",
+            "delivered_at",
+            "mode",
+            "outcome",
+        }
     )
+    optional = frozenset(
+        {
+            "workspace_id",
+            "relative_path",
+            "prior_physical_revision",
+            "result_physical_revision",
+            "failure_code",
+        }
+    )
+    if not required <= set(value) <= required | optional:
+        raise ValueError("artifact delivery receipt has an invalid shape")
     renamed = value.get("renamed_for_collision")
     if not isinstance(renamed, bool):
         raise ValueError("artifact delivery renamed_for_collision must be a boolean")
@@ -704,20 +1058,43 @@ def artifact_delivery_receipt_from_mapping(
         delivered_at=_datetime_value(
             value.get("delivered_at"), "delivery delivered_at"
         ),
+        mode=ArtifactDeliveryMode(value.get("mode")),
+        outcome=ArtifactDeliveryOutcome(value.get("outcome")),
+        workspace_id=_optional_mapping_text(value, "workspace_id"),
+        relative_path=_optional_mapping_text(value, "relative_path"),
+        prior_physical_revision=_optional_mapping_text(
+            value, "prior_physical_revision"
+        ),
+        result_physical_revision=_optional_mapping_text(
+            value, "result_physical_revision"
+        ),
+        failure_code=_optional_mapping_text(value, "failure_code"),
     )
+
+
+def _optional_mapping_text(value: Mapping[str, object], key: str) -> str | None:
+    selected = value.get(key)
+    if selected is not None and not isinstance(selected, str):
+        raise ValueError(f"artifact delivery {key} must be text or absent")
+    return selected
 
 
 __all__ = [
     "ArtifactAuthorship",
+    "ArtifactDeliveryMode",
+    "ArtifactDeliveryOutcome",
     "ArtifactDeliveryReceipt",
     "ArtifactDestination",
     "ArtifactDestinationKind",
     "ArtifactDraft",
     "ArtifactError",
+    "ArtifactLocalFileBinding",
     "ArtifactPayload",
     "ArtifactProvenance",
     "ArtifactRef",
     "ArtifactResourceBinding",
+    "ArtifactTextChangeSummary",
+    "BOUND_FILE_DESTINATION_ID",
     "DestinationAuthorization",
     "DestinationAvailability",
 ]

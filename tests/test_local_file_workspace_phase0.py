@@ -16,8 +16,11 @@ from daita.adapters.models import SourceRegistration
 from daita.hosting.embedded import EmbeddedAgent
 from daita.domains.data import LOCAL_FILE_CAPABILITY_IDS, LOCAL_FILE_EXECUTOR_IDS
 from daita.domains.data.export_capabilities import (
+    ARTIFACT_EDIT_TEXT_TOOL_NAME,
     ARTIFACT_SAVE_LOCAL_EXECUTOR_ID,
     ARTIFACT_SET_EXPORT_LOCATION_EXECUTOR_ID,
+    LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
+    LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
 )
 from daita.adapters.local_workspace import LocalWorkspaceBackend
 from daita.llm.models import (
@@ -224,7 +227,24 @@ async def test_file_read_mixed_continuation_shape_fails_before_workspace_io(
 
 async def test_hosted_composition_has_no_local_file_authority(tmp_path: Path) -> None:
     provider = MockModelProvider(
-        (_call("forged-file-read", "file_read", {"path": "secret.txt"}), _stop())
+        (
+            _call("forged-file-read", "file_read", {"path": "secret.txt"}),
+            _call(
+                "forged-file-edit",
+                ARTIFACT_EDIT_TEXT_TOOL_NAME,
+                {
+                    "binding": "forged",
+                    "replacements": [
+                        {
+                            "old_text": "secret",
+                            "new_text": "changed",
+                            "expected_occurrences": 1,
+                        }
+                    ],
+                },
+            ),
+            _stop(),
+        )
     )
     hosted = await EmbeddedAgent.create(
         "hosted",
@@ -236,29 +256,38 @@ async def test_hosted_composition_has_no_local_file_authority(tmp_path: Path) ->
     try:
         assert "file_search" not in hosted._capabilities.tool_names
         assert "file_read" not in hosted._capabilities.tool_names
+        assert ARTIFACT_EDIT_TEXT_TOOL_NAME not in hosted._capabilities.tool_names
         assert "artifact_save_local" not in hosted._capabilities.tool_names
         assert hosted._workspace_backend is None
         assert hosted._artifact_delivery is None
         assert not (set(hosted._capabilities._capabilities) & LOCAL_FILE_CAPABILITY_IDS)
         assert not (set(hosted._capabilities._executors) & LOCAL_FILE_EXECUTOR_IDS)
+        assert not (
+            set(hosted._capabilities._capabilities) & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
+        )
+        assert not (
+            set(hosted._capabilities._executors) & LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS
+        )
         assert {
             ARTIFACT_SAVE_LOCAL_EXECUTOR_ID,
             ARTIFACT_SET_EXPORT_LOCATION_EXECUTOR_ID,
         }.isdisjoint(hosted._capabilities._executors)
         result = await hosted.run("Attempt a forged local file call")
         transcript = await hosted.transcript(result.run_id)
-        rejected = next(
-            block
+        rejected = {
+            block.call_id: block
             for message in transcript.messages
             if message.role is MessageRole.TOOL
             for block in message.content
             if isinstance(block, ToolResultBlock)
-            and block.call_id == "forged-file-read"
-        )
-        assert rejected.is_error
-        error = rejected.output["error"]
-        assert isinstance(error, Mapping)
-        assert error["code"] == "tool_not_available"
+            and block.call_id in {"forged-file-read", "forged-file-edit"}
+        }
+        assert set(rejected) == {"forged-file-read", "forged-file-edit"}
+        for block in rejected.values():
+            assert block.is_error
+            error = block.output["error"]
+            assert isinstance(error, Mapping)
+            assert error["code"] == "tool_not_available"
         with pytest.raises(ValueError, match="hosted"):
             await EmbeddedAgent.open(
                 "hosted",

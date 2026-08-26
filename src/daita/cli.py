@@ -1152,6 +1152,7 @@ async def _prompt_for_exact_approval(
     print()
     print(f"Tool:       {request.tool_name}")
     print(f"Capability: {request.capability_id}")
+    print(f"Change:     {request.reason}")
     print("Arguments:")
     print(
         json.dumps(

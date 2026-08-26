@@ -82,6 +82,7 @@ from .controller import (
 )
 from .export_capabilities import (
     ARTIFACT_CONVERT_CAPABILITY_ID,
+    ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
     ARTIFACT_LIST_CAPABILITY_ID,
     ARTIFACT_READ_CAPABILITY_ID,
     ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
@@ -1866,6 +1867,7 @@ def _system_prompt(
             ARTIFACT_LIST_CAPABILITY_ID,
             ARTIFACT_READ_CAPABILITY_ID,
             ARTIFACT_CONVERT_CAPABILITY_ID,
+            ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
             ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
         }
     )
@@ -2053,6 +2055,20 @@ def _system_prompt(
             "A preview fingerprint is not approval or authority, and database "
             "mutation remains unavailable in this release phase."
         )
+    if ARTIFACT_EDIT_TEXT_CAPABILITY_ID in capability_ids:
+        instructions.append(
+            "Workspace text edits are artifact-backed: first call file_read for the "
+            "exact target, copy its data.binding string verbatim into "
+            "artifact_edit_text, and never decode, normalize, or reconstruct that "
+            "opaque binding. Then call artifact_save_local with "
+            "mode=replace_bound_file and only the "
+            "committed edit artifact_id. The edit tool prepares an internal complete "
+            "replacement and never changes the workspace. Only the final save call "
+            "requests one approval, rechecks drift, and may atomically replace the "
+            "unchanged bound file. Never provide a path, revision, destination, "
+            "filename, or raw bytes to either edit preparation or bound replacement; "
+            "after drift, re-read instead of retrying, merging, or rebasing."
+        )
     if artifact_destinations:
         if artifact_tools_available:
             instructions.append(
@@ -2069,7 +2085,8 @@ def _system_prompt(
                     "if the artifact choice remains ambiguous. "
                     "A committed artifact reference proves only internal creation, not "
                     "delivery. After each creation, call "
-                    'artifact_save_local with destination_id="default" before normal '
+                    'artifact_save_local with mode="create_new" and '
+                    'destination_id="default" before normal '
                     "text unless another projected destination was selected; one call per "
                     "new artifact and no text first. Only a successful artifact delivery "
                     "receipt proves a local file exists; never claim saved or downloaded "

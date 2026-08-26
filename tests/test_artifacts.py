@@ -324,7 +324,7 @@ async def test_artifact_draft_bytes_never_enter_tool_result_transcript_exit_or_j
     assert (await store.read(ref.artifact_id)).content == secret
 
 
-async def test_pre_lineage_artifact_reference_is_admitted_and_reserialized_canonically(
+async def test_unreleased_pre_lineage_artifact_reference_is_rejected_exactly(
     tmp_path: Path,
 ) -> None:
     store, _ = await _store(tmp_path)
@@ -359,13 +359,9 @@ async def test_pre_lineage_artifact_reference_is_admitted_and_reserialized_canon
         clock=lambda: NOW,
         id_factory=_artifact_ids(),
     )
-    assert reopened.available
-    payload = await reopened.read(ref.artifact_id)
-    assert payload.content == b"# Result\n"
-    assert payload.ref.provenance.derived_from_artifact_id is None
-    canonical = artifact_ref_to_mapping(payload.ref)
-    canonical_provenance = cast(dict[str, object], canonical["provenance"])
-    assert canonical_provenance["derived_from_artifact_id"] is None
+    assert not reopened.available
+    with pytest.raises(ValueError, match="invalid shape"):
+        artifact_ref_from_mapping(serialized)
 
     invalid = dict(serialized)
     invalid["provenance"] = {**provenance, "unexpected": True}

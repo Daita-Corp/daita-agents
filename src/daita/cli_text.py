@@ -17,6 +17,7 @@ from daita.learning_candidates import (
     learning_candidate_content_from_mapping,
     learning_candidate_content_to_mapping,
 )
+from daita.artifacts.models import ArtifactDeliveryMode, ArtifactDeliveryOutcome
 from daita.semantics import SemanticAnnotationState, SemanticAnnotationView
 
 from .tui.projection import artifact_delivery_messages, completed_tool_pairs
@@ -34,6 +35,22 @@ async def _write_artifact_outcomes(
         filename = getattr(receipt, "filename", None)
         saved_path = getattr(receipt, "saved_path", None)
         if not isinstance(filename, str) or not isinstance(saved_path, str):
+            continue
+        if receipt.mode is ArtifactDeliveryMode.REPLACE_BOUND_FILE:
+            if receipt.outcome is ArtifactDeliveryOutcome.SUCCEEDED:
+                message = "Updated workspace file " + safe_display(
+                    saved_path, fallback="the bound file"
+                )
+            elif receipt.outcome is ArtifactDeliveryOutcome.UNCERTAIN:
+                message = (
+                    "Workspace file update outcome is uncertain for "
+                    + safe_display(saved_path, fallback="the bound file")
+                )
+            else:
+                message = "Workspace file was not updated: " + safe_display(
+                    saved_path, fallback="the bound file"
+                )
+            print(message, file=output_stream)
             continue
         print(
             "Saved "

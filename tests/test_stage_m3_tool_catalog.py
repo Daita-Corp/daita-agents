@@ -481,6 +481,7 @@ async def test_production_inventory_has_exact_membership_and_phase1_loading_poli
         } == {
             "artifact_convert",
             "artifact_create_document",
+            "artifact_edit_text",
             "artifact_list",
             "artifact_read",
             "artifact_save_local",

@@ -10,17 +10,21 @@ from hashlib import sha256
 from typing import Protocol
 
 from ..._json import FrozenJsonObject, canonical_json
+from ...adapters.local_workspace import LocalWorkspaceBackend, LocalWorkspaceError
 from ...artifacts.delivery import LocalArtifactDelivery
 from ...artifacts.models import (
     MAX_ARTIFACT_BYTES,
     MAX_DOCUMENT_BYTES,
+    MAX_TEXT_EDIT_OPERATIONS,
     ArtifactAuthorship,
     ArtifactDraft,
     ArtifactError,
+    ArtifactLocalFileBinding,
     ArtifactPayload,
     ArtifactProvenance,
     ArtifactRef,
     ArtifactResourceBinding,
+    artifact_text_change_summary_to_mapping,
     artifact_delivery_receipt_to_mapping,
     artifact_destination_to_mapping,
     canonical_artifact_filename,
@@ -34,11 +38,19 @@ from ...artifacts.renderers import (
     MAX_CSV_SECONDS,
     MAX_XLSX_BYTES,
     MAX_XLSX_SECONDS,
+    MAX_TEXT_EDIT_ANCHOR_BYTES,
+    MAX_TEXT_EDIT_BYTES,
+    MAX_TEXT_EDIT_OCCURRENCES,
+    MAX_TEXT_EDIT_REPLACEMENT_BYTES,
+    TEXT_EDIT_ALLOWED_EXTENSIONS,
+    TEXT_EDIT_MEDIA_TYPES,
     XLSX_ALLOWED_EXTENSIONS,
     XLSX_MEDIA_TYPE,
     read_exact_xlsx_data,
     render_exact_csv,
     render_model_document,
+    apply_bounded_text_edits,
+    text_edit_media_type,
 )
 from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
@@ -61,7 +73,7 @@ from ...capabilities import (
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
 from ...llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
-from ...loop.models import RunInput, Transcript
+from ...loop.models import RunInput, RunOrigin, Transcript
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .sql import (
@@ -102,6 +114,11 @@ ARTIFACT_CONVERT_CAPABILITY_ID = "artifact.convert"
 ARTIFACT_CONVERT_EXECUTOR_ID = "artifact.convert.executor"
 ARTIFACT_CONVERT_TOOL_NAME = "artifact_convert"
 ARTIFACT_CONVERT_OUTPUT_KIND = "artifact.conversion"
+
+ARTIFACT_EDIT_TEXT_CAPABILITY_ID = "artifact.edit_text"
+ARTIFACT_EDIT_TEXT_EXECUTOR_ID = "artifact.edit_text.executor"
+ARTIFACT_EDIT_TEXT_TOOL_NAME = "artifact_edit_text"
+ARTIFACT_EDIT_TEXT_OUTPUT_KIND = "artifact.text_edit"
 
 ARTIFACT_SAVE_LOCAL_CAPABILITY_ID = "artifact.save_local"
 ARTIFACT_SAVE_LOCAL_EXECUTOR_ID = "artifact.save_local.executor"
@@ -422,12 +439,7 @@ class ArtifactReadExecutor:
                     "truncated": len(rows) < len(data.rows),
                 },
             )
-        if payload.ref.media_type not in {
-            "application/json",
-            "text/csv",
-            "text/markdown",
-            "text/plain",
-        }:
+        if payload.ref.media_type not in TEXT_EDIT_MEDIA_TYPES:
             raise ArtifactError(
                 "artifact_invalid_format",
                 "This artifact format does not support a model preview.",
@@ -550,6 +562,72 @@ class ArtifactConvertExecutor:
         )
 
 
+class ArtifactEditTextExecutor:
+    executor_id = ARTIFACT_EDIT_TEXT_EXECUTOR_ID
+
+    def __init__(self, workspace: LocalWorkspaceBackend) -> None:
+        self._workspace = workspace
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        token = request.arguments["binding"]
+        replacements = request.arguments["replacements"]
+        assert isinstance(token, str)
+        assert isinstance(replacements, tuple)
+        observation = await self._workspace.observe_bound_text(
+            run_id=request.run_id,
+            token=token,
+        )
+        transformed = await asyncio.to_thread(
+            apply_bounded_text_edits,
+            source=observation.content,
+            relative_path=observation.binding.relative_path,
+            replacements=tuple(
+                item for item in replacements if isinstance(item, Mapping)
+            ),
+        )
+        summary = transformed.summary
+        binding = ArtifactLocalFileBinding(
+            workspace_id=observation.binding.workspace_id,
+            relative_path=observation.binding.relative_path,
+            original_physical_revision=observation.binding.physical_revision,
+            observed_content_sha256=observation.content_sha256,
+            source_byte_size=len(observation.content),
+            change_summary=summary,
+        )
+        filename = observation.binding.relative_path.rsplit("/", 1)[-1]
+        sensitivity = Sensitivity(self._workspace.sensitivity.value)
+        draft = ArtifactDraft(
+            content=transformed.content,
+            suggested_filename=filename,
+            media_type=transformed.media_type,
+            sensitivity=sensitivity,
+            provenance=ArtifactProvenance(
+                authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
+                local_file_binding=binding,
+            ),
+        )
+        return ToolOutput(
+            kind=ARTIFACT_EDIT_TEXT_OUTPUT_KIND,
+            data={
+                "relative_path": binding.relative_path,
+                "filename": filename,
+                "original_physical_revision": binding.original_physical_revision,
+                "observed_content_sha256": binding.observed_content_sha256,
+                "source_byte_size": binding.source_byte_size,
+                "result_byte_size": len(transformed.content),
+                "change_summary": artifact_text_change_summary_to_mapping(summary),
+            },
+            artifact=draft,
+            sensitivity=ModelSensitivity(self._workspace.sensitivity.value),
+            sensitivity_provenance={
+                "authority": "local_workspace_binding",
+                "workspace_id": self._workspace.workspace_id,
+                "relative_paths": (binding.relative_path,),
+                "physical_revisions": (binding.original_physical_revision,),
+            },
+        )
+
+
 async def _read_conversation_artifact(
     artifacts: AgentHomeArtifactStore,
     conversation_id: str,
@@ -600,28 +678,34 @@ class ArtifactSaveLocalExecutor:
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
         artifact_id = request.arguments["artifact_id"]
-        destination_id = request.arguments["destination_id"]
+        mode = request.arguments["mode"]
+        destination_id = request.arguments.get("destination_id")
         filename = request.arguments.get("filename")
         assert isinstance(artifact_id, str)
-        assert isinstance(destination_id, str)
+        assert isinstance(mode, str)
+        assert destination_id is None or isinstance(destination_id, str)
         assert filename is None or isinstance(filename, str)
         return await self._delivery.preflight_save(
             run_id=request.run_id,
             artifact_id=artifact_id,
+            mode=mode,
             destination_id=destination_id,
             filename=filename,
         )
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         artifact_id = request.arguments["artifact_id"]
-        destination_id = request.arguments["destination_id"]
+        mode = request.arguments["mode"]
+        destination_id = request.arguments.get("destination_id")
         filename = request.arguments.get("filename")
         assert isinstance(artifact_id, str)
-        assert isinstance(destination_id, str)
+        assert isinstance(mode, str)
+        assert destination_id is None or isinstance(destination_id, str)
         assert filename is None or isinstance(filename, str)
         receipt = await self._delivery.save_committed(
             run_id=request.run_id,
             artifact_id=artifact_id,
+            mode=mode,
             destination_id=destination_id,
             filename=filename,
         )
@@ -656,6 +740,7 @@ def artifact_declarations(
     delivery: LocalArtifactDelivery | None,
     artifacts: AgentHomeArtifactStore,
     *,
+    workspace: LocalWorkspaceBackend | None,
     agent_id: str,
     sqlite_backend: ExactTabularExportBackend,
     postgresql_backend: ExactTabularExportBackend,
@@ -663,7 +748,8 @@ def artifact_declarations(
 ) -> ArtifactCapabilityDeclarations:
     include_local_delivery = delivery is not None
     declarations = artifact_capability_declarations(
-        include_local_delivery=include_local_delivery
+        include_local_delivery=include_local_delivery,
+        include_local_edit=workspace is not None,
     )
     delivery_executors: tuple[Executor, ...] = ()
     if delivery is not None:
@@ -680,6 +766,7 @@ def artifact_declarations(
             ArtifactListExecutor(artifacts),
             ArtifactReadExecutor(artifacts),
             ArtifactConvertExecutor(artifacts),
+            *((ArtifactEditTextExecutor(workspace),) if workspace is not None else ()),
             *delivery_executors,
         ),
         tool_views=declarations.tool_views,
@@ -687,7 +774,9 @@ def artifact_declarations(
 
 
 def artifact_capability_declarations(
-    *, include_local_delivery: bool = True
+    *,
+    include_local_delivery: bool = True,
+    include_local_edit: bool = True,
 ) -> CapabilityDeclarations:
     document = Capability(
         id=DOCUMENT_CREATE_CAPABILITY_ID,
@@ -862,12 +951,101 @@ def artifact_capability_declarations(
             max_total_bytes_per_call=MAX_CSV_BYTES,
         ),
     )
+    artifact_edit_text = Capability(
+        id=ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
+        description=(
+            "Apply one bounded ordered exact UTF-8 text replacement family to an "
+            "authenticated current-run file_read binding and commit the complete "
+            "result as an internal artifact without changing the workspace file. "
+            "Copy file_read data.binding verbatim; it is opaque and must never be "
+            "decoded, normalized, or reconstructed."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "binding": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8 * 1024,
+                    "description": (
+                        "The exact opaque file_read data.binding string copied "
+                        "verbatim without decoding, normalization, or reconstruction."
+                    ),
+                },
+                "replacements": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_TEXT_EDIT_OPERATIONS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_text": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_TEXT_EDIT_ANCHOR_BYTES,
+                            },
+                            "new_text": {
+                                "type": "string",
+                                "maxLength": MAX_TEXT_EDIT_REPLACEMENT_BYTES,
+                            },
+                            "expected_occurrences": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": MAX_TEXT_EDIT_OCCURRENCES,
+                            },
+                        },
+                        "required": [
+                            "old_text",
+                            "new_text",
+                            "expected_occurrences",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["binding", "replacements"],
+            "additionalProperties": False,
+        },
+        output_kind=ARTIFACT_EDIT_TEXT_OUTPUT_KIND,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "filename": {"type": "string"},
+                "original_physical_revision": {"type": "string"},
+                "observed_content_sha256": {"type": "string"},
+                "source_byte_size": {"type": "integer", "minimum": 0},
+                "result_byte_size": {"type": "integer", "minimum": 0},
+                "change_summary": _change_summary_schema(),
+            },
+            "required": [
+                "relative_path",
+                "filename",
+                "original_physical_revision",
+                "observed_content_sha256",
+                "source_byte_size",
+                "result_byte_size",
+                "change_summary",
+            ],
+            "additionalProperties": False,
+        },
+        executor_id=ARTIFACT_EDIT_TEXT_EXECUTOR_ID,
+        artifact_policy=ArtifactPolicy(
+            allowed_media_types=TEXT_EDIT_MEDIA_TYPES,
+            allowed_extensions=TEXT_EDIT_ALLOWED_EXTENSIONS,
+            artifact_required=True,
+            max_artifact_count=1,
+            max_bytes_per_artifact=MAX_TEXT_EDIT_BYTES,
+            max_total_bytes_per_call=MAX_TEXT_EDIT_BYTES,
+        ),
+        access_mode=AccessMode.READ,
+    )
     save = Capability(
         id=ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
         description=(
-            "Complete local delivery of one committed internal artifact to the "
-            "effective default or an exact authorized destination without overwrite; "
-            "only this tool's successful receipt proves the local file exists."
+            "Publish one committed artifact either as a collision-safe new file in "
+            "an authorized destination or as an atomic replacement of only the exact "
+            "unchanged workspace file bound into a text-edit artifact."
         ),
         input_schema={
             "type": "object",
@@ -875,6 +1053,10 @@ def artifact_capability_declarations(
                 "artifact_id": {
                     "type": "string",
                     "pattern": "^artifact-[0-9a-f]{32}$",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["create_new", "replace_bound_file"],
                 },
                 "destination_id": {
                     "type": "string",
@@ -887,7 +1069,7 @@ def artifact_capability_declarations(
                     "maxLength": 120,
                 },
             },
-            "required": ["artifact_id", "destination_id"],
+            "required": ["artifact_id", "mode"],
             "additionalProperties": False,
         },
         output_kind=ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND,
@@ -927,6 +1109,7 @@ def artifact_capability_declarations(
         artifact_list,
         artifact_read,
         artifact_convert,
+        *((artifact_edit_text,) if include_local_edit else ()),
         *((save, set_location) if include_local_delivery else ()),
     )
     views = (
@@ -1014,6 +1197,28 @@ def artifact_capability_declarations(
         *(
             (
                 ToolView(
+                    name=ARTIFACT_EDIT_TEXT_TOOL_NAME,
+                    capability_id=artifact_edit_text.id,
+                    description=artifact_edit_text.description,
+                    presentation=ToolPresentation(
+                        toolbox_id=ToolboxId.ARTIFACTS,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
+                        summary="Prepare a bounded exact UTF-8 workspace-file edit artifact.",
+                        when_to_use=(
+                            "Use only with an authenticated binding returned by file_read; "
+                            "then use artifact_save_local in replace_bound_file mode."
+                        ),
+                        keywords=("artifact", "edit", "text", "replace", "workspace"),
+                    ),
+                ),
+            )
+            if include_local_edit
+            else ()
+        ),
+        *(
+            (
+                ToolView(
                     name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
                     capability_id=save.id,
                     description=save.description,
@@ -1067,6 +1272,7 @@ _ARTIFACT_PRODUCER_CAPABILITIES = frozenset(
         SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
         POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
+        ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
     }
 )
 _ARTIFACT_ADAPTER_CAPABILITIES = {
@@ -1086,6 +1292,8 @@ _BASE_ARTIFACT_CAPABILITIES = frozenset(
 _LOCAL_DELIVERY_CAPABILITIES = frozenset(
     {ARTIFACT_SAVE_LOCAL_CAPABILITY_ID, ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID}
 )
+LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS = frozenset({ARTIFACT_EDIT_TEXT_CAPABILITY_ID})
+LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS = frozenset({ARTIFACT_EDIT_TEXT_EXECUTOR_ID})
 
 
 class ArtifactDomainCatalog(Protocol):
@@ -1145,6 +1353,7 @@ class ArtifactCapabilityDomain:
         transcripts: ArtifactTranscriptReader,
         artifacts: AgentHomeArtifactStore,
         delivery: LocalArtifactDelivery | None,
+        workspace: LocalWorkspaceBackend | None,
         learning: LearningCandidateGuard,
         *,
         files_only_run_ids: set[str] | None = None,
@@ -1152,18 +1361,25 @@ class ArtifactCapabilityDomain:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("artifact declarations have the wrong domain owner")
         declared_ids = {item.id for item in declarations.capabilities}
-        if declared_ids not in {
-            _BASE_ARTIFACT_CAPABILITIES,
-            _BASE_ARTIFACT_CAPABILITIES | _LOCAL_DELIVERY_CAPABILITIES,
-        }:
+        expected_ids = _BASE_ARTIFACT_CAPABILITIES
+        if delivery is not None:
+            expected_ids |= _LOCAL_DELIVERY_CAPABILITIES
+        if workspace is not None:
+            expected_ids |= LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
+        if declared_ids != expected_ids:
             raise ValueError("artifact domain requires its exact capabilities")
         if bool(declared_ids & _LOCAL_DELIVERY_CAPABILITIES) != (delivery is not None):
             raise ValueError("artifact local delivery composition is inconsistent")
+        if bool(declared_ids & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS) != (
+            workspace is not None
+        ):
+            raise ValueError("artifact local edit composition is inconsistent")
         self._declarations = declarations
         self._catalog = catalog
         self._transcripts = transcripts
         self._artifacts = artifacts
         self._delivery = delivery
+        self._workspace = workspace
         self._learning = learning
         self._files_only_run_ids = (
             files_only_run_ids if files_only_run_ids is not None else set()
@@ -1229,6 +1445,16 @@ class ArtifactCapabilityDomain:
         names: list[str] = []
         for view in candidates:
             capability = self._capabilities[view.capability_id]
+            if capability.id in LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS and (
+                self._workspace is None
+                or run.origin is not RunOrigin.USER
+                or run.execution_scope is not None
+            ):
+                continue
+            if capability.id in _LOCAL_DELIVERY_CAPABILITIES and (
+                run.origin is not RunOrigin.USER or run.execution_scope is not None
+            ):
+                continue
             if (
                 capability.id in _CONVERSATION_ARTIFACT_CAPABILITIES
                 and not may_have_current_artifact
@@ -1252,6 +1478,7 @@ class ArtifactCapabilityDomain:
         capability: Capability,
         arguments: Mapping[str, object],
     ) -> Mapping[str, object]:
+        del capability
         return arguments
 
     async def prepare_call(
@@ -1264,6 +1491,38 @@ class ArtifactCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
         del request_sensitivity
+        if capability.id == ARTIFACT_EDIT_TEXT_CAPABILITY_ID:
+            if (
+                self._workspace is None
+                or run.origin is not RunOrigin.USER
+                or run.execution_scope is not None
+            ):
+                raise CapabilityInputError(
+                    "workspace_unavailable",
+                    "Workspace text editing is unavailable for this run.",
+                )
+            token = arguments.get("binding")
+            if not isinstance(token, str):
+                raise CapabilityInputError(
+                    "artifact_edit_binding_invalid",
+                    "Text editing requires an authenticated current-run file binding.",
+                )
+            try:
+                binding = self._workspace.authenticate_file_binding(
+                    run_id=run.id,
+                    token=token,
+                )
+                text_edit_media_type(binding.relative_path)
+            except LocalWorkspaceError as error:
+                raise CapabilityInputError(
+                    "artifact_edit_binding_invalid",
+                    "The file binding is invalid or no longer available.",
+                ) from error
+            except ArtifactError as error:
+                raise CapabilityInputError(
+                    error.code, error.message, error.details
+                ) from error
+            return arguments
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(run.id, call)
         supplied_source_id = arguments.get("source_id")
@@ -1303,10 +1562,7 @@ class ArtifactCapabilityDomain:
                     {"artifact_id": artifact_id},
                 )
             if capability.id == ARTIFACT_READ_CAPABILITY_ID and ref.media_type not in {
-                "application/json",
-                "text/csv",
-                "text/markdown",
-                "text/plain",
+                *TEXT_EDIT_MEDIA_TYPES,
                 XLSX_MEDIA_TYPE,
             }:
                 raise CapabilityInputError(
@@ -1325,6 +1581,45 @@ class ArtifactCapabilityDomain:
                     "to CSV.",
                     {"media_type": ref.media_type, "allowed_extensions": (".xlsx",)},
                 )
+        if capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID:
+            mode = arguments.get("mode")
+            names = set(arguments)
+            if mode == "create_new":
+                if "destination_id" not in names or names - {
+                    "artifact_id",
+                    "mode",
+                    "destination_id",
+                    "filename",
+                }:
+                    raise CapabilityInputError(
+                        "artifact_delivery_invalid",
+                        "create_new requires one authorized destination and optional filename.",
+                    )
+            elif mode == "replace_bound_file":
+                if names != {"artifact_id", "mode"}:
+                    raise CapabilityInputError(
+                        "artifact_edit_binding_invalid",
+                        "replace_bound_file accepts only the committed artifact ID.",
+                    )
+                artifact_id = arguments.get("artifact_id")
+                ref = (
+                    await self._artifacts.find_ref(artifact_id)
+                    if isinstance(artifact_id, str)
+                    else None
+                )
+                if (
+                    ref is None
+                    or ref.capability_id != ARTIFACT_EDIT_TEXT_CAPABILITY_ID
+                    or ref.provenance.local_file_binding is None
+                ):
+                    raise CapabilityInputError(
+                        "artifact_edit_binding_invalid",
+                        "replace_bound_file requires one committed bound edit artifact.",
+                    )
+            else:
+                raise CapabilityInputError(
+                    "artifact_delivery_invalid", "Artifact delivery mode is invalid."
+                )
         if capability.id in _EXACT_TABULAR_CAPABILITIES:
             await self._validate_sql(run, capability, arguments)
         return arguments
@@ -1338,6 +1633,15 @@ class ArtifactCapabilityDomain:
         fingerprint: FrozenJsonObject,
     ) -> SideEffectPlan:
         if capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID:
+            if fingerprint.get("mode") == "replace_bound_file":
+                assert self._delivery is not None
+                return SideEffectPlan(
+                    approval_required=True,
+                    approval_arguments=fingerprint,
+                    approval_reason=self._delivery.approval_prompt_for_bound_replacement(
+                        fingerprint
+                    ),
+                )
             return SideEffectPlan(
                 approval_required=fingerprint.get("requires_approval") is not False,
                 approval_arguments=fingerprint,
@@ -1372,7 +1676,10 @@ class ArtifactCapabilityDomain:
                     output.artifact,
                 ),
             )
-        if capability.operational_effect is not OperationalEffect.NONE:
+        if capability.operational_effect is not OperationalEffect.NONE and not (
+            capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
+            and output.data.get("outcome") == "failed"
+        ):
             self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
@@ -1412,6 +1719,13 @@ class ArtifactCapabilityDomain:
         call: ToolCall,
         error: BaseException,
     ) -> CapabilityFailure | None:
+        if isinstance(error, LocalWorkspaceError):
+            code = error.code
+            if code in {"file_binding_invalid", "file_binding_expired"}:
+                code = "artifact_edit_binding_invalid"
+            elif code in {"file_too_large", "file_edit_timeout"}:
+                code = "artifact_edit_limited"
+            return CapabilityFailure(code, error.message, error.details)
         return None
 
     def _validate_artifact_summary(
@@ -1422,6 +1736,27 @@ class ArtifactCapabilityDomain:
         draft = output.artifact
         assert draft is not None
         if draft.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA:
+            if capability.id == ARTIFACT_EDIT_TEXT_CAPABILITY_ID:
+                binding = draft.provenance.local_file_binding
+                valid = (
+                    binding is not None
+                    and output.data.get("relative_path") == binding.relative_path
+                    and output.data.get("filename") == draft.suggested_filename
+                    and output.data.get("original_physical_revision")
+                    == binding.original_physical_revision
+                    and output.data.get("observed_content_sha256")
+                    == binding.observed_content_sha256
+                    and output.data.get("source_byte_size") == binding.source_byte_size
+                    and output.data.get("result_byte_size") == len(draft.content)
+                    and output.data.get("change_summary")
+                    == FrozenJsonObject.from_mapping(
+                        artifact_text_change_summary_to_mapping(binding.change_summary)
+                    )
+                )
+                if not valid:
+                    raise ToolOutputValidationError(
+                        "artifact edit summary differs from its execution provenance"
+                    )
             return
         if capability.id in _EXACT_TABULAR_CAPABILITIES:
             valid = (
@@ -1456,6 +1791,8 @@ class ArtifactCapabilityDomain:
         draft: ArtifactDraft,
     ) -> ArtifactDraft:
         provenance = draft.provenance
+        if capability.id == ARTIFACT_EDIT_TEXT_CAPABILITY_ID:
+            return self._bind_local_edit(run, arguments, draft)
         if provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
             if capability.id in _EXACT_TABULAR_CAPABILITIES:
                 return await self._bind_exact_export(
@@ -1603,6 +1940,46 @@ class ArtifactCapabilityDomain:
                 resource_bindings=tuple(bindings[key] for key in sorted(bindings)),
             ),
         )
+
+    def _bind_local_edit(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        draft: ArtifactDraft,
+    ) -> ArtifactDraft:
+        if (
+            self._workspace is None
+            or run.origin is not RunOrigin.USER
+            or run.execution_scope is not None
+        ):
+            raise ToolOutputValidationError(
+                "artifact local edit lacks workspace authority"
+            )
+        token = arguments.get("binding")
+        if not isinstance(token, str):
+            raise ToolOutputValidationError(
+                "artifact local edit binding is unavailable"
+            )
+        authenticated = self._workspace.authenticate_file_binding(
+            run_id=run.id,
+            token=token,
+        )
+        binding = draft.provenance.local_file_binding
+        if (
+            binding is None
+            or binding.workspace_id != self._workspace.workspace_id
+            or binding.workspace_id != authenticated.workspace_id
+            or binding.relative_path != authenticated.relative_path
+            or binding.original_physical_revision != authenticated.physical_revision
+            or binding.source_byte_size != authenticated.size_bytes
+            or draft.suggested_filename
+            != authenticated.relative_path.rsplit("/", 1)[-1]
+            or draft.sensitivity is not Sensitivity(self._workspace.sensitivity.value)
+        ):
+            raise ToolOutputValidationError(
+                "artifact local edit differs from its authenticated source binding"
+            )
+        return draft
 
     async def _bind_exact_export(
         self,
@@ -1949,11 +2326,43 @@ def _receipt_schema() -> dict[str, object]:
         "sha256": "string",
         "renamed_for_collision": "boolean",
         "delivered_at": "string",
+        "mode": "string",
+        "outcome": "string",
+    }
+    optional_types = {
+        "workspace_id": "string",
+        "relative_path": "string",
+        "prior_physical_revision": "string",
+        "result_physical_revision": "string",
+        "failure_code": "string",
     }
     return {
         "type": "object",
-        "properties": {name: {"type": kind} for name, kind in types.items()},
+        "properties": {
+            name: {"type": kind} for name, kind in {**types, **optional_types}.items()
+        },
         "required": list(types),
+        "additionalProperties": False,
+    }
+
+
+def _change_summary_schema() -> dict[str, object]:
+    integer_names = (
+        "operation_count",
+        "replacement_count",
+        "insertion_count",
+        "deletion_count",
+        "occurrence_count",
+        "bytes_removed",
+        "bytes_added",
+    )
+    return {
+        "type": "object",
+        "properties": {
+            **{name: {"type": "integer", "minimum": 0} for name in integer_names},
+            "description": {"type": "string"},
+        },
+        "required": [*integer_names, "description"],
         "additionalProperties": False,
     }
 
@@ -1965,7 +2374,7 @@ def _artifact_summary_schema() -> dict[str, object]:
             "artifact_id": {"type": "string"},
             "filename": {"type": "string"},
             "media_type": {"type": "string"},
-            "byte_size": {"type": "integer", "minimum": 1},
+            "byte_size": {"type": "integer", "minimum": 0},
             "sha256": {"type": "string"},
             "created_at": {"type": "string"},
             "derived_from_artifact_id": {"type": "string"},

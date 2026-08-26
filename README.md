@@ -26,7 +26,7 @@ remains read only.
 
 | | |
 | --- | --- |
-| **Talk to real data** | Query SQLite and PostgreSQL without writing SQL, and search or read files in one admitted workspace. |
+| **Talk to real data** | Query SQLite and PostgreSQL without writing SQL, and search, read, or safely approve targeted text edits in one admitted workspace. |
 | **Use your preferred model** | OpenAI, Anthropic, Gemini, Grok, Ollama, a custom OpenAI compatible endpoint, or supported Codex, Claude Code, and Grok Build subscriptions. |
 | **Keep useful context** | Persist conversations, user approved memory, and reusable Markdown skills. |
 | **Stay in control** | Validate reads against the current catalog and require resource scoped readiness, preview, and exact approval for the limited PostgreSQL update. |
@@ -181,14 +181,19 @@ acceptance.
 
 File requests use the same direct loop. The pinned `file_search` and
 `file_read` tools expose only bounded workspace-relative results and never add
-a Files-domain writer. Exact SQL results can become CSV or XLSX artifacts. A
-later turn can use a bounded model-only `artifact_list` for the current conversation,
-`artifact_read` for a bounded preview of an exact known ID owned by the agent,
-and `artifact_convert` for the supported current-conversation Daita XLSX `Data`
-snapshot to CSV conversion. This lets a new conversation read an exact artifact
-reference returned by a durable job without creating an agent-wide inventory.
-There is no public artifact inventory, CLI list command, hidden current-file
-pointer, or prompt keyword router.
+a Files-domain writer. For bounded UTF-8 text, a current-run `file_read`
+binding can feed `artifact_edit_text`, which commits a complete replacement
+artifact without changing the workspace. `artifact_save_local` then requests
+one approval and atomically replaces only that exact unchanged bound file;
+drift requires a fresh read and never triggers a silent merge or retry. Exact
+SQL results can become CSV or XLSX artifacts. A later turn can use a bounded
+model-only `artifact_list` for the current conversation, `artifact_read` for a
+bounded preview of an exact known ID owned by the agent, and `artifact_convert`
+for the supported current-conversation Daita XLSX `Data` snapshot to CSV
+conversion. This lets a new conversation read an exact artifact reference
+returned by a durable job without creating an agent-wide inventory. There is
+no `file_write`, public artifact inventory, CLI list command, hidden
+current-file pointer, or prompt keyword router.
 
 Local files are normally delivered automatically to the authorized default
 destination and reported with the verified saved path. Public recovery remains

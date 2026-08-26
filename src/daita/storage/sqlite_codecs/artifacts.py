@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from ...artifacts.models import (
     ArtifactAuthorship,
+    ArtifactDeliveryMode,
+    ArtifactDeliveryOutcome,
     ArtifactDeliveryReceipt,
+    ArtifactLocalFileBinding,
     ArtifactProvenance,
     ArtifactRef,
     ArtifactResourceBinding,
+    ArtifactTextChangeSummary,
+    artifact_text_change_summary_to_mapping,
 )
 from ...catalog.models import Sensitivity
 from .common import (
@@ -55,6 +60,90 @@ def decode_artifact_binding(value: JsonValue) -> ArtifactResourceBinding:
     )
 
 
+def encode_local_file_binding(
+    value: ArtifactLocalFileBinding,
+) -> dict[str, JsonValue]:
+    return record(
+        "ArtifactLocalFileBinding",
+        {
+            "workspace_id": value.workspace_id,
+            "relative_path": value.relative_path,
+            "original_physical_revision": value.original_physical_revision,
+            "observed_content_sha256": value.observed_content_sha256,
+            "source_byte_size": value.source_byte_size,
+            "change_summary": record(
+                "ArtifactTextChangeSummary",
+                artifact_text_change_summary_to_mapping(value.change_summary),
+            ),
+        },
+    )
+
+
+def decode_local_file_binding(value: JsonValue) -> ArtifactLocalFileBinding:
+    fields = record_fields(
+        value,
+        "ArtifactLocalFileBinding",
+        (
+            "workspace_id",
+            "relative_path",
+            "original_physical_revision",
+            "observed_content_sha256",
+            "source_byte_size",
+            "change_summary",
+        ),
+    )
+    summary = record_fields(
+        fields["change_summary"],
+        "ArtifactTextChangeSummary",
+        (
+            "operation_count",
+            "replacement_count",
+            "insertion_count",
+            "deletion_count",
+            "occurrence_count",
+            "bytes_removed",
+            "bytes_added",
+            "description",
+        ),
+    )
+    return ArtifactLocalFileBinding(
+        workspace_id=text(fields["workspace_id"], "artifact workspace id"),
+        relative_path=text(fields["relative_path"], "artifact relative path"),
+        original_physical_revision=text(
+            fields["original_physical_revision"],
+            "artifact original physical revision",
+        ),
+        observed_content_sha256=text(
+            fields["observed_content_sha256"], "artifact observed content hash"
+        ),
+        source_byte_size=integer(
+            fields["source_byte_size"], "artifact source byte size"
+        ),
+        change_summary=ArtifactTextChangeSummary(
+            operation_count=integer(
+                summary["operation_count"], "artifact edit operation count"
+            ),
+            replacement_count=integer(
+                summary["replacement_count"], "artifact replacement count"
+            ),
+            insertion_count=integer(
+                summary["insertion_count"], "artifact insertion count"
+            ),
+            deletion_count=integer(
+                summary["deletion_count"], "artifact deletion count"
+            ),
+            occurrence_count=integer(
+                summary["occurrence_count"], "artifact occurrence count"
+            ),
+            bytes_removed=integer(
+                summary["bytes_removed"], "artifact removed byte count"
+            ),
+            bytes_added=integer(summary["bytes_added"], "artifact added byte count"),
+            description=text(summary["description"], "artifact change description"),
+        ),
+    )
+
+
 def encode_artifact_provenance(value: ArtifactProvenance) -> dict[str, JsonValue]:
     return record(
         "ArtifactProvenance",
@@ -65,6 +154,11 @@ def encode_artifact_provenance(value: ArtifactProvenance) -> dict[str, JsonValue
             "resource_bindings": [
                 encode_artifact_binding(item) for item in value.resource_bindings
             ],
+            "local_file_binding": (
+                None
+                if value.local_file_binding is None
+                else encode_local_file_binding(value.local_file_binding)
+            ),
             "sql_fingerprint": value.sql_fingerprint,
             "parameters_sha256": value.parameters_sha256,
             "columns": list(value.columns),
@@ -82,6 +176,7 @@ def decode_artifact_provenance(value: JsonValue) -> ArtifactProvenance:
             "evidence_call_ids",
             "derived_from_artifact_id",
             "resource_bindings",
+            "local_file_binding",
             "sql_fingerprint",
             "parameters_sha256",
             "columns",
@@ -106,6 +201,11 @@ def decode_artifact_provenance(value: JsonValue) -> ArtifactProvenance:
             for item in sequence(
                 fields["resource_bindings"], "artifact resource bindings"
             )
+        ),
+        local_file_binding=(
+            None
+            if fields["local_file_binding"] is None
+            else decode_local_file_binding(fields["local_file_binding"])
         ),
         sql_fingerprint=optional_text(
             fields["sql_fingerprint"], "artifact SQL fingerprint"
@@ -190,6 +290,13 @@ def encode_delivery_receipt(
             "sha256": value.sha256,
             "renamed_for_collision": value.renamed_for_collision,
             "delivered_at": datetime_encode(value.delivered_at),
+            "mode": enum_encode(value.mode, "ArtifactDeliveryMode"),
+            "outcome": enum_encode(value.outcome, "ArtifactDeliveryOutcome"),
+            "workspace_id": value.workspace_id,
+            "relative_path": value.relative_path,
+            "prior_physical_revision": value.prior_physical_revision,
+            "result_physical_revision": value.result_physical_revision,
+            "failure_code": value.failure_code,
         },
     )
 
@@ -207,6 +314,13 @@ def decode_delivery_receipt(value: JsonValue) -> ArtifactDeliveryReceipt:
             "sha256",
             "renamed_for_collision",
             "delivered_at",
+            "mode",
+            "outcome",
+            "workspace_id",
+            "relative_path",
+            "prior_physical_revision",
+            "result_physical_revision",
+            "failure_code",
         ),
     )
     return ArtifactDeliveryReceipt(
@@ -220,4 +334,17 @@ def decode_delivery_receipt(value: JsonValue) -> ArtifactDeliveryReceipt:
             fields["renamed_for_collision"], "delivery collision flag"
         ),
         delivered_at=datetime_decode(fields["delivered_at"]),
+        mode=enum_decode(fields["mode"], ArtifactDeliveryMode, "ArtifactDeliveryMode"),
+        outcome=enum_decode(
+            fields["outcome"], ArtifactDeliveryOutcome, "ArtifactDeliveryOutcome"
+        ),
+        workspace_id=optional_text(fields["workspace_id"], "delivery workspace id"),
+        relative_path=optional_text(fields["relative_path"], "delivery relative path"),
+        prior_physical_revision=optional_text(
+            fields["prior_physical_revision"], "delivery prior revision"
+        ),
+        result_physical_revision=optional_text(
+            fields["result_physical_revision"], "delivery result revision"
+        ),
+        failure_code=optional_text(fields["failure_code"], "delivery failure code"),
     )

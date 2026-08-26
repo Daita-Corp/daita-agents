@@ -379,6 +379,26 @@ def artifact_delivery_messages(
         if isinstance(artifact_id, str):
             delivery_attempts.add(artifact_id)
         if not result.is_error:
+            data = result.output.get("data")
+            if not isinstance(data, Mapping):
+                continue
+            if data.get("mode") != "replace_bound_file":
+                continue
+            outcome = data.get("outcome")
+            relative_path = sanitize_terminal_text(
+                data.get("relative_path"),
+                maximum=512,
+                preserve_lines=False,
+                fallback="the bound workspace file",
+            )
+            if outcome == "failed":
+                messages.append(
+                    f"Workspace file {relative_path} was not updated; the committed edit artifact remains available."
+                )
+            elif outcome == "uncertain":
+                messages.append(
+                    f"The update outcome for workspace file {relative_path} is uncertain; re-read the target before any further edit."
+                )
             continue
         error = result.output.get("error")
         if not isinstance(artifact_id, str) or not isinstance(error, Mapping):
@@ -546,6 +566,7 @@ def approval_review_document(
     tool_name: str,
     capability_id: str,
     arguments_text: str | None,
+    reason: str | None = None,
 ) -> tuple[str | None, bool]:
     """Return the review document and whether it is reviewable."""
 
@@ -554,7 +575,19 @@ def approval_review_document(
     header = (
         f"Tool: {sanitize_terminal_text(tool_name, maximum=128, preserve_lines=False, fallback='tool')}\n"
         f"Capability: {sanitize_terminal_text(capability_id, maximum=128, preserve_lines=False, fallback='capability')}\n"
-        "Arguments:\n"
+        + (
+            "Change: "
+            + sanitize_terminal_text(
+                reason,
+                maximum=768,
+                preserve_lines=False,
+                fallback="Review this exact change once.",
+            )
+            + "\n"
+            if reason is not None
+            else ""
+        )
+        + "Arguments:\n"
     )
     document = header + arguments_text
     if looks_secret_shaped(arguments_text):

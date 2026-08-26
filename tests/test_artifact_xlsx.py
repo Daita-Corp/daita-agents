@@ -548,6 +548,7 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
                     name="artifact_save_local",
                     arguments={
                         "artifact_id": "artifact-00000000000000000000000000000001",
+                        "mode": "create_new",
                         "destination_id": "default",
                     },
                 )
@@ -855,6 +856,7 @@ async def test_delivery_failure_after_xlsx_commit_retains_verified_artifact(
                     name="artifact_save_local",
                     arguments={
                         "artifact_id": "artifact-00000000000000000000000000000001",
+                        "mode": "create_new",
                         "destination_id": "default",
                     },
                 )

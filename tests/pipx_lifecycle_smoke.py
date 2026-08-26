@@ -358,6 +358,7 @@ async def main():
                             "artifact_id": (
                                 "artifact-00000000000000000000000000000001"
                             ),
+                            "mode": "create_new",
                             "destination_id": "default",
                         },
                     ),

@@ -187,6 +187,7 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
                     name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
                     arguments={
                         "artifact_id": xlsx_id,
+                        "mode": "create_new",
                         "destination_id": "default",
                     },
                 )
@@ -229,6 +230,7 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
                     name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
                     arguments={
                         "artifact_id": csv_id,
+                        "mode": "create_new",
                         "destination_id": "default",
                     },
                 )

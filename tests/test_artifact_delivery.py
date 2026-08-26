@@ -3,6 +3,7 @@ from __future__ import annotations
 from _workspace_support import workspace_for
 
 import asyncio
+import inspect
 import sqlite3
 import threading
 from collections import defaultdict
@@ -12,6 +13,7 @@ import pytest
 
 import daita.artifacts.delivery as delivery_module
 from daita import Agent, ArtifactError
+from daita.artifacts.delivery import LocalArtifactDelivery
 from daita.artifacts.models import (
     SYSTEM_DOWNLOADS_DESTINATION_ID,
     DestinationAuthorization,
@@ -28,6 +30,15 @@ from daita.llm.models import (
 from _toolbox_model_support import (
     ToolboxAwareMockModelProvider as MockModelProvider,
 )
+
+
+def test_local_delivery_requires_one_explicit_save_mode() -> None:
+    for method in (
+        LocalArtifactDelivery.preflight_save,
+        LocalArtifactDelivery.save_committed,
+    ):
+        mode = inspect.signature(method).parameters["mode"]
+        assert mode.default is inspect.Parameter.empty
 
 
 def _ids():
@@ -453,6 +464,7 @@ async def test_verified_receipt_path_and_artifact_identity_are_not_projected_fro
                         name="artifact_save_local",
                         arguments={
                             "artifact_id": artifact_id,
+                            "mode": "create_new",
                             "destination_id": "default",
                         },
                     ),

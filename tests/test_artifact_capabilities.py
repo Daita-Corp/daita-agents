@@ -20,6 +20,7 @@ from daita._json import FrozenJsonObject
 from daita.domains.data.context import DataContextBuilder
 from daita.domains.data.export_capabilities import (
     ARTIFACT_CONVERT_TOOL_NAME,
+    ARTIFACT_EDIT_TEXT_TOOL_NAME,
     ARTIFACT_LIST_TOOL_NAME,
     ARTIFACT_READ_TOOL_NAME,
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
@@ -168,6 +169,10 @@ def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite()
                 "type": "string",
                 "pattern": "^artifact-[0-9a-f]{32}$",
             },
+            "mode": {
+                "type": "string",
+                "enum": ["create_new", "replace_bound_file"],
+            },
             "destination_id": {
                 "type": "string",
                 "minLength": 1,
@@ -175,16 +180,37 @@ def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite()
             },
             "filename": {"type": "string", "minLength": 1, "maxLength": 120},
         },
-        "required": ["artifact_id", "destination_id"],
+        "required": ["artifact_id", "mode"],
         "additionalProperties": False,
     }
     properties = schema["properties"]
     assert isinstance(properties, FrozenJsonObject)
     assert set(properties) == {
         "artifact_id",
+        "mode",
         "destination_id",
         "filename",
     }
+
+
+def test_artifact_edit_binding_contract_requires_verbatim_opaque_reuse() -> None:
+    declarations = artifact_capability_declarations(include_local_edit=True)
+    view = next(
+        item
+        for item in declarations.tool_views
+        if item.name == ARTIFACT_EDIT_TEXT_TOOL_NAME
+    )
+    capability = next(
+        item for item in declarations.capabilities if item.id == view.capability_id
+    )
+    properties = capability.input_schema.get("properties")
+    assert isinstance(properties, Mapping)
+    binding = properties.get("binding")
+    assert isinstance(binding, Mapping)
+    contract = f"{capability.description} {binding.get('description')}".casefold()
+    assert "verbatim" in contract
+    assert "opaque" in contract
+    assert "never be decoded" in contract
 
 
 def test_artifact_set_export_location_schema_accepts_only_one_destination_id() -> None:
@@ -264,13 +290,21 @@ async def test_system_and_persistent_save_preflight_are_preauthorized_for_explic
             _call(
                 "save-system",
                 ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-                {"artifact_id": artifact_id, "destination_id": "default"},
+                {
+                    "artifact_id": artifact_id,
+                    "mode": "create_new",
+                    "destination_id": "default",
+                },
             ),
             _stop("saved system"),
             _call(
                 "save-persistent",
                 ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-                {"artifact_id": artifact_id, "destination_id": destination_id},
+                {
+                    "artifact_id": artifact_id,
+                    "mode": "create_new",
+                    "destination_id": destination_id,
+                },
             ),
             _stop("saved persistent"),
         ),
@@ -361,6 +395,7 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
                         name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
                         arguments={
                             "artifact_id": artifact_id,
+                            "mode": "create_new",
                             "destination_id": destination.destination_id,
                         },
                     ),
@@ -519,7 +554,8 @@ async def test_context_requires_default_delivery_before_final_text_for_explicit_
         )
         assert "artifact_create_document" in system
         assert (
-            'artifact_save_local with destination_id="default" before normal' in system
+            'artifact_save_local with mode="create_new" and '
+            'destination_id="default" before normal' in system
         )
         assert "Normal assistant text ends the run" in system
         assert "Ordinary user wording is not an exact stored value" in system

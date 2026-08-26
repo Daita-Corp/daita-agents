@@ -198,6 +198,77 @@ def test_phase2_local_workspace_backend_is_explicit_and_conditionally_composed()
     assert "local_files.executors if local_files is not None else ()" in compose_text
 
 
+def test_phase3_bound_text_edit_has_one_artifact_producer_and_one_publication_owner():
+    from daita.domains.data.export_capabilities import (
+        ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
+        ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+        artifact_capability_declarations,
+    )
+
+    declarations = artifact_capability_declarations()
+    capabilities = {item.id: item for item in declarations.capabilities}
+    edit_schema = capabilities[ARTIFACT_EDIT_TEXT_CAPABILITY_ID].input_schema
+    save_schema = capabilities[ARTIFACT_SAVE_LOCAL_CAPABILITY_ID].input_schema
+    edit_properties = edit_schema.get("properties")
+    edit_required = edit_schema.get("required")
+    save_properties = save_schema.get("properties")
+    save_required = save_schema.get("required")
+    assert isinstance(edit_properties, Mapping)
+    assert isinstance(edit_required, (tuple, list))
+    assert isinstance(save_properties, Mapping)
+    assert isinstance(save_required, (tuple, list))
+    assert set(edit_properties) == {"binding", "replacements"}
+    assert set(edit_required) == {"binding", "replacements"}
+    assert set(save_properties) == {
+        "artifact_id",
+        "mode",
+        "destination_id",
+        "filename",
+    }
+    assert set(save_required) == {"artifact_id", "mode"}
+    assert not {
+        "path",
+        "relative_path",
+        "revision",
+        "physical_revision",
+        "content",
+        "bytes",
+    } & set(edit_properties)
+    assert not {
+        "path",
+        "relative_path",
+        "revision",
+        "physical_revision",
+        "content",
+        "bytes",
+    } & set(save_properties)
+
+    workspace = (PACKAGE / "adapters" / "local_workspace.py").read_text(
+        encoding="utf-8"
+    )
+    artifact_domain = (
+        PACKAGE / "domains" / "data" / "export_capabilities.py"
+    ).read_text(encoding="utf-8")
+    delivery = (PACKAGE / "artifacts" / "delivery.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    production = _python_text(PACKAGE)
+    assert _class_owners("ArtifactEditTextExecutor") == {
+        "domains/data/export_capabilities.py"
+    }
+    assert _class_owners("LocalArtifactDelivery") == {"artifacts/delivery.py"}
+    assert "os.replace(" not in workspace
+    assert "os.replace(" not in artifact_domain
+    assert "os.replace(" in delivery
+    assert "subprocess" not in _imports(PACKAGE / "artifacts" / "delivery.py")
+    assert "subprocess" not in _imports(
+        PACKAGE / "domains" / "data" / "export_capabilities.py"
+    )
+    assert "file_write" not in production
+    assert "exact_target_resolver=workspace_backend" in embedded
+    assert "LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS" in embedded
+    assert "LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS" in embedded
+
+
 def test_stage_m2_is_server_neutral_lazy_and_uses_existing_runtime_owners():
     runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
     adapter_path = PACKAGE / "adapters" / "mcp.py"
